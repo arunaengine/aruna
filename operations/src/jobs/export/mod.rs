@@ -56,13 +56,14 @@ use crate::blob::hidden::delete_hidden;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::repository::NodeScope;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::read::export_rocrate_routed;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::jobs::WaitTarget;
 use aruna_core::metadata::AuthToken;
@@ -74,6 +75,7 @@ use resolve::{
 
 pub(crate) mod archive;
 mod resolve;
+use crate::auth::enforcement::PolicyBulkOperation;
 use archive::*;
 
 const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
@@ -297,7 +299,17 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         .as_ref()
         .and_then(|target| target.link.as_ref())
     {
-        Some(link) => super::repository::push::settle(ctx, spec, link, outcome).await,
+        Some(link) => {
+            use super::repository::push::{ExportEnd, SettlePushOperation, settled_outcome};
+            let settle = SettlePushOperation::new(
+                NodeScope::of(&ctx.driver),
+                ctx.job_id,
+                spec.document_id,
+                link.clone(),
+                ExportEnd::of(&outcome),
+            );
+            settled_outcome(outcome, drive(settle, &ctx.driver).await)
+        }
         None => outcome,
     }
 }
@@ -488,8 +500,13 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::check::{check_content, check_crate, unmet};
-    use super::repository::{Action, TransferError, deposit, ensure_supported, repository};
+    use super::repository::check::{
+        CheckContentOperation, CrateCheck, checks_content, profile_failure, unmet,
+    };
+    use super::repository::connector::ConnectorViewOperation;
+    use super::repository::invenio::export::{ExportRun, RepositoryExportOperation};
+    use super::repository::{Action, JobScope, TransferError, ensure_supported};
+    use crate::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
@@ -500,8 +517,9 @@ async fn repository_export(
         Ok(())
     } else {
         Box::pin(async {
-            let view =
-                repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+            let connector =
+                ConnectorViewOperation::new(destination.group_id, destination.connector_id);
+            let view = drive(connector, &ctx.driver).await?;
             let kind = view.connector.kind;
             ensure_supported(kind, Action::Publish)?;
             if destination.published_id.is_some() {
@@ -512,17 +530,52 @@ async fn repository_export(
                 let jsonld = checkpoint.raw_jsonld.as_deref().ok_or_else(|| {
                     TransferError::Permanent("source crate metadata missing".into())
                 })?;
-                let endpoint = &view.connector.endpoint;
-                let checked = check_crate(&ctx.driver, kind, endpoint, jsonld).await?;
+                let check = CrateCheck::new(kind, &view.connector.endpoint, jsonld)?;
+                let local = ctx.driver.net_handle.as_ref().map(|net| net.node_id());
+                let assess =
+                    ProfileAssessOperation::against(local, check.profile_iri, jsonld.to_string());
+                let status = Box::pin(drive(assess, &ctx.driver))
+                    .await
+                    .map(profile_verdict)
+                    .map_err(profile_failure)?;
+                let checked = check.finish(status)?;
                 if !checked.ready {
                     return Err(unmet(checked.findings));
                 }
-                let findings = check_content(ctx, spec, kind, checkpoint).await?;
-                if !findings.is_empty() {
-                    return Err(unmet(findings));
+                if checks_content(kind)? {
+                    let artifact = export_artifact(checkpoint)?;
+                    let inspection = inspect_artifact(ctx, spec, &artifact).await?;
+                    let content = CheckContentOperation::new(
+                        kind,
+                        checkpoint,
+                        artifact,
+                        inspection,
+                        JobScope::of(ctx).stop,
+                    )?;
+                    let findings = drive(content, &ctx.driver).await?;
+                    if !findings.is_empty() {
+                        return Err(unmet(findings));
+                    }
                 }
             }
-            deposit(kind, ctx, spec, destination, checkpoint).await
+            let inspection = match export_artifact(checkpoint) {
+                Ok(artifact) => inspect_artifact(ctx, spec, &artifact).await,
+                Err(error) => Err(error),
+            };
+            let export = RepositoryExportOperation::new(
+                kind,
+                ExportRun {
+                    scope: NodeScope::of(&ctx.driver),
+                    job: JobScope::of(ctx),
+                    spec: spec.clone(),
+                    destination: destination.clone(),
+                },
+                checkpoint.clone(),
+                inspection,
+            );
+            let (stored, result) = Box::pin(drive(export, &ctx.driver)).await?;
+            *checkpoint = stored;
+            result
         })
         .await
     };
@@ -563,6 +616,48 @@ async fn repository_export(
     }
 }
 
+fn export_artifact(
+    checkpoint: &ExportCheckpoint,
+) -> Result<ArtifactRef, super::repository::TransferError> {
+    checkpoint.artifact.clone().ok_or_else(|| {
+        super::repository::TransferError::Permanent("export artifact missing".into())
+    })
+}
+
+/// The export artifact's entries, with the limits an export archive may reach; a stop of the
+/// job ends the inspection.
+async fn inspect_artifact(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    artifact: &ArtifactRef,
+) -> Result<crate::jobs::import::archive::ArchiveInspection, super::repository::TransferError> {
+    use super::repository::TransferError;
+    let blob = ctx
+        .driver
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
+    let mut limits = spec.limits.clone();
+    limits.import_source_bytes = spec.limits.export_artifact_bytes;
+    limits.expanded_import_bytes = spec.limits.export_artifact_bytes;
+    limits.max_entries = limits.max_entries.saturating_add(2);
+    let inspect = crate::jobs::import::archive::inspect_reader(
+        blob.clone(),
+        artifact.location.clone(),
+        artifact.size,
+        false,
+        &limits,
+    );
+    tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => Err(TransferError::Cancelled),
+        _ = ctx.shutdown.cancelled() => Err(TransferError::Interrupted),
+        inspected = inspect => inspected
+            .map(|(inspection, _)| inspection)
+            .map_err(TransferError::Permanent),
+    }
+}
+
 /// Queues the record's identifiers as `Published` identifiers of the exported dataset.
 /// The dedup key names this job, so a rerun of the publish phase joins the queued job.
 async fn register_published(
@@ -573,8 +668,7 @@ async fn register_published(
     if record.identifiers.is_empty() {
         return Ok(());
     }
-    crate::jobs::service::submit_identifiers(
-        &ctx.driver,
+    let submit = crate::jobs::submit_local::SubmitLocalOperation::identifiers(
         aruna_core::structs::secondary_id::RegisterIdentifiersSpec {
             document_id: spec.document_id,
             identifiers: record.identifiers.clone(),
@@ -582,12 +676,17 @@ async fn register_published(
         },
         ctx.owner_node_id,
         format!("identifiers/{}", ctx.job_id),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        super::repository::TransferError::Retryable(format!("queueing identifiers failed: {error}"))
-    })
+        ctx.driver.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    crate::driver::drive(submit, ctx.driver.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            super::repository::TransferError::Retryable(format!(
+                "queueing identifiers failed: {error}"
+            ))
+        })
 }
 
 /// Reads the dataset's PID and live identifiers from its PID authority.
@@ -617,7 +716,7 @@ async fn export_identity(
 }
 
 /// The crate JSON-LD a repository export of the dataset would start from, with its revision.
-pub(crate) async fn crate_jsonld(
+pub async fn crate_jsonld(
     context: &std::sync::Arc<DriverContext>,
     auth: &AuthContext,
     document_id: Ulid,
@@ -636,7 +735,7 @@ pub(crate) async fn crate_jsonld(
 
 /// The bucket that refuses a selected file of crate `jsonld` at consent: the job's resolution
 /// finds copies of it on this node, and the holder rule refuses each of them.
-pub(crate) async fn unheld_bucket(
+pub async fn unheld_bucket(
     driver: &std::sync::Arc<DriverContext>,
     spec: &ExportRoCrateSpec,
     node_id: NodeId,
@@ -722,19 +821,22 @@ async fn read_crate(
     // Route the raw revision from a document holder; a job on a job-control bucket
     // rarely holds the document's bucket. The holder re-checks READ for this peer.
     let routed = |view| {
-        export_rocrate_routed(
-            context,
-            auth.realm_id,
-            ExportMetadataRequest {
-                document_id,
-                auth: Some(auth.clone()),
-                view,
-                limit: None,
-                offset: None,
-                after: None,
-            },
-            Some(AuthToken::internal(auth.clone())),
-            metadata_bytes,
+        drive(
+            RoutedExportOperation::new(
+                context.net_handle.as_ref().map(|net| net.node_id()),
+                auth.realm_id,
+                ExportMetadataRequest {
+                    document_id,
+                    auth: Some(auth.clone()),
+                    view,
+                    limit: None,
+                    offset: None,
+                    after: None,
+                },
+                Some(AuthToken::internal(auth.clone())),
+                metadata_bytes,
+            ),
+            &context,
         )
     };
     Ok(match routed(RoCrateExportView::Raw).await {
@@ -1284,9 +1386,9 @@ async fn load_policies(
         return Ok(());
     }
     let realm_id = spec.auth_context.realm_id;
-    let mut loaded = PolicyEvaluator::load_bulk(
+    let mut loaded = drive(
+        PolicyBulkOperation::new(pending.iter().map(|group_id| (realm_id, *group_id))),
         &ctx.driver,
-        pending.iter().map(|group_id| (realm_id, *group_id)),
     )
     .await
     .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
@@ -1796,19 +1898,21 @@ async fn open_remote(
     };
     // The challenge loop fills in this node's advertised subject and the refs
     // it learns, so a governed copy can be staged instead of dead-ending.
-    match managed_read(
+    match drive(
+        ManagedReadOperation::new(
+            node_id,
+            BaoReadRequest {
+                auth_context: spec.auth_context.clone(),
+                realm_id: spec.auth_context.realm_id,
+                target,
+                expected_blake3,
+                metadata_only,
+                destination: None,
+                known_refs: Vec::new(),
+                range: None,
+            },
+        ),
         driver,
-        node_id,
-        BaoReadRequest {
-            auth_context: spec.auth_context.clone(),
-            realm_id: spec.auth_context.realm_id,
-            target,
-            expected_blake3,
-            metadata_only,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        },
     )
     .await
     {

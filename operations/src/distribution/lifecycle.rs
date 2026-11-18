@@ -6,17 +6,19 @@
 // A transfer away drains its uploads before its fence is stated; a deletion purges the member
 // bucket once it commits. Every pass is bounded and resumes from durable state.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use aruna_core::rows::{outside_answer, outside_call};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::rows::{read_row, value};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -27,26 +29,28 @@ use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::structs::storage::distribution::lifecycle::MAX_CURSOR_BYTES;
 use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange, MemberState,
-    MetadataCoverage, Statement, StatementClaim, StatementKind,
+    DistributionBinding, DistributionMember, DistributionSnapshot, DistributionView, KeyRange,
+    MemberState, MetadataCoverage, Statement, StatementClaim, StatementKind,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::create::submit;
-use super::fence_row::{FenceChange, UpdateFenceOperation};
-use super::imports::{drop_resume, fenced_imports, fetch_imports, keep_resume};
-use super::purge::{
-    PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
-    purge_range, purge_rest, read,
+use super::fence_row::{FenceChange, FenceError, UpdateFenceOperation};
+use super::imports::{
+    FencedImportsOperation, FetchImportsOperation, ImportError, KeepResumeOperation,
 };
-use super::roots::{RootsCheckOperation, RootsOutcome, Sweep};
-use super::status::read_view;
-use crate::driver::{DriverContext, drive, drive_retry};
-use crate::replication::members::OwesFanoutOperation;
+use super::purge_steps::{
+    ClearSetOperation, DeleteRowsOperation, DropResumeOperation, PurgeError, PurgeRangeOperation,
+    PurgeRestOperation, PurgeTarget, Purged, RangeUploadsOperation, ReadRowOperation,
+};
+use super::roots::{RootsCheckOperation, RootsError, RootsOutcome, Sweep};
+use super::status_view::{ReadViewOperation, StatusError};
+use super::submit::{StateOperation, Stated};
+use crate::replication::members::{OwesFanoutOperation, RecordError};
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
 
@@ -57,10 +61,6 @@ const PURGE_PAGES: usize = 32;
 const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 /// How long uploads opened before a transfer fence may still complete before they are aborted.
 const UPLOAD_GRACE_MS: u64 = 5 * 60 * 1000;
-/// The set marker after which the next pass continues; a restart begins at the first set.
-static MARKER_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-/// Where the open source root sweep of each transfer goes on.
-static SWEEPS: Mutex<BTreeMap<Ulid, Sweep>> = Mutex::new(BTreeMap::new());
 
 /// What a range held when its former coordinator fenced it; the new coordinator completes
 /// once its own counters of the range reach it.
@@ -110,44 +110,169 @@ impl Left {
     }
 }
 
-/// One bounded pass over the sets with open lifecycle work. Returns when to look again.
-pub async fn tend_lifecycle(context: &Arc<DriverContext>) -> Option<Duration> {
-    let net = context.net_handle.as_ref()?;
-    let (realm_id, local) = (*net.realm_id(), net.node_id());
-    let rows = match scan_markers(context).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            warn!(%error, "Lifecycle work could not read its sets");
-            return Some(LIFECYCLE_POLL);
-        }
-    };
-    let mut waiting = false;
-    let mut budget = PURGE_PAGES;
-    for (key, seen) in rows {
-        let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
-            let _ = batch_delete(context, vec![marker(&key)]).await;
-            continue;
-        };
-        let set = SetWork {
+fn failed(error: impl std::fmt::Display) -> PurgeError {
+    PurgeError(error.to_string())
+}
+
+/// What lifecycle passes keep between them: the set marker after which the next continues, and
+/// where the open source root sweep of each transfer goes on.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct LifecycleCursors {
+    marker: Option<Vec<u8>>,
+    sweeps: BTreeMap<Ulid, Sweep>,
+}
+
+/// One finished pass: when to look again, if work waits, and the cursors for the next.
+#[derive(Debug, PartialEq)]
+pub(super) struct LifecyclePass {
+    pub(super) poll: Option<Duration>,
+    pub(super) cursors: LifecycleCursors,
+}
+
+/// What the pending call of a lifecycle pass answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PassStep {
+    Scan,
+    DropMarker,
+    Set,
+    Settle,
+}
+
+/// One bounded pass over the sets with open lifecycle work. It reads the next batch of sets
+/// after the last one looked at, so sets that keep waiting never starve later ones; a short
+/// batch makes the next pass start over.
+#[derive(Debug, PartialEq)]
+pub(super) struct TendLifecycleOperation {
+    realm_id: RealmId,
+    local: NodeId,
+    cursors: LifecycleCursors,
+    step: PassStep,
+    rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    current: Option<(Vec<u8>, Vec<u8>, Ulid)>,
+    budget: usize,
+    waiting: bool,
+}
+
+type Passing = Result<Next<LifecyclePass>, IoError>;
+
+impl TendLifecycleOperation {
+    pub(super) fn new(realm_id: RealmId, local: NodeId, cursors: LifecycleCursors) -> Self {
+        Self {
             realm_id,
             local,
-            set_id,
+            cursors,
+            step: PassStep::Scan,
+            rows: VecDeque::new(),
+            current: None,
+            budget: PURGE_PAGES,
+            waiting: false,
+        }
+    }
+
+    fn finish(&mut self, poll: bool) -> Passing {
+        Ok(Next::Done(LifecyclePass {
+            poll: poll.then_some(LIFECYCLE_POLL),
+            cursors: std::mem::take(&mut self.cursors),
+        }))
+    }
+
+    fn scanned(&mut self, result: IoResult) -> Passing {
+        let rows = match outside_answer(result) {
+            Ok(IoResult::Page { rows, .. }) => rows,
+            Ok(other) => return self.scan_failed(&other.label()),
+            Err(error) => return self.scan_failed(&error),
         };
-        match set.run(context, &mut budget).await {
-            Ok(Left::Settled) => {
-                let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
-                if let Err(error) = settle_marker(context, space, &key, &seen).await {
-                    warn!(%set_id, %error, "A settled lifecycle row stays until the next pass");
-                }
-            }
-            Ok(Left::Waiting) => waiting = true,
+        self.rows = (rows.into_iter())
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        self.cursors.marker = (self.rows.len() == SET_BATCH)
+            .then(|| self.rows.back().map(|(key, _)| key.clone()))
+            .flatten();
+        self.next_set()
+    }
+
+    fn scan_failed(&mut self, error: &dyn std::fmt::Display) -> Passing {
+        warn!(%error, "Lifecycle work could not read its sets");
+        self.finish(true)
+    }
+
+    fn next_set(&mut self) -> Passing {
+        let Some((key, seen)) = self.rows.pop_front() else {
+            return self.finish(self.waiting);
+        };
+        let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
+            let deletes = vec![marker(&key)];
+            self.step = PassStep::DropMarker;
+            return Ok(Next::Call(IoCall::child(DeleteRowsOperation { deletes })));
+        };
+        let sweeps = self.cursors.sweeps.clone();
+        let ids = (self.realm_id, self.local);
+        let work = SetWorkOperation::new(ids, set_id, self.budget, sweeps);
+        self.current = Some((key, seen, set_id));
+        self.step = PassStep::Set;
+        Ok(Next::Call(IoCall::child(work)))
+    }
+
+    fn set_worked(&mut self, result: Result<Worked, PurgeError>) -> Passing {
+        let (key, seen, set_id) = self.current.take().ok_or(IoError::Unfinished)?;
+        let worked = match result {
+            Ok(worked) => worked,
             Err(error) => {
                 warn!(%set_id, %error, "Distributed bucket lifecycle work failed; retrying");
-                waiting = true;
+                self.waiting = true;
+                return self.next_set();
+            }
+        };
+        self.budget = worked.budget;
+        for (transfer_id, sweep) in worked.sweeps {
+            match sweep {
+                Some(sweep) => self.cursors.sweeps.insert(transfer_id, sweep),
+                None => self.cursors.sweeps.remove(&transfer_id),
+            };
+        }
+        if worked.left == Left::Waiting {
+            self.waiting = true;
+            return self.next_set();
+        }
+        let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
+        let settle = SettleMarkerOperation::new(space, key, seen);
+        self.current = Some((Vec::new(), Vec::new(), set_id));
+        self.step = PassStep::Settle;
+        Ok(Next::Call(IoCall::child(settle)))
+    }
+}
+
+impl Operation for TendLifecycleOperation {
+    type Output = LifecyclePass;
+    type Error = IoError;
+
+    fn first(&mut self) -> Passing {
+        let page = IoCall::Page {
+            space: DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.cursors.marker.clone().map(Key::from),
+            limit: SET_BATCH,
+        };
+        Ok(Next::Call(outside_call(page)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Passing {
+        match self.step {
+            PassStep::Scan => self.scanned(result),
+            PassStep::DropMarker => {
+                result.child::<(), PurgeError>()?.ok();
+                self.next_set()
+            }
+            PassStep::Set => self.set_worked(result.child::<Worked, PurgeError>()?),
+            PassStep::Settle => {
+                let (.., set_id) = self.current.take().ok_or(IoError::Unfinished)?;
+                if let Err(error) = result.child::<(), PurgeError>()? {
+                    warn!(%set_id, %error, "A settled lifecycle row stays until the next pass");
+                }
+                self.next_set()
             }
         }
     }
-    waiting.then_some(LIFECYCLE_POLL)
 }
 
 fn marker(key: &[u8]) -> (String, Key) {
@@ -157,251 +282,87 @@ fn marker(key: &[u8]) -> (String, Key) {
     )
 }
 
-/// Reads the next batch of sets after the last one looked at, so sets that keep waiting never
-/// starve later ones; a short batch makes the next pass start over.
-async fn scan_markers(context: &DriverContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-    let after = MARKER_CURSOR
-        .lock()
-        .map(|cursor| cursor.clone())
-        .unwrap_or(None);
-    let iter = StorageEffect::Iter {
-        key_space: DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
-        prefix: None,
-        start: after.map(|key| IterStart::After(key.into())),
-        limit: SET_BATCH,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let rows: Vec<(Vec<u8>, Vec<u8>)> = (values.into_iter())
-                .map(|(key, value)| (key.to_vec(), value.to_vec()))
-                .collect();
-            let next = (rows.len() == SET_BATCH)
-                .then(|| rows.last().map(|(key, _)| key.clone()))
-                .flatten();
-            if let Ok(mut cursor) = MARKER_CURSOR.lock() {
-                *cursor = next;
-            }
-            Ok(rows)
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {}", other.label())),
-    }
-}
-
 /// Deletes a set's marker row only while it still holds `seen`: a record installed since the
 /// pass read it wrote a newer revision, and its work is looked at again.
-pub(crate) async fn settle_marker(
-    context: &DriverContext,
-    key_space: &str,
-    key: &[u8],
-    seen: &[u8],
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let started = storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await;
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!(
-            "the marker transaction did not start: {}",
-            started.label()
-        ));
-    };
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.to_vec().into(),
-        txn_id: Some(txn_id),
-    };
-    let current = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("the marker was not read: {}", other.label()));
-        }
-    };
-    if current.as_deref() != Some(seen) {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Ok(());
-    }
-    let effects = [
-        StorageEffect::BatchDelete {
-            deletes: vec![(key_space.to_string(), key.to_vec().into())],
-            txn_id: Some(txn_id),
-        },
-        StorageEffect::CommitTransaction { txn_id },
-    ];
-    for effect in effects {
-        if let Event::Storage(StorageEvent::Error { error }) =
-            storage.send_storage_effect(effect).await
-        {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(error.to_string());
-        }
-    }
-    Ok(())
+#[derive(Debug, PartialEq)]
+pub(crate) struct SettleMarkerOperation {
+    key_space: String,
+    key: Vec<u8>,
+    seen: Vec<u8>,
+    deleting: bool,
 }
 
-/// One set's lifecycle work on this node.
-struct SetWork {
+impl SettleMarkerOperation {
+    pub(crate) fn new(key_space: &str, key: Vec<u8>, seen: Vec<u8>) -> Self {
+        Self {
+            key_space: key_space.to_string(),
+            key,
+            seen,
+            deleting: false,
+        }
+    }
+
+    fn row(&self) -> (String, Key) {
+        (self.key_space.clone(), self.key.clone().into())
+    }
+}
+
+impl Operation for SettleMarkerOperation {
+    type Output = ();
+    type Error = PurgeError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, PurgeError> {
+        Ok(Next::Call(IoCall::Read(vec![self.row()])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if value(result)?.as_deref() != Some(self.seen.as_slice()) {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(vec![self.row()])))
+    }
+}
+
+/// What working on one set left: its state, the purge budget, and changed transfer sweeps.
+#[derive(Debug, PartialEq)]
+pub(super) struct Worked {
+    left: Left,
+    budget: usize,
+    sweeps: Vec<(Ulid, Option<Sweep>)>,
+}
+
+/// This node's view of one set it works on.
+#[derive(Clone, Debug, PartialEq)]
+struct SetScope {
     realm_id: RealmId,
     local: NodeId,
     set_id: Ulid,
-}
-
-/// This node's member of a set and its local bucket binding, while the bucket is bound.
-struct Local<'a> {
-    member: &'a DistributionMember,
+    snapshot: DistributionSnapshot,
+    member: DistributionMember,
+    /// The local bucket's binding, while the bucket is this member's.
     binding: Option<DistributionBinding>,
 }
 
-impl SetWork {
-    async fn run(&self, context: &Arc<DriverContext>, budget: &mut usize) -> Result<Left, String> {
-        let Some(view) = read_view(context, self.set_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(Left::Settled);
-        };
-        let snapshot = &view.head.snapshot;
-        let Some(member) = (snapshot.config.members.iter()).find(|m| m.node_id == self.local)
-        else {
-            return Ok(Left::Settled);
-        };
-        let bound = self.binding(context, snapshot).await?;
-        if let Some(left) = bound
-            .as_ref()
-            .filter(|binding| replaced(snapshot, member, binding))
-        {
-            // A replaced member's departure finishes before the new member's work.
-            return self.depart(context, snapshot, left, budget).await;
-        }
-        let binding = bound.filter(|binding| owns(self.set_id, member, binding));
-        let local = Local { member, binding };
-        if snapshot.lifecycle.deletion.is_some() {
-            return self.delete(context, snapshot, &local, budget).await;
-        }
-        let mut left = Left::Settled;
-        if member.state == MemberState::Leaving {
-            left = left.and(self.leave(context, snapshot, &local, budget).await?);
-        }
-        for open in &snapshot.lifecycle.transfers {
-            if open.from == member.member_id {
-                left = left.and(self.hand_over(context, snapshot, &local, open).await?);
-            } else if open.to == member.member_id {
-                left = left.and(self.take_over(context, snapshot, &local, open).await?);
-            }
-        }
-        if !view.conflicted() {
-            left = left.and(self.reclaim(context, snapshot, &local, budget).await?);
-        }
-        Ok(left)
+impl SetScope {
+    fn bucket(&self) -> &str {
+        &self.snapshot.config.bucket
     }
 
-    /// The local bucket's binding to this set.
-    async fn binding(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-    ) -> Result<Option<DistributionBinding>, String> {
-        let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
-        set_binding(self.set_id, drive(bucket, context).await)
-    }
-
-    /// Releases the bucket of a member a join replaced: fences it and clears the set's rows,
-    /// then unbinds it and drops the fence in one transaction.
-    async fn depart(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        binding: &DistributionBinding,
-        budget: &mut usize,
-    ) -> Result<Left, String> {
-        update_fence(context, self.set_id, FenceChange::Close).await?;
-        let clearing = (snapshot.config.bucket.as_str(), true, Some(binding));
-        if self.clear_set(context, clearing, budget).await? == Left::Waiting {
-            return Ok(Left::Waiting);
-        }
-        unbind(context, &snapshot.config.bucket, binding, true).await?;
-        // The new member's work follows in the next pass.
-        Ok(Left::Waiting)
-    }
-
-    /// Fences the whole set, states it as a coordinator, and purges once it is committed.
-    async fn delete(
-        &self,
-        context: &Arc<DriverContext>,
-        snapshot: &DistributionSnapshot,
-        local: &Local<'_>,
-        budget: &mut usize,
-    ) -> Result<Left, String> {
-        let Some(deletion) = snapshot.lifecycle.deletion.as_ref() else {
-            return Ok(Left::Settled);
-        };
-        let identity = deletion.identity(self.set_id);
-        update_fence(context, self.set_id, FenceChange::Delete(identity)).await?;
-        let member_id = local.member.member_id;
-        let coordinates = snapshot
-            .config
-            .ranges
-            .iter()
-            .any(|r| r.coordinator == member_id);
-        if !deletion.committed {
-            if coordinates && !deletion.fenced.contains(&member_id) {
-                let kind = StatementKind::DeleteFenced { deletion: identity };
-                self.state(context, snapshot, local.member, &identity, kind)
-                    .await?;
-            }
-            return Ok(Left::Waiting);
-        }
-        let Some(binding) = local.binding.clone() else {
-            // The member bucket is gone or replaced: nothing of the set is left here.
-            return self
-                .clear_set(context, (&snapshot.config.bucket, true, None), budget)
-                .await;
-        };
-        for range in &snapshot.config.ranges {
-            let target = self.target(snapshot, &binding, range);
-            if purge_range(context, &target, budget).await? == Purged::More {
-                return Ok(Left::Waiting);
-            }
-        }
-        let delete =
-            crate::s3::bucket::delete::DeleteBucketOperation::new(snapshot.config.bucket.clone())
-                .bound_to(binding.clone())
-                .purge_notices(context.node_and_realm());
-        match drive(delete, context.as_ref()).await {
-            Ok(()) | Err(crate::s3::bucket::delete::DeleteBucketError::NotFound) => {
-                self.clear_set(context, (&snapshot.config.bucket, true, None), budget)
-                    .await
-            }
-            Err(error) => {
-                // Versions the inventory did not name block the delete; their walk follows.
-                debug!(set_id = %self.set_id, %error, "The member bucket is not empty yet");
-                if let Some(range) = snapshot.config.ranges.first() {
-                    purge_rest(context, &self.target(snapshot, &binding, range)).await?;
-                }
-                Ok(Left::Waiting)
-            }
-        }
-    }
-
-    fn target(
-        &self,
-        snapshot: &DistributionSnapshot,
-        binding: &DistributionBinding,
-        range: &KeyRange,
-    ) -> PurgeTarget {
+    fn target(&self, binding: &DistributionBinding, range: &KeyRange) -> PurgeTarget {
         PurgeTarget {
             realm_id: self.realm_id,
             node_id: self.local,
-            bucket: snapshot.config.bucket.clone(),
-            group_id: snapshot.config.owner_group,
+            bucket: self.bucket().to_string(),
+            group_id: self.snapshot.config.owner_group,
             binding: binding.clone(),
             range_id: range.range_id,
             lower: range.lower.clone(),
@@ -409,294 +370,1005 @@ impl SetWork {
         }
     }
 
-    /// Deletes what this node keeps of the set besides its bucket: inventory, accounting,
-    /// bootstrap, purge cursors and kept copies, a bounded number of pages per pass.
-    async fn clear_set(
-        &self,
-        context: &DriverContext,
-        (bucket, keep_fence, clearing): (&str, bool, Option<&DistributionBinding>),
-        budget: &mut usize,
-    ) -> Result<Left, String> {
-        let rows = (self.set_id, bucket, clearing);
-        match clear_set_rows(context, rows, keep_fence, budget).await? {
-            Purged::Done => Ok(Left::Settled),
-            Purged::More => Ok(Left::Waiting),
-        }
+    /// Changes the set's fence row; a lost conflict runs it again.
+    fn fence(&self, change: FenceChange) -> IoCall {
+        let set_id = self.set_id;
+        let build = move || UpdateFenceOperation::new(set_id, change.clone());
+        let child = boxed_retry(build, &set_id.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
     }
 
-    /// A leaving member refuses publications, then releases its bucket as an ordinary one.
-    async fn leave(
+    /// Clears what this node keeps of the set besides its bucket, within `pages`.
+    fn clear(
         &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        local: &Local<'_>,
-        budget: &mut usize,
-    ) -> Result<Left, String> {
-        if let Some(binding) = &local.binding {
-            update_fence(context, self.set_id, FenceChange::Close).await?;
-            unbind(context, &snapshot.config.bucket, binding, false).await?;
-        }
-        // The released bucket checks no fence; a later join of this node starts afresh.
-        self.clear_set(context, (&snapshot.config.bucket, false, None), budget)
-            .await
+        keep_fence: bool,
+        clearing: Option<DistributionBinding>,
+        pages: usize,
+    ) -> IoCall {
+        let rows = (self.set_id, self.bucket().to_string(), clearing);
+        IoCall::child(ClearSetOperation::new(rows, keep_fence, pages))
     }
 
-    /// The former coordinator's side: fence the range, let its open uploads complete for a
-    /// bounded grace period, abort the rest, then state the fence.
-    async fn hand_over(
-        &self,
-        context: &Arc<DriverContext>,
-        snapshot: &DistributionSnapshot,
-        local: &Local<'_>,
-        open: &OpenTransfer,
-    ) -> Result<Left, String> {
-        let Some(range) = (snapshot.config.ranges.iter()).find(|r| r.range_id == open.range_id)
-        else {
-            return Ok(Left::Settled);
+    /// Signs a lifecycle statement with this node's key and hands it to the publisher.
+    fn state(&self, subject: &[u8], kind: StatementKind) -> IoCall {
+        let statement =
+            Statement::lifecycle(self.realm_id, self.set_id, &self.member, subject, kind);
+        let claim = StatementClaim {
+            signer: self.local,
+            statement,
         };
+        let ids = Some((self.local, self.realm_id));
+        IoCall::child(StateOperation::new(
+            ids,
+            self.snapshot.root.publisher,
+            claim,
+        ))
+    }
+
+    /// An unreachable publisher keeps the fence; the statement is sent again next pass.
+    fn stated(&self, result: IoResult) -> Result<(), PurgeError> {
+        match result.child::<Stated, IoError>()?? {
+            Stated::Taken => Ok(()),
+            Stated::Unsigned(reason) => Err(PurgeError(reason)),
+            Stated::Refused(refusal) => {
+                let set_id = self.set_id;
+                debug!(%set_id, %refusal, "A lifecycle statement was not taken yet");
+                Ok(())
+            }
+        }
+    }
+}
+
+fn fence_of(result: IoResult) -> Result<LocalFence, PurgeError> {
+    result.child::<LocalFence, FenceError>()?.map_err(failed)
+}
+
+fn cleared(result: IoResult) -> Result<(Left, usize), PurgeError> {
+    let (purged, budget) = result.child::<(Purged, usize), PurgeError>()??;
+    let left = match purged {
+        Purged::Done => Left::Settled,
+        Purged::More => Left::Waiting,
+    };
+    Ok((left, budget))
+}
+
+fn worked(left: Left, budget: usize) -> Next<Worked> {
+    Next::Done(Worked {
+        left,
+        budget,
+        sweeps: Vec::new(),
+    })
+}
+
+type Working = Result<Next<Worked>, PurgeError>;
+
+/// What the pending call of one set's work answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetStep {
+    View,
+    Bucket,
+    Part,
+}
+
+/// One part of a set's work, in the order it runs.
+#[derive(Clone, Debug, PartialEq)]
+enum Part {
+    Leave,
+    HandOver(OpenTransfer),
+    TakeOver(OpenTransfer),
+    Reclaim,
+}
+
+/// One set's lifecycle work on this node.
+#[derive(Debug, PartialEq)]
+struct SetWorkOperation {
+    realm_id: RealmId,
+    local: NodeId,
+    set_id: Ulid,
+    budget: usize,
+    sweeps: BTreeMap<Ulid, Sweep>,
+    step: SetStep,
+    view: Option<DistributionView>,
+    scope: Option<SetScope>,
+    parts: VecDeque<Part>,
+    left: Left,
+    changed: Vec<(Ulid, Option<Sweep>)>,
+}
+
+impl SetWorkOperation {
+    fn new(
+        (realm_id, local): (RealmId, NodeId),
+        set_id: Ulid,
+        budget: usize,
+        sweeps: BTreeMap<Ulid, Sweep>,
+    ) -> Self {
+        Self {
+            realm_id,
+            local,
+            set_id,
+            budget,
+            sweeps,
+            step: SetStep::View,
+            view: None,
+            scope: None,
+            parts: VecDeque::new(),
+            left: Left::Settled,
+            changed: Vec::new(),
+        }
+    }
+
+    fn settled(&self) -> Next<Worked> {
+        worked(Left::Settled, self.budget)
+    }
+
+    fn viewed(&mut self, view: Option<DistributionView>) -> Working {
+        let Some(view) = view else {
+            return Ok(self.settled());
+        };
+        let snapshot = &view.head.snapshot;
+        if !(snapshot.config.members.iter()).any(|m| m.node_id == self.local) {
+            return Ok(self.settled());
+        }
+        let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
+        self.view = Some(view);
+        self.step = SetStep::Bucket;
+        Ok(Next::Call(IoCall::child(bucket)))
+    }
+
+    /// Chooses the work from the record and the local bucket's binding to this set.
+    fn bound(&mut self, bound: Option<DistributionBinding>) -> Working {
+        let view = self.view.as_ref().ok_or(IoError::Unfinished)?;
+        let conflicted = view.conflicted();
+        let snapshot = view.head.snapshot.clone();
+        let member = (snapshot.config.members.iter())
+            .find(|m| m.node_id == self.local)
+            .cloned()
+            .ok_or(IoError::Unfinished)?;
+        let departing = bound.clone().filter(|b| replaced(&snapshot, &member, b));
+        let binding = bound.filter(|binding| owns(self.set_id, &member, binding));
+        let scope = SetScope {
+            realm_id: self.realm_id,
+            local: self.local,
+            set_id: self.set_id,
+            snapshot,
+            member,
+            binding,
+        };
+        self.step = SetStep::Part;
+        if let Some(left) = departing {
+            // A replaced member's departure finishes before the new member's work.
+            let depart = DepartOperation::new(scope, left, self.budget);
+            return Ok(Next::Call(IoCall::child(depart)));
+        }
+        if scope.snapshot.lifecycle.deletion.is_some() {
+            let delete = SetDeleteOperation::new(scope, self.budget);
+            return Ok(Next::Call(IoCall::child(delete)));
+        }
+        if scope.member.state == MemberState::Leaving {
+            self.parts.push_back(Part::Leave);
+        }
+        let member_id = scope.member.member_id;
+        for open in &scope.snapshot.lifecycle.transfers {
+            if open.from == member_id {
+                self.parts.push_back(Part::HandOver(open.clone()));
+            } else if open.to == member_id {
+                self.parts.push_back(Part::TakeOver(open.clone()));
+            }
+        }
+        if !conflicted {
+            self.parts.push_back(Part::Reclaim);
+        }
+        self.scope = Some(scope);
+        self.next_part()
+    }
+
+    fn next_part(&mut self) -> Working {
+        let Some(part) = self.parts.pop_front() else {
+            return Ok(Next::Done(Worked {
+                left: self.left,
+                budget: self.budget,
+                sweeps: std::mem::take(&mut self.changed),
+            }));
+        };
+        let scope = self.scope.clone().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(match part {
+            Part::Leave => IoCall::child(LeaveOperation::new(scope, self.budget)),
+            Part::HandOver(open) => IoCall::child(HandOverOperation::new(scope, open, self.budget)),
+            Part::TakeOver(open) => {
+                let sweep = self.sweeps.get(&open.transfer_id).cloned();
+                IoCall::child(TakeOverOperation::new(scope, open, self.budget, sweep))
+            }
+            Part::Reclaim => IoCall::child(ReclaimOperation::new(scope, self.budget)),
+        }))
+    }
+}
+
+impl Operation for SetWorkOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        let read = ReadViewOperation {
+            set_id: self.set_id,
+        };
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            SetStep::View => {
+                let view = result.child::<Option<DistributionView>, StatusError>()?;
+                self.viewed(view.map_err(failed)?)
+            }
+            SetStep::Bucket => {
+                let info = result.child::<BucketInfo, GetBucketError>()?;
+                let binding = set_binding(self.set_id, info).map_err(PurgeError)?;
+                self.bound(binding)
+            }
+            SetStep::Part => {
+                let done = result.child::<Worked, PurgeError>()??;
+                self.left = self.left.and(done.left);
+                self.budget = done.budget;
+                self.changed.extend(done.sweeps);
+                self.next_part()
+            }
+        }
+    }
+}
+
+/// What the pending call of a departure answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DepartStep {
+    Fence,
+    Clear,
+    Unbind,
+}
+
+/// Releases the bucket of a member a join replaced: fences it and clears the set's rows, then
+/// unbinds it and drops the fence in one transaction.
+#[derive(Debug, PartialEq)]
+struct DepartOperation {
+    scope: SetScope,
+    left: DistributionBinding,
+    budget: usize,
+    step: DepartStep,
+}
+
+impl DepartOperation {
+    fn new(scope: SetScope, left: DistributionBinding, budget: usize) -> Self {
+        Self {
+            scope,
+            left,
+            budget,
+            step: DepartStep::Fence,
+        }
+    }
+}
+
+impl Operation for DepartOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        Ok(Next::Call(self.scope.fence(FenceChange::Close)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            DepartStep::Fence => {
+                fence_of(result)?;
+                self.step = DepartStep::Clear;
+                let clear = self.scope.clear(true, Some(self.left.clone()), self.budget);
+                Ok(Next::Call(clear))
+            }
+            DepartStep::Clear => {
+                let (left, budget) = cleared(result)?;
+                self.budget = budget;
+                if left == Left::Waiting {
+                    return Ok(worked(Left::Waiting, budget));
+                }
+                self.step = DepartStep::Unbind;
+                let unbind = UnbindOperation::new(self.scope.bucket(), self.left.clone(), true);
+                Ok(Next::Call(IoCall::child(unbind)))
+            }
+            // The new member's work follows in the next pass.
+            DepartStep::Unbind => {
+                result.child::<(), PurgeError>()??;
+                Ok(worked(Left::Waiting, self.budget))
+            }
+        }
+    }
+}
+
+/// What the pending call of a set deletion answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteStep {
+    Fence,
+    State,
+    Purge,
+    Bucket,
+    Clear,
+    Rest,
+}
+
+/// Fences the whole set, states it as a coordinator, and purges once it is committed.
+#[derive(Debug, PartialEq)]
+struct SetDeleteOperation {
+    scope: SetScope,
+    budget: usize,
+    step: DeleteStep,
+    next_range: usize,
+}
+
+impl SetDeleteOperation {
+    fn new(scope: SetScope, budget: usize) -> Self {
+        Self {
+            scope,
+            budget,
+            step: DeleteStep::Fence,
+            next_range: 0,
+        }
+    }
+
+    fn clear(&mut self) -> Working {
+        // The member bucket is gone or replaced: nothing of the set is left here.
+        self.step = DeleteStep::Clear;
+        Ok(Next::Call(self.scope.clear(true, None, self.budget)))
+    }
+
+    fn fenced(&mut self) -> Working {
+        let snapshot = &self.scope.snapshot;
+        let deletion = (snapshot.lifecycle.deletion.as_ref()).ok_or(IoError::Unfinished)?;
+        let member_id = self.scope.member.member_id;
+        if deletion.committed {
+            return match self.scope.binding.is_some() {
+                true => self.purge_next(),
+                false => self.clear(),
+            };
+        }
+        let coordinates = (snapshot.config.ranges.iter()).any(|r| r.coordinator == member_id);
+        if !coordinates || deletion.fenced.contains(&member_id) {
+            return Ok(worked(Left::Waiting, self.budget));
+        }
+        let identity = deletion.identity(self.scope.set_id);
+        let kind = StatementKind::DeleteFenced { deletion: identity };
+        self.step = DeleteStep::State;
+        Ok(Next::Call(self.scope.state(&identity, kind)))
+    }
+
+    fn purge_next(&mut self) -> Working {
+        let binding = self.scope.binding.clone().ok_or(IoError::Unfinished)?;
+        let snapshot = &self.scope.snapshot;
+        if let Some(range) = snapshot.config.ranges.get(self.next_range) {
+            let target = self.scope.target(&binding, range);
+            self.next_range += 1;
+            self.step = DeleteStep::Purge;
+            let purge = PurgeRangeOperation::new(target, self.budget);
+            return Ok(Next::Call(IoCall::child(purge)));
+        }
+        let origin = Some((self.scope.local, self.scope.realm_id));
+        let delete = DeleteBucketOperation::new(self.scope.bucket().to_string())
+            .bound_to(binding)
+            .purge_notices(origin);
+        self.step = DeleteStep::Bucket;
+        Ok(Next::Call(IoCall::child(delete)))
+    }
+}
+
+impl Operation for SetDeleteOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        let deletion = self.scope.snapshot.lifecycle.deletion.as_ref();
+        let deletion = deletion.ok_or(IoError::Unfinished)?;
+        let identity = deletion.identity(self.scope.set_id);
+        Ok(Next::Call(self.scope.fence(FenceChange::Delete(identity))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            DeleteStep::Fence => {
+                fence_of(result)?;
+                self.fenced()
+            }
+            DeleteStep::State => {
+                self.scope.stated(result)?;
+                Ok(worked(Left::Waiting, self.budget))
+            }
+            DeleteStep::Purge => {
+                let (left, budget) = cleared(result)?;
+                self.budget = budget;
+                match left {
+                    Left::Waiting => Ok(worked(Left::Waiting, budget)),
+                    Left::Settled => self.purge_next(),
+                }
+            }
+            DeleteStep::Bucket => match result.child::<(), DeleteBucketError>()? {
+                Ok(()) | Err(DeleteBucketError::NotFound) => self.clear(),
+                Err(error) => {
+                    // Versions the inventory did not name block the delete; their walk follows.
+                    let set_id = self.scope.set_id;
+                    debug!(%set_id, %error, "The member bucket is not empty yet");
+                    let binding = self.scope.binding.as_ref().ok_or(IoError::Unfinished)?;
+                    let Some(range) = self.scope.snapshot.config.ranges.first() else {
+                        return Ok(worked(Left::Waiting, self.budget));
+                    };
+                    let rest = PurgeRestOperation::new(self.scope.target(binding, range));
+                    self.step = DeleteStep::Rest;
+                    Ok(Next::Call(IoCall::child(rest)))
+                }
+            },
+            DeleteStep::Clear => {
+                let (left, budget) = cleared(result)?;
+                Ok(worked(left, budget))
+            }
+            DeleteStep::Rest => {
+                result.child::<(), PurgeError>()??;
+                Ok(worked(Left::Waiting, self.budget))
+            }
+        }
+    }
+}
+
+/// What the pending call of a member's leave answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaveStep {
+    Fence,
+    Unbind,
+    Clear,
+}
+
+/// A leaving member refuses publications, then releases its bucket as an ordinary one.
+#[derive(Debug, PartialEq)]
+struct LeaveOperation {
+    scope: SetScope,
+    budget: usize,
+    step: LeaveStep,
+}
+
+impl LeaveOperation {
+    fn new(scope: SetScope, budget: usize) -> Self {
+        Self {
+            scope,
+            budget,
+            step: LeaveStep::Fence,
+        }
+    }
+
+    /// The released bucket checks no fence; a later join of this node starts afresh.
+    fn clear(&mut self) -> Working {
+        self.step = LeaveStep::Clear;
+        Ok(Next::Call(self.scope.clear(false, None, self.budget)))
+    }
+}
+
+impl Operation for LeaveOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        match self.scope.binding {
+            Some(_) => Ok(Next::Call(self.scope.fence(FenceChange::Close))),
+            None => self.clear(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            LeaveStep::Fence => {
+                fence_of(result)?;
+                let binding = self.scope.binding.clone().ok_or(IoError::Unfinished)?;
+                let unbind = UnbindOperation::new(self.scope.bucket(), binding, false);
+                self.step = LeaveStep::Unbind;
+                Ok(Next::Call(IoCall::child(unbind)))
+            }
+            LeaveStep::Unbind => {
+                result.child::<(), PurgeError>()??;
+                self.clear()
+            }
+            LeaveStep::Clear => {
+                let (left, budget) = cleared(result)?;
+                Ok(worked(left, budget))
+            }
+        }
+    }
+}
+
+/// What the pending call of a transfer hand-over answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandStep {
+    FenceRow,
+    Keep,
+    Fence,
+    Uploads,
+    Close,
+    Abort,
+    Owes,
+    Counters,
+    Imports,
+    State,
+}
+
+/// The former coordinator's side: fence the range, let its open uploads complete for a bounded
+/// grace period, abort the rest, then state the fence.
+#[derive(Debug, PartialEq)]
+struct HandOverOperation {
+    scope: SetScope,
+    open: OpenTransfer,
+    budget: usize,
+    range: Option<KeyRange>,
+    step: HandStep,
+    watermark: Vec<u8>,
+}
+
+impl HandOverOperation {
+    fn new(scope: SetScope, open: OpenTransfer, budget: usize) -> Self {
+        let range = (scope.snapshot.config.ranges.iter())
+            .find(|range| range.range_id == open.range_id)
+            .cloned();
+        Self {
+            scope,
+            open,
+            budget,
+            range,
+            step: HandStep::FenceRow,
+            watermark: Vec::new(),
+        }
+    }
+
+    fn waiting(&self) -> Working {
+        Ok(worked(Left::Waiting, self.budget))
+    }
+
+    fn range(&self) -> Result<&KeyRange, IoError> {
+        self.range.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn target(&self) -> Result<Option<PurgeTarget>, IoError> {
+        let range = self.range()?;
+        let binding = self.scope.binding.as_ref();
+        Ok(binding.map(|binding| self.scope.target(binding, range)))
+    }
+
+    /// Fences the range and keeps the byte copies it has now; this node's copy goes only once
+    /// it has them again.
+    fn fence(&mut self) -> Working {
+        let range = self.range()?;
         let fence = RangeFence {
             range_id: range.range_id,
-            transfer_id: open.transfer_id,
+            transfer_id: self.open.transfer_id,
             epoch: range.epoch,
             since_ms: unix_timestamp_millis(),
             uploads_open: true,
         };
-        // Where each open import stands is kept before the fence, for the new coordinator.
-        if self
-            .unfenced(context, range.range_id, open.transfer_id)
-            .await?
-        {
-            keep_resume(context, &snapshot.config.bucket, open.transfer_id).await?;
-        }
-        // The byte copies the range has now; this node's copy goes only once it has them again.
-        let copies = snapshot.byte_holders(range, None).len();
+        let copies = self.scope.snapshot.byte_holders(range, None).len();
         let copies = u32::try_from(copies).unwrap_or(u32::MAX);
-        let change = FenceChange::Range {
-            fence: fence.clone(),
-            copies,
+        let change = FenceChange::Range { fence, copies };
+        self.step = HandStep::Fence;
+        Ok(Next::Call(self.scope.fence(change)))
+    }
+
+    fn fenced(&mut self, fence: LocalFence) -> Working {
+        // Keep the set until the range is reclaimed after the activation.
+        if self.open.fenced.is_some() {
+            return self.waiting();
+        }
+        let Some(target) = self.target()? else {
+            return self.waiting();
         };
-        let fenced = update_fence(context, self.set_id, change).await?;
-        if open.fenced.is_some() {
-            // Keep the set until the range is reclaimed after the activation.
-            return Ok(Left::Waiting);
-        }
-        let Some(binding) = local.binding.clone() else {
-            return Ok(Left::Waiting);
+        let range_id = self.range()?.range_id;
+        let Some(grace) = fence.range(range_id).filter(|fenced| fenced.uploads_open) else {
+            return self.abort(target);
         };
-        let target = self.target(snapshot, &binding, range);
-        if let Some(grace) = fenced.range(range.range_id).filter(|f| f.uploads_open) {
-            let ends = grace.since_ms.saturating_add(UPLOAD_GRACE_MS);
-            if unix_timestamp_millis() < ends && has_uploads(context, &target).await? {
-                return Ok(Left::Waiting);
-            }
-            // Closing conflicts every completion still in flight, so none commits after it.
-            let change = FenceChange::Uploads(range.range_id);
-            update_fence(context, self.set_id, change).await?;
+        let ends = grace.since_ms.saturating_add(UPLOAD_GRACE_MS);
+        if unix_timestamp_millis() < ends {
+            self.step = HandStep::Uploads;
+            let look = RangeUploadsOperation::new(target, false);
+            return Ok(Next::Call(IoCall::child(look)));
         }
-        if abort_range_uploads(context, &target).await? {
-            return Ok(Left::Waiting);
-        }
-        // The new coordinator learns nothing of what this node still owes other members.
-        let owes = OwesFanoutOperation::new(&snapshot.config.bucket, self.set_id, range.clone());
-        if drive(owes, context)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(Left::Waiting);
-        }
-        let Some(counters) = range_counters(context, self.set_id, range.range_id).await? else {
-            return Ok(Left::Waiting);
-        };
-        let watermark =
-            postcard::to_allocvec(&Watermark::of(&counters)).map_err(|error| error.to_string())?;
-        // Imports open at the fence or since go on at the new coordinator; refresh rounds restart.
-        let jobs = fenced_imports(context, &snapshot.config.bucket, open.transfer_id).await?;
+        self.close()
+    }
+
+    /// Closing conflicts every completion still in flight, so none commits after it.
+    fn close(&mut self) -> Working {
+        let change = FenceChange::Uploads(self.range()?.range_id);
+        self.step = HandStep::Close;
+        Ok(Next::Call(self.scope.fence(change)))
+    }
+
+    fn abort(&mut self, target: PurgeTarget) -> Working {
+        self.step = HandStep::Abort;
+        let abort = RangeUploadsOperation::new(target, true);
+        Ok(Next::Call(IoCall::child(abort)))
+    }
+
+    /// The new coordinator learns nothing of what this node still owes other members.
+    fn owes(&mut self) -> Working {
+        let range = self.range()?.clone();
+        let owes = OwesFanoutOperation::new(self.scope.bucket(), self.scope.set_id, range);
+        self.step = HandStep::Owes;
+        Ok(Next::Call(IoCall::child(owes)))
+    }
+
+    /// States the fence with the watermark and the imports that go on at the new coordinator;
+    /// refresh rounds restart.
+    fn state(&mut self, jobs: Vec<JobId>) -> Working {
         let import_cursor = match jobs.is_empty() {
             true => None,
-            false => Some(postcard::to_allocvec(&jobs).map_err(|error| error.to_string())?),
+            false => Some(postcard::to_allocvec(&jobs).map_err(failed)?),
         };
         if import_cursor
             .as_ref()
             .is_some_and(|jobs| jobs.len() > MAX_CURSOR_BYTES)
         {
-            return Ok(Left::Waiting);
+            return self.waiting();
         }
+        let range = self.range()?;
         let kind = StatementKind::TransferFenced {
-            transfer_id: open.transfer_id,
+            transfer_id: self.open.transfer_id,
             range_id: range.range_id,
             epoch: range.epoch,
-            next_epoch: open.epoch,
-            watermark,
+            next_epoch: self.open.epoch,
+            watermark: std::mem::take(&mut self.watermark),
             import_cursor,
             refresh_cursor: None,
             open_uploads: 0,
         };
-        let subject = open.transfer_id.to_bytes();
-        self.state(context, snapshot, local.member, &subject, kind)
-            .await?;
-        Ok(Left::Waiting)
+        let subject = self.open.transfer_id.to_bytes();
+        let state = self.scope.state(&subject, kind);
+        self.step = HandStep::State;
+        Ok(Next::Call(state))
+    }
+}
+
+impl Operation for HandOverOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        if self.range.is_none() {
+            return Ok(worked(Left::Settled, self.budget));
+        }
+        let key = LocalFence::key(self.scope.set_id);
+        let read = ReadRowOperation {
+            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+            key,
+        };
+        Ok(Next::Call(IoCall::child(read)))
     }
 
-    /// Whether this node has not fenced `range_id` for `transfer_id` yet.
-    async fn unfenced(
-        &self,
-        context: &DriverContext,
-        range_id: Ulid,
-        transfer_id: Ulid,
-    ) -> Result<bool, String> {
-        let key = LocalFence::key(self.set_id);
-        let stored = read(context, DISTRIBUTION_FENCE_KEYSPACE, key).await?;
-        let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
-        let fenced = fence.range(range_id);
-        Ok(fenced.is_none_or(|fenced| fenced.transfer_id != transfer_id))
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            HandStep::FenceRow => {
+                let stored = result.child::<Option<Value>, PurgeError>()??;
+                let fence = LocalFence::decode(stored.as_deref()).map_err(failed)?;
+                let fenced = fence.range(self.range()?.range_id);
+                // Where each open import stands is kept before the fence, for the new
+                // coordinator.
+                if fenced.is_none_or(|fenced| fenced.transfer_id != self.open.transfer_id) {
+                    let keep = KeepResumeOperation::new(self.scope.bucket(), self.open.transfer_id);
+                    self.step = HandStep::Keep;
+                    return Ok(Next::Call(IoCall::child(keep)));
+                }
+                self.fence()
+            }
+            HandStep::Keep => {
+                result.child::<(), ImportError>()?.map_err(failed)?;
+                self.fence()
+            }
+            HandStep::Fence => self.fenced(fence_of(result)?),
+            HandStep::Uploads => match result.child::<bool, PurgeError>()?? {
+                true => self.waiting(),
+                false => self.close(),
+            },
+            HandStep::Close => {
+                fence_of(result)?;
+                let target = self.target()?.ok_or(IoError::Unfinished)?;
+                self.abort(target)
+            }
+            HandStep::Abort => match result.child::<bool, PurgeError>()?? {
+                true => self.waiting(),
+                false => self.owes(),
+            },
+            HandStep::Owes => match result.child::<bool, RecordError>()?.map_err(failed)? {
+                true => self.waiting(),
+                false => {
+                    let read =
+                        RangeCountersOperation::new(self.scope.set_id, self.range()?.range_id);
+                    self.step = HandStep::Counters;
+                    Ok(Next::Call(IoCall::child(read)))
+                }
+            },
+            HandStep::Counters => {
+                let Some(counters) = result.child::<Option<RangeCounters>, PurgeError>()?? else {
+                    return self.waiting();
+                };
+                self.watermark =
+                    postcard::to_allocvec(&Watermark::of(&counters)).map_err(failed)?;
+                let imports =
+                    FencedImportsOperation::new(self.scope.bucket(), self.open.transfer_id);
+                self.step = HandStep::Imports;
+                Ok(Next::Call(IoCall::child(imports)))
+            }
+            HandStep::Imports => {
+                let jobs = result.child::<Vec<JobId>, ImportError>()?.map_err(failed)?;
+                self.state(jobs)
+            }
+            HandStep::State => {
+                self.scope.stated(result)?;
+                self.waiting()
+            }
+        }
+    }
+}
+
+/// What the pending call of a transfer take-over answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TakeStep {
+    Counters,
+    Roots,
+    Imports,
+    State,
+}
+
+/// The new coordinator's side: complete once its copy reached the fenced watermark and every
+/// source root it holds references of is checked.
+#[derive(Debug, PartialEq)]
+struct TakeOverOperation {
+    scope: SetScope,
+    open: OpenTransfer,
+    budget: usize,
+    sweep: Option<Sweep>,
+    step: TakeStep,
+    fenced: Option<([u8; 32], Vec<u8>, Option<Vec<u8>>)>,
+    changed: Vec<(Ulid, Option<Sweep>)>,
+}
+
+impl TakeOverOperation {
+    fn new(scope: SetScope, open: OpenTransfer, budget: usize, sweep: Option<Sweep>) -> Self {
+        Self {
+            scope,
+            open,
+            budget,
+            sweep,
+            step: TakeStep::Counters,
+            fenced: None,
+            changed: Vec::new(),
+        }
     }
 
-    /// The new coordinator's side: complete once its copy reached the fenced watermark and
-    /// every source root it holds references of is checked.
-    async fn take_over(
-        &self,
-        context: &Arc<DriverContext>,
-        snapshot: &DistributionSnapshot,
-        local: &Local<'_>,
-        open: &OpenTransfer,
-    ) -> Result<Left, String> {
-        let (Some(fenced), None) = (open.fenced, open.completed) else {
-            return Ok(Left::Waiting);
+    fn waiting(&mut self) -> Working {
+        Ok(Next::Done(Worked {
+            left: Left::Waiting,
+            budget: self.budget,
+            sweeps: std::mem::take(&mut self.changed),
+        }))
+    }
+
+    /// The watermark and the imports the former coordinator's fence statement names.
+    fn fenced_parts(&self) -> Option<([u8; 32], Vec<u8>, Option<Vec<u8>>)> {
+        let (Some(fenced), None) = (self.open.fenced, self.open.completed) else {
+            return None;
         };
-        let fenced_parts = (snapshot.statements.iter())
-            .find(|signed| signed.statement.digest() == fenced)
-            .and_then(|signed| match &signed.statement.kind {
-                StatementKind::TransferFenced {
-                    watermark,
-                    import_cursor,
-                    ..
-                } => Some((watermark.clone(), import_cursor.clone())),
-                _ => None,
-            });
-        let Some((bytes, imports)) = fenced_parts else {
-            return Ok(Left::Waiting);
+        let statements = self.scope.snapshot.statements.iter();
+        let signed = statements
+            .into_iter()
+            .find(|signed| signed.statement.digest() == fenced)?;
+        match &signed.statement.kind {
+            StatementKind::TransferFenced {
+                watermark,
+                import_cursor,
+                ..
+            } => Some((fenced, watermark.clone(), import_cursor.clone())),
+            _ => None,
+        }
+    }
+
+    fn counted(&mut self, counters: Option<RangeCounters>) -> Working {
+        let (_, bytes, _) = self.fenced.as_ref().ok_or(IoError::Unfinished)?;
+        let wanted: Watermark = postcard::from_bytes(bytes).map_err(failed)?;
+        let Some(counters) = counters else {
+            return self.waiting();
         };
-        let wanted: Watermark = postcard::from_bytes(&bytes).map_err(|error| error.to_string())?;
-        let Some(counters) = range_counters(context, self.set_id, open.range_id).await? else {
-            return Ok(Left::Waiting);
-        };
-        if !wanted.reached_by(&counters) || local.binding.is_none() {
-            return Ok(Left::Waiting);
+        if !wanted.reached_by(&counters) || self.scope.binding.is_none() {
+            return self.waiting();
         }
         // A holder's version at the new epoch or above would outrank the new coordinator.
-        if !wanted.below(open.epoch) || !Watermark::of(&counters).below(open.epoch) {
-            warn!(set_id = %self.set_id, transfer_id = %open.transfer_id, "A transfer epoch is not above its range's versions");
-            return Ok(Left::Waiting);
+        let epoch = self.open.epoch;
+        if !wanted.below(epoch) || !Watermark::of(&counters).below(epoch) {
+            let (set_id, transfer_id) = (self.scope.set_id, self.open.transfer_id);
+            warn!(%set_id, %transfer_id, "A transfer epoch is not above the range's versions");
+            return self.waiting();
         }
         // Every source root of what it applied must be readable here before it takes over.
-        let group_id = snapshot.config.owner_group;
-        let sweep = (SWEEPS.lock().ok()).and_then(|sweeps| sweeps.get(&open.transfer_id).cloned());
-        let check = RootsCheckOperation::new(self.set_id, group_id, sweep);
-        let outcome = drive(check, context).await.map_err(|e| e.to_string())?;
-        if let Ok(mut sweeps) = SWEEPS.lock() {
-            match &outcome {
-                RootsOutcome::Continue(sweep) => sweeps.insert(open.transfer_id, sweep.clone()),
-                RootsOutcome::Done(_) => sweeps.remove(&open.transfer_id),
-            };
+        let group_id = self.scope.snapshot.config.owner_group;
+        let check = RootsCheckOperation::new(self.scope.set_id, group_id, self.sweep.take());
+        self.step = TakeStep::Roots;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn checked(&mut self, outcome: RootsOutcome) -> Working {
+        let transfer_id = self.open.transfer_id;
+        match &outcome {
+            RootsOutcome::Continue(sweep) => self.changed.push((transfer_id, Some(sweep.clone()))),
+            RootsOutcome::Done(_) => self.changed.push((transfer_id, None)),
         }
         if outcome != RootsOutcome::Done(true) {
-            return Ok(Left::Waiting);
+            return self.waiting();
         }
+        let (_, _, imports) = self.fenced.as_ref().ok_or(IoError::Unfinished)?;
+        let Some(imports) = imports else {
+            return self.complete();
+        };
         // The former coordinator's open imports are fetched now, while it still holds them,
         // and run once this node coordinates.
-        if let Some(imports) = imports {
-            let jobs: Vec<JobId> = postcard::from_bytes(&imports).map_err(|e| e.to_string())?;
-            let range = (self.set_id, open.range_id, open.transfer_id);
-            let from = (snapshot.config.members.iter()).find(|m| m.member_id == open.from);
-            let Some(from) = from.map(|member| member.node_id) else {
-                return Ok(Left::Waiting);
-            };
-            if !fetch_imports(context, range, from, &jobs).await? {
-                return Ok(Left::Waiting);
-            }
-        }
-        let kind = StatementKind::TransferComplete {
-            transfer_id: open.transfer_id,
-            range_id: open.range_id,
-            fenced,
-            watermark: bytes,
+        let jobs: Vec<JobId> = postcard::from_bytes(imports).map_err(failed)?;
+        let members = self.scope.snapshot.config.members.iter();
+        let from = members.into_iter().find(|m| m.member_id == self.open.from);
+        let Some(from) = from.map(|member| member.node_id) else {
+            return self.waiting();
         };
-        let subject = open.transfer_id.to_bytes();
-        self.state(context, snapshot, local.member, &subject, kind)
-            .await?;
-        Ok(Left::Waiting)
+        let range = (self.scope.set_id, self.open.range_id, transfer_id);
+        let fetch = FetchImportsOperation::new(range, self.scope.local, from, jobs);
+        self.step = TakeStep::Imports;
+        Ok(Next::Call(IoCall::child(fetch)))
     }
 
-    /// Purges a range this node fenced for a transfer, or each range split from it, once the
-    /// record no longer lists it as a byte holder, the range is ready and has at least as many
-    /// ready byte copies without this node as it had at the fence.
-    async fn reclaim(
-        &self,
-        context: &Arc<DriverContext>,
-        snapshot: &DistributionSnapshot,
-        local: &Local<'_>,
-        budget: &mut usize,
-    ) -> Result<Left, String> {
-        let (Some(binding), member) = (local.binding.clone(), local.member) else {
-            return Ok(Left::Settled);
+    fn complete(&mut self) -> Working {
+        let (fenced, watermark, _) = self.fenced.take().ok_or(IoError::Unfinished)?;
+        let kind = StatementKind::TransferComplete {
+            transfer_id: self.open.transfer_id,
+            range_id: self.open.range_id,
+            fenced,
+            watermark,
         };
-        let stored = read(
-            context,
-            DISTRIBUTION_FENCE_KEYSPACE,
-            LocalFence::key(self.set_id),
-        )
-        .await?;
-        let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
-        // Imports kept for a transfer away are dropped once it is no longer open.
-        for fenced in &fence.ranges {
-            let transfers = &snapshot.lifecycle.transfers;
-            if !transfers
-                .iter()
-                .any(|t| t.transfer_id == fenced.transfer_id)
-            {
-                drop_resume(context, fenced.transfer_id).await?;
+        let subject = self.open.transfer_id.to_bytes();
+        self.step = TakeStep::State;
+        Ok(Next::Call(self.scope.state(&subject, kind)))
+    }
+}
+
+impl Operation for TakeOverOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        self.fenced = self.fenced_parts();
+        if self.fenced.is_none() {
+            return self.waiting();
+        }
+        let read = RangeCountersOperation::new(self.scope.set_id, self.open.range_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            TakeStep::Counters => {
+                self.counted(result.child::<Option<RangeCounters>, PurgeError>()??)
+            }
+            TakeStep::Roots => {
+                let outcome = result.child::<RootsOutcome, RootsError>()?;
+                self.checked(outcome.map_err(failed)?)
+            }
+            TakeStep::Imports => match result.child::<bool, ImportError>()?.map_err(failed)? {
+                true => self.complete(),
+                false => self.waiting(),
+            },
+            TakeStep::State => {
+                self.scope.stated(result)?;
+                self.waiting()
             }
         }
-        let mut left = Left::Settled;
-        for (range, ready) in given_away(snapshot, &fence, member) {
+    }
+}
+
+/// What the pending call of a reclaim answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReclaimStep {
+    Fence,
+    Drop,
+    Purge,
+}
+
+/// Purges a range this node fenced for a transfer, or each range split from it, once the record
+/// no longer lists it as a byte holder, the range is ready and has at least as many ready byte
+/// copies without this node as it had at the fence.
+#[derive(Debug, PartialEq)]
+struct ReclaimOperation {
+    scope: SetScope,
+    budget: usize,
+    step: ReclaimStep,
+    closed: VecDeque<Ulid>,
+    ranges: VecDeque<(KeyRange, bool)>,
+    left: Left,
+}
+
+impl ReclaimOperation {
+    fn new(scope: SetScope, budget: usize) -> Self {
+        Self {
+            scope,
+            budget,
+            step: ReclaimStep::Fence,
+            closed: VecDeque::new(),
+            ranges: VecDeque::new(),
+            left: Left::Settled,
+        }
+    }
+
+    /// Imports kept for a transfer away are dropped once it is no longer open.
+    fn next_drop(&mut self) -> Working {
+        match self.closed.pop_front() {
+            Some(transfer_id) => {
+                self.step = ReclaimStep::Drop;
+                let drop = DropResumeOperation::new(transfer_id);
+                Ok(Next::Call(IoCall::child(drop)))
+            }
+            None => self.next_range(),
+        }
+    }
+
+    fn next_range(&mut self) -> Working {
+        let binding = self.scope.binding.clone().ok_or(IoError::Unfinished)?;
+        while let Some((range, ready)) = self.ranges.pop_front() {
             if !ready {
-                left = Left::Waiting;
+                self.left = Left::Waiting;
                 continue;
             }
-            let target = self.target(snapshot, &binding, range);
-            if purge_range(context, &target, budget).await? == Purged::More {
-                left = Left::Waiting;
-            }
+            let target = self.scope.target(&binding, &range);
+            self.step = ReclaimStep::Purge;
+            let purge = PurgeRangeOperation::new(target, self.budget);
+            return Ok(Next::Call(IoCall::child(purge)));
         }
-        Ok(left)
+        Ok(worked(self.left, self.budget))
+    }
+}
+
+impl Operation for ReclaimOperation {
+    type Output = Worked;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Working {
+        if self.scope.binding.is_none() {
+            return Ok(worked(Left::Settled, self.budget));
+        }
+        let read = ReadRowOperation {
+            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+            key: LocalFence::key(self.scope.set_id),
+        };
+        Ok(Next::Call(IoCall::child(read)))
     }
 
-    /// Signs a lifecycle statement with this node's key and hands it to the publisher.
-    async fn state(
-        &self,
-        context: &Arc<DriverContext>,
-        snapshot: &DistributionSnapshot,
-        member: &DistributionMember,
-        subject: &[u8],
-        kind: StatementKind,
-    ) -> Result<(), String> {
-        let statement = Statement::lifecycle(self.realm_id, self.set_id, member, subject, kind);
-        let claim = StatementClaim {
-            signer: self.local,
-            statement,
-        };
-        let signed = match context.net_handle.as_ref().map_or_else(
-            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
-            |net| net.sign_statement(claim),
-        ) {
-            StatementSignEvent::Signed(signed) => *signed,
-            StatementSignEvent::Unavailable(reason) => return Err(reason),
-        };
-        if let Err(refusal) = submit(context, snapshot.root.publisher, self.local, signed).await {
-            // An unreachable publisher keeps the fence; the statement is sent again next pass.
-            debug!(set_id = %self.set_id, %refusal, "A lifecycle statement was not taken yet");
+    fn next(&mut self, result: IoResult) -> Working {
+        match self.step {
+            ReclaimStep::Fence => {
+                let stored = result.child::<Option<Value>, PurgeError>()??;
+                let fence = LocalFence::decode(stored.as_deref()).map_err(failed)?;
+                let snapshot = &self.scope.snapshot;
+                let transfers = &snapshot.lifecycle.transfers;
+                self.closed = (fence.ranges.iter())
+                    .map(|fenced| fenced.transfer_id)
+                    .filter(|id| !transfers.iter().any(|t| t.transfer_id == *id))
+                    .collect();
+                self.ranges = given_away(snapshot, &fence, &self.scope.member)
+                    .into_iter()
+                    .map(|(range, ready)| (range.clone(), ready))
+                    .collect();
+                self.next_drop()
+            }
+            ReclaimStep::Drop => {
+                result.child::<(), PurgeError>()??;
+                self.next_drop()
+            }
+            ReclaimStep::Purge => {
+                let (left, budget) = cleared(result)?;
+                self.left = self.left.and(left);
+                self.budget = budget;
+                self.next_range()
+            }
         }
-        Ok(())
     }
 }
 
@@ -768,124 +1440,146 @@ fn set_binding(
 }
 
 /// The active counters this node keeps for a range, while its account is not split or rebuilt.
-pub(super) async fn range_counters(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub(super) struct RangeCountersOperation {
     set_id: Ulid,
     range_id: Ulid,
-) -> Result<Option<RangeCounters>, String> {
-    let Some(account) = read(
-        context,
-        RANGE_ACCOUNT_KEYSPACE,
-        account_key(set_id, range_id),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let account = RangeAccount::from_bytes(&account).map_err(|error| error.to_string())?;
-    let (Charge::Active(generation), None) = (account.charge, account.rebuild) else {
-        return Ok(None);
-    };
-    let row = generation_key(set_id, range_id, generation);
-    let counters = read(context, RANGE_COUNTER_KEYSPACE, row).await?;
-    (counters.map(|value| RangeCounters::from_bytes(&value)))
-        .transpose()
-        .map(|counters| Some(counters.unwrap_or_default()))
-        .map_err(|error| error.to_string())
+    reading_counters: bool,
 }
 
-/// Changes the set's fence row; see [`UpdateFenceOperation`].
-async fn update_fence(
-    context: &DriverContext,
-    set_id: Ulid,
-    change: FenceChange,
-) -> Result<LocalFence, String> {
-    let build = || UpdateFenceOperation::new(set_id, change.clone());
-    let fence = drive_retry(build, context, &set_id.to_bytes()).await;
-    fence.map_err(|error| error.to_string())
+impl RangeCountersOperation {
+    pub(super) fn new(set_id: Ulid, range_id: Ulid) -> Self {
+        Self {
+            set_id,
+            range_id,
+            reading_counters: false,
+        }
+    }
+}
+
+impl Operation for RangeCountersOperation {
+    type Output = Option<RangeCounters>;
+    type Error = PurgeError;
+
+    fn first(&mut self) -> Result<Next<Option<RangeCounters>>, PurgeError> {
+        let key = account_key(self.set_id, self.range_id);
+        Ok(Next::Call(read_row(RANGE_ACCOUNT_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<RangeCounters>>, PurgeError> {
+        let stored = value(result)?;
+        if self.reading_counters {
+            let counters = stored.map(|value| RangeCounters::from_bytes(&value));
+            let counters = counters.transpose().map_err(failed)?;
+            return Ok(Next::Done(Some(counters.unwrap_or_default())));
+        }
+        let Some(account) = stored else {
+            return Ok(Next::Done(None));
+        };
+        let account = RangeAccount::from_bytes(&account).map_err(failed)?;
+        let (Charge::Active(generation), None) = (account.charge, account.rebuild) else {
+            return Ok(Next::Done(None));
+        };
+        self.reading_counters = true;
+        let row = generation_key(self.set_id, self.range_id, generation);
+        Ok(Next::Call(read_row(RANGE_COUNTER_KEYSPACE, row)))
+    }
 }
 
 /// Releases the member bucket as an ordinary bucket, only while it carries `binding`; with
 /// `drop_fence` the set's fence row goes in the same transaction.
-async fn unbind(
-    context: &DriverContext,
-    bucket: &str,
-    binding: &DistributionBinding,
+#[derive(Debug, PartialEq)]
+struct UnbindOperation {
+    bucket: String,
+    binding: DistributionBinding,
     drop_fence: bool,
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let started = storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await;
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("the release did not start: {}", started.label()));
-    };
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let read = StorageEffect::Read {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: Some(txn_id),
-    };
-    let abort = StorageEffect::AbortTransaction { txn_id };
-    let info = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
+    writes: usize,
+}
+
+impl UnbindOperation {
+    fn new(bucket: &str, binding: DistributionBinding, drop_fence: bool) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            binding,
+            drop_fence,
+            writes: 0,
         }
-        other => {
-            storage.send_storage_effect(abort).await;
-            return Err(format!("the bucket was not read: {}", other.label()));
-        }
-    };
-    let same = |info: &BucketInfo| {
+    }
+
+    fn key(&self) -> Key {
+        self.bucket.as_bytes().to_vec().into()
+    }
+
+    /// Whether the stored bucket still carries this binding.
+    fn same(&self, info: &BucketInfo) -> bool {
+        let wanted = &self.binding;
         info.distribution.as_ref().is_some_and(|bound| {
             (bound.set_id, bound.member_id, bound.incarnation)
-                == (binding.set_id, binding.member_id, binding.incarnation)
+                == (wanted.set_id, wanted.member_id, wanted.incarnation)
         })
-    };
-    let Some(mut info) = info.filter(same) else {
-        storage.send_storage_effect(abort).await;
-        return Ok(());
-    };
-    info.distribution = None;
-    let value = info.to_bytes().map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        key,
-        value: value.into(),
-        txn_id: Some(txn_id),
-    };
-    storage.send_storage_effect(write).await;
-    // The released bucket is ordinary now: its group's published replica share must go.
-    let markers = StorageEffect::BatchWrite {
-        writes: dirty_rows([info.group_id], Ulid::generate()),
-        txn_id: Some(txn_id),
-    };
-    storage.send_storage_effect(markers).await;
-    if drop_fence {
-        let delete = StorageEffect::Delete {
-            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-            key: LocalFence::key(binding.set_id).into(),
-            txn_id: Some(txn_id),
-        };
-        storage.send_storage_effect(delete).await;
     }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            // Scheduling the publish is best effort; the committed markers wait for it.
-            let _ = drive(MarkDirtyOperation::wake(), context).await;
-            Ok(())
+
+    /// The bucket without its binding; its group's published replica share must go too.
+    fn release(&mut self, mut info: BucketInfo) -> Result<Next<()>, PurgeError> {
+        info.distribution = None;
+        let bucket = info.to_bytes().map_err(failed)?;
+        let mut writes = vec![(S3_BUCKET_KEYSPACE.to_string(), self.key(), bucket.into())];
+        writes.extend(dirty_rows([info.group_id], Ulid::generate()));
+        self.writes = 1;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for UnbindOperation {
+    type Output = ();
+    type Error = PurgeError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, PurgeError> {
+        let row = (S3_BUCKET_KEYSPACE.to_string(), self.key());
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
+        // Scheduling the publish is best effort; the committed markers wait for it.
+        let wake = || Next::Then {
+            output: (),
+            calls: vec![IoCall::child(MarkDirtyOperation::wake())],
+        };
+        match self.writes {
+            0 => {
+                let stored = value(result)?;
+                let info = stored.and_then(|value| BucketInfo::from_bytes(&value).ok());
+                match info.filter(|info| self.same(info)) {
+                    Some(info) => self.release(info),
+                    None => Ok(Next::Done(())),
+                }
+            }
+            1 if self.drop_fence => {
+                result.done()?;
+                self.writes = 2;
+                let key = LocalFence::key(self.binding.set_id).into();
+                let row = (DISTRIBUTION_FENCE_KEYSPACE.to_string(), key);
+                Ok(Next::Call(IoCall::Delete(vec![row])))
+            }
+            _ => {
+                result.done()?;
+                Ok(wake())
+            }
         }
-        other => Err(format!("the bucket was not released: {}", other.label())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use std::sync::Arc;
 
     #[test]
     fn unadmitted_bucket_deleted() {
@@ -944,7 +1638,8 @@ mod tests {
         };
         handle.send_storage_effect(write).await;
 
-        unbind(&context, "spire", &binding, false).await.unwrap();
+        let unbind = UnbindOperation::new("spire", binding.clone(), false);
+        drive(unbind, &context).await.unwrap();
 
         let stored = get(&handle, S3_BUCKET_KEYSPACE, b"spire".to_vec()).await;
         assert!(
@@ -1052,12 +1747,10 @@ mod tests {
             handle.send_storage_effect(write).await;
         }
         let context = Arc::new(context(&handle));
-        let work = SetWork {
-            realm_id: realm(),
-            local: secret(2).public(),
-            set_id,
-        };
-        assert_eq!(work.run(&context, &mut 64).await, Ok(Left::Waiting));
+        let ids = (realm(), secret(2).public());
+        let work = SetWorkOperation::new(ids, set_id, 64, BTreeMap::new());
+        let worked = drive(work, &context).await.unwrap();
+        assert_eq!(worked.left, Left::Waiting);
         let stored = get(&handle, S3_BUCKET_KEYSPACE, b"spire".to_vec())
             .await
             .unwrap();
@@ -1075,7 +1768,7 @@ mod tests {
     #[tokio::test]
     async fn drops_settled_imports() {
         // A former coordinator drops the imports it kept for a transfer no longer open only.
-        use crate::distribution::imports::keep_resume;
+        use crate::distribution::imports::KeepResumeOperation;
         use crate::distribution::test_record::store_record;
         use crate::distribution::test_record::{binding, member, realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
@@ -1143,14 +1836,13 @@ mod tests {
         }
         let context = Arc::new(context(&handle));
         for transfer_id in [settled, open_id] {
-            keep_resume(&context, "spire", transfer_id).await.unwrap();
+            let keep = KeepResumeOperation::new("spire", transfer_id);
+            drive(keep, &context).await.unwrap();
         }
-        let work = SetWork {
-            realm_id: realm(),
-            local: secret(1).public(),
-            set_id,
-        };
-        assert_eq!(work.run(&context, &mut 64).await, Ok(Left::Waiting));
+        let ids = (realm(), secret(1).public());
+        let work = SetWorkOperation::new(ids, set_id, 64, BTreeMap::new());
+        let worked = drive(work, &context).await.unwrap();
+        assert_eq!(worked.left, Left::Waiting);
         let jobs = |id: Ulid| [b"import_jobs/".as_slice(), &id.to_bytes()].concat();
         let kept = get(&handle, NODE_STATE_KEYSPACE, jobs(settled)).await;
         assert_eq!(kept, None, "a transfer no longer open keeps no imports");
@@ -1162,7 +1854,7 @@ mod tests {
     async fn settling_keeps_newer() {
         // A marker rewritten by a newer record after the pass read it stays.
         let (_dir, storage_handle) = crate::distribution::test_store::open();
-        let context = DriverContext {
+        let context = crate::driver::DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
@@ -1181,14 +1873,18 @@ mod tests {
             txn_id: None,
         };
         context.storage_handle.send_storage_effect(put(8)).await;
-        let seen = 7u64.to_be_bytes();
-        settle_marker(&context, space, &key, &seen).await.unwrap();
-        let kept = read(&context, space, key.to_vec()).await.unwrap();
+        let settle = |seen: u64| {
+            SettleMarkerOperation::new(space, key.to_vec(), seen.to_be_bytes().to_vec())
+        };
+        let read = || ReadRowOperation {
+            key_space: space.to_string(),
+            key: key.to_vec(),
+        };
+        drive(settle(7), &context).await.unwrap();
+        let kept = drive(read(), &context).await.unwrap();
         assert!(kept.is_some(), "a newer marker stays");
-        settle_marker(&context, space, &key, &8u64.to_be_bytes())
-            .await
-            .unwrap();
-        assert_eq!(read(&context, space, key.to_vec()).await.unwrap(), None);
+        drive(settle(8), &context).await.unwrap();
+        assert_eq!(drive(read(), &context).await.unwrap(), None);
     }
 
     #[test]

@@ -290,8 +290,8 @@ fn lost_outcome_counts() {
 fn unresolved_restart_notified() {
     use crate::s3::restart_notice::RestartNoticeOperation;
     use aruna_core::calls::{IoCall, Next};
-    use aruna_core::operation::Operation;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::execution::notification::NotificationOutboxRecord;
 
     for action in [AuditAction::Unlock, AuditAction::Extend] {

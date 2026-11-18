@@ -1947,7 +1947,7 @@ async fn join_authority_replication() {
         )
         .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &requested, None)
+        check_group_authority(&storage, &requested, None)
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -1973,7 +1973,7 @@ async fn join_authority_replication() {
         },
     );
     assert!(matches!(
-        validate_group_authority(&storage, &denied, Some(&reducer))
+        check_group_authority(&storage, &denied, Some(&reducer))
             .await
             .unwrap(),
         AdminEventValidation::Rejected(_)
@@ -1999,7 +1999,7 @@ async fn join_authority_replication() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &approved, Some(&previous))
+        check_group_authority(&storage, &approved, Some(&previous))
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -2116,7 +2116,7 @@ async fn policies_authority_gate() {
         .await
         .expect("group auth doc writes");
 
-        let validation = validate_group_authority(&storage, &event, None)
+        let validation = check_group_authority(&storage, &event, None)
             .await
             .expect("validation runs without panic");
         assert_eq!(

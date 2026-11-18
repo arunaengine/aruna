@@ -737,6 +737,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::SubOperation(_)
         | Effect::Group(_)
         | Effect::Delay(_)
+        | Effect::Job(_)
         | Effect::Search()
         | Effect::Stream() => None,
     }
@@ -1150,6 +1151,7 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
+            let _hold = take_hold(context, operation.hold_scope()).await;
             let mut run = SubRun(operation.as_mut(), None);
             let mut state = drive_effects(
                 &mut run,
@@ -1197,7 +1199,22 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+        HoldScope::DocumentWrite(document_id) => {
+            Some(context.graph_handle.as_ref()?.hold_document(document_id).await)
+        }
+        scope => Some(local_hold(scope).lock_owned().await),
     }
+}
+
+/// The lock of a scope no backend owns; it lives as long as the process.
+fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Holds = std::collections::HashMap<HoldScope, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static HOLDS: std::sync::LazyLock<std::sync::Mutex<Holds>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut holds = HOLDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    holds.entry(scope).or_default().clone()
 }
 
 /// Drives an operation of either kind under one wall-clock deadline. Cleanup after expiry is

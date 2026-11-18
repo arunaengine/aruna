@@ -13,8 +13,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::email::check_smtp;
-use aruna_operations::notifications::email::refresh_mail;
+use aruna_operations::notifications::email::{RefreshMailOperation, check_smtp};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };
@@ -306,7 +305,10 @@ async fn change_profile(
     )
     .await
     .map_err(map_email_error)?;
-    refresh_mail(&state.get_ctx(), state.get_realm_id()).await;
+    let refresh = RefreshMailOperation::new(state.get_realm_id());
+    if let Err(error) = drive(refresh, &state.get_ctx()).await {
+        tracing::warn!(%error, "Mail settings refresh stopped after a profile change");
+    }
     Ok(stored)
 }
 

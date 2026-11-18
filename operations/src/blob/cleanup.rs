@@ -769,7 +769,6 @@ async fn archive_owned(context: &DriverContext, location: &BackendLocation) -> O
 #[cfg(test)]
 mod tests {
     use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
-    use crate::blob::cleanup_rows::{MAX_CLEANUP_RETRIES, PendingCleanup};
     use crate::driver::DriverContext;
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
@@ -828,61 +827,6 @@ mod tests {
         }
         .to_bytes()
         .unwrap()
-    }
-
-    #[test]
-    fn retains_refused_row() {
-        // A temporary storage rejection must not discard the only location.
-        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
-        let error = aruna_core::errors::StorageError::QueueFull;
-        let mut pending = PendingCleanup::default();
-
-        let first = pending.queue(work).unwrap();
-        assert_eq!(pending.retry(&error), Some(first));
-        let first = pending.retry(&error).unwrap();
-        assert_eq!(pending.retry(&error), Some(first));
-
-        let mut pending = PendingCleanup::default();
-        assert!(
-            pending
-                .queue(BlobCleanupWork::from_bytes(&delete_work()).unwrap())
-                .is_some()
-        );
-        pending.accepted();
-        assert!(pending.retry(&error).is_none());
-    }
-
-    #[test]
-    fn bounds_retry_attempts() {
-        // Endless rejection must surrender the row so the request can finish and
-        // release its blob reservation.
-        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
-        let error = aruna_core::errors::StorageError::QueueFull;
-        let mut pending = PendingCleanup::default();
-        assert!(pending.queue(work).is_some());
-
-        for _ in 0..MAX_CLEANUP_RETRIES {
-            assert!(pending.retry(&error).is_some());
-        }
-
-        assert!(pending.retry(&error).is_none());
-        assert!(pending.retry(&error).is_none());
-    }
-
-    #[test]
-    fn closed_retry_stops() {
-        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
-        let mut pending = PendingCleanup::default();
-        assert!(pending.queue(work).is_some());
-
-        assert_eq!(
-            pending.retry(&aruna_core::errors::StorageError::ChannelClosed),
-            None
-        );
-        assert_eq!(
-            pending.retry(&aruna_core::errors::StorageError::Timeout),
-            None
-        );
     }
 
     fn group_delete_work() -> Vec<u8> {

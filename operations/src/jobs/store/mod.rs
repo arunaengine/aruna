@@ -195,33 +195,6 @@ pub async fn delete_finished_run(
     .await
 }
 
-/// Same transaction as [`mutate_job`], with `guard` re-checking the mutated
-/// record against the attempt control read in that transaction; a rejection
-/// aborts before any write, so the invariant is atomic with the state change.
-pub async fn mutate_job_guarded<F, G>(
-    context: &DriverContext,
-    job_id: JobId,
-    mut mutate: F,
-    mut guard: G,
-) -> Result<JobRecord, JobMutationError>
-where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
-    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
-{
-    let mut attempt = 0;
-    loop {
-        let result = drive(
-            MutateJobOperation::new(job_id, &mut mutate, Some(&mut guard)),
-            context,
-        )
-        .await;
-        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
-            Some(result) => return result,
-            None => attempt += 1,
-        }
-    }
-}
-
 /// Read and decode a state row, keeping a missing row distinct from a malformed one.
 pub(super) async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
     context: &DriverContext,

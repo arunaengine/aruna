@@ -5,7 +5,11 @@
 use std::sync::Arc;
 
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
-use aruna_operations::notifications::webhook::{self, WebhookError, read_webhook, remove_webhook};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::drive;
+use aruna_operations::notifications::webhook::{
+    ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookError,
+};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -77,7 +81,7 @@ pub async fn get_webhook(
     UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<WebhookResponse>> {
     settings_node(&state, &auth).await?;
-    let subscription = read_webhook(&state.get_ctx(), auth.user_id)
+    let subscription = drive(ReadWebhookOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_error)?;
     let subscription = subscription.ok_or(ServerError::NotFound)?;
@@ -140,10 +144,13 @@ pub async fn set_webhook(
     Json(request): Json<WebhookRequest>,
 ) -> ServerResult<Json<WebhookResponse>> {
     settings_node(&state, &auth).await?;
-    let ctx = state.get_ctx();
-    let outcome = webhook::set_webhook(&ctx, state.get_node_id(), auth.user_id, request.url)
-        .await
-        .map_err(map_error)?;
+    let set = SetWebhookOperation::new(
+        auth.user_id,
+        state.get_node_id(),
+        request.url,
+        unix_timestamp_millis(),
+    );
+    let outcome = drive(set, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(response(outcome.subscription, Some(outcome.secret))))
 }
 
@@ -178,9 +185,9 @@ pub async fn delete_webhook(
     UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     settings_node(&state, &auth).await?;
-    remove_webhook(&state.get_ctx(), state.get_node_id(), auth.user_id)
-        .await
-        .map_err(map_error)?;
+    let remove =
+        RemoveWebhookOperation::new(auth.user_id, state.get_node_id(), unix_timestamp_millis());
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

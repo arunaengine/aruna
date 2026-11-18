@@ -736,23 +736,6 @@ impl Operation for RepairAccount {
     }
 }
 
-/// An account, read on its own.
-#[derive(Debug, PartialEq)]
-pub(crate) struct ReadUser(pub UserId);
-
-impl Operation for ReadUser {
-    type Output = Option<User>;
-    type Error = AccountError;
-
-    fn first(&mut self) -> Result<Next<Option<User>>, AccountError> {
-        Ok(Next::Call(read_user_call(self.0)))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<Option<User>>, AccountError> {
-        Ok(Next::Done(read_user_result(result)?))
-    }
-}
-
 /// A group's authorization document, read on its own.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadGroupAuth(pub GroupId);

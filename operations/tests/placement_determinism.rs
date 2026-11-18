@@ -25,13 +25,15 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
+use aruna_operations::testing::sync_topics;
 use ulid::Ulid;
 
 use crate::convergence;
@@ -135,14 +137,11 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
         s3: Some("https://s3.node-a.example.test".to_string()),
     };
 
-    seed_info_document(
-        publisher.context.as_ref(),
-        publisher_id,
-        realm_id,
-        urls.clone(),
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+    let facts = NodeFacts::gather(publisher.context.as_ref());
+    let seed = SeedInfoOperation::new(realm_id, publisher_id, urls.clone(), facts, false);
+    drive(seed, publisher.context.as_ref())
+        .await
+        .map_err(std::io::Error::other)?;
     drive(
         ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -487,21 +486,19 @@ async fn install_realm_config(
     // before the fixture starts publishing or changing placement.
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::driver::drive(
+                aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    realm_id,
+                ),
                 &node.context,
-                node.net.node_id(),
-                realm_id,
             )
-            .await;
+            .await
+            .expect("shard topics restore");
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {
@@ -559,19 +556,8 @@ async fn seed_config_topic(
         }
     }
 
-    match nodes[0]
-        .net
-        .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentEffect::SyncDocuments {
-                topics: vec![topic],
-                peers: Vec::new(),
-            },
-        )))
-        .await
-    {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        other => Err(format!("unexpected realm config seed sync event: {other:?}").into()),
-    }
+    sync_topics(nodes[0].context.as_ref(), vec![topic], Vec::new()).await?;
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

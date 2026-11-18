@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use super::submission_rules::{input_reference, source_error};
 use crate::distribution::guard::GuardError;
-use crate::distribution::read_route::ReadCoordinatorOperation;
+use crate::distribution::routing::read_coordinator;
 use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
 use crate::jobs::submit::SubmitJobError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -427,7 +427,7 @@ impl Operation for RangeHolderOperation {
                     return self.finish();
                 };
                 let (_, key, _) = source_parts(self.input()?);
-                let route = ReadCoordinatorOperation::new(binding, key.to_string());
+                let route = read_coordinator(&binding, key);
                 self.step = HolderStep::Coordinator;
                 Ok(Next::Call(IoCall::child(route)))
             }

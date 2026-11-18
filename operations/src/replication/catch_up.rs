@@ -5,7 +5,7 @@
 
 use aruna_core::handle::Handle;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -29,8 +29,8 @@ use super::bootstrap::{
 };
 use super::members::ReadRecordOperation;
 use super::queue::schedule_blob_drain;
-use crate::distribution::create::submit;
-use crate::distribution::lifecycle::settle_marker;
+use crate::distribution::lifecycle::SettleMarkerOperation;
+use crate::distribution::submit::SubmitOperation;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
 
@@ -171,7 +171,13 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
             set_id,
         };
         match walk.run(context, &mut budget).await {
-            Ok(Outcome::Settled) => settle_marker(context, CATCH_UP_KEYSPACE, &key, &seen).await?,
+            Ok(Outcome::Settled) => {
+                let settle =
+                    SettleMarkerOperation::new(CATCH_UP_KEYSPACE, key.to_vec(), seen.to_vec());
+                drive(settle, context)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(Outcome::Waiting) => waiting = true,
             Ok(Outcome::Stated) => {}
             Err(error) => {
@@ -425,8 +431,8 @@ impl SetWalk {
             StatementSignEvent::Unavailable(reason) => return Err(reason),
         };
         let publisher = snapshot.root.publisher;
-        let shared = Arc::new(context.clone());
-        match submit(&shared, publisher, self.local, signed).await {
+        let submit = SubmitOperation::new(context.node_and_realm(), publisher, signed);
+        match drive(submit, context).await {
             Ok(()) => Ok(Outcome::Stated),
             Err(refusal) => {
                 debug!(set_id = %self.set_id, %member_id, %refusal, "Bootstrap statement not taken yet");

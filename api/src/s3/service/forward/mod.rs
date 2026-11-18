@@ -12,10 +12,12 @@ pub(super) mod reads;
 mod uploads;
 mod versions;
 
+use aruna_operations::driver::drive;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -29,7 +31,6 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::{route_read, route_upload, route_write};
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::distribution::status::node_reach;
-use aruna_operations::node::node_info::node_urls;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -430,8 +431,8 @@ impl ArunaS3Service {
             return Ok(None);
         }
         let route = match upload {
-            true => route_upload(self.state.as_ref(), binding, key).await,
-            false => route_write(self.state.as_ref(), binding, key).await,
+            true => drive(route_upload(binding, key), self.state.as_ref()).await,
+            false => drive(route_write(binding, key), self.state.as_ref()).await,
         };
         match route {
             Ok(WriteRoute::Local { .. }) => Ok(None),
@@ -458,7 +459,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(false);
         };
-        match route_read(self.state.as_ref(), binding, key, listing).await {
+        match drive(route_read(binding, key, listing), self.state.as_ref()).await {
             Ok(ReadRoute::Local { catching_up }) if listing && catching_up => {
                 Err(catching_up_error(binding.set_id))
             }
@@ -486,7 +487,10 @@ impl ArunaS3Service {
         forward: &Forward,
         request: ForwardRequest,
     ) -> S3Result<reqwest::Response> {
-        let urls = node_urls(self.state.as_ref(), forward.node_id).await;
+        let urls = drive(NodeUrlsOperation::new(forward.node_id), self.state.as_ref())
+            .await
+            .ok()
+            .flatten();
         let Some(base) = urls.and_then(|urls| urls.s3) else {
             return Err(unreachable_error(
                 forward,
@@ -633,7 +637,7 @@ impl ArunaS3Service {
         };
         let missing = || s3_error!(NoSuchUpload, "The specified upload does not exist.");
         let tag = UploadTag::parse(value).ok_or_else(missing)?;
-        match upload_route(self.state.as_ref(), binding, key, &tag).await {
+        match drive(upload_route(binding, key, &tag), self.state.as_ref()).await {
             Ok(()) => Ok(tag.upload_id),
             Err(GuardError::Route(RouteError::StaleRange(_))) => Err(s3_error!(
                 NoSuchUpload,
@@ -653,7 +657,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(upload_id.to_string());
         };
-        upload_tag(self.state.as_ref(), binding, key, upload_id)
+        drive(upload_tag(binding, key, upload_id), self.state.as_ref())
             .await
             .map(|tag| tag.encode())
             .map_err(|error| guard_error(&error))
@@ -668,7 +672,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(std::collections::HashMap::new());
         };
-        let tags = upload_tags(self.state.as_ref(), binding, uploads)
+        let tags = drive(upload_tags(binding, uploads), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))?;
         Ok(tags

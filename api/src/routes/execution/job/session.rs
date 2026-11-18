@@ -6,6 +6,8 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use crate::job_service::read_session_reason;
+use crate::job_service::submit_copy_job;
 use aruna_core::compute::session::{
     EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
     SessionEvent, SessionRequest, SessionSnapshot, StagedInput,
@@ -18,8 +20,6 @@ use aruna_core::structs::storage::blob::key_content_type;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::jobs::service::read_session_reason;
-use aruna_operations::jobs::service::submit_copy_job;
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };

@@ -2,18 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::ops::Range;
+use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
 use crate::UserId;
+use crate::events::Event;
+use crate::id::NodeId;
 use crate::metadata::AuthToken;
+use crate::operation::SubOperation;
+use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::{
     InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
     JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
 };
+use crate::structs::execution::table::GzipCursor;
+use crate::structs::identity::auth::PathRestriction;
+use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
@@ -444,4 +455,133 @@ pub struct InputResolveRequest {
     /// Unix seconds the grants end at, bounded by this node's job retention.
     pub expires_at: u64,
     pub inputs: Vec<InputSelection>,
+}
+
+/// What a running job asks its host, the runtime that holds its stop signals, progress and
+/// range turns; never persisted.
+#[derive(Debug, PartialEq)]
+pub enum JobEffect {
+    /// Answers `JobEvent::Stops` with whether the job should stop now.
+    Stops,
+    /// Records progress; answered by `JobEvent::Reported`.
+    Report(JobReport),
+    /// Waits this long, or until the job stops; answered by `JobEvent::Paused`.
+    Pause(Duration),
+    /// Runs `child` while this node's turns of `turns` are held, taken in key order; answered by
+    /// `JobEvent::Finished` with the child's event.
+    InTurns {
+        turns: BTreeSet<(Ulid, Ulid)>,
+        child: Box<dyn SubOperation>,
+    },
+    /// Runs `child` until it ends or the job stops; `JobEvent::Finished` or `JobEvent::Stopped`.
+    UntilStop(Box<dyn SubOperation>),
+    /// Reads a stream to its end; answered by `JobEvent::Collected`.
+    Collect(ByteStream),
+    /// Feeds `work` until its cursor holds the next chunk; answered by `JobEvent::GzipFilled`.
+    FillGzip(GzipWork),
+    /// Opens an object as the job's submitter; answered by `JobEvent::Object`.
+    ReadObject(Box<ObjectRead>),
+}
+
+/// A stream of bytes read from a source or an object.
+pub type ByteStream = BackendStream<Result<Bytes, StreamError>>;
+
+/// Whether a job was cancelled by its user or its node is shutting down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobStops {
+    pub cancelled: bool,
+    pub shutdown: bool,
+}
+
+impl JobStops {
+    pub fn any(self) -> bool {
+        self.cancelled || self.shutdown
+    }
+}
+
+/// A change to a job's visible progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobReport {
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub advance: u64,
+    /// A durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub checkpoint: bool,
+}
+
+/// An open gzip table stream with the cursor that decodes it.
+pub struct GzipWork {
+    pub stream: ByteStream,
+    pub cursor: GzipCursor,
+}
+
+impl fmt::Debug for GzipWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GzipWork").finish_non_exhaustive()
+    }
+}
+
+/// Equal only for the same stream: a decoder has no comparable state.
+impl PartialEq for GzipWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream == other.stream
+    }
+}
+
+/// Why filling a gzip chunk stopped: the transport failed or the bytes are no valid gzip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GzipBroken {
+    Stream(String),
+    Gzip(String),
+}
+
+/// One object read, as the job's submitter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectRead {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<Ulid>,
+    /// The first and last byte to read.
+    pub range: Option<(u64, u64)>,
+    pub group_id: GroupId,
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub restrictions: Option<Vec<PathRestriction>>,
+}
+
+/// An opened object: its bytes, the version they belong to and the object's whole size.
+#[derive(Debug, PartialEq)]
+pub struct ObjectBody {
+    pub stream: ByteStream,
+    pub version_id: Option<Ulid>,
+    pub size: u64,
+}
+
+/// Why an object could not be opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectReadFailure {
+    /// The key, the version or the object itself is gone.
+    Gone(String),
+    /// The range starts at or after the object's end.
+    InvalidRange,
+    Failed(String),
+}
+
+/// The answer to a [`JobEffect`].
+#[derive(Debug, PartialEq)]
+pub enum JobEvent {
+    Stops(JobStops),
+    Reported,
+    Paused {
+        stopped: bool,
+    },
+    Finished(Box<Event>),
+    Stopped,
+    Collected(Result<Vec<u8>, String>),
+    GzipFilled {
+        work: GzipWork,
+        result: Result<(), GzipBroken>,
+    },
+    Object(Result<ObjectBody, ObjectReadFailure>),
 }

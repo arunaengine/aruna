@@ -37,9 +37,10 @@ use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::auth::error::AuthorizeError;
-use aruna_operations::auth::request_authorization::authorize;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::drive;
 use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -1430,13 +1431,15 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
             Duration::from_millis(200),
             || async {
                 matches!(
-                    authorize(
-                        &harness.joiner.context,
-                        realm_id,
-                        &creator,
-                        &write_path,
-                        &Permission::WRITE,
-                        PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
+                    drive(
+                        AuthorizeOperation::new(
+                            realm_id,
+                            &creator,
+                            &write_path,
+                            &Permission::WRITE,
+                            PolicyRequestExtras::operation("s3.DeleteBucketReplication")
+                        ),
+                        &harness.joiner.context
                     )
                     .await,
                     Err(AuthorizeError::PermissionDenied)

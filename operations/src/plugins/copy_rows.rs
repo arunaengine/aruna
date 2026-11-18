@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 
 use super::artifacts::ArtifactError;
+use super::copies::{Assembled, MemoryPermit, reserve};
 use super::rows::{Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
@@ -441,7 +442,7 @@ enum StorePhase {
 /// Writes this node's whole copy and syncs before anyone is told. Progress is kept with every
 /// chunk, so an interrupted write is counted and swept like an unfinished copy from a peer.
 #[derive(Debug, PartialEq)]
-pub(crate) struct StoreCopy<'a> {
+pub struct StoreCopy<'a> {
     kept: BTreeSet<String>,
     digest: String,
     bytes: &'a [u8],
@@ -499,6 +500,10 @@ impl<'a> StoreCopy<'a> {
 impl Operation for StoreCopy<'_> {
     type Output = ();
     type Error = ArtifactError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginCopies)
+    }
 
     fn first(&mut self) -> Result<Next<()>, ArtifactError> {
         Ok(Next::Call(read_state(&self.digest)))
@@ -776,6 +781,10 @@ impl Operation for SweepCopies {
     type Output = usize;
     type Error = ArtifactError;
 
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginCopies)
+    }
+
     fn first(&mut self) -> Result<Next<usize>, ArtifactError> {
         match &self.phase {
             SweepPhase::ScanningDone(scan) => Ok(Next::Call(scan.ask())),
@@ -808,6 +817,121 @@ impl Operation for SweepCopies {
             SweepPhase::Deleting => {
                 done(result)?;
                 Ok(self.delete_next())
+            }
+        }
+    }
+}
+
+/// This node's complete copy within the memory budget, or `None` without one.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReadLocal {
+    digest: String,
+    memory: Option<HeldMemory>,
+}
+
+/// Memory reserved for what an operation assembles; two reservations count as equal.
+struct HeldMemory(MemoryPermit);
+
+impl std::fmt::Debug for HeldMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldMemory({} MiB)", self.0.num_permits())
+    }
+}
+
+impl PartialEq for HeldMemory {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+fn held_memory(total: u64) -> Result<HeldMemory, ArtifactError> {
+    reserve(total as usize)
+        .map(HeldMemory)
+        .ok_or(ArtifactError::Busy)
+}
+
+impl ReadLocal {
+    pub(crate) fn new(digest: &str) -> Self {
+        Self {
+            digest: digest.to_string(),
+            memory: None,
+        }
+    }
+}
+
+impl Operation for ReadLocal {
+    type Output = Option<Assembled>;
+    type Error = ArtifactError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, ArtifactError> {
+        Ok(Next::Call(IoCall::child(CopyTotal::new(&self.digest))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ArtifactError> {
+        if let Some(HeldMemory(memory)) = self.memory.take() {
+            let bytes = result.child::<Vec<u8>, ArtifactError>()??;
+            return Ok(Next::Done(Some(Assembled::new(bytes, memory))));
+        }
+        let Some(total) = result.child::<Option<u64>, ArtifactError>()?? else {
+            return Ok(Next::Done(None));
+        };
+        self.memory = Some(held_memory(total)?);
+        Ok(Next::Call(IoCall::child(ReadCopy::new(
+            &self.digest,
+            total,
+        ))))
+    }
+}
+
+/// Keeps one chunk of a copy another management node sends. Once every chunk is here and the
+/// whole artifact checks out, the copy is done; `true` means it is done and synced now.
+#[derive(Debug, PartialEq)]
+pub(crate) struct KeepChunk {
+    store: Option<StoreChunk>,
+    digest: String,
+    total: u64,
+    now_ms: u64,
+    /// Held while the whole copy is read and checked.
+    memory: Option<HeldMemory>,
+}
+
+impl KeepChunk {
+    pub(crate) fn new(config: &RealmConfigDocument, chunk: Chunk, now_ms: u64) -> Self {
+        Self {
+            digest: chunk.digest.clone(),
+            total: chunk.total,
+            now_ms,
+            store: Some(StoreChunk::new(config, chunk, now_ms)),
+            memory: None,
+        }
+    }
+}
+
+impl Operation for KeepChunk {
+    type Output = bool;
+    type Error = ArtifactError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginCopies)
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, ArtifactError> {
+        let store = self.store.take().ok_or_else(|| storage("kept twice"))?;
+        Ok(Next::Call(IoCall::child(store)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArtifactError> {
+        if self.memory.is_some() {
+            result.child::<(), ArtifactError>()??;
+            return Ok(Next::Done(true));
+        }
+        match result.child::<ChunkStored, ArtifactError>()?? {
+            ChunkStored::Held => Ok(Next::Done(false)),
+            ChunkStored::Confirmed => Ok(Next::Done(true)),
+            ChunkStored::AllHere => {
+                self.memory = Some(held_memory(self.total)?);
+                let complete = CompleteCopy::new(self.digest.clone(), self.total, self.now_ms);
+                Ok(Next::Call(IoCall::child(complete)))
             }
         }
     }

@@ -14,11 +14,11 @@ use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::node::restore_plan::RESTORE_TOPIC_COUNT;
-use aruna_operations::node::startup::restore_shard_subscriptions;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
+use aruna_operations::shard::restore::RestoreTopicsOperation;
+use aruna_operations::shard::restore_plan::RESTORE_TOPIC_COUNT;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use ulid::Ulid;
@@ -97,7 +97,8 @@ async fn prepare_restart_state(
 
 async fn assert_restore_bound(node: &TestNode, realm_id: RealmId, created: &[(GroupId, Ulid)]) {
     // The startup restore touches O(held shards) topics, not O(documents).
-    let summary = restore_shard_subscriptions(&node.context, node.net.node_id(), realm_id).await;
+    let restore = RestoreTopicsOperation::new(node.net.node_id(), realm_id);
+    let summary = drive(restore, &node.context).await.expect("restore runs");
     println!(
         "restore summary: held_shards={} shard_topics={} shared_topics={} total={}",
         summary.held_shards,
@@ -371,7 +372,7 @@ fn offline_scale_bound() -> Result<(), BoxError> {
 }
 
 async fn offline_bound_body() -> Result<(), BoxError> {
-    use aruna_operations::node::recovery::{RecoveryError, RecoveryOutcome};
+    use aruna_operations::shard::recovery::{RecoveryError, RecoveryOutcome};
     use aruna_operations::tasks::incoming::OutboxDrainer;
 
     assert_eq!(INCIDENT_LIMIT, 8_192);
@@ -413,7 +414,7 @@ fn offline_recovery_converges() -> Result<(), BoxError> {
 }
 
 async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(), BoxError> {
-    use aruna_operations::node::recovery::{RecoveryError, RecoveryOutcome};
+    use aruna_operations::shard::recovery::{RecoveryError, RecoveryOutcome};
     use aruna_operations::tasks::incoming::OutboxDrainer;
 
     let realm_id = RealmId([92u8; 32]);
@@ -432,26 +433,27 @@ fn spawn_recovery(
     node: &TestNode,
     realm_id: RealmId,
 ) -> (
-    aruna_operations::node::recovery::RecoveryStatus,
+    aruna_operations::shard::recovery::RecoveryStatus,
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    use aruna_operations::node::recovery::RecoveryStatus;
-    use aruna_operations::node::startup::{RecoveryConfig, run_recovery};
+    use aruna_operations::node::recovery_run::{RecoveryConfig, RecoveryOperation};
+    use aruna_operations::shard::recovery::{RecoveryStatus, RecoveryStop};
     use tokio_util::sync::CancellationToken;
 
     let status = RecoveryStatus::new();
     let cancelled = CancellationToken::new();
-    let driver = tokio::spawn(run_recovery(
-        node.context.clone(),
-        RecoveryConfig {
-            realm_id,
-            node_id: node.net.node_id(),
-            publish_full_usage: false,
-        },
-        status.clone(),
-        cancelled.clone(),
-    ));
+    let config = RecoveryConfig {
+        realm_id,
+        node_id: node.net.node_id(),
+        publish_full_usage: false,
+    };
+    let stop = RecoveryStop::new(cancelled.clone());
+    let recovery = RecoveryOperation::new(&node.context, config, status.clone(), stop);
+    let context = node.context.clone();
+    let driver = tokio::spawn(async move {
+        drive(recovery, &context).await.expect("recovery runs");
+    });
     (status, cancelled, driver)
 }
 
@@ -532,11 +534,11 @@ async fn assert_drain_bound(
 async fn finish_outage(
     outage: OutageFixture,
     drainer: &aruna_operations::tasks::incoming::OutboxDrainer,
-    status: &aruna_operations::node::recovery::RecoveryStatus,
+    status: &aruna_operations::shard::recovery::RecoveryStatus,
     cancelled: tokio_util::sync::CancellationToken,
     driver: tokio::task::JoinHandle<()>,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::recovery::{RecoveryOutcome, RecoveryState};
+    use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState};
 
     let realm_id = outage.config.realm_id;
     let nodes = restore_peers(
@@ -555,18 +557,27 @@ async fn finish_outage(
     );
     // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
-        aruna_operations::node::startup::restore_shard_subscriptions(
+        aruna_operations::driver::drive(
+            aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                peer.net.node_id(),
+                realm_id,
+            ),
             &peer.context,
-            peer.net.node_id(),
-            realm_id,
         )
-        .await;
-        aruna_operations::placement::process_placements::process_shard_placements(
+        .await
+        .expect("shard topics restore");
+        aruna_operations::driver::drive(
+            aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
+                realm_id,
+                peer.net.node_id(),
+                true,
+            ),
             &peer.context,
-            realm_id,
-            peer.net.node_id(),
         )
-        .await;
+        .await
+        .unwrap_or_else(|_| {
+            aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+        });
     }
 
     let expected_event = Ulid::from_parts(3, INCIDENT_METADATA_RECORDS as u128);
@@ -968,9 +979,9 @@ async fn write_registry(
 }
 
 async fn wait_degraded(
-    status: &aruna_operations::node::recovery::RecoveryStatus,
+    status: &aruna_operations::shard::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::recovery::{RecoveryOutcome, RecoveryState};
+    use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState};
 
     wait_for_convergence("recovery did not report degraded", || async {
         let snapshot = status.snapshot();
@@ -1133,9 +1144,9 @@ async fn wait_registry(
 }
 
 async fn wait_recovery(
-    status: &aruna_operations::node::recovery::RecoveryStatus,
+    status: &aruna_operations::shard::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::recovery::RecoveryState;
+    use aruna_operations::shard::recovery::RecoveryState;
 
     wait_for_convergence("recovery did not converge", || async {
         Ok::<usize, BoxError>(usize::from(
@@ -1173,7 +1184,7 @@ async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
     let mut keys = Vec::new();
     let mut start: Option<Vec<u8>> = None;
     loop {
-        let batch = aruna_operations::sync::document_outbox::read_outbox_records(
+        let batch = aruna_operations::testing::read_outbox_records(
             &node.context.storage_handle,
             &[],
             start.take(),

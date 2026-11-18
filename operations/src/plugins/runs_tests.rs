@@ -5,10 +5,10 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use crate::plugin_host::worker::prune_runs;
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
-use crate::plugins::worker::prune_runs;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};

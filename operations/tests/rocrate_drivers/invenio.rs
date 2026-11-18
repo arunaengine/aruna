@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+#[path = "invenio_driven.rs"]
+mod driven;
 #[path = "invenio_export.rs"]
 mod export;
 #[path = "invenio_import.rs"]

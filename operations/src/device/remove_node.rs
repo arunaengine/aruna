@@ -6,11 +6,11 @@
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect, abort_effects};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -18,12 +18,9 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
-use tracing::warn;
 
 use crate::realm::ensure_config::overlay_reducer_state;
 use crate::realm::mutate_placement::is_management;
@@ -49,18 +46,17 @@ pub struct RemoveNodeConfig {
     pub scope: DeviceEvictionScope,
 }
 
+/// Removes the device from the realm config in one transaction; the outbox drain is woken after
+/// the commit, and the durable outbox row stays retryable if that wake fails.
 #[derive(Debug, PartialEq)]
 pub struct RemoveNodeOperation {
     config: RemoveNodeConfig,
-    txn_id: Option<TxnId>,
     state: RemoveNodeState,
-    output: Option<Result<RealmConfigDocument, RemoveNodeError>>,
+    document: Option<RealmConfigDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum RemoveNodeState {
-    Init,
-    StartTransaction,
     ReadCurrent,
     /// Checks that the node publishes no distributed bucket.
     ReadCutoffs {
@@ -71,27 +67,6 @@ enum RemoveNodeState {
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
     DeleteAdminConflicts,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
-}
-
-impl RemoveNodeState {
-    fn name(&self) -> &'static str {
-        match self {
-            RemoveNodeState::Init => "init",
-            RemoveNodeState::StartTransaction => "start transaction",
-            RemoveNodeState::ReadCurrent => "read current",
-            RemoveNodeState::ReadCutoffs { .. } => "read cutoffs",
-            RemoveNodeState::WriteDocumentState { .. } => "write document state",
-            RemoveNodeState::DeleteAdminConflicts => "delete admin conflicts",
-            RemoveNodeState::CommitTransaction => "commit transaction",
-            RemoveNodeState::ScheduleSyncDrain => "schedule sync drain",
-            RemoveNodeState::Finish => "finish",
-            RemoveNodeState::Error => "error",
-        }
-    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -114,25 +89,22 @@ pub enum RemoveNodeError {
     DeviceNotFound { node_id: NodeId },
     #[error("this node is not a realm management node")]
     NotManagementNode,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
+}
+
+impl From<IoError> for RemoveNodeError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
 }
 
 impl RemoveNodeOperation {
     pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            state: RemoveNodeState::Init,
-            output: None,
+            state: RemoveNodeState::ReadCurrent,
+            document: None,
         }
     }
 
@@ -148,38 +120,48 @@ impl RemoveNodeOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = RemoveNodeState::ReadCurrent;
+    fn read_current(&self) -> IoCall {
         let document = self.document_ref();
         let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
-                    MembershipFence::key(self.config.actor.realm_id)
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                MembershipFence::key(self.config.actor.realm_id),
+            ),
+        ])
     }
 
-    fn emit_removal_writes(
+    fn read_cutoffs(&mut self, result: IoResult) -> Result<IoCall, RemoveNodeError> {
+        let [document_value, reducer_state_value, membership] = values::<3>(result)?;
+        let membership = MembershipFence::from_value(membership.as_deref())?;
+        if !membership.pending.is_empty() {
+            return Err(RemoveNodeError::DeletionPending);
+        }
+        self.state = RemoveNodeState::ReadCutoffs {
+            document_value,
+            reducer_state_value,
+        };
+        Ok(IoCall::Page {
+            space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+            prefix: self.config.node_id.as_bytes().to_vec().into(),
+            after: None,
+            limit: 1,
+        })
+    }
+
+    fn removal_writes(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, RemoveNodeError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(RemoveNodeError::MissingTransaction);
-        };
+    ) -> Result<IoCall, RemoveNodeError> {
         let Some(document_value) = document_value else {
             return Err(RemoveNodeError::ConfigMissing);
         };
@@ -260,191 +242,61 @@ impl RemoveNodeOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document));
+        self.document = Some(document);
         self.state = RemoveNodeState::WriteDocumentState {
             stale_conflict_deletes,
         };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        Ok(IoCall::Write(writes))
     }
 
-    fn emit_commit_transaction(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RemoveNodeError::MissingTransaction);
-        };
-        self.state = RemoveNodeState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: RemoveNodeError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RemoveNodeState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: &str,
-        expected: &'static str,
-        got: &'static str,
-    ) -> Effects {
-        self.fail(RemoveNodeError::UnexpectedEvent {
-            state: state.to_string(),
-            expected,
-            got,
+    /// Commits the removal, then wakes the outbox drain.
+    fn finish(&mut self) -> Result<Next<RealmConfigDocument>, RemoveNodeError> {
+        let output = self.document.take().ok_or(RemoveNodeError::NotFinished)?;
+        Ok(Next::Then {
+            output,
+            calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
         })
     }
 }
 
-impl EffectOperation for RemoveNodeOperation {
+impl Operation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
     type Error = RemoveNodeError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RemoveNodeState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<RealmConfigDocument>, RemoveNodeError> {
+        Ok(Next::Call(self.read_current()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let name = self.state.name();
-        match std::mem::replace(&mut self.state, RemoveNodeState::Error) {
-            RemoveNodeState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "transaction start result", other.label()),
-            },
-            RemoveNodeState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [
-                        (_, document_value),
-                        (_, reducer_state_value),
-                        (_, membership),
-                    ] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            name,
-                            "storage batch read result with realm config and reducer state",
-                            "a batch of another length",
-                        );
-                    };
-                    let membership = match MembershipFence::from_value(membership.as_deref()) {
-                        Ok(fence) => fence,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    if !membership.pending.is_empty() {
-                        return self.fail(RemoveNodeError::DeletionPending);
-                    }
-                    self.state = RemoveNodeState::ReadCutoffs {
-                        document_value: document_value.clone(),
-                        reducer_state_value: reducer_state_value.clone(),
-                    };
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
-                        prefix: Some(self.config.node_id.as_bytes().to_vec().into()),
-                        start: None,
-                        limit: 1,
-                        txn_id: self.txn_id,
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "storage batch read result", other.label()),
-            },
+    fn next(&mut self, result: IoResult) -> Result<Next<RealmConfigDocument>, RemoveNodeError> {
+        match std::mem::replace(&mut self.state, RemoveNodeState::DeleteAdminConflicts) {
+            RemoveNodeState::ReadCurrent => Ok(Next::Call(self.read_cutoffs(result)?)),
             RemoveNodeState::ReadCutoffs {
                 document_value,
                 reducer_state_value,
-            } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    // A cached head is no final cutoff, so a publisher stays until failover.
-                    if !values.is_empty() {
-                        return self.fail(RemoveNodeError::PublisherRemoval);
-                    }
-                    match self.emit_removal_writes(document_value, reducer_state_value) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
+            } => {
+                let (rows, _) = result.page()?;
+                // A cached head is no final cutoff, so a publisher stays until failover.
+                if !rows.is_empty() {
+                    return Err(RemoveNodeError::PublisherRemoval);
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "publisher index rows", other.label()),
-            },
+                let writes = self.removal_writes(document_value, reducer_state_value)?;
+                Ok(Next::Call(writes))
+            }
             RemoveNodeState::WriteDocumentState {
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(RemoveNodeError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = RemoveNodeState::DeleteAdminConflicts;
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
-                    }
-                    self.emit_commit_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "storage batch write result", other.label()),
-            },
-            RemoveNodeState::DeleteAdminConflicts => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "storage batch delete result", other.label()),
-            },
-            RemoveNodeState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = RemoveNodeState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event(name, "transaction commit result", other.label()),
-            },
-            RemoveNodeState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = RemoveNodeState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule device removal outbox drain; durable outbox remains retryable");
-                    self.state = RemoveNodeState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected_event(
-                    name,
-                    "document sync outbox drain timer schedule",
-                    other.label(),
-                ),
-            },
-            state @ (RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init) => {
-                self.state = state;
-                smallvec![]
+            } => {
+                done(result)?;
+                Ok(Next::Call(IoCall::Delete(stale_conflict_deletes)))
+            }
+            RemoveNodeState::DeleteAdminConflicts => {
+                done(result)?;
+                self.finish()
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RemoveNodeState::Finish | RemoveNodeState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RemoveNodeError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -455,7 +307,8 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use ulid::Ulid;
 
@@ -503,6 +356,79 @@ mod tests {
             node_id: node(2),
             scope,
         }
+    }
+
+    fn at_removal(document: &RealmConfigDocument, actor: &Actor) -> RemoveNodeOperation {
+        let mut operation = RemoveNodeOperation::new(removal(actor, DeviceEvictionScope::Owner));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert_eq!(operation.first(), Ok(Next::Call(operation.read_current())));
+        let stored = Some(document.to_bytes(actor).unwrap().into());
+        let current = IoResult::Values(vec![stored, None, None]);
+        assert!(matches!(
+            operation.next(current),
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
+        ));
+        operation
+    }
+
+    fn no_publisher() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
+
+    // The removal writes its rows in the transaction and wakes the drain after the commit.
+    #[test]
+    fn removal_wakes_drain() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let actor = actor(realm_id);
+        let document = realm_with_device(realm_id, &actor, actor.user_id);
+        let mut operation = at_removal(&document, &actor);
+        assert!(matches!(
+            operation.next(no_publisher()),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(Vec::new())))
+        );
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("expected the document and the drain wake");
+        };
+        assert_eq!(output.nodes.len(), 1);
+        let [IoCall::Effect(wake)] = calls.as_slice() else {
+            panic!("expected one wake, got {calls:?}");
+        };
+        assert!(matches!(**wake, Effect::Task(_)));
+    }
+
+    // A pending group deletion, a publisher and a missing config all refuse the removal.
+    #[test]
+    fn refusals_stop_removal() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let actor = actor(realm_id);
+        let document = realm_with_device(realm_id, &actor, actor.user_id);
+        let mut operation = at_removal(&document, &actor);
+        let row = (Key::from(vec![1]), Value::from(vec![2]));
+        let publisher = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        assert_eq!(
+            operation.next(publisher),
+            Err(RemoveNodeError::PublisherRemoval)
+        );
+
+        let mut operation = RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner));
+        operation.first().unwrap();
+        operation
+            .next(IoResult::Values(vec![None, None, None]))
+            .unwrap();
+        assert_eq!(
+            operation.next(no_publisher()),
+            Err(RemoveNodeError::ConfigMissing)
+        );
     }
 
     #[tokio::test]

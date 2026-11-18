@@ -7,16 +7,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use aruna_core::calls::IoError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobResultPayload,
 };
+use aruna_core::time::unix_timestamp_millis;
 use futures_util::future::BoxFuture;
 use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::notifications::email_job::EmailJobOperation;
+use crate::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
+use crate::notifications::webhook_job::WebhookJobOperation;
 
 /// In-memory progress with a persisted snapshot taken on flush and lease renew.
 #[derive(Clone)]
@@ -221,18 +226,24 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             let result = Box::pin(crate::driver::drive(cleanup, &ctx.driver)).await;
             crate::jobs::workflow::cleanup::cleanup_outcome(result)
         }
-        JobPayload::Staging(spec) => {
-            Box::pin(crate::jobs::staging::run_staging_job(ctx, spec)).await
-        }
+        JobPayload::Staging(spec) => Box::pin(crate::jobs::host::run_staging_job(ctx, spec)).await,
         JobPayload::ExportRoCrate(spec) => {
             Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await
         }
         JobPayload::ImportRoCrate(spec) => {
             Box::pin(crate::jobs::import::run_rocrate_import(ctx, spec)).await
         }
-        JobPayload::Harvest(spec) => {
-            Box::pin(crate::jobs::harvest::run_harvest_job(ctx, spec)).await
-        }
+        JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
+            Box::pin(crate::driver::drive(
+                crate::jobs::harvest::HarvestJobOperation::new(
+                    crate::jobs::repository::NodeScope::of(&ctx.driver),
+                    crate::jobs::repository::JobScope::of(ctx),
+                    spec.clone(),
+                ),
+                &ctx.driver,
+            ))
+            .await,
+        ),
         JobPayload::MintPersistentId(spec) => {
             Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
         }
@@ -250,7 +261,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         }
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => {
-            Box::pin(crate::jobs::backend_import::run_backend_import(ctx, spec)).await
+            Box::pin(crate::jobs::host::run_backend_import(ctx, spec)).await
         }
         JobPayload::RegisterIdentifiers(spec) => {
             Box::pin(crate::jobs::persistent_id::run_register_identifiers(
@@ -259,10 +270,14 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::WebhookDelivery(spec) => {
-            Box::pin(crate::notifications::webhook::run_webhook_job(ctx, spec)).await
+            let now_ms = unix_timestamp_millis();
+            let job = WebhookJobOperation::new(spec.clone(), delivery_node(ctx), now_ms);
+            Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
         }
         JobPayload::EmailDelivery(spec) => {
-            Box::pin(crate::notifications::email::run_email_job(ctx, spec)).await
+            let now_ms = unix_timestamp_millis();
+            let job = EmailJobOperation::new(spec.clone(), delivery_node(ctx), now_ms);
+            Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
         }
         JobPayload::PluginWork(_) => {
             let handled = (ctx.handlers.iter()).find_map(|handler| handler.run(ctx, payload));
@@ -305,6 +320,38 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::WebhookDelivery(_)
         | JobPayload::EmailDelivery(_)
         | JobPayload::PluginWork(_) => {}
+    }
+}
+
+/// The node a delivery job decides for.
+fn delivery_node(ctx: &JobContext) -> NodeId {
+    (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id())
+}
+
+/// Runs a delivery job until it ends, is cancelled or the node shuts down. A node without a
+/// metadata transport cannot open secrets, so the job waits; a failed run may pass on a retry.
+async fn run_delivery(
+    ctx: &JobContext,
+    delivery: impl Future<Output = Result<DeliveryOutcome, IoError>>,
+) -> JobRunOutcome {
+    if ctx.driver.metadata_handle.is_none() || ctx.driver.outbound_handle.is_none() {
+        return JobRunOutcome::DeferredFor(
+            JobError::retryable("the metadata transport is unavailable"),
+            Duration::from_millis(BACKOFF_START_MS),
+        );
+    }
+    tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
+        outcome = delivery => match outcome {
+            Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
+            Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
+            Ok(DeliveryOutcome::DeferredFor(error, delay)) => {
+                JobRunOutcome::DeferredFor(error, delay)
+            }
+            Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
+        },
     }
 }
 

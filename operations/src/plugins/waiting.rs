@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_runs::{GapReason, WAITING_EXPIRY_MS};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -123,7 +123,7 @@ enum RecheckPhase {
 }
 
 /// Decides each waiting event that is ready or expired; answers how many left the waiting set.
-/// The caller holds `ADMISSIONS` while it runs.
+///
 #[derive(Debug, PartialEq)]
 pub(crate) struct RecheckWaiting {
     config: Arc<RealmConfigDocument>,
@@ -172,6 +172,10 @@ impl RecheckWaiting {
 impl Operation for RecheckWaiting {
     type Output = usize;
     type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {

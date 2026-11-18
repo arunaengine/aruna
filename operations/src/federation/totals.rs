@@ -1,48 +1,55 @@
-//! Computes the realm-wide totals a realm publishes: data bytes, objects and datasets.
+//! Computes the realm-wide data totals a realm publishes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::federation::RealmTotals;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_core::time::unix_timestamp_secs;
+use thiserror::Error;
 
-use crate::driver::{DriverContext, drive};
-use crate::metadata::stats::count_realm_documents;
-use crate::node::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use crate::node::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope};
 
-/// The realm's totals from the realm usage sum and the live document count. Fails when one
-/// part is unknown, so a caller shows nothing instead of a zero.
-pub async fn realm_totals(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> Result<RealmTotals, String> {
-    let datasets = count_realm_documents(context, realm_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or("no metadata subsystem for the dataset count")?;
-    let (objects, data_bytes) = data_totals(context, node_id).await?;
-    Ok(RealmTotals {
-        realm_id,
-        data_bytes,
-        objects,
-        datasets,
-        observed_at: unix_timestamp_secs(),
-    })
+#[derive(Debug, Error, PartialEq)]
+pub enum DataTotalsError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(transparent)]
+    Usage(#[from] RealmUsageError),
+    #[error("no realm usage total")]
+    Missing,
 }
 
 /// The realm's current objects and data bytes, stored and referenced alike, private data
 /// included, from the realm usage sum.
-pub async fn data_totals(context: &DriverContext, node_id: NodeId) -> Result<(u64, u64), String> {
-    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
-    let operation = RealmUsageOperation::new(node_id, realm_id, RealmUsageScope::Global);
-    let mut totals = drive(operation, context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let usage = totals.pop().ok_or("no realm usage total")?;
-    Ok(data_of(&usage.counters))
+#[derive(Debug, PartialEq)]
+pub struct DataTotalsOperation {
+    node_id: NodeId,
+    realm_id: Option<RealmId>,
+}
+
+impl DataTotalsOperation {
+    /// `realm_id` is the realm this node serves, when it runs a net transport.
+    pub fn new(node_id: NodeId, realm_id: Option<RealmId>) -> Self {
+        Self { node_id, realm_id }
+    }
+}
+
+impl Operation for DataTotalsOperation {
+    type Output = (u64, u64);
+    type Error = DataTotalsError;
+
+    fn first(&mut self) -> Result<Next<(u64, u64)>, DataTotalsError> {
+        let usage = RealmUsageOperation::new(self.node_id, self.realm_id, RealmUsageScope::Global);
+        Ok(Next::Call(IoCall::child(usage)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(u64, u64)>, DataTotalsError> {
+        let mut totals = result.child::<Vec<RealmUsage>, RealmUsageError>()??;
+        let usage = totals.pop().ok_or(DataTotalsError::Missing)?;
+        Ok(Next::Done(data_of(&usage.counters)))
+    }
 }
 
 /// Objects and stored plus referenced bytes; both count each object once.
@@ -56,7 +63,11 @@ fn data_of(counters: &UsageCounters) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use aruna_core::calls::ChildOutcome;
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[2; 32]).public()
+    }
 
     #[test]
     fn data_counted_once() {
@@ -71,26 +82,13 @@ mod tests {
         assert_eq!(data_of(&counters), (3, 120));
     }
 
-    #[tokio::test]
-    async fn unknown_count_fails() {
-        // Without a metadata subsystem the dataset count is unknown, never zero.
-        let dir = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let result = realm_totals(&context, RealmId::from_bytes([7; 32]), node).await;
-        assert_eq!(
-            result.unwrap_err(),
-            "no metadata subsystem for the dataset count"
-        );
+    #[test]
+    fn empty_sum_unknown() {
+        let mut operation = DataTotalsOperation::new(node(), None);
+        let usage = RealmUsageOperation::new(node(), None, RealmUsageScope::Global);
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::child(usage))));
+        let empty: Result<Vec<RealmUsage>, RealmUsageError> = Ok(Vec::new());
+        let answer = operation.next(IoResult::Child(ChildOutcome::new(empty)));
+        assert_eq!(answer, Err(DataTotalsError::Missing));
     }
 }

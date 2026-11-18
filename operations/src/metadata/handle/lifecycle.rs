@@ -30,7 +30,6 @@ use super::{
 use crate::driver::{DriverContext, drive};
 use crate::metadata::graph_deleted::GraphDeletedOperation;
 use crate::metadata::repository::{iter_registry_effect, parse_registry_iter};
-use crate::metadata::summary_cache::summary_cache;
 
 impl MetadataVisibilityCache {
     pub(super) fn new() -> Self {
@@ -455,9 +454,6 @@ impl MetadataHandle {
         // Peer sync invalidates summaries because their cursor may precede newly applied content.
         if !applied.is_empty() {
             self.inner.query_cache.bump_apply();
-            for graph in &applied {
-                summary_cache().remove(graph);
-            }
         }
         Ok(applied.len())
     }
@@ -558,6 +554,7 @@ pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
             | MetadataEffect::GetGraphPolicy { .. }
             | MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportSummaryAt { .. }
             | MetadataEffect::ExportRoCratePage { .. }
             | MetadataEffect::PlanBatch { .. }
             | MetadataEffect::MergeBatch { .. }

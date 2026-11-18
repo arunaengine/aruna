@@ -5,12 +5,56 @@
 use super::*;
 use crate::s3::bucket::key::rows::authority_rows;
 use aruna_core::compute::SecretBytes;
+use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::TransitionState;
 use std::time::SystemTime;
 
 const BUCKET_ID: Ulid = Ulid::from_bytes([7; 16]);
+
+type Turn = Result<Next<ChangeResult>, ChangeError>;
+
+fn keyed_rows(values: Vec<(Key, Option<Value>)>) -> IoResult {
+    IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+}
+
+fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+    IoResult::Page { rows, next }
+}
+
+fn blob(event: BlobEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Blob(event)))
+}
+
+/// The answer to the node vault write.
+fn vault_written() -> IoResult {
+    let written = StorageEvent::WriteResult {
+        key: Vec::new().into(),
+    };
+    IoResult::Event(Box::new(Event::Storage(written)))
+}
+
+fn asked(turn: &Turn) -> &Effect {
+    match turn {
+        Ok(Next::Call(IoCall::Effect(effect))) => effect,
+        other => panic!("expected an effect call, got {other:?}"),
+    }
+}
+
+fn woke(turn: Turn) -> ChangeResult {
+    match turn {
+        Ok(Next::Then { output, calls }) => {
+            let wake = Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::MigrateCompression,
+                after: std::time::Duration::ZERO,
+            });
+            assert_eq!(calls, vec![IoCall::from(wake)]);
+            output
+        }
+        other => panic!("expected the transition wake, got {other:?}"),
+    }
+}
 
 fn info() -> BucketInfo {
     BucketInfo {
@@ -76,7 +120,7 @@ fn loaded(
     operation: &mut ChangeEncryptionOperation,
     mode: EncryptionMode,
     uploads: Vec<(Key, Value)>,
-) -> Effects {
+) -> Turn {
     loaded_with(operation, mode, uploads, None, true)
 }
 
@@ -88,39 +132,26 @@ fn loaded_with(
     uploads: Vec<(Key, Value)>,
     transition: Option<EncryptionTransition>,
     unlocked: bool,
-) -> Effects {
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TxnId::default(),
-    }));
+) -> Turn {
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    operation.first().unwrap();
     let current = settings(mode);
     let values = authority_rows(&info(), Some(&current), &[admin()]);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: uploads,
-        next_start_after: None,
-    }));
-    if !matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ) {
+    operation.next(keyed_rows(values)).unwrap();
+    let effects = operation.next(page(uploads, None));
+    if !matches!(&effects, Ok(Next::Call(IoCall::Read(_)))) {
         return effects;
     }
     let record = active(mode == EncryptionMode::NodeManaged);
     let transition = transition.map(|record| Value::from(record.to_bytes().unwrap()));
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                Key::from(Vec::new()),
-                Some(record.to_bytes().unwrap().into()),
-            ),
-            (Key::from(Vec::new()), transition),
-        ],
-    }));
-    if !matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReadKeyStatus { .. })]
-    ) {
+    let answer = IoResult::Values(vec![Some(record.to_bytes().unwrap().into()), transition]);
+    let effects = operation.next(answer);
+    let reads_status = matches!(
+        &effects,
+        Ok(Next::Call(IoCall::Effect(effect)))
+            if matches!(effect.as_ref(), Effect::Blob(BlobEffect::ReadKeyStatus { .. }))
+    );
+    if !reads_status {
         return effects;
     }
     let status = UnlockStatus {
@@ -134,11 +165,11 @@ fn loaded_with(
         max_remaining: None,
     };
     let generations = if unlocked { vec![status] } else { Vec::new() };
-    operation.step(Event::Blob(BlobEvent::KeyStatus { generations }))
+    operation.next(blob(BlobEvent::KeyStatus { generations }))
 }
 
-fn rows(effects: &Effects) -> Vec<(String, Key, Value)> {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+fn rows(effects: &Turn) -> Vec<(String, Key, Value)> {
+    let Ok(Next::Call(IoCall::Write(writes))) = effects else {
         panic!("expected the row writes, got {effects:?}")
     };
     writes.clone()
@@ -149,18 +180,15 @@ fn row(rows: &[(String, Key, Value)], key_space: &str) -> Vec<u8> {
     found.map(|(_, _, value)| value.to_vec()).unwrap()
 }
 
-fn generated(operation: &mut ChangeEncryptionOperation) -> Effects {
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    }));
+fn generated(operation: &mut ChangeEncryptionOperation) -> Turn {
+    operation.next(page(Vec::new(), None)).unwrap();
     let private = SecretBytes::new(vec![4; 32]);
     let public_key = aruna_core::structs::storage::encryption::public_key_of(&private).unwrap();
-    let effects = operation.step(Event::Blob(BlobEvent::BucketKeyGenerated {
+    let effects = operation.next(blob(BlobEvent::BucketKeyGenerated {
         public_key,
         private_key: SharedSecret::new(private),
     }));
-    crate::s3::bucket::key::abe::admit_parameters(operation, effects)
+    crate::s3::bucket::key::abe::tests::admit_parameters(operation, effects)
 }
 
 #[test]
@@ -168,8 +196,8 @@ fn rotation_journals_generations() {
     let mut operation = operation(KeyChange::Rotate);
     let effects = loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == BUCKET_HOLDER_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Page { space, .. })) if space == BUCKET_HOLDER_KEYSPACE
     ));
 
     let rows = rows(&generated(&mut operation));
@@ -188,24 +216,12 @@ fn rotation_journals_generations() {
     assert_eq!(old.state, KeyState::Retiring);
 
     // A node-managed rotation keeps a node copy of the new generation.
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
+    let effects = operation.next(IoResult::Done);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::VaultWrite { .. })]
+        asked(&effects),
+        Effect::Storage(StorageEffect::VaultWrite { .. })
     ));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Vec::new().into(),
-    }));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: TxnId::default(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Task(TaskEffect::ShortenTimer { .. })]
-    ));
-    let result = operation.finalize().unwrap();
+    let result = woke(operation.next(vault_written()));
     assert_eq!(result.key.unwrap().0.key.generation, 2);
 }
 
@@ -214,15 +230,11 @@ fn locking_needs_recovery() {
     // Without ready holders a vault_locked generation would be lost, and the node copy is
     // never written for it.
     let mut operation = operation(settings_change(EncryptionMode::VaultLocked));
-    loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
+    loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new()).unwrap();
 
     let effects = generated(&mut operation);
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(ChangeError::RecoveryUnmet));
+    assert_eq!(effects, Err(ChangeError::RecoveryUnmet));
 }
 
 #[test]
@@ -302,9 +314,9 @@ fn combined_change_reencodes() {
             .input
             .lookups
             .insert(admin(), KeyLookup::Keys(vec![holder.clone()]));
-        loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
+        loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new()).unwrap();
         let effects = generated(&mut operation);
-        let [Effect::Blob(BlobEffect::SealHolderCopies { key, .. })] = effects.as_slice() else {
+        let Effect::Blob(BlobEffect::SealHolderCopies { key, .. }) = asked(&effects) else {
             panic!("expected holder copies")
         };
         let copy = SealedCopy {
@@ -316,8 +328,7 @@ fn combined_change_reencodes() {
             ciphertext: vec![0; 48],
             created_at_ms: 50,
         };
-        let writes =
-            rows(&operation.step(Event::Blob(BlobEvent::CopiesSealed { copies: vec![copy] })));
+        let writes = rows(&operation.next(blob(BlobEvent::CopiesSealed { copies: vec![copy] })));
         let transition =
             EncryptionTransition::from_bytes(&row(&writes, TRANSITION_KEYSPACE)).unwrap();
         assert_eq!(transition.kind, TransitionKind::Reencode);
@@ -377,8 +388,6 @@ fn concurrent_put_converted() {
             transition,
             SystemTime::UNIX_EPOCH,
         );
-        use aruna_core::calls::{IoCall, IoResult, Next};
-        use aruna_core::operation::Operation;
         rewrite.first().unwrap();
         let version = aruna_core::structs::storage::blob::BlobVersion::materialized(
             [1; 32],
@@ -436,22 +445,12 @@ fn managed_refuses_limit() {
     let mut operation = operation(settings_change(EncryptionMode::NodeManaged));
     operation.input.max_unlock_ms = Some(Some(60_000));
 
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TxnId::default(),
-    }));
+    operation.first().unwrap();
     let current = settings(EncryptionMode::NodeManaged);
     let values = authority_rows(&info(), Some(&current), &[admin()]);
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let effects = operation.next(keyed_rows(values));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(
-        operation.finalize(),
-        Err(ChangeError::Key(BucketKeyError::ManagedLimit))
-    );
+    assert_eq!(effects, Err(ChangeError::Key(BucketKeyError::ManagedLimit)));
 }
 
 #[test]
@@ -470,21 +469,14 @@ fn combined_settings_refused() {
         let mut operation = operation(settings_change(EncryptionMode::Off));
         operation.input.max_unlock_ms = Some(max);
         operation.input.expected_generation = generation;
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
+        operation.first().unwrap();
         let values = authority_rows(
             &info(),
             Some(&settings(EncryptionMode::NodeManaged)),
             &[admin()],
         );
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(operation.finalize(), Err(ChangeError::Key(error)));
+        let effects = operation.next(keyed_rows(values));
+        assert_eq!(effects, Err(ChangeError::Key(error)));
     }
 }
 
@@ -494,24 +486,22 @@ fn unlocking_adds_copy() {
     let effects = loaded(&mut operation, EncryptionMode::VaultLocked, Vec::new());
     let key = BucketKeyRef::new(BUCKET_ID, 1);
     assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReadUnlockedKey { key })]
+        asked(&effects),
+        &Effect::Blob(BlobEffect::ReadUnlockedKey { key })
     );
 
     let private_key = SharedSecret::new(SecretBytes::new(vec![4; 32]));
-    let rows = rows(&operation.step(Event::Blob(BlobEvent::UnlockedKeyRead { key, private_key })));
+    let rows = rows(&operation.next(blob(BlobEvent::UnlockedKeyRead { key, private_key })));
 
     assert!(
         rows.iter()
             .all(|(space, _, _)| space != TRANSITION_KEYSPACE)
     );
     let record = BucketKeyRecord::from_bytes(&row(&rows, BUCKET_KEY_KEYSPACE)).unwrap();
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
+    let effects = operation.next(IoResult::Done);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::VaultWrite { entry, .. })]
+        asked(&effects),
+        Effect::Storage(StorageEffect::VaultWrite { entry, .. })
             if Some(entry.id) == record.vault_entry
     ));
 }
@@ -519,13 +509,13 @@ fn unlocking_adds_copy() {
 #[test]
 fn locked_bucket_stays() {
     let mut operation = operation(settings_change(EncryptionMode::NodeManaged));
-    loaded(&mut operation, EncryptionMode::VaultLocked, Vec::new());
+    loaded(&mut operation, EncryptionMode::VaultLocked, Vec::new()).unwrap();
 
     let locked = BucketKeyError::Locked(BUCKET_ID);
-    operation.step(Event::Blob(BlobEvent::Error(locked.clone().into())));
+    let effects = operation.next(blob(BlobEvent::Error(locked.clone().into())));
 
     assert_eq!(
-        operation.finalize(),
+        effects,
         Err(ChangeError::Blob(BlobError::BucketKey(locked)))
     );
 }
@@ -557,11 +547,7 @@ fn running_transition_rejects() {
                 Some(transition.clone()),
                 true,
             );
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert_eq!(operation.finalize(), Err(ChangeError::TransitionRunning));
+            assert_eq!(effects, Err(ChangeError::TransitionRunning));
         }
     }
 
@@ -576,10 +562,7 @@ fn running_transition_rejects() {
         Some(finished),
         true,
     );
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { .. })]
-    ));
+    assert!(matches!(&effects, Ok(Next::Call(IoCall::Page { .. }))));
 }
 
 #[test]
@@ -605,12 +588,8 @@ fn locked_source_refuses() {
 
         let effects = loaded_with(&mut operation, mode, Vec::new(), None, false);
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
         assert_eq!(
-            operation.finalize(),
+            effects,
             Err(ChangeError::Key(BucketKeyError::Locked(BUCKET_ID)))
         );
     }
@@ -619,20 +598,13 @@ fn locked_source_refuses() {
 #[test]
 fn former_admin_refused() {
     let mut operation = operation(KeyChange::Rotate);
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TxnId::default(),
-    }));
+    operation.first().unwrap();
     let current = settings(EncryptionMode::NodeManaged);
     let values = authority_rows(&info(), Some(&current), &[]);
 
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let effects = operation.next(keyed_rows(values));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(ChangeError::NotAdmin));
+    assert_eq!(effects, Err(ChangeError::NotAdmin));
 }
 
 #[test]
@@ -640,7 +612,7 @@ fn change_writes_audit() {
     use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
     use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
     let mut change = operation(KeyChange::Rotate);
-    loaded(&mut change, EncryptionMode::NodeManaged, Vec::new());
+    loaded(&mut change, EncryptionMode::NodeManaged, Vec::new()).unwrap();
     let rotation = rows(&generated(&mut change));
     let record = BucketAuditRecord::from_bytes(&row(&rotation, BUCKET_AUDIT_KEYSPACE)).unwrap();
     assert_eq!(record.action, AuditAction::Rotation);

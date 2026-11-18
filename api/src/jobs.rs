@@ -4,6 +4,7 @@
 
 use std::str::FromStr;
 
+use crate::job_service::read_owned_job;
 use aruna_core::UserId;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
@@ -19,9 +20,6 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::{
-    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
-};
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
@@ -34,8 +32,10 @@ use aruna_operations::jobs::lifecycle::ingress::ingress_node;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::service::read_owned_job;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -353,16 +353,17 @@ async fn local_submit(
     workspace_mode: WorkspaceMode,
 ) -> Result<AcceptedExecution, JobRequestError> {
     let context = state.get_ctx();
-    let result = submit_local_execution(
-        &context,
-        LocalExecutionConfig {
-            spec,
-            owner: auth.user_id,
-            node_id: state.get_node_id(),
-            idempotency_key,
-            workspace_mode,
-            retention_ms: state.rocrate_limits().artifact_retention_ms,
-        },
+    let config = LocalExecutionConfig {
+        spec,
+        owner: auth.user_id,
+        node_id: state.get_node_id(),
+        idempotency_key,
+        workspace_mode,
+        retention_ms: state.rocrate_limits().artifact_retention_ms,
+    };
+    let result = drive(
+        LocalRunOperation::on_node(config, &context),
+        context.as_ref(),
     )
     .await
     .map_err(JobRequestError::from_local)?;

@@ -12,9 +12,6 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::shard::client::fetch_shard_manifest;
-use aruna_operations::shard::verify::{is_shard_verified, verify_held_shards};
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
@@ -22,6 +19,10 @@ use crate::topology::store_realm_config;
 use crate::topology::{
     TestNode, announce_nodes, install_default_config, spawn_replica, spawn_replicas,
 };
+use aruna_operations::shard::AssembleManifestOperation;
+use aruna_operations::shard::client::FetchManifestOperation;
+use aruna_operations::shard::verify::ShardVerifiedOperation;
+use aruna_operations::shard::verify::VerifyHeldOperation;
 
 #[tokio::test]
 async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,13 +40,16 @@ async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let placement = any_held_placement(&config, nodes[0].net.node_id());
-    let error = fetch_shard_manifest(&outsider.net, nodes[0].net.node_id(), realm_id, placement)
-        .await
-        .expect_err("non-realm peer must be rejected");
+    let error = drive(
+        FetchManifestOperation::new(nodes[0].net.node_id(), realm_id, placement),
+        &outsider.context,
+    )
+    .await
+    .expect_err("non-realm peer must be rejected");
     // Inbound admission drops unregistered peers before the manifest protocol
     // can answer, so the client usually observes a closed connection.
     assert!(
-        error.contains("connection lost") || error.contains("not a sync-eligible node"),
+        error.0.contains("connection lost") || error.0.contains("not a sync-eligible node"),
         "unexpected reject: {error}"
     );
 
@@ -65,11 +69,14 @@ async fn rejects_unheld_shard() -> Result<(), Box<dyn std::error::Error>> {
         strategy_id: Ulid::from_bytes([0xAB; 16]),
         shard: 1,
     };
-    let error = fetch_shard_manifest(&nodes[1].net, nodes[0].net.node_id(), realm_id, bogus)
-        .await
-        .expect_err("non-held shard must be rejected");
+    let error = drive(
+        FetchManifestOperation::new(nodes[0].net.node_id(), realm_id, bogus),
+        &nodes[1].context,
+    )
+    .await
+    .expect_err("non-held shard must be rejected");
     assert!(
-        error.contains("does not hold shard"),
+        error.0.contains("does not hold shard"),
         "unexpected reject: {error}"
     );
 
@@ -88,11 +95,14 @@ async fn rejects_nonholder_peer() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .find(|node| node.net.node_id() == non_holder)
         .expect("non-holder node exists");
-    let error = fetch_shard_manifest(&non_holder_node.net, responder, realm_id, placement)
-        .await
-        .expect_err("sync-eligible non-holder peer must be rejected");
+    let error = drive(
+        FetchManifestOperation::new(responder, realm_id, placement),
+        &non_holder_node.context,
+    )
+    .await
+    .expect_err("sync-eligible non-holder peer must be rejected");
     assert!(
-        error.contains("is not a holder"),
+        error.0.contains("is not a holder"),
         "unexpected reject: {error}"
     );
 
@@ -100,7 +110,11 @@ async fn rejects_nonholder_peer() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .find(|node| node.net.node_id() == holder)
         .expect("holder node exists");
-    let manifest = fetch_shard_manifest(&holder_node.net, responder, realm_id, placement).await?;
+    let manifest = drive(
+        FetchManifestOperation::new(responder, realm_id, placement),
+        &holder_node.context,
+    )
+    .await?;
     assert_eq!(manifest.holder, responder);
     assert_eq!(manifest.placement, placement);
 
@@ -147,25 +161,50 @@ async fn new_holder_verifies() -> Result<(), Box<dyn std::error::Error>> {
     wait_manifest_entry(&nodes[1], realm_id, placement, &target).await?;
 
     // Before verification, node B has no marker for that shard.
-    assert!(!is_shard_verified(nodes[1].context.as_ref(), realm_id, &placement).await);
+    assert!(
+        !drive(
+            ShardVerifiedOperation::new(realm_id, &placement),
+            nodes[1].context.as_ref()
+        )
+        .await
+        .unwrap_or(false)
+    );
 
     // Node B fetches node A's manifest directly and sees the same document.
-    let remote =
-        fetch_shard_manifest(&nodes[1].net, nodes[0].net.node_id(), realm_id, placement).await?;
+    let remote = drive(
+        FetchManifestOperation::new(nodes[0].net.node_id(), realm_id, placement),
+        &nodes[1].context,
+    )
+    .await?;
     assert!(remote.entries.iter().any(|entry| entry.target == target));
 
-    let summary = verify_held_shards(&nodes[1].context, nodes[1].net.node_id(), realm_id).await;
+    let summary = drive(
+        VerifyHeldOperation::new(nodes[1].net.node_id(), realm_id),
+        &nodes[1].context,
+    )
+    .await
+    .unwrap_or_default();
     assert!(
         summary.newly_verified > 0,
         "expected at least one shard verified, got {summary:?}"
     );
     assert!(
-        is_shard_verified(nodes[1].context.as_ref(), realm_id, &placement).await,
+        drive(
+            ShardVerifiedOperation::new(realm_id, &placement),
+            nodes[1].context.as_ref()
+        )
+        .await
+        .unwrap_or(false),
         "the document's shard must be verified"
     );
 
     // A second pass finds every held shard already verified (idempotent, cheap).
-    let second = verify_held_shards(&nodes[1].context, nodes[1].net.node_id(), realm_id).await;
+    let second = drive(
+        VerifyHeldOperation::new(nodes[1].net.node_id(), realm_id),
+        &nodes[1].context,
+    )
+    .await
+    .unwrap_or_default();
     assert_eq!(second.newly_verified, 0);
     assert_eq!(second.already_verified, second.held);
 
@@ -182,8 +221,16 @@ async fn genesisless_never_verify() -> Result<(), Box<dyn std::error::Error>> {
     let config = install_unplaced_config(&nodes, realm_id, 2).await?;
 
     let placement = any_held_placement(&config, nodes[1].net.node_id());
-    let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
-    let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+    let left = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let right = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[1].context.as_ref(),
+    )
+    .await?;
     assert_eq!(
         left.digest, right.digest,
         "genesis-less holders share the empty fingerprint"
@@ -196,13 +243,23 @@ async fn genesisless_never_verify() -> Result<(), Box<dyn std::error::Error>> {
         "no local genesis exists for the shard"
     );
 
-    let summary = verify_held_shards(&nodes[1].context, nodes[1].net.node_id(), realm_id).await;
+    let summary = drive(
+        VerifyHeldOperation::new(nodes[1].net.node_id(), realm_id),
+        &nodes[1].context,
+    )
+    .await
+    .unwrap_or_default();
     assert_eq!(
         summary.newly_verified, 0,
         "a matching empty digest must not verify a genesis-less shard: {summary:?}"
     );
     assert!(
-        !is_shard_verified(nodes[1].context.as_ref(), realm_id, &placement).await,
+        !drive(
+            ShardVerifiedOperation::new(realm_id, &placement),
+            nodes[1].context.as_ref()
+        )
+        .await
+        .unwrap_or(false),
         "a genesis-less shard must stay unverified"
     );
 
@@ -299,13 +356,21 @@ async fn wait_manifest_entry(
     target: &DocumentTarget,
 ) -> Result<ShardManifest, Box<dyn std::error::Error>> {
     wait_for_convergence("timed out waiting for manifest entry", || async {
-        let manifest = assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?;
+        let manifest = drive(
+            AssembleManifestOperation::new(realm_id, placement),
+            node.context.as_ref(),
+        )
+        .await?;
         Ok::<_, Box<dyn std::error::Error>>(usize::from(
             !manifest.entries.iter().any(|entry| &entry.target == target),
         ))
     })
     .await?;
-    Ok(assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?)
+    Ok(drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        node.context.as_ref(),
+    )
+    .await?)
 }
 
 async fn build_realm_nodes(

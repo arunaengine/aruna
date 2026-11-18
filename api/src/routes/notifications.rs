@@ -6,6 +6,10 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{decode_cursor, encode_cursor};
+use crate::routes::notification_calls::{
+    self, create_for_user, delete_for_user, list_for_user, mark_for_user, resolve_user_holder,
+    unread_for_user,
+};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -21,13 +25,12 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch;
 use aruna_operations::notifications::dispatch::{
-    InboxWakeReceiver, NotificationDispatchError, create_for_user, delete_for_user, list_for_user,
-    mark_for_user, resolve_user_holder, subscribe_inbox_wakes, unread_for_user,
+    InboxWakeReceiver, NotificationDispatchError, subscribe_inbox_wakes,
 };
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
 use aruna_operations::notifications::user_call::WatchDispatchError;
-use aruna_operations::notifications::watch::authorization::evaluate_watch_creation;
+use aruna_operations::notifications::watch::check::WatchCheckOperation;
 use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
@@ -466,15 +469,8 @@ async fn authorize_watch(
         );
         return Err(error);
     }
-    match evaluate_watch_creation(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        auth,
-        path_prefix,
-        event_mask,
-    )
-    .await
-    {
+    let check = WatchCheckOperation::creation(state.get_realm_id(), auth, path_prefix, event_mask);
+    match drive(check, &state.get_ctx()).await {
         Ok(WatchAuthorization::Authorized) => Ok(()),
         Ok(WatchAuthorization::Denied(reason)) => {
             record_watch_denial(state, reason.metric_reason());
@@ -486,7 +482,7 @@ async fn authorize_watch(
         }
         Err(error) => {
             record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
-            Err(ServerError::InternalError(error.into()))
+            Err(ServerError::InternalError(error.to_string().into()))
         }
     }
 }
@@ -1175,9 +1171,10 @@ pub async fn list_watches(
     State(state): State<Arc<ServerState>>,
     UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
-    let subscriptions = dispatch::list_watches(&state.get_ctx(), state.get_node_id(), auth.user_id)
-        .await
-        .map_err(|error| map_watch_error(error, "list_watches"))?;
+    let subscriptions =
+        notification_calls::list_watches(&state.get_ctx(), state.get_node_id(), auth.user_id)
+            .await
+            .map_err(|error| map_watch_error(error, "list_watches"))?;
 
     let watches = subscriptions.iter().map(watch_response).collect();
     Ok((StatusCode::OK, Json(WatchListResponse { watches })))

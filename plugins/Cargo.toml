@@ -23,6 +23,7 @@ runtime = [
     "dep:tokio",
     "dep:tokio-util",
     "dep:tracing",
+    "dep:ulid",
     "dep:wasmtime",
     "dep:wasmtime-wasi",
     "dep:wasmtime-wasi-io",
@@ -42,6 +43,7 @@ toml = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+ulid = { workspace = true, optional = true }
 url = { workspace = true }
 wasm-encoder = { workspace = true }
 wasmparser = { workspace = true }

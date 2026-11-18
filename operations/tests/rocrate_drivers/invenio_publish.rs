@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::driven::change_link;
+use super::driven::remote_state;
+use super::driven::{current_event, start_push};
 use super::link::{
     LINK_TOKEN, attach, change, current, drain, due_now, import_dataset, linked, replace_crate,
     run_push, succeeded,
@@ -12,11 +15,9 @@ use super::*;
 use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-use aruna_operations::jobs::repository::link_store::change_link;
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
-use aruna_operations::jobs::repository::remote_state;
-use aruna_operations::metadata::raw_revision::load_raw_revision;
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::revision_read::RawViewOperation;
 
 async fn push_now(
     fixture: &Fixture,
@@ -553,8 +554,9 @@ async fn set_creator(
     fixture: &Fixture,
     creator: Option<Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
+        .1
         .ok_or("revision missing")?;
     let mut document: Value = serde_json::from_str(&revision.jsonld)?;
     let graph = document["@graph"].as_array_mut().ok_or("graph missing")?;

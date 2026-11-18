@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod access;
 mod check;
 mod commit;
 mod coordinator;
@@ -10,9 +11,10 @@ mod peer;
 mod prepare;
 mod resources;
 
-pub(crate) use coordinator::sync_decision;
-pub use coordinator::{check_group, delete_group, install_onboarding};
-pub(crate) use peer::apply_request;
+pub use check::{CheckGroupOperation, GroupBlockers};
+pub(crate) use coordinator::SyncDecisionOperation;
+pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
+pub(crate) use peer::ApplyRequestOperation;
 
 #[cfg(test)]
 mod barrier_tests;

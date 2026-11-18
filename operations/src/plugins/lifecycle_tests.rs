@@ -6,9 +6,9 @@
 use super::*;
 use crate::driver::drive;
 use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
+use crate::plugins::calls::*;
 use crate::plugins::grants::role_paths;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::install::{repair_install, repair_settled};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_core::UserId;
@@ -407,4 +407,192 @@ async fn updates_bind_slots() {
     let (updated, _) = update(narrow).await.unwrap();
     let names: Vec<String> = updated.secrets.values().map(ToString::to_string).collect();
     assert_eq!(names, ["group:api-key"]);
+}
+
+mod operations {
+    use serde_json::json;
+
+    use super::*;
+    use crate::document_repository::GetConfigError;
+    use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rows::tests::child_result;
+    use crate::users::service_account::check::ServiceCheckError;
+    use aruna_core::structs::identity::user::User;
+
+    fn open_manifest() -> serde_json::Value {
+        json!({ "permissions": { "required": [] } })
+    }
+
+    fn loaded(current: &PluginInstall) -> IoResult {
+        let config = Arc::new(fixtures::config(current, open_manifest()));
+        let current = current.clone();
+        child_result(Ok::<_, InstallError>(LoadedInstall { config, current }))
+    }
+
+    fn holder_ok() -> IoResult {
+        child_result(Ok::<(), InstallError>(()))
+    }
+
+    fn settled(install: &PluginInstall) -> IoResult {
+        child_result(Ok::<_, InstallError>(install.clone()))
+    }
+
+    fn write_done() -> IoResult {
+        child_result(Ok::<Option<PluginInstall>, RecordError>(None))
+    }
+
+    #[test]
+    fn load_checks_admin() {
+        let install = fixtures::install();
+        let caller = fixtures::caller();
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        assert!(is_child(&load.first()));
+        let config = fixtures::config(&install, json!({}));
+        assert!(is_child(&load.next(config_result(config.clone()))));
+        let admin = child_result(Ok::<Option<User>, ServiceCheckError>(None));
+        let Ok(Next::Done(done)) = load.next(admin) else {
+            panic!("an admin gets the install");
+        };
+        assert_eq!(done.current, install);
+
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        load.first().unwrap();
+        load.next(config_result(config)).unwrap();
+        let refused = child_result(Err::<Option<User>, _>(ServiceCheckError::Refused));
+        assert_eq!(load.next(refused), Err(InstallError::Unauthorized));
+
+        let mut load = LoadInstall::new(&caller, Ulid::from_parts(9, 9));
+        load.first().unwrap();
+        let other = fixtures::config(&install, json!({}));
+        assert_eq!(load.next(config_result(other)), Err(InstallError::NotFound));
+        let failed = child_result(Err::<RealmConfigDocument, _>(
+            GetConfigError::DocumentNotFound,
+        ));
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        load.first().unwrap();
+        assert!(matches!(
+            load.next(failed),
+            Err(InstallError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn commit_then_settles() {
+        let install = fixtures::install();
+        let mut commit = CommitChange {
+            caller: fixtures::caller(),
+            expected: install.revision,
+            next: Some(install.clone()),
+            action: AdminAuditAction::PluginUpdated,
+        };
+        assert!(is_child(&commit.first()));
+        assert!(is_child(&commit.next(write_done())));
+        assert_eq!(commit.next(settled(&install)), Ok(Next::Done(install)));
+    }
+
+    #[test]
+    fn grants_run_steps() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut change = SetGrants::new(fixtures::caller(), id, &BTreeMap::new());
+        assert_eq!(change.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&change.first()));
+        assert!(is_child(&change.next(loaded(&install))));
+        assert!(is_child(&change.next(holder_ok())));
+        assert_eq!(
+            change.next(settled(&install)),
+            Ok(Next::Done(install.clone()))
+        );
+
+        let mut removing = install;
+        removing.state = InstallState::Removing;
+        let mut change = SetGrants::new(fixtures::caller(), id, &BTreeMap::new());
+        change.first().unwrap();
+        let refused = InstallError::State(InstallState::Removing.as_str());
+        assert_eq!(change.next(loaded(&removing)), Err(refused));
+    }
+
+    #[test]
+    fn update_runs_steps() {
+        let install = fixtures::install();
+        let who = (fixtures::caller(), Some(fixtures::node(3)));
+        let id = install.install_id;
+        let mut update = UpdateInstall::new(who, id, &install.digest, None);
+        assert_eq!(update.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&update.first()));
+        assert!(is_child(&update.next(loaded(&install))));
+        assert!(is_child(&update.next(holder_ok())));
+        let bound = child_result(Ok::<BoundSlots, BindError>((BTreeMap::new(), Vec::new())));
+        assert!(is_child(&update.next(bound)));
+        let done = update.next(settled(&install));
+        assert_eq!(done, Ok(Next::Done((install, Vec::new()))));
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut pause = SetPaused::new(fixtures::caller(), id, true);
+        assert!(is_child(&pause.first()));
+        assert!(is_child(&pause.next(loaded(&install))));
+        let Ok(Next::Done(paused)) = pause.next(write_done()) else {
+            panic!("the write ends the pause");
+        };
+        assert_eq!((paused.state, paused.paused), (InstallState::Paused, true));
+
+        let mut resume = SetPaused::new(fixtures::caller(), id, false);
+        resume.first().unwrap();
+        assert!(is_child(&resume.next(loaded(&paused))));
+        let Ok(Next::Done(active)) = resume.next(write_done()) else {
+            panic!("the write ends the resume");
+        };
+        assert_eq!((active.state, active.paused), (InstallState::Active, false));
+        assert_eq!(active.active_since_ms, Some(5_000));
+
+        let mut again = SetPaused::new(fixtures::caller(), id, true);
+        again.first().unwrap();
+        let refused = InstallError::State(InstallState::Paused.as_str());
+        assert_eq!(again.next(loaded(&paused)), Err(refused));
+        let mut idle = SetPaused::new(fixtures::caller(), id, false);
+        idle.first().unwrap();
+        assert!(matches!(
+            idle.next(loaded(&install)),
+            Err(InstallError::State(_))
+        ));
+    }
+
+    #[test]
+    fn remove_runs_steps() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut remove = RemoveInstall::new(fixtures::caller(), id);
+        assert_eq!(remove.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&remove.first()));
+        assert!(is_child(&remove.next(loaded(&install))));
+        assert!(is_child(&remove.next(write_done())));
+        assert!(is_child(
+            &remove.next(child_result(Ok::<(), AccountError>(())))
+        ));
+        let kept = child_result(Err::<(), _>(RulesFailure("no".into())));
+        assert!(is_child(&remove.next(kept)));
+        let Ok(Next::Done(gone)) = remove.next(write_done()) else {
+            panic!("the delete ends the removal");
+        };
+        assert_eq!(gone.state, InstallState::Removing);
+    }
+
+    #[test]
+    fn remove_resumes_teardown() {
+        let mut removing = fixtures::install();
+        removing.state = InstallState::Removing;
+        let mut remove = RemoveInstall::new(fixtures::caller(), removing.install_id);
+        remove.first().unwrap();
+        assert!(is_child(&remove.next(loaded(&removing))));
+        let failed = child_result(Err::<(), _>(AccountError("no".into())));
+        let step = InstallError::Step {
+            step: "remove",
+            error: "no".into(),
+        };
+        assert_eq!(remove.next(failed), Err(step));
+    }
 }

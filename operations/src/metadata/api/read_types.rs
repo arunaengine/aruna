@@ -24,7 +24,7 @@ pub enum ApiQueryMode {
     Distributed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocumentQueryRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
@@ -45,7 +45,7 @@ pub struct MetadataQueryRequest {
     pub allow_partial: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataQueryExecution {
     pub results: MetadataQueryResults,
     pub fanout_stats: MetadataFanoutStats,

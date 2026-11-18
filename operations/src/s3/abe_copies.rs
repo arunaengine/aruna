@@ -2,26 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, keyed, parse_abe};
 use crate::s3::usage::QuotaGate;
 use crate::s3::usage::RowChange;
 use crate::s3::usage::UsageCounterUpdate;
-use crate::storage_read::iter_prefix_page;
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::errors::{BlobError, ConversionError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopeArchive, ObjectEnvelope, PendingCopy,
 };
@@ -31,7 +29,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -332,51 +331,127 @@ pub(crate) fn still_active(row: Option<&[u8]>, key: BucketKeyRef) -> Result<(), 
     }
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum CompleteCopiesError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Config(#[from] GetConfigError),
+    #[error(transparent)]
+    Abe(#[from] AbeError),
+}
+
+impl From<IoError> for CompleteCopiesError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WalkStep {
+    Page,
+    Config,
+    Copy,
+}
+
+type WalkTurn = Result<Next<usize>, CompleteCopiesError>;
+
 /// Pages through pending copies and envelopes those of `key`; a lock in between stops the walk.
-pub async fn complete_copies(
-    context: &DriverContext,
+/// Outputs how many copies were completed.
+#[derive(Debug, PartialEq)]
+pub struct CompleteCopiesOperation {
     key: BucketKeyRef,
-    (realm, node): (RealmId, NodeId),
-) -> Result<usize, String> {
-    let mut quota = None;
-    let mut start_after = None;
-    let mut completed = 0;
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            ABE_COPY_KEYSPACE,
-            Some(key.bucket_id.to_bytes().to_vec().into()),
-            start_after,
-            COPY_PAGE,
-            None,
-        )
-        .await?;
-        if quota.is_none() && !rows.is_empty() {
-            let config = drive(GetConfigOperation::new(realm), context).await;
-            quota = Some(config.map_err(|error| error.to_string())?.quota);
+    origin: (RealmId, NodeId),
+    pages: PrefixPages,
+    rows: VecDeque<(Key, Value)>,
+    quota: Option<QuotaConfig>,
+    step: WalkStep,
+    completed: usize,
+}
+
+impl CompleteCopiesOperation {
+    pub fn new(key: BucketKeyRef, origin: (RealmId, NodeId)) -> Self {
+        let prefix = key.bucket_id.to_bytes().to_vec();
+        Self {
+            key,
+            origin,
+            pages: PrefixPages::new(ABE_COPY_KEYSPACE, prefix, COPY_PAGE),
+            rows: VecDeque::new(),
+            quota: None,
+            step: WalkStep::Page,
+            completed: 0,
         }
-        for (row, value) in &rows {
-            let pending = PendingCopy::from_bytes(value).map_err(|error| error.to_string())?;
+    }
+
+    fn call(&mut self, step: WalkStep, call: IoCall) -> WalkTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    /// The realm quota is read once, when the first page holds a copy.
+    fn page_read(&mut self, result: IoResult) -> WalkTurn {
+        self.rows = self.pages.take(result)?.into();
+        if self.quota.is_none() && !self.rows.is_empty() {
+            let config = GetConfigOperation::new(self.origin.0);
+            return self.call(WalkStep::Config, IoCall::child(config));
+        }
+        self.next_copy()
+    }
+
+    fn next_copy(&mut self) -> WalkTurn {
+        while let Some((row, value)) = self.rows.pop_front() {
+            let pending = PendingCopy::from_bytes(&value)?;
             // Rows of another generation wait for that key.
-            if pending.source.context.parameters.key != key {
+            if pending.source.context.parameters.key != self.key {
                 continue;
             }
-            let version = copy_version(row).map_err(|error| error.to_string())?;
+            let version = copy_version(&row)?;
             let mut operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
-            if let Some(quota) = &quota {
+            if let Some(quota) = &self.quota {
+                let (realm, node) = self.origin;
                 operation = operation.with_quota(quota.clone(), realm, node);
             }
-            match drive(operation, context).await {
-                Ok(CopyOutcome::Completed) => completed += 1,
-                Ok(CopyOutcome::Gone) => {}
-                Ok(CopyOutcome::Locked) => return Ok(completed),
-                // A raise in between leaves this copy for the next unlock.
-                Err(error) => warn!(%error, "Failed to envelope a pending copy"),
-            }
+            return self.call(WalkStep::Copy, IoCall::child(operation));
         }
-        match next {
-            Some(next) if !rows.is_empty() => start_after = Some(next),
-            _ => return Ok(completed),
+        if self.pages.done() {
+            return Ok(Next::Done(self.completed));
+        }
+        let page = self.pages.call();
+        self.call(WalkStep::Page, page)
+    }
+
+    fn copy_ended(&mut self, ended: Result<CopyOutcome, AbeError>) -> WalkTurn {
+        match ended {
+            Ok(CopyOutcome::Completed) => self.completed += 1,
+            Ok(CopyOutcome::Gone) => {}
+            Ok(CopyOutcome::Locked) => return Ok(Next::Done(self.completed)),
+            // A raise in between leaves this copy for the next unlock.
+            Err(error) => warn!(%error, "Failed to envelope a pending copy"),
+        }
+        self.next_copy()
+    }
+}
+
+impl Operation for CompleteCopiesOperation {
+    type Output = usize;
+    type Error = CompleteCopiesError;
+
+    fn first(&mut self) -> WalkTurn {
+        let page = self.pages.call();
+        self.call(WalkStep::Page, page)
+    }
+
+    fn next(&mut self, result: IoResult) -> WalkTurn {
+        match self.step {
+            WalkStep::Page => self.page_read(result),
+            WalkStep::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()??;
+                self.quota = Some(config.quota);
+                self.next_copy()
+            }
+            WalkStep::Copy => self.copy_ended(result.child::<CopyOutcome, AbeError>()?),
         }
     }
 }

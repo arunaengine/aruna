@@ -10,6 +10,7 @@ use crate::error::ServerError;
 use crate::lookup::map_guard_error;
 use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::ReadRoute;
@@ -20,7 +21,6 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::node::node_info::node_urls;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
@@ -145,7 +145,7 @@ impl McpServer {
         // A member that keeps no records of the key's range sends the call to one that does.
         let mut routed = None;
         if let Some(binding) = info.as_ref().and_then(|info| info.distribution.as_ref()) {
-            let route = route_read(&context, binding, key, false).await;
+            let route = drive(route_read(binding, key, false), &context).await;
             if let ReadRoute::Holder { node_id, .. } = route.map_err(guard_error)? {
                 routed = Some(node_id);
             }
@@ -156,7 +156,7 @@ impl McpServer {
         }
         let mut members = Vec::new();
         if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
-            members = key_holders(&context, set_id, key).await;
+            members = drive(key_holders(set_id, key), &context).await.unwrap_or_default();
         }
         pick_node(here, (named, info.is_some(), routed), &holders, &members)
             .map_err(|error| route_error(error, bucket, &missed))
@@ -258,7 +258,10 @@ impl McpServer {
                 ),
             ));
         }
-        let urls = node_urls(context.as_ref(), node_id).await;
+        let urls = drive(NodeUrlsOperation::new(node_id), context.as_ref())
+            .await
+            .ok()
+            .flatten();
         let Some(base) = urls.and_then(|urls| urls.api) else {
             return Err(silent("publishes no api address".to_string()));
         };

@@ -10,21 +10,23 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
-use aruna_core::profile_shapes::{ProfileShaclError, ProfileShaclReport, ProfileShapes};
+use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleIrokleOptions, CraqleNode, CraqleOptions,
-    CrateViolation, GraphId, SearchStorage,
+    GraphId, SearchStorage,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 
 use crate::convert::{error_from_craqle, fjall_persist_mode, irokle_peer_id, policy_from_craqle};
 use crate::persist::flush_metadata_persistence;
 
 mod convert;
 mod persist;
+mod profiles;
 mod read;
 mod run;
 mod shacl;
+mod summaries;
 
 pub use crate::read::{Properties, ReadScope};
 pub use crate::shacl::ProfileShaclEngine;
@@ -105,7 +107,16 @@ struct GraphInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    /// RO-Crate summaries by graph and document cursor.
+    summaries: crate::summaries::MetadataSummaryCache,
+    /// Shape sources of the Profile revisions this node fetched.
+    profiles: crate::profiles::ProfileCache,
+    /// Striped holds that serialize this node's writes to one document.
+    document_holds: [Arc<tokio::sync::Mutex<()>>; DOCUMENT_HOLDS],
 }
+
+/// Stripes of the document write holds.
+const DOCUMENT_HOLDS: usize = 64;
 
 impl std::fmt::Debug for GraphHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -160,8 +171,27 @@ impl GraphHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
                 profile_shacl,
+                profiles: crate::profiles::ProfileCache::new(),
+                summaries: crate::summaries::MetadataSummaryCache::new(
+                    crate::summaries::SUMMARY_CACHE_ENTRIES,
+                    crate::summaries::SUMMARY_CACHE_BYTES,
+                    crate::summaries::SUMMARY_CACHE_TTL,
+                ),
+                document_holds: std::array::from_fn(|_| Arc::default()),
             }),
         })
+    }
+
+    /// Profile revisions this node fetched for validation since start. A second validation of
+    /// the same revision must not raise it.
+    pub fn profile_loads(&self) -> u64 {
+        self.inner.profiles.loads()
+    }
+
+    /// Waits for the write hold of one document; the caller keeps it until it drops the guard.
+    pub async fn hold_document(&self, document_id: ulid::Ulid) -> OwnedMutexGuard<()> {
+        let stripe = usize::from(document_id.to_bytes()[15]) % DOCUMENT_HOLDS;
+        self.inner.document_holds[stripe].clone().lock_owned().await
     }
 
     /// The store's Fjall database, for consistent read snapshots such as live backups.
@@ -224,10 +254,15 @@ impl GraphHandle {
                 .await
                 .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        Ok(applied
+        // Peer sync invalidates summaries because their cursor may precede newly applied content.
+        let applied: Vec<String> = applied
             .iter()
             .map(|graph| graph.as_str().to_string())
-            .collect())
+            .collect();
+        for graph in &applied {
+            self.inner.summaries.remove(graph);
+        }
+        Ok(applied)
     }
 
     /// The document sync topic of one graph, bound or derived.
@@ -303,32 +338,7 @@ impl GraphHandle {
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))
     }
 
-    /// Whether Profile checks can run on this node.
-    pub fn profile_validation_available(&self) -> bool {
-        self.inner.profile_shacl.is_some()
-    }
-
-    /// Structural RO-Crate findings for a candidate that carries no Profile
-    /// tag. Nothing is committed: the document is only prepared.
-    pub async fn preview_crate_structure(
-        &self,
-        jsonld: String,
-    ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
-        self.run_profile_shacl(move |engine| engine.structural(&jsonld))
-            .await
-    }
-
-    /// Evaluates one candidate against a registered Profile's shapes.
-    pub async fn evaluate_profile_shapes(
-        &self,
-        profile: ProfileShapes,
-        jsonld: String,
-    ) -> Result<ProfileShaclReport, ProfileShaclError> {
-        self.run_profile_shacl(move |engine| engine.evaluate(&profile, &jsonld))
-            .await
-    }
-
-    async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
+    pub(crate) async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
     where
         T: Send + 'static,
         F: FnOnce(&ProfileShaclEngine) -> Result<T, ProfileShaclError> + Send + 'static,
@@ -415,6 +425,39 @@ mod tests {
 
         assert!(!options.sync_all);
         assert_eq!(options.search_storage, MetadataSearchStorage::Disk);
+    }
+
+    // The graph was never written, so a returned summary can only come from the summary cache;
+    // a cursor advance must fall through to the store.
+    #[tokio::test]
+    async fn summary_follows_cursor() {
+        let dir = tempfile::tempdir().expect("graph dir");
+        let graph = GraphHandle::open(dir.path(), node_id(1), None, None, memory_options())
+            .expect("graph opens");
+        let graph_iri = "https://w3id.org/aruna/summary".to_string();
+        let cursor = ulid::Ulid::from_parts(1, 1);
+        let at = |cursor| aruna_core::metadata::MetadataEffect::ExportSummaryAt {
+            graph_iri: graph_iri.clone(),
+            cursor,
+        };
+        (graph.inner.summaries).insert(
+            &graph_iri,
+            cursor,
+            "{\"cached\":true}",
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            graph.run(at(cursor)).await,
+            aruna_core::metadata::MetadataEvent::RoCrateSummaryResult {
+                graph_iri: graph_iri.clone(),
+                jsonld: "{\"cached\":true}".to_string(),
+            }
+        );
+        let stale = graph.run(at(ulid::Ulid::from_parts(2, 2))).await;
+        assert!(!matches!(
+            stale,
+            aruna_core::metadata::MetadataEvent::RoCrateSummaryResult { .. }
+        ));
     }
 
     #[tokio::test]

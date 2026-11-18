@@ -12,11 +12,11 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{GuardError, authority_read, record_epoch};
+use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
@@ -24,17 +24,19 @@ use crate::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect, abort_effects};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    SOURCE_INDEX_KEYSPACE,
 };
-use aruna_core::calls::ChildOutcome;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
+use aruna_core::rows::{read_row, value, values};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{
@@ -52,8 +54,7 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEp
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication_queue::build_live_obligation;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -105,6 +106,12 @@ pub enum MaterializeReferenceError {
     Distribution(#[from] GuardError),
 }
 
+impl From<IoError> for MaterializeReferenceError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 /// Heads the staged source and records it as a reference version: the head's connector and
 /// its mirrors are re-checked when the version commits.
 #[derive(Debug, PartialEq)]
@@ -112,11 +119,8 @@ pub struct MaterializeReferenceOperation {
     input: Option<MaterializeReferenceInput>,
     now: SystemTime,
     fresh: Ulid,
-    /// The source head runs as a child; its result comes back as a child event.
-    heading: bool,
-    write: Option<WriteReferenceOperation>,
+    /// What the head found, once the reference write runs.
     found: Option<(SourceConnector, SourceMetadata, VersionSourceBinding)>,
-    output: Option<Result<MaterializeReferenceResult, MaterializeReferenceError>>,
 }
 
 impl MaterializeReferenceOperation {
@@ -126,25 +130,13 @@ impl MaterializeReferenceOperation {
             input: Some(input),
             now,
             fresh,
-            heading: false,
-            write: None,
             found: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: MaterializeReferenceError) -> Effects {
-        self.heading = false;
-        self.write = None;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    /// Builds the reference write from the head, or hands the head error back.
-    fn headed(&mut self, head: HeadSourceResult) -> Effects {
-        let Some(input) = self.input.take() else {
-            return self.fail(StorageError::InvalidEffect.into());
-        };
+    /// Builds the reference write from the head.
+    fn headed(&mut self, head: HeadSourceResult) -> Result<IoCall, MaterializeReferenceError> {
+        let input = self.input.take().ok_or(StorageError::InvalidEffect)?;
         let mut version_source = build_source_binding(
             StagingStrategy::Reference,
             &head.connector,
@@ -186,91 +178,41 @@ impl MaterializeReferenceOperation {
             job_id: input.job_id,
         };
         self.found = Some((head.connector, head.metadata, version_source));
-        let mut operation = WriteReferenceOperation::new(write, self.now, self.fresh);
-        let effects = operation.start();
-        self.write_step(operation, effects)
-    }
-
-    fn write_step(&mut self, operation: WriteReferenceOperation, effects: Effects) -> Effects {
-        if !operation.is_complete() {
-            self.write = Some(operation);
-            return effects;
-        }
-        match (operation.finalize(), self.found.take()) {
-            (Ok((version_id, _)), Some((connector, source_metadata, version_source))) => {
-                self.output = Some(Ok(MaterializeReferenceResult {
-                    connector,
-                    source_metadata,
-                    version_source,
-                    version_id,
-                }));
-                effects
-            }
-            (Ok(_), None) => self.fail(StorageError::InvalidEffect.into()),
-            (Err(error), _) => self.fail(error),
-        }
-    }
-
-    fn head_step(&mut self, event: Event) -> Effects {
-        self.heading = false;
-        let Event::Child(outcome) = event else {
-            let label = event.label();
-            return self.fail(StorageError::ReadError(format!("unexpected event {label}")).into());
-        };
-        match outcome.take::<HeadSourceResult, HeadSourceError>() {
-            Some(Ok(head)) => self.headed(head),
-            Some(Err(error)) => self.fail(error.into()),
-            None => self.fail(StorageError::ReadError("unexpected head answer".into()).into()),
-        }
+        let write = WriteReferenceOperation::new(write, self.now, self.fresh);
+        Ok(IoCall::child(write))
     }
 }
 
-impl EffectOperation for MaterializeReferenceOperation {
+impl Operation for MaterializeReferenceOperation {
     type Output = MaterializeReferenceResult;
     type Error = MaterializeReferenceError;
 
-    fn start(&mut self) -> Effects {
-        let Some(input) = self.input.as_ref() else {
-            return self.fail(StorageError::InvalidEffect.into());
-        };
+    fn first(&mut self) -> Result<Next<MaterializeReferenceResult>, MaterializeReferenceError> {
+        let input = self.input.as_ref().ok_or(StorageError::InvalidEffect)?;
         let head = HeadSourceOperation::new(HeadSourceInput {
             group_id: input.group_id,
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
         });
-        self.heading = true;
-        let child = boxed_suboperation(head, |result| Event::Child(ChildOutcome::new(result)));
-        smallvec![Effect::SubOperation(child)]
+        Ok(Next::Call(IoCall::child(head)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.heading {
-            return self.head_step(event);
-        }
-        if let Some(mut write) = self.write.take() {
-            let effects = write.step(event);
-            return self.write_step(write, effects);
-        }
-        let label = event.label();
-        self.fail(StorageError::ReadError(format!("unexpected event {label}")).into())
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some() && !self.heading && self.write.is_none()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(StorageError::ReadError(
-            "the reference was not written".into(),
-        )
-        .into()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.write.as_mut() {
-            Some(write) => write.abort(),
-            None => smallvec![],
-        }
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<MaterializeReferenceResult>, MaterializeReferenceError> {
+        let Some((connector, source_metadata, version_source)) = self.found.take() else {
+            let head = result.child::<HeadSourceResult, HeadSourceError>()??;
+            return Ok(Next::Call(self.headed(head)?));
+        };
+        let written = result.child::<(Ulid, bool), MaterializeReferenceError>()?;
+        let (version_id, _) = written?;
+        Ok(Next::Done(MaterializeReferenceResult {
+            connector,
+            source_metadata,
+            version_source,
+            version_id,
+        }))
     }
 }
 
@@ -301,11 +243,9 @@ pub struct ReferenceWrite {
     pub job_id: Option<Ulid>,
 }
 
-/// Where a reference write is.
+/// What the pending call of a reference write answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteState {
-    Init,
-    Begin,
     Fence,
     Bucket,
     Authority,
@@ -317,12 +257,9 @@ enum WriteState {
     Current,
     Rows,
     Usage,
-    Commit,
-    Schedule,
-    Abort,
-    Finish,
-    Error,
 }
+
+type WriteNext = Result<Next<(Ulid, bool)>, MaterializeReferenceError>;
 
 /// Writes one reference version in one transaction. Outputs the version id and whether
 /// anything changed: the same binding with the same observation at the head is kept.
@@ -332,7 +269,6 @@ pub struct WriteReferenceOperation {
     now: SystemTime,
     fresh: Ulid,
     state: WriteState,
-    txn_id: Option<TxnId>,
     policies: Vec<PlacementPolicyRef>,
     binding: Option<DistributionBinding>,
     epoch: OriginalEpoch,
@@ -341,8 +277,6 @@ pub struct WriteReferenceOperation {
     pointer: Option<CurrentVersionPointer>,
     rows: VecDeque<Effect>,
     usage: Option<UsageCounterUpdate>,
-    result: Option<(Ulid, bool)>,
-    output: Option<Result<(Ulid, bool), MaterializeReferenceError>>,
 }
 
 impl WriteReferenceOperation {
@@ -352,8 +286,7 @@ impl WriteReferenceOperation {
             write,
             now,
             fresh,
-            state: WriteState::Init,
-            txn_id: None,
+            state: WriteState::Fence,
             policies: Vec::new(),
             binding: None,
             epoch: OriginalEpoch::default(),
@@ -362,60 +295,32 @@ impl WriteReferenceOperation {
             pointer: None,
             rows: VecDeque::new(),
             usage: None,
-            result: None,
-            output: None,
         }
     }
 
-    fn txn(&self) -> Result<TxnId, MaterializeReferenceError> {
-        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
-    }
-
-    fn read(
-        &mut self,
-        state: WriteState,
-        key_space: &str,
-        key: Key,
-    ) -> Result<Effects, MaterializeReferenceError> {
-        let txn_id = self.txn()?;
+    fn call(&mut self, state: WriteState, call: IoCall) -> WriteNext {
         self.state = state;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Next::Call(call))
     }
 
-    /// Ends with `error`, aborting the open transaction first.
-    fn fail(&mut self, error: MaterializeReferenceError) -> Effects {
-        self.output = Some(Err(error));
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = WriteState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = WriteState::Error;
-                smallvec![]
-            }
+    fn read(&mut self, state: WriteState, key_space: &str, key: impl Into<Key>) -> WriteNext {
+        self.call(state, read_row(key_space, key))
+    }
+
+    /// Ends with `result`; a changed head wakes the usage snapshot after the commit, and a
+    /// missed wake only delays that snapshot.
+    fn finish(&self, result: (Ulid, bool)) -> WriteNext {
+        if !result.1 {
+            return Ok(Next::Done(result));
         }
-    }
-
-    /// Commits and ends with `result`; a changed head schedules the usage snapshot afterwards.
-    fn commit(&mut self, result: (Ulid, bool)) -> Result<Effects, MaterializeReferenceError> {
-        let txn_id = self
-            .txn_id
-            .take()
-            .ok_or(StorageError::TransactionNotFound)?;
-        self.result = Some(result);
-        self.state = WriteState::Commit;
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction { txn_id }
-        )])
+        Ok(Next::Then {
+            output: result,
+            calls: vec![IoCall::Effect(Box::new(schedule_snapshot_publish()))],
+        })
     }
 
     /// The bucket as read in the transaction must be the one the caller saw.
-    fn bucket_read(&mut self, value: Option<Value>) -> Result<Effects, MaterializeReferenceError> {
+    fn bucket_read(&mut self, value: Option<Value>) -> WriteNext {
         let current = (value.as_ref())
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
@@ -438,16 +343,15 @@ impl WriteReferenceOperation {
             // Only the coordinator of the key's range writes, at its epoch; the read in the
             // write transaction conflicts with a fence set meanwhile.
             Some(binding) => {
-                let read = authority_read(binding.set_id, Some(self.txn()?));
-                self.state = WriteState::Authority;
-                Ok(smallvec![read])
+                let reads = authority_reads(binding.set_id);
+                self.call(WriteState::Authority, IoCall::Read(reads))
             }
             None => self.named(),
         }
     }
 
     /// Names the version and starts the connector checks.
-    fn named(&mut self) -> Result<Effects, MaterializeReferenceError> {
+    fn named(&mut self) -> WriteNext {
         let hint = self.binding.as_ref().map(DistributionBinding::hint);
         if let (Some(hint), Some(planned)) = (hint, self.write.preassigned_version_id)
             && SetHint::of_version(planned) != hint
@@ -474,7 +378,7 @@ impl WriteReferenceOperation {
     }
 
     /// Re-reads the next mirror connector, or goes on to the head once all are checked.
-    fn next_mirror(&mut self) -> Result<Effects, MaterializeReferenceError> {
+    fn next_mirror(&mut self) -> WriteNext {
         let Some(connector) = self.write.mirror_guards.get(self.mirror) else {
             return self.versions();
         };
@@ -484,20 +388,20 @@ impl WriteReferenceOperation {
     }
 
     /// A planned version is read first; otherwise the current head.
-    fn versions(&mut self) -> Result<Effects, MaterializeReferenceError> {
+    fn versions(&mut self) -> WriteNext {
         let (bucket, key) = (&self.write.bucket, &self.write.key);
         match self.write.preassigned_version_id {
             Some(_) => {
                 let row = VersionKey::new(bucket, key, self.version_id).to_bytes()?;
-                self.read(WriteState::Planned, BLOB_VERSIONS_KEYSPACE, row.into())
+                self.read(WriteState::Planned, BLOB_VERSIONS_KEYSPACE, row)
             }
             None => self.pointer(),
         }
     }
 
-    fn pointer(&mut self) -> Result<Effects, MaterializeReferenceError> {
+    fn pointer(&mut self) -> WriteNext {
         let head = BlobHeadKey::new(&self.write.bucket, &self.write.key).to_bytes()?;
-        self.read(WriteState::Pointer, BLOB_HEAD_KEYSPACE, head.into())
+        self.read(WriteState::Pointer, BLOB_HEAD_KEYSPACE, head)
     }
 
     /// Whether `version` already references the same source with the same observation.
@@ -511,11 +415,7 @@ impl WriteReferenceOperation {
     }
 
     /// The rows of a new head version, in write order, and its usage update.
-    fn plan_rows(
-        &mut self,
-        existing: Option<BlobVersion>,
-    ) -> Result<Effects, MaterializeReferenceError> {
-        let txn_id = self.txn()?;
+    fn plan_rows(&mut self, existing: Option<BlobVersion>) -> WriteNext {
         let write = &self.write;
         // An offered directory observation is charged only while it is the head.
         let released =
@@ -533,7 +433,7 @@ impl WriteReferenceOperation {
             &write.key,
         );
         let mut rows: VecDeque<Effect> =
-            build_transition_effects(&alias, Some(next_pointer), None, Some(txn_id))?
+            build_transition_effects(&alias, Some(next_pointer), None, None)?
                 .into_iter()
                 .collect();
         let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
@@ -561,14 +461,14 @@ impl WriteReferenceOperation {
             version_id,
             now_ms,
         );
-        let effect = write_version_effect(&version_key, &version, Some(txn_id))?;
+        let effect = write_version_effect(&version_key, &version, None)?;
         rows.push_back(journaled(effect, &uploaded)?);
         for (key_space, key, value) in connector_reference_write(&version, &version_key)? {
             rows.push_back(Effect::Storage(StorageEffect::Write {
                 key_space,
                 key,
                 value,
-                txn_id: Some(txn_id),
+                txn_id: None,
             }));
         }
         // The obligation commits with the version, so its fan-out survives a crash.
@@ -585,7 +485,7 @@ impl WriteReferenceOperation {
             write.key.clone(),
             version_id,
             false,
-            Some(txn_id),
+            None,
         )?);
         let referenced_bytes = write.metadata.content_length;
         let added = AddedVersion {
@@ -611,162 +511,23 @@ impl WriteReferenceOperation {
     }
 
     /// Writes the next planned row, then runs the usage update, then commits.
-    fn next_row(&mut self) -> Result<Effects, MaterializeReferenceError> {
+    fn next_row(&mut self) -> WriteNext {
         if let Some(row) = self.rows.pop_front() {
-            self.state = WriteState::Rows;
-            return Ok(smallvec![row]);
+            return self.call(WriteState::Rows, IoCall::from(row));
         }
-        let txn_id = self.txn()?;
         match self.usage.as_mut() {
             Some(usage) => {
-                self.state = WriteState::Usage;
-                Ok(usage.start(txn_id))
+                let call = usage.start_calls().into_call();
+                self.call(WriteState::Usage, call)
             }
-            None => self.commit((self.version_id, true)),
+            None => self.finish((self.version_id, true)),
         }
     }
 
-    fn step_inner(&mut self, event: Event) -> Result<Effects, MaterializeReferenceError> {
-        let (bucket, key) = (self.write.bucket.clone(), self.write.key.clone());
-        match (self.state, event) {
-            (WriteState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = WriteState::Fence;
-                Ok(smallvec![write_fence_read(&bucket, Some(txn_id))])
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (WriteState::Fence, event) => {
-                check_write_fence(event, &bucket, &key)?;
-                self.read(
-                    WriteState::Bucket,
-                    S3_BUCKET_KEYSPACE,
-                    bucket.as_bytes().into(),
-                )
-            }
-            (WriteState::Bucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.bucket_read(value)
-            }
-            (WriteState::Authority, event) => {
-                let binding = self.binding.as_ref().ok_or(StorageError::InvalidEffect)?;
-                self.epoch = record_epoch(binding, &key, event)?;
-                self.named()
-            }
-            (WriteState::Connector, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let (connector, _) =
-                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
-                guard_record(connector, value)?;
-                let connector_id = connector.connector_id;
-                self.state = WriteState::Secret;
-                Ok(smallvec![read_secret_effect(
-                    connector_id,
-                    Some(self.txn()?)
-                )])
-            }
-            (WriteState::Secret, event) => {
-                let (connector, fingerprint) =
-                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
-                let current = match parse_secret_read(event, connector.connector_id) {
-                    Ok(secret) => secret,
-                    Err(StorageReadError::Storage(error)) => return Err(error.into()),
-                    Err(StorageReadError::Conversion(error)) => return Err(error.into()),
-                };
-                if current.as_ref().map(secret_fingerprint) != *fingerprint {
-                    return Err(StorageError::TransactionConflict.into());
-                }
-                self.next_mirror()
-            }
-            (WriteState::Mirror, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let checked = self.mirror.checked_sub(1);
-                let connector = (checked.and_then(|index| self.write.mirror_guards.get(index)))
-                    .ok_or(StorageError::InvalidEffect)?;
-                guard_record(connector, value)?;
-                self.next_mirror()
-            }
-            (WriteState::Planned, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let existing = (value.as_ref())
-                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
-                    .transpose()?;
-                match existing {
-                    Some(existing) if self.same_reference(&existing) => {
-                        self.commit((self.version_id, false))
-                    }
-                    Some(_) => Err(StorageError::WriteError(
-                        "planned reference version changed".into(),
-                    )
-                    .into()),
-                    None => self.pointer(),
-                }
-            }
-            (WriteState::Pointer, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.pointer = (value.as_ref())
-                    .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-                    .transpose()?;
-                match self.pointer.as_ref() {
-                    Some(pointer) => {
-                        let row = VersionKey::new(&bucket, &key, pointer.version_id).to_bytes()?;
-                        self.read(WriteState::Current, BLOB_VERSIONS_KEYSPACE, row.into())
-                    }
-                    None => self.plan_rows(None),
-                }
-            }
-            (WriteState::Current, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let existing = (value.as_ref())
-                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
-                    .transpose()?;
-                let kept = (self.write.preassigned_version_id.is_none())
-                    .then(|| {
-                        existing
-                            .as_ref()
-                            .filter(|version| self.same_reference(version))
-                    })
-                    .flatten()
-                    .and(self.pointer.as_ref().map(|pointer| pointer.version_id));
-                match kept {
-                    Some(version_id) => self.commit((version_id, false)),
-                    None => self.plan_rows(existing),
-                }
-            }
-            (
-                WriteState::Rows,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. }
-                    | StorageEvent::BatchWriteResult { .. }
-                    | StorageEvent::DeleteResult { .. },
-                ),
-            ) => self.next_row(),
-            (WriteState::Usage, event) => {
-                let txn_id = self.txn()?;
-                let usage = self.usage.as_mut().ok_or(StorageError::InvalidEffect)?;
-                match usage.step(event, txn_id)? {
-                    Some(effects) => Ok(effects),
-                    None => {
-                        self.usage = None;
-                        self.commit((self.version_id, true))
-                    }
-                }
-            }
-            (WriteState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                let result = self.result.ok_or(StorageError::InvalidEffect)?;
-                if !result.1 {
-                    self.state = WriteState::Finish;
-                    self.output = Some(Ok(result));
-                    return Ok(smallvec![]);
-                }
-                self.state = WriteState::Schedule;
-                Ok(smallvec![schedule_snapshot_publish()])
-            }
-            // A missed snapshot timer only delays the usage snapshot; the commit stands.
-            (WriteState::Schedule, Event::Task(_)) => {
-                self.state = WriteState::Finish;
-                self.output = self.result.map(Ok);
-                Ok(smallvec![])
-            }
-            (state, event) => Err(StorageError::ReadError(format!(
-                "unexpected event {} in state {state:?}",
-                event.label()
-            ))
-            .into()),
-        }
+    fn existing(value: Option<Value>) -> Result<Option<BlobVersion>, ConversionError> {
+        (value.as_ref())
+            .map(|value| BlobVersion::from_bytes(value.as_ref()))
+            .transpose()
     }
 }
 
@@ -784,52 +545,116 @@ fn guard_record(
     }
 }
 
-impl EffectOperation for WriteReferenceOperation {
+impl Operation for WriteReferenceOperation {
     type Output = (Ulid, bool);
     type Error = MaterializeReferenceError;
 
-    fn start(&mut self) -> Effects {
-        self.state = WriteState::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> WriteNext {
+        let fence = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.write.bucket));
+        Ok(Next::Call(fence))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == WriteState::Abort {
-            self.state = WriteState::Error;
-            return smallvec![];
-        }
-        if self.state == WriteState::Commit
-            && let Event::Storage(StorageEvent::Error { error }) = &event
-        {
-            // A failed commit leaves no transaction to abort.
-            let error = error.clone();
-            self.state = WriteState::Error;
-            self.output = Some(Err(error.into()));
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, WriteState::Finish | WriteState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn next(&mut self, result: IoResult) -> WriteNext {
+        let (bucket, key) = (self.write.bucket.clone(), self.write.key.clone());
         match self.state {
-            WriteState::Finish | WriteState::Error => self.output.unwrap_or(Err(
-                StorageError::WriteError("the reference write did not finish".into()).into(),
-            )),
-            _ => Err(StorageError::WriteError("the reference write did not finish".into()).into()),
+            WriteState::Fence => {
+                check_fence_row(value(result)?.as_deref(), &bucket, &key)?;
+                self.read(WriteState::Bucket, S3_BUCKET_KEYSPACE, bucket.into_bytes())
+            }
+            WriteState::Bucket => self.bucket_read(value(result)?),
+            WriteState::Authority => {
+                let [record, fence] = values::<2>(result)?;
+                let binding = self.binding.as_ref().ok_or(StorageError::InvalidEffect)?;
+                self.epoch = write_epoch(binding, &key, record.as_deref(), fence.as_deref())?;
+                self.named()
+            }
+            WriteState::Connector => {
+                let (connector, _) =
+                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
+                guard_record(connector, value(result)?)?;
+                let read = IoCall::from(read_secret_effect(connector.connector_id, None));
+                self.call(WriteState::Secret, read)
+            }
+            WriteState::Secret => {
+                let (connector, fingerprint) =
+                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
+                let current = match parse_secret_read(result.event()?, connector.connector_id) {
+                    Ok(secret) => secret,
+                    Err(StorageReadError::Storage(error)) => return Err(error.into()),
+                    Err(StorageReadError::Conversion(error)) => return Err(error.into()),
+                };
+                if current.as_ref().map(secret_fingerprint) != *fingerprint {
+                    return Err(StorageError::TransactionConflict.into());
+                }
+                self.next_mirror()
+            }
+            WriteState::Mirror => {
+                let checked = self.mirror.checked_sub(1);
+                let connector = (checked.and_then(|index| self.write.mirror_guards.get(index)))
+                    .ok_or(StorageError::InvalidEffect)?;
+                guard_record(connector, value(result)?)?;
+                self.next_mirror()
+            }
+            WriteState::Planned => match Self::existing(value(result)?)? {
+                Some(existing) if self.same_reference(&existing) => {
+                    self.finish((self.version_id, false))
+                }
+                Some(_) => {
+                    Err(StorageError::WriteError("planned reference version changed".into()).into())
+                }
+                None => self.pointer(),
+            },
+            WriteState::Pointer => {
+                self.pointer = (value(result)?.as_ref())
+                    .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+                    .transpose()?;
+                match self.pointer.as_ref() {
+                    Some(pointer) => {
+                        let row = VersionKey::new(&bucket, &key, pointer.version_id).to_bytes()?;
+                        self.read(WriteState::Current, BLOB_VERSIONS_KEYSPACE, row)
+                    }
+                    None => self.plan_rows(None),
+                }
+            }
+            WriteState::Current => {
+                let existing = Self::existing(value(result)?)?;
+                let kept = (self.write.preassigned_version_id.is_none())
+                    .then(|| {
+                        existing
+                            .as_ref()
+                            .filter(|version| self.same_reference(version))
+                    })
+                    .flatten()
+                    .and(self.pointer.as_ref().map(|pointer| pointer.version_id));
+                match kept {
+                    Some(version_id) => self.finish((version_id, false)),
+                    None => self.plan_rows(existing),
+                }
+            }
+            WriteState::Rows => match result.event()? {
+                Event::Storage(
+                    StorageEvent::WriteResult { .. }
+                    | StorageEvent::BatchWriteResult { .. }
+                    | StorageEvent::DeleteResult { .. },
+                ) => self.next_row(),
+                other => Err(StorageError::ReadError(format!(
+                    "unexpected event {} for a reference row",
+                    other.label()
+                ))
+                .into()),
+            },
+            WriteState::Usage => {
+                let usage = self.usage.as_mut().ok_or(StorageError::InvalidEffect)?;
+                match usage.step_calls(result)? {
+                    Some(call) => Ok(Next::Call(call.into_call())),
+                    None => self.finish((self.version_id, true)),
+                }
+            }
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -1035,9 +860,9 @@ mod tests {
     }
 
     /// Stores `bucket-a` for `group_id`, so only the guard under test can refuse the write.
-    async fn seed_bucket(context: &DriverContext, group_id: Ulid) {
+    fn seeded_bucket(group_id: Ulid) -> BucketInfo {
         let realm_id = RealmId::from_bytes([6u8; 32]);
-        let bucket = BucketInfo {
+        BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
@@ -1047,7 +872,11 @@ mod tests {
             placement_policy_generation: 0,
             compression: Compression::Off,
             distribution: None,
-        };
+        }
+    }
+
+    async fn seed_bucket(context: &DriverContext, group_id: Ulid) {
+        let bucket = seeded_bucket(group_id);
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1632,7 +1461,9 @@ mod tests {
             node_id: iroh::SecretKey::generate().public(),
             user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
         };
-        offer_directory(context, offer.clone()).await.unwrap();
+        drive(offer_directory(offer.clone()), context)
+            .await
+            .unwrap();
 
         let write = ReferenceWrite {
             job_id: None,
@@ -1721,66 +1552,146 @@ mod tests {
         WriteReferenceOperation::new(write, SystemTime::UNIX_EPOCH, Ulid::from_bytes([5; 16]))
     }
 
-    // The write opens its transaction, reads the purge fence in it and aborts on a missing bucket.
+    // The write reads the purge fence, then the bucket, in its transaction; a missing bucket
+    // is a conflict.
     #[test]
-    fn missing_bucket_aborts() {
-        use aruna_core::operation_check::check_trace;
-        let txn_id = Ulid::from_bytes([9; 16]);
+    fn missing_bucket_conflicts() {
         let mut operation = pure_write();
-        check_trace(
-            &mut operation,
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })],
-            vec![
-                (
-                    Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-                    vec![write_fence_read("bucket-a", Some(txn_id))],
-                ),
-                (
-                    Event::Storage(StorageEvent::ReadResult {
-                        key: Vec::new().into(),
-                        value: None,
-                    }),
-                    vec![Effect::Storage(StorageEffect::Read {
-                        key_space: S3_BUCKET_KEYSPACE.to_string(),
-                        key: b"bucket-a".to_vec().into(),
-                        txn_id: Some(txn_id),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::ReadResult {
-                        key: Vec::new().into(),
-                        value: None,
-                    }),
-                    vec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-                ),
-                (
-                    Event::Storage(StorageEvent::TransactionAborted { txn_id }),
-                    Vec::new(),
-                ),
-            ],
-        );
-        assert_conflict(operation.finalize().map(|_| ()));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        let fence = read_row(PURGE_FENCE_KEYSPACE, fence_key("bucket-a"));
+        assert_eq!(operation.first(), Ok(Next::Call(fence)));
+        let bucket = read_row(S3_BUCKET_KEYSPACE, b"bucket-a".to_vec());
+        let absent = || IoResult::Values(vec![None]);
+        assert_eq!(operation.next(absent()), Ok(Next::Call(bucket)));
+        assert_conflict(operation.next(absent()).map(|_| ()));
     }
 
-    // Unstarted operations refuse every event, abort an open transaction and never finish early.
+    fn at_head() -> WriteReferenceOperation {
+        let mut operation = pure_write();
+        operation.state = WriteState::Pointer;
+        operation.binding = None;
+        operation
+    }
+
+    // A new head writes its rows one by one, updates usage and wakes the snapshot publisher
+    // after the commit.
     #[test]
-    fn rejects_unexpected() {
-        use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
-        let all = sample_events().len();
-        assert_eq!(
-            rejects_events(pure_write, sample_events, |_| false).len(),
-            all
+    fn head_wakes_publisher() {
+        let mut operation = at_head();
+        let absent = IoResult::Values(vec![None]);
+        assert!(matches!(
+            operation.next(absent),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let written = || {
+            IoResult::Event(Box::new(Event::Storage(StorageEvent::WriteResult {
+                key: Vec::new().into(),
+            })))
+        };
+        let mut next = operation.next(written());
+        while matches!(next, Ok(Next::Call(IoCall::Effect(_)))) {
+            next = operation.next(written());
+        }
+        assert!(matches!(next, Ok(Next::Call(IoCall::AddUsage { .. }))));
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("expected the version and the wake");
+        };
+        assert_eq!(output, (Ulid::from_bytes([5; 16]), true));
+        assert_eq!(calls.len(), 1);
+    }
+
+    // A head that already references the same observation keeps it and changes nothing.
+    #[test]
+    fn same_head_kept() {
+        let mut operation = at_head();
+        let held = Ulid::from_bytes([8; 16]);
+        let pointer = CurrentVersionPointer::new(held).to_bytes().unwrap();
+        let stored = IoResult::Values(vec![Some(pointer.into())]);
+        assert!(matches!(
+            operation.next(stored),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let version = BlobVersion::reference(
+            operation.write.version_source.clone(),
+            operation.write.metadata.clone(),
+            SystemTime::UNIX_EPOCH,
+            operation.write.user_id,
+            SystemTime::UNIX_EPOCH,
         );
-        rejects_finalize(pure_write());
-        let mut open = pure_write();
-        open.start();
-        let txn_id = Ulid::from_bytes([9; 16]);
-        open.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let current = IoResult::Values(vec![Some(version.to_bytes().unwrap().into())]);
+        assert_eq!(operation.next(current), Ok(Next::Done((held, false))));
+    }
+
+    fn materialize_input() -> MaterializeReferenceInput {
+        let write = pure_write().write;
+        MaterializeReferenceInput {
+            group_id: write.group_id,
+            user_id: write.user_id,
+            realm_id: write.realm_id,
+            node_id: write.node_id,
+            connector_id: connector().connector_id,
+            source_path: "a".to_string(),
+            bucket: write.bucket,
+            key: write.key,
+            expected_bucket: seeded_bucket(write.group_id),
+            inherited_policies: Vec::new(),
+            restrictions: None,
+            mirrors: Vec::new(),
+            job_id: None,
+        }
+    }
+
+    // A materialization heads the source, then writes the reference, each as a child.
+    #[test]
+    fn materialize_runs_children() {
+        use aruna_core::calls::ChildOutcome;
+        let version_id = Ulid::from_bytes([5; 16]);
+        let mut operation = MaterializeReferenceOperation::new(
+            materialize_input(),
+            SystemTime::UNIX_EPOCH,
+            version_id,
+        );
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let metadata = pure_write().write.metadata;
+        let head: Result<HeadSourceResult, HeadSourceError> = Ok(HeadSourceResult {
+            connector: connector(),
+            secret_fingerprint: None,
+            metadata: metadata.clone(),
+        });
+        let write = operation.next(IoResult::Child(ChildOutcome::new(head)));
+        assert!(matches!(write, Ok(Next::Call(IoCall::Child(_)))));
+        let written: Result<(Ulid, bool), MaterializeReferenceError> = Ok((version_id, true));
+        let Ok(Next::Done(result)) = operation.next(IoResult::Child(ChildOutcome::new(written)))
+        else {
+            panic!("expected the materialized reference");
+        };
+        assert_eq!(result.version_id, version_id);
+        assert_eq!(result.source_metadata, metadata);
+    }
+
+    // A failed head is the materialization's error.
+    #[test]
+    fn head_failure_surfaces() {
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::errors::SourceResolutionError;
+        let mut operation = MaterializeReferenceOperation::new(
+            materialize_input(),
+            SystemTime::UNIX_EPOCH,
+            Ulid::nil(),
+        );
+        operation.first().unwrap();
+        let failed: Result<HeadSourceResult, HeadSourceError> =
+            Err(SourceResolutionError::NotFound.into());
         assert_eq!(
-            open.abort().as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            operation.next(IoResult::Child(ChildOutcome::new(failed))),
+            Err(HeadSourceError::Resolve(SourceResolutionError::NotFound).into())
         );
     }
 }

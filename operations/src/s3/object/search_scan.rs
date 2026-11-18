@@ -23,6 +23,7 @@ use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_core::types::{GroupId, Key, TxnId};
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
@@ -203,7 +204,7 @@ async fn authorize(
     }
     let policy_scope = (input.realm_id, candidate.hit.group_id);
     if !evaluators.contains_key(&policy_scope) {
-        evaluators.extend(PolicyEvaluator::load_bulk(context, vec![policy_scope]).await?);
+        evaluators.extend(drive(PolicyBulkOperation::new(vec![policy_scope]), context).await?);
     }
     let request = policy_request_with(
         &path,

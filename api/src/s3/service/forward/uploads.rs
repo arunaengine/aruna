@@ -70,7 +70,7 @@ impl ArunaS3Service {
             .map(|upload| (upload.key.clone(), upload.upload_id))
             .collect();
         let mut response = list_uploads_output(input, max_uploads, result);
-        let tags = upload_tags(self.state.as_ref(), binding, &listed)
+        let tags = drive(upload_tags(binding, &listed), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))?;
         let output = &mut response.output;
@@ -111,7 +111,7 @@ impl ArunaS3Service {
         let listed: Vec<(String, Ulid)> = (result.uploads.iter())
             .map(|upload| (upload.key.clone(), upload.upload_id))
             .collect();
-        let tags = upload_tags(self.state.as_ref(), binding, &listed)
+        let tags = drive(upload_tags(binding, &listed), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))?;
         let prefixes = result.common_prefixes.clone();

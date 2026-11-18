@@ -8,6 +8,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::job_service::{
+    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
+};
 use crate::jobs::{family_report, submit_external_job};
 use crate::routes::routes_at;
 use aruna_core::compute::{
@@ -22,14 +25,10 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
-use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
+use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::service::{
-    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
-};
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
@@ -50,6 +49,8 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
 use crate::server::state::ServerState;
+use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
+use aruna_operations::auth::bearer_token::UserCutoffOperation;
 
 /// GA4GH TES version this facade implements.
 const TES_VERSION: &str = "1.1.0";
@@ -701,16 +702,18 @@ pub async fn create_task(
     let workspace_mode = target_modes(target).1;
 
     if target == ExecutionTarget::Local {
-        return match submit_local_execution(
-            &state.get_ctx(),
-            LocalExecutionConfig {
-                spec,
-                owner: caller.auth.user_id,
-                node_id: state.get_node_id(),
-                idempotency_key,
-                workspace_mode,
-                retention_ms: state.rocrate_limits().artifact_retention_ms,
-            },
+        let config = LocalExecutionConfig {
+            spec,
+            owner: caller.auth.user_id,
+            node_id: state.get_node_id(),
+            idempotency_key,
+            workspace_mode,
+            retention_ms: state.rocrate_limits().artifact_retention_ms,
+        };
+        let context = state.get_ctx();
+        return match drive(
+            LocalRunOperation::on_node(config, &context),
+            context.as_ref(),
         )
         .await
         {
@@ -2090,11 +2093,14 @@ async fn authenticate_tes(
         )
     };
     let context = state.get_ctx();
-    let (storage, owner) = (&context.storage_handle, &access.user_identity);
-    let cutoff = realm_user_cutoff(storage, state.get_realm_id(), owner)
-        .await
-        .map_err(unavailable)?;
-    let deactivated = account_deactivated(storage, owner)
+    let owner = &access.user_identity;
+    let cutoff = drive(
+        UserCutoffOperation::new(state.get_realm_id(), owner),
+        &context,
+    )
+    .await
+    .map_err(unavailable)?;
+    let deactivated = drive(AccountDeactivatedOperation::new(owner), &context)
         .await
         .map_err(unavailable)?;
     if deactivated || cutoff.is_some_and(|cutoff| issued < cutoff) {

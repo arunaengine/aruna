@@ -4,16 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, RunTrigger};
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
+use crate::plugin_host::jobs::start_work;
+use crate::plugin_host::worker::{notify_work, prune_runs};
 use crate::plugins::host_calls::call_intent;
-use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::start_work;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::page_result;
 use crate::plugins::rows::tests::values_result;
@@ -22,7 +23,6 @@ use crate::plugins::submit::WorkRequest;
 use crate::plugins::submit::tests::{path, ready, request, scope};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
-use crate::plugins::worker::{notify_work, prune_runs};
 use crate::s3::object::copy::test::seed_bucket;
 
 /// An install whose version copies and has a `job_finished` trigger, with buckets `in` and `out`.
@@ -342,7 +342,7 @@ fn due_after_success() {
 }
 
 #[test]
-fn failed_run_not_due() {
+fn failed_run_waits() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let (row, _) = settled_work();
     let mut due = completions(&install);

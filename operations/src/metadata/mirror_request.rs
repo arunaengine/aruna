@@ -118,7 +118,7 @@ impl Operation for MirrorRequestOperation {
                     .map_err(|error| MetadataError::Backend(error.to_string()))?;
                 self.answered(answer)
             }
-            Err(PeerRequestError::Failed(error)) => Err(error),
+            Err(PeerRequestError::Failed(error) | PeerRequestError::NotSent(error)) => Err(error),
             Err(PeerRequestError::TimedOut) => Err(MetadataError::Backend(
                 "sync mirror request timed out".to_string(),
             )),

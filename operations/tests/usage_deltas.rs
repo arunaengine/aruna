@@ -1236,14 +1236,14 @@ async fn promote_observation(h: &Harness, bucket: &str, group_id: Ulid) {
         node_id: h.node_id,
         user_id: h.created_by,
     };
-    offer_directory(&h.driver, offer).await.unwrap();
+    drive(offer_directory(offer), &h.driver).await.unwrap();
     let withdrawal = WithdrawOfferInput {
         bucket: bucket.to_string(),
         realm_id: h.realm_id,
         node_id: h.node_id,
         user_id: h.created_by,
     };
-    withdraw_offer(&h.driver, withdrawal).await.unwrap();
+    drive(withdraw_offer(withdrawal), &h.driver).await.unwrap();
     let head = BlobHeadKey::new(bucket, "data.bin").to_bytes().unwrap();
     let head = read_key(&h.driver, BLOB_HEAD_KEYSPACE, head).await.unwrap();
     let marker = CurrentVersionPointer::from_bytes(&head).unwrap().version_id;

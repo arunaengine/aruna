@@ -2,51 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::{blob_location_read, pending_location_read};
-use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
-    location_from_read, multipart_summary_read,
-};
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use crate::s3::object::lookup::{FoundVersion, VersionLookup, VersionLookupError};
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-#[cfg(test)]
-use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE};
-use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
-use aruna_core::operation::EffectOperation;
+use aruna_core::managed_copy::ManagedCopyError;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, VersionKey,
-};
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{
-    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
-
-const PART_SCAN_LIMIT: usize = 10_000;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetAttributesState {
-    Init,
-    StartTransaction,
-    GetVersion,
-    GetCurrentVersion,
-    CheckManagedCopy,
-    CheckPendingCopy,
-    GetBlobLocation,
-    ReadMultipartSummary,
-    ReadMultipartParts,
-    CommitTransaction,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum GetAttributesError {
@@ -54,14 +21,6 @@ pub enum GetAttributesError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: GetAttributesState,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("The specified key does not exist.")]
     NoSuchKey,
     #[error("The specified version does not exist.")]
@@ -72,8 +31,26 @@ pub enum GetAttributesError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error("GetObjectAttributes failed")]
     GetAttributesFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+}
+
+impl From<IoError> for GetAttributesError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+impl From<VersionLookupError> for GetAttributesError {
+    fn from(error: VersionLookupError) -> Self {
+        match error {
+            VersionLookupError::Storage(error) => Self::StorageError(error),
+            VersionLookupError::Conversion(error) => Self::ConversionError(error),
+            VersionLookupError::Managed(error) => Self::ManagedCopyError(error),
+            VersionLookupError::NoSuchKey => Self::NoSuchKey,
+            VersionLookupError::NoSuchVersion => Self::NoSuchVersion,
+            VersionLookupError::DeleteMarker => Self::DeleteMarker,
+            VersionLookupError::Failed => Self::GetAttributesFailed,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -96,464 +73,69 @@ pub struct GetAttributesResult {
     pub parts: Vec<MultipartObjectPart>,
 }
 
+type AttributesTurn = Result<Next<GetAttributesResult>, GetAttributesError>;
+
+/// The attributes of one version, from one read snapshot.
 #[derive(Debug, PartialEq)]
 pub struct GetAttributesOperation {
-    input: GetAttributesInput,
-    state: GetAttributesState,
-    txn_id: Option<Ulid>,
-    location: Option<BackendLocation>,
-    source_metadata: Option<SourceMetadata>,
-    version_created_at: Option<std::time::SystemTime>,
-    resolved_version_id: Option<Ulid>,
-    pending_copy: Option<ManagedCopyKey>,
-    pending_location: Option<BlobLocationKey>,
-    /// The archive of a governed pending version while its registration is verified.
-    pending_archive: Option<ArchiveKey>,
-    /// Refs of the version being described, compared against its registration.
-    source_policies: Vec<PlacementPolicyRef>,
-    summary: Option<MultipartObjectSummary>,
-    parts: Vec<MultipartObjectPart>,
-    output: Option<Result<GetAttributesResult, GetAttributesError>>,
+    requested: Option<Ulid>,
+    lookup: VersionLookup,
 }
 
 impl GetAttributesOperation {
     pub fn new(input: GetAttributesInput) -> Self {
         Self {
-            input,
-            state: GetAttributesState::Init,
-            txn_id: None,
-            location: None,
-            source_metadata: None,
-            version_created_at: None,
-            resolved_version_id: None,
-            pending_copy: None,
-            pending_location: None,
-            pending_archive: None,
-            source_policies: Vec::new(),
-            summary: None,
-            parts: Vec::new(),
-            output: None,
+            requested: input.version_id,
+            lookup: VersionLookup::new(
+                input.bucket,
+                input.key,
+                input.version_id,
+                input.include_parts,
+            ),
         }
     }
 
-    fn emit_error(&mut self, error: GetAttributesError) -> Effects {
-        self.state = GetAttributesState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetAttributesError {
-        match error {
-            LookupError::Conversion(err) => GetAttributesError::ConversionError(err),
-            LookupError::Managed(err) => GetAttributesError::ManagedCopyError(err),
-            LookupError::InvalidEvent(received) => GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected,
-                received: received.label(),
-            },
-            LookupError::Missing => GetAttributesError::GetAttributesFailed,
-        }
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = GetAttributesState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event.label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        if let Some(version_id) = self.input.version_id {
-            self.state = GetAttributesState::GetVersion;
-            let key =
-                match VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes() {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(err.into()),
-                };
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key,
-                txn_id: self.txn_id,
-            })]
-        } else {
-            self.state = GetAttributesState::GetCurrentVersion;
-            let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
-                Ok(key) => key.into(),
-                Err(err) => return self.emit_error(err.into()),
-            };
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_HEAD_KEYSPACE.to_string(),
-                key,
-                txn_id: self.txn_id,
-            })]
-        }
-    }
-
-    fn current_version_received(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(GetAttributesError::NoSuchKey);
-        };
-
-        let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
-            Ok(pointer) => pointer,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
-            .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        self.resolved_version_id = Some(pointer.version_id);
-        self.state = GetAttributesState::GetVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_received_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(if self.input.version_id.is_some() {
-                GetAttributesError::NoSuchVersion
-            } else {
-                GetAttributesError::NoSuchKey
-            });
-        };
-
-        let version = match BlobVersion::from_bytes(val.as_ref()) {
-            Ok(version) => version,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(GetAttributesError::GetAttributesFailed);
-        };
-
-        self.read_version(version_id, version, self.input.version_id.is_some())
-    }
-
-    fn read_version(
-        &mut self,
-        version_id: Ulid,
-        version: BlobVersion,
-        explicit_version_request: bool,
-    ) -> Effects {
-        self.resolved_version_id = Some(version_id);
-
-        match version.state {
-            BlobVersionState::Materialized {
-                blob_hash,
-                backend,
-                encoding,
-                ..
-            } => {
-                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
-                self.source_metadata = None;
-                self.version_created_at = Some(version.created_at);
-                // Size and checksums are governed metadata: a copy this node may
-                // not serve must not answer for them either.
-                self.source_policies = version.placement_policies.clone();
-                if self.source_policies.is_empty() {
-                    return self.read_blob_location(location_key);
-                }
-                self.check_managed_copy(version_id, location_key)
-            }
-            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
-                GetAttributesError::DeleteMarker
-            } else {
-                GetAttributesError::NoSuchKey
-            }),
-            BlobVersionState::Reference {
-                cached_metadata, ..
-            } => {
-                self.location = None;
-                self.source_metadata = Some(cached_metadata);
-                self.version_created_at = None;
-                self.finish_lookup()
-            }
-            BlobVersionState::PendingContent { archive, .. } => {
-                self.source_metadata = None;
-                self.version_created_at = Some(version.created_at);
-                self.source_policies = version.placement_policies.clone();
-                if !self.source_policies.is_empty() {
-                    return self.check_pending_copy(version_id, archive);
-                }
-                self.state = GetAttributesState::GetBlobLocation;
-                smallvec![pending_location_read(&archive, self.txn_id)]
-            }
-        }
-    }
-
-    /// A governed pending archive answers only through this node's registration of it.
-    fn check_pending_copy(&mut self, version_id: Ulid, archive: ArchiveKey) -> Effects {
-        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        let copy_key = ManagedCopyKey::new(version, archive.backend.clone());
-        let effect = match serve_reads(&copy_key, self.txn_id) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.pending_copy = Some(copy_key);
-        self.pending_archive = Some(archive);
-        self.state = GetAttributesState::CheckPendingCopy;
-        smallvec![effect]
-    }
-
-    fn handle_pending_copy(&mut self, event: Event) -> Effects {
-        let (Some(copy_key), Some(archive)) =
-            (self.pending_copy.take(), self.pending_archive.take())
-        else {
-            let error = self.lookup_error("a pending registration check", LookupError::Missing);
-            return self.emit_error(error);
-        };
-        if let Err(err) = finish_pending_check(event, &copy_key, &archive, &self.source_policies) {
-            let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
-            return self.emit_error(error);
-        }
-        self.state = GetAttributesState::GetBlobLocation;
-        smallvec![pending_location_read(&archive, self.txn_id)]
-    }
-
-    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = GetAttributesState::GetBlobLocation;
-        smallvec![blob_location_read(&key, self.txn_id)]
-    }
-
-    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
-        let check = match begin_copy_check(
-            &self.input.bucket,
-            &self.input.key,
-            version_id,
-            location_key,
-            self.txn_id,
-        ) {
-            Ok(check) => check,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.pending_copy = Some(check.copy_key);
-        self.pending_location = Some(check.location_key);
-        self.state = GetAttributesState::CheckManagedCopy;
-        smallvec![check.effect]
-    }
-
-    fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match finish_copy_check(
-            event,
-            &mut self.pending_copy,
-            &mut self.pending_location,
-            &self.source_policies,
-            ExpectedNode::Subject,
-        ) {
-            Ok(key) => key,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-        self.read_blob_location(key)
-    }
-
-    fn location_read(&mut self, event: Event) -> Effects {
-        let location = match location_from_read(event) {
-            Ok(Some(location)) => location,
-            Ok(None) => return self.read_multipart_summary(),
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-        self.location = Some(location);
-
-        self.read_multipart_summary()
-    }
-
-    fn read_multipart_summary(&mut self) -> Effects {
-        let Some(version_id) = self.resolved_version_id else {
-            return self.finish_lookup();
-        };
-
-        let effect = match multipart_summary_read(version_id, self.txn_id) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        self.state = GetAttributesState::ReadMultipartSummary;
-        smallvec![effect]
-    }
-
-    fn summary_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
-
-        self.summary = match value {
-            Some(value) => match MultipartObjectSummary::from_bytes(value.as_ref()) {
-                Ok(summary) => Some(summary),
-                Err(err) => return self.emit_error(err.into()),
-            },
-            None => None,
-        };
-
-        let Some(version_id) = self.resolved_version_id else {
-            return self.finish_lookup();
-        };
-        if !self.input.include_parts || self.summary.is_none() {
-            return self.finish_lookup();
-        }
-
-        let prefix = match MultipartObjectKey::part_prefix(version_id) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = GetAttributesState::ReadMultipartParts;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: PART_SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn parts_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event.label(),
-            });
-        };
-
-        let mut parts = Vec::with_capacity(values.len());
-        for (_key, value) in values {
-            let part = match MultipartObjectPart::from_bytes(value.as_ref()) {
-                Ok(part) => part,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            parts.push(part);
-        }
-        // Fixed big-endian part keys already iterate in ascending order; sort
-        // defensively to stay independent of storage iteration guarantees.
-        parts.sort_by_key(|part| part.part_number);
-        self.parts = parts;
-
-        self.finish_lookup()
-    }
-
-    fn finish_lookup(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetAttributesError::NoTransactionFound);
-        };
-        self.state = GetAttributesState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(GetAttributesError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event.label(),
-            });
-        };
-
-        let checksum_type = self
-            .summary
-            .as_ref()
+    fn result(&self, found: FoundVersion) -> GetAttributesResult {
+        let checksum_type = (found.summary.as_ref())
             .map(|summary| summary.checksum_type)
             .unwrap_or(MultipartChecksumType::FullObject);
-        self.state = GetAttributesState::Finish;
-        self.output = Some(Ok(GetAttributesResult {
-            location: self.location.clone(),
-            source_metadata: self.source_metadata.clone(),
-            version_created_at: self.version_created_at,
-            version_id: self.resolved_version_id.or(self.input.version_id),
-            resolved_version_id: self.resolved_version_id,
+        GetAttributesResult {
+            location: found.location,
+            source_metadata: found.source_metadata,
+            version_created_at: found.created_at,
+            version_id: found.version_id.or(self.requested),
+            resolved_version_id: found.version_id,
             checksum_type,
-            summary: self.summary.clone(),
-            parts: std::mem::take(&mut self.parts),
-        }));
-        smallvec![]
+            summary: found.summary,
+            parts: found.parts,
+        }
+    }
+
+    fn advance(&self, turn: Result<Next<FoundVersion>, VersionLookupError>) -> AttributesTurn {
+        match turn? {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Done(found) => Ok(Next::Done(self.result(found))),
+            Next::Wait | Next::Then { .. } => Err(IoError::Unfinished.into()),
+        }
     }
 }
 
-impl EffectOperation for GetAttributesOperation {
+impl Operation for GetAttributesOperation {
     type Output = GetAttributesResult;
     type Error = GetAttributesError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> AttributesTurn {
+        let turn = self.lookup.first();
+        self.advance(turn)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(GetAttributesError::StorageError(error));
-        }
-
-        match self.state {
-            GetAttributesState::Init => self.handle_init(),
-            GetAttributesState::StartTransaction => self.handle_transaction_started(event),
-            GetAttributesState::GetVersion => self.handle_received_version(event),
-            GetAttributesState::GetCurrentVersion => self.current_version_received(event),
-            GetAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
-            GetAttributesState::CheckPendingCopy => self.handle_pending_copy(event),
-            GetAttributesState::GetBlobLocation => self.location_read(event),
-            GetAttributesState::ReadMultipartSummary => self.summary_read(event),
-            GetAttributesState::ReadMultipartParts => self.parts_read(event),
-            GetAttributesState::CommitTransaction => self.handle_transaction_committed(event),
-            GetAttributesState::Finish | GetAttributesState::Error => smallvec![],
-        }
+    fn next(&mut self, result: IoResult) -> AttributesTurn {
+        let turn = self.lookup.next(result);
+        self.advance(turn)
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetAttributesState::Finish | GetAttributesState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(GetAttributesError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 
@@ -562,11 +144,19 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        OBJECT_METADATA_KEYSPACE,
+    };
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::blob::{
+        BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::multipart::MultipartObjectKey;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -586,86 +176,79 @@ mod tests {
     }
 
     #[test]
-    fn pending_reads_location() {
-        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
-        use aruna_core::structs::storage::blob::ArchiveKey;
-        use aruna_core::structs::storage::encryption::BucketKeyRef;
-        use aruna_core::structs::storage::format::PithosLayout;
-
-        let mut sealed = location();
-        sealed.hashes.remove(HASH_BLAKE3);
-        let layout = PithosLayout {
-            stored_size: 70,
-            metadata_digest: [3; 32],
-            storage_generation: 0,
+    fn answers_from_snapshot() {
+        // A reference version answers from its cached metadata, with no copy to describe.
+        let source = aruna_core::structs::execution::staging::VersionSourceBinding {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
+                kind: aruna_core::structs::execution::source_connector::SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "path".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: None,
+            mirrors: Vec::new(),
         };
-        sealed.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
-        let archive = ArchiveKey::of(&sealed);
-        let version_id = Ulid::generate();
+        let metadata = SourceMetadata {
+            content_length: 3,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let version = BlobVersion::reference(
+            source,
+            metadata.clone(),
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let version_id = Ulid::from_parts(4, 4);
         let mut operation = GetAttributesOperation::new(GetAttributesInput {
             bucket: "bucket".to_string(),
-            key: "sealed.bin".to_string(),
+            key: "key".to_string(),
             version_id: Some(version_id),
-            include_parts: false,
+            include_parts: true,
         });
-        operation.txn_id = Some(Ulid::generate());
-        let version =
-            BlobVersion::pending(archive.clone(), sealed.created_at, sealed.created_by, None);
-
-        let effects = operation.read_version(version_id, version, true);
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, key, .. })]
-                if key_space == PENDING_LOCATION_KEYSPACE && key.as_ref() == archive.to_bytes()
+            operation.first(),
+            Ok(Next::Call(aruna_core::calls::IoCall::Read(_)))
         ));
-        let read = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: value.map(Into::into),
-            })
+        let row = IoResult::Values(vec![Some(version.to_bytes().unwrap().into())]);
+        let Ok(Next::Done(result)) = operation.next(row) else {
+            panic!("a reference needs no further reads");
         };
-        operation.step(read(Some(sealed.to_bytes().unwrap())));
-        operation.step(read(None));
-        assert_eq!(operation.location, Some(sealed));
+        assert_eq!(result.source_metadata, Some(metadata));
+        assert_eq!(result.version_id, Some(version_id));
+        assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
+        assert_eq!(result.location, None);
     }
 
-    // A result exists only once the read transaction committed, so an aborted read never succeeds.
     #[test]
-    fn output_after_commit() {
-        let stored = location();
-        let version_id = Ulid::generate();
-        let looked_up = || {
-            let mut operation = GetAttributesOperation::new(GetAttributesInput {
-                bucket: "bucket".to_string(),
-                key: "object.bin".to_string(),
-                version_id: Some(version_id),
-                include_parts: false,
-            });
-            let txn_id = Ulid::generate();
-            operation.txn_id = Some(txn_id);
-            operation.location = Some(stored.clone());
-            let effects = operation.finish_lookup();
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })]
-                    if *commit == txn_id
-            ));
-            (operation, txn_id)
-        };
-
-        let (early, _) = looked_up();
-        assert!(!early.is_complete());
-        assert!(matches!(
-            early.finalize(),
-            Err(GetAttributesError::NotFinished)
-        ));
-
-        let (mut operation, txn_id) = looked_up();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap().location, Some(stored));
+    fn lookup_errors_map() {
+        for (from, to) in [
+            (VersionLookupError::NoSuchKey, GetAttributesError::NoSuchKey),
+            (
+                VersionLookupError::NoSuchVersion,
+                GetAttributesError::NoSuchVersion,
+            ),
+            (
+                VersionLookupError::DeleteMarker,
+                GetAttributesError::DeleteMarker,
+            ),
+            (
+                VersionLookupError::Failed,
+                GetAttributesError::GetAttributesFailed,
+            ),
+        ] {
+            assert_eq!(GetAttributesError::from(from), to);
+        }
     }
 
     fn location() -> BackendLocation {

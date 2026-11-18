@@ -1352,14 +1352,16 @@ pub(super) async fn finish_export(
         auth,
     } = &error
     {
-        let waits = super::super::remote_key::ask_waits(
-            &ctx.driver,
+        let ask = crate::jobs::key_locks::AskWaitsOperation::new(
             auth,
             ctx.job_id,
             *node_id,
             std::slice::from_ref(target),
-        )
-        .await;
+            ctx.driver.node_and_realm(),
+        );
+        let waits = crate::driver::drive(ask, ctx.driver.as_ref())
+            .await
+            .unwrap_or_default();
         if !waits.is_empty() {
             return JobRunOutcome::AwaitingKey(waits);
         }

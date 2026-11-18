@@ -41,21 +41,6 @@ impl DocumentSyncService {
         }
     }
 
-    pub async fn reconcile_documents_event(&self) -> DocumentNetEvent {
-        match self.reconcile_documents().await {
-            Ok(result) => DocumentNetEvent::DocumentsReconciled {
-                applied: result.applied(),
-                targets: result.targets,
-                metadata_create_events: result.metadata_create_events,
-                metadata_graph_tombstones: result.metadata_graph_tombstones,
-            },
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
-        }
-    }
-
     pub async fn sync_document_event(
         &self,
         topic_id: ::irokle::TopicId,
@@ -124,17 +109,8 @@ impl DocumentSyncService {
                 error: error.to_string(),
             };
         }
-        match self.reconcile_document_topics([topic_id]).await {
-            Ok(result) => DocumentNetEvent::DocumentsReconciled {
-                applied: result.applied(),
-                targets: result.targets,
-                metadata_create_events: result.metadata_create_events,
-                metadata_graph_tombstones: result.metadata_graph_tombstones,
-            },
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
+        DocumentNetEvent::DocumentsSynced {
+            topics: vec![topic_id],
         }
     }
 
@@ -201,32 +177,16 @@ impl DocumentSyncService {
             };
         }
         let flush_elapsed = flush_started.elapsed();
-        let reconcile_started = Instant::now();
-        match self.reconcile_document_topics(topic_ids).await {
-            Ok(result) => {
-                info!(
-                    event = "pipeline.sync.summary",
-                    targets = target_count,
-                    applied = result.applied(),
-                    bootstrap_ms = duration_ms(bootstrap_elapsed),
-                    peer_sync_ms = duration_ms(peer_sync_elapsed),
-                    flush_ms = duration_ms(flush_elapsed),
-                    reconcile_ms = duration_ms(reconcile_started.elapsed()),
-                    total_ms = duration_ms(sync_started.elapsed()),
-                    "Document sync batch summary"
-                );
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: result.applied(),
-                    targets: result.targets,
-                    metadata_create_events: result.metadata_create_events,
-                    metadata_graph_tombstones: result.metadata_graph_tombstones,
-                }
-            }
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
-        }
+        info!(
+            event = "pipeline.sync.summary",
+            targets = target_count,
+            bootstrap_ms = duration_ms(bootstrap_elapsed),
+            peer_sync_ms = duration_ms(peer_sync_elapsed),
+            flush_ms = duration_ms(flush_elapsed),
+            total_ms = duration_ms(sync_started.elapsed()),
+            "Document sync batch summary"
+        );
+        DocumentNetEvent::DocumentsSynced { topics: topic_ids }
     }
 
     async fn publish_events(

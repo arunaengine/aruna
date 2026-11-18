@@ -23,13 +23,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::{read_outbox_records, reconcile_topics};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
 use std::sync::Arc;
@@ -308,7 +308,7 @@ async fn seed_topic(
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     assert!(net.sync_topic_exists(topic).unwrap());
     assert_eq!(net.realm_peers().await, vec![peer_id]);
-    net.reconcile_sync_topics(vec![topic]).await.unwrap();
+    reconcile_topics(context, vec![topic]).await.unwrap();
     topic
 }
 
@@ -462,7 +462,7 @@ async fn joiner_announces_watch() {
     )
     .await;
     sync_peer_topic(
-        &joiner_net,
+        &joiner_context,
         topic,
         bootstrap_id,
         &bootstrap_target,
@@ -543,7 +543,7 @@ async fn retries_until_seeded() {
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let (sync, seeded) = tokio::join!(
         sync_with_retry(
-            &joiner_net,
+            &joiner_context,
             topic,
             bootstrap_id,
             &target,

@@ -158,21 +158,11 @@ async fn registry_fence_ulid() {
         100,
         Ulid::from_parts(2_124, 1),
     );
-    let txn_id = start_storage_transaction(&storage)
-        .await
-        .expect("fence transaction starts");
     assert!(
-        record_fenced_txn(&storage, &record, txn_id)
+        run_plan(&storage, FencePlan(record))
             .await
             .expect("newer ULID fence checks")
     );
-    match storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
-        other => panic!("unexpected fence transaction result: {other:?}"),
-    }
 
     let live = registry_record(group_id, document_id, "datasets/post-delete", 300, boundary);
     write_registry_record(&storage, &live).await;
@@ -183,21 +173,11 @@ async fn registry_fence_ulid() {
         100,
         Ulid::from_parts(2_124, 1),
     );
-    let txn_id = start_storage_transaction(&storage)
-        .await
-        .expect("stale fence transaction starts");
     assert!(
-        !record_fenced_txn(&storage, &stale, txn_id)
+        !run_plan(&storage, FencePlan(stale))
             .await
             .expect("stale registry fence checks live primary")
     );
-    match storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
-        other => panic!("unexpected stale fence transaction result: {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -988,7 +968,7 @@ async fn tombstone_blocks_upsert() {
     )
     .await
     .expect("late registry upsert is fenced by tombstone");
-    assert!(matches!(outcome, MetadataPlacementOutcome::Accepted(())));
+    assert!(matches!(outcome, PlacementOutcome::Accepted(())));
 
     assert_registry_deleted(&storage, group_id, document_id).await;
     assert_eq!(
@@ -1589,7 +1569,7 @@ fn delete_entries_prune() {
         deleted_after_id: Ulid::from_parts(9, 1),
     };
 
-    let entries = document_delete_entries(&record).expect("entries build");
+    let entries = document_delete_entries(&record, 1).expect("entries build");
 
     let prune_jobs = entries
         .iter()

@@ -52,7 +52,7 @@ impl From<IoError> for EmailError {
     }
 }
 
-/// One email opt-in; ids and time come from the caller, as does the address format check.
+/// One email opt-in with its ids, time and address format check.
 #[derive(Debug, PartialEq)]
 pub struct EmailOptIn {
     pub owner: UserId,
@@ -64,6 +64,29 @@ pub struct EmailOptIn {
     pub write_id: Ulid,
     pub event_id: Ulid,
     pub now_ms: u64,
+}
+
+impl EmailOptIn {
+    /// An opt-in of the trimmed `address` with new ids.
+    pub fn new(
+        owner: UserId,
+        local: NodeId,
+        address: String,
+        categories: BTreeSet<String>,
+        now_ms: u64,
+    ) -> Self {
+        let address = address.trim().to_string();
+        Self {
+            owner,
+            local,
+            address_valid: aruna_outbound::valid_address(&address),
+            address,
+            categories,
+            write_id: Ulid::generate(),
+            event_id: Ulid::generate(),
+            now_ms,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]

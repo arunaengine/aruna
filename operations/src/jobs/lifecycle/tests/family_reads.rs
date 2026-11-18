@@ -120,8 +120,9 @@ async fn reads_kind_only() {
 #[tokio::test]
 async fn resolves_session_alias() {
     use super::session_job;
+    use crate::jobs::job_reads::tests::{read_owned_job, read_report_routed};
+    use crate::jobs::job_reports::{JobReportLookup, ReportQuery};
     use crate::jobs::route::JobRouteError;
-    use crate::jobs::service::read_owned_job;
 
     let family = Family::new([7u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
@@ -161,34 +162,20 @@ async fn resolves_session_alias() {
         path_restrictions: None,
         session: None,
     };
-    let report = crate::jobs::service::read_report_routed(
-        &ctx,
-        &auth(spec.created_by),
-        spec.job_id,
-        None,
-        None,
-        1,
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
-        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
-    );
+    let query = || ReportQuery {
+        expected_digest: None,
+        last_key: None,
+        limit: 1,
+    };
+    let report = read_report_routed(&ctx, &auth(spec.created_by), spec.job_id, query())
+        .await
+        .unwrap();
+    assert!(matches!(report, JobReportLookup::Ready { job, .. }
+        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32]));
     let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
-        crate::jobs::service::read_report_routed(
-            &ctx,
-            &auth(stranger),
-            spec.job_id,
-            None,
-            None,
-            1,
-            None
-        )
-        .await,
-        Ok(crate::jobs::service::JobReportLookup::NotFound)
+        read_report_routed(&ctx, &auth(stranger), spec.job_id, query()).await,
+        Ok(JobReportLookup::NotFound)
     ));
     assert!(matches!(
         session_job(&ctx, stranger, spec.job_id).await,

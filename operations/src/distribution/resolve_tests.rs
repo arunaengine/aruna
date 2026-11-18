@@ -4,6 +4,7 @@
 
 use super::{probe_targets, range_holders};
 use crate::distribution::test_record::{member, replicated, secret};
+use crate::driver::drive;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSnapshot, MemberState, MetadataCoverage,
 };
@@ -87,13 +88,19 @@ async fn content_page_bounded() {
     install(&handle, set, &[range(1, "", None)]).await;
     assert!(apply(&handle, write(set, "a", 3, 10)).await.unwrap());
     let context = context(&handle);
-    let found = content_versions(&context, set, &[3; 32], 4).await.unwrap();
+    let found = drive(content_versions(set, &[3; 32], 4), &context)
+        .await
+        .unwrap();
     assert_eq!(
         found,
         (vec![(Ulid::from_bytes([3; 16]), "a".to_string())], false)
     );
-    let cut = content_versions(&context, set, &[3; 32], 0).await.unwrap();
+    let cut = drive(content_versions(set, &[3; 32], 0), &context)
+        .await
+        .unwrap();
     assert_eq!(cut, (Vec::new(), true), "a cut page says more exist");
-    let other = content_versions(&context, set, &[4; 32], 4).await.unwrap();
+    let other = drive(content_versions(set, &[4; 32], 4), &context)
+        .await
+        .unwrap();
     assert_eq!(other, (Vec::new(), false));
 }

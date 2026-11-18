@@ -7,9 +7,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::metadata::{
-    MaterializationState, MetadataError, MetadataEventPayload, MetadataEventRecord,
-    MetadataMergedRevision, MetadataRawRevision, apply_raw_event, raw_context_digest,
-    resolve_raw_revision,
+    MetadataError, MetadataEventPayload, MetadataEventRecord, MetadataMergedRevision,
+    MetadataRawRevision, apply_raw_event, raw_context_digest, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{event_log_key, raw_revision_key};
 use aruna_core::types::TxnId;
@@ -21,7 +20,7 @@ use crate::metadata::raw_events::{
     RAW_ENCODED_LIMIT, RawBaseIdentity, RawEventsOperation, RawLoadBudget, RawReadError,
     RawRevisionState, budget_error, validate_raw_entry,
 };
-use crate::metadata::revision_read::{MetadataRawView, RawStateOperation, RawViewOperation};
+use crate::metadata::revision_read::{RawStateOperation, RawViewOperation};
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
@@ -47,35 +46,6 @@ impl RawEventPlan {
     }
 }
 
-pub(crate) async fn load_raw_view(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<MetadataRawView>, RawReadError> {
-    let (status, revision) =
-        drive(RawViewOperation::new(document_id, txn_id, true), context).await?;
-    let Some(revision) = revision else {
-        return Ok(None);
-    };
-    let projection_state = status
-        .as_ref()
-        .map(|status| status.state)
-        .unwrap_or(MaterializationState::Pending);
-    let projected_event_id = status
-        .filter(|status| {
-            status.state == MaterializationState::Materialized
-                && status.event_id == revision.winning_event_id
-                && status.context_digest == Some(revision.context_digest)
-                && status.dataset_digest == revision.dataset_digest
-        })
-        .map(|status| status.event_id);
-    Ok(Some(MetadataRawView {
-        revision,
-        projection_state,
-        projected_event_id,
-    }))
-}
-
 pub async fn load_raw_revision(
     context: &DriverContext,
     document_id: Ulid,
@@ -83,17 +53,6 @@ pub async fn load_raw_revision(
 ) -> Result<Option<MetadataRawRevision>, RawReadError> {
     let operation = RawViewOperation::new(document_id, txn_id, false);
     Ok(drive(operation, context).await?.1)
-}
-
-/// Digest of the displayed revision, read without replaying the event log.
-pub(crate) async fn load_raw_digest(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<Option<[u8; 32]>, RawReadError> {
-    Ok(drive(RawStateOperation::new(document_id), context)
-        .await?
-        .and_then(|state| state.revision)
-        .and_then(|revision| revision.dataset_digest))
 }
 
 pub(crate) async fn prepare_raw_event(

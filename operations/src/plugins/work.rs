@@ -220,7 +220,7 @@ pub(crate) fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, 
     Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
 }
 
-pub(super) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
+pub(crate) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
     [
         &[WORK_INDEX][..],
         &install_id.to_bytes(),
@@ -869,7 +869,7 @@ pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
     [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
 }
 
-pub(super) fn install_at(key: &[u8]) -> Option<Ulid> {
+pub(crate) fn install_at(key: &[u8]) -> Option<Ulid> {
     Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
 }
 

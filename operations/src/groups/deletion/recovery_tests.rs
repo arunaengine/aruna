@@ -382,7 +382,17 @@ async fn unavailable_peer_preserves() {
     fixture.context.net_handle = Some(net.clone());
     let context = Arc::new(fixture.context);
     assert!(matches!(
-        super::coordinator::delete_group(&context, fixture.auth, None, fixture.plan.group_id).await,
+        drive(
+            super::coordinator::DeleteGroupOperation::new(
+                context.node_and_realm(),
+                fixture.auth,
+                None,
+                fixture.plan.group_id,
+                Ulid::generate()
+            ),
+            &context
+        )
+        .await,
         Err(GroupDeletionError::Unavailable(_))
     ));
     assert!(

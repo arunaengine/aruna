@@ -79,7 +79,7 @@ TRIGGER_MATCHES = (
     ("operations/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("operations/src/sync/incoming.rs", "Alpn::"),
 )
-TRIGGER_IMPLS = (("operations/src/plugins/broker.rs", "Broker"),)
+TRIGGER_IMPLS = (("operations/src/plugin_host/broker.rs", "Broker"),)
 SIMILAR_NAMES = (
     "*backoff*",
     "now_ms",

@@ -51,23 +51,24 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::inbound::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
+use aruna_operations::testing::{project_logged_events, replay_event_log};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::placement::expand_placement::expand_realm_placement;
-use aruna_operations::placement::mutation::drive_placement_mutation;
+use aruna_operations::placement::expand_placement::ExpandPlacementOperation;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
+use aruna_operations::testing::sync_topics;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -598,9 +599,15 @@ impl Topology {
         // driver re-drives a conflicted mutation itself.
         self.config = hang_cap(
             "placement mutation",
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                None,
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig { actor, mutation },
+                    None,
+                    node.context
+                        .as_ref()
+                        .node_and_realm()
+                        .map(|(node_id, _)| node_id),
+                ),
                 node.context.as_ref(),
             ),
         )
@@ -905,29 +912,25 @@ impl Topology {
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
-        aruna_operations::node::startup::restore_shard_subscriptions(
+        aruna_operations::driver::drive(
+            aruna_operations::shard::restore::RestoreTopicsOperation::new(node_id, self.realm_id),
             &node.context,
-            node_id,
-            self.realm_id,
         )
-        .await;
+        .await
+        .expect("shard topics restore");
         let topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
-        node.net
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentEffect::SyncDocuments {
-                    topics: vec![topic],
-                    peers: Vec::new(),
-                },
-            )))
-            .await;
+        let _ = sync_topics(node.context.as_ref(), vec![topic], Vec::new()).await;
 
         let actor = self.actor(self.node(0));
         let started = hang_cap(
             "onboarding expansion",
-            expand_realm_placement(self.nodes[0].context.as_ref(), &actor),
+            drive(
+                ExpandPlacementOperation::new(&actor),
+                self.nodes[0].context.as_ref(),
+            ),
         )
         .await?;
         self.await_config("expansion transitions replicate", |config| {
@@ -1161,19 +1164,26 @@ async fn install_realm_config(
     for strategy_id in strategy_ids {
         hang_cap(
             "initialize activations",
-            drive_placement_mutation(
-                MutatePlacementConfig {
-                    actor: Actor {
-                        node_id: nodes[0].node_id(),
-                        user_id,
-                        realm_id,
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig {
+                        actor: Actor {
+                            node_id: nodes[0].node_id(),
+                            user_id,
+                            realm_id,
+                        },
+                        mutation: RealmPlacementMutation::InitializeActivations {
+                            strategy_id,
+                            candidate_map_epoch: 1,
+                        },
                     },
-                    mutation: RealmPlacementMutation::InitializeActivations {
-                        strategy_id,
-                        candidate_map_epoch: 1,
-                    },
-                },
-                None,
+                    None,
+                    nodes[0]
+                        .context
+                        .as_ref()
+                        .node_and_realm()
+                        .map(|(node_id, _)| node_id),
+                ),
                 nodes[0].context.as_ref(),
             ),
         )
@@ -1201,19 +1211,17 @@ async fn install_realm_config(
         "shard placement reconciliation never reported clean",
         || async {
             join_all(nodes.iter().map(|node| {
-                aruna_operations::node::startup::restore_shard_subscriptions(
+                aruna_operations::driver::drive(
+                    aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                        node.node_id(),
+                        realm_id,
+                    ),
                     &node.context,
-                    node.node_id(),
-                    realm_id,
                 )
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                )
+                async move { aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()) }
             }))
             .await;
             let pending = outcomes
@@ -1287,21 +1295,7 @@ async fn seed_config_topic(
         if node.node_id() == seeder.node_id() || !node.is_sync_eligible() {
             continue;
         }
-        match node
-            .net
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentEffect::SyncDocuments {
-                    topics: vec![topic],
-                    peers: Vec::new(),
-                },
-            )))
-            .await
-        {
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
-                ..
-            })) => {}
-            other => return Err(format!("unexpected config topic seed sync: {other:?}").into()),
-        }
+        sync_topics(node.context.as_ref(), vec![topic], Vec::new()).await?;
     }
     Ok(())
 }
@@ -1321,11 +1315,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                ),
+                async { aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()) },
                 span,
             )
             .await;
@@ -1363,14 +1353,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
         nodes
             .iter()
             .filter(|node| node.is_sync_eligible())
-            .map(|node| {
-                node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
-                    DocumentEffect::SyncDocuments {
-                        topics: vec![topic],
-                        peers: Vec::new(),
-                    },
-                )))
-            }),
+            .map(|node| sync_topics(node.context.as_ref(), vec![topic], Vec::new())),
     )
     .await;
 }
@@ -1678,21 +1661,19 @@ pub async fn install_replica_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::driver::drive(
+                aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    *realm_id,
+                ),
                 &node.context,
-                node.net.node_id(),
-                *realm_id,
             )
-            .await;
+            .await
+            .expect("shard topics restore");
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {
@@ -1719,12 +1700,7 @@ pub async fn install_default_config(
         store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(config)
 }

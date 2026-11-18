@@ -832,7 +832,7 @@ pub fn mint_forward_document(
     mint_document_for(config, actor, group_id, document_path, true)
 }
 
-pub(super) fn mint_document_for(
+pub(crate) fn mint_document_for(
     config: &RealmConfigDocument,
     actor: &Actor,
     group_id: GroupId,
@@ -943,7 +943,7 @@ fn id_generator() -> &'static Mutex<StructuredIdGenerator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::create_entry::create_metadata_document;
+    use crate::metadata::create_entry::CreateEntryOperation;
 
     use std::sync::Arc;
 
@@ -967,7 +967,7 @@ mod tests {
     use aruna_storage::storage::EffectReceiver;
     use aruna_storage::{FjallStorage, StorageHandle};
 
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
     use crate::metadata::MetadataHandle;
 
     type Rows = Vec<(String, Key, Value)>;
@@ -1650,7 +1650,14 @@ mod tests {
 
         let operation =
             CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id));
-        let result = create_metadata_document(operation, context.clone()).await;
+        let result = drive(
+            CreateEntryOperation::new(
+                operation,
+                context.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            &context,
+        )
+        .await;
         assert!(result.is_ok(), "retry recovers conflict: {result:?}");
 
         drop(context);
@@ -1676,7 +1683,14 @@ mod tests {
 
         let operation =
             CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id));
-        let result = create_metadata_document(operation, context.clone()).await;
+        let result = drive(
+            CreateEntryOperation::new(
+                operation,
+                context.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            &context,
+        )
+        .await;
         assert!(matches!(
             result,
             Err(CreateDocumentError::StorageError(

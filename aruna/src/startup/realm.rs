@@ -13,10 +13,14 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::projector::replay_until_stopped;
-use aruna_operations::node::startup::prepare_shard_policy;
+use aruna_operations::metadata::projection::{
+    MetadataProjectionError, ReplayPageOperation, max_clock_skew,
+};
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_operations::shard::restore::PreparePolicyOperation;
 use tracing::{info, warn};
 
 use crate::bootstrap::{
@@ -64,14 +68,17 @@ pub(crate) async fn prepare(
     };
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
-    prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    let policy = PreparePolicyOperation::new(config.node_id, config.realm_id);
+    if let Err(error) = drive(policy, driver_ctx).await {
+        warn!(error = %error, "Deferring shard topic policy to remote recovery");
+    }
     if stop.is_cancelled() {
         return Ok(None);
     }
     // Devices fetch governing realm documents before serving because they run no sync.
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        && !fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH).await
+        && !drive(fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH), driver_ctx).await.unwrap_or(false)
     {
         warn!("Serving this device from its stored realm documents for now");
     }
@@ -329,16 +336,15 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
 }
 
 async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::node::node_info::seed_info_document(
-        ctx,
-        config.node_id,
-        config.realm_id,
-        NodeUrls {
-            api: config.api_public_url.clone(),
-            s3: config.s3_public_url.clone(),
-        },
-    )
-    .await
+    let urls = NodeUrls {
+        api: config.api_public_url.clone(),
+        s3: config.s3_public_url.clone(),
+    };
+    let facts = NodeFacts::gather(ctx);
+    let seed = SeedInfoOperation::new(config.realm_id, config.node_id, urls, facts, false);
+    aruna_operations::driver::drive(seed, ctx)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -402,4 +408,26 @@ mod tests {
         assert!(matches!(result, Ok(None)));
         net.shutdown().await;
     }
+}
+
+/// Replays the event log one page at a time, checking `should_continue` before each page. A
+/// stop accepted during a large replay ends at a page boundary with every completed page
+/// projected, so no in-flight projection step is abandoned.
+async fn replay_until_stopped(
+    context: &DriverContext,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<usize, MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    while should_continue() {
+        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let (count, next) = drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(projected)
 }

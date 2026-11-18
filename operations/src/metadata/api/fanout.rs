@@ -19,7 +19,7 @@ use super::{
     select_fanout_nodes, short_display_id, stream, warn,
 };
 use crate::driver::DriverContext;
-use crate::s3::bucket::local_search::search_local_buckets;
+use crate::s3::bucket::local_search::LocalBucketSearch;
 
 use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages, retired_nodes};
 use super::distributed::record_bucket_result;
@@ -448,9 +448,8 @@ pub async fn search_buckets_distributed(
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
-            search_local_buckets(
-                &context,
-                SearchBucketsInput {
+            crate::driver::drive(
+                LocalBucketSearch::new(SearchBucketsInput {
                     auth,
                     realm_id,
                     node_id,
@@ -461,7 +460,8 @@ pub async fn search_buckets_distributed(
                     group_id,
                     start_after: start_after.map(Into::into),
                     database,
-                },
+                }),
+                &context,
             )
             .await
             .map_err(|_| MetadataReadError::Unavailable)

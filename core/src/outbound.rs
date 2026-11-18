@@ -10,8 +10,13 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::UserId;
+use crate::calls::IoError;
+use crate::injection::OutgoingRequest;
 use crate::structs::execution::email::SmtpTls;
 use crate::structs::execution::setting::SettingChannel;
+
+/// Bytes of a connection answer a call reads at most, headers and body together.
+pub const MAX_CONNECTION_ANSWER: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboundEffect {
@@ -22,6 +27,12 @@ pub enum OutboundEffect {
     Mail(Box<MailRequest>),
     /// Reads or changes the in-memory delay of the deliveries to one owner and channel.
     Backoff(BackoffRequest),
+    /// Sends one request through the egress screen and answers with its status.
+    Request(Box<HttpRequest>),
+    /// Drops the cached mail sender unless it belongs to this profile revision.
+    RefreshMail(Option<Ulid>),
+    /// Sends one request of a plugin connection and answers with what the service said.
+    Connection(Box<ConnectionCall>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +73,69 @@ pub enum OutboundEvent {
     Backoff {
         stored: Option<StoredBackoff>,
     },
+    /// The status the receiver of an [`OutboundEffect::Request`] answered with.
+    Answered {
+        result: Result<u16, OutboundError>,
+    },
+    MailRefreshed,
+    /// The answer to an [`OutboundEffect::Connection`].
+    ConnectionAnswered {
+        result: Result<ConnectionAnswer, ConnectionError>,
+    },
+}
+
+/// One request of a plugin connection, with any secret already added.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionCall {
+    pub request: OutgoingRequest,
+    pub body: Vec<u8>,
+}
+
+/// Shows neither the target, the headers nor the body.
+impl std::fmt::Debug for ConnectionCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionCall")
+            .field("method", &self.request.method)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An answer as the destination sent it, before any exposure applies.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionAnswer {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Shows neither the headers nor the body, which may echo a secret.
+impl std::fmt::Debug for ConnectionAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionAnswer")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a connection call has no answer, and whether it may have reached the destination.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ConnectionError {
+    #[error("the request was not sent: {0}")]
+    NotSent(String),
+    #[error("the request may have been sent: {0}")]
+    Unknown(String),
+    /// The destination answered, but its answer does not fit the bound.
+    #[error("the answer with status {status} is larger than 1 MiB")]
+    TooLarge { status: u16 },
+}
+
+/// A call the runner could not finish may already have left the node.
+impl From<IoError> for ConnectionError {
+    fn from(error: IoError) -> Self {
+        Self::Unknown(error.to_string())
+    }
 }
 
 /// A failure of one outbound call; its text never holds an address, a body or a credential.
@@ -89,6 +163,36 @@ pub struct HttpPost {
 impl std::fmt::Debug for HttpPost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpPost")
+            .field("body_len", &self.body.len())
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Head,
+    Post,
+    Put,
+    Delete,
+}
+
+/// One HTTP call whose answer only matters by its status.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Bytes,
+    /// Total time the call may take.
+    pub deadline: Duration,
+}
+
+/// Shows neither the target path, the headers nor the body.
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
             .field("body_len", &self.body.len())
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()

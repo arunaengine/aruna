@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
-use aruna_operations::auth::request_authorization::authorize;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::replication::plaintext::EncryptionCheckOperation;
@@ -64,13 +64,9 @@ impl ArunaS3Service {
             session: None,
         };
         let path = group_admin_path(self.realm_id, info.group_id);
-        authorize(
+        drive(
+            AuthorizeOperation::new(self.realm_id, &auth, &path, &Permission::WRITE, extras),
             &self.state,
-            self.realm_id,
-            &auth,
-            &path,
-            &Permission::WRITE,
-            extras,
         )
         .await
         .map_err(map_authorize_error)?;

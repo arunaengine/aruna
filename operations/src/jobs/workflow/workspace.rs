@@ -45,13 +45,11 @@ use crate::jobs::read_access::SourceReadOperation;
 use crate::jobs::store::attempt::reserve_output_commits;
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::live_queue::complete_put;
-use crate::replication::managed_read::local_is_user;
-use crate::replication::managed_read::managed_read;
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use crate::replication::managed_read::LocalUserOperation;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::replication::version_replication::{
-    ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
-};
+use crate::replication::version_replication::{ReplicateScopeOperation, SourceAuthorizationError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -60,8 +58,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation}
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::staging::native_source::granted_read;
-use aruna_blob::native::body_stream;
+use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
@@ -268,8 +265,12 @@ async fn input_bytes(
     if let Some(remote) = input.source_node_id.filter(|remote| *remote != node_id) {
         return match captured() {
             Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
-            None if local_is_user(context, context.serving_realm(record.created_by.realm_id))
-                .await =>
+            None if drive(
+                LocalUserOperation::new(context.serving_realm(record.created_by.realm_id)),
+                context,
+            )
+            .await
+            .unwrap_or(false) =>
             {
                 Box::pin(device_source(context, record, input, remote)).await
             }
@@ -547,8 +548,12 @@ async fn input_policies(
             Some(captured) => refs.extend(captured.policies.iter().copied()),
             // A device captures no inputs and may never read governed content, so
             // its inputs carry none; a realm node must not guess them.
-            None if local_is_user(context, context.serving_realm(record.created_by.realm_id))
-                .await => {}
+            None if drive(
+                LocalUserOperation::new(context.serving_realm(record.created_by.realm_id)),
+                context,
+            )
+            .await
+            .unwrap_or(false) => {}
             None => {
                 return Err(JobError::permanent(format!(
                     "input `{}` has no captured inputs to inherit refs from",
@@ -843,18 +848,21 @@ async fn put_file_output(
             path_restrictions: None,
             session: None,
         };
-        Box::pin(complete_put(
+        Box::pin(drive(
+            CompletePutOperation::new(CompletePutInput {
+                realm_id: auth.realm_id,
+                node_id,
+                auth,
+                group_id: spec.group_id,
+                bucket: write_bucket.clone(),
+                key: write_key.clone(),
+                version_id: result.version_id,
+                size_bytes: size,
+            }),
             context,
-            auth.realm_id,
-            node_id,
-            auth,
-            spec.group_id,
-            write_bucket.clone(),
-            write_key.clone(),
-            result.version_id,
-            size,
         ))
-        .await;
+        .await
+        .ok();
     }
     Ok(output_object(
         output,
@@ -919,17 +927,23 @@ async fn replicate_output(
         path_restrictions: None,
         session: None,
     };
-    let source =
-        SourceAuthorization::load(context, auth.clone(), spec.group_id, record.owner_node_id)
-            .await
-            .map_err(|error| match error {
-                SourceAuthorizationError::Denied => {
-                    JobError::permanent("output staging read access denied")
-                }
-                SourceAuthorizationError::Unavailable(error) => {
-                    JobError::retryable(format!("output staging authorization failed: {error}"))
-                }
-            })?;
+    let source = drive(
+        crate::replication::source_rules::SourceAuthOperation::new(
+            auth.clone(),
+            spec.group_id,
+            record.owner_node_id,
+        ),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        SourceAuthorizationError::Denied => {
+            JobError::permanent("output staging read access denied")
+        }
+        SourceAuthorizationError::Unavailable(error) => {
+            JobError::retryable(format!("output staging authorization failed: {error}"))
+        }
+    })?;
     let routing = drive(QuotaOperation::new(node_routing(context)), context)
         .await
         .map_err(|error| routing_error("output copy", error))?;
@@ -1128,20 +1142,23 @@ async fn granted_source(
     let grant = captured.grant.as_ref().ok_or_else(|| {
         JobError::permanent("a reference input on another node has no read grant")
     })?;
-    let read = granted_read(context, captured.source_node_id, grant, None, false);
-    let (metadata, stream) = Box::pin(read).await.map_err(|error| match error {
-        StagingSourceError::AccessDenied | StagingSourceError::NotFound => {
-            JobError::permanent(format!("reference input read refused: {error}"))
-        }
-        other => JobError::retryable(format!("reference input read failed: {other}")),
-    })?;
-    if metadata.content_length != captured.bytes {
+    let ids = context.node_and_realm();
+    let read = GrantedReadOperation::new(ids, captured.source_node_id, grant, None, false);
+    let body = Box::pin(drive(read, context))
+        .await
+        .map_err(|error| match error {
+            StagingSourceError::AccessDenied | StagingSourceError::NotFound => {
+                JobError::permanent(format!("reference input read refused: {error}"))
+            }
+            other => JobError::retryable(format!("reference input read failed: {other}")),
+        })?;
+    if body.metadata.content_length != captured.bytes {
         return Err(JobError::permanent(
             "staged input size differs from the captured input".to_string(),
         ));
     }
     Ok(StagedSource {
-        blob: body_stream(stream),
+        blob: body.blob,
         location: None,
         size: Some(captured.bytes),
         served_source: None,
@@ -1194,7 +1211,7 @@ async fn device_source(
         known_refs: Vec::new(),
         range: None,
     };
-    match managed_read(context, source, request).await {
+    match drive(ManagedReadOperation::new(source, request), context).await {
         Ok(BaoReadOutput::Stream { blob, size, .. }) => Ok(StagedSource {
             blob,
             location: None,

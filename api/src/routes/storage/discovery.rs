@@ -11,10 +11,11 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
 use aruna_operations::driver::drive;
+use aruna_operations::s3::imports::ReadImportOperation;
 use aruna_operations::s3::imports::discovery::{
-    FileOutcome, SetDiscoveryOperation, authorized_preview, bucket_access, read_discovery,
+    AuthorizedPreviewOperation, FileOutcome, ReadDiscoveryOperation, RuleAccessOperation,
+    SetDiscoveryOperation,
 };
-use aruna_operations::s3::imports::read_import;
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
@@ -144,11 +145,11 @@ pub async fn get_discovery(
 ) -> ServerResult<Json<DiscoveryRules>> {
     let (_, group_id, import_id) = admin_rule(&state, auth, &group_id, &import_id).await?;
     let context = state.get_ctx();
-    read_import(&context, group_id, import_id)
+    drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
         .map_err(map_error)?
         .ok_or(ServerError::NotFound)?;
-    let rules = read_discovery(&context, group_id, import_id)
+    let rules = drive(ReadDiscoveryOperation::new(group_id, import_id), &context)
         .await
         .map_err(map_error)?;
     Ok(Json(from_rules(rules)))
@@ -233,13 +234,16 @@ pub async fn put_discovery(
 ) -> ServerResult<Json<DiscoveryRules>> {
     let (auth, group_id, import_id) = admin_rule(&state, auth, &group_id, &import_id).await?;
     let context = state.get_ctx();
-    let rule = read_import(&context, group_id, import_id)
+    let rule = drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
         .map_err(map_error)?
         .ok_or(ServerError::NotFound)?;
-    bucket_access(&context, &auth, state.get_node_id(), &rule)
-        .await
-        .map_err(map_error)?;
+    drive(
+        RuleAccessOperation::new(&auth, state.get_node_id(), &rule),
+        &context,
+    )
+    .await
+    .map_err(map_error)?;
     let operation = SetDiscoveryOperation::new(group_id, import_id, to_rules(request.rules));
     let rules = drive(operation, &context).await.map_err(map_error)?;
     Ok(Json(from_rules(rules)))
@@ -315,15 +319,18 @@ pub async fn preview_rules(
 ) -> ServerResult<Json<DiscoveryPreviewResponse>> {
     let (auth, group_id, import_id) = admin_rule(&state, auth, &group_id, &import_id).await?;
     let context = state.get_ctx();
-    let rule = read_import(&context, group_id, import_id)
+    let rule = drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
         .map_err(map_error)?
         .ok_or(ServerError::NotFound)?;
     let rules = to_rules(request.rules);
     let caller = (&auth, state.get_node_id());
-    let preview = authorized_preview(&context, caller, &rule, &rules, request.after)
-        .await
-        .map_err(map_error)?;
+    let preview = drive(
+        AuthorizedPreviewOperation::new(caller, &rule, &rules, request.after),
+        &context,
+    )
+    .await
+    .map_err(map_error)?;
     let files = preview
         .files
         .into_iter()

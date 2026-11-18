@@ -2,15 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::discovery::read_discovery;
-use super::{ImportRuleError, folders_overlap, list_imports, read_earlier};
-use crate::driver::DriverContext;
-use aruna_core::effects::{IterStart, StorageEffect};
+use super::folders::shares_folder;
+use super::{ImportRuleError, ListImportsOperation};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE};
-use aruna_core::structs::storage::backend_import::{BackendImport, object_key, object_prefix};
-use aruna_core::structs::storage::discovery::{DiscoveryRule, file_identity};
-use std::collections::HashSet;
+use aruna_core::keyspaces::{
+    IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
+use aruna_core::structs::storage::backend_import::{
+    BackendImport, WriteIntent, import_key, object_key, object_prefix, read_patterns,
+};
+use aruna_core::structs::storage::discovery::{DiscoveryRule, DiscoveryRules, file_identity};
+use aruna_core::types::{Key, Value};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use ulid::Ulid;
 
 /// Rows and intents one range read returns.
 const RANGE_PAGE: usize = 500;
@@ -34,91 +43,269 @@ pub enum Claim {
     Conflict,
 }
 
-/// Whether `other` is another rule that reads an overlapping folder of the same backend.
-pub fn shares_folder(rule: &BackendImport, other: &BackendImport) -> bool {
-    other.import_id != rule.import_id
-        && other.backend_id == rule.backend_id
-        && folders_overlap(&other.backend_prefix, &rule.backend_prefix)
-}
+type SharedTurn = Result<Next<Vec<SharedRule>>, ImportRuleError>;
 
 /// The other rules of the group that read an overlapping folder of the same backend.
-pub async fn read_shared(
-    context: &DriverContext,
-    rule: &BackendImport,
-) -> Result<Vec<SharedRule>, ImportRuleError> {
-    let mut shared = Vec::new();
-    for other in list_imports(context, rule.group_id).await? {
-        if !shares_folder(rule, &other) {
-            continue;
+#[derive(Debug, PartialEq)]
+pub struct ReadSharedOperation {
+    rule: BackendImport,
+    listed: bool,
+    others: VecDeque<BackendImport>,
+    reading: Option<BackendImport>,
+    shared: Vec<SharedRule>,
+}
+
+impl ReadSharedOperation {
+    pub fn new(rule: &BackendImport) -> Self {
+        Self {
+            rule: rule.clone(),
+            listed: false,
+            others: VecDeque::new(),
+            reading: None,
+            shared: Vec::new(),
         }
-        let discovery = read_discovery(context, other.group_id, other.import_id).await?;
-        let earlier = read_earlier(context, other.import_id).await?;
-        shared.push(SharedRule {
-            rule: other,
-            earlier,
+    }
+
+    fn next_rule(&mut self) -> SharedTurn {
+        let Some(other) = self.others.pop_front() else {
+            return Ok(Next::Done(std::mem::take(&mut self.shared)));
+        };
+        let reads = vec![
+            (
+                IMPORT_DISCOVERY_KEYSPACE.to_string(),
+                import_key(other.group_id, other.import_id),
+            ),
+            (
+                IMPORT_PATTERN_KEYSPACE.to_string(),
+                object_prefix(other.import_id),
+            ),
+        ];
+        self.reading = Some(other);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn rule_read(&mut self, [discovery, earlier]: [Option<Value>; 2]) -> SharedTurn {
+        let rule = self
+            .reading
+            .take()
+            .ok_or(ImportRuleError::Unexpected("Shared"))?;
+        let discovery = (discovery.as_deref())
+            .map(DiscoveryRules::from_bytes)
+            .transpose()?
+            .map(|rules| rules.rules)
+            .unwrap_or_default();
+        self.shared.push(SharedRule {
+            rule,
+            earlier: read_patterns(earlier.as_deref())?,
             discovery,
         });
+        self.next_rule()
     }
-    Ok(shared)
 }
+
+impl Operation for ReadSharedOperation {
+    type Output = Vec<SharedRule>;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> SharedTurn {
+        let list = ListImportsOperation::new(self.rule.group_id);
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SharedTurn {
+        if self.listed {
+            return self.rule_read(values::<2>(result)?);
+        }
+        self.listed = true;
+        let rules = result.child::<Vec<BackendImport>, ImportRuleError>()??;
+        let rule = &self.rule;
+        self.others = (rules.into_iter())
+            .filter(|other| shares_folder(rule, other))
+            .collect();
+        self.next_rule()
+    }
+}
+
+/// The page of a rule's rows in `space` from `start`. The first page starts at a row itself,
+/// which only a storage scan can do.
+fn range_page(space: &str, import_id: Ulid, start: IterStart) -> IoCall {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: space.to_string(),
+        prefix: Some(object_prefix(import_id)),
+        start: Some(start),
+        limit: RANGE_PAGE,
+        txn_id: None,
+    })
+    .into()
+}
+
+type RangeRows = (Vec<(Key, Value)>, Option<Key>);
+
+fn range_rows(event: Event) -> Result<RangeRows, ImportRuleError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => Ok((values, next_start_after)),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(ImportRuleError::Read(other.label().to_string())),
+    }
+}
+
+/// The path of an intent key: the import id, the path, a zero byte and the version id.
+fn intent_path(key: &[u8]) -> Option<&str> {
+    let end = key.len().checked_sub(17)?;
+    let path = key.get(16..end)?;
+    (key[end] == 0).then_some(())?;
+    std::str::from_utf8(path).ok()
+}
+
+/// The write intents by path.
+pub type PathIntents = BTreeMap<String, Vec<(Key, WriteIntent)>>;
+
+/// The write intents of every path from the first to the last of `paths`, read as one range, so
+/// a page of known files costs one read however many paths it has.
+#[derive(Debug, PartialEq)]
+pub struct PathIntentsOperation {
+    import_id: Ulid,
+    bounds: Option<(String, String)>,
+    intents: PathIntents,
+}
+
+type IntentsTurn = Result<Next<PathIntents>, ImportRuleError>;
+
+impl PathIntentsOperation {
+    pub fn new(import_id: Ulid, paths: &[&str]) -> Self {
+        let first = paths.iter().min().map(|path| path.to_string());
+        let last = paths.iter().max().map(|path| path.to_string());
+        Self {
+            import_id,
+            bounds: first.zip(last),
+            intents: BTreeMap::new(),
+        }
+    }
+
+    fn page(&self, start: IterStart) -> IntentsTurn {
+        let page = range_page(IMPORT_INTENT_KEYSPACE, self.import_id, start);
+        Ok(Next::Call(page))
+    }
+}
+
+impl Operation for PathIntentsOperation {
+    type Output = PathIntents;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> IntentsTurn {
+        let Some((first, _)) = self.bounds.as_ref() else {
+            return Ok(Next::Done(PathIntents::new()));
+        };
+        self.page(IterStart::At(object_key(self.import_id, first)))
+    }
+
+    fn next(&mut self, result: IoResult) -> IntentsTurn {
+        let (rows, next) = range_rows(result.event()?)?;
+        let last = self.bounds.as_ref().map_or("", |(_, last)| last.as_str());
+        for (key, value) in rows {
+            let path = intent_path(&key);
+            let path = path
+                .ok_or_else(|| ImportRuleError::Read("a malformed write intent key".to_string()))?;
+            if path > last {
+                return Ok(Next::Done(std::mem::take(&mut self.intents)));
+            }
+            let path = path.to_string();
+            let intent = WriteIntent::from_bytes(&value)?;
+            self.intents.entry(path).or_default().push((key, intent));
+        }
+        match next {
+            Some(next) => self.page(IterStart::After(next)),
+            None => Ok(Next::Done(std::mem::take(&mut self.intents))),
+        }
+    }
+}
+
+type TakenTurn = Result<Next<HashSet<String>>, ImportRuleError>;
 
 /// The paths among `paths` that another rule recorded or has a write intent for. Each rule
 /// costs one range read per keyspace over the paths, however many there are.
-pub async fn taken_paths(
-    context: &DriverContext,
-    shared: &[SharedRule],
-    paths: &[&str],
-) -> Result<HashSet<String>, ImportRuleError> {
-    let wanted: HashSet<&str> = paths.iter().copied().collect();
-    let mut taken = HashSet::new();
-    let (Some(first), Some(last)) = (paths.iter().min(), paths.iter().max()) else {
-        return Ok(taken);
-    };
-    for other in shared {
-        let import_id = other.rule.import_id;
-        for space in [IMPORTED_OBJECT_KEYSPACE, IMPORT_INTENT_KEYSPACE] {
-            let mut start = IterStart::At(object_key(import_id, first));
-            loop {
-                let effect = StorageEffect::Iter {
-                    key_space: space.to_string(),
-                    prefix: Some(object_prefix(import_id)),
-                    start: Some(start),
-                    limit: RANGE_PAGE,
-                    txn_id: None,
-                };
-                let event = context.storage_handle.send_storage_effect(effect).await;
-                let (values, next) = match event {
-                    Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    }) => (values, next_start_after),
-                    Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-                    other => return Err(ImportRuleError::Read(format!("{other:?}"))),
-                };
-                let mut past = false;
-                for (key, _) in values {
-                    let rest = key.get(16..).unwrap_or_default();
-                    // An intent key ends in a zero byte and the 16 bytes of its version id.
-                    let path = match space == IMPORT_INTENT_KEYSPACE {
-                        true => rest
-                            .get(..rest.len().saturating_sub(17))
-                            .unwrap_or_default(),
-                        false => rest,
-                    };
-                    let path = std::str::from_utf8(path).unwrap_or_default();
-                    past |= path > *last;
-                    if wanted.contains(path) {
-                        taken.insert(path.to_string());
-                    }
-                }
-                match next {
-                    Some(next) if !past => start = IterStart::After(next),
-                    _ => break,
-                }
-            }
+#[derive(Debug, PartialEq)]
+pub struct TakenPathsOperation {
+    wanted: HashSet<String>,
+    bounds: Option<(String, String)>,
+    scans: VecDeque<(Ulid, &'static str)>,
+    scan: Option<(Ulid, &'static str)>,
+    taken: HashSet<String>,
+}
+
+impl TakenPathsOperation {
+    pub fn new(shared: &[SharedRule], paths: &[&str]) -> Self {
+        let first = paths.iter().min().map(|path| path.to_string());
+        let last = paths.iter().max().map(|path| path.to_string());
+        let scans = (shared.iter())
+            .flat_map(|other| {
+                let import_id = other.rule.import_id;
+                [
+                    (import_id, IMPORTED_OBJECT_KEYSPACE),
+                    (import_id, IMPORT_INTENT_KEYSPACE),
+                ]
+            })
+            .collect();
+        Self {
+            wanted: paths.iter().map(|path| path.to_string()).collect(),
+            bounds: first.zip(last),
+            scans,
+            scan: None,
+            taken: HashSet::new(),
         }
     }
-    Ok(taken)
+
+    fn next_scan(&mut self) -> TakenTurn {
+        let (Some((first, _)), Some((import_id, space))) =
+            (self.bounds.as_ref(), self.scans.pop_front())
+        else {
+            return Ok(Next::Done(std::mem::take(&mut self.taken)));
+        };
+        let start = IterStart::At(object_key(import_id, first));
+        self.scan = Some((import_id, space));
+        Ok(Next::Call(range_page(space, import_id, start)))
+    }
+}
+
+impl Operation for TakenPathsOperation {
+    type Output = HashSet<String>;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> TakenTurn {
+        self.next_scan()
+    }
+
+    fn next(&mut self, result: IoResult) -> TakenTurn {
+        let (import_id, space) = self.scan.ok_or(ImportRuleError::Unexpected("Taken"))?;
+        let (rows, next) = range_rows(result.event()?)?;
+        let last = self.bounds.as_ref().map_or("", |(_, last)| last.as_str());
+        let mut past = false;
+        for (key, _) in rows {
+            let rest = key.get(16..).unwrap_or_default();
+            // An intent key ends in a zero byte and the 16 bytes of its version id.
+            let path = match space == IMPORT_INTENT_KEYSPACE {
+                true => rest
+                    .get(..rest.len().saturating_sub(17))
+                    .unwrap_or_default(),
+                false => rest,
+            };
+            let path = std::str::from_utf8(path).unwrap_or_default();
+            past |= path > last;
+            if self.wanted.contains(path) {
+                self.taken.insert(path.to_string());
+            }
+        }
+        match next {
+            Some(next) if !past => {
+                let page = range_page(space, import_id, IterStart::After(next));
+                Ok(Next::Call(page))
+            }
+            _ => self.next_scan(),
+        }
+    }
 }
 
 /// A rule's view of one unmapped file: placed by a pattern, or at a root key of a bucket.
@@ -185,6 +372,7 @@ pub fn claim_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::testing::test_context;
     use crate::tests::s3::test_storage;
     use aruna_core::events::{Event, StorageEvent};
@@ -268,11 +456,15 @@ mod tests {
         );
         put(&context, IMPORT_INTENT_KEYSPACE, intent.to_vec(), vec![1]).await;
 
-        let shared = read_shared(&context, &bar).await.unwrap();
+        let shared = drive(ReadSharedOperation::new(&bar), &context)
+            .await
+            .unwrap();
         assert_eq!(shared.len(), 1);
         assert_eq!(shared[0].rule.import_id, foo.import_id);
         let paths = ["raw/a.fna", "raw/baz", "raw/inflight.txt", "raw/report.txt"];
-        let taken = taken_paths(&context, &shared, &paths).await.unwrap();
+        let taken = drive(TakenPathsOperation::new(&shared, &paths), &context)
+            .await
+            .unwrap();
         let expected = ["raw/inflight.txt", "raw/report.txt"].map(str::to_string);
         assert_eq!(taken, HashSet::from(expected));
         let own = pattern("*.fna");
@@ -328,5 +520,51 @@ mod tests {
             claim(&shared(&bar, Vec::new()), &[], "raw/x"),
             Claim::Conflict
         );
+    }
+
+    fn intent() -> WriteIntent {
+        WriteIntent {
+            key: "a".to_string(),
+            version_id: Ulid::from_parts(3, 3),
+            backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
+            created_by: Default::default(),
+            written: None,
+            mover: None,
+        }
+    }
+
+    fn scanned(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: next,
+        })))
+    }
+
+    #[test]
+    fn no_paths_no_scan() {
+        let mut intents = PathIntentsOperation::new(Ulid::nil(), &[]);
+        assert_eq!(intents.first(), Ok(Next::Done(PathIntents::new())));
+        let mut taken = TakenPathsOperation::new(&[], &["a"]);
+        assert_eq!(taken.first(), Ok(Next::Done(HashSet::new())));
+    }
+
+    #[test]
+    fn intents_stop_past_range() {
+        let id = Ulid::from_parts(2, 2);
+        let version = Ulid::from_parts(3, 3);
+        let inside = aruna_core::structs::storage::backend_import::intent_key(id, "a", version);
+        let past = aruna_core::structs::storage::backend_import::intent_key(id, "z", version);
+        let value: Value = intent().to_bytes().unwrap().into();
+        let mut operation = PathIntentsOperation::new(id, &["a"]);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let rows = vec![(inside.clone(), value.clone()), (past, value)];
+        let turn = operation.next(scanned(rows, Some(Key::from(vec![1]))));
+        let Ok(Next::Done(intents)) = turn else {
+            panic!("the range ended: {turn:?}");
+        };
+        assert_eq!(intents["a"], vec![(inside, intent())]);
     }
 }

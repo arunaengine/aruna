@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::email::{self, read_email, remove_email};
-use aruna_operations::notifications::opt_in::EmailError;
+use aruna_operations::notifications::email::{ReadEmailOperation, RemoveEmailOperation};
+use aruna_operations::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
 use aruna_operations::notifications::setting_rows::SettingError;
 use axum::Json;
 use axum::extract::State;
@@ -78,7 +79,7 @@ pub async fn get_email(
     UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<EmailResponse>> {
     settings_node(&state, &auth).await?;
-    let preference = read_email(&state.get_ctx(), auth.user_id)
+    let preference = drive(ReadEmailOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_error)?;
     Ok(Json(response(preference.ok_or(ServerError::NotFound)?)))
@@ -136,17 +137,16 @@ pub async fn set_email(
     Json(request): Json<EmailRequest>,
 ) -> ServerResult<Json<EmailResponse>> {
     settings_node(&state, &auth).await?;
-    let ctx = state.get_ctx();
-    let local = state.get_node_id();
-    let preference = email::set_email(
-        &ctx,
-        local,
+    let opt_in = EmailOptIn::new(
         auth.user_id,
+        state.get_node_id(),
         request.address,
         request.categories,
-    )
-    .await
-    .map_err(map_error)?;
+        unix_timestamp_millis(),
+    );
+    let preference = drive(SetEmailOperation::new(opt_in), &state.get_ctx())
+        .await
+        .map_err(map_error)?;
     Ok(Json(response(preference)))
 }
 
@@ -181,9 +181,9 @@ pub async fn delete_email(
     UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     settings_node(&state, &auth).await?;
-    remove_email(&state.get_ctx(), state.get_node_id(), auth.user_id)
-        .await
-        .map_err(map_error)?;
+    let remove =
+        RemoveEmailOperation::new(auth.user_id, state.get_node_id(), unix_timestamp_millis());
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

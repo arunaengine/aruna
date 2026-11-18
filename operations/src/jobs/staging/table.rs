@@ -3,14 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::manifest::lasting_read;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use aruna_core::errors::StagingSourceError;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::errors::{AuthorizationError, StagingSourceError};
+use aruna_core::events::Event;
+use aruna_core::jobs::{
+    ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent, ObjectBody, ObjectRead,
+    ObjectReadFailure,
+};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
-    StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, StagingJobSpec, TableRead,
+    StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, TableRead,
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::table::{
@@ -18,41 +26,51 @@ use aruna_core::structs::execution::table::{
     TableSource, is_gzip, parse_rows, read_header, source_path,
 };
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_core::structs::storage::routing::RoutingError;
+use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot};
+use aruna_core::types::{Key, KeySpace, Value};
 use bytes::Bytes;
 use byteview::ByteView;
-use futures_util::StreamExt;
+use ulid::Ulid;
 
-use super::manifest::lasting_head;
-use super::retried;
+use super::limiter::{in_turns, retried_call, retried_result, turns_result};
+use super::manifest::{lasting_head, lasting_read};
+use super::page::ImportPageOperation;
 use super::walk::{
-    PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
-    record_failure, source_permission_path,
+    StagedFile, Turns, WalkPlace, authority_call, key_turns, own_ranges, read_check_call,
+    record_failure, rules_call, rules_result, source_permission_path,
 };
-use super::{ItemFailure, pinned_bucket, queue_key};
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::jobs::executor::JobContext;
-use crate::placement::policy::GateOperation;
+use super::{ItemFailure, PageFailure, StagingRun, committed, pinned, queue_key};
+use crate::auth::permission_rules::PermissionRules;
+use crate::connectors::get_connector::{
+    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
+};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
-use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::replication::queue::{
+    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
+};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
-use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
+};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
-use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
-use aruna_core::time::unix_timestamp_millis;
+use crate::staging::read_source::{
+    ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
+};
 
 /// Directories the queue holds before the table is read further.
 const QUEUE_PAUSE: u64 = 1024;
@@ -78,13 +96,15 @@ pub(super) fn reads_table(checkpoint: &StagingJobCheckpoint) -> bool {
 }
 
 /// One window of the table and what the read learned about it.
-struct Chunk {
+#[derive(Debug, PartialEq)]
+pub(super) struct Chunk {
     bytes: Vec<u8>,
     complete: bool,
     read: TableRead,
 }
 
-enum ChunkFailure {
+#[derive(Debug, PartialEq)]
+pub(super) enum ChunkFailure {
     /// The table changed between chunks, so it is read again from its start.
     Changed,
     /// The table cannot be read; the job records it and ends the table.
@@ -92,125 +112,683 @@ enum ChunkFailure {
     Retry(String),
 }
 
-/// A table stream as opened, with the version it opened when the table is an object.
-type Opened = (
-    BackendStream<Result<Bytes, StreamError>>,
-    Option<ulid::Ulid>,
-);
+impl From<IoError> for ChunkFailure {
+    fn from(error: IoError) -> Self {
+        Self::Retry(error.to_string())
+    }
+}
 
 /// A gzip table's open stream and decoder, kept across the steps of one job run so the table
 /// is decoded once instead of from its start for every chunk.
+#[derive(Debug, PartialEq)]
 pub(super) struct GzipStream {
-    version_id: Option<ulid::Ulid>,
+    version_id: Option<Ulid>,
     observation: Option<SourceMetadata>,
-    stream: BackendStream<Result<Bytes, StreamError>>,
-    cursor: GzipCursor,
+    work: GzipWork,
+}
+
+/// A chunk that was read, and the stream to keep for the next step.
+#[derive(Debug, PartialEq)]
+pub(super) struct ChunkRead {
+    chunk: Chunk,
+    kept: Option<GzipStream>,
+}
+
+/// Where the table's bytes come from.
+#[derive(Debug, PartialEq)]
+enum Origin {
+    Connector {
+        path: String,
+    },
+    Object {
+        bucket: String,
+        key: String,
+        group_id: Option<Ulid>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+enum ChunkStep {
+    Bucket,
+    Allowed,
+    Head,
+    OpenRange,
+    OpenGzip { reused: bool },
+    Fill { reused: bool },
+    Collect { end: u64, size: Option<u64> },
+}
+
+/// Reads the next window of a table: below the read connector, every chunk bound to its first
+/// observation, or an uploaded object, read as the submitter and pinned to its first version.
+#[derive(Debug, PartialEq)]
+pub(super) struct ChunkReadOperation {
+    run: StagingRun,
+    origin: Origin,
+    read: TableRead,
+    kept: Option<GzipStream>,
+    observation: Option<SourceMetadata>,
+    gzip: bool,
+    window: usize,
+    opened: Option<Ulid>,
+    step: ChunkStep,
+}
+
+impl ChunkReadOperation {
+    fn new(
+        run: StagingRun,
+        origin: Origin,
+        read: TableRead,
+        kept: Option<GzipStream>,
+        window: usize,
+    ) -> Self {
+        Self {
+            run,
+            origin,
+            read,
+            kept,
+            observation: None,
+            gzip: false,
+            window,
+            opened: None,
+            step: ChunkStep::Allowed,
+        }
+    }
+
+    fn import(&self) -> Result<&TableImport, ChunkFailure> {
+        (self.run.spec.table.as_ref())
+            .ok_or_else(|| ChunkFailure::Retry("the job has no table".to_string()))
+    }
+
+    fn name(&self) -> &str {
+        match &self.origin {
+            Origin::Connector { path } => path,
+            Origin::Object { key, .. } => key,
+        }
+    }
+
+    fn done(&mut self, bytes: Vec<u8>, complete: bool) -> Next<ChunkRead> {
+        Next::Done(ChunkRead {
+            chunk: Chunk {
+                bytes,
+                complete,
+                read: self.read.clone(),
+            },
+            kept: self.kept.take(),
+        })
+    }
+
+    /// Decides the table's kind, then reads its bytes.
+    fn start(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
+        let format = &self.import()?.format;
+        self.gzip = self
+            .read
+            .gzip
+            .unwrap_or_else(|| is_gzip(format, self.name(), &[]));
+        self.proceed()
+    }
+
+    fn proceed(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
+        if self.gzip {
+            return self.gzip_chunk();
+        }
+        let start = self.read.offset;
+        match &self.origin {
+            Origin::Connector { .. } => {
+                let length = self.observation()?.content_length;
+                let end = (start + self.window as u64).min(length);
+                if start >= end {
+                    return Ok(self.done(Vec::new(), true));
+                }
+                self.step = ChunkStep::OpenRange;
+                Ok(Next::Call(self.source_call(Some(start..end))?))
+            }
+            Origin::Object { .. } => {
+                let last = start + self.window as u64 - 1;
+                self.step = ChunkStep::OpenRange;
+                Ok(Next::Call(self.object_call(Some((start, last)))?))
+            }
+        }
+    }
+
+    fn observation(&self) -> Result<&SourceMetadata, ChunkFailure> {
+        (self.observation.as_ref())
+            .ok_or_else(|| ChunkFailure::Retry("the table has no observation".to_string()))
+    }
+
+    /// The connector table's bytes in `range`, or all of them, bound to its observation.
+    fn source_call(&self, range: Option<std::ops::Range<u64>>) -> Result<IoCall, ChunkFailure> {
+        let spec = &self.run.spec;
+        let input = ReadSourceInput {
+            group_id: spec.group_id,
+            connector_id: spec.connector_id,
+            source_path: self.name().to_string(),
+            range,
+            expected: Some(self.observation()?.clone()),
+        };
+        let transient: fn(&ReadSourceError) -> bool = |error| !lasting_read(error);
+        Ok(retried_call(
+            &self.run,
+            input,
+            ReadSourceOperation::new,
+            transient,
+        ))
+    }
+
+    fn object_call(&self, range: Option<(u64, u64)>) -> Result<IoCall, ChunkFailure> {
+        let Origin::Object {
+            bucket,
+            key,
+            group_id,
+        } = &self.origin
+        else {
+            return Err(ChunkFailure::Retry("the table is no object".to_string()));
+        };
+        let group_id = group_id.ok_or_else(|| ChunkFailure::Retry("no bucket".to_string()))?;
+        let spec = &self.run.spec;
+        let auth = &spec.auth_context;
+        let read = ObjectRead {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: self.read.version_id,
+            range,
+            group_id,
+            user_id: auth.user_id,
+            realm_id: auth.realm_id,
+            node_id: spec.node_id,
+            restrictions: auth.path_restrictions.clone(),
+        };
+        Ok(job_call(JobEffect::ReadObject(Box::new(read))))
+    }
+
+    /// The decompressed chunk, read on from a stream an earlier step left open at this version,
+    /// observation and offset, or from a new stream skipped to the offset once.
+    fn gzip_chunk(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
+        let offset = self.read.offset;
+        let (version_id, observation) = (self.read.version_id, self.observation.clone());
+        let kept = (self.kept.take())
+            .filter(|kept| kept.version_id == version_id && kept.observation == observation)
+            .and_then(|mut kept| kept.work.cursor.advance(offset).then_some(kept));
+        match kept {
+            Some(kept) => {
+                self.step = ChunkStep::Fill { reused: true };
+                let version = kept.version_id;
+                let observation = kept.observation;
+                self.kept = Some(GzipStream {
+                    version_id: version,
+                    observation,
+                    work: empty_work(),
+                });
+                Ok(Next::Call(job_call(JobEffect::FillGzip(kept.work))))
+            }
+            None => self.open_gzip(),
+        }
+    }
+
+    fn open_gzip(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
+        self.kept = None;
+        self.step = ChunkStep::OpenGzip { reused: false };
+        let call = match self.origin {
+            Origin::Connector { .. } => self.source_call(None)?,
+            Origin::Object { .. } => self.object_call(None)?,
+        };
+        Ok(Next::Call(call))
+    }
+
+    /// A stream the source just opened, as the connector or the object store answered it.
+    fn opened(&mut self, result: IoResult) -> Result<OpenedTable, ChunkFailure> {
+        match self.origin {
+            Origin::Connector { .. } => {
+                let seen = self.observation()?;
+                match retried_result::<ReadSourceResult, ReadSourceError>(result)? {
+                    Ok(read) if read.metadata.compare(seen) == ObservationMatch::Changed => {
+                        Err(ChunkFailure::Changed)
+                    }
+                    Ok(read) => Ok(OpenedTable::Stream(read.stream, None, None)),
+                    Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
+                        Err(ChunkFailure::Changed)
+                    }
+                    Err(error) if lasting_read(&error) => {
+                        Err(ChunkFailure::Lasting(format!("table read failed: {error}")))
+                    }
+                    Err(error) => Err(ChunkFailure::Retry(error.to_string())),
+                }
+            }
+            Origin::Object { .. } => match object_answer(result)? {
+                Ok(body) => Ok(OpenedTable::Stream(
+                    body.stream,
+                    body.version_id,
+                    Some(body.size),
+                )),
+                // A range from the table's end on reads nothing.
+                Err(ObjectReadFailure::InvalidRange) => Ok(OpenedTable::Past),
+                Err(ObjectReadFailure::Gone(error)) => {
+                    Err(ChunkFailure::Lasting(format!("table unavailable: {error}")))
+                }
+                Err(ObjectReadFailure::Failed(error)) => Err(ChunkFailure::Retry(error)),
+            },
+        }
+    }
+
+    fn fill(&mut self, stream: ByteStream, version: Option<Ulid>) -> Next<ChunkRead> {
+        let version_id = self.read.version_id.or(version);
+        self.opened = version;
+        let cursor = GzipCursor::new(self.read.offset, self.window);
+        self.kept = Some(GzipStream {
+            version_id,
+            observation: self.observation.clone(),
+            work: empty_work(),
+        });
+        self.step = ChunkStep::Fill { reused: false };
+        Next::Call(job_call(JobEffect::FillGzip(GzipWork { stream, cursor })))
+    }
+
+    fn collected(
+        &mut self,
+        result: IoResult,
+        end: u64,
+        size: Option<u64>,
+    ) -> Result<Next<ChunkRead>, ChunkFailure> {
+        let event = result.event()?;
+        let Event::Job(JobEvent::Collected(bytes)) = event else {
+            return Err(IoError::Unexpected {
+                expected: "the collected table bytes",
+                got: event.label(),
+            }
+            .into());
+        };
+        let bytes = bytes.map_err(ChunkFailure::Retry)?;
+        let format = &self.import()?.format;
+        // The first chunk decides by its magic bytes whether a table is compressed.
+        if self.read.gzip.is_none() && is_gzip(format, self.name(), &bytes) {
+            self.gzip = true;
+            return self.proceed();
+        }
+        self.read.gzip = Some(false);
+        let complete = match size {
+            Some(size) => self.read.offset + bytes.len() as u64 >= size,
+            None => end == self.observation()?.content_length,
+        };
+        Ok(self.done(bytes, complete))
+    }
+}
+
+/// Holds a kept stream's place while its work is out at the adapter.
+fn empty_work() -> GzipWork {
+    GzipWork {
+        stream: BackendStream::new(futures_util::stream::empty::<Result<Bytes, StreamError>>()),
+        cursor: GzipCursor::new(0, 0),
+    }
+}
+
+/// What opening a table stream gave.
+enum OpenedTable {
+    Stream(ByteStream, Option<Ulid>, Option<u64>),
+    /// The range starts at or after the table's end.
+    Past,
+}
+
+fn job_call(effect: JobEffect) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Job(effect)))
+}
+
+/// The answer to an object read.
+fn object_answer(result: IoResult) -> Result<Result<ObjectBody, ObjectReadFailure>, IoError> {
+    let event = result.event()?;
+    match event {
+        Event::Job(JobEvent::Object(body)) => Ok(body),
+        other => Err(IoError::Unexpected {
+            expected: "the opened object",
+            got: other.label(),
+        }),
+    }
+}
+
+impl Operation for ChunkReadOperation {
+    type Output = ChunkRead;
+    type Error = ChunkFailure;
+
+    fn first(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
+        match &self.origin {
+            Origin::Connector { path } => {
+                let spec = &self.run.spec;
+                let allowed = source_permission_path(spec, path);
+                Ok(Next::Call(read_check_call(spec, allowed)))
+            }
+            Origin::Object { bucket, .. } => {
+                self.step = ChunkStep::Bucket;
+                let bucket = GetBucketOperation::new(bucket.clone());
+                Ok(Next::Call(IoCall::child(bucket)))
+            }
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ChunkRead>, ChunkFailure> {
+        match std::mem::replace(&mut self.step, ChunkStep::Allowed) {
+            ChunkStep::Bucket => {
+                let info = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => info,
+                    Err(GetBucketError::NotFound) => {
+                        return Err(ChunkFailure::Lasting(
+                            "the table's bucket does not exist".to_string(),
+                        ));
+                    }
+                    Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
+                };
+                let spec = self.run.spec.clone();
+                let Origin::Object {
+                    bucket,
+                    key,
+                    group_id,
+                } = &mut self.origin
+                else {
+                    return Err(ChunkFailure::Retry("the table is no object".to_string()));
+                };
+                *group_id = Some(info.group_id);
+                let auth = &spec.auth_context;
+                let path =
+                    object_permission_path(auth.realm_id, info.group_id, spec.node_id, bucket, key);
+                Ok(Next::Call(read_check_call(&spec, path)))
+            }
+            ChunkStep::Allowed => {
+                let allowed = (result.child::<bool, AuthorizationError>()?)
+                    .map_err(|error| ChunkFailure::Retry(error.to_string()))?;
+                if !allowed {
+                    return Err(ChunkFailure::Lasting("table read denied".to_string()));
+                }
+                if matches!(self.origin, Origin::Object { .. }) {
+                    return self.start();
+                }
+                match self.read.observation.clone() {
+                    Some(observation) => {
+                        self.observation = Some(observation);
+                        self.start()
+                    }
+                    None => {
+                        self.step = ChunkStep::Head;
+                        let spec = &self.run.spec;
+                        let input = HeadSourceInput {
+                            group_id: spec.group_id,
+                            connector_id: spec.connector_id,
+                            source_path: self.name().to_string(),
+                        };
+                        let transient: fn(&HeadSourceError) -> bool = |error| !lasting_head(error);
+                        let head =
+                            retried_call(&self.run, input, HeadSourceOperation::new, transient);
+                        Ok(Next::Call(head))
+                    }
+                }
+            }
+            ChunkStep::Head => match retried_result::<HeadSourceResult, HeadSourceError>(result)? {
+                Ok(head) => {
+                    self.read.observation = Some(head.metadata.clone());
+                    self.observation = Some(head.metadata);
+                    self.start()
+                }
+                Err(error) if lasting_head(&error) => {
+                    Err(ChunkFailure::Lasting(format!("table unavailable: {error}")))
+                }
+                Err(error) => Err(ChunkFailure::Retry(error.to_string())),
+            },
+            ChunkStep::OpenRange => {
+                let start = self.read.offset;
+                match self.opened(result)? {
+                    OpenedTable::Past => Ok(self.done(Vec::new(), true)),
+                    OpenedTable::Stream(stream, version, size) => {
+                        self.read.version_id = self.read.version_id.or(version);
+                        let end = match &self.origin {
+                            Origin::Connector { .. } => {
+                                let length = self.observation()?.content_length;
+                                (start + self.window as u64).min(length)
+                            }
+                            Origin::Object { .. } => 0,
+                        };
+                        self.step = ChunkStep::Collect { end, size };
+                        Ok(Next::Call(job_call(JobEffect::Collect(stream))))
+                    }
+                }
+            }
+            ChunkStep::OpenGzip { .. } => match self.opened(result)? {
+                OpenedTable::Past => Ok(self.done(Vec::new(), true)),
+                OpenedTable::Stream(stream, version, _) => Ok(self.fill(stream, version)),
+            },
+            ChunkStep::Fill { reused } => {
+                let event = result.event()?;
+                let Event::Job(JobEvent::GzipFilled {
+                    work,
+                    result: filled,
+                }) = event
+                else {
+                    return Err(IoError::Unexpected {
+                        expected: "the filled gzip chunk",
+                        got: event.label(),
+                    }
+                    .into());
+                };
+                match filled {
+                    Ok(()) => {
+                        let (bytes, complete) = work.cursor.chunk();
+                        if let Some(kept) = self.kept.as_mut() {
+                            kept.work = work;
+                        }
+                        self.read.version_id = self.read.version_id.or(self.opened.take());
+                        self.read.gzip = Some(true);
+                        Ok(self.done(bytes, complete))
+                    }
+                    // A stream kept between steps may have been closed or its source rewritten
+                    // meanwhile; opening it again checks the source like the first read did.
+                    Err(_) if reused => self.open_gzip(),
+                    Err(GzipBroken::Stream(error)) => Err(ChunkFailure::Retry(error)),
+                    Err(GzipBroken::Gzip(error)) => Err(ChunkFailure::Lasting(error)),
+                }
+            }
+            ChunkStep::Collect { end, size } => self.collected(result, end, size),
+        }
+    }
+}
+
+/// The checkpoint a table step left, and the stream kept for the next one.
+#[derive(Debug, PartialEq)]
+pub(super) struct TableStepEnd {
+    pub(super) checkpoint: StagingJobCheckpoint,
+    pub(super) kept: Option<GzipStream>,
+}
+
+#[derive(Debug, PartialEq)]
+enum TableStep {
+    Connector,
+    Chunk,
+    Commit,
+    Rows,
 }
 
 /// Reads the next chunk of the table: its header first, then rows, and commits their rows
-/// with the checkpoint. `kept` carries a gzip table's stream from one step of the run to the next.
-pub(super) async fn read_table_chunk(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    checkpoint: &mut StagingJobCheckpoint,
-    kept: &mut Option<GzipStream>,
-) -> Result<(), PageFailure> {
-    let (Some(import), Some(read)) = (spec.table.as_ref(), checkpoint.table.clone()) else {
-        return Ok(());
-    };
-    checkpoint.phase = StagingJobPhase::Discovering;
-    let name = table_name(import);
-    checkpoint.current_path = Some(name.clone());
-    let mut next = checkpoint.clone();
-    let connector = drive(
-        GetSourceOperation::new(GetSourceInput {
-            group_id: spec.group_id,
-            connector_id: spec.connector_id,
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| PageFailure::Retry(error.to_string()))?
-    .connector;
-    let base = connector.base_url();
-    let chunk = match &import.source {
-        TableSource::Connector(path) => {
-            let path = source_path(path, base.as_deref()).map_err(PageFailure::Permanent)?;
-            connector_chunk(ctx, spec, (import, &path), *read, kept).await
+/// with the checkpoint.
+#[derive(Debug, PartialEq)]
+pub(super) struct TableChunkOperation {
+    run: StagingRun,
+    next: StagingJobCheckpoint,
+    base: Option<String>,
+    kept: Option<GzipStream>,
+    step: TableStep,
+}
+
+impl TableChunkOperation {
+    pub(super) fn new(
+        run: StagingRun,
+        checkpoint: &StagingJobCheckpoint,
+        kept: Option<GzipStream>,
+    ) -> Self {
+        let mut next = checkpoint.clone();
+        next.phase = StagingJobPhase::Discovering;
+        next.current_path = run.spec.table.as_ref().map(table_name);
+        Self {
+            run,
+            next,
+            base: None,
+            kept,
+            step: TableStep::Connector,
         }
-        TableSource::Object { bucket, key } => {
-            object_chunk(ctx, spec, (import, bucket, key), *read, kept).await
-        }
-    };
-    let chunk = match chunk {
-        Ok(chunk) => chunk,
-        Err(ChunkFailure::Changed) => {
-            next.table = Some(Box::default());
-            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
-        }
-        Err(ChunkFailure::Lasting(message)) => {
-            record_failure(&mut next, &name, "", message);
-            next.table = None;
-            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
-        }
-        Err(ChunkFailure::Retry(message)) => return Err(PageFailure::Retry(message)),
-    };
-    let permanent = |error: aruna_core::structs::execution::table::TableError| {
-        PageFailure::Permanent(error.to_string())
-    };
-    let mut read = chunk.read;
-    let Some(columns) = read.columns.clone() else {
-        let (columns, used) =
-            read_header(&import.format, &chunk.bytes, chunk.complete).map_err(permanent)?;
-        RowMapper::new(&import.rows, &columns).map_err(permanent)?;
-        read.columns = Some(columns);
-        read.offset += used as u64;
-        next.table = Some(Box::new(read));
-        return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
-    };
-    let mapper = RowMapper::new(&import.rows, &columns).map_err(permanent)?;
-    let width = Some(columns.len());
-    let (mut rows, mut used) =
-        parse_rows(&import.format, width, &chunk.bytes, chunk.complete).map_err(permanent)?;
-    let mut complete = chunk.complete;
-    let (step_rows, _) = step_size(import);
-    if rows.len() > step_rows {
-        used = rows[step_rows - 1].1;
-        rows.truncate(step_rows);
-        complete = false;
     }
-    let mut entries = Vec::new();
-    for (row, end) in rows {
-        let at = read.offset + end as u64;
-        let (outcome, target) = match row {
-            Ok(fields) => match mapper.map(&fields, base.as_deref()) {
-                failed @ RowOutcome::Failed(_) => (failed, mapper.target_key(&fields)),
-                outcome => (outcome, None),
-            },
-            Err(reason) => (RowOutcome::Failed(reason), None),
+
+    fn import(&self) -> Result<TableImport, PageFailure> {
+        (self.run.spec.table.clone())
+            .ok_or_else(|| PageFailure::Retry("the job has no table".to_string()))
+    }
+
+    fn done(&mut self, checkpoint: StagingJobCheckpoint) -> Next<TableStepEnd> {
+        Next::Done(TableStepEnd {
+            checkpoint,
+            kept: self.kept.take(),
+        })
+    }
+
+    fn commit(&mut self) -> Result<Next<TableStepEnd>, PageFailure> {
+        self.step = TableStep::Commit;
+        let call = (self.run)
+            .commit_call(None, &self.next, Vec::new(), Vec::new())
+            .map_err(PageFailure::Retry)?;
+        Ok(Next::Call(call))
+    }
+
+    fn read_chunk(&mut self) -> Result<Next<TableStepEnd>, PageFailure> {
+        let import = self.import()?;
+        let Some(read) = self.next.table.clone() else {
+            return Ok(self.done(self.next.clone()));
         };
-        match outcome {
-            RowOutcome::Filtered | RowOutcome::Skipped => {}
-            RowOutcome::Failed(reason) => record_failure(
-                &mut next,
-                &name,
-                target.as_deref().unwrap_or_default(),
-                format!("row ending at byte {at}: {reason}"),
-            ),
-            RowOutcome::Import(entry) => entries.push(entry),
+        let origin = match &import.source {
+            TableSource::Connector(path) => Origin::Connector {
+                path: source_path(path, self.base.as_deref()).map_err(PageFailure::Permanent)?,
+            },
+            TableSource::Object { bucket, key } => Origin::Object {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                group_id: None,
+            },
+        };
+        self.step = TableStep::Chunk;
+        let window = step_size(&import).1;
+        let kept = self.kept.take();
+        let chunk = ChunkReadOperation::new(self.run.clone(), origin, *read, kept, window);
+        Ok(Next::Call(IoCall::child(chunk)))
+    }
+
+    /// Maps the chunk's rows and records them; the header comes first, in a step of its own.
+    fn rows(&mut self, chunk: Chunk) -> Result<Next<TableStepEnd>, PageFailure> {
+        let import = self.import()?;
+        let name = table_name(&import);
+        let permanent = |error: TableError| PageFailure::Permanent(error.to_string());
+        let mut read = chunk.read;
+        let Some(columns) = read.columns.clone() else {
+            let (columns, used) =
+                read_header(&import.format, &chunk.bytes, chunk.complete).map_err(permanent)?;
+            RowMapper::new(&import.rows, &columns).map_err(permanent)?;
+            read.columns = Some(columns);
+            read.offset += used as u64;
+            self.next.table = Some(Box::new(read));
+            return self.commit();
+        };
+        let mapper = RowMapper::new(&import.rows, &columns).map_err(permanent)?;
+        let width = Some(columns.len());
+        let (mut rows, mut used) =
+            parse_rows(&import.format, width, &chunk.bytes, chunk.complete).map_err(permanent)?;
+        let mut complete = chunk.complete;
+        let (step_rows, _) = step_size(&import);
+        if rows.len() > step_rows {
+            used = rows[step_rows - 1].1;
+            rows.truncate(step_rows);
+            complete = false;
         }
+        let mut entries = Vec::new();
+        for (row, end) in rows {
+            let at = read.offset + end as u64;
+            let (outcome, target) = match row {
+                Ok(fields) => match mapper.map(&fields, self.base.as_deref()) {
+                    failed @ RowOutcome::Failed(_) => (failed, mapper.target_key(&fields)),
+                    outcome => (outcome, None),
+                },
+                Err(reason) => (RowOutcome::Failed(reason), None),
+            };
+            match outcome {
+                RowOutcome::Filtered | RowOutcome::Skipped => {}
+                RowOutcome::Failed(reason) => record_failure(
+                    &mut self.next,
+                    &name,
+                    target.as_deref().unwrap_or_default(),
+                    format!("row ending at byte {at}: {reason}"),
+                ),
+                RowOutcome::Import(entry) => entries.push(entry),
+            }
+        }
+        let (entries, conflicts) = distinct_targets(entries);
+        for entry in conflicts {
+            let message = "another row of the table maps to this key".to_string();
+            record_failure(&mut self.next, &entry.source_path, &entry.target, message);
+        }
+        read.offset += used as u64;
+        read.done = complete;
+        self.next.table = Some(Box::new(read));
+        self.step = TableStep::Rows;
+        let run = self.run.clone();
+        let next = self.next.clone();
+        Ok(Next::Call(match mapper.kind() {
+            RowKind::File | RowKind::Record => {
+                IoCall::child(FileRowsOperation::new(run, next, entries))
+            }
+            RowKind::Folder => IoCall::child(FolderRowsOperation::new(run, next, entries)),
+        }))
     }
-    let (entries, conflicts) = distinct_targets(entries);
-    for entry in conflicts {
-        let message = "another row of the table maps to this key".to_string();
-        record_failure(&mut next, &entry.source_path, &entry.target, message);
+}
+
+impl Operation for TableChunkOperation {
+    type Output = TableStepEnd;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<TableStepEnd>, PageFailure> {
+        let spec = &self.run.spec;
+        Ok(Next::Call(IoCall::child(GetSourceOperation::new(
+            GetSourceInput {
+                group_id: spec.group_id,
+                connector_id: spec.connector_id,
+            },
+        ))))
     }
-    read.offset += used as u64;
-    read.done = complete;
-    next.table = Some(Box::new(read));
-    match mapper.kind() {
-        RowKind::File | RowKind::Record => file_rows(ctx, spec, checkpoint, next, entries).await,
-        RowKind::Folder => folder_rows(ctx, spec, checkpoint, next, entries).await,
+
+    fn next(&mut self, result: IoResult) -> Result<Next<TableStepEnd>, PageFailure> {
+        match self.step {
+            TableStep::Connector => {
+                let source = (result.child::<GetSourceResult, GetSourceError>()?)
+                    .map_err(|error| PageFailure::Retry(error.to_string()))?;
+                self.base = source.connector.base_url();
+                self.read_chunk()
+            }
+            TableStep::Chunk => {
+                let name = table_name(&self.import()?);
+                match result.child::<ChunkRead, ChunkFailure>()? {
+                    Ok(read) => {
+                        self.kept = read.kept;
+                        self.rows(read.chunk)
+                    }
+                    Err(ChunkFailure::Changed) => {
+                        self.next.table = Some(Box::default());
+                        self.commit()
+                    }
+                    Err(ChunkFailure::Lasting(message)) => {
+                        record_failure(&mut self.next, &name, "", message);
+                        self.next.table = None;
+                        self.commit()
+                    }
+                    Err(ChunkFailure::Retry(message)) => Err(PageFailure::Retry(message)),
+                }
+            }
+            TableStep::Commit => {
+                committed(result).map_err(PageFailure::Retry)?;
+                Ok(self.done(self.next.clone()))
+            }
+            TableStep::Rows => {
+                let checkpoint = result.child::<StagingJobCheckpoint, PageFailure>()??;
+                Ok(self.done(checkpoint))
+            }
+        }
     }
 }
 
@@ -240,461 +818,420 @@ fn table_name(import: &TableImport) -> String {
     }
 }
 
-async fn source_allowed(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    path: String,
-) -> Result<bool, ChunkFailure> {
-    drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: spec.auth_context.clone(),
-            path,
-            required_permission: Permission::READ,
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| ChunkFailure::Retry(error.to_string()))
-}
-
-/// A table below the read connector, every chunk bound to its first observation.
-async fn connector_chunk(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    (import, path): (&TableImport, &str),
-    mut read: TableRead,
-    kept: &mut Option<GzipStream>,
-) -> Result<Chunk, ChunkFailure> {
-    if !source_allowed(ctx, spec, source_permission_path(spec, path)).await? {
-        return Err(ChunkFailure::Lasting("table read denied".to_string()));
-    }
-    let observation = match read.observation.clone() {
-        Some(observation) => observation,
-        None => {
-            let input = HeadSourceInput {
-                group_id: spec.group_id,
-                connector_id: spec.connector_id,
-                source_path: path.to_string(),
-            };
-            let transient = |error: &_| !lasting_head(error);
-            match retried(ctx, spec, input, HeadSourceOperation::new, transient).await {
-                Ok(head) => head.metadata,
-                Err(error) if lasting_head(&error) => {
-                    return Err(ChunkFailure::Lasting(format!("table unavailable: {error}")));
-                }
-                Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
-            }
-        }
-    };
-    read.observation = Some(observation.clone());
-    let length = observation.content_length;
-    let mut gzip = read
-        .gzip
-        .unwrap_or_else(|| is_gzip(&import.format, path, &[]));
-    loop {
-        if gzip {
-            let at = (None, Some(observation.clone()), read.offset);
-            let observation = &observation;
-            let open = || async move {
-                let stream = open_source(ctx, spec, path, observation, None).await?;
-                Ok((stream, None))
-            };
-            let (bytes, complete, _) = gzip_chunk(kept, at, step_size(import).1, open).await?;
-            read.gzip = Some(true);
-            return Ok(Chunk {
-                bytes,
-                complete,
-                read,
-            });
-        }
-        let end = (read.offset + step_size(import).1 as u64).min(length);
-        if read.offset >= end {
-            return Ok(Chunk {
-                bytes: Vec::new(),
-                complete: true,
-                read,
-            });
-        }
-        let range = Some(read.offset..end);
-        let bytes = collect(open_source(ctx, spec, path, &observation, range).await?).await?;
-        // The first chunk decides by its magic bytes whether a table is compressed.
-        if read.gzip.is_none() && is_gzip(&import.format, path, &bytes) {
-            gzip = true;
-            continue;
-        }
-        read.gzip = Some(false);
-        return Ok(Chunk {
-            bytes,
-            complete: end == length,
-            read,
-        });
-    }
-}
-
-/// The connector table's bytes in `range`, or all of them, bound to `observation`.
-async fn open_source(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    path: &str,
-    observation: &SourceMetadata,
-    range: Option<std::ops::Range<u64>>,
-) -> Result<BackendStream<Result<Bytes, StreamError>>, ChunkFailure> {
-    let input = ReadSourceInput {
-        group_id: spec.group_id,
-        connector_id: spec.connector_id,
-        source_path: path.to_string(),
-        range,
-        expected: Some(observation.clone()),
-    };
-    let transient = |error: &ReadSourceError| !lasting_read(error);
-    match retried(ctx, spec, input, ReadSourceOperation::new, transient).await {
-        Ok(result) if result.metadata.compare(observation) == ObservationMatch::Changed => {
-            Err(ChunkFailure::Changed)
-        }
-        Ok(result) => Ok(result.stream),
-        Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
-            Err(ChunkFailure::Changed)
-        }
-        Err(error) if lasting_read(&error) => {
-            Err(ChunkFailure::Lasting(format!("table read failed: {error}")))
-        }
-        Err(error) => Err(ChunkFailure::Retry(error.to_string())),
-    }
-}
-
-/// An uploaded table, read as the submitter and pinned to the version first read.
-async fn object_chunk(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    (import, bucket, key): (&TableImport, &str, &str),
-    mut read: TableRead,
-    kept: &mut Option<GzipStream>,
-) -> Result<Chunk, ChunkFailure> {
-    let info = match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(info) => info,
-        Err(GetBucketError::NotFound) => {
-            return Err(ChunkFailure::Lasting(
-                "the table's bucket does not exist".to_string(),
-            ));
-        }
-        Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
-    };
-    let auth = &spec.auth_context;
-    let path = object_permission_path(auth.realm_id, info.group_id, spec.node_id, bucket, key);
-    if !source_allowed(ctx, spec, path).await? {
-        return Err(ChunkFailure::Lasting("table read denied".to_string()));
-    }
-    let input = |version_id, range| GetObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id,
-        range,
-        group_id: info.group_id,
-        user_identity: auth.user_id,
-        realm_id: auth.realm_id,
-        node_id: spec.node_id,
-    };
-    let restrictions = || auth.path_restrictions.clone();
-    let mut gzip = read
-        .gzip
-        .unwrap_or_else(|| is_gzip(&import.format, key, &[]));
-    loop {
-        if gzip {
-            let version_id = read.version_id;
-            let (input, restrictions) = (&input, &restrictions);
-            let open = || async move {
-                let found = get_object_routed(&ctx.driver, input(version_id, None), restrictions())
-                    .await
-                    .map_err(object_failure)?;
-                Ok((found.blob, found.resolved_version_id.or(found.version_id)))
-            };
-            let at = (version_id, None, read.offset);
-            let (bytes, complete, opened) = gzip_chunk(kept, at, step_size(import).1, open).await?;
-            read.version_id = read.version_id.or(opened);
-            read.gzip = Some(true);
-            return Ok(Chunk {
-                bytes,
-                complete,
-                read,
-            });
-        }
-        let start = read.offset;
-        let range = Some(ObjectRangeRequest::StartEnd {
-            start,
-            end: start + step_size(import).1 as u64 - 1,
-        });
-        let input = input(read.version_id, range);
-        let result = match get_object_routed(&ctx.driver, input, restrictions()).await {
-            Ok(result) => result,
-            // A range from the table's end on reads nothing.
-            Err(GetObjectError::InvalidRange) => {
-                return Ok(Chunk {
-                    bytes: Vec::new(),
-                    complete: true,
-                    read,
-                });
-            }
-            Err(error) => return Err(object_failure(error)),
-        };
-        read.version_id = read
-            .version_id
-            .or(result.resolved_version_id.or(result.version_id));
-        let size = result.info.size;
-        let bytes = collect(result.blob).await?;
-        if read.gzip.is_none() && is_gzip(&import.format, key, &bytes) {
-            gzip = true;
-            continue;
-        }
-        read.gzip = Some(false);
-        return Ok(Chunk {
-            complete: start + bytes.len() as u64 >= size,
-            bytes,
-            read,
-        });
-    }
-}
-
-fn object_failure(error: GetObjectError) -> ChunkFailure {
-    match error {
-        GetObjectError::NoSuchKey
-        | GetObjectError::NoSuchVersion
-        | GetObjectError::DeleteMarker => {
-            ChunkFailure::Lasting(format!("table unavailable: {error}"))
-        }
-        error => ChunkFailure::Retry(error.to_string()),
-    }
-}
-
-async fn collect(
-    mut stream: BackendStream<Result<Bytes, StreamError>>,
-) -> Result<Vec<u8>, ChunkFailure> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| ChunkFailure::Retry(error.to_string()))?;
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
-/// The decompressed chunk of at most `window` bytes at a version, observation and offset, read on
-/// from a stream an earlier step left open there, or from a new `open` stream skipped to the
-/// offset once. Returns the version the stream opened, if it opened one.
-async fn gzip_chunk<F, Opening>(
-    kept: &mut Option<GzipStream>,
-    (version_id, observation, offset): (Option<ulid::Ulid>, Option<SourceMetadata>, u64),
-    window: usize,
-    mut open: F,
-) -> Result<(Vec<u8>, bool, Option<ulid::Ulid>), ChunkFailure>
-where
-    F: FnMut() -> Opening,
-    Opening: Future<Output = Result<Opened, ChunkFailure>>,
-{
-    let mut current = (kept.take())
-        .filter(|kept| kept.version_id == version_id && kept.observation == observation)
-        .and_then(|mut kept| kept.cursor.advance(offset).then_some(kept));
-    let mut opened = None;
-    loop {
-        let reused = current.is_some();
-        let mut gzip = match current.take() {
-            Some(gzip) => gzip,
-            None => {
-                let (stream, version) = open().await?;
-                opened = version;
-                GzipStream {
-                    version_id: version_id.or(version),
-                    observation: observation.clone(),
-                    stream,
-                    cursor: GzipCursor::new(offset, window),
-                }
-            }
-        };
-        match decode_chunk(&mut gzip).await {
-            Ok(()) => {
-                let (bytes, complete) = gzip.cursor.chunk();
-                *kept = Some(gzip);
-                return Ok((bytes, complete, opened));
-            }
-            // A stream kept between steps may have been closed or its source rewritten
-            // meanwhile; opening it again checks the source like the first read did.
-            Err(_) if reused => {}
-            Err(Broken::Stream(error)) => return Err(ChunkFailure::Retry(error)),
-            Err(Broken::Gzip(error)) => return Err(ChunkFailure::Lasting(error.to_string())),
-        }
-    }
-}
-
-/// Why decoding a chunk stopped: the transport failed or the bytes are no valid gzip.
-enum Broken {
-    Stream(String),
-    Gzip(TableError),
-}
-
-/// Pulls compressed bytes until the cursor holds the next chunk or the table's end.
-async fn decode_chunk(gzip: &mut GzipStream) -> Result<(), Broken> {
-    while !gzip.cursor.fill().map_err(Broken::Gzip)? {
-        match gzip.stream.next().await {
-            Some(Ok(bytes)) => gzip.cursor.push(&bytes),
-            Some(Err(error)) => return Err(Broken::Stream(error.to_string())),
-            None => gzip.cursor.finish(),
-        }
-    }
-    Ok(())
+#[derive(Debug, PartialEq)]
+enum FileRowsStep {
+    Empty,
+    Import,
 }
 
 /// Registers the files of file and record rows as references carrying their row metadata, and
 /// writes the empty objects of record rows without a source.
-async fn file_rows(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    checkpoint: &mut StagingJobCheckpoint,
-    mut next: StagingJobCheckpoint,
+#[derive(Debug, PartialEq)]
+struct FileRowsOperation {
+    run: StagingRun,
+    next: StagingJobCheckpoint,
+    empty: Vec<TableEntry>,
     entries: Vec<TableEntry>,
-) -> Result<(), PageFailure> {
-    let (empty, entries): (Vec<_>, Vec<_>) =
-        (entries.into_iter()).partition(|entry| entry.source_path.is_empty());
-    if !empty.is_empty() {
-        empty_objects(ctx, spec, &mut next, empty).await?;
+    step: FileRowsStep,
+}
+
+impl FileRowsOperation {
+    fn new(run: StagingRun, next: StagingJobCheckpoint, entries: Vec<TableEntry>) -> Self {
+        let (empty, entries) =
+            (entries.into_iter()).partition(|entry: &TableEntry| entry.source_path.is_empty());
+        Self {
+            run,
+            next,
+            empty,
+            entries,
+            step: FileRowsStep::Empty,
+        }
     }
-    // A row with a size is its own observation; its checksums bind the reads without a strong
-    // ETag, and a row without a size is headed.
-    let files = (entries.into_iter())
-        .map(|entry| StagedFile {
-            source_path: entry.source_path,
-            target_key: entry.target,
-            size: entry.size,
-            observation: entry.size.map(|content_length| SourceMetadata {
-                content_length,
-                content_type: entry.content_type,
-                etag: entry.etag,
-                last_modified: entry.modified,
-                source_version: None,
-                digests: Default::default(),
-            }),
-            manifest: entry.digests,
-            metadata: entry.metadata,
-            modified: entry.modified,
-            mirrors: entry.mirrors,
-        })
-        .collect();
-    let rows = (files, Vec::new(), Vec::new());
-    import_page(ctx, spec, (None, None), checkpoint, next, rows, None).await
+
+    fn import(&mut self) -> Next<StagingJobCheckpoint> {
+        self.step = FileRowsStep::Import;
+        // A row with a size is its own observation; its checksums bind the reads without a
+        // strong ETag, and a row without a size is headed.
+        let files = (std::mem::take(&mut self.entries).into_iter())
+            .map(|entry| StagedFile {
+                source_path: entry.source_path,
+                target_key: entry.target,
+                size: entry.size,
+                observation: entry.size.map(|content_length| SourceMetadata {
+                    content_length,
+                    content_type: entry.content_type,
+                    etag: entry.etag,
+                    last_modified: entry.modified,
+                    source_version: None,
+                    digests: Default::default(),
+                }),
+                manifest: entry.digests,
+                metadata: entry.metadata,
+                modified: entry.modified,
+                mirrors: entry.mirrors,
+            })
+            .collect();
+        Next::Call(IoCall::child(ImportPageOperation::new(
+            self.run.clone(),
+            WalkPlace::default(),
+            self.next.clone(),
+            (files, Vec::new(), Vec::new()),
+            None,
+        )))
+    }
+}
+
+impl Operation for FileRowsOperation {
+    type Output = StagingJobCheckpoint;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        if self.empty.is_empty() {
+            return Ok(self.import());
+        }
+        let entries = std::mem::take(&mut self.empty);
+        let empty = EmptyObjectsOperation::new(self.run.clone(), self.next.clone(), entries);
+        Ok(Next::Call(IoCall::child(empty)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        match self.step {
+            FileRowsStep::Empty => {
+                self.next = result.child::<StagingJobCheckpoint, PageFailure>()??;
+                Ok(self.import())
+            }
+            FileRowsStep::Import => {
+                let checkpoint = result.child::<StagingJobCheckpoint, PageFailure>()??;
+                Ok(Next::Done(checkpoint))
+            }
+        }
+    }
+}
+
+/// The turns one key is written in, read from the set's authority rows when it has any.
+fn turn_of(
+    bucket: &BucketInfo,
+    key: &str,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<Option<Turns>, PageFailure> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(Some(Turns::new()));
+    };
+    let mut turns = key_turns(binding, &[key], record, fence).map_err(PageFailure::Retry)?;
+    Ok(turns.pop().flatten())
+}
+
+#[derive(Debug, PartialEq)]
+enum EmptyStep {
+    Bucket,
+    Rules,
+    Authority,
+    Put,
 }
 
 /// Writes each empty object this node coordinates, with its row metadata, before the chunk
 /// commits; a transient failure retries the chunk, which writes equal objects only once.
-async fn empty_objects(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    next: &mut StagingJobCheckpoint,
-    entries: Vec<TableEntry>,
-) -> Result<(), PageFailure> {
-    let bucket = pinned_bucket(ctx, spec).await.map_err(page_failure)?;
-    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
-    let keys: Vec<&str> = entries.iter().map(|entry| entry.target.as_str()).collect();
-    let turns = key_turns(ctx, &bucket, &keys).await;
-    for (entry, turn) in entries.iter().zip(turns.map_err(PageFailure::Retry)?) {
-        let target = object_permission_path(
-            spec.auth_context.realm_id,
-            spec.group_id,
-            spec.node_id,
-            &spec.bucket,
-            &entry.target,
-        );
-        if !rules.allows(&target, &Permission::WRITE) {
-            record_failure(next, "", &entry.target, "permission denied".to_string());
-            continue;
-        }
-        let Some(turn) = turn else {
-            continue;
-        };
-        // Pages of other jobs into the key's range wait instead of conflicting with the put.
-        let _turn = ctx.range_turns.take(&turn).await;
-        match Box::pin(put_folder(
-            ctx,
-            spec,
-            &bucket,
-            &entry.target,
-            &entry.metadata,
-        ))
-        .await
-        {
-            Ok(()) => {
-                next.items_current = next.items_current.saturating_add(1);
-                next.items_succeeded = next.items_succeeded.saturating_add(1);
-            }
-            Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                record_failure(next, "", &entry.target, message)
-            }
-            Err(failure) => return Err(page_failure(failure)),
+#[derive(Debug, PartialEq)]
+struct EmptyObjectsOperation {
+    run: StagingRun,
+    next: StagingJobCheckpoint,
+    entries: VecDeque<TableEntry>,
+    bucket: Option<BucketInfo>,
+    rules: Option<PermissionRules>,
+    authority: (Option<Value>, Option<Value>),
+    current: Option<TableEntry>,
+    step: EmptyStep,
+}
+
+impl EmptyObjectsOperation {
+    fn new(run: StagingRun, next: StagingJobCheckpoint, entries: Vec<TableEntry>) -> Self {
+        Self {
+            run,
+            next,
+            entries: entries.into(),
+            bucket: None,
+            rules: None,
+            authority: (None, None),
+            current: None,
+            step: EmptyStep::Bucket,
         }
     }
-    Ok(())
+
+    fn advance(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        let spec = self.run.spec.clone();
+        let bucket = self.bucket.clone().ok_or(lost_rows())?;
+        let (record, fence) = (self.authority.0.clone(), self.authority.1.clone());
+        while let Some(entry) = self.entries.pop_front() {
+            let target = object_permission_path(
+                spec.auth_context.realm_id,
+                spec.group_id,
+                spec.node_id,
+                &spec.bucket,
+                &entry.target,
+            );
+            let rules = self.rules.as_ref().ok_or(lost_rows())?;
+            if !rules.allows(&target, &Permission::WRITE) {
+                record_failure(
+                    &mut self.next,
+                    "",
+                    &entry.target,
+                    "permission denied".to_string(),
+                );
+                continue;
+            }
+            let turn = turn_of(&bucket, &entry.target, record.as_deref(), fence.as_deref())?;
+            let Some(turn) = turn else {
+                continue;
+            };
+            // Pages of other jobs into the key's range wait instead of conflicting with the put.
+            let put = PutFolderOperation::new(
+                self.run.clone(),
+                bucket.clone(),
+                entry.target.clone(),
+                entry.metadata.clone(),
+            );
+            self.current = Some(entry);
+            self.step = EmptyStep::Put;
+            return Ok(Next::Call(in_turns(turn, put)));
+        }
+        Ok(Next::Done(self.next.clone()))
+    }
+}
+
+fn lost_rows() -> PageFailure {
+    PageFailure::Retry("the table rows lost their state".to_string())
+}
+
+impl Operation for EmptyObjectsOperation {
+    type Output = StagingJobCheckpoint;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        Ok(Next::Call(self.run.bucket_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        match self.step {
+            EmptyStep::Bucket => {
+                self.bucket = Some(pinned(&self.run.spec, result).map_err(page_failure)?);
+                self.step = EmptyStep::Rules;
+                Ok(Next::Call(rules_call(&self.run.spec)))
+            }
+            EmptyStep::Rules => {
+                self.rules = Some(rules_result(result).map_err(PageFailure::Retry)?);
+                let bucket = self.bucket.as_ref().ok_or(lost_rows())?;
+                match bucket.distribution.as_ref() {
+                    Some(binding) => {
+                        self.step = EmptyStep::Authority;
+                        Ok(Next::Call(authority_call(binding)))
+                    }
+                    None => self.advance(),
+                }
+            }
+            EmptyStep::Authority => {
+                let [record, fence] = values::<2>(result)?;
+                self.authority = (record, fence);
+                self.advance()
+            }
+            EmptyStep::Put => {
+                let entry = self.current.take().ok_or(lost_rows())?;
+                match turns_result::<(), ItemFailure>(result)? {
+                    Ok(()) => {
+                        let next = &mut self.next;
+                        next.items_current = next.items_current.saturating_add(1);
+                        next.items_succeeded = next.items_succeeded.saturating_add(1);
+                    }
+                    Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+                        record_failure(&mut self.next, "", &entry.target, message)
+                    }
+                    Err(failure) => return Err(page_failure(failure)),
+                }
+                self.advance()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum FolderStep {
+    Bucket,
+    Ranges,
+    Rules,
+    Turn,
+    Put,
+    Commit,
 }
 
 /// Queues the folders of folder rows whose keys overlap a range this node coordinates, after
 /// writing each folder object on the coordinator of its key.
-async fn folder_rows(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    checkpoint: &mut StagingJobCheckpoint,
-    mut next: StagingJobCheckpoint,
-    entries: Vec<TableEntry>,
-) -> Result<(), PageFailure> {
-    let bucket = pinned_bucket(ctx, spec).await.map_err(page_failure)?;
-    let ranges = match bucket.distribution.as_ref() {
-        Some(binding) => Some(own_ranges(ctx, binding).await?),
-        None => None,
-    };
-    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
-    let mut writes = Vec::new();
-    for entry in entries {
-        let prefix = format!("{}/", entry.target);
-        if !overlaps(ranges.as_deref(), &prefix) {
-            continue;
+#[derive(Debug, PartialEq)]
+struct FolderRowsOperation {
+    run: StagingRun,
+    next: StagingJobCheckpoint,
+    entries: VecDeque<TableEntry>,
+    bucket: Option<BucketInfo>,
+    ranges: Option<Vec<(String, Option<String>)>>,
+    rules: Option<PermissionRules>,
+    current: Option<TableEntry>,
+    writes: Vec<(KeySpace, Key, Value)>,
+    step: FolderStep,
+}
+
+impl FolderRowsOperation {
+    fn new(run: StagingRun, next: StagingJobCheckpoint, entries: Vec<TableEntry>) -> Self {
+        Self {
+            run,
+            next,
+            entries: entries.into(),
+            bucket: None,
+            ranges: None,
+            rules: None,
+            current: None,
+            writes: Vec::new(),
+            step: FolderStep::Bucket,
         }
-        let source = source_permission_path(spec, &entry.source_path);
-        let target = object_permission_path(
-            spec.auth_context.realm_id,
-            spec.group_id,
-            spec.node_id,
-            &spec.bucket,
-            &prefix,
-        );
-        if !rules.allows(&source, &Permission::READ) || !rules.allows(&target, &Permission::WRITE) {
-            record_failure(
-                &mut next,
-                &entry.source_path,
-                &prefix,
-                "permission denied".to_string(),
-            );
-            continue;
-        }
-        let turn = key_turns(ctx, &bucket, &[prefix.as_str()]).await;
-        if let Some(Some(turn)) = turn.map_err(PageFailure::Retry)?.pop() {
-            let _turn = ctx.range_turns.take(&turn).await;
-            match Box::pin(put_folder(ctx, spec, &bucket, &prefix, &entry.metadata)).await {
-                Ok(()) => {}
-                Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                    record_failure(&mut next, &entry.source_path, &prefix, message)
-                }
-                Err(failure) => return Err(page_failure(failure)),
+    }
+
+    fn rules_call(&mut self) -> Next<StagingJobCheckpoint> {
+        self.step = FolderStep::Rules;
+        Next::Call(rules_call(&self.run.spec))
+    }
+
+    fn advance(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        let spec = self.run.spec.clone();
+        while let Some(entry) = self.entries.pop_front() {
+            let prefix = format!("{}/", entry.target);
+            if !overlaps(self.ranges.as_deref(), &prefix) {
+                continue;
             }
+            let source = source_permission_path(&spec, &entry.source_path);
+            let target = object_permission_path(
+                spec.auth_context.realm_id,
+                spec.group_id,
+                spec.node_id,
+                &spec.bucket,
+                &prefix,
+            );
+            let rules = self.rules.as_ref().ok_or(lost_rows())?;
+            if !rules.allows(&source, &Permission::READ)
+                || !rules.allows(&target, &Permission::WRITE)
+            {
+                let denied = "permission denied".to_string();
+                record_failure(&mut self.next, &entry.source_path, &prefix, denied);
+                continue;
+            }
+            self.current = Some(entry);
+            let bucket = self.bucket.as_ref().ok_or(lost_rows())?;
+            return match bucket.distribution.as_ref() {
+                Some(binding) => {
+                    self.step = FolderStep::Turn;
+                    Ok(Next::Call(authority_call(binding)))
+                }
+                None => self.put(Some(Turns::new())),
+            };
         }
+        self.step = FolderStep::Commit;
+        let writes = std::mem::take(&mut self.writes);
+        let call = (self.run)
+            .commit_call(None, &self.next, writes, Vec::new())
+            .map_err(PageFailure::Retry)?;
+        Ok(Next::Call(call))
+    }
+
+    /// Writes the current folder's object in its turn; a folder of another node just queues.
+    fn put(&mut self, turn: Option<Turns>) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        let Some(turn) = turn else {
+            return self.queue();
+        };
+        let entry = self.current.as_ref().ok_or(lost_rows())?;
+        let bucket = self.bucket.clone().ok_or(lost_rows())?;
+        let key = format!("{}/", entry.target);
+        let metadata = entry.metadata.clone();
+        let put = PutFolderOperation::new(self.run.clone(), bucket, key, metadata);
+        self.step = FolderStep::Put;
+        Ok(Next::Call(in_turns(turn, put)))
+    }
+
+    fn queue(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        let entry = self.current.take().ok_or(lost_rows())?;
         let directory = StagingJobDirectory {
             source_path: entry.source_path,
             target_prefix: entry.target,
         };
         let value = postcard::to_allocvec(&directory)
             .map_err(|error| PageFailure::Permanent(error.to_string()))?;
-        let key = queue_key(ctx.job_id, next.queue_tail);
-        writes.push((
+        let key = queue_key(self.run.job_id, self.next.queue_tail);
+        self.writes.push((
             STAGING_QUEUE_KEYSPACE.to_string(),
             key,
             ByteView::from(value),
         ));
-        next.queue_tail += 1;
+        self.next.queue_tail += 1;
+        self.advance()
     }
-    commit_rows(ctx, checkpoint, next, writes, Vec::new()).await
+}
+
+impl Operation for FolderRowsOperation {
+    type Output = StagingJobCheckpoint;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        Ok(Next::Call(self.run.bucket_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+        match self.step {
+            FolderStep::Bucket => {
+                let bucket = pinned(&self.run.spec, result).map_err(page_failure)?;
+                let authority = bucket.distribution.as_ref().map(authority_call);
+                self.bucket = Some(bucket);
+                match authority {
+                    Some(call) => {
+                        self.step = FolderStep::Ranges;
+                        Ok(Next::Call(call))
+                    }
+                    None => Ok(self.rules_call()),
+                }
+            }
+            FolderStep::Ranges => {
+                let [record, fence] = values::<2>(result)?;
+                let bucket = self.bucket.as_ref().ok_or(lost_rows())?;
+                let binding = bucket.distribution.as_ref().ok_or(lost_rows())?;
+                let ranges = own_ranges(binding, record.as_deref(), fence.as_deref())?;
+                self.ranges = Some(ranges);
+                Ok(self.rules_call())
+            }
+            FolderStep::Rules => {
+                self.rules = Some(rules_result(result).map_err(PageFailure::Retry)?);
+                self.advance()
+            }
+            FolderStep::Turn => {
+                let [record, fence] = values::<2>(result)?;
+                let entry = self.current.as_ref().ok_or(lost_rows())?;
+                let bucket = self.bucket.as_ref().ok_or(lost_rows())?;
+                let prefix = format!("{}/", entry.target);
+                let turn = turn_of(bucket, &prefix, record.as_deref(), fence.as_deref())?;
+                self.put(turn)
+            }
+            FolderStep::Put => {
+                match turns_result::<(), ItemFailure>(result)? {
+                    Ok(()) => {}
+                    Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+                        let entry = self.current.as_ref().ok_or(lost_rows())?;
+                        let prefix = format!("{}/", entry.target);
+                        record_failure(&mut self.next, &entry.source_path, &prefix, message)
+                    }
+                    Err(failure) => return Err(page_failure(failure)),
+                }
+                self.queue()
+            }
+            FolderStep::Commit => {
+                committed(result).map_err(PageFailure::Retry)?;
+                Ok(Next::Done(self.next.clone()))
+            }
+        }
+    }
 }
 
 fn page_failure(failure: ItemFailure) -> PageFailure {
@@ -718,118 +1255,177 @@ fn overlaps(ranges: Option<&[(String, Option<String>)]>, prefix: &str) -> bool {
     })
 }
 
-/// Writes the zero-byte folder object at `key` with the row metadata; an equal head stays.
-async fn put_folder(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    bucket: &BucketInfo,
-    key: &str,
-    metadata: &BTreeMap<String, String>,
-) -> Result<(), ItemFailure> {
-    let head = HeadObjectInput {
-        bucket: spec.bucket.clone(),
-        key: key.to_string(),
-        version_id: None,
-    };
-    if let Ok(head) = drive(HeadObjectOperation::new(head), &ctx.driver).await {
-        let empty = head
-            .location
-            .as_ref()
-            .is_some_and(|location| location.blob_size == 0);
-        let same = head.metadata.len() == metadata.len()
-            && (metadata.iter()).all(|(key, value)| head.metadata.get(key) == Some(value));
-        if empty && same {
-            return Ok(());
-        }
-    }
-    let target = (spec.bucket.as_str(), bucket);
-    Box::pin(write_object(
-        ctx,
-        spec,
-        target,
-        key,
-        (Bytes::new(), metadata),
-    ))
-    .await
+#[derive(Debug, PartialEq)]
+enum PutStep {
+    Head,
+    Routing,
+    Gate(Box<RoutingSnapshot>),
+    Quota(Box<RoutingSnapshot>, Option<Box<GateContext>>),
+    Put,
+    Replicate,
 }
 
-/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication;
-/// the version's origin is the job's import, like the references of its other rows.
-async fn write_object(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    (name, bucket): (&str, &BucketInfo),
-    key: &str,
-    (body, metadata): (Bytes, &BTreeMap<String, String>),
-) -> Result<(), ItemFailure> {
-    let system = |error: String| ItemFailure::System(error);
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(&ctx.driver),
-            (bucket).group_id,
-            BucketRules::of(bucket),
-        ),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| system(error.to_string()))?;
-    let auth = &spec.auth_context;
-    let gate = drive(
-        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| system(error.to_string()))?;
-    let quota = drive(GetConfigOperation::new(auth.realm_id), &ctx.driver)
-        .await
-        .map_err(|error| system(error.to_string()))?
-        .quota
-        .effective_group_ceiling(&bucket.group_id);
-    let length = body.len() as u64;
-    let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(body)]));
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: auth.user_id,
-        group_id: bucket.group_id,
-        realm_id: auth.realm_id,
-        node_id: spec.node_id,
-        request: PutObjectInput {
-            bucket: name.to_string(),
-            key: key.to_string(),
-            content_length: Some(length),
-            body: Some(body),
-        },
-        expected_checksums: Vec::new(),
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: quota,
-        routing,
-    })
-    .with_bucket_guard(bucket.clone())
-    .with_version_origin(Some(VersionOrigin::Source {
-        job_id: Some(ctx.job_id.as_ulid()),
-    }))
-    .with_restrictions(auth.path_restrictions.clone())
-    .with_metadata(metadata.clone().into_iter().collect::<HashMap<_, _>>());
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
+/// Writes the zero-byte folder object at `key` with the row metadata, through the ordinary put
+/// as the submitter, and queues its replication; an equal head stays. The version's origin is
+/// the job's import, like the references of its other rows.
+#[derive(Debug, PartialEq)]
+pub(super) struct PutFolderOperation {
+    run: StagingRun,
+    bucket: BucketInfo,
+    key: String,
+    metadata: BTreeMap<String, String>,
+    now_ms: u64,
+    step: PutStep,
+}
+
+impl PutFolderOperation {
+    pub(super) fn new(
+        run: StagingRun,
+        bucket: BucketInfo,
+        key: String,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            run,
+            bucket,
+            key,
+            metadata,
+            now_ms: 0,
+            step: PutStep::Head,
+        }
     }
-    let result = drive(operation, &ctx.driver).await.map_err(put_failure)?;
-    drive(
-        LiveVersionOperation::new(LiveVersionInput {
-            local_node_id: spec.node_id,
-            auth_context: auth.clone(),
-            bucket: name.to_string(),
-            key: key.to_string(),
-            version_id: result.version_id,
-            delete_marker: false,
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| ItemFailure::Stage(format!("replication queue failed: {error}")))
+
+    fn put(
+        &mut self,
+        routing: RoutingSnapshot,
+        gate: Option<GateContext>,
+        quota_ceiling: Option<u64>,
+    ) -> Next<()> {
+        let spec = &self.run.spec;
+        let auth = &spec.auth_context;
+        let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(
+            Bytes::new(),
+        )]));
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: auth.user_id,
+            group_id: self.bucket.group_id,
+            realm_id: auth.realm_id,
+            node_id: spec.node_id,
+            request: PutObjectInput {
+                bucket: spec.bucket.clone(),
+                key: self.key.clone(),
+                content_length: Some(0),
+                body: Some(body),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling,
+            routing,
+        })
+        .with_bucket_guard(self.bucket.clone())
+        .with_version_origin(Some(VersionOrigin::Source {
+            job_id: Some(self.run.job_id.as_ulid()),
+        }))
+        .with_restrictions(auth.path_restrictions.clone())
+        .with_metadata(self.metadata.clone().into_iter().collect::<HashMap<_, _>>());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        self.step = PutStep::Put;
+        Next::Call(IoCall::child(operation))
+    }
+}
+
+fn system<T: 'static, E: ToString + 'static>(result: IoResult) -> Result<T, ItemFailure> {
+    (result.child::<T, E>()?).map_err(|error| ItemFailure::System(error.to_string()))
+}
+
+impl Operation for PutFolderOperation {
+    type Output = ();
+    type Error = ItemFailure;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, ItemFailure> {
+        Ok(Next::Call(IoCall::child(HeadObjectOperation::new(
+            HeadObjectInput {
+                bucket: self.run.spec.bucket.clone(),
+                key: self.key.clone(),
+                version_id: None,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ItemFailure> {
+        let realm_id = self.run.spec.auth_context.realm_id;
+        match std::mem::replace(&mut self.step, PutStep::Replicate) {
+            PutStep::Head => {
+                if let Ok(head) = result.child::<HeadObjectResult, HeadObjectError>()? {
+                    let empty =
+                        (head.location.as_ref()).is_some_and(|location| location.blob_size == 0);
+                    let metadata = &self.metadata;
+                    let same = head.metadata.len() == metadata.len()
+                        && (metadata.iter())
+                            .all(|(key, value)| head.metadata.get(key) == Some(value));
+                    if empty && same {
+                        return Ok(Next::Done(()));
+                    }
+                }
+                self.step = PutStep::Routing;
+                Ok(Next::Call(IoCall::child(SnapshotOperation::new(
+                    &self.run.routing,
+                    self.bucket.group_id,
+                    BucketRules::of(&self.bucket),
+                ))))
+            }
+            PutStep::Routing => {
+                let routing = system::<RoutingSnapshot, RoutingInputsError>(result)?;
+                self.step = PutStep::Gate(Box::new(routing));
+                let gate = GateOperation::new(realm_id, self.now_ms);
+                Ok(Next::Call(IoCall::child(gate)))
+            }
+            PutStep::Gate(routing) => {
+                let gate = system::<Option<GateContext>, GateContextError>(result)?;
+                self.step = PutStep::Quota(routing, gate.map(Box::new));
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+            }
+            PutStep::Quota(routing, gate) => {
+                let config = system::<RealmConfigDocument, GetConfigError>(result)?;
+                let quota = config.quota.effective_group_ceiling(&self.bucket.group_id);
+                Ok(self.put(*routing, gate.map(|gate| *gate), quota))
+            }
+            PutStep::Put => {
+                let put = result
+                    .child::<PutObjectResult, PutObjectError>()?
+                    .map_err(put_failure)?;
+                let spec = &self.run.spec;
+                self.step = PutStep::Replicate;
+                Ok(Next::Call(IoCall::child(LiveVersionOperation::new(
+                    LiveVersionInput {
+                        local_node_id: spec.node_id,
+                        auth_context: spec.auth_context.clone(),
+                        bucket: spec.bucket.clone(),
+                        key: self.key.clone(),
+                        version_id: put.version_id,
+                        delete_marker: false,
+                    },
+                ))))
+            }
+            PutStep::Replicate => {
+                result
+                    .child::<QueueBlobResult, BlobQueueError>()?
+                    .map_err(|error| {
+                        ItemFailure::Stage(format!("replication queue failed: {error}"))
+                    })?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
 }
 
 /// A put that fails the same way again fails its row; any other retries the chunk, which keeps
@@ -1016,3 +1612,7 @@ mod tests {
 #[cfg(test)]
 #[path = "table_tests.rs"]
 mod adapter_tests;
+
+#[cfg(test)]
+#[path = "chunk_tests.rs"]
+mod chunk_tests;

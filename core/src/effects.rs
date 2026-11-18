@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::placement::record::PlacementRef;
+use crate::structs::placement::transition::ProofClaim;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::UserId;
@@ -62,6 +65,8 @@ pub enum Effect {
     Delay(Duration),
     /// One call to an executor backend of this node; never persisted.
     Compute(Box<crate::compute::effect::ComputeEffect>),
+    /// A request to the host of a running job; never persisted.
+    Job(crate::jobs::JobEffect),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -466,6 +471,9 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// One repository, provider or stored artifact call of a job or link; answers
+    /// `BlobEvent::Remote`.
+    Remote(Box<crate::repository::remote::RemoteRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +799,15 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Applies a realm configuration to this node's peer set; answers
+    /// `NetEvent::DocumentPeers`.
+    RefreshDocumentPeers(Box<crate::structs::identity::realm::RealmConfigDocument>),
+    /// Reads one version from another node under a read grant; answers
+    /// `NetEvent::GrantedRead`.
+    GrantedRead(Box<crate::native_reference::GrantedReadEffect>),
+    /// Reads one version from another node under a delegation; answers
+    /// `NetEvent::DelegatedRead`.
+    DelegatedRead(Box<crate::native_reference::DelegatedReadEffect>),
     /// Signs a read grant; only a grant naming this node as issuer. Answers
     /// `NetEvent::GrantSign`.
     GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
@@ -799,10 +816,47 @@ pub enum NetEffect {
     WritePeerAuth(Box<WritePeerRequest>),
     /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
     DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
+    /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
+    HeartbeatSilence(Vec<NodeId>),
+    /// Works on this node's shard topics; answers `NetEvent::Shard`.
+    Shard(Box<ShardNetEffect>),
+    /// Creates shared sync topics with these peers; answers `NetEvent::TopicPeers`.
+    EnsureTopics {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Lets these peers into existing sync topics; answers `NetEvent::TopicPeers`.
+    AllowTopicPeers {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Signs this node's statement that it is ready for a group deletion plan; answers
+    /// `NetEvent::DeletePlanSigned`.
+    SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
+    /// Checks a forwarded caller's credential and that the sending peer is a realm member;
+    /// answers `NetEvent::WritePeerChecked`.
+    AuthorizeWritePeer {
+        peer: NodeId,
+        auth_token: Option<Box<crate::metadata::AuthToken>>,
+    },
+    /// Verifies a token that may already be revoked and reads its claims; answers
+    /// `NetEvent::RevocationClaims`.
+    RevocationClaims(Box<crate::metadata::AuthToken>),
+    /// Routes one harvest metadata write to the document's holders; answers
+    /// `NetEvent::HarvestWrite`.
+    HarvestWrite(Box<crate::repository::remote::HarvestWrite>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
     RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Asks for this node's id; answers `NetEvent::LocalNode`.
+    LocalNode,
+    /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
+    WatchHolders {
+        realm_id: crate::structs::identity::realm::RealmId,
+        path: String,
+        kind: crate::structs::execution::notification_watch::WatchEventKind,
+    },
     /// Notes a watch a local user just created on `holder`, so events reach the holder before
     /// its interest digest arrives.
     RegisterInterest {
@@ -827,7 +881,61 @@ pub enum NetEffect {
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
 /// sends it to `peer`, waits at most `timeout`, and never routes or retries.
+/// The exact membership a set of shard topics should have.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardMembership {
+    pub topics: Vec<irokle::TopicId>,
+    pub members: Vec<NodeId>,
+    pub publishers: Vec<NodeId>,
+    pub retained: BTreeSet<NodeId>,
+    pub verified: BTreeSet<irokle::TopicId>,
+}
+
+/// Shard topic work the network side of this node carries out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShardNetEffect {
+    /// Which of these topics have a local genesis.
+    Existing(Vec<irokle::TopicId>),
+    /// Reopens topics this node holds again.
+    Reopen(Vec<irokle::TopicId>),
+    /// Closes a topic this node left; says whether a sync still runs on it.
+    Close(irokle::TopicId),
+    Membership(ShardMembership),
+    /// Asks peers which of these topics they already hold.
+    Probe {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Pulls these topics from peers and applies what arrived.
+    Pull {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Creates topics held by this node alone.
+    EnsureLocal(Vec<irokle::TopicId>),
+    /// Creates topics shared with these peers.
+    EnsureShared {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Whether an eviction hand-off for this bucket is still journalled.
+    EvictionPending(PlacementRef),
+    /// The topic's fingerprint and clock.
+    TopicFacts(irokle::TopicId),
+    /// The hash binding a topic's genesis and the operations at a frontier.
+    FrontierRoot {
+        topic: irokle::TopicId,
+        frontier: irokle::ActorClock,
+    },
+    SignProof(ProofClaim),
+    FetchManifest {
+        peer: NodeId,
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
@@ -839,6 +947,17 @@ pub struct MetadataRequestEffect {
 pub struct WritePeerRequest {
     pub peer: NodeId,
     pub token: crate::metadata::AuthToken,
+}
+
+/// Shows the frame size only: a frame can carry credentials or the realm key.
+impl std::fmt::Debug for MetadataRequestEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataRequestEffect")
+            .field("peer", &self.peer)
+            .field("frame_bytes", &self.frame.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

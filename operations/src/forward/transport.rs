@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
@@ -10,9 +9,7 @@ use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentError;
-use aruna_core::NodeId;
 use aruna_core::calls::IoError;
-use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
 /// Why a request forwarded to peers ended without being accepted.
@@ -42,13 +39,7 @@ impl From<ForwardError> for MetadataApiError {
     }
 }
 
-/// This node's id and serving realm, when it has a network.
-pub(crate) fn local_identity(context: &DriverContext) -> Option<(NodeId, RealmId)> {
-    let net = context.net_handle.as_ref()?;
-    Some((net.node_id(), *net.realm_id()))
-}
-
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MetadataWriteError {
     #[error("metadata write requires authentication")]
     Unauthorized,
@@ -67,6 +58,13 @@ pub enum MetadataWriteError {
     /// outbox that can only drain to a topic this node may not join.
     #[error("metadata write is undeliverable: {0}")]
     Undeliverable(String),
+}
+
+/// A runner failure leaves the write undelivered.
+impl From<aruna_core::calls::IoError> for MetadataWriteError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Undeliverable(error.to_string())
+    }
 }
 
 pub(crate) fn write_error(error: MetadataWriteError) -> MetadataApiError {
@@ -141,3 +139,61 @@ pub(crate) fn forwarded_unavailable(
         _ => reject("unexpected forwarded metadata message"),
     }
 }
+
+/// Upper bound of one request; the transport's own step limits end it earlier.
+const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The call that sends `message` to `peer`, or why it does not encode.
+pub(crate) fn peer_call(
+    peer: aruna_core::NodeId,
+    message: &MetadataTransportMessage,
+) -> Result<aruna_core::calls::IoCall, String> {
+    peer_call_within(peer, message, PEER_DEADLINE)
+}
+
+/// [`peer_call`] with an answer due within `timeout`.
+pub(crate) fn peer_call_within(
+    peer: aruna_core::NodeId,
+    message: &MetadataTransportMessage,
+    timeout: std::time::Duration,
+) -> Result<aruna_core::calls::IoCall, String> {
+    let frame = crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
+    let request = aruna_core::effects::MetadataRequestEffect {
+        peer,
+        frame,
+        timeout,
+    };
+    let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(Box::new(request)));
+    Ok(aruna_core::calls::IoCall::from(effect))
+}
+
+/// The peer's decoded answer, or why there is none.
+pub(crate) fn peer_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<Result<MetadataTransportMessage, String>, aruna_core::calls::IoError> {
+    Ok(timed_answer(result)?.0)
+}
+
+/// The peer's decoded answer and how long the request took.
+pub(crate) fn timed_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<(Result<MetadataTransportMessage, String>, std::time::Duration), aruna_core::calls::IoError> {
+    let answer = match result.event()? {
+        aruna_core::events::Event::Net(aruna_core::events::NetEvent::MetadataAnswer(answer)) => answer,
+        other => {
+            return Err(aruna_core::calls::IoError::Unexpected {
+                expected: "Event::Net(NetEvent::MetadataAnswer)",
+                got: other.label(),
+            });
+        }
+    };
+    let decoded = match answer.result {
+        Ok(bytes) => crate::metadata::protocol::decode_message(&bytes).map_err(|error| error.to_string()),
+        Err(error) => Err(format!("{error:?}")),
+    };
+    Ok((decoded, answer.elapsed))
+}
+
+#[cfg(test)]
+#[path = "peer_call_tests.rs"]
+mod peer_call_tests;

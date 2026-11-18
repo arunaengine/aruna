@@ -21,7 +21,7 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::testing::replay_event_log;
 use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use tempfile::TempDir;

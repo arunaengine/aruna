@@ -3,219 +3,429 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::NodeId;
-use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, FetchCursor, JobRecordFrame, LaunchFrame, NetEffect, PageLimit};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
+use aruna_core::operation::Operation;
+use aruna_core::placement::holds_placement;
+use aruna_core::structs::execution::job::record_rows::PendingNeed;
 use aruna_core::structs::execution::job::{
-    InputPage, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::group_delete::GroupWriteError;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use tracing::warn;
 
+use super::RecordStoreError;
 use super::admit::Admission;
-use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-use super::family::LoadFamilyOperation;
-use super::pages::{KeepPagesOperation, ServePageOperation};
-use crate::driver::{DriverContext, drive};
+use super::append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use super::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+use super::family::{FamilyReadError, LoadFamilyOperation};
+use super::pages::{KeepPagesOperation, PageReadError, ServingNode};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
-use crate::jobs::lifecycle::launch_admit::AdmitLaunchOperation;
-use crate::jobs::lifecycle::target::launch_node;
+use crate::jobs::lifecycle::launch_admit::{
+    AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
+};
+use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
-use crate::realm::load_config::load_realm_config;
-use aruna_core::placement::holds_placement;
-use aruna_core::structs::execution::job::record_rows::PendingNeed;
+use crate::realm::load_config::config_unavailable;
 
+#[derive(Debug, PartialEq)]
 struct PageRequest {
-    placement: PlacementRef,
     submission_id: SubmissionId,
     request_digest: Option<[u8; 32]>,
     cursor: Option<FetchCursor>,
     limit: PageLimit,
 }
 
-/// Serves one inbound record publish or page request from an authenticated peer.
-pub async fn serve_job_record(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    match message {
-        MetadataTransportMessage::ForwardJobRecord { placement, record } => {
-            match accept_record(context, peer, placement, *record).await {
-                Ok(()) => MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) },
-                Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedJobRecord {
-                    result: Err(reason),
-                },
-                Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
-            }
-        }
-        MetadataTransportMessage::ForwardRecordPage {
-            placement,
-            submission_id,
-            request_digest,
-            cursor,
-            limit,
-        } => {
-            let request = PageRequest {
-                placement,
-                submission_id,
-                request_digest,
-                cursor,
-                limit,
-            };
-            match serve_page(context, peer, request).await {
-                Ok(reply) => MetadataTransportMessage::ForwardedRecordPage { result: Ok(reply) },
-                Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedRecordPage {
-                    result: Err(reason),
-                },
-                Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
-            }
-        }
-        other => MetadataTransportMessage::Reject(format!(
-            "unexpected job record request {}",
-            transport_message_kind(&other)
-        )),
-    }
+/// What a peer asks of this holder.
+#[derive(Debug, PartialEq)]
+enum RecordRequest {
+    Publish(Box<JobRecordFrame>),
+    Page(PageRequest),
 }
 
 /// A refusal this node stands behind, or a local failure that says nothing
 /// about the record. A transient local failure must never be answered as a
 /// definitive refusal: the publisher would stop retrying a valid record.
+#[derive(Debug, PartialEq)]
 enum ServeError {
     Refused(JobRecordRejection),
     Unavailable,
 }
 
-/// This node's authority to answer for one family placement: it must hold the
-/// placement, and the peer must be a sync-eligible node of this realm.
-struct ServeAuthority {
-    config: RealmConfigDocument,
-    local: NodeId,
-    realm_id: RealmId,
+#[derive(Debug, PartialEq)]
+enum ServeStep {
+    Config,
+    Append,
+    Dashboard,
+    Armed,
+    Pages,
+    Cancels,
+    Stopped,
+    Audit,
 }
 
-async fn holder_view(
-    context: &Arc<DriverContext>,
+/// What a stored record still requires of this node.
+#[derive(Debug, PartialEq)]
+struct Accepted {
+    family: JobFamilyId,
+    admission: Admission,
+    rearms: bool,
+    paged: Option<JobFamilyRecord>,
+}
+
+/// Serves one inbound record publish or page request from an authenticated peer. This node
+/// must hold the family's placement, and the peer must be a sync-eligible node of this realm.
+#[derive(Debug, PartialEq)]
+pub struct ServeRecordOperation {
     peer: NodeId,
     placement: PlacementRef,
-) -> Result<ServeAuthority, ServeError> {
-    let net_handle = context.net_handle.as_ref().ok_or(ServeError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context.as_ref(), realm_id)
-        .await
-        .ok_or(ServeError::Unavailable)?;
-    let eligible = config
-        .sync_eligible_nodes()
-        .is_ok_and(|nodes| nodes.contains(&peer));
-    if !eligible {
-        return Err(ServeError::Refused(JobRecordRejection::Unauthorized));
+    request: Option<RecordRequest>,
+    serving: ServingNode,
+    now_ms: u64,
+    /// Whether the peer asked for a page, which picks the answer's form.
+    paging: bool,
+    rejected: Option<String>,
+    accepted: Option<Box<Accepted>>,
+    step: ServeStep,
+}
+
+type ServeNext = Result<Next<MetadataTransportMessage>, IoError>;
+
+fn record_answer(result: Result<(), ServeError>) -> MetadataTransportMessage {
+    match result {
+        Ok(()) => MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) },
+        Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedJobRecord {
+            result: Err(reason),
+        },
+        Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
     }
-    let local = net_handle.node_id();
-    if !holds_placement(&config, &placement, local) {
-        return Err(ServeError::Refused(JobRecordRejection::NotHolder));
+}
+
+fn page_answer(result: Result<JobPageReply, ServeError>) -> MetadataTransportMessage {
+    match result {
+        Ok(reply) => MetadataTransportMessage::ForwardedRecordPage { result: Ok(reply) },
+        Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedRecordPage {
+            result: Err(reason),
+        },
+        Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
     }
-    Ok(ServeAuthority {
-        config,
-        local,
-        realm_id,
+}
+
+/// The page a peer gets from one audit read.
+fn audit_reply(audit: AuditPage) -> Result<JobPageReply, ServeError> {
+    let frames: Vec<JobRecordFrame> = audit
+        .records
+        .into_iter()
+        .filter_map(|envelope| JobRecordFrame::new(envelope).ok())
+        .collect();
+    let page = JobRecordPage::new(frames).map_err(|error| {
+        warn!(error = %error, "Job record page exceeds its bound");
+        ServeError::Unavailable
+    })?;
+    Ok(JobPageReply {
+        page,
+        next: audit.next,
     })
 }
 
-async fn accept_record(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    placement: PlacementRef,
-    record: JobRecordFrame,
-) -> Result<(), ServeError> {
-    let authority = holder_view(context, peer, placement).await?;
-    let family = record.envelope().family();
-    // The family placement is derived here, never taken from the requester.
-    let derived = authority
-        .config
-        .family_placement(family.submission_id)
-        .map_err(|_| ServeError::Refused(JobRecordRejection::NotHolder))?;
-    if derived != placement {
-        return Err(ServeError::Refused(JobRecordRejection::Invalid));
+fn append_failure(error: RecordStoreError) -> ServeError {
+    if matches!(
+        error,
+        RecordStoreError::GroupWrite(GroupWriteError::Deleted)
+    ) {
+        return ServeError::Refused(JobRecordRejection::Unauthorized);
     }
-    let rearms = rearms_witness(record.envelope());
-    let paged = binds_pages(&record.envelope().record).then(|| record.envelope().record.clone());
-    let now_ms = aruna_core::time::unix_timestamp_millis();
-    let outcome = drive(
-        AppendRecordOperation::new(AppendRecordConfig {
-            realm_id: authority.realm_id,
-            local_node_id: authority.local,
-            record,
-            local: None,
-            origin: RecordOrigin::Peer(peer),
-            now_ms,
-        }),
-        context.as_ref(),
-    )
-    .await
-    .map_err(|error| {
-        if matches!(
-            error,
-            super::RecordStoreError::GroupWrite(
-                aruna_core::structs::identity::group_delete::GroupWriteError::Deleted
-            )
-        ) {
-            return ServeError::Refused(JobRecordRejection::Unauthorized);
-        }
-        warn!(error = %error, "Job record append failed");
-        ServeError::Unavailable
-    })?;
-    if matches!(outcome.admission, Admission::Authentic) {
-        context.notify_dashboard_change();
-        if rearms {
-            crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
-        }
-    }
-    match outcome.admission {
-        Admission::Authentic | Admission::Duplicate => {
-            // The publisher retries until this holder keeps the pages the record binds.
-            if let Some(record) = &paged {
-                let keep = KeepPagesOperation::new(record, peer, context.node_and_realm());
-                drive(keep, context.as_ref()).await.map_err(|error| {
-                    warn!(error = %error, "Job record input pages unavailable");
-                    ServeError::Unavailable
-                })?;
-            }
-            let cancels = drive(
-                LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
-                context.as_ref(),
-            )
-            .await
-            .map_err(|_| ServeError::Unavailable)?;
-            // Admission may promote a pending cancel, and retries must reapply its side effect.
-            if !cancels.is_empty() {
-                let cancel = CancelLocalRunsOperation::new(
-                    family,
-                    context.node_and_realm(),
-                    aruna_core::time::unix_timestamp_millis(),
-                );
-                let _ = drive(cancel, context.as_ref()).await;
-            }
-            Ok(())
-        }
+    warn!(error = %error, "Job record append failed");
+    ServeError::Unavailable
+}
+
+/// What an admission verdict tells the publisher; `None` for a stored record.
+fn admission_refusal(admission: &Admission) -> Option<ServeError> {
+    match admission {
+        Admission::Authentic | Admission::Duplicate => None,
         Admission::Local
         | Admission::Pending(
             PendingNeed::Evidence(_) | PendingNeed::LocalView | PendingNeed::HolderView,
         )
-        | Admission::PendingFull => Err(ServeError::Unavailable),
-        Admission::Conflict => Err(ServeError::Refused(JobRecordRejection::Conflict)),
+        | Admission::PendingFull => Some(ServeError::Unavailable),
+        Admission::Conflict => Some(ServeError::Refused(JobRecordRejection::Conflict)),
         Admission::Rejected(
             JobRecordError::BadSignature
             | JobRecordError::WrongPublisher(_)
             | JobRecordError::NotHolder(_)
             | JobRecordError::Unauthorized,
-        ) => Err(ServeError::Refused(JobRecordRejection::Unauthorized)),
-        Admission::Rejected(_) => Err(ServeError::Refused(JobRecordRejection::Invalid)),
+        ) => Some(ServeError::Refused(JobRecordRejection::Unauthorized)),
+        Admission::Rejected(_) => Some(ServeError::Refused(JobRecordRejection::Invalid)),
+    }
+}
+
+impl ServeRecordOperation {
+    pub fn new(
+        peer: NodeId,
+        message: MetadataTransportMessage,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (placement, request, rejected) = match message {
+            MetadataTransportMessage::ForwardJobRecord { placement, record } => {
+                (placement, Some(RecordRequest::Publish(record)), None)
+            }
+            MetadataTransportMessage::ForwardRecordPage {
+                placement,
+                submission_id,
+                request_digest,
+                cursor,
+                limit,
+            } => {
+                let page = PageRequest {
+                    submission_id,
+                    request_digest,
+                    cursor,
+                    limit,
+                };
+                (placement, Some(RecordRequest::Page(page)), None)
+            }
+            other => {
+                let kind = transport_message_kind(&other).to_string();
+                (PlacementRef::NIL, None, Some(kind))
+            }
+        };
+        Self {
+            peer,
+            placement,
+            paging: matches!(request, Some(RecordRequest::Page(_))),
+            request,
+            serving,
+            now_ms,
+            rejected,
+            accepted: None,
+            step: ServeStep::Config,
+        }
+    }
+
+    fn fail(&self, error: ServeError) -> ServeNext {
+        Ok(Next::Done(match self.paging {
+            true => page_answer(Err(error)),
+            false => record_answer(Err(error)),
+        }))
+    }
+
+    fn accepted_ok(&self) -> ServeNext {
+        Ok(Next::Done(record_answer(Ok(()))))
+    }
+
+    /// Checks this node's authority, and that the family placement it derives itself is the
+    /// one the requester named.
+    fn authorized(
+        &self,
+        config: &RealmConfigDocument,
+        submission: SubmissionId,
+    ) -> Result<(), ServeError> {
+        let (local, _) = self.serving.ok_or(ServeError::Unavailable)?;
+        let eligible = config
+            .sync_eligible_nodes()
+            .is_ok_and(|nodes| nodes.contains(&self.peer));
+        if !eligible {
+            return Err(ServeError::Refused(JobRecordRejection::Unauthorized));
+        }
+        if !holds_placement(config, &self.placement, local) {
+            return Err(ServeError::Refused(JobRecordRejection::NotHolder));
+        }
+        let derived = config
+            .family_placement(submission)
+            .map_err(|_| ServeError::Refused(JobRecordRejection::NotHolder))?;
+        if derived != self.placement {
+            return Err(ServeError::Refused(JobRecordRejection::Invalid));
+        }
+        Ok(())
+    }
+
+    fn configured(&mut self, config: RealmConfigDocument) -> ServeNext {
+        let Some(request) = self.request.take() else {
+            return Err(IoError::Unfinished);
+        };
+        match request {
+            RecordRequest::Publish(record) => {
+                let family = record.envelope().family();
+                if let Err(error) = self.authorized(&config, family.submission_id) {
+                    return self.fail(error);
+                }
+                self.append(*record)
+            }
+            RecordRequest::Page(request) => {
+                if let Err(error) = self.authorized(&config, request.submission_id) {
+                    return self.fail(error);
+                }
+                let scope = match request.request_digest {
+                    Some(request_digest) => AuditScope::Family(JobFamilyId {
+                        submission_id: request.submission_id,
+                        request_digest,
+                    }),
+                    None => AuditScope::Submission(request.submission_id),
+                };
+                self.step = ServeStep::Audit;
+                let audit = FamilyAuditOperation::new(FamilyAuditConfig {
+                    scope,
+                    cursor: request.cursor,
+                    limit: request.limit,
+                });
+                Ok(Next::Call(IoCall::child(audit)))
+            }
+        }
+    }
+
+    fn append(&mut self, record: JobRecordFrame) -> ServeNext {
+        let Some((local, realm_id)) = self.serving else {
+            return self.fail(ServeError::Unavailable);
+        };
+        let envelope = record.envelope();
+        self.accepted = Some(Box::new(Accepted {
+            family: envelope.family(),
+            admission: Admission::Duplicate,
+            rearms: rearms_witness(envelope),
+            paged: binds_pages(&envelope.record).then(|| envelope.record.clone()),
+        }));
+        self.step = ServeStep::Append;
+        let append = AppendRecordOperation::new(AppendRecordConfig {
+            realm_id,
+            local_node_id: local,
+            record,
+            local: None,
+            origin: RecordOrigin::Peer(self.peer),
+            now_ms: self.now_ms,
+        });
+        Ok(Next::Call(IoCall::child(append)))
+    }
+
+    fn accepted(&mut self) -> Result<&mut Accepted, IoError> {
+        self.accepted.as_deref_mut().ok_or(IoError::Unfinished)
+    }
+
+    fn appended(&mut self, outcome: AppendOutcome) -> ServeNext {
+        let authentic = matches!(outcome.admission, Admission::Authentic);
+        self.accepted()?.admission = outcome.admission;
+        if !authentic {
+            return self.settle();
+        }
+        self.step = ServeStep::Dashboard;
+        let changed = Effect::Net(NetEffect::DashboardChanged);
+        Ok(Next::Call(IoCall::Effect(Box::new(changed))))
+    }
+
+    fn notified(&mut self) -> ServeNext {
+        let (family, rearms) = {
+            let accepted = self.accepted()?;
+            (accepted.family, accepted.rearms)
+        };
+        let (true, Some((local, realm_id))) = (rearms, self.serving) else {
+            return self.settle();
+        };
+        self.step = ServeStep::Armed;
+        let arm = ArmFamilyOperation::new(family, local, realm_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(arm)))
+    }
+
+    /// The publisher retries until this holder keeps the pages the record binds.
+    fn settle(&mut self) -> ServeNext {
+        let serving = self.serving;
+        let peer = self.peer;
+        let accepted = self.accepted()?;
+        if let Some(refusal) = admission_refusal(&accepted.admission) {
+            return self.fail(refusal);
+        }
+        if let Some(record) = accepted.paged.take() {
+            self.step = ServeStep::Pages;
+            let keep = KeepPagesOperation::new(&record, peer, serving);
+            return Ok(Next::Call(IoCall::child(keep)));
+        }
+        self.read_cancels()
+    }
+
+    fn read_cancels(&mut self) -> ServeNext {
+        let family = self.accepted()?.family;
+        self.step = ServeStep::Cancels;
+        let read = LoadFamilyOperation::kind(family, JobRecordKind::Cancel);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Admission may promote a pending cancel, and retries must reapply its side effect.
+    fn cancels_read(&mut self, cancels: Vec<JobRecordEnvelope>) -> ServeNext {
+        if cancels.is_empty() {
+            return self.accepted_ok();
+        }
+        let family = self.accepted()?.family;
+        self.step = ServeStep::Stopped;
+        let cancel = CancelLocalRunsOperation::new(family, self.serving, self.now_ms);
+        Ok(Next::Call(IoCall::child(cancel)))
+    }
+}
+
+impl Operation for ServeRecordOperation {
+    type Output = MetadataTransportMessage;
+    type Error = IoError;
+
+    fn first(&mut self) -> ServeNext {
+        if let Some(kind) = self.rejected.take() {
+            return Ok(Next::Done(MetadataTransportMessage::Reject(format!(
+                "unexpected job record request {kind}"
+            ))));
+        }
+        let Some((_, realm_id)) = self.serving else {
+            return self.fail(ServeError::Unavailable);
+        };
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> ServeNext {
+        match self.step {
+            ServeStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
+                Ok(config) => self.configured(config),
+                Err(error) => {
+                    config_unavailable(&error);
+                    self.fail(ServeError::Unavailable)
+                }
+            },
+            ServeStep::Append => match result.child::<AppendOutcome, RecordStoreError>()? {
+                Ok(outcome) => self.appended(outcome),
+                Err(error) => self.fail(append_failure(error)),
+            },
+            ServeStep::Dashboard => self.notified(),
+            ServeStep::Armed => {
+                if let Err(error) = result.child::<(), LifecycleError>()? {
+                    warn!(error = %error, "Witness deadline was not armed");
+                }
+                self.settle()
+            }
+            ServeStep::Pages => match result.child::<(), PageReadError>()? {
+                Ok(()) => self.read_cancels(),
+                Err(error) => {
+                    warn!(error = %error, "Job record input pages unavailable");
+                    self.fail(ServeError::Unavailable)
+                }
+            },
+            ServeStep::Cancels => {
+                match result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()? {
+                    Ok(cancels) => self.cancels_read(cancels),
+                    Err(_) => self.fail(ServeError::Unavailable),
+                }
+            }
+            ServeStep::Stopped => self.accepted_ok(),
+            ServeStep::Audit => match result.child::<AuditPage, RecordStoreError>()? {
+                Ok(audit) => Ok(Next::Done(page_answer(audit_reply(audit)))),
+                Err(error) => {
+                    warn!(error = %error, "Job record page read failed");
+                    self.fail(ServeError::Unavailable)
+                }
+            },
+        }
     }
 }
 
@@ -238,111 +448,243 @@ fn rearms_witness(envelope: &JobRecordEnvelope) -> bool {
     }
 }
 
-/// One input page for a realm infrastructure node; nothing for anyone else.
-pub async fn serve_input_page(
-    context: &DriverContext,
+/// Serves one inbound launch offer. The offer is bounded and kind-checked at decode; admission,
+/// reservation and receipt are the target's own decision. An undecidable offer is answered as
+/// unavailable so the scheduler can retry. `node` is `None` on a node without a network.
+#[derive(Debug, PartialEq)]
+pub struct ServeLaunchOperation {
     peer: NodeId,
-    submission: SubmissionId,
-    digest: [u8; 32],
-) -> Option<Box<InputPage>> {
-    let (_, realm_id) = context.node_and_realm()?;
-    let serve = ServePageOperation::new(realm_id, peer, submission, digest);
-    drive(serve, context).await.ok().flatten()
+    offer: Option<(LaunchFrame, LaunchNode)>,
+    admitting: bool,
 }
 
-async fn serve_page(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    request: PageRequest,
-) -> Result<JobPageReply, ServeError> {
-    let authority = holder_view(context, peer, request.placement).await?;
-    let derived = authority
-        .config
-        .family_placement(request.submission_id)
-        .map_err(|_| ServeError::Refused(JobRecordRejection::NotHolder))?;
-    if derived != request.placement {
-        return Err(ServeError::Refused(JobRecordRejection::Invalid));
+type LaunchNext = Result<Next<MetadataTransportMessage>, IoError>;
+
+fn launch_unavailable() -> LaunchNext {
+    Ok(Next::Done(
+        MetadataTransportMessage::ForwardedWriteUnavailable,
+    ))
+}
+
+impl ServeLaunchOperation {
+    pub(crate) fn new(peer: NodeId, launch: LaunchFrame, node: Option<LaunchNode>) -> Self {
+        Self {
+            peer,
+            offer: node.map(|node| (launch, node)),
+            admitting: false,
+        }
     }
-    let scope = match request.request_digest {
-        Some(request_digest) => AuditScope::Family(JobFamilyId {
-            submission_id: request.submission_id,
-            request_digest,
-        }),
-        None => AuditScope::Submission(request.submission_id),
-    };
-    let audit = drive(
-        FamilyAuditOperation::new(FamilyAuditConfig {
-            scope,
-            cursor: request.cursor,
-            limit: request.limit,
-        }),
-        context.as_ref(),
-    )
-    .await
-    .map_err(|error| {
-        warn!(error = %error, "Job record page read failed");
-        ServeError::Unavailable
-    })?;
-    let frames: Vec<JobRecordFrame> = audit
-        .records
-        .into_iter()
-        .filter_map(|envelope| JobRecordFrame::new(envelope).ok())
-        .collect();
-    let page = JobRecordPage::new(frames).map_err(|error| {
-        warn!(error = %error, "Job record page exceeds its bound");
-        ServeError::Unavailable
-    })?;
-    Ok(JobPageReply {
-        page,
-        next: audit.next,
-    })
 }
 
-/// Serves one inbound launch offer. The offer is bounded and kind-checked at
-/// decode; admission, reservation, and receipt are the target's own decision.
-/// An undecidable offer is answered as unavailable so the scheduler can retry.
-pub async fn serve_launch_offer(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    launch: LaunchFrame,
-) -> MetadataTransportMessage {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context.as_ref(), realm_id).await else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    if !config
-        .sync_eligible_nodes()
-        .is_ok_and(|nodes| nodes.contains(&peer))
-    {
-        return MetadataTransportMessage::ForwardedLaunchOffer {
-            result: Err(LaunchDecline::Unauthorized),
+impl Operation for ServeLaunchOperation {
+    type Output = MetadataTransportMessage;
+    type Error = IoError;
+
+    fn first(&mut self) -> LaunchNext {
+        let Some((_, node)) = self.offer.as_ref() else {
+            return launch_unavailable();
         };
+        let read = GetConfigOperation::new(node.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
     }
-    let Some(node) = launch_node(context, &launch) else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    match drive(AdmitLaunchOperation::new(launch, node), context.as_ref())
-        .await
-        .ok()
-    {
-        Some(Ok(receipt)) => MetadataTransportMessage::ForwardedLaunchOffer {
-            result: Ok(Box::new(receipt)),
-        },
-        Some(Err(reason)) => MetadataTransportMessage::ForwardedLaunchOffer {
-            result: Err(reason),
-        },
-        None => MetadataTransportMessage::ForwardedWriteUnavailable,
+
+    fn next(&mut self, result: IoResult) -> LaunchNext {
+        if self.admitting {
+            return match result.child::<LaunchDecision, LaunchUndecided>()? {
+                Ok(Ok(receipt)) => Ok(Next::Done(MetadataTransportMessage::ForwardedLaunchOffer {
+                    result: Ok(Box::new(receipt)),
+                })),
+                Ok(Err(reason)) => Ok(Next::Done(MetadataTransportMessage::ForwardedLaunchOffer {
+                    result: Err(reason),
+                })),
+                Err(_) => launch_unavailable(),
+            };
+        }
+        let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => config,
+            Err(error) => {
+                config_unavailable(&error);
+                return launch_unavailable();
+            }
+        };
+        let eligible = config
+            .sync_eligible_nodes()
+            .is_ok_and(|nodes| nodes.contains(&self.peer));
+        if !eligible {
+            return Ok(Next::Done(MetadataTransportMessage::ForwardedLaunchOffer {
+                result: Err(LaunchDecline::Unauthorized),
+            }));
+        }
+        let Some((launch, node)) = self.offer.take() else {
+            return Err(IoError::Unfinished);
+        };
+        self.admitting = true;
+        let admit = AdmitLaunchOperation::new(launch, node);
+        Ok(Next::Call(IoCall::child(admit)))
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::records::Family;
+    use crate::jobs::job_reads::tests::{child, is_child};
+    use crate::tests::records::{Family, node};
     use aruna_core::structs::execution::job::JobRecordBody;
+
+    fn record_request(family: &Family) -> MetadataTransportMessage {
+        let spec = family.spec();
+        let envelope = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
+        MetadataTransportMessage::ForwardJobRecord {
+            placement: family.placement,
+            record: Box::new(JobRecordFrame::new(envelope).expect("bounded record")),
+        }
+    }
+
+    fn serving() -> ServingNode {
+        Some((node(1), crate::tests::records::REALM))
+    }
+
+    // Another message kind is rejected, and without a network nothing is answered for.
+    #[test]
+    fn unserved_requests_answered() {
+        let other = MetadataTransportMessage::ForwardedWriteUnavailable;
+        let mut serve = ServeRecordOperation::new(node(2), other, serving(), 5);
+        assert!(matches!(
+            serve.first(),
+            Ok(Next::Done(MetadataTransportMessage::Reject(_)))
+        ));
+        let family = Family::new([14u8; 32]);
+        let mut serve = ServeRecordOperation::new(node(2), record_request(&family), None, 5);
+        assert_eq!(
+            serve.first().unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedWriteUnavailable)
+        );
+    }
+
+    // A peer outside the realm's sync set is refused before anything is stored.
+    #[test]
+    fn outsider_refused() {
+        let family = Family::new([15u8; 32]);
+        let mut serve = ServeRecordOperation::new(node(9), record_request(&family), serving(), 5);
+        assert!(is_child(&serve.first().unwrap()));
+        let config = child(Ok::<_, GetConfigError>(family.config.clone()));
+        assert_eq!(
+            serve.next(config).unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedJobRecord {
+                result: Err(JobRecordRejection::Unauthorized),
+            })
+        );
+    }
+
+    // A deleted group refuses the record, while other store failures stay retryable.
+    #[test]
+    fn append_failures_mapped() {
+        assert_eq!(
+            append_failure(RecordStoreError::GroupWrite(GroupWriteError::Deleted)),
+            ServeError::Refused(JobRecordRejection::Unauthorized)
+        );
+        assert_eq!(
+            append_failure(RecordStoreError::NotFinished),
+            ServeError::Unavailable
+        );
+    }
+
+    // Only a stored record passes; pending and conflicting ones answer the publisher.
+    #[test]
+    fn admission_verdicts_mapped() {
+        assert_eq!(admission_refusal(&Admission::Duplicate), None);
+        assert_eq!(
+            admission_refusal(&Admission::PendingFull),
+            Some(ServeError::Unavailable)
+        );
+        assert_eq!(
+            admission_refusal(&Admission::Conflict),
+            Some(ServeError::Refused(JobRecordRejection::Conflict))
+        );
+    }
+
+    // A stored record with a cancel on file stops the local runs before it is acknowledged.
+    #[test]
+    fn stored_record_settles() {
+        let family = Family::new([16u8; 32]);
+        let mut serve = ServeRecordOperation::new(node(2), record_request(&family), serving(), 5);
+        serve.accepted = Some(Box::new(Accepted {
+            family: family.family(),
+            admission: Admission::Duplicate,
+            rearms: false,
+            paged: None,
+        }));
+        assert!(is_child(&serve.settle().unwrap()));
+        assert_eq!(serve.step, ServeStep::Cancels);
+        let spec = family.spec();
+        let cancel = family.sign(
+            &family.holder,
+            JobFamilyRecord::Cancel(family.cancel(&spec)),
+        );
+        let cancels = child(Ok::<_, FamilyReadError>(vec![cancel]));
+        assert!(is_child(&serve.next(cancels).unwrap()));
+        assert_eq!(serve.step, ServeStep::Stopped);
+        let stopped = child(Ok::<_, IoError>(()));
+        assert_eq!(
+            serve.next(stopped).unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) })
+        );
+    }
+
+    fn launch_offer(family: &Family) -> LaunchFrame {
+        let spec = family.spec();
+        let launch = family.launch(&spec, family.holder.public(), 0);
+        let envelope = family.sign(&family.holder, JobFamilyRecord::Launch(Box::new(launch)));
+        LaunchFrame::new(envelope).expect("bounded launch")
+    }
+
+    fn launch_node() -> LaunchNode {
+        LaunchNode {
+            local: node(1),
+            realm_id: crate::tests::records::REALM,
+            now_ms: 5,
+            execution_id: ulid::Ulid::from_bytes([1u8; 16]),
+            limits: None,
+        }
+    }
+
+    // Without a network an offer stays undecided, and an outsider is declined.
+    #[test]
+    fn launch_offer_checked() {
+        let family = Family::new([17u8; 32]);
+        let mut offline = ServeLaunchOperation::new(node(2), launch_offer(&family), None);
+        assert_eq!(
+            offline.first().unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedWriteUnavailable)
+        );
+        let node_view = Some(launch_node());
+        let mut serve = ServeLaunchOperation::new(node(9), launch_offer(&family), node_view);
+        assert!(is_child(&serve.first().unwrap()));
+        let config = child(Ok::<_, GetConfigError>(family.config.clone()));
+        assert_eq!(
+            serve.next(config).unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedLaunchOffer {
+                result: Err(LaunchDecline::Unauthorized),
+            })
+        );
+    }
+
+    // An undecided admission answers unavailable so the scheduler can retry.
+    #[test]
+    fn undecided_launch_unavailable() {
+        let family = Family::new([18u8; 32]);
+        let mut serve = ServeLaunchOperation::new(
+            family.holder.public(),
+            launch_offer(&family),
+            Some(launch_node()),
+        );
+        serve.admitting = true;
+        let undecided = child(Err::<LaunchDecision, _>(LaunchUndecided));
+        assert_eq!(
+            serve.next(undecided).unwrap(),
+            Next::Done(MetadataTransportMessage::ForwardedWriteUnavailable)
+        );
+    }
 
     #[test]
     fn error_rearms_family() {

@@ -3,14 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::key::abe::PrepareAbe;
 use crate::s3::bucket::key::rows::{
-    SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
+    SettingsError, audit_row, authority_keys, copy_targets, full_scan, generation_rows,
     group_bucket_key, parse_authority, uploads_open,
 };
 use crate::s3::imports::LinkScan;
+use crate::s3::object::put::abe::keyed;
 use aruna_blob::blob::pithos::MAX_SIZE;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
-use aruna_core::effects::IterStart;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -19,7 +21,8 @@ use aruna_core::keyspaces::{
     GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
@@ -33,9 +36,8 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
@@ -45,8 +47,6 @@ const SIZE_PAGE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnableState {
-    Init,
-    StartTransaction,
     ReadBucket,
     CheckLinks,
     CheckUploads,
@@ -56,13 +56,10 @@ enum EnableState {
     ReadTransition,
     ReadGrants,
     GenerateKey,
+    PrepareAbe,
     SealCopies,
     WriteSettings,
     WriteVault,
-    CommitTransaction,
-    Finish,
-    Error,
-    PrepareAbe,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -104,6 +101,14 @@ pub enum EnableError {
     NotFinished,
 }
 
+impl From<IoError> for EnableError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type EnableTurn = Result<Next<EnableResult>, EnableError>;
+
 /// What the caller resolved before the transaction: the key directory answers. Admins are read
 /// in the transaction; one without a lookup is reported unavailable and gets no copy yet.
 #[derive(Debug, PartialEq)]
@@ -137,8 +142,7 @@ pub struct EnableResult {
 pub struct EnableEncryptionOperation {
     input: EnableInput,
     state: EnableState,
-    abe: Option<crate::s3::bucket::key::abe::PrepareAbeOperation>,
-    txn_id: Option<TxnId>,
+    abe: Option<PrepareAbe>,
     creator: Option<UserId>,
     admins: BTreeSet<UserId>,
     settings: BucketEncryption,
@@ -147,7 +151,6 @@ pub struct EnableEncryptionOperation {
     record: Option<BucketKeyRecord>,
     private_key: Option<SharedSecret>,
     result: Option<EnableResult>,
-    output: Option<Result<EnableResult, EnableError>>,
     /// Last version key of the current size page, and whether another page may follow.
     size_cursor: Option<Key>,
     more_sizes: bool,
@@ -158,9 +161,8 @@ impl EnableEncryptionOperation {
     pub fn new(input: EnableInput) -> Self {
         Self {
             input,
-            state: EnableState::Init,
+            state: EnableState::ReadBucket,
             abe: None,
-            txn_id: None,
             creator: None,
             admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
@@ -169,130 +171,127 @@ impl EnableEncryptionOperation {
             record: None,
             private_key: None,
             result: None,
-            output: None,
             size_cursor: None,
             more_sizes: false,
             links: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<EnableError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        let effects = self.abort();
-        self.state = EnableState::Error;
-        effects
+    fn call(&mut self, state: EnableState, call: IoCall) -> EnableTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn refused(&self, received: Event) -> EnableTurn {
+        match received {
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            other => Err(EnableError::InvalidStateEvent {
+                state: format!("{:?}", self.state),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+        }
+    }
+
+    fn read_bucket(&mut self, values: Vec<Option<Value>>) -> EnableTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let (info, settings) = match parse_authority(values, realm_id, group_id) {
+        let (info, settings) = match parse_authority(keyed(&values), realm_id, group_id) {
             Ok(state) if !state.admins.contains(&self.input.caller) => {
-                return self.fail(EnableError::NotAdmin);
+                return Err(EnableError::NotAdmin);
             }
             Ok(state) => {
                 self.admins = state.admins;
                 (state.info, state.settings)
             }
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
         if settings.is_encrypted() {
-            return self.fail(EnableError::AlreadyEncrypted);
+            return Err(EnableError::AlreadyEncrypted);
         }
         if settings.storage_generation != self.input.expected_generation {
-            return self.fail(BucketKeyError::StaleGeneration {
+            return Err(BucketKeyError::StaleGeneration {
                 requested: self.input.expected_generation,
                 current: settings.storage_generation,
-            });
+            }
+            .into());
         }
         self.creator = Some(info.created_by);
         self.compression = info.compression;
         self.settings = settings;
-        self.state = EnableState::CheckLinks;
         let links = LinkScan::new(self.input.group_id, &self.input.bucket);
-        let effects = links.page(None, self.txn_id);
+        let page = links.page(None);
         self.links = Some(links);
-        effects
+        self.call(EnableState::CheckLinks, page)
     }
 
     /// A bucket linked whole to a provider bucket keeps its bytes raw.
-    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        let Some(links) = self.links.as_mut() else {
-            return self.fail(EnableError::NotFinished);
-        };
-        match links.scanned(values, next, self.txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) if links.linked => self.fail(EnableError::Mapped),
-            Ok(None) => {
-                self.state = EnableState::CheckUploads;
-                smallvec![full_scan(UPLOAD_KEYSPACE, None, self.txn_id)]
-            }
-            Err(error) => self.fail(error),
+    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> EnableTurn {
+        let links = self.links.as_mut().ok_or(EnableError::NotFinished)?;
+        match links.scanned(values, next)? {
+            Some(page) => Ok(Next::Call(page)),
+            None if links.linked => Err(EnableError::Mapped),
+            None => self.call(EnableState::CheckUploads, full_scan(UPLOAD_KEYSPACE, None)),
         }
     }
 
-    fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
+    fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> EnableTurn {
         if uploads_open(uploads, &self.input.bucket) {
-            return self.fail(EnableError::OpenUploads);
+            return Err(EnableError::OpenUploads);
         }
         self.scan_versions()
     }
 
     /// Every copy must fit a Pithos archive, or the encryption transition could never move it.
     /// The scan reads in the enable transaction, so a concurrent larger write conflicts.
-    fn scan_versions(&mut self) -> Effects {
+    fn scan_versions(&mut self) -> EnableTurn {
         let prefix = match VersionKey::bucket_prefix(&self.input.bucket) {
             Ok(prefix) => prefix,
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
-        self.state = EnableState::ScanVersions;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: self.size_cursor.clone().map(IterStart::After),
+        let page = IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: self.size_cursor.clone(),
             limit: SIZE_PAGE,
-            txn_id: self.txn_id,
-        })]
+        };
+        self.call(EnableState::ScanVersions, page)
     }
 
-    fn versions_scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    fn versions_scanned(&mut self, values: Vec<(Key, Value)>) -> EnableTurn {
         self.more_sizes = values.len() == SIZE_PAGE;
         self.size_cursor = values.last().map(|(key, _)| key.clone());
         let mut locations = BTreeSet::new();
         for (_, value) in &values {
             match BlobVersion::from_bytes(value.as_ref()) {
                 Ok(version) => locations.extend(version.location_key().map(|key| key.to_bytes())),
-                Err(error) => return self.fail(error),
+                Err(error) => return Err(error.into()),
             }
         }
         if locations.is_empty() {
             return self.after_sizes();
         }
-        self.state = EnableState::ReadSizes;
         let reads = locations
             .into_iter()
             .map(|key| (BLOB_LOCATIONS_KEYSPACE.to_string(), key.into()))
             .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(EnableState::ReadSizes, IoCall::Read(reads))
     }
 
-    fn sizes_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        for value in values.into_iter().filter_map(|(_, value)| value) {
+    fn sizes_read(&mut self, values: Vec<Option<Value>>) -> EnableTurn {
+        for value in values.into_iter().flatten() {
             match BackendLocation::from_bytes(value.as_ref()) {
                 Ok(location) if location.blob_size > MAX_SIZE => {
                     let limit = MAX_SIZE;
-                    return self.fail(BlobError::SizeLimitExceeded { limit });
+                    return Err(BlobError::SizeLimitExceeded { limit }.into());
                 }
                 Ok(_) => {}
-                Err(error) => return self.fail(error),
+                Err(error) => return Err(error.into()),
             }
         }
         self.after_sizes()
     }
 
-    fn after_sizes(&mut self) -> Effects {
+    fn after_sizes(&mut self) -> EnableTurn {
         if self.more_sizes {
             return self.scan_versions();
         }
@@ -300,37 +299,33 @@ impl EnableEncryptionOperation {
             return self.generate();
         }
         // A bucket that was encrypted before may still run its decryption.
-        self.state = EnableState::ReadTransition;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: TRANSITION_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        let key = self.input.bucket.as_bytes().to_vec();
+        self.call(
+            EnableState::ReadTransition,
+            read_row(TRANSITION_KEYSPACE, key),
+        )
     }
 
-    fn check_transition(&mut self, value: Option<Value>) -> Effects {
+    fn check_transition(&mut self, value: Option<Value>) -> EnableTurn {
         let transition = value.map(|value| EncryptionTransition::from_bytes(value.as_ref()));
         match transition.transpose() {
             Ok(Some(transition)) if transition.finished_at_ms.is_none() => {
-                return self.fail(EnableError::TransitionRunning);
+                return Err(EnableError::TransitionRunning);
             }
             Ok(_) => {}
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         }
         let Some(bucket_id) = self.settings.bucket_id else {
             return self.generate();
         };
-        self.state = EnableState::ReadGrants;
-        smallvec![full_scan(
-            BUCKET_HOLDER_KEYSPACE,
-            Some(bucket_id.to_bytes().to_vec().into()),
-            self.txn_id
-        )]
+        let prefix = Some(bucket_id.to_bytes().to_vec().into());
+        let scan = full_scan(BUCKET_HOLDER_KEYSPACE, prefix);
+        self.call(EnableState::ReadGrants, scan)
     }
 
-    fn generate(&mut self) -> Effects {
-        self.state = EnableState::GenerateKey;
-        smallvec![Effect::Blob(BlobEffect::GenerateBucketKey)]
+    fn generate(&mut self) -> EnableTurn {
+        let generate = Effect::Blob(BlobEffect::GenerateBucketKey);
+        self.call(EnableState::GenerateKey, generate.into())
     }
 
     fn key_ref(&self) -> BucketKeyRef {
@@ -340,7 +335,7 @@ impl EnableEncryptionOperation {
 
     /// Every published key of every eligible holder gets a copy, so any key in the user's vault
     /// opens it.
-    fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> Effects {
+    fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> EnableTurn {
         if self.settings.bucket_id.is_none() {
             self.settings.bucket_id = Some(Ulid::generate());
         }
@@ -352,56 +347,36 @@ impl EnableEncryptionOperation {
         }
         self.record = Some(record);
         self.private_key = Some(private_key.clone());
-        let Some(txn) = self.txn_id else {
-            return self.fail(EnableError::NotFinished);
-        };
-        let mut abe = crate::s3::bucket::key::abe::PrepareAbeOperation::new(
-            self.input.realm_id,
-            self.input.node_id,
-            key,
-            private_key,
-            txn,
-        );
-        self.state = EnableState::PrepareAbe;
-        let effects = abe.start();
+        let mut abe = PrepareAbe::new(self.input.realm_id, self.input.node_id, key, private_key);
+        let call = abe.first()?;
         self.abe = Some(abe);
-        effects
+        self.call(EnableState::PrepareAbe, call)
     }
 
-    fn prepare_abe(&mut self, event: Event) -> Effects {
-        let Some(abe) = self.abe.as_mut() else {
-            return self.fail(EnableError::NotFinished);
-        };
-        let effects = abe.step(event);
-        if !abe.is_complete() {
-            return effects;
+    fn prepare_abe(&mut self, result: IoResult) -> EnableTurn {
+        let abe = self.abe.as_mut().ok_or(EnableError::NotFinished)?;
+        if let Some(call) = abe.next::<EnableError>(result)? {
+            return Ok(Next::Call(call));
         }
-        let Some(abe) = self.abe.take() else {
-            return self.fail(EnableError::NotFinished);
-        };
-        if let Err(error) = abe.finalize() {
-            return self.fail(error);
-        }
-        let Some((key, public_key)) = self.record.as_ref().map(|r| (r.key, r.public_key)) else {
-            return self.fail(EnableError::NotFinished);
-        };
-        let Some(private_key) = self.private_key.clone() else {
-            return self.fail(EnableError::NotFinished);
-        };
+        self.abe = None;
+        let (key, public_key) = (self.record.as_ref())
+            .map(|record| (record.key, record.public_key))
+            .ok_or(EnableError::NotFinished)?;
+        let private_key = self.private_key.clone().ok_or(EnableError::NotFinished)?;
         let report = self.report(&[]);
         let holders = copy_targets(&report, &self.input.lookups);
         if holders.is_empty() {
             return self.write_settings(Vec::new());
         }
-        self.state = EnableState::SealCopies;
-        smallvec![Effect::Blob(BlobEffect::SealHolderCopies {
+        let seal = BlobEffect::SealHolderCopies {
             key,
             public_key,
             private_key,
             realm_id: self.input.realm_id,
             node_id: self.input.node_id,
             holders,
-        })]
+        };
+        self.call(EnableState::SealCopies, Effect::Blob(seal).into())
     }
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
@@ -409,20 +384,20 @@ impl EnableEncryptionOperation {
         resolve_holders(creator, &self.admins, &self.grants, &input.lookups, copies)
     }
 
-    fn write_settings(&mut self, copies: Vec<SealedCopy>) -> Effects {
+    fn write_settings(&mut self, copies: Vec<SealedCopy>) -> EnableTurn {
         let key = self.key_ref();
         if copies.iter().any(|copy| copy.key != key) {
-            return self.fail(EnableError::NotFinished);
+            return Err(EnableError::NotFinished);
         }
         let report = self.report(&copies);
         if self.input.mode == EncryptionMode::VaultLocked
             && report.recovery.state != RecoveryState::Met
         {
-            return self.fail(EnableError::RecoveryUnmet);
+            return Err(EnableError::RecoveryUnmet);
         }
         let (Some(record), Some(private_key)) = (self.record.clone(), self.private_key.clone())
         else {
-            return self.fail(EnableError::NotFinished);
+            return Err(EnableError::NotFinished);
         };
         self.settings = BucketEncryption {
             mode: self.input.mode,
@@ -442,13 +417,13 @@ impl EnableEncryptionOperation {
         );
         let mut writes = match rows {
             Ok(writes) => writes,
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
         // Plain copies already stored start their encrypt transition in the same transaction.
         let (bucket, now_ms) = (&self.input.bucket, self.input.now_ms);
         match encrypt_rows(bucket, &self.settings, &record, self.compression, now_ms) {
             Ok(rows) => writes.extend(rows),
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         }
         // The mode change and its audit record commit together.
         let audit = BucketAuditRecord {
@@ -468,7 +443,7 @@ impl EnableEncryptionOperation {
         };
         match audit_row(&audit) {
             Ok(row) => writes.push(row),
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         }
         let group = group_bucket_key(self.input.group_id, &self.input.bucket);
         writes.push((
@@ -482,174 +457,104 @@ impl EnableEncryptionOperation {
             holders: report,
             private_key,
         });
-        self.state = EnableState::WriteSettings;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        self.call(EnableState::WriteSettings, IoCall::Write(writes))
     }
 
-    fn write_vault(&mut self) -> Effects {
+    fn write_vault(&mut self) -> EnableTurn {
         let entry = self.record.as_ref().and_then(|record| record.vault_entry);
         let (Some(id), Some(secret)) = (entry, self.private_key.clone()) else {
-            return self.commit();
+            return self.finish();
         };
-        self.state = EnableState::WriteVault;
-        smallvec![Effect::Storage(StorageEffect::VaultWrite {
+        let write = StorageEffect::VaultWrite {
             entry: VaultEntry::new(VaultPurpose::BucketKey, id),
             secret,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(EnableError::NotFinished);
+            txn_id: None,
         };
-        self.state = EnableState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.call(EnableState::WriteVault, Effect::Storage(write).into())
     }
 
     /// The operation keeps no key after the commit; the output hands its only handle on.
-    fn finish(&mut self) -> Effects {
+    fn finish(&mut self) -> EnableTurn {
         self.private_key = None;
-        self.state = EnableState::Finish;
-        self.output = self.result.take().map(Ok);
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+        let output = self.result.take().ok_or(EnableError::NotFinished)?;
+        let wake = Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::MigrateCompression,
             after: std::time::Duration::ZERO,
-        })]
+        });
+        Ok(Next::Then {
+            output,
+            calls: vec![wake.into()],
+        })
+    }
+
+    fn grants_read(&mut self, rows: Vec<(Key, Value)>) -> EnableTurn {
+        self.grants = rows
+            .iter()
+            .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.generate()
     }
 }
 
-impl EffectOperation for EnableEncryptionOperation {
+impl Operation for EnableEncryptionOperation {
     type Output = EnableResult;
     type Error = EnableError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> EnableTurn {
         if self.input.mode == EncryptionMode::Off || self.input.max_unlock_ms == Some(0) {
-            return self.fail(EnableError::InvalidMode);
+            return Err(EnableError::InvalidMode);
         }
         if self.input.mode == EncryptionMode::NodeManaged && self.input.max_unlock_ms.is_some() {
-            return self.fail(BucketKeyError::ManagedLimit);
+            return Err(BucketKeyError::ManagedLimit.into());
         }
-        self.state = EnableState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
+        self.call(EnableState::ReadBucket, IoCall::Read(reads))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone());
-        }
-        match (self.state, event) {
-            (EnableState::PrepareAbe, event) => self.prepare_abe(event),
-            (
-                EnableState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = EnableState::ReadBucket;
-                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-                smallvec![authority_read(
-                    &self.input.bucket,
-                    realm_id,
-                    group_id,
-                    Some(txn_id)
-                )]
+    fn next(&mut self, result: IoResult) -> EnableTurn {
+        match self.state {
+            EnableState::ReadBucket => self.read_bucket(result.values()?),
+            EnableState::CheckLinks => {
+                let (rows, next) = result.page()?;
+                self.links_scanned(rows, next)
             }
-            (EnableState::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_bucket(values)
-            }
-            (
-                EnableState::CheckLinks,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.links_scanned(values, next_start_after),
-            (
-                EnableState::CheckUploads,
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.check_uploads(&values),
-            (
-                EnableState::ScanVersions,
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.versions_scanned(values),
-            (EnableState::ReadSizes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.sizes_read(values)
-            }
-            (
-                EnableState::ReadTransition,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => self.check_transition(value),
-            (EnableState::ReadGrants, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                let grants = values
-                    .iter()
-                    .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
-                    .collect::<Result<Vec<_>, _>>();
-                match grants {
-                    Ok(grants) => {
-                        self.grants = grants;
-                        self.generate()
-                    }
-                    Err(error) => self.fail(error),
-                }
-            }
-            (
-                EnableState::GenerateKey,
+            EnableState::CheckUploads => self.check_uploads(&result.page()?.0),
+            EnableState::ScanVersions => self.versions_scanned(result.page()?.0),
+            EnableState::ReadSizes => self.sizes_read(result.values()?),
+            EnableState::ReadTransition => self.check_transition(result.value()?),
+            EnableState::ReadGrants => self.grants_read(result.page()?.0),
+            EnableState::GenerateKey => match result.event()? {
                 Event::Blob(BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
-                }),
-            ) => self.seal(public_key, private_key),
-            (EnableState::SealCopies, Event::Blob(BlobEvent::CopiesSealed { copies })) => {
-                self.write_settings(copies)
-            }
-            (EnableState::WriteSettings, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                }) => self.seal(public_key, private_key),
+                other => self.refused(other),
+            },
+            EnableState::PrepareAbe => self.prepare_abe(result),
+            EnableState::SealCopies => match result.event()? {
+                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.write_settings(copies),
+                other => self.refused(other),
+            },
+            EnableState::WriteSettings => {
+                result.done()?;
                 self.write_vault()
             }
-            (EnableState::WriteVault, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.commit()
-            }
-            (
-                EnableState::CommitTransaction,
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-            ) if Some(txn_id) == self.txn_id => {
-                self.txn_id = None;
-                self.finish()
-            }
-            (EnableState::Finish | EnableState::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(EnableError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            EnableState::WriteVault => match result.event()? {
+                Event::Storage(StorageEvent::WriteResult { .. }) => self.finish(),
+                other => self.refused(other),
+            },
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, EnableState::Finish | EnableState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            EnableState::Finish | EnableState::Error => {
-                self.output.unwrap_or(Err(EnableError::NotFinished))
-            }
-            _ => Err(EnableError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
+    /// A failed enable keeps no key.
+    fn abort(&mut self) -> Vec<IoCall> {
         self.private_key = None;
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        Vec::new()
     }
 }
 

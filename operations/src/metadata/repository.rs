@@ -12,7 +12,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE,
+    METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -255,6 +256,14 @@ pub(crate) fn parse_registry_iter(
 }
 
 /// Wakes the materialization drain at once.
+/// Wakes the projection drain after `after`.
+pub(crate) fn schedule_projection(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainProjectionQueue,
+        after,
+    })
+}
+
 pub(crate) fn schedule_materialization() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainMaterializationQueue,
@@ -356,9 +365,10 @@ pub(crate) fn schedule_prune_drain() -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
     use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
+    use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
     use aruna_core::keyspaces::{
         SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
         UPDATED_INDEX_KEYSPACE,

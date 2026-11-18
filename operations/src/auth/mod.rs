@@ -9,7 +9,6 @@ pub mod enforcement;
 pub mod epoch_due;
 pub mod error;
 pub mod permission_rules;
-pub mod policy_load;
 pub mod request_authorization;
 pub mod request_policy;
 pub mod revoke_token;

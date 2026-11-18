@@ -36,7 +36,8 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{CommitVerdict, RESERVE_ATTEMPTS, classify};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionOperation, reservation_key};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::node::node_info::set_operator_drain;
+use crate::node::info::facts::NodeFacts;
+use crate::node::info::flows::OperatorDrainOperation;
 use crate::tests::records::{Family, REALM, context, local_capability};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::to_bytes;
@@ -347,7 +348,8 @@ async fn drain_still_drains() {
     ));
 
     let (_operator_dir, operator) = context(&family.config, family.holder.public()).await;
-    set_operator_drain(&operator, local, REALM, true)
+    let drain = OperatorDrainOperation::new(REALM, local, true, NodeFacts::gather(&operator));
+    drive(drain, &operator)
         .await
         .expect("operator drain records");
     advertise(&operator, &advertised(local, false)).await;

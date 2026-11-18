@@ -13,7 +13,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permissi
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship};
 use aruna_operations::auth::error::AuthorizeError;
-use aruna_operations::auth::request_authorization::authorize;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
@@ -52,18 +52,20 @@ impl ArunaS3Service {
         if !restrictions_reach(user_access.path_restrictions.as_deref(), &bucket_path) {
             return Ok(false);
         }
-        match authorize(
+        match drive(
+            AuthorizeOperation::new(
+                self.realm_id,
+                &AuthContext {
+                    user_id: user_access.user_identity,
+                    realm_id: self.realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                &bucket_path,
+                &Permission::READ,
+                extras.clone(),
+            ),
             &self.state,
-            self.realm_id,
-            &AuthContext {
-                user_id: user_access.user_identity,
-                realm_id: self.realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            &bucket_path,
-            &Permission::READ,
-            extras.clone(),
         )
         .await
         {
@@ -309,23 +311,25 @@ impl ArunaS3Service {
             )
             .await
             .map_err(IntoS3Error::into_s3_error)?;
-            authorize(
-                &self.state,
-                self.realm_id,
-                &AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: self.realm_id,
-                    path_restrictions: user_access.path_restrictions.clone(),
-                    session: None,
-                },
-                &bucket_permission_path(
+            drive(
+                AuthorizeOperation::new(
                     self.realm_id,
-                    bucket_info.group_id,
-                    self.node_id,
-                    target_bucket,
+                    &AuthContext {
+                        user_id: user_access.user_identity,
+                        realm_id: self.realm_id,
+                        path_restrictions: user_access.path_restrictions.clone(),
+                        session: None,
+                    },
+                    &bucket_permission_path(
+                        self.realm_id,
+                        bucket_info.group_id,
+                        self.node_id,
+                        target_bucket,
+                    ),
+                    &Permission::WRITE,
+                    extras.clone(),
                 ),
-                &Permission::WRITE,
-                extras.clone(),
+                &self.state,
             )
             .await
             .map_err(map_authorize_error)?;

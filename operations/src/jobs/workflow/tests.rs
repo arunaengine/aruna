@@ -936,11 +936,16 @@ async fn session_end_succeeds() {
     assert!(stored.report_digest.is_some());
     assert_eq!(session.finished().await, EndReason::Ended);
     assert!(registry.sessions().get(&job_id.to_string()).is_none());
+    let query = crate::jobs::job_reports::ReportQuery {
+        expected_digest: None,
+        last_key: None,
+        limit: 10,
+    };
     let report =
-        crate::jobs::service::read_owned_report(&ctx, stored.created_by, job_id, None, None, 10)
+        crate::jobs::job_reads::tests::read_owned_report(&ctx, stored.created_by, job_id, query)
             .await
             .unwrap();
-    let crate::jobs::service::JobReportLookup::Ready { rows, .. } = report else {
+    let crate::jobs::job_reports::JobReportLookup::Ready { rows, .. } = report else {
         panic!("ended session report must be readable");
     };
     assert_eq!(rows.len(), 1);

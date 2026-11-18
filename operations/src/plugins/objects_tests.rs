@@ -84,7 +84,7 @@ fn marked_version_refused() {
 }
 
 #[test]
-fn missing_object_reads_nothing() {
+fn missing_object_empty() {
     let mut read = Unmarked::new(("b", "k"), None);
     let none = read.next(child::<Option<Ulid>>(None));
     assert_eq!(none, Ok(Next::Done(None)));

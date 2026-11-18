@@ -248,12 +248,12 @@ impl ArunaS3Service {
             }));
         }
         let (range_id, coordinator) =
-            match route_read(self.state.as_ref(), binding, key, false).await {
+            match drive(route_read(binding, key, false), self.state.as_ref()).await {
                 Ok(ReadRoute::Holder { range_id, node_id }) => (range_id, node_id),
                 Ok(ReadRoute::Local { .. }) => return Ok(None),
                 Err(error) => return Err(guard_error(&error)),
             };
-        let holders = key_holders(self.state.as_ref(), binding.set_id, key).await;
+        let holders = drive(key_holders(binding.set_id, key), self.state.as_ref()).await.unwrap_or_default();
         let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
         let candidates = drive(choice, self.state.as_ref()).await.unwrap_or_default();
         let seed = Ulid::generate().random();
@@ -273,7 +273,7 @@ impl ArunaS3Service {
         binding: &DistributionBinding,
         key: &str,
     ) -> S3Result<Option<Forward>> {
-        let coordinator = read_coordinator(self.state.as_ref(), binding, key)
+        let coordinator = drive(read_coordinator(binding, key), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))?;
         Ok(coordinator.map(|(range_id, node_id)| Forward {
@@ -331,7 +331,7 @@ impl ArunaS3Service {
         let Some(binding) = binding.filter(|_| !pinned && !delegated && unreachable(&error)) else {
             return Err(error);
         };
-        let readers = copy_readers(self.state.as_ref(), binding, key).await;
+        let readers = drive(copy_readers(binding, key), self.state.as_ref()).await;
         let (range_id, here, copies) = readers.map_err(|error| guard_error(&error))?;
         if here {
             return Ok(ReadAnswer::Local(Some(range_id)));

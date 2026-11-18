@@ -207,7 +207,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
-        let net = aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage.clone())
+        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {

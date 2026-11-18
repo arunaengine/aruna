@@ -33,10 +33,12 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::matcher::Outbox;
+use super::peer::{ask_peer, peer_answer};
 use super::rows::{
     Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, values,
 };
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
@@ -700,6 +702,38 @@ impl Operation for CollectOutbox {
                 answer.child::<(), StoreError>()??;
                 self.take_gaps(rows)
             }
+        }
+    }
+}
+
+/// Hands a batch of events to its receiver over the metadata transport.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SendEvents {
+    node: NodeId,
+    batch: EventBatch,
+}
+
+impl SendEvents {
+    pub(crate) fn new(node: NodeId, batch: EventBatch) -> Self {
+        Self { node, batch }
+    }
+}
+
+impl Operation for SendEvents {
+    type Output = Decisions;
+    type Error = MetadataReadError;
+
+    fn first(&mut self) -> Result<Next<Decisions>, MetadataReadError> {
+        let batch = std::mem::take(&mut self.batch);
+        let forward = MetadataTransportMessage::ForwardEvents { batch };
+        let ask = ask_peer(self.node, &forward).ok_or(MetadataReadError::Unavailable)?;
+        Ok(Next::Call(ask))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Decisions>, MetadataReadError> {
+        match peer_answer(self.node, result)? {
+            Some(MetadataTransportMessage::EventsDecided { result }) => Ok(Next::Done(result?)),
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 }

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
+use crate::metadata::revision_read::RawViewOperation;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_CAPTURE_KEYSPACE,
@@ -651,7 +653,9 @@ async fn failure_cap_parks() {
     let parked =
         defer_materialization_job(index_key.as_ref(), &job, &event, &application_failure());
     assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
-    finish_completed_jobs(&storage, vec![parked]).await.unwrap();
+    finish_completed_jobs(&crate::testing::test_context(storage.clone()), vec![parked])
+        .await
+        .unwrap();
 
     assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, index_key.to_vec()).await);
     assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, sidecar_key.to_vec()).await);
@@ -1073,7 +1077,9 @@ async fn park_skips_superseded() {
     let parked =
         defer_materialization_job(job_key.as_ref(), &job, &old_event, &application_failure());
     assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
-    let plan = plan_finish_chunk(&storage, vec![parked]).await.unwrap();
+    let plan = plan_finish_chunk(&crate::testing::test_context(storage.clone()), vec![parked])
+        .await
+        .unwrap();
 
     assert!(
         !plan
@@ -1350,7 +1356,9 @@ async fn finish_commits_chunks() {
     let finished = reschedule_batch(&storage, count).await;
 
     let before = storage.snapshot_metrics().requests_total;
-    finish_completed_jobs(&storage, finished).await.unwrap();
+    finish_completed_jobs(&crate::testing::test_context(storage.clone()), finished)
+        .await
+        .unwrap();
     let delta = storage.snapshot_metrics().requests_total - before;
 
     // Two chunks, each a handful of requests: far below one transaction per
@@ -1367,7 +1375,9 @@ async fn finish_avoids_conflicts() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let finished = reschedule_batch(&storage, 4).await;
-    let plan = plan_finish_chunk(&storage, finished).await.unwrap();
+    let plan = plan_finish_chunk(&crate::testing::test_context(storage.clone()), finished)
+        .await
+        .unwrap();
 
     let document_id = Ulid::from_bytes([120u8; 16]);
     let racing = MaterializationStatusRecord {
@@ -1440,7 +1450,9 @@ async fn finish_keeps_newer() {
             merge: false,
         },
     )];
-    let plan = plan_finish_chunk(&storage, finished).await.unwrap();
+    let plan = plan_finish_chunk(&crate::testing::test_context(storage.clone()), finished)
+        .await
+        .unwrap();
 
     // The newer event lands after the snapshot was taken.
     let newer_job = MetadataMaterializationRecord {
@@ -1528,7 +1540,7 @@ async fn finish_not_regress() {
     .await;
 
     finish_completed_jobs(
-        &storage,
+        &crate::testing::test_context(storage.clone()),
         vec![FinishedMaterializationJob::Completed(
             CompletedMaterializationJob {
                 job_key: old_job_key.to_vec(),
@@ -1634,7 +1646,7 @@ async fn finish_stores_merge() {
         merge: true,
     };
     finish_completed_jobs(
-        &storage,
+        &crate::testing::test_context(storage.clone()),
         vec![FinishedMaterializationJob::Completed(completed)],
     )
     .await
@@ -1727,10 +1739,13 @@ async fn late_merges_chain() {
             },
         ));
     }
-    finish_completed_jobs(&storage, finished).await.unwrap();
-
-    let raw = crate::metadata::raw_revision::load_raw_revision(&context, document_id, None)
+    finish_completed_jobs(&crate::testing::test_context(storage.clone()), finished)
         .await
+        .unwrap();
+
+    let raw = drive(RawViewOperation::revision(document_id), &context)
+        .await
+        .map(|(_, revision)| revision)
         .unwrap()
         .expect("the merged graph is stored");
     assert_eq!(
@@ -1780,7 +1795,9 @@ async fn prune_keeps_retry() {
     assert_eq!(seen, vec![Some(first.clone())]);
     let transient = MetadataMaterializationError::Storage(StorageError::Timeout);
     let retry = defer_materialization_job(&first_key, &first, &event, &transient);
-    finish_completed_jobs(&storage, vec![retry]).await.unwrap();
+    finish_completed_jobs(&crate::testing::test_context(storage.clone()), vec![retry])
+        .await
+        .unwrap();
     let (_, dead) = filter_live_jobs(&storage, vec![(first_key.clone(), first.clone())])
         .await
         .unwrap();
@@ -1905,7 +1922,7 @@ async fn supersedes_prior_rows() {
         .await
         .unwrap();
         finish_completed_jobs(
-            &storage,
+            &crate::testing::test_context(storage.clone()),
             vec![FinishedMaterializationJob::Completed(build(event_id, rows))],
         )
         .await
@@ -2109,7 +2126,9 @@ async fn reschedules_batched() {
     );
 
     let before = storage.snapshot_metrics().requests_total;
-    finish_completed_jobs(&storage, finished).await.unwrap();
+    finish_completed_jobs(&crate::testing::test_context(storage.clone()), finished)
+        .await
+        .unwrap();
     let delta = storage.snapshot_metrics().requests_total - before;
 
     // A single finish transaction issues far fewer requests than one

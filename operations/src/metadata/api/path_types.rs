@@ -9,20 +9,20 @@ use super::{
     resolve_holders_limit, resolve_shard_holders, select_top_peers, selector_hash,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataLookupRequest {
     pub group_id: GroupId,
     pub document_path: String,
     pub auth: Option<AuthContext>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataLookupResult {
     pub winner: MetadataPathWinner,
     pub conflicts: Vec<Ulid>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct PathHolderSelection {
     pub(super) node_id: NodeId,
     pub(super) shards: Vec<u32>,
@@ -43,7 +43,6 @@ pub(super) fn select_path_holders(
     shard_count: u32,
     replica_count: Option<u32>,
     local_node: NodeId,
-    deadline: tokio::time::Instant,
 ) -> Result<(Vec<PathHolderSelection>, Vec<usize>), MetadataApiError> {
     if shard_count == 0 {
         return Err(MetadataApiError::ServiceUnavailable);
@@ -58,9 +57,6 @@ pub(super) fn select_path_holders(
     };
     let mut shard_holders = Vec::with_capacity(scan_shards as usize);
     for shard in 0..scan_shards {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
         let placement = PlacementRef { strategy_id, shard };
         let holders = resolve_holders_limit(config, &placement, QUERY_MAX_NODES);
         if holders.is_empty() {
@@ -136,9 +132,6 @@ pub(super) fn select_path_holders(
     }
     let mut replica_counts = vec![0usize; shard_count as usize];
     for (shard, holders) in shard_holders.into_iter().enumerate() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
         let mut selected = 0usize;
         for holder in holders {
             if let Some(selection) = selections

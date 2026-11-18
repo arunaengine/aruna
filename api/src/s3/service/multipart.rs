@@ -4,7 +4,8 @@
 
 use super::ArunaS3Service;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::replication::live_queue::complete_put;
+use aruna_operations::driver::drive;
+use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use s3s::{S3Result, s3_error};
 
 pub(super) fn parse_upload_marker(
@@ -32,17 +33,20 @@ impl ArunaS3Service {
         version_id: ulid::Ulid,
         size_bytes: u64,
     ) {
-        complete_put(
+        drive(
+            CompletePutOperation::new(CompletePutInput {
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                auth,
+                group_id,
+                bucket,
+                key,
+                version_id,
+                size_bytes,
+            }),
             &self.state,
-            self.realm_id,
-            self.node_id,
-            auth,
-            group_id,
-            bucket,
-            key,
-            version_id,
-            size_bytes,
         )
-        .await;
+        .await
+        .ok();
     }
 }

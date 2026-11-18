@@ -29,6 +29,7 @@ pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
 pub mod node_names;
+pub(crate) mod notification_calls;
 pub mod notifications;
 pub mod oai;
 pub mod oidc_providers;

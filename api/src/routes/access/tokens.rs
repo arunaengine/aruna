@@ -15,7 +15,7 @@ use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::forward::entry::forward_token_revoke;
+use aruna_operations::forward::token::ForwardRevokeOperation;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use axum::extract::State;
@@ -115,11 +115,15 @@ pub async fn revoke_token(
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
             .map_err(map_api_error)?
             .ok_or(ServerError::Unauthorized)?;
-        forward_token_revoke(
+        drive(
+            ForwardRevokeOperation::new(
+                state.get_realm_id(),
+                ctx.node_and_realm().map(|(node_id, _)| node_id),
+                auth_token,
+                request.token.clone(),
+                ulid::Ulid::generate(),
+            ),
             &ctx,
-            state.get_realm_id(),
-            auth_token,
-            request.token.clone(),
         )
         .await
         .map_err(MetadataApiError::from)

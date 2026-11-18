@@ -68,6 +68,8 @@ pub enum Event {
     Child(crate::calls::ChildOutcome),
     /// Answers `Effect::Compute`; never persisted.
     Compute(Box<crate::compute::effect::ComputeAnswer>),
+    /// The answer of a running job's host; never persisted.
+    Job(crate::jobs::JobEvent),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -155,10 +157,6 @@ pub enum SubOperationEvent {
     },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
-    /// One version of a re-key page ended.
-    VersionRekeyed {
-        outcome: RekeyOutcome,
-    },
     /// A kept bucket key audit record was stored and its retry timer row removed.
     AuditStored {
         result: Result<(), String>,
@@ -179,18 +177,6 @@ pub enum SubOperationEvent {
     NotificationsFailed {
         reason: String,
     },
-}
-
-/// How the re-key of one version ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RekeyOutcome {
-    Moved,
-    Skipped,
-    /// The bucket key is locked on this node.
-    Locked,
-    Failed,
-    /// The version needs a later page; this page stops before it.
-    Unfinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -357,6 +343,10 @@ pub enum BlobEvent {
     BucketDeleted {
         deleted: bool,
     },
+    /// The answer to a repository, provider or stored artifact call.
+    Remote(
+        Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>,
+    ),
 }
 
 #[derive(Debug, PartialEq)]
@@ -487,6 +477,8 @@ pub enum NetEvent {
     DocumentSync(DocumentNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
+    /// Milliseconds since each asked node's last heartbeat, or since this node started.
+    HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
     AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
     PolicySign(PolicySignEvent),
@@ -504,16 +496,95 @@ pub enum NetEvent {
         Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
     ),
     InboxWoken,
+    /// This node's id, or `None` on a node without a net handle.
+    LocalNode(Option<crate::NodeId>),
+    /// This node's id and the holders its watch interest matches; `None` without a net handle.
+    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// Whether the peer set follows the configuration, or why it does not.
+    DocumentPeers(Result<(), String>),
+    /// The version a granted read reached, or why it did not.
+    GrantedRead(
+        Result<Box<crate::native_reference::GrantedBody>, crate::errors::StagingSourceError>,
+    ),
+    /// The version a delegated read reached, or why it did not.
+    DelegatedRead(
+        Result<Box<crate::native_reference::DelegatedBody>, crate::errors::StagingSourceError>,
+    ),
     /// The signed read grant, or `None` when this node cannot sign it.
     GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
     DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
+    Shard(Box<ShardNetEvent>),
+    /// Whether sync topics took the requested peers.
+    TopicPeers(Result<(), TopicPeerError>),
+    /// This node's signature over a group deletion plan.
+    DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
+    /// The caller a forwarded credential names, or why the peer may not act for it.
+    WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
+    /// The verified claims of a token named for revocation, or why it is invalid.
+    RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
+    /// The end of a routed harvest metadata write.
+    HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
+}
+
+/// What peers said about topics this node lacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenesisProbe {
+    /// Topics at least one reached peer holds.
+    pub known_co_holder: std::collections::BTreeSet<irokle::TopicId>,
+    /// Topics a reached peer may hold; creating them could fork the topic.
+    pub unconfirmed: std::collections::BTreeSet<irokle::TopicId>,
+    pub unreachable: Vec<NodeId>,
+}
+
+/// The answer to a [`crate::effects::ShardNetEffect`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardNetEvent {
+    /// This node has no net transport.
+    NoNetwork,
+    Existing(std::collections::BTreeSet<irokle::TopicId>),
+    /// How many topics could not be reopened.
+    Reopened {
+        failed: usize,
+    },
+    Closed(Result<bool, String>),
+    Outcome(Result<(), String>),
+    Probed(GenesisProbe),
+    /// What a pull brought, for this node and realm to apply.
+    Pulled {
+        node_id: NodeId,
+        realm_id: RealmId,
+        sync: Box<DocumentNetEvent>,
+    },
+    Flag(bool),
+    Facts {
+        holder: NodeId,
+        digest: [u8; 32],
+        cursor: Vec<u8>,
+    },
+    Root(Result<[u8; 32], String>),
+    Proof(crate::structs::placement::transition::CompletionProof),
+    Manifest(Result<Box<crate::document::ShardManifest>, String>),
+}
+
+/// Why sync topics did not take the requested peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicPeerError {
+    NoNetwork,
+    Failed(String),
+}
+
+/// Why a forwarded credential was not accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePeerRefusal {
+    Unauthorized,
+    Unavailable(String),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -543,8 +614,10 @@ impl From<crate::calls::IoError> for PeerAuthRefusal {
 /// Why a peer request has no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
-    /// The request failed before an answer arrived.
+    /// The request failed before an answer arrived; the peer may have acted on it.
     Failed(crate::metadata::MetadataError),
+    /// The request never left this node, so asking again or elsewhere replays nothing.
+    NotSent(crate::metadata::MetadataError),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }
@@ -745,6 +818,11 @@ pub enum LaunchDecline {
 #[derive(Debug, PartialEq)]
 pub enum JobControlEvent {
     Response(Box<JobResponse>),
+    /// The owner's response and the artifact bytes that follow it on the stream.
+    Streamed {
+        response: Box<JobResponse>,
+        body: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
     Unavailable(String),
 }
 
@@ -818,6 +896,7 @@ impl MetadataEvent {
                 QueryResult,
                 GraphDeleted,
                 GraphListResult,
+                CachedRecords,
                 ContainsGraphResult,
                 ContainsDotResult,
                 VersionedExport,
@@ -825,6 +904,10 @@ impl MetadataEvent {
                 SnapshotInstalled,
                 BatchPlanned,
                 BatchMerged,
+                CacheGeneration,
+                CachedGroup,
+                ProfileShapes,
+                ProfileChecked,
                 Error,
             }
         )
@@ -882,6 +965,7 @@ impl Event {
                     BucketReady,
                     BucketExists,
                     BucketDeleted,
+                    Remote,
                 }
             ),
             Event::StagingSource(event) => variant_label!(
@@ -944,12 +1028,24 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    DocumentPeers,
+                    GrantedRead,
+                    DelegatedRead,
                     DatasetSummary,
+                    HarvestWrite,
                     WritePeerAuth,
                     GrantSign,
+                    Shard,
+                    TopicPeers,
+                    DeletePlanSigned,
+                    WritePeerChecked,
+                    RevocationClaims,
                     Notification,
                     InboxWoken,
+                    LocalNode,
+                    WatchHolders,
                     Heartbeat,
+                    HeartbeatSilence,
                     Recorded,
                 }
             ),
@@ -978,7 +1074,6 @@ impl Event {
                     VaultHeld,
                     KeyRequestsOpened,
                     KeyRequestsFailed,
-                    VersionRekeyed,
                     AuditStored,
                     KeysLooked,
                     CopySealed,
@@ -1006,6 +1101,7 @@ impl Event {
             Event::Delayed => "Event::Delayed",
             Event::Hung { .. } => "Event::Hung",
             Event::Child(_) => "Event::Child",
+            Event::Job(_) => "Event::Job",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(
@@ -1027,7 +1123,10 @@ impl Event {
                 OutboundEvent {
                     Posted,
                     MailSent,
-                    Backoff
+                    Backoff,
+                    Answered,
+                    MailRefreshed,
+                    ConnectionAnswered
                 }
             ),
         }
