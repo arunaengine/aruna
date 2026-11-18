@@ -413,114 +413,34 @@ impl UnlockBucketOperation {
         };
         record.intent_id = self.intent.as_ref().map(|intent| intent.event_id);
         record.sequence = result.as_ref().ok().map(|status| status.sequence);
-        self.output = Some(result);
-        self.outcome = Some(record);
-        self.retry_outcome()
+        self.finished = Some(result);
+        self.outcome = Some(record.clone());
+        let keep = KeepAudit::new(vec![record]);
+        self.call(UnlockStep::WriteOutcome, IoCall::child(keep))
     }
 
-    fn retry_outcome(&mut self) -> Effects {
-        let Some(record) = self.outcome.clone() else {
-            return self.fail(UnlockError::NotFinished);
-        };
-        self.attempts += 1;
-        self.step = UnlockStep::WriteOutcome;
-        self.write_record(&record, None)
-    }
-}
-
-impl EffectOperation for UnlockBucketOperation {
-    type Output = UnlockStatus;
-    type Error = UnlockError;
-
-    fn start(&mut self) -> Effects {
-        self.step = UnlockStep::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    /// The key state is settled, so the run ends with what the activation decided.
+    fn finish(&mut self, kept: Result<bool, AuditError>) -> UnlockTurn {
+        kept?;
+        self.outcome = None;
+        let finished = self.finished.take().ok_or(UnlockError::NotFinished)?;
+        finished.map(Next::Done)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event
-            && self.step != UnlockStep::WriteOutcome
-        {
-            return self.fail(error.clone());
-        }
+    fn event_answered(&mut self, event: Event) -> UnlockTurn {
         match (self.step, event) {
-            (
-                UnlockStep::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.step = UnlockStep::ReadBucket;
-                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-                smallvec![authority_read(
-                    &self.input.bucket,
-                    realm_id,
-                    group_id,
-                    Some(txn_id)
-                )]
-            }
-            (UnlockStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_key(values)
-            }
-            (UnlockStep::ReadKey, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.prepare(values)
-            }
-            (UnlockStep::ReadCopy, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.copy_read(values)
-            }
-            (UnlockStep::PrepareKey, Event::Blob(BlobEvent::KeyPrepared { ticket }))
-                if ticket.key == self.input.key =>
-            {
-                self.ticket = Some(ticket);
-                self.session = Some(ticket.session_id);
-                let intent = self.record(AuditOutcome::Intent, self.input.now_ms);
-                self.step = UnlockStep::WriteIntent;
-                let effects = self.write_record(&intent, self.txn_id);
-                self.intent = Some(intent);
-                effects
-            }
-            (UnlockStep::WriteIntent, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(UnlockError::NotFinished);
-                };
-                self.step = UnlockStep::CommitIntent;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (
-                UnlockStep::CommitIntent,
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-            ) if Some(txn_id) == self.txn_id => {
-                self.txn_id = None;
-                // The intent must survive a crash before any read can use the key.
-                self.step = UnlockStep::SyncIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
             (UnlockStep::SyncIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
-                let Some(ticket) = self.ticket else {
-                    return self.fail(UnlockError::NotFinished);
-                };
-                self.step = UnlockStep::ActivateKey;
-                smallvec![Effect::Blob(BlobEffect::ActivateKey { ticket })]
+                self.activate()
             }
             (UnlockStep::ActivateKey, Event::Blob(BlobEvent::KeyActivated { status }))
                 if self.ticket.is_some_and(|ticket| {
                     (ticket.key, ticket.session_id) == (status.key, status.session_id)
                 }) =>
             {
-                let Some(ticket) = self.ticket.take() else {
-                    return self.fail(UnlockError::NotFinished);
-                };
-                let Some(after) = status.remaining else {
-                    return self.write_outcome(Ok(status));
-                };
-                // The registry closes admission at the deadline; the timer records the lock.
-                self.activated = Some(status);
-                self.step = UnlockStep::ArmTimer;
-                smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                    key: lock_timer(&ticket),
-                    after,
-                })]
+                self.activated(status)
+            }
+            (UnlockStep::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
+                self.activation_failed(error)
             }
             (UnlockStep::ArmTimer, Event::Task(event))
                 if self.activated.as_ref().is_some_and(|status| {
@@ -531,19 +451,8 @@ impl EffectOperation for UnlockBucketOperation {
                     answers_timer(&event, &lock_timer(&ticket))
                 }) =>
             {
-                match self.activated.take() {
-                    Some(status) => self.write_outcome(Ok(status)),
-                    None => self.fail(UnlockError::NotFinished),
-                }
-            }
-            // A failed activation discards the prepared key; the intent stays unconfirmed.
-            (UnlockStep::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
-                let Some(ticket) = self.ticket.take() else {
-                    return self.fail(error);
-                };
-                self.failure = Some(error.into());
-                self.step = UnlockStep::DiscardKey;
-                smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })]
+                let status = self.activated.take().ok_or(UnlockError::NotFinished)?;
+                self.write_outcome(Ok(status))
             }
             (
                 UnlockStep::DiscardKey,
@@ -552,69 +461,46 @@ impl EffectOperation for UnlockBucketOperation {
                 let error = self.failure.take().unwrap_or(UnlockError::NotFinished);
                 self.write_outcome(Err(error))
             }
-            // The key state is settled; a failed outcome write is retried here first.
-            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::Error { .. }))
-                if self.attempts < AUDIT_ATTEMPTS =>
-            {
-                self.retry_outcome()
-            }
-            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.outcome = None;
-                self.step = UnlockStep::Finish;
-                smallvec![]
-            }
-            // A lasting outage hands the outcome to its own retry timer.
-            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::Error { .. })) => {
-                let Some(record) = self.outcome.as_ref() else {
-                    return self.fail(UnlockError::NotFinished);
-                };
-                self.step = UnlockStep::ArmRetry;
-                smallvec![retry_effect(record)]
-            }
-            (UnlockStep::ArmRetry, Event::Task(event))
-                if self
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
-            {
-                self.outcome = None;
-                self.step = UnlockStep::Finish;
-                smallvec![]
-            }
-            (UnlockStep::Finish | UnlockStep::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(UnlockError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            (step, received) => refused(&format!("{step:?}"), received),
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.step, UnlockStep::Finish | UnlockStep::Error)
+impl Operation for UnlockBucketOperation {
+    type Output = UnlockStatus;
+    type Error = UnlockError;
+
+    fn first(&mut self) -> UnlockTurn {
+        let private_key = self.private_key.take().ok_or(UnlockError::NotFinished)?;
+        let intent = UnlockIntent {
+            input: self.input.clone(),
+            step: IntentStep::ReadBucket,
+            implicit: false,
+            max: None,
+            private_key: Some(private_key),
+            record: None,
+            ticket: None,
+            intent: None,
+        };
+        self.call(UnlockStep::Intent, IoCall::child(intent))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn next(&mut self, result: IoResult) -> UnlockTurn {
         match self.step {
-            UnlockStep::Finish | UnlockStep::Error => {
-                self.output.unwrap_or(Err(UnlockError::NotFinished))
+            UnlockStep::Intent => {
+                let prepared = result.child::<PreparedUnlock, UnlockError>()??;
+                self.intent_committed(prepared)
             }
-            _ => Err(UnlockError::NotFinished),
+            UnlockStep::WriteOutcome => self.finish(result.child::<bool, AuditError>()?),
+            _ => self.event_answered(result.event()?),
         }
     }
 
-    fn abort(&mut self) -> Effects {
+    /// A prepared key that never activated is discarded.
+    fn abort(&mut self) -> Vec<IoCall> {
         self.private_key = None;
-        let mut effects = Effects::new();
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        // A prepared key that never activated is discarded.
-        if let Some(ticket) = self.ticket.take() {
-            effects.push(Effect::Blob(BlobEffect::DiscardKey { ticket }));
-        }
-        effects
+        let discard = |ticket| Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        self.ticket.take().map(discard).into_iter().collect()
     }
 }
 
