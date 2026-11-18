@@ -11,13 +11,12 @@ use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
 use aruna_core::structs::storage::data::link::DataLink;
-use aruna_core::structs::storage::dataset_description::DatasetDescription;
+use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::write::route_metadata_delete;
-use aruna_operations::s3::bucket::dataset::{
-    DescriptionError, bucket_metadata, dataset_description,
-};
+use aruna_operations::s3::bucket::dataset::{BucketMetadataOperation, DatasetSummaryOperation};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -129,10 +128,13 @@ pub async fn describe_bucket(
     let identifiers = checked_identifiers(&request)?;
     let info = bucket_info(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, info.group_id).await?;
-    let current = bucket_metadata(&state.get_ctx(), &bucket, &info)
-        .await
-        .map_err(ServerError::ServiceUnavailableReason)?
-        .unwrap_or_default();
+    let current = drive(
+        BucketMetadataOperation::new(&bucket, &info),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?
+    .unwrap_or_default();
     if let Some(dataset) = current.dataset {
         return Err(ServerError::Conflict(format!(
             "the bucket is already described by dataset {dataset}; edit that dataset"
@@ -162,7 +164,12 @@ pub async fn describe_bucket(
         let token = forwarded_auth_token(bearer.clone())?;
         let (ctx, realm_id) = (state.get_ctx(), state.get_realm_id());
         let caller = (Some(&auth), token);
-        let read = || dataset_description(&ctx, realm_id, dataset, caller.clone());
+        let read = || {
+            drive(
+                DatasetSummaryOperation::new(realm_id, dataset, caller.clone()),
+                &ctx,
+            )
+        };
         if !becomes_readable(read).await {
             return Err(ServerError::ServiceUnavailableReason(format!(
                 "dataset {dataset} was created but cannot be read yet; link it with \

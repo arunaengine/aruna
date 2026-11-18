@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
 use aruna_core::structs::execution::job::{
@@ -11,7 +12,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::storage::dataset_description::DatasetDescription;
+use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::time::unix_timestamp_millis;
 use serde::Serialize;
@@ -22,7 +23,6 @@ use crate::jobs::read_access::SourceReadError;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::SubmitJobError;
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::s3::bucket::dataset::DescriptionError;
 
 /// What one resolve request or answer may carry: half a transport message, so the bearer and
 /// the envelope always fit beside it.
@@ -319,6 +319,14 @@ pub(super) fn refusal_of(error: SubmitJobError) -> SubmissionRefusal {
         other => SubmissionRefusal::Invalid {
             reason: other.to_string(),
         },
+    }
+}
+
+/// What a peer learns when its forwarded token gives no caller.
+pub(super) fn peer_refusal(refusal: PeerAuthRefusal) -> SubmissionRefusal {
+    match refusal {
+        PeerAuthRefusal::Unauthorized => SubmissionRefusal::Unauthorized,
+        PeerAuthRefusal::Unavailable(_) => SubmissionRefusal::Unavailable,
     }
 }
 

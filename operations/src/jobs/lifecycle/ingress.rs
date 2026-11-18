@@ -42,8 +42,8 @@ use super::output_policies::OutputPoliciesOperation;
 use super::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use super::submission_rules::{
     admitted_description, caller_of, exact_version, family_view, fits, forwarded_request_fits,
-    input_reference, is_device, is_directory, pin_outputs, reference_content, reference_shape,
-    refusal_of, resolver_admits, source_error,
+    input_reference, is_device, is_directory, peer_refusal, pin_outputs, reference_content,
+    reference_shape, refusal_of, resolver_admits, source_error,
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
@@ -56,11 +56,11 @@ use crate::jobs::service::mint_local_job;
 use crate::jobs::source_read::{authorize_read, issue_grant, public_read};
 use crate::jobs::submit::SubmitJobError;
 use crate::jobs::submit_execution::validate_execution;
-use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::load_config::load_realm_config;
 use crate::realm::peer_trust::peer_acts_for;
-use crate::s3::bucket::dataset::{bucket_metadata, dataset_description};
+use crate::s3::bucket::dataset::{BucketMetadataOperation, DatasetSummaryOperation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::release::read::release_members;
 use crate::s3::bucket::release::{BucketScope, MembershipCaller};
@@ -78,21 +78,14 @@ pub async fn serve_input_resolve(
     auth_token: AuthToken,
     request: InputResolveRequest,
 ) -> Result<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal> {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return Err(SubmissionRefusal::Unavailable);
-    };
     let AuthToken::Bearer(bearer) = &auth_token else {
         return Err(SubmissionRefusal::Unauthorized);
     };
     // Kept to ask range coordinators about release membership for the same caller.
     let bearer = bearer.as_str().to_string();
-    let auth = metadata
-        .authorize_write_peer(peer, Some(auth_token))
+    let auth = drive(WritePeerOperation::new(peer, auth_token), context)
         .await
-        .map_err(|error| match error {
-            WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
-            WritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
-        })?;
+        .map_err(peer_refusal)?;
     let (config, local) = local_view(context)
         .await
         .map_err(|_| SubmissionRefusal::Unavailable)?;
@@ -578,7 +571,9 @@ async fn readable_metadata(
     )
     .await
     {
-        Ok(()) => bucket_metadata(context, bucket, info).await?,
+        Ok(()) => drive(BucketMetadataOperation::new(bucket, info), context)
+            .await
+            .map_err(|error| error.to_string())?,
         // Only a refusal omits the metadata; unreadable policy state stays a retryable failure.
         Err(
             AuthorizeError::PermissionDenied
@@ -593,8 +588,8 @@ async fn readable_metadata(
         Some(dataset) => {
             let token =
                 bearer.and_then(|token| aruna_core::metadata::AuthToken::bearer(token).ok());
-            let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
-            admitted_description(read.await)?
+            let read = DatasetSummaryOperation::new(auth.realm_id, dataset, (Some(auth), token));
+            admitted_description(drive(read, context).await)?
         }
         None => Default::default(),
     };
@@ -696,16 +691,8 @@ async fn admit_forwarded(
     submission_id: SubmissionId,
     mut request: SubmissionRequest,
 ) -> Result<SubmissionAck, SubmissionRefusal> {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return Err(SubmissionRefusal::Unavailable);
-    };
-    let auth = metadata
-        .authorize_write_peer(peer, Some(auth_token.clone()))
-        .await
-        .map_err(|error| match error {
-            WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
-            WritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
-        })?;
+    let check = WritePeerOperation::new(peer, auth_token.clone());
+    let auth = drive(check, context.as_ref()).await.map_err(peer_refusal)?;
     // The forwarded request keeps its own submitter: a relay may not re-attribute
     // a plan to another caller, and the identity is recomputed from that caller.
     if auth.user_id != request.created_by {
@@ -902,7 +889,6 @@ mod tests {
     use crate::jobs::lifecycle::submission_rules::{
         answers_input, batch_len, resolve_answer, sources_match,
     };
-    use crate::s3::bucket::dataset::DescriptionError;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::execution::job::OutputDestination;
     use aruna_core::structs::execution::job::{
@@ -910,6 +896,7 @@ mod tests {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::dataset_description::DatasetDescription;
+    use aruna_core::structs::storage::dataset_description::DescriptionError;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
