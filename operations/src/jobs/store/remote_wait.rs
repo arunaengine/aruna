@@ -10,6 +10,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::encoded_row;
 
+use super::row_calls::WAKE_PAGE;
 use super::*;
 
 /// Prefix of a registration: key reference, waiting node, job.

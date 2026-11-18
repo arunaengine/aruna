@@ -2,25 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::attempt_intent::{AttemptCommit, RecordIntentOperation};
+use super::attempt_intent::AttemptCommit;
+use super::job_calls::{self, RunSuccess};
+pub use super::job_calls::{
+    ClaimOutcome, ExecutionCompleteOutcome, ReleaseOutcome, RenewOutcome, RequeueOutcome,
+};
+use super::row_calls;
+pub(crate) use super::row_calls::artifact_tombstone_key;
 use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.
 pub async fn read_job_record(
     context: &DriverContext,
     job_id: JobId,
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<Option<JobRecord>, String> {
-    match read_raw(context, JOB_KEYSPACE, job_record_key(job_id), txn_id).await? {
-        Some(value) => match JobRecord::from_bytes(&value) {
-            Ok(record) => Ok(Some(record)),
-            Err(error) => {
-                warn!(job_id = %job_id, error = %error, "Malformed job record retained");
-                Ok(None)
-            }
-        },
-        None => Ok(None),
-    }
+    drive(row_calls::read_job_record(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn preserve_artifact_tombstone(
@@ -29,33 +28,12 @@ pub(crate) async fn preserve_artifact_tombstone(
     owner: UserId,
     expires_at_ms: u64,
 ) -> Result<(), String> {
-    let tombstone = ArtifactTombstone {
-        owner,
-        expires_at_ms,
-    };
-    batch_write(
+    drive(
+        row_calls::preserve_artifact_tombstone(job_id, owner, expires_at_ms),
         context,
-        vec![
-            (
-                ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
-                artifact_tombstone_key(job_id),
-                ByteView::from(
-                    postcard::to_allocvec(&tombstone).map_err(|error| error.to_string())?,
-                ),
-            ),
-            (
-                SCHEDULE_INDEX_KEYSPACE.to_string(),
-                job_prune_key(expires_at_ms, job_id),
-                aruna_core::types::Value::from(Vec::<u8>::new()),
-            ),
-        ],
-        None,
     )
     .await
-}
-
-pub(crate) fn artifact_tombstone_key(job_id: JobId) -> Key {
-    ByteView::from(job_id.to_bytes().to_vec())
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn read_artifact_tombstone(
@@ -63,30 +41,9 @@ pub(crate) async fn read_artifact_tombstone(
     job_id: JobId,
     now_ms: u64,
 ) -> Result<Option<UserId>, String> {
-    read_raw(
-        context,
-        ARTIFACT_TOMBSTONE_KEYSPACE,
-        artifact_tombstone_key(job_id),
-        None,
-    )
-    .await?
-    .map(|value| {
-        postcard::from_bytes::<ArtifactTombstone>(value.as_ref()).map_err(|error| error.to_string())
-    })
-    .transpose()
-    .map(|tombstone| {
-        tombstone
-            .filter(|tombstone| tombstone.expires_at_ms > now_ms)
-            .map(|tombstone| tombstone.owner)
-    })
-}
-
-// --- claim / lease / transition operations -------------------------------------
-
-pub enum ClaimOutcome {
-    Claimed(JobRecord),
-    CancelledFresh(JobRecord),
-    NotEligible,
+    drive(row_calls::read_artifact_tombstone(job_id, now_ms), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Claim a queued job, or cancel it directly if it never ran and is cancel-requested.
@@ -96,41 +53,11 @@ pub async fn claim_job(
     holder_node_id: NodeId,
     now_ms: u64,
 ) -> Result<ClaimOutcome, JobMutationError> {
-    let mut claimed_now = false;
-    let mut cancelled_fresh = false;
-    let record = mutate_job(context, job_id, |record| {
-        claimed_now = false;
-        cancelled_fresh = false;
-        if record.state != JobState::Queued {
-            return Ok(JobMutation::Skip);
-        }
-        record.updated_at_ms = now_ms;
-        if record.cancel_requested && !record.has_run && record.attempt_intent.is_none() {
-            record.state = JobState::Cancelled;
-            record.finished_at_ms = Some(now_ms);
-            record.claim = None;
-            cancelled_fresh = true;
-            return Ok(JobMutation::Persist);
-        }
-        record.state = JobState::Claimed;
-        record.claim = Some(JobClaim {
-            holder_node_id,
-            claim_token: Ulid::generate(),
-            lease_expires_ms: now_ms.saturating_add(JOB_LEASE_MS),
-        });
-        claimed_now = true;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    // Only a claim WE won returns a token; an already-Claimed job is NotEligible.
-    Ok(if claimed_now {
-        ClaimOutcome::Claimed(record)
-    } else if cancelled_fresh {
-        ClaimOutcome::CancelledFresh(record)
-    } else {
-        ClaimOutcome::NotEligible
-    })
+    drive(
+        job_calls::claim_job(job_id, holder_node_id, now_ms),
+        context,
+    )
+    .await
 }
 
 pub async fn transition_to_running(
@@ -139,21 +66,11 @@ pub async fn transition_to_running(
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Running;
-        record.has_run = true;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::transition_to_running(job_id, token, now_ms),
+        context,
+    )
     .await
-}
-
-pub struct RenewOutcome {
-    pub cancel_requested: bool,
 }
 
 pub async fn renew_lease(
@@ -163,21 +80,11 @@ pub async fn renew_lease(
     now_ms: u64,
     progress: Option<JobProgress>,
 ) -> Result<RenewOutcome, JobMutationError> {
-    let record = mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        if let Some(progress) = &progress {
-            record.progress = progress.clone();
-        }
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-    Ok(RenewOutcome {
-        cancel_requested: record.cancel_requested,
-    })
+    drive(
+        job_calls::renew_lease(job_id, token, now_ms, progress),
+        context,
+    )
+    .await
 }
 
 /// Persist an in-memory progress snapshot without touching the lease or state.
@@ -188,16 +95,11 @@ pub async fn flush_progress(
     progress: JobProgress,
     now_ms: u64,
 ) -> Result<RenewOutcome, JobMutationError> {
-    let record = mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.progress = progress.clone();
-        record.updated_at_ms = now_ms;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-    Ok(RenewOutcome {
-        cancel_requested: record.cancel_requested,
-    })
+    drive(
+        job_calls::flush_progress(job_id, token, progress, now_ms),
+        context,
+    )
+    .await
 }
 
 pub async fn complete_job(
@@ -208,24 +110,11 @@ pub async fn complete_job(
     final_progress: JobProgress,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Succeeded;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.progress = final_progress.clone();
-        record.result = Some(result.clone());
-        // An error of an earlier run is no outcome of the job.
-        record.last_error = None;
-        record.claim = None;
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::complete_job(job_id, token, result, final_progress, now_ms),
+        context,
+    )
     .await
-}
-
-pub enum ExecutionCompleteOutcome {
-    Completed(JobRecord),
-    CancelRequested(JobRecord),
 }
 
 /// Complete an execution only when cancellation has not already committed.
@@ -237,29 +126,19 @@ pub async fn complete_execution(
     final_progress: JobProgress,
     now_ms: u64,
 ) -> Result<ExecutionCompleteOutcome, JobMutationError> {
-    let mut completed = false;
-    let record = commit_success(
+    drive(
+        job_calls::complete_execution(
+            job_id,
+            token,
+            RunSuccess {
+                result,
+                progress: final_progress,
+                now_ms,
+            },
+        ),
         context,
-        job_id,
-        token,
-        result,
-        final_progress,
-        now_ms,
-        |record| match record.cancel_requested {
-            true => JobMutation::Skip,
-            false => {
-                completed = true;
-                JobMutation::Persist
-            }
-        },
     )
-    .await?;
-
-    Ok(if completed {
-        ExecutionCompleteOutcome::Completed(record)
-    } else {
-        ExecutionCompleteOutcome::CancelRequested(record)
-    })
+    .await
 }
 
 /// Complete an execution that finished successfully after cancellation was
@@ -273,58 +152,17 @@ pub async fn complete_cancelled(
     final_progress: JobProgress,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    commit_success(
+    drive(
+        job_calls::complete_cancelled(
+            job_id,
+            token,
+            RunSuccess {
+                result,
+                progress: final_progress,
+                now_ms,
+            },
+        ),
         context,
-        job_id,
-        token,
-        result,
-        final_progress,
-        now_ms,
-        |_| JobMutation::Persist,
-    )
-    .await
-}
-
-/// The storage-level success invariant: `Succeeded` commits in the transaction
-/// that reads the attempt control, and only when every output binds the active
-/// ExecutionId, names a reserved version, and the exact output record is durable.
-async fn commit_success<G>(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    result: JobResultPayload,
-    final_progress: JobProgress,
-    now_ms: u64,
-    mut gate: G,
-) -> Result<JobRecord, JobMutationError>
-where
-    G: FnMut(&JobRecord) -> JobMutation + Send,
-{
-    let proof = result.clone();
-    mutate_job_guarded(
-        context,
-        job_id,
-        |record| {
-            guard_token(record, token)?;
-            if matches!(gate(record), JobMutation::Skip) {
-                return Ok(JobMutation::Skip);
-            }
-            record.state = JobState::Succeeded;
-            record.finished_at_ms = Some(now_ms);
-            record.updated_at_ms = now_ms;
-            record.progress = final_progress.clone();
-            record.result = Some(result.clone());
-            record.last_error = None;
-            record.claim = None;
-            Ok(JobMutation::Persist)
-        },
-        |record, control| match record.state {
-            JobState::Succeeded => {
-                let control = control.ok_or(JobMutationError::MissingControl)?;
-                Ok(proof.proves_outputs(control)?)
-            }
-            _ => Ok(()),
-        },
     )
     .await
 }
@@ -336,20 +174,11 @@ pub async fn read_output_record(
     job_id: JobId,
     attempt_epoch: u64,
 ) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
-    let value = read_raw(
+    drive(
+        row_calls::read_output_record(job_id, attempt_epoch),
         context,
-        OUTPUT_RECORD_KEYSPACE,
-        ByteView::from(attempt_control_key(job_id, attempt_epoch)),
-        None,
     )
     .await
-    .map_err(JobMutationError::Storage)?;
-    value
-        .map(|bytes| {
-            postcard::from_bytes(bytes.as_ref())
-                .map_err(|error| JobMutationError::Storage(error.to_string()))
-        })
-        .transpose()
 }
 
 /// Make this execution's signed output record durable and name its digest on
@@ -362,27 +191,11 @@ pub async fn persist_output_record(
     digest: [u8; 32],
     envelope: Vec<u8>,
 ) -> Result<(), JobMutationError> {
-    let write = vec![(
-        OUTPUT_RECORD_KEYSPACE.to_string(),
-        ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
-        ByteView::from(envelope),
-    )];
-    mutate_control_with(context, job_id, write, |_, stored| {
-        if stored.execution_id != control.execution_id {
-            return Err(JobMutationError::EpochMismatch);
-        }
-        if let Some(existing) = stored.output_record {
-            return if existing == digest {
-                Ok(JobMutation::Skip)
-            } else {
-                Err(JobMutationError::OutputRecordConflict)
-            };
-        }
-        stored.output_record = Some(digest);
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-    Ok(())
+    drive(
+        job_calls::persist_output_record(job_id, control, digest, envelope),
+        context,
+    )
+    .await
 }
 
 pub async fn fail_job(
@@ -392,16 +205,7 @@ pub async fn fail_job(
     error: JobError,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Failed;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.last_error = Some(error.clone());
-        record.claim = None;
-        Ok(JobMutation::Persist)
-    })
-    .await
+    drive(job_calls::fail_job(job_id, token, error, now_ms), context).await
 }
 
 /// Ends the attempts of a job whose outcome cannot be known: `Indeterminate` and locally
@@ -413,13 +217,10 @@ pub async fn exhaust_job(
     error: JobError,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.last_error = Some(JobError::retryable(error.message.clone()));
-        record.updated_at_ms = now_ms;
-        exhaust_attempts(record, now_ms);
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::exhaust_job(job_id, token, error, now_ms),
+        context,
+    )
     .await
 }
 
@@ -429,56 +230,11 @@ pub async fn cancel_running_job(
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Cancelled;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.claim = None;
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::cancel_running_job(job_id, token, now_ms),
+        context,
+    )
     .await
-}
-
-pub enum RequeueOutcome {
-    Requeued(JobRecord),
-    /// `JOB_MAX_ATTEMPTS` spent: terminal `Failed` on a permanent verdict, otherwise
-    /// `Indeterminate` and locally exhausted.
-    Exhausted(JobRecord),
-    /// A submitted external attempt lost its lease or the node restarted: requeuing
-    /// would double-run the container, so the record is left for reconciliation.
-    NeedsReconcile(JobRecord),
-    Skipped,
-}
-
-/// `JOB_MAX_ATTEMPTS` are spent. Only a permanent verdict terminalizes; a
-/// retryable or absent one leaves the outcome `Indeterminate`, since exhausting
-/// this node's attempts proves nothing. An execution keeps a result payload.
-pub(super) fn exhaust_attempts(record: &mut JobRecord, now_ms: u64) {
-    let permanent = record
-        .last_error
-        .as_ref()
-        .is_some_and(|error| error.kind == JobErrorKind::Permanent);
-    record.claim = None;
-    if permanent {
-        record.state = JobState::Failed;
-        record.finished_at_ms = Some(now_ms);
-    } else {
-        record.state = JobState::Indeterminate;
-        record.locally_exhausted = true;
-    }
-    if record.result.is_some() || !matches!(record.payload, JobPayload::Execution(_)) {
-        return;
-    }
-    let result = JobResultPayload::Execution {
-        exit_code: None,
-        workspace_bucket: record.workspace_bucket.clone(),
-        outputs: Vec::new(),
-        stdout: String::new(),
-        stderr: String::new(),
-        output_digest: None,
-    };
-    record.result = Some(result);
 }
 
 /// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent; `token` is
@@ -492,8 +248,11 @@ pub async fn requeue_job(
     require_expired_before: Option<u64>,
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
-    let expired = require_expired_before;
-    requeue_counted(context, job_id, token, now_ms, expired, error, false).await
+    drive(
+        job_calls::requeue_job(job_id, token, now_ms, require_expired_before, error),
+        context,
+    )
+    .await
 }
 
 /// Re-queue after a transient failure of an execution that advanced a durable checkpoint:
@@ -505,92 +264,11 @@ pub async fn requeue_progressed(
     now_ms: u64,
     error: JobError,
 ) -> Result<RequeueOutcome, JobMutationError> {
-    requeue_counted(
+    drive(
+        job_calls::requeue_progressed(job_id, token, now_ms, error),
         context,
-        job_id,
-        Some(token),
-        now_ms,
-        None,
-        Some(error),
-        true,
     )
     .await
-}
-
-async fn requeue_counted(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Option<Ulid>,
-    now_ms: u64,
-    require_expired_before: Option<u64>,
-    error: Option<JobError>,
-    progressed: bool,
-) -> Result<RequeueOutcome, JobMutationError> {
-    let mut persisted = false;
-    let mut needs_reconcile = false;
-    let record = mutate_job(context, job_id, |record| {
-        persisted = false;
-        needs_reconcile = false;
-        if let Some(token) = token {
-            guard_token(record, token)?;
-        }
-        if record.is_settled() {
-            return Ok(JobMutation::Skip);
-        }
-        if let Some(now) = require_expired_before {
-            let Some(claim) = &record.claim else {
-                return Ok(JobMutation::Skip);
-            };
-            if claim.lease_expires_ms > now {
-                return Ok(JobMutation::Skip);
-            }
-        }
-        // Checked AFTER the expired-lease re-check: a live renewed attempt is a
-        // plain Skip and must not be routed to the reconciler.
-        if record.execution_class == JobExecutionClass::ExternalAttempt
-            && record.attempt_intent.is_some()
-        {
-            needs_reconcile = true;
-            return Ok(JobMutation::Skip);
-        }
-        if let Some(error) = error.clone() {
-            record.last_error = Some(error);
-        }
-        if progressed {
-            record.attempts = 0;
-        }
-        record.attempts = record.attempts.saturating_add(1);
-        record.updated_at_ms = now_ms;
-        record.claim = None;
-        if record.attempts >= JOB_MAX_ATTEMPTS
-            && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
-        {
-            exhaust_attempts(record, now_ms);
-        } else {
-            record.state = JobState::Queued;
-            record.due_at_ms = now_ms.saturating_add(retry_delay_ms(record.attempts));
-            record.progress = JobProgress::new(record.payload.progress_unit());
-        }
-        persisted = true;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if needs_reconcile {
-        RequeueOutcome::NeedsReconcile(record)
-    } else if !persisted {
-        RequeueOutcome::Skipped
-    } else if record.is_settled() {
-        RequeueOutcome::Exhausted(record)
-    } else {
-        RequeueOutcome::Requeued(record)
-    })
-}
-
-#[derive(Debug)]
-pub enum ReleaseOutcome {
-    Released(JobRecord),
-    Skipped,
 }
 
 /// Hand a lease back without spending an attempt: clear the claim, re-queue, make it
@@ -602,28 +280,7 @@ pub async fn release_job(
     token: Ulid,
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
-    let mut released = false;
-    let record = mutate_job(context, job_id, |record| {
-        released = false;
-        guard_token(record, token)?;
-        if record.state.is_terminal() {
-            return Ok(JobMutation::Skip);
-        }
-        record.state = JobState::Queued;
-        record.claim = None;
-        record.due_at_ms = now_ms;
-        record.updated_at_ms = now_ms;
-        record.progress = JobProgress::new(record.payload.progress_unit());
-        released = true;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if released {
-        ReleaseOutcome::Released(record)
-    } else {
-        ReleaseOutcome::Skipped
-    })
+    drive(job_calls::release_job(job_id, token, now_ms), context).await
 }
 
 /// Requeue a dependency-blocked job without spending an attempt. Unlike a
@@ -637,29 +294,11 @@ pub async fn defer_job(
     retry_after_ms: u64,
     error: JobError,
 ) -> Result<ReleaseOutcome, JobMutationError> {
-    let mut deferred = false;
-    let record = mutate_job(context, job_id, |record| {
-        deferred = false;
-        guard_token(record, token)?;
-        if record.state.is_terminal() {
-            return Ok(JobMutation::Skip);
-        }
-        record.state = JobState::Queued;
-        record.claim = None;
-        record.due_at_ms = now_ms.saturating_add(retry_after_ms);
-        record.updated_at_ms = now_ms;
-        record.last_error = Some(error.clone());
-        record.progress = JobProgress::new(record.payload.progress_unit());
-        deferred = true;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if deferred {
-        ReleaseOutcome::Released(record)
-    } else {
-        ReleaseOutcome::Skipped
-    })
+    drive(
+        job_calls::defer_job(job_id, token, now_ms, retry_after_ms, error),
+        context,
+    )
+    .await
 }
 
 /// Hand an external execution to reconciliation without re-queuing it.
@@ -671,47 +310,11 @@ pub async fn handoff_external_attempt(
     token: Ulid,
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
-    let mut released = false;
-    let result = mutate_attempt_control(context, job_id, |record, control| {
-        released = false;
-        guard_token(record, token)?;
-        if record.execution_class != JobExecutionClass::ExternalAttempt
-            || record.state.is_terminal()
-        {
-            return Ok(JobMutation::Skip);
-        }
-        if let Some(claim) = record.claim.as_mut() {
-            claim.claim_token = Ulid::generate();
-            claim.lease_expires_ms = now_ms;
-        }
-        bump_generation(control)?;
-        control.bound_token = None;
-        record.updated_at_ms = now_ms;
-        released = true;
-        Ok(JobMutation::Persist)
-    })
-    .await;
-
-    match result {
-        Ok((record, _)) => Ok(if released {
-            ReleaseOutcome::Released(record)
-        } else {
-            ReleaseOutcome::Skipped
-        }),
-        // A job interrupted while still staging has no attempt intent; release
-        // its lease instead of leaving it to the sweep's attempt charge.
-        Err(JobMutationError::MissingControl) => {
-            let record = read_job_record(context, job_id, None)
-                .await
-                .map_err(JobMutationError::Storage)?;
-            if record.is_some_and(|record| record.attempt_intent.is_none()) {
-                release_job(context, job_id, token, now_ms).await
-            } else {
-                Err(JobMutationError::MissingControl)
-            }
-        }
-        Err(error) => Err(error),
-    }
+    drive(
+        job_calls::handoff_external_attempt(job_id, token, now_ms),
+        context,
+    )
+    .await
 }
 
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
@@ -728,11 +331,16 @@ pub async fn record_attempt_intent(
     launch: Option<&LaunchRecord>,
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
-    let execution_id = execution_id.unwrap_or_else(Ulid::generate);
-    let launch = launch.cloned();
-    let build = || {
-        let ids = (job_id, token);
-        RecordIntentOperation::new(ids, draft.clone(), execution_id, launch.clone(), now_ms)
-    };
-    drive_settled(context, build, "attempt commit exhausted conflict retries").await
+    drive(
+        job_calls::record_attempt_intent(
+            job_id,
+            token,
+            draft,
+            execution_id,
+            launch.cloned(),
+            now_ms,
+        ),
+        context,
+    )
+    .await
 }

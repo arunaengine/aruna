@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::row_calls;
+use super::store_call::RowBatch;
 use super::*;
 use crate::driver::drive;
 
@@ -30,25 +32,12 @@ pub async fn list_job_entries(
     last_key: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
-    let (values, next) = iter_prefix_page(
-        &context.storage_handle,
-        JOB_ENTRY_KEYSPACE,
-        Some(job_entry_prefix(job_id)),
-        last_key.map(|key| job_entry_key(job_id, &key)),
-        limit,
-        None,
+    drive(
+        row_calls::list_job_entries(job_id, last_key, limit),
+        context,
     )
-    .await?;
-    let rows = values
-        .into_iter()
-        .map(|(key, value)| Ok((parse_entry_key(job_id, key.as_ref())?, value)))
-        .collect::<Result<Vec<_>, ConversionError>>()
-        .map_err(|error| error.to_string())?;
-    let next = next
-        .map(|key| parse_entry_key(job_id, key.as_ref()))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    Ok((rows, next))
+    .await
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn job_entry_deletes(
@@ -56,22 +45,9 @@ pub(crate) async fn job_entry_deletes(
     job_id: JobId,
     limit: usize,
 ) -> Result<(JobDeletes, bool), String> {
-    let (values, next) = iter_prefix_page(
-        &context.storage_handle,
-        JOB_ENTRY_KEYSPACE,
-        Some(job_entry_prefix(job_id)),
-        None,
-        limit,
-        None,
-    )
-    .await?;
-    Ok((
-        values
-            .into_iter()
-            .map(|(key, _)| (JOB_ENTRY_KEYSPACE.to_string(), key))
-            .collect(),
-        next.is_some(),
-    ))
+    drive(row_calls::job_entry_deletes(job_id, limit), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// One bounded page of a staging job's queue, manifest and lane rows; `true` while more remain.
@@ -80,67 +56,31 @@ pub(crate) async fn staging_row_deletes(
     job_id: JobId,
     limit: usize,
 ) -> Result<(JobDeletes, bool), String> {
-    let prefix = ByteView::from(job_id.to_bytes().to_vec());
-    let mut deletes = Vec::new();
-    let mut more = false;
-    for key_space in [
-        aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE,
-        aruna_core::keyspaces::STAGING_MANIFEST_KEYSPACE,
-        aruna_core::keyspaces::STAGING_STATE_KEYSPACE,
-    ] {
-        let room = limit.saturating_sub(deletes.len());
-        if room == 0 {
-            return Ok((deletes, true));
-        }
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            key_space,
-            Some(prefix.clone()),
-            None,
-            room,
-            None,
-        )
-        .await?;
-        more |= next.is_some();
-        deletes.extend(
-            values
-                .into_iter()
-                .map(|(key, _)| (key_space.to_string(), key)),
-        );
-    }
-    Ok((deletes, more))
+    drive(row_calls::staging_row_deletes(job_id, limit), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub async fn find_dedup_job(
     context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<Option<JobId>, String> {
-    Ok(find_dedup_plan(context, created_by, dedup_key, txn_id)
-        .await?
-        .map(|(job_id, _)| job_id))
+    drive(row_calls::find_dedup_job(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub async fn find_dedup_plan(
     context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<Option<(JobId, [u8; 32])>, String> {
-    match read_raw(
-        context,
-        DEDUP_INDEX_KEYSPACE,
-        dedup_index_key(created_by, dedup_key),
-        txn_id,
-    )
-    .await?
-    {
-        Some(value) => parse_dedup_value(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        None => Ok(None),
-    }
+    drive(row_calls::find_dedup_plan(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Earliest `(timestamp, job_id)` under a schedule-index prefix.
@@ -148,113 +88,33 @@ pub async fn first_schedule_entry(
     context: &DriverContext,
     prefix: &[u8],
 ) -> Result<Option<(u64, JobId)>, String> {
-    let (values, _) = iter_prefix_page(
-        &context.storage_handle,
-        SCHEDULE_INDEX_KEYSPACE,
-        Some(ByteView::from(prefix.to_vec())),
-        None,
-        1,
-        None,
-    )
-    .await?;
-    match values.into_iter().next() {
-        Some((key, _)) => {
-            match aruna_core::structs::execution::job::parse_schedule_key(key.as_ref()) {
-                Ok(parsed) => Ok(Some(parsed)),
-                Err(error) => {
-                    warn!(error = %error, "Deleting malformed job schedule index row");
-                    delete_raw(context, SCHEDULE_INDEX_KEYSPACE, key, None).await?;
-                    Ok(None)
-                }
-            }
-        }
-        None => Ok(None),
-    }
+    drive(row_calls::first_schedule_entry(prefix), context)
+        .await
+        .map_err(|error| error.to_string())
 }
-
-// --- low-level storage plumbing ------------------------------------------------
 
 pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
-    let writes = job_insert_entries(record).map_err(|error| error.to_string())?;
-    batch_write(context, writes, None).await
-}
-
-pub(super) async fn read_raw(
-    context: &DriverContext,
-    key_space: &str,
-    key: Key,
-    txn_id: Option<TxnId>,
-) -> Result<Option<Value>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id,
-        })
+    drive(row_calls::insert_job(record), context)
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
-    }
+        .map_err(|error| error.to_string())
 }
 
 pub(super) async fn batch_write(
     context: &DriverContext,
     writes: JobWrites,
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<(), String> {
-    if writes.is_empty() {
-        return Ok(());
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
+    drive(RowBatch::write(Ok(writes)), context)
         .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
-    }
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn batch_delete(
     context: &DriverContext,
     deletes: JobDeletes,
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<(), String> {
-    if deletes.is_empty() {
-        return Ok(());
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
+    drive(row_calls::delete_rows(deletes), context)
         .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
-    }
-}
-
-pub(super) async fn delete_raw(
-    context: &DriverContext,
-    key_space: &str,
-    key: Key,
-    txn_id: Option<TxnId>,
-) -> Result<(), String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: key_space.to_string(),
-            key,
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
-    }
+        .map_err(|error| error.to_string())
 }
