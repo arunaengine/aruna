@@ -25,12 +25,11 @@ use aruna_plugins::permission::Permission;
 use futures_util::StreamExt;
 use ulid::Ulid;
 
-use super::broker::local_object;
-use super::broker::unmarked;
-use super::check::{authorize_access, authorize_call, matching};
+use super::check::{Authorize, matching};
 use super::grants::InstallScope;
 use super::held::release_into;
 use super::install::{pick_version, read_manifest};
+use super::objects::{LocalObject, Unmarked};
 use super::outgoing::outgoing;
 use super::outgoing::whole_text;
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
@@ -64,7 +63,8 @@ pub async fn download_work(
         Err(error) => return refused(error),
     };
     let place = (spec.realm_id, ctx.owner_node_id);
-    let (bucket, key) = match local_object(&ctx.driver, place, install, download.target).await {
+    let object = LocalObject::new(place, install, download.target);
+    let (bucket, key) = match drive(object, &ctx.driver).await {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
@@ -266,12 +266,14 @@ pub async fn upload_work(
         return outcome;
     }
     let place = (spec.realm_id, ctx.owner_node_id);
-    let (bucket, key) = match local_object(&ctx.driver, place, install, upload.source).await {
+    let object = LocalObject::new(place, install, upload.source);
+    let (bucket, key) = match drive(object, &ctx.driver).await {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
     // The version checked is the version sent, so a newer marked one never slips in.
-    let version = match unmarked(&ctx.driver, (&bucket, &key), upload.version).await {
+    let readable = Unmarked::new((&bucket, &key), upload.version);
+    let version = match drive(readable, &ctx.driver).await {
         Ok(Some(version)) => version,
         Ok(None) => return permanent("the object to upload is gone"),
         Err(error) => return refused(error),
@@ -445,14 +447,8 @@ async fn upload_grants(
     connection_granted(ctx, install, row).await?;
     let upload = Permission::TransfersUpload;
     let patterns = matching(install, upload, source)?;
-    authorize_access(
-        &ctx.driver,
-        install,
-        (upload, Access::READ),
-        source,
-        &patterns,
-    )
-    .await?;
+    let check = Authorize::access(install, (upload, Access::READ), source, &patterns);
+    drive(check, &ctx.driver).await?;
     Ok(patterns)
 }
 
@@ -473,7 +469,8 @@ async fn connection_granted(
     let send = Permission::ConnectionsSend;
     let connection = scope.connection(&context.connection);
     let patterns = matching(install, send, &connection)?;
-    authorize_call(&ctx.driver, install, send, &connection, &patterns).await
+    let check = Authorize::call(install, send, &connection, &patterns);
+    Ok(drive(check, &ctx.driver).await?)
 }
 
 fn locked(error: &GetObjectError) -> bool {
@@ -492,7 +489,8 @@ async fn download_grants(
     connection_granted(ctx, install, row).await?;
     let download = Permission::TransfersDownload;
     let patterns = matching(install, download, target)?;
-    authorize_call(&ctx.driver, install, download, target, &patterns).await?;
+    let check = Authorize::call(install, download, target, &patterns);
+    drive(check, &ctx.driver).await?;
     Ok(patterns)
 }
 

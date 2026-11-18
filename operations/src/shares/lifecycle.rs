@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::SHARE_LINK_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_retry, boxed_suboperation};
 use aruna_core::rows;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::share::{ShareAction, ShareEvent, ShareLink, ShareToken};
@@ -231,12 +231,17 @@ impl OpenShareOperation {
             client: Some(self.config.client.clone()),
         };
         let share_id = self.config.token.share_id();
+        let entry_id = self.config.entry_id;
         self.state = state;
-        let log = LogShareOperation::new(share_id, self.config.entry_id, event);
-        Next::Call(IoCall::Child(boxed_suboperation(log, |result| {
-            let result = result.map_err(|error| error.to_string());
-            Event::SubOperation(SubOperationEvent::ShareLogged { result })
-        })))
+        let build = move || LogShareOperation::new(share_id, entry_id, event.clone());
+        Next::Call(IoCall::Child(boxed_retry(
+            build,
+            &entry_id.to_bytes(),
+            |result| {
+                let result = result.map_err(|error| error.to_string());
+                Event::SubOperation(SubOperationEvent::ShareLogged { result })
+            },
+        )))
     }
 
     fn loaded(&mut self, link: Option<ShareLink>) -> Result<Next<OpenedShare>, ShareError> {

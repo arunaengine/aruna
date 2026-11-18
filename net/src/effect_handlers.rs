@@ -12,13 +12,16 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
-    PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    PeerAuthRefusal, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::dataset_description::DescriptionError;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
+use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
 use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -241,17 +244,26 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ExecutionSign(claim) => {
             NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
         }
+        NetEffect::GrantSign(grant) => NetEvent::GrantSign(sign_grant(&ctx.secret_key, *grant)),
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
+        // Token validation state lives in the metadata handle the runner holds.
+        NetEffect::WritePeerAuth(_) => NetEvent::WritePeerAuth(Err(PeerAuthRefusal::Unavailable(
+            "peer authorization must be dispatched by the operations runner".to_string(),
+        ))),
+        // The routed export reads through the handles the runner holds.
+        NetEffect::DatasetSummary(_) => {
+            NetEvent::DatasetSummary(Err(DescriptionError::Unavailable))
+        }
         // Metadata requests ride the metadata transport the runner holds.
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
             elapsed: Duration::ZERO,
-            result: Err(PeerRequestError::Failed(
+            result: Err(PeerRequestError::Failed(MetadataError::Backend(
                 "metadata request must be dispatched by the operations runner".to_string(),
-            )),
+            ))),
         })),
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Notification(_) => NetEvent::Notification(Err(
@@ -303,6 +315,15 @@ pub(crate) fn sign_statement(key: &iroh::SecretKey, claim: StatementClaim) -> St
         signer: claim.signer,
         statement: claim.statement,
     }))
+}
+
+/// Signs a read grant with this node's key, only when the grant names this node as issuer.
+pub(crate) fn sign_grant(key: &iroh::SecretKey, grant: ReadGrant) -> Option<Box<SignedGrant>> {
+    if grant.issuer != key.public() {
+        return None;
+    }
+    let signature = key.sign(&grant.signing_bytes().ok()?);
+    Some(Box::new(SignedGrant { signature, grant }))
 }
 
 /// Signs a job record with this node's key, only when the claim names this node as publisher.
@@ -590,6 +611,9 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
+        NetEffect::DatasetSummary(_) => "dataset_summary",
+        NetEffect::WritePeerAuth(_) => "write_peer_auth",
+        NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",

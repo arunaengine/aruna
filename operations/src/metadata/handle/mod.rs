@@ -41,7 +41,6 @@ use crate::auth::bearer_token::{
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::sync::mirror_repair::RECONCILE_GRACE;
 
 mod effects;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
@@ -65,7 +64,6 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
-const SYNC_MIRROR_TIMEOUT: Duration = RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
 const GRAPH_SYNC_ATTEMPTS: usize = 3;
 const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
 pub(crate) const QUERY_MAX_BYTES: usize = 64 * 1024;
@@ -199,7 +197,7 @@ impl MetadataRequestError {
         self.delivery
     }
 
-    fn into_metadata_error(self) -> MetadataError {
+    pub(crate) fn into_metadata_error(self) -> MetadataError {
         self.error
     }
 }

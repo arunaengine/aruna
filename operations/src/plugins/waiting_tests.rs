@@ -15,7 +15,8 @@ use crate::plugins::decide::{SeenRow, seen_key};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::rows::decode;
-use crate::plugins::rows::{page_result, values_result};
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;
@@ -177,4 +178,67 @@ fn settle_frees_slot() {
     };
     assert_eq!(rows.len(), 1);
     assert!(refused.next(page_result(Vec::new(), None)).is_err());
+}
+
+fn stored_waiting(received_ms: u64) -> (Vec<u8>, Vec<u8>) {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let row = ForwardRow {
+        install_id: install.install_id,
+        revision: 1,
+        event: aruna_core::plugin_runs::SourceEvent {
+            kind: aruna_core::plugin_runs::SourceKind::DatasetCreated,
+            group_id: install.group_id,
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: "s1".into(),
+            actor: None,
+            anchor_ms: 5,
+            journaled_ms: 5,
+        },
+        queued_ms: 5,
+    };
+    let row = WaitingRow { row, received_ms };
+    (b"w".to_vec(), crate::plugins::rows::encode(&row).unwrap())
+}
+
+fn recheck_pass(now_ms: u64) -> RecheckWaiting {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    let config = RealmConfigDocument::new(realm, Vec::new(), 3);
+    let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    RecheckWaiting::new(Arc::new(config), node, now_ms)
+}
+
+#[test]
+fn expired_waiting_settles() {
+    let mut pass = recheck_pass(WAITING_EXPIRY_MS + 10);
+    assert!(matches!(pass.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = page_result(vec![stored_waiting(1)], None);
+    assert!(matches!(pass.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(pass.phase, RecheckPhase::Settling);
+    let settled = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(pass.next(settled), Ok(Next::Done(1)));
+}
+
+#[test]
+fn unready_waiting_stays() {
+    let mut pass = recheck_pass(10);
+    let page = page_result(vec![stored_waiting(5)], None);
+    assert!(matches!(pass.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    let verdict = child_result(Ok::<_, StoreError>(Verdict::Unready));
+    assert_eq!(pass.next(verdict), Ok(Next::Done(0)));
+}
+
+#[test]
+fn ready_waiting_settles() {
+    let mut pass = recheck_pass(10);
+    pass.next(page_result(vec![stored_waiting(5)], None))
+        .unwrap();
+    let verdict = child_result(Ok::<_, StoreError>(Verdict::Denied("no".into())));
+    assert!(matches!(
+        pass.next(verdict),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let settled = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(pass.next(settled), Ok(Next::Done(1)));
 }

@@ -3,15 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoResult, Next};
+use std::collections::VecDeque;
+
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{Row, StoreError, delete_call, done, encode, read_call, row, values};
+use super::objects::absent;
+use super::rows::{
+    Row, StoreError, decode, delete_call, done, encode, mapped_child, page_call, page_of,
+    read_call, row, values,
+};
 use super::work::{Found, WorkKind, WorkLookup, WorkState};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.
 pub const MARK_ROW: u8 = b'm';
@@ -117,6 +124,130 @@ impl Operation for MarkEnded {
             }
             (ended, _) => Ok(Next::Done(ended)),
         }
+    }
+}
+
+/// Marks one sweep pass reads at a time.
+const MARK_PAGE: usize = 100;
+
+#[derive(Debug, PartialEq)]
+enum SweepStep {
+    Paging,
+    /// Asks whether the work that minted the version can write no more.
+    Ended,
+    /// Asks whether the version is gone.
+    Head,
+    /// Deletes the mark, reading the work row again.
+    Dropping,
+}
+
+/// One mark a sweep looks at.
+#[derive(Debug, PartialEq)]
+struct SweptMark {
+    key: Vec<u8>,
+    mark: Mark,
+    head: Option<HeadObjectInput>,
+}
+
+/// Drops the marks nothing can need any more, a page at a time: the work that minted the version
+/// can write no more, as its row is settled or gone, and only then the version is absent. The
+/// delete reads the row again, so it conflicts with a settlement or reservation.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SweepMarks {
+    after: Option<Vec<u8>>,
+    more: bool,
+    rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    current: Option<SweptMark>,
+    dropped: usize,
+    step: SweepStep,
+}
+
+impl SweepMarks {
+    pub(crate) fn new() -> Self {
+        Self {
+            after: None,
+            more: false,
+            rows: VecDeque::new(),
+            current: None,
+            dropped: 0,
+            step: SweepStep::Paging,
+        }
+    }
+
+    fn page(&mut self) -> IoCall {
+        self.step = SweepStep::Paging;
+        let after = self.after.clone();
+        page_call(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, MARK_PAGE)
+    }
+
+    /// The call for the next mark, the next page, or the end.
+    fn advance(&mut self) -> Result<Next<usize>, StoreError> {
+        let Some((key, value)) = self.rows.pop_front() else {
+            return Ok(match self.more {
+                true => Next::Call(self.page()),
+                false => Next::Done(self.dropped),
+            });
+        };
+        let mark: Mark = decode(&value)?;
+        let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
+        let head = HeadObjectInput {
+            bucket,
+            key: object,
+            version_id: Some(version_id),
+        };
+        let ended = MarkEnded::check(&mark, None);
+        self.current = Some(SweptMark {
+            key,
+            mark,
+            head: Some(head),
+        });
+        self.step = SweepStep::Ended;
+        Ok(Next::Call(IoCall::child(ended)))
+    }
+}
+
+impl Operation for SweepMarks {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        match self.step {
+            SweepStep::Paging => {
+                let (rows, next) = page_of(answer)?;
+                self.rows = rows.into();
+                self.more = next.is_some();
+                self.after = next;
+            }
+            SweepStep::Ended => {
+                if answer.child::<bool, StoreError>()?? {
+                    let head = (self.current.as_mut()).and_then(|mark| mark.head.take());
+                    let head = head.ok_or(IoError::Unfinished)?;
+                    self.step = SweepStep::Head;
+                    let head = HeadObjectOperation::new(head);
+                    // Present, or not known now: the mark stays.
+                    return Ok(Next::Call(mapped_child(head, |head| {
+                        Ok::<bool, ()>(head.is_err_and(|error| absent(&error)))
+                    })));
+                }
+            }
+            SweepStep::Head => {
+                if answer.child::<bool, ()>()?.unwrap_or(false) {
+                    let swept = self.current.take().ok_or(IoError::Unfinished)?;
+                    self.step = SweepStep::Dropping;
+                    let drop = MarkEnded::check(&swept.mark, Some(swept.key));
+                    return Ok(Next::Call(IoCall::child(drop)));
+                }
+            }
+            SweepStep::Dropping => {
+                let dropped = answer.child::<bool, StoreError>()??;
+                self.dropped += usize::from(dropped);
+            }
+        }
+        self.advance()
     }
 }
 

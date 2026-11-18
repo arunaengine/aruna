@@ -375,6 +375,52 @@ impl Outbox {
     }
 }
 
+/// Matches every pending journal row with at most `bound` forward rows per install, a page per
+/// transaction; answers how many rows were read.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MatchJournal {
+    targets: Vec<Target>,
+    keep: bool,
+    now_ms: u64,
+    bound: usize,
+    read: usize,
+}
+
+impl MatchJournal {
+    pub(crate) fn new((targets, keep): (Vec<Target>, bool), now_ms: u64, bound: usize) -> Self {
+        Self {
+            targets,
+            keep,
+            now_ms,
+            bound,
+            read: 0,
+        }
+    }
+
+    fn page(&self) -> IoCall {
+        let matched = (&self.targets[..], self.keep);
+        IoCall::child(match_page(matched, self.now_ms, self.bound))
+    }
+}
+
+impl Operation for MatchJournal {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        let count = answer.child::<usize, StoreError>()??;
+        self.read += count;
+        Ok(match count < JOURNAL_PAGE {
+            true => Next::Done(self.read),
+            false => Next::Call(self.page()),
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "matcher_tests.rs"]
 pub(crate) mod tests;

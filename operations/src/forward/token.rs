@@ -2,389 +2,314 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::revoke_token::RevokeTokenAdmission;
-use crate::auth::revoke_token::RevokeTokenConfig;
-use crate::auth::revoke_token::RevokeTokenError;
-use crate::auth::revoke_token::RevokeTokenOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::forward::authorize::authorize_forwarded_caller;
-use crate::forward::authorize::authorize_write;
-use crate::forward::authorize::forward_auth_error;
-use crate::forward::transport::reject;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::handle::MetadataRequestError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::WriteAuthError;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::fetch::{peer_call, peer_reply};
+use crate::forward::routing::distinct_holders;
+use crate::forward::transport::ForwardError;
+use crate::metadata::handle::transport_message_kind;
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
 use aruna_core::NodeId;
 use aruna_core::auth::bearer_token_hash;
-use aruna_core::auth::valid_revocation_expiry;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_secs;
-use std::future::Future;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
 
-pub(super) const REVOKE_PEER_LIMIT: usize = 4;
+const REVOKE_PEER_LIMIT: usize = 4;
 
-pub(super) const REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub(super) const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
+const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 
-pub async fn forward_token_revoke(
-    context: &Arc<DriverContext>,
+type RevokeTurn = Result<Next<()>, ForwardError>;
+
+/// Asks ranked realm peers to revoke a token until one accepts or the deadline passes. A
+/// revocation is keyed by token hash, so an ambiguous attempt is safe to replay on the next peer.
+#[derive(Debug, PartialEq)]
+pub struct ForwardRevokeOperation {
     realm_id: RealmId,
-    auth_token: AuthToken,
-    token: String,
-) -> Result<(), MetadataApiError> {
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
-        return Err(MetadataApiError::ServiceUnavailable);
-    };
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return Err(MetadataApiError::ServiceUnavailable);
-    };
-    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut subject = bearer_token_hash(&token).into_bytes();
-    subject.extend_from_slice(&Ulid::generate().to_bytes());
-    let peers = rank_revoke_peers(
-        config
-            .nodes
-            .iter()
+    local: Option<NodeId>,
+    subject: Vec<u8>,
+    frame: Result<Vec<u8>, String>,
+    now_ms: u64,
+    deadline_ms: u64,
+    /// Reversed, so the next peer pops off the end.
+    peers: Vec<NodeId>,
+    asked: Option<NodeId>,
+}
+
+impl ForwardRevokeOperation {
+    /// `salt` varies the peer order between attempts at the same token.
+    pub fn new(
+        realm_id: RealmId,
+        local: Option<NodeId>,
+        auth_token: AuthToken,
+        token: String,
+        salt: Ulid,
+    ) -> Self {
+        let mut subject = bearer_token_hash(&token).into_bytes();
+        subject.extend_from_slice(&salt.to_bytes());
+        let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
+        Self {
+            realm_id,
+            local,
+            subject,
+            frame: encode_message(&message),
+            now_ms: 0,
+            deadline_ms: 0,
+            peers: Vec::new(),
+            asked: None,
+        }
+    }
+
+    fn plan(&mut self, config: &RealmConfigDocument) -> RevokeTurn {
+        let candidates = (config.nodes.iter())
             .filter(|node| node.kind.is_sync_eligible())
             .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-            .filter(|peer| Some(*peer) != local_node_id),
-        &subject,
-    );
-    if peers.is_empty() {
-        return Err(MetadataApiError::ServiceUnavailable);
+            .filter(|peer| Some(*peer) != self.local);
+        self.set_peers(rank_revoke_peers(candidates, &self.subject));
+        self.ask()
     }
 
-    let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
-    run_revoke(
-        &peers,
-        message,
-        Instant::now() + TOKEN_REVOKE_DEADLINE,
-        |peer, message| metadata.request_forwarded_write(peer, message),
-    )
-    .await
-}
+    fn set_peers(&mut self, ranked: Vec<NodeId>) {
+        let mut peers = distinct_holders(&ranked);
+        peers.truncate(REVOKE_PEER_LIMIT);
+        peers.reverse();
+        self.peers = peers;
+    }
 
-pub(super) async fn run_revoke<F, Fut>(
-    peers: &[NodeId],
-    message: MetadataTransportMessage,
-    deadline: Instant,
-    mut request: F,
-) -> Result<(), MetadataApiError>
-where
-    F: FnMut(NodeId, MetadataTransportMessage) -> Fut,
-    Fut: Future<Output = Result<MetadataTransportMessage, MetadataRequestError>>,
-{
-    let mut seen = Vec::with_capacity(REVOKE_PEER_LIMIT);
-    for peer in peers.iter().copied() {
-        if seen.len() >= REVOKE_PEER_LIMIT {
-            break;
-        }
-        if seen.contains(&peer) {
-            continue;
-        }
-        seen.push(peer);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let attempt = remaining.min(REVOKE_ATTEMPT_TIMEOUT);
-        match timeout(attempt, request(peer, message.clone())).await {
-            Err(_) => {
-                warn!(%peer, "Token revocation forwarding attempt timed out");
-                continue;
-            }
-            Ok(Ok(MetadataTransportMessage::ForwardedTokenRevoked)) => return Ok(()),
-            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+    /// Asks the next peer with what is left of the deadline, at most one attempt's share.
+    fn ask(&mut self) -> RevokeTurn {
+        let remaining = self.deadline_ms.saturating_sub(self.now_ms);
+        let frame = self.frame.as_ref().map_err(|error| {
+            warn!(%error, "A forwarded token revocation does not encode");
+            ForwardError::Unavailable
+        })?;
+        let (Some(peer), true) = (self.peers.pop(), remaining > 0) else {
+            return Err(ForwardError::Unavailable);
+        };
+        self.asked = Some(peer);
+        let timeout = Duration::from_millis(remaining).min(REVOKE_ATTEMPT_TIMEOUT);
+        Ok(Next::Call(peer_call(peer, frame.clone(), timeout)))
+    }
+
+    fn answered(
+        &mut self,
+        peer: NodeId,
+        reply: Result<MetadataTransportMessage, PeerRequestError>,
+    ) -> RevokeTurn {
+        match reply {
+            Ok(MetadataTransportMessage::ForwardedTokenRevoked) => Ok(Next::Done(())),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: WriteAuthError::Unauthorized,
-            })) => return Err(MetadataApiError::Unauthorized),
-            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+            }) => Err(ForwardError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: WriteAuthError::Forbidden,
-            })) => return Err(MetadataApiError::Forbidden),
-            Ok(Ok(MetadataTransportMessage::ForwardedWriteUnavailable))
-            | Ok(Ok(MetadataTransportMessage::TokenRevocationCapacity)) => continue,
-            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+            }) => Err(ForwardError::Forbidden),
+            Ok(
+                MetadataTransportMessage::ForwardedWriteUnavailable
+                | MetadataTransportMessage::TokenRevocationCapacity,
+            ) => self.ask(),
+            Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(%peer, %error, "Peer rejected a forwarded token revocation");
-                return Err(MetadataApiError::ServiceUnavailable);
+                Err(ForwardError::Unavailable)
             }
-            Ok(Ok(response)) => {
-                warn!(%peer, response = ?crate::metadata::handle::transport_message_kind(&response), "Peer returned an unexpected token revocation response");
-                return Err(MetadataApiError::ServiceUnavailable);
+            Ok(response) => {
+                let response = transport_message_kind(&response);
+                warn!(%peer, response, "Peer returned an unexpected token revocation response");
+                Err(ForwardError::Unavailable)
             }
-            Ok(Err(error)) => {
-                // Revocation is keyed by token hash, so an ambiguous write is safe to replay.
+            Err(PeerRequestError::TimedOut) => {
+                warn!(%peer, "Token revocation forwarding attempt timed out");
+                self.ask()
+            }
+            Err(PeerRequestError::Failed(error)) => {
                 warn!(%peer, %error, "Failed to forward a token revocation");
+                self.ask()
             }
         }
     }
-    Err(MetadataApiError::ServiceUnavailable)
 }
 
-pub(super) fn rank_revoke_peers(
-    peers: impl IntoIterator<Item = NodeId>,
-    subject: &[u8],
-) -> Vec<NodeId> {
+impl Operation for ForwardRevokeOperation {
+    type Output = ();
+    type Error = ForwardError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> RevokeTurn {
+        self.deadline_ms = self.now_ms + TOKEN_REVOKE_DEADLINE.as_millis() as u64;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> RevokeTurn {
+        if let Some(peer) = self.asked.take() {
+            let reply = peer_reply(peer, result)?;
+            return self.answered(peer, reply);
+        }
+        let config = result
+            .child::<RealmConfigDocument, GetConfigError>()?
+            .map_err(|_| ForwardError::Unavailable)?;
+        self.plan(&config)
+    }
+}
+
+fn rank_revoke_peers(peers: impl IntoIterator<Item = NodeId>, subject: &[u8]) -> Vec<NodeId> {
     select_top_peers(peers, subject, REVOKE_PEER_LIMIT, |_| {})
-}
-
-pub(crate) async fn apply_token_revoke(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    let realm_id = *net_handle.realm_id();
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    let local_node = config
-        .nodes
-        .iter()
-        .find(|node| node.node_id == net_handle.node_id().to_string());
-    if !local_node.is_some_and(|node| node.kind.is_sync_eligible()) {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    }
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    let MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } = &message else {
-        return reject("unexpected token revocation message");
-    };
-    let AuthToken::Bearer(caller_token) = auth_token else {
-        return MetadataTransportMessage::ForwardedWriteDenied {
-            error: WriteAuthError::Unauthorized,
-        };
-    };
-    let caller_hash = bearer_token_hash(caller_token.as_str());
-    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
-        Ok(auth) => auth,
-        Err(error) => return forward_auth_error(error),
-    };
-    let MetadataTransportMessage::ForwardTokenRevocation { token, .. } = message else {
-        return reject("unexpected token revocation message");
-    };
-    let claims = match metadata.claims_for_revocation(&token).await {
-        Ok(claims) => claims,
-        Err(error) => return reject(format!("invalid token revocation target: {error}")),
-    };
-    let expires_at = claims.exp;
-    let now = unix_timestamp_secs();
-    if !valid_revocation_expiry(expires_at, now) {
-        return reject("token revocation expiry is outside the supported window");
-    }
-    let subject: AuthContext = match claims.try_into() {
-        Ok(subject) => subject,
-        Err(error) => return reject(format!("invalid token revocation subject: {error}")),
-    };
-    if subject.realm_id != realm_id {
-        return MetadataTransportMessage::ForwardedWriteDenied {
-            error: WriteAuthError::Forbidden,
-        };
-    }
-    // A path-restricted caller may retire only the token it presented, never another one.
-    let self_service = auth.user_id == subject.user_id
-        && (auth.path_restrictions.is_none() || caller_hash == bearer_token_hash(&token));
-    if !self_service
-        && let Err(error) = authorize_write(
-            context,
-            auth.clone(),
-            format!("/{realm_id}/admin/u/{}", subject.user_id),
-        )
-        .await
-    {
-        return forward_auth_error(error);
-    }
-    match drive(
-        RevokeTokenOperation::new(RevokeTokenConfig {
-            actor: Actor {
-                node_id: net_handle.node_id(),
-                user_id: auth.user_id,
-                realm_id,
-            },
-            token_hash: bearer_token_hash(&token),
-            expires_at,
-            token_owner: subject.user_id,
-            admission: if self_service {
-                RevokeTokenAdmission::SelfService
-            } else {
-                RevokeTokenAdmission::Privileged
-            },
-            now,
-        }),
-        context.as_ref(),
-    )
-    .await
-    {
-        Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
-        Err(RevokeTokenError::CapacityReached) => MetadataTransportMessage::TokenRevocationCapacity,
-        Err(error) => reject(format!("token revocation failed: {error}")),
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::REVOKE_PEER_LIMIT;
-    use super::TOKEN_REVOKE_DEADLINE;
-    use super::rank_revoke_peers;
-    use super::run_revoke;
-    use crate::metadata::api::MetadataApiError;
-    use crate::metadata::handle::MetadataRequestError;
-    use crate::metadata::protocol::MetadataTransportMessage;
-    use aruna_core::NodeId;
-    use aruna_core::auth::bearer_token_hash;
-    use aruna_core::metadata::AuthToken;
-    use aruna_core::metadata::MetadataError;
-    use tokio::time::Instant;
+    use super::*;
+    use crate::tests::peers::{failed_answer, peer_answer};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn revoke_message() -> MetadataTransportMessage {
-        MetadataTransportMessage::ForwardTokenRevocation {
-            auth_token: AuthToken::bearer("caller-token").unwrap(),
-            token: "target-token".to_string(),
+    /// A revocation that planned `peers` and has its full deadline left at time 1000.
+    fn planned(peers: &[NodeId]) -> ForwardRevokeOperation {
+        let mut operation = ForwardRevokeOperation::new(
+            RealmId::from_bytes([1; 32]),
+            None,
+            AuthToken::bearer("caller-token").unwrap(),
+            "target-token".to_string(),
+            Ulid::from_bytes([2; 16]),
+        );
+        operation.stamp(1_000);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation.set_peers(peers.to_vec());
+        operation
+    }
+
+    fn asked(turn: RevokeTurn) -> (NodeId, Duration) {
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("expected a peer request");
+        };
+        let aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
+            request,
+        )) = *effect
+        else {
+            panic!("expected a metadata request");
+        };
+        (request.peer, request.timeout)
+    }
+
+    #[test]
+    fn plans_ranked_peers() {
+        // Only sync-eligible peers other than this node are asked.
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.ensure_node(node(1), RealmNodeKind::Server);
+        config.ensure_node(node(2), RealmNodeKind::Server);
+        config.ensure_node(
+            node(3),
+            RealmNodeKind::User {
+                owner: aruna_core::UserId::nil(realm_id),
+            },
+        );
+        let mut operation = ForwardRevokeOperation::new(
+            realm_id,
+            Some(node(1)),
+            AuthToken::bearer("caller-token").unwrap(),
+            "target-token".to_string(),
+            Ulid::from_bytes([2; 16]),
+        );
+        operation.first().unwrap();
+        operation.stamp(1);
+        let child = aruna_core::calls::ChildOutcome::new(Ok::<_, GetConfigError>(config));
+        assert_eq!(asked(operation.next(IoResult::Child(child))).0, node(2));
+        assert!(operation.peers.is_empty());
+    }
+
+    #[test]
+    fn missing_config_unavailable() {
+        let mut operation = planned(&[]);
+        let failed = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
+        let child = aruna_core::calls::ChildOutcome::new(failed);
+        assert_eq!(
+            operation.next(IoResult::Child(child)),
+            Err(ForwardError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn capacity_then_success() {
+        let mut operation = planned(&[node(1), node(2)]);
+        let (peer, timeout) = asked(operation.ask());
+        assert_eq!((peer, timeout), (node(1), REVOKE_ATTEMPT_TIMEOUT));
+        let full = peer_answer(node(1), &MetadataTransportMessage::TokenRevocationCapacity);
+        assert_eq!(asked(operation.next(full)).0, node(2));
+        let revoked = peer_answer(node(2), &MetadataTransportMessage::ForwardedTokenRevoked);
+        assert_eq!(operation.next(revoked), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn retries_failed_send() {
+        // A failed or timed out attempt moves on: replaying a revocation is safe.
+        let mut operation = planned(&[node(1), node(2), node(3)]);
+        operation.ask().unwrap();
+        let failed = failed_answer(node(1), PeerRequestError::Failed("gone".to_string()));
+        assert_eq!(asked(operation.next(failed)).0, node(2));
+        let late = failed_answer(node(2), PeerRequestError::TimedOut);
+        assert_eq!(asked(operation.next(late)).0, node(3));
+    }
+
+    #[test]
+    fn all_capacity_unavailable() {
+        let mut operation = planned(&[node(1)]);
+        operation.ask().unwrap();
+        let full = peer_answer(node(1), &MetadataTransportMessage::TokenRevocationCapacity);
+        assert_eq!(operation.next(full), Err(ForwardError::Unavailable));
+    }
+
+    #[test]
+    fn verdicts_stop_retry() {
+        // A refusal or a rejection is final, whatever peers remain.
+        let denied = |error| MetadataTransportMessage::ForwardedWriteDenied { error };
+        let cases = [
+            (
+                denied(WriteAuthError::Unauthorized),
+                ForwardError::Unauthorized,
+            ),
+            (denied(WriteAuthError::Forbidden), ForwardError::Forbidden),
+            (
+                MetadataTransportMessage::Reject("invalid token".to_string()),
+                ForwardError::Unavailable,
+            ),
+            (
+                MetadataTransportMessage::AdminEventQueued,
+                ForwardError::Unavailable,
+            ),
+        ];
+        for (answer, expected) in cases {
+            let mut operation = planned(&[node(1), node(2)]);
+            operation.ask().unwrap();
+            let answer = peer_answer(node(1), &answer);
+            assert_eq!(operation.next(answer), Err(expected));
         }
     }
 
-    #[tokio::test]
-    async fn capacity_then_success() {
-        let peers = [node(1), node(2)];
-        let order = rank_revoke_peers(
-            peers.iter().copied(),
-            bearer_token_hash("target-token").as_bytes(),
-        );
-        let mut calls = Vec::new();
-        let result = run_revoke(
-            &order,
-            revoke_message(),
-            Instant::now() + TOKEN_REVOKE_DEADLINE,
-            |peer, _| {
-                calls.push(peer);
-                std::future::ready(Ok(if peer == order[0] {
-                    MetadataTransportMessage::TokenRevocationCapacity
-                } else {
-                    MetadataTransportMessage::ForwardedTokenRevoked
-                }))
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(calls, order);
-    }
-
-    #[tokio::test]
-    async fn retries_possible_send() {
-        let peers = [node(1), node(2)];
-        let order = rank_revoke_peers(
-            peers.iter().copied(),
-            bearer_token_hash("target-token").as_bytes(),
-        );
-        let mut calls = Vec::new();
-        let result = run_revoke(
-            &order,
-            revoke_message(),
-            Instant::now() + TOKEN_REVOKE_DEADLINE,
-            |peer, _| {
-                calls.push(peer);
-                if peer == order[0] {
-                    std::future::ready(Err(MetadataRequestError::possibly_sent(
-                        MetadataError::HandleMissing,
-                    )))
-                } else {
-                    std::future::ready(Ok(MetadataTransportMessage::ForwardedTokenRevoked))
-                }
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(calls, order);
-    }
-
-    #[tokio::test]
-    async fn all_capacity_unavailable() {
-        let peers = [node(1), node(2)];
-        let order = rank_revoke_peers(
-            peers.iter().copied(),
-            bearer_token_hash("target-token").as_bytes(),
-        );
-        let mut calls = Vec::new();
-        let result = run_revoke(
-            &order,
-            revoke_message(),
-            Instant::now() + TOKEN_REVOKE_DEADLINE,
-            |peer, _| {
-                calls.push(peer);
-                std::future::ready(Ok(MetadataTransportMessage::TokenRevocationCapacity))
-            },
-        )
-        .await;
-
-        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-        assert_eq!(calls, order);
-    }
-
-    #[tokio::test]
-    async fn reject_stops_retry() {
-        let peers = [node(1), node(2)];
-        let order = rank_revoke_peers(
-            peers.iter().copied(),
-            bearer_token_hash("target-token").as_bytes(),
-        );
-        let mut calls = Vec::new();
-        let result = run_revoke(
-            &order,
-            revoke_message(),
-            Instant::now() + TOKEN_REVOKE_DEADLINE,
-            |peer, _| {
-                calls.push(peer);
-                std::future::ready(Ok(MetadataTransportMessage::Reject(
-                    "invalid token".to_string(),
-                )))
-            },
-        )
-        .await;
-
-        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-        assert_eq!(calls, vec![order[0]]);
-    }
-
-    #[tokio::test]
-    async fn no_retry_loop() {
-        let peer = node(1);
-        let peers = vec![peer, peer];
-        let mut calls = Vec::new();
-        let result = run_revoke(
-            &peers,
-            revoke_message(),
-            Instant::now() + TOKEN_REVOKE_DEADLINE,
-            |peer, _| {
-                calls.push(peer);
-                std::future::ready(Ok(MetadataTransportMessage::TokenRevocationCapacity))
-            },
-        )
-        .await;
-
-        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-        assert_eq!(calls, vec![peer]);
+    #[test]
+    fn asks_peer_once() {
+        let mut operation = planned(&[node(1), node(1)]);
+        operation.ask().unwrap();
+        let full = peer_answer(node(1), &MetadataTransportMessage::TokenRevocationCapacity);
+        assert_eq!(operation.next(full), Err(ForwardError::Unavailable));
     }
 
     #[test]
@@ -400,17 +325,14 @@ mod tests {
         assert!(first.iter().all(|peer| peers.contains(peer)));
     }
 
-    #[tokio::test]
-    async fn deadline_stops_calls() {
-        let peers = vec![node(1), node(2)];
-        let mut calls = Vec::new();
-        let result = run_revoke(&peers, revoke_message(), Instant::now(), |peer, _| {
-            calls.push(peer);
-            std::future::ready(Ok(MetadataTransportMessage::ForwardedTokenRevoked))
-        })
-        .await;
-
-        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-        assert!(calls.is_empty());
+    #[test]
+    fn deadline_limits_attempts() {
+        // The last attempt gets what remains, and none starts once the deadline passed.
+        let mut operation = planned(&[node(1), node(2)]);
+        operation.stamp(operation.deadline_ms - 1_000);
+        assert_eq!(asked(operation.ask()).1, Duration::from_secs(1));
+        operation.stamp(operation.deadline_ms);
+        let late = failed_answer(node(1), PeerRequestError::TimedOut);
+        assert_eq!(operation.next(late), Err(ForwardError::Unavailable));
     }
 }

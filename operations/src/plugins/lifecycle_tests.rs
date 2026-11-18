@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::account::{ensure_role, guard_of};
+use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
 use crate::plugins::grants::role_paths;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::install::{repair_install, repair_settled};
@@ -256,18 +256,10 @@ async fn stale_node_changes() {
     let wanted = role_paths(&parse_grants(&active.grants));
 
     // A writes its role before it learns of B's record; that role reaches B late, and B repairs.
-    let identity = Identity::of(&stale);
+    let change = AccountChange::of((&a.actor, &a_auth), &stale, 1);
     let paths_a = role_paths(&grants_a);
-    let write = ensure_role(
-        &a.ctx,
-        &a.actor,
-        &a_auth,
-        &scope,
-        identity,
-        &paths_a,
-        guard_of(&stale),
-    );
-    write.await.unwrap();
+    let write = EnsureRole::new(change.clone(), paths_a.clone());
+    drive(write, &a.ctx).await.unwrap();
     a.deliver_group(&b).await;
     assert_ne!(b.role(&active).await.unwrap().permissions, wanted);
     let node = b.actor.node_id;
@@ -280,25 +272,10 @@ async fn stale_node_changes() {
 
     // Once A holds B's record, its stale role write and cleanup are refused, and A repairs too.
     b.deliver_config(&a).await;
-    let again = ensure_role(
-        &a.ctx,
-        &a.actor,
-        &a_auth,
-        &scope,
-        identity,
-        &paths_a,
-        guard_of(&stale),
-    );
-    assert!(again.await.is_err(), "a stale role write is refused");
-    let undo = teardown(
-        &a.ctx,
-        &a.actor,
-        &a_auth,
-        &scope,
-        identity,
-        guard_of(&stale),
-    )
-    .await;
+    let again = EnsureRole::new(change.clone(), paths_a);
+    let again = drive(again, &a.ctx).await;
+    assert!(again.is_err(), "a stale role write is refused");
+    let undo = drive(Teardown::new(change), &a.ctx).await;
     assert!(undo.is_err(), "a stale cleanup is refused");
     assert!(!a.account(&active).await.unwrap().is_deactivated());
     assert!(
@@ -315,13 +292,10 @@ async fn keeps_admin_deactivation() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let installed = fixture.install(&fixture.request(None)).await.unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
-    let scope = scope_of(realm, &installed);
-    let identity = Identity::of(&installed);
+    let change = AccountChange::of((actor, &auth), &installed, 1);
 
     // The install's own stop is repaired.
-    teardown(ctx, actor, &auth, &scope, identity, guard_of(&installed))
-        .await
-        .unwrap();
+    drive(Teardown::new(change), ctx).await.unwrap();
     assert!(repair_install(ctx, node, realm, &installed).await.unwrap());
     assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
 
@@ -344,11 +318,8 @@ async fn repairs_after_failure() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let installed = fixture.install(&fixture.request(None)).await.unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
-    let scope = scope_of(realm, &installed);
-    let identity = Identity::of(&installed);
-    teardown(ctx, actor, &auth, &scope, identity, guard_of(&installed))
-        .await
-        .unwrap();
+    let change = AccountChange::of((actor, &auth), &installed, 1);
+    drive(Teardown::new(change), ctx).await.unwrap();
 
     // The first entry's approving admin holds no rights, so its repair fails; the next still runs.
     let mut orphaned = installed.clone();

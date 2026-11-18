@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::plugins::broker::call_intent;
+use crate::plugins::host_calls::call_intent;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceKind};
 use aruna_core::plugin_runs::{StateRemoval, StateWrite};

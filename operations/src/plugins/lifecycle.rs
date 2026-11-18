@@ -10,14 +10,14 @@ use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding, Wi
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::trigger::TriggerKind;
 use serde_json::{Map, Value};
 use tracing::info;
 use ulid::Ulid;
 
-use super::account::{Identity, guard_of, teardown};
+use super::account::{AccountChange, Teardown};
 use super::bound::{BindError, BindPlace, bind_slots};
 use super::grants::{
     Grants, carry_grants, check_supported, held_covers, narrow_grants, parse_grants, patterns_for,
@@ -186,20 +186,13 @@ pub async fn remove_install(
             write_record(ctx, actor, auth, Some(current.revision), next, None).await?
         }
     };
-    let scope = scope_of(actor.realm_id, &removing);
-    teardown(
-        ctx,
-        actor,
-        auth,
-        &scope,
-        Identity::of(&removing),
-        guard_of(&removing),
-    )
-    .await
-    .map_err(|error| InstallError::Step {
-        step: "remove",
-        error,
-    })?;
+    let change = AccountChange::of((actor, auth), &removing, unix_timestamp_secs());
+    drive(Teardown::new(change), ctx)
+        .await
+        .map_err(|error| InstallError::Step {
+            step: "remove",
+            error: error.0,
+        })?;
     retire_rules(ctx, actor, &removing).await;
     let action = AdminAuditAction::PluginRemoved;
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &removing);

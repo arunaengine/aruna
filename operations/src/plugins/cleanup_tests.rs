@@ -13,7 +13,7 @@ use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::encode;
-use crate::plugins::rows::page_result;
+use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed, worker};
 use aruna_core::calls::IoCall;

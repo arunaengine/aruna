@@ -34,7 +34,7 @@ use crate::connectors::repository::source_connector_key;
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive};
 use crate::effect_adapters::dispatch_effect;
-use crate::s3::bucket::dataset::bucket_metadata;
+use crate::s3::bucket::dataset::BucketMetadataOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 #[derive(Debug, Error)]
@@ -193,9 +193,9 @@ pub async fn read_origin(
         realm_id,
         version_id,
     });
-    let metadata = bucket_metadata(context, bucket, &info)
+    let metadata = drive(BucketMetadataOperation::new(bucket, &info), context)
         .await
-        .map_err(OriginError::Storage)?;
+        .map_err(|error| OriginError::Storage(error.to_string()))?;
     let parser = (metadata.as_ref())
         .and_then(|metadata| metadata.parser.as_ref())
         .and_then(|parser| CompiledParser::compile(parser).ok());
