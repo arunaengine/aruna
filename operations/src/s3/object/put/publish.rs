@@ -152,7 +152,7 @@ impl PutObjectOperation {
 
     /// The location row of the published bytes, written with the head or the path index, so
     /// a version an import registered meanwhile commits nothing.
-    fn location_row(&self) -> Result<(String, Key, Value), PutObjectError> {
+    pub(super) fn location_row(&self) -> Result<(String, Key, Value), PutObjectError> {
         let location = self.get_output().cloned();
         let location = location.ok_or(PutObjectError::MissingOutput)?;
         let blake3_hash = location.get_blake3();
@@ -221,7 +221,10 @@ impl PutObjectOperation {
         self.write_current_lookup(existing.as_ref())
     }
 
-    fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Turn {
+    pub(super) fn write_current_lookup(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Turn {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id

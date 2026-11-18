@@ -573,3 +573,392 @@ pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, 
         value,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::object::put::test::{asked, event, read_spaces, values, written};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::routing::{
+        BackendCatalog, GroupRoutingInputs, RoutingSnapshot, RoutingTarget,
+    };
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    fn backend_id() -> Ulid {
+        Ulid::from_bytes([5u8; 16])
+    }
+
+    fn rule(import_id: Ulid, bucket: &str, key_prefix: &str, pattern: &str) -> BackendImport {
+        BackendImport {
+            import_id,
+            group_id: Ulid::from_parts(2, 2),
+            backend_id: backend_id(),
+            backend_prefix: "raw/".to_string(),
+            bucket: bucket.to_string(),
+            key_prefix: key_prefix.to_string(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: pattern.to_string(),
+        }
+    }
+
+    fn operation(pattern: &str) -> PutObjectOperation {
+        let rule = rule(Ulid::from_bytes([4u8; 16]), "bucket", "in/", pattern);
+        let catalog = BackendCatalog::new("default").with_backend("default", None);
+        let routing = RoutingSnapshot::new(Ulid::from_parts(2, 2), catalog).with_group_inputs(
+            GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id()))),
+                backend_ids: BTreeSet::from([backend_id()]),
+                imports: vec![rule],
+                ..Default::default()
+            },
+        );
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::from_parts(1, 1), realm_id),
+            group_id: routing.group_id,
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "in/x/one.csv".to_string(),
+                content_length: Some(3),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"abc"[..],
+                ))),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing,
+        })
+    }
+
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        values(vec![value.map(Into::into)])
+    }
+
+    fn fenced(result: Result<Fenced, StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    /// Runs the gate reads of a bucket without policies, fence or encryption.
+    fn begin(operation: &mut PutObjectOperation) -> Turn {
+        operation.first().unwrap();
+        operation.next(row(None)).unwrap();
+        operation.next(row(None)).unwrap();
+        operation.next(row(None))
+    }
+
+    /// Answers the stored intent and its sync; the write waits for both.
+    fn past_intent(operation: &mut PutObjectOperation) -> Turn {
+        assert_eq!(operation.state, PutObjectState::WriteIntent);
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))), "{turn:?}");
+        operation.next(IoResult::Done)
+    }
+
+    fn written_at(path: String, ulid: Ulid) -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: path,
+            ulid,
+            format: StoredFormat::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![7u8; 32])]),
+        }
+    }
+
+    fn plain_write(turn: &Turn) -> &PlainPath {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::WritePlain { plain, .. }) => plain,
+            other => panic!("expected a plain write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mapped_needs_path() {
+        let mapped = |key: &str| {
+            let mut operation = operation("{dir}{name}");
+            operation.config.routing.imports[0].key_prefix = String::new();
+            operation.config.request.key = key.to_string();
+            let turn = begin(&mut operation);
+            (operation, turn)
+        };
+        let (mut operation, _) = mapped("data/a.csv");
+        // The same-name write first looks at the exact key in the provider bucket.
+        let turn = operation.next(row(None));
+        let Effect::Blob(BlobEffect::StatPlain { path, .. }) = asked(&turn) else {
+            panic!("expected a plain path, got {turn:?}")
+        };
+        assert_eq!(path, "raw/data/a.csv");
+        // A folder key is written at its exact key, without looking first.
+        let (mut operation, _) = mapped("reports/");
+        let turn = past_intent(&mut operation);
+        assert_eq!(plain_write(&turn).path, "raw/reports/");
+        // Keys without a plain path are refused before any byte is written.
+        for key in ["reports//a.csv", "reports//"] {
+            let (_, turn) = mapped(key);
+            assert_eq!(turn.err(), Some(PutObjectError::Unmapped), "{key}");
+        }
+    }
+
+    /// The version transaction's records, after the scan of the rules that read the path
+    /// finds `readers`.
+    fn records(operation: &mut PutObjectOperation, readers: &[BackendImport]) -> Option<Turn> {
+        let turn = operation.plain_records()?;
+        let Ok(Next::Call(IoCall::Page { space, .. })) = &turn else {
+            return Some(turn);
+        };
+        if space != BACKEND_IMPORT_KEYSPACE {
+            return Some(turn);
+        }
+        let rows = readers
+            .iter()
+            .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+            .collect();
+        Some(operation.next(IoResult::Page { rows, next: None }))
+    }
+
+    /// Another rule that reads the folder, created after the write was routed.
+    fn reader() -> BackendImport {
+        rule(Ulid::from_parts(9, 9), "other", "", DEFAULT_PATTERN)
+    }
+
+    #[test]
+    fn keeps_shared_path() {
+        // Another rule of the folder recorded the written path: the version is refused.
+        let mut put = operation(DEFAULT_PATTERN);
+        begin(&mut put).unwrap();
+        let id = put.version_id.unwrap();
+        // The rule that reads the folder is found in the version transaction.
+        let other = reader().import_id;
+        let path = format!("raw/x/one.csv~{id}");
+        put.written_location = Some(written_at(path.clone(), id));
+        put.output = Some(written_at(path.clone(), id));
+        let turn = records(&mut put, &[reader()]).unwrap();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the fence read, got {turn:?}")
+        };
+        assert_eq!(reads[1].1, object_key(other, &path));
+        let turn = put.import_rule_read(vec![Some(vec![1].into()), Some(vec![1].into())]);
+        assert_eq!(
+            turn.err(),
+            Some(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+        );
+    }
+
+    #[test]
+    fn orders_intent_acks() {
+        // The write waits for the stored intent and then its sync, each answered once.
+        let mut operation = operation(DEFAULT_PATTERN);
+        begin(&mut operation).unwrap();
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        assert_eq!(operation.state, PutObjectState::SyncIntent);
+        let turn = operation.next(IoResult::Done);
+        plain_write(&turn);
+        assert_eq!(operation.state, PutObjectState::WriteBlob);
+    }
+
+    #[test]
+    fn writes_unique_path() {
+        let mut operation = operation(DEFAULT_PATTERN);
+        let turn = begin(&mut operation);
+
+        // The identity of the write is stored before any byte moves.
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let id = operation.version_id.expect("the path names the version");
+        let path = format!("raw/x/one.csv~{id}");
+        assert_eq!(
+            operation.written_intent,
+            [intent_key(Ulid::from_bytes([4u8; 16]), &path, id)],
+            "a unique path gets one intent"
+        );
+        let turn = past_intent(&mut operation);
+        let plain = plain_write(&turn);
+        assert_eq!(plain.path, path);
+        assert_eq!(plain.ulid, id);
+        assert!(!plain.if_not_exists);
+
+        // A failed write leaves the tenant path alone.
+        let written = BlobEvent::PlainWritten {
+            location: written_at(plain.path.clone(), id),
+            version: None,
+            etag: None,
+        };
+        operation.next(event(Event::Blob(written))).unwrap();
+        operation.state = PutObjectState::Error;
+        assert!(operation.abort().is_empty());
+    }
+
+    #[test]
+    fn guards_import_rows() {
+        let guarded = |found: Option<Vec<u8>>| {
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(Ulid::from_bytes([4u8; 16]), Vec::new())
+                .with_import_guards(vec![(
+                    IMPORTED_OBJECT_KEYSPACE.to_string(),
+                    Key::from(vec![1u8]),
+                    Some(Value::from(vec![2u8])),
+                )]);
+            let turn = records(&mut operation, &[]).expect("the guarded rule read");
+            assert_eq!(read_spaces(&turn).len(), 2);
+            let turn = operation
+                .import_rule_read(vec![Some(Value::from(vec![0u8])), found.map(Value::from)]);
+            (operation, turn)
+        };
+        // A row that changed since the import read it refuses the write.
+        let (_, turn) = guarded(Some(vec![3u8]));
+        assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
+        let (_, turn) = guarded(None);
+        assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
+        let (kept, turn) = guarded(Some(vec![2u8]));
+        assert_eq!(kept.rule_exists, Some(true));
+        assert_ne!(turn.err(), Some(PutObjectError::HeadChanged));
+    }
+
+    #[test]
+    fn checks_delete_trail() {
+        use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+        let id = Ulid::from_parts(1_000, 1);
+        let checked = |kind: BlobAuditKind, head: bool| {
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(Ulid::from_bytes([4u8; 16]), Vec::new())
+                .with_trail_check(id);
+            operation.rule_exists = Some(true);
+            if head {
+                operation.existing_pointer = Some(CurrentVersionPointer::new(Ulid::nil()));
+            }
+            // The trail is read in the version transaction, so a later delete conflicts. The
+            // bucket's creation row comes first and names the incarnation.
+            let turn = records(&mut operation, &[]).expect("the trail read");
+            assert_eq!(
+                read_spaces(&turn),
+                [aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE]
+            );
+            let turn = operation.next(row(None));
+            let Ok(Next::Call(IoCall::Page { space, .. })) = turn else {
+                panic!("expected one trail page, got {turn:?}")
+            };
+            assert_eq!(space, DELETE_TRAIL_KEYSPACE);
+            let record = BlobAuditRecord {
+                realm_id: RealmId::from_bytes([1; 32]),
+                group_id: operation.config.group_id,
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+                user_id: Default::default(),
+                kind,
+                bucket: operation.config.request.bucket.clone(),
+                key: operation.config.request.key.clone(),
+                version_id: Some(Ulid::nil()),
+                occurred_at_ms: 2_000,
+            };
+            let rows = vec![(
+                Key::from(vec![1u8]),
+                Value::from(record.to_bytes().unwrap()),
+            )];
+            let turn = operation.next(IoResult::Page { rows, next: None });
+            // The purges of the group are the second range, read in the same transaction.
+            let Ok(Next::Call(IoCall::Page { prefix, .. })) = turn else {
+                panic!("expected the purge range, got {turn:?}")
+            };
+            let purges = aruna_core::structs::storage::delete_audit::purge_prefix;
+            let group = operation.config.group_id;
+            assert_eq!(prefix, Key::from(purges(group, "bucket", 0)));
+            operation.next(IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            })
+        };
+        let deleted = |turn: &Turn| matches!(turn, Err(PutObjectError::HistoryDeleted));
+        // A key whose head was deleted on purpose gets no version back.
+        assert!(deleted(&checked(BlobAuditKind::DeleteMarker, false)));
+        // Below a current head older history may join.
+        assert!(!deleted(&checked(BlobAuditKind::DeleteVersion, true)));
+    }
+
+    #[test]
+    fn records_own_write() {
+        let records = |rule: bool, deduplicated: bool| {
+            let mut operation = operation("{dir}{name}");
+            begin(&mut operation).unwrap();
+            let id = operation.version_id.unwrap();
+            let location = written_at("raw/x/one.csv".to_string(), id);
+            operation.written_location = Some(location.clone());
+            operation.output = Some(match deduplicated {
+                // An identical earlier upload to the same name keeps its own location.
+                true => written_at("raw/x/one.csv".to_string(), Ulid::from_parts(3, 3)),
+                false => location,
+            });
+            let plain = operation.plain.as_mut().unwrap();
+            (plain.version, plain.etag) = (Some("v1".to_string()), Some("\"e1\"".to_string()));
+
+            // The import row needs the rule, read in the version transaction.
+            let turn = records(&mut operation, &[]).expect("the rule read");
+            assert_eq!(read_spaces(&turn), [BACKEND_IMPORT_KEYSPACE]);
+            let turn = operation.next(row(rule.then(|| vec![0u8])));
+            (id, written(&turn).to_vec())
+        };
+
+        let (id, writes) = records(true, false);
+        let [
+            (version_space, version_row, version),
+            (row_space, row_key, row),
+        ] = writes.as_slice()
+        else {
+            panic!("expected the backend version and the import row")
+        };
+        assert_eq!(version_space, BACKEND_VERSION_KEYSPACE);
+        assert_eq!(*version_row, version_key(id));
+        assert_eq!(version.as_ref(), b"v1");
+        assert_eq!(row_space, IMPORTED_OBJECT_KEYSPACE);
+        assert_eq!(
+            *row_key,
+            object_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv")
+        );
+        let row = ImportedObject::from_bytes(row).unwrap();
+        assert_eq!(row.key.as_deref(), Some("in/x/one.csv"));
+        assert_eq!(row.version_id, id);
+        // The backend's ETag lets the first listing compare without reading the file.
+        assert_eq!(row.etag.as_deref(), Some("\"e1\""));
+        assert!(!row.unlisted());
+
+        // Without the rule only the backend version is written; the version still commits.
+        let (_, writes) = records(false, false);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, BACKEND_VERSION_KEYSPACE);
+
+        // A deduplicated version reads an older location; the written path still gets its row.
+        let (_, writes) = records(true, true);
+        let [(row_space, row_key, _)] = writes.as_slice() else {
+            panic!("expected only the import row, got {writes:?}")
+        };
+        assert_eq!(row_space, IMPORTED_OBJECT_KEYSPACE);
+        assert_eq!(
+            *row_key,
+            object_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv")
+        );
+    }
+}

@@ -1218,3 +1218,7 @@ pub(crate) use plain::{
 
 #[path = "abe.rs"]
 pub(crate) mod abe;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod test;

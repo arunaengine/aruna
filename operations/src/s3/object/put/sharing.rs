@@ -152,30 +152,19 @@ mod tests {
             let expected = expected.iter().copied().collect();
             let mut op = PutObjectOperation::new(config)
                 .with_rule_scan(RuleScan::new(own.clone(), expected));
-            op.txn_id = Some(Ulid::nil());
-            let effects = op.rule_page(Ulid::nil()).unwrap();
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Iter {
-                    txn_id: Some(_),
-                    ..
-                })]
-            ));
+            let turn = op.rule_page().unwrap();
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
             let rows = [own.clone(), rule(2, "raw/sub/"), rule(3, "other/")];
             let values = rows
                 .iter()
                 .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()));
-            op.rules_read(Event::Storage(StorageEvent::IterResult {
-                values: values.collect(),
-                next_start_after: None,
-            }));
-            op
+            op.rules_read((values.collect(), None))
         };
         // The rule seen by the run still shares the folder; nothing else does.
-        let op = scan(&[Ulid::from_parts(2, 1)]);
-        assert!(!matches!(op.output, Some(Err(PutObjectError::HeadChanged))));
+        let turn = scan(&[Ulid::from_parts(2, 1)]);
+        assert_ne!(turn.err(), Some(PutObjectError::HeadChanged));
         // A rule added on the folder since the run looked refuses the version.
-        let op = scan(&[]);
-        assert!(matches!(op.output, Some(Err(PutObjectError::HeadChanged))));
+        let turn = scan(&[]);
+        assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
     }
 }
