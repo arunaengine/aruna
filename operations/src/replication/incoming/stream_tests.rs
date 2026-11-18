@@ -16,7 +16,187 @@ use aruna_storage::FjallStorage;
 use tempfile::tempdir;
 
 use super::*;
+use crate::driver::{DriverContext, drive};
+use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+
+async fn bao_peer_admitted(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local: NodeId,
+    peer: NodeId,
+) -> Option<BaoAdmission> {
+    let admission = BaoAdmissionOperation::new(realm_id, local, peer);
+    drive(admission, context).await.unwrap()
+}
+
+async fn manifest_policy(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    manifest: &VersionReplicationManifest,
+) -> Result<ManifestPaths, StreamPolicyError> {
+    drive(
+        ManifestPolicyOperation::new(realm_id, node_id, manifest),
+        context,
+    )
+    .await
+}
+
+async fn bao_policy(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    request: &BaoReadRequest,
+) -> Result<ReadPolicy, StreamPolicyError> {
+    drive(
+        ReadPolicyOperation::new(realm_id, node_id, request),
+        context,
+    )
+    .await
+}
+
+fn peer_stream() -> BaoPeerStream {
+    BaoPeerStream {
+        realm_id: RealmId::from_bytes([1; 32]),
+        local_node: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        peer: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+        stream_id: Ulid::from_bytes([4; 16]),
+    }
+}
+
+fn serve(admission: BaoAdmission, message: &VersionReplicationMessage) -> ServeBaoOperation {
+    let payload = message.to_bytes().unwrap();
+    let limits = RoCrateLimits::default();
+    ServeBaoOperation::new(
+        peer_stream(),
+        admission,
+        payload,
+        NodeRouting::default(),
+        &limits,
+    )
+}
+
+fn key_request(realm_id: RealmId) -> VersionReplicationMessage {
+    VersionReplicationMessage::VersionKeyRequest {
+        realm_id,
+        set_id: Ulid::from_bytes([5; 16]),
+        version_id: Ulid::from_bytes([6; 16]),
+    }
+}
+
+fn is_close(turn: &StreamTurn) -> bool {
+    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        return false;
+    };
+    matches!(
+        effect.as_ref(),
+        Effect::Blob(BlobEffect::CloseConnection { .. })
+    )
+}
+
+fn connection_closed() -> IoResult {
+    let stream_id = peer_stream().stream_id;
+    let event = Event::Blob(BlobEvent::ConnectionClosed { stream_id });
+    IoResult::Event(Box::new(event))
+}
+
+#[test]
+fn device_lookup_refused() {
+    let message = key_request(peer_stream().realm_id);
+    let mut op = serve(BaoAdmission::DeviceRead, &message);
+    assert!(is_close(&op.first()));
+    assert_eq!(op.next(connection_closed()), Ok(Next::Done(())));
+}
+
+#[test]
+fn foreign_lookup_refused() {
+    let message = key_request(RealmId::from_bytes([9; 32]));
+    let mut op = serve(BaoAdmission::Infra, &message);
+    assert!(is_close(&op.first()));
+}
+
+#[test]
+fn unreadable_payload_refused() {
+    let limits = RoCrateLimits::default();
+    let mut op = ServeBaoOperation::new(
+        peer_stream(),
+        BaoAdmission::Infra,
+        vec![0xff; 3],
+        NodeRouting::default(),
+        &limits,
+    );
+    assert!(is_close(&op.first()));
+}
+
+#[test]
+fn failed_lookup_answers() {
+    let lookup = SetLookup::Key {
+        set_id: Ulid::from_bytes([5; 16]),
+        version_id: Ulid::from_bytes([6; 16]),
+    };
+    let mut op = AnswerLookupOperation::new(peer_stream().stream_id, lookup);
+    op.first().unwrap();
+    let failed: Result<Option<String>, ResolveError> = Err(IoError::Unfinished.into());
+    let sent = op.next(IoResult::Child(ChildOutcome::new(failed))).unwrap();
+    let Next::Call(IoCall::Effect(effect)) = sent else {
+        panic!("the lookup answers");
+    };
+    let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = *effect else {
+        panic!("the lookup sends its answer");
+    };
+    assert_eq!(
+        VersionReplicationMessage::from_bytes(&payload).unwrap(),
+        VersionReplicationMessage::VersionKeyResponse(None)
+    );
+    let stream_id = peer_stream().stream_id;
+    let event = Event::Blob(BlobEvent::MessageSent { stream_id });
+    assert!(is_close(&op.next(IoResult::Event(Box::new(event)))));
+}
+
+#[test]
+fn failed_content_closes() {
+    let lookup = SetLookup::Content {
+        set_id: Ulid::from_bytes([5; 16]),
+        identity: [7; 32],
+    };
+    let mut op = AnswerLookupOperation::new(peer_stream().stream_id, lookup);
+    op.first().unwrap();
+    let failed: Result<ContentPage, ResolveError> = Err(IoError::Unfinished.into());
+    assert!(is_close(
+        &op.next(IoResult::Child(ChildOutcome::new(failed)))
+    ));
+}
+
+#[test]
+fn failed_policy_closes() {
+    let request = BaoReadRequest {
+        auth_context: AuthContext::anonymous(peer_stream().realm_id),
+        realm_id: peer_stream().realm_id,
+        target: BaoReadTarget::Blake3([8; 32]),
+        expected_blake3: None,
+        metadata_only: false,
+        destination: None,
+        known_refs: Vec::new(),
+        range: None,
+    };
+    let mut op = AnswerReadOperation::new(peer_stream(), request);
+    op.first().unwrap();
+    let failed: Result<ReadPolicy, StreamPolicyError> = Err(policy_failed("unavailable"));
+    assert!(is_close(
+        &op.next(IoResult::Child(ChildOutcome::new(failed)))
+    ));
+}
+
+#[test]
+fn unreadable_config_refuses() {
+    let stream = peer_stream();
+    let mut op = BaoAdmissionOperation::new(stream.realm_id, stream.local_node, stream.peer);
+    op.first().unwrap();
+    let failed: Result<RealmConfigDocument, GetConfigError> = Err(IoError::Unfinished.into());
+    let answer = op.next(IoResult::Child(ChildOutcome::new(failed)));
+    assert_eq!(answer, Ok(Next::Done(None)));
+}
 
 #[tokio::test]
 async fn rejects_foreign_peer() {
