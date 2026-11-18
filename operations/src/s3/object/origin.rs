@@ -4,40 +4,48 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
+use std::collections::{BTreeSet, VecDeque};
 use std::time::SystemTime;
 
-use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
+use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::source_access::{SourceDigest, SourceStats};
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, SourceDigest, SourceStats,
+};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
+    VersionKey,
 };
 use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, SyncHop, VersionOrigin, project, public_source_url, publishable,
 };
-use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::blob::migration::misplaced::KeyRule;
 use crate::connectors::repository::source_connector_key;
-use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
-use crate::driver::{DriverContext, drive};
-use crate::effect_adapters::dispatch_effect;
-use crate::s3::bucket::dataset::BucketMetadataOperation;
+use crate::connectors::resolver::{
+    ResolveBindingInput, ResolveBindingOperation, SourceResolutionError,
+};
+use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum OriginError {
     #[error("bucket not found")]
     BucketMissing,
@@ -47,8 +55,14 @@ pub enum OriginError {
     Storage(String),
 }
 
+impl From<IoError> for OriginError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
 /// The external source a version is bound to, as readers of the file see it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceView {
     pub url: Option<String>,
     pub path: String,
@@ -88,71 +102,219 @@ fn place(single: &VersionSourceBinding) -> SourcePlace {
 }
 
 /// One source of a version with this node's measurements of it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceHealth {
     pub place: SourcePlace,
     /// `None` when this node cannot resolve the source, as it lacks its connector.
     pub stats: Option<SourceStats>,
 }
 
-/// This node's measurements of every source of `version_id`, or of the current version, in
-/// the binding's order; empty for a version without an external source.
-pub async fn source_health(
-    context: &DriverContext,
-    group_id: GroupId,
-    (bucket, key): (&str, &str),
+type OriginTurn<T> = Result<Next<T>, OriginError>;
+
+fn storage(error: impl std::fmt::Display) -> OriginError {
+    OriginError::Storage(error.to_string())
+}
+
+#[derive(Debug, PartialEq)]
+enum VersionStep {
+    Head,
+    Version(Ulid),
+    Root(Ulid, Box<BlobVersion>),
+}
+
+/// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
+#[derive(Debug, PartialEq)]
+struct ReadVersionOperation {
+    bucket: String,
+    key: String,
     version_id: Option<Ulid>,
-) -> Result<Vec<SourceHealth>, OriginError> {
-    let (_, version) = read_version(context, bucket, key, version_id).await?;
-    let binding = match version.state {
-        BlobVersionState::Reference { source, .. }
-        | BlobVersionState::Materialized {
-            source: Some(source),
-            ..
+    step: VersionStep,
+}
+
+type VersionTurn = OriginTurn<(Ulid, BlobVersion)>;
+
+impl ReadVersionOperation {
+    fn new(bucket: &str, key: &str, version_id: Option<Ulid>) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            step: VersionStep::Head,
         }
-        | BlobVersionState::PendingContent {
-            source: Some(source),
-            ..
-        } => source,
-        _ => return Ok(Vec::new()),
-    };
-    let mut sources = Vec::new();
-    for single in (0..binding.source_count()).filter_map(|slot| binding.source_at(slot)) {
-        let input = ResolveBindingInput {
-            source: single.clone(),
-            group_id: Some(group_id),
-        };
-        let access = drive(ResolveBindingOperation::new(input), context)
-            .await
-            .ok();
-        sources.push((place(&single), access));
     }
-    let accesses: Vec<_> = sources
-        .iter()
-        .filter_map(|(_, access)| access.clone())
-        .collect();
-    let mut stats = match accesses.is_empty() {
-        true => Vec::new(),
-        false => {
-            let health = Effect::StagingSource(StagingSourceEffect::Health { accesses });
-            match dispatch_effect(health, context, 0).await {
-                Event::StagingSource(StagingSourceEvent::HealthResult { stats, .. }) => stats,
-                _ => return Err(OriginError::Storage("no source health answer".to_string())),
+
+    fn read_version(&mut self, version_id: Ulid) -> VersionTurn {
+        let row = VersionKey::new(&self.bucket, &self.key, version_id)
+            .to_bytes()
+            .map_err(storage)?;
+        self.step = VersionStep::Version(version_id);
+        Ok(Next::Call(read_row(BLOB_VERSIONS_KEYSPACE, row)))
+    }
+}
+
+impl Operation for ReadVersionOperation {
+    type Output = (Ulid, BlobVersion);
+    type Error = OriginError;
+
+    fn first(&mut self) -> VersionTurn {
+        if let Some(version_id) = self.version_id {
+            return self.read_version(version_id);
+        }
+        let head = BlobHeadKey::new(&self.bucket, &self.key)
+            .to_bytes()
+            .map_err(storage)?;
+        Ok(Next::Call(read_row(BLOB_HEAD_KEYSPACE, head)))
+    }
+
+    fn next(&mut self, result: IoResult) -> VersionTurn {
+        match std::mem::replace(&mut self.step, VersionStep::Head) {
+            VersionStep::Head => {
+                let value = result.value()?.ok_or(OriginError::VersionMissing)?;
+                let pointer = CurrentVersionPointer::from_bytes(&value).map_err(storage)?;
+                self.read_version(pointer.version_id)
+            }
+            VersionStep::Version(version_id) => {
+                let value = result.value()?.ok_or(OriginError::VersionMissing)?;
+                let version = BlobVersion::from_bytes(&value).map_err(storage)?;
+                // The source's public address comes from the root this node keeps once.
+                let Some(digest) = named_root(&version) else {
+                    return Ok(Next::Done((version_id, version)));
+                };
+                self.step = VersionStep::Root(version_id, Box::new(version));
+                Ok(Next::Call(Effect::Storage(read_root(digest, None)).into()))
+            }
+            VersionStep::Root(version_id, version) => {
+                let root = parse_root(result.event()?).map_err(storage)?;
+                let root = root.ok_or_else(|| storage("the source root record is missing"))?;
+                let version = hydrated(*version, &root).map_err(OriginError::Storage)?;
+                Ok(Next::Done((version_id, version)))
             }
         }
     }
-    .into_iter();
-    Ok(sources
-        .into_iter()
-        .map(|(place, access)| SourceHealth {
-            place,
-            stats: access.and_then(|_| stats.next()),
-        })
-        .collect())
+}
+
+#[derive(Debug, PartialEq)]
+enum HealthStep {
+    Version,
+    Resolve,
+    Measure,
+}
+
+/// This node's measurements of every source of `version_id`, or of the current version, in the
+/// binding's order; empty for a version without an external source.
+#[derive(Debug, PartialEq)]
+pub struct SourceHealthOperation {
+    group_id: GroupId,
+    bucket: String,
+    key: String,
+    version_id: Option<Ulid>,
+    pending: VecDeque<VersionSourceBinding>,
+    sources: Vec<(SourcePlace, Option<ResolvedSourceAccess>)>,
+    step: HealthStep,
+}
+
+type HealthTurn = OriginTurn<Vec<SourceHealth>>;
+
+impl SourceHealthOperation {
+    pub fn new(group_id: GroupId, (bucket, key): (&str, &str), version_id: Option<Ulid>) -> Self {
+        Self {
+            group_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            pending: VecDeque::new(),
+            sources: Vec::new(),
+            step: HealthStep::Version,
+        }
+    }
+
+    fn resolve_next(&mut self) -> HealthTurn {
+        let Some(single) = self.pending.front() else {
+            return self.measure();
+        };
+        let resolve = ResolveBindingOperation::new(ResolveBindingInput {
+            source: single.clone(),
+            group_id: Some(self.group_id),
+        });
+        self.step = HealthStep::Resolve;
+        Ok(Next::Call(IoCall::child(resolve)))
+    }
+
+    fn measure(&mut self) -> HealthTurn {
+        let accesses: Vec<_> = (self.sources.iter())
+            .filter_map(|(_, access)| access.clone())
+            .collect();
+        if accesses.is_empty() {
+            return self.finish(Vec::new());
+        }
+        self.step = HealthStep::Measure;
+        let health = StagingSourceEffect::Health { accesses };
+        Ok(Next::Call(Effect::StagingSource(health).into()))
+    }
+
+    fn finish(&mut self, stats: Vec<SourceStats>) -> HealthTurn {
+        let mut stats = stats.into_iter();
+        let sources = std::mem::take(&mut self.sources);
+        Ok(Next::Done(
+            sources
+                .into_iter()
+                .map(|(place, access)| SourceHealth {
+                    place,
+                    stats: access.and_then(|_| stats.next()),
+                })
+                .collect(),
+        ))
+    }
+}
+
+impl Operation for SourceHealthOperation {
+    type Output = Vec<SourceHealth>;
+    type Error = OriginError;
+
+    fn first(&mut self) -> HealthTurn {
+        let read = ReadVersionOperation::new(&self.bucket, &self.key, self.version_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> HealthTurn {
+        match self.step {
+            HealthStep::Version => {
+                let (_, version) = result.child::<(Ulid, BlobVersion), OriginError>()??;
+                let binding = match version.state {
+                    BlobVersionState::Reference { source, .. }
+                    | BlobVersionState::Materialized {
+                        source: Some(source),
+                        ..
+                    }
+                    | BlobVersionState::PendingContent {
+                        source: Some(source),
+                        ..
+                    } => source,
+                    _ => return Ok(Next::Done(Vec::new())),
+                };
+                self.pending = (0..binding.source_count())
+                    .filter_map(|slot| binding.source_at(slot))
+                    .collect();
+                self.resolve_next()
+            }
+            HealthStep::Resolve => {
+                let access = result.child::<ResolvedSourceAccess, SourceResolutionError>()?;
+                let single = self.pending.pop_front().ok_or(IoError::Unfinished)?;
+                self.sources.push((place(&single), access.ok()));
+                self.resolve_next()
+            }
+            HealthStep::Measure => match result.event()? {
+                Event::StagingSource(StagingSourceEvent::HealthResult { stats, .. }) => {
+                    self.finish(stats)
+                }
+                _ => Err(storage("no source health answer")),
+            },
+        }
+    }
 }
 
 /// Everything file readers see about one version's origin.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OriginView {
     pub version_id: Ulid,
     /// The global id, for a version of a distributed bucket.
@@ -174,40 +336,44 @@ pub struct OriginView {
     pub size: Option<u64>,
 }
 
+#[derive(Debug, PartialEq)]
+enum OriginStep {
+    Bucket,
+    Version,
+    Metadata,
+    Size,
+    Connectors(Vec<usize>),
+}
+
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
-pub async fn read_origin(
-    context: &DriverContext,
-    (realm_id, _node_id): (RealmId, NodeId),
-    bucket: &str,
-    key: &str,
+#[derive(Debug, PartialEq)]
+pub struct ReadOriginOperation {
+    realm_id: RealmId,
+    bucket: String,
+    key: String,
     version_id: Option<Ulid>,
-) -> Result<OriginView, OriginError> {
-    let info = drive(GetBucketOperation::new(bucket.to_string()), context)
-        .await
-        .map_err(|error| match error {
-            GetBucketError::NotFound => OriginError::BucketMissing,
-            other => OriginError::Storage(other.to_string()),
-        })?;
-    let (version_id, version) = read_version(context, bucket, key, version_id).await?;
-    let global = info.distribution.as_ref().map(|_| GlobalId::Version {
-        realm_id,
-        version_id,
-    });
-    let metadata = drive(BucketMetadataOperation::new(bucket, &info), context)
-        .await
-        .map_err(|error| OriginError::Storage(error.to_string()))?;
-    let parser = (metadata.as_ref())
-        .and_then(|metadata| metadata.parser.as_ref())
-        .and_then(|parser| CompiledParser::compile(parser).ok());
-    let size = version_size(context, &version).await?;
-    let mut view = view(version_id, global, version);
-    view.size = size;
-    for place in view
-        .source
-        .iter_mut()
-        .flat_map(|source| source.sources.iter_mut())
-    {
-        place.connector_name = connector_name(context, info.group_id, place.connector_id).await?;
+    info: Option<BucketInfo>,
+    version: Option<(Ulid, BlobVersion)>,
+    metadata: Option<BucketMetadata>,
+    view: Option<OriginView>,
+    step: OriginStep,
+}
+
+type ReadTurn = OriginTurn<OriginView>;
+
+impl ReadOriginOperation {
+    pub fn new(realm_id: RealmId, bucket: &str, key: &str, version_id: Option<Ulid>) -> Self {
+        Self {
+            realm_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            info: None,
+            version: None,
+            metadata: None,
+            view: None,
+            step: OriginStep::Bucket,
+        }
     }
     let source_url = view
         .source
