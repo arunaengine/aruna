@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::calls::{called, child, node, runs_child, shard_effect, shard_event};
-use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_core::structs::placement::record::PlacementStrategy;
+use crate::tests::calls::{
+    bucket_realm, called, child, node, runs_child, shard_effect, shard_event,
+};
 use aruna_core::types::Value;
 use ulid::Ulid;
 
@@ -26,24 +26,6 @@ fn placement() -> PlacementRef {
 
 fn topic() -> irokle::TopicId {
     shard_topic_id(realm(), &placement())
-}
-
-fn config(nodes: &[NodeId]) -> RealmConfigDocument {
-    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
-    config.strategies = vec![PlacementStrategy {
-        strategy_id: strategy_id(),
-        name: "default".to_string(),
-        replica_count: None,
-        distinct_locations: false,
-        affinity: Vec::new(),
-        shard_count: 1,
-    }];
-    config.default_strategy_id = Some(strategy_id());
-    for node_id in nodes {
-        config.ensure_node(*node_id, RealmNodeKind::Server);
-    }
-    config.snapshot_candidate_map();
-    config
 }
 
 fn manifest(digest: u8) -> ShardManifest {
@@ -470,4 +452,8 @@ fn forgetting_names_marker() {
             verification_key(realm(), &placement()),
         )]
     );
+}
+
+fn config(nodes: &[NodeId]) -> RealmConfigDocument {
+    bucket_realm(realm(), strategy_id(), nodes)
 }

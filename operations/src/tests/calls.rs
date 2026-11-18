@@ -4,10 +4,16 @@
 
 use std::fmt::Debug;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, ShardNetEffect};
 use aruna_core::events::{Event, NetEvent, ShardNetEvent};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::PlacementStrategy;
+use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
+use ulid::Ulid;
 
 pub(crate) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -49,4 +55,47 @@ pub(crate) fn shard_effect<T: Debug, E: Debug>(turn: Result<Next<T>, E>) -> Shar
         },
         other => panic!("expected a shard effect, got {other:?}"),
     }
+}
+
+/// An unrestricted user of `realm_id`.
+pub(crate) fn caller_of(realm_id: RealmId) -> AuthContext {
+    AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    }
+}
+
+pub(crate) fn owned_group(group_id: GroupId, owner: &AuthContext) -> Group {
+    Group {
+        display_name: "group".to_string(),
+        group_id,
+        realm_id: owner.realm_id,
+        roles: Default::default(),
+        owner: owner.user_id,
+    }
+}
+
+/// A realm with one activated single-bucket strategy held by server `nodes`.
+pub(crate) fn bucket_realm(
+    realm_id: RealmId,
+    strategy_id: Ulid,
+    nodes: &[NodeId],
+) -> RealmConfigDocument {
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.strategies = vec![PlacementStrategy {
+        strategy_id,
+        name: "default".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 1,
+    }];
+    config.default_strategy_id = Some(strategy_id);
+    for node_id in nodes {
+        config.ensure_node(*node_id, RealmNodeKind::Server);
+    }
+    config.snapshot_candidate_map();
+    config
 }

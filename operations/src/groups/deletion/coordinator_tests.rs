@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
+use crate::tests::calls::{caller_of, owned_group};
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -27,15 +27,6 @@ fn request() -> Ulid {
     Ulid::from_bytes([6; 16])
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        user_id: UserId::local(Ulid::from_bytes([4; 16]), realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
-}
-
 /// The lowest of the two server nodes coordinates, so tests pick their side by id order.
 fn ordered() -> (NodeId, NodeId) {
     let (one, two) = (node(1), node(2));
@@ -48,16 +39,6 @@ fn config() -> RealmConfigDocument {
     config.ensure_node(low, RealmNodeKind::Server);
     config.ensure_node(high, RealmNodeKind::Server);
     config
-}
-
-fn group() -> Group {
-    Group {
-        display_name: "group".to_string(),
-        group_id: group_id(),
-        realm_id: realm(),
-        roles: Default::default(),
-        owner: auth().user_id,
-    }
 }
 
 fn answer<T, E>(result: Result<T, E>) -> IoResult
@@ -556,4 +537,12 @@ fn foreign_record_refused() {
         operation.first(),
         Err(GroupDeletionError::Invalid(_))
     ));
+}
+
+fn auth() -> AuthContext {
+    caller_of(realm())
+}
+
+fn group() -> Group {
+    owned_group(group_id(), &auth())
 }

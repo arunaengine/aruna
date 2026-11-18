@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tests::peers::peer_answer;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
@@ -31,17 +32,6 @@ fn peer_failed(peer: NodeId, error: PeerRequestError) -> IoResult {
     let answer = MetadataAnswer {
         peer,
         result: Err(error),
-        elapsed: Duration::ZERO,
-    };
-    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
-        answer,
-    )))))
-}
-
-fn peer_says(peer: NodeId, message: &MetadataTransportMessage) -> IoResult {
-    let answer = MetadataAnswer {
-        peer,
-        result: Ok(encode_message(message).unwrap()),
         elapsed: Duration::ZERO,
     };
     IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
@@ -116,7 +106,7 @@ fn conflict_is_callers() {
         reason: "limit".to_string(),
     };
     assert_eq!(
-        operation.next(peer_says(peer, &conflict)),
+        operation.next(peer_answer(peer, &conflict)),
         Err(ForwardGroupError::Conflict("limit".to_string()))
     );
 }

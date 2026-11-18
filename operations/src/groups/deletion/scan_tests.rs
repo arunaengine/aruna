@@ -4,8 +4,7 @@
 
 use super::*;
 use crate::document_repository::GetConfigError;
-use crate::tests::calls::{child, node, runs_child};
-use aruna_core::UserId;
+use crate::tests::calls::{caller_of, child, node, owned_group, runs_child};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use ulid::Ulid;
@@ -16,25 +15,6 @@ fn realm() -> RealmId {
 
 fn group_id() -> GroupId {
     Ulid::from_bytes([3; 16])
-}
-
-fn auth() -> AuthContext {
-    AuthContext {
-        user_id: UserId::local(Ulid::from_bytes([4; 16]), realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
-}
-
-fn group() -> Group {
-    Group {
-        display_name: "group".to_string(),
-        group_id: group_id(),
-        realm_id: realm(),
-        roles: Default::default(),
-        owner: auth().user_id,
-    }
 }
 
 fn config(kind: RealmNodeKind) -> RealmConfigDocument {
@@ -226,4 +206,12 @@ fn node_errors_kept() {
     };
     assert!(blockers.contains(&(node(2), Err(conflict()))));
     assert!(blockers.contains(&(node(1), Ok(()))));
+}
+
+fn auth() -> AuthContext {
+    caller_of(realm())
+}
+
+fn group() -> Group {
+    owned_group(group_id(), &auth())
 }

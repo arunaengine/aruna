@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tests::calls::caller_of;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::group_delete::GroupDeletePlan;
@@ -20,15 +21,6 @@ fn node() -> NodeId {
 
 fn group() -> GroupId {
     Ulid::from_bytes([3; 16])
-}
-
-fn auth() -> AuthContext {
-    AuthContext {
-        user_id: UserId::local(Ulid::from_bytes([4; 16]), realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
 }
 
 fn allowed() -> IoResult {
@@ -136,4 +128,8 @@ fn garbled_group_unavailable() {
         operation.next(IoResult::Values(vec![Some(garbled), None])),
         Err(GroupDeletionError::Unavailable(_))
     ));
+}
+
+fn auth() -> AuthContext {
+    caller_of(realm())
 }

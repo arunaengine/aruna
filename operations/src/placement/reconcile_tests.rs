@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::calls::{called, child, node, runs_child, shard_effect, shard_event};
+use crate::tests::calls::{
+    bucket_realm, called, child, node, runs_child, shard_effect, shard_event,
+};
 use aruna_core::effects::Effect;
-use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_core::structs::placement::record::PlacementStrategy;
 use aruna_core::structs::placement::transition::{BucketPlan, PlacementTransition, TransitionPlan};
 use aruna_core::task::{TaskEffect, TaskKey};
 use ulid::Ulid;
@@ -28,25 +28,6 @@ fn placement() -> PlacementRef {
         strategy_id: strategy_id(),
         shard: 0,
     }
-}
-
-/// A realm whose one single-bucket strategy is activated over `nodes`.
-fn config(nodes: &[NodeId]) -> RealmConfigDocument {
-    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
-    config.strategies = vec![PlacementStrategy {
-        strategy_id: strategy_id(),
-        name: "default".to_string(),
-        replica_count: None,
-        distinct_locations: false,
-        affinity: Vec::new(),
-        shard_count: 1,
-    }];
-    config.default_strategy_id = Some(strategy_id());
-    for node_id in nodes {
-        config.ensure_node(*node_id, RealmNodeKind::Server);
-    }
-    config.snapshot_candidate_map();
-    config
 }
 
 fn existing(topics: &[TopicId]) -> IoResult {
@@ -788,4 +769,8 @@ fn open_transition_counts() {
             created_at_ms: 1,
         }));
     assert!(has_transition_work(&config, 0));
+}
+
+fn config(nodes: &[NodeId]) -> RealmConfigDocument {
+    bucket_realm(realm(), strategy_id(), nodes)
 }
