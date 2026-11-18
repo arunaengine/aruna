@@ -2,29 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::IoError;
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{ConversionError, StorageError, StorageReadError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use futures_util::{Stream, stream};
-use thiserror::Error;
-
-#[derive(Debug, Error, PartialEq)]
-pub enum StorageReadError {
-    #[error(transparent)]
-    Storage(StorageError),
-    #[error(transparent)]
-    Conversion(ConversionError),
-}
-
-/// A runner failure as a storage failure; one that is none reads as a read error.
-impl From<IoError> for StorageReadError {
-    fn from(error: IoError) -> Self {
-        Self::Storage(StorageError::from(error))
-    }
-}
 
 /// Decodes a read row, if any.
 pub(crate) fn decode_row<T>(

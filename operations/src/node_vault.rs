@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::node_vault::VaultEntry;
 use aruna_core::types::TxnId;
 
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 pub fn read_secret(entry: VaultEntry, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::VaultRead { entry, txn_id })

@@ -51,9 +51,9 @@ use crate::metadata::repository::{
     registry_outbox_record, schedule_materialization, schedule_projection,
 };
 use crate::realm::mutate_placement::node_kind;
-use crate::storage_read::StorageReadError;
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
+use aruna_core::errors::StorageReadError;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PROJECTION_PAGE_SIZE: usize = 256;
