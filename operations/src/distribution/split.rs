@@ -273,7 +273,10 @@ impl Operation for SplitOperation {
                 // Entries beyond the read would stay behind under the retired parent.
                 if next.is_some() {
                     let range_id = self.config.range_id;
-                    return Err(SplitError::Refused(range_id, "the key sample needs a refill"));
+                    return Err(SplitError::Refused(
+                        range_id,
+                        "the key sample needs a refill",
+                    ));
                 }
                 self.state = State::Write;
                 IoCall::Write(self.plan(sample)?)

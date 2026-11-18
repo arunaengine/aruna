@@ -527,9 +527,10 @@ fn missing_topic_pulled() {
             )
         )))
     );
-    let pulled = IoResult::Child(aruna_core::calls::ChildOutcome::new(
-        Ok::<bool, aruna_core::calls::IoError>(true),
-    ));
+    let pulled = IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<
+        bool,
+        aruna_core::calls::IoError,
+    >(true)));
     assert!(runs_child(operation.next(pulled)));
 }
 

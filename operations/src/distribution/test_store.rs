@@ -17,7 +17,9 @@ use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges};
+use super::inventory::{
+    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
+};
 
 pub(crate) fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");

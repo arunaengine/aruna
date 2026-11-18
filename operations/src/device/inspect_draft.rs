@@ -70,7 +70,9 @@ mod tests {
         let mut inspect = InspectDraftOperation::new(Ulid::nil());
         assert_eq!(
             inspect.first(),
-            Ok(Next::Call(crate::device::publish_queue::read_entry(Ulid::nil())))
+            Ok(Next::Call(crate::device::publish_queue::read_entry(
+                Ulid::nil()
+            )))
         );
         let missing = inspect.next(IoResult::Values(vec![None]));
         assert_eq!(missing, Err(InspectDraftError::NotFound));

@@ -12,8 +12,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
 use tracing::warn;
 
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::forward::transport::{peer_answer, peer_call};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::transport_message_kind;
 
 /// Delay before the first poll; it doubles up to [`PULL_POLL_AFTER`], so a small file settles

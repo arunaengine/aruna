@@ -113,9 +113,12 @@ fn create_miss_undeliverable() {
 fn unsent_tries_next() {
     let mut operation = walk(&[node(1), node(2)], &delete());
     operation.first().unwrap();
-    let unsent = failed_answer(node(1), PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+    let unsent = failed_answer(
+        node(1),
+        PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
             "no route".to_string(),
-        )));
+        )),
+    );
     assert_eq!(asked(operation.next(unsent)), node(2));
 }
 

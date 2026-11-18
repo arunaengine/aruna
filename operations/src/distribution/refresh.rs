@@ -17,13 +17,13 @@ use aruna_core::operation::Operation;
 use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, KeyRange, WriteRoute,
 };
-use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -287,8 +287,9 @@ impl RefreshRangesOperation {
         };
         let bucket = &set.bucket;
         let start = match &round.after {
-            Some(after) => (BlobHeadKey::new(bucket, after).to_bytes())
-                .map(|key| IterStart::After(key.into())),
+            Some(after) => {
+                (BlobHeadKey::new(bucket, after).to_bytes()).map(|key| IterStart::After(key.into()))
+            }
             None => (BlobHeadKey::new(bucket, &walk.range.lower).to_bytes())
                 .map(|key| IterStart::At(key.into())),
         };
@@ -302,7 +303,10 @@ impl RefreshRangesOperation {
             limit: PAGE,
             txn_id: None,
         };
-        self.call(State::Heads, IoCall::Effect(Box::new(Effect::Storage(iter))))
+        self.call(
+            State::Heads,
+            IoCall::Effect(Box::new(Effect::Storage(iter))),
+        )
     }
 
     /// Reads the version of the next head of the page, or writes the round once the page ends.
@@ -342,7 +346,11 @@ impl RefreshRangesOperation {
             return Err("no range is walked".to_string());
         };
         let value = postcard::to_allocvec(&walk.walked).map_err(|error| error.to_string())?;
-        let row = (NODE_STATE_KEYSPACE.to_string(), walk.key.clone().into(), value.into());
+        let row = (
+            NODE_STATE_KEYSPACE.to_string(),
+            walk.key.clone().into(),
+            value.into(),
+        );
         self.call(State::WriteRound, IoCall::Write(vec![row]))
     }
 
@@ -385,7 +393,8 @@ impl RefreshRangesOperation {
                 let Some(set) = self.set.as_ref() else {
                     return Err("no set is walked".to_string());
                 };
-                let ranges = coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())?;
+                let ranges =
+                    coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())?;
                 self.ranges = after_range(ranges, set.after.as_deref()).into();
                 self.last = None;
                 self.next_range()

@@ -115,7 +115,8 @@ impl Operation for SetCountsOperation {
         let values = self.pages.take(result)?;
         self.seen += values.len();
         // An unreadable record is skipped, as every reader of the records does.
-        let views = (values.iter()).filter_map(|(_, value)| DistributionView::from_bytes(value).ok());
+        let views =
+            (values.iter()).filter_map(|(_, value)| DistributionView::from_bytes(value).ok());
         for view in views {
             let snapshot = view.snapshot();
             if (self.group).is_none_or(|group| snapshot.config.owner_group == group) {

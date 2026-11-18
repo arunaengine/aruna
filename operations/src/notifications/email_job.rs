@@ -18,7 +18,7 @@ use crate::notifications::send::{SendError, SendOperation, job_error};
 use crate::notifications::settings::{
     Delivery, DeliveryOperation, DeliveryOutcome, SettingWinner, managers,
 };
-use crate::realm_vault::{RealmSecretError, ReadSecretOperation};
+use crate::realm_vault::{ReadSecretOperation, RealmSecretError};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 enum EmailState {

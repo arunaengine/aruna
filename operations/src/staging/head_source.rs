@@ -107,11 +107,11 @@ impl Operation for HeadSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
     use crate::tests::staging::{
         create_http_connector, sample_connector, sample_metadata, sample_resolved_connector,
         setup_driver_context,
     };
+    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
 
     fn sample_input() -> HeadSourceInput {
         HeadSourceInput {

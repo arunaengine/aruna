@@ -24,8 +24,8 @@ use super::{
     source_permission_path, source_uses_eln, stopped_failure, stops_of, transfer_failure,
     unexpected,
 };
-use crate::jobs::export::CrateJsonOperation;
 use crate::harvest::read_connector::ConnectorView;
+use crate::jobs::export::CrateJsonOperation;
 use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::import::{AcquireOperation, AcquireRequest, Acquired};
 use crate::jobs::repository::pull::PullProgress;

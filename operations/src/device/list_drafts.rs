@@ -93,7 +93,10 @@ mod tests {
         let Ok(Next::Call(IoCall::Page { space, limit, .. })) = list.first() else {
             panic!("expected a page call");
         };
-        assert_eq!((space.as_str(), limit), (DEVICE_INTAKE_KEYSPACE, PUBLISH_PAGE_SIZE));
+        assert_eq!(
+            (space.as_str(), limit),
+            (DEVICE_INTAKE_KEYSPACE, PUBLISH_PAGE_SIZE)
+        );
         let full = IoResult::Page {
             rows: vec![(key.clone(), value); MAX_PUBLISH_ENTRIES],
             next: Some(key.clone()),

@@ -4,17 +4,17 @@
 
 use super::*;
 use crate::connectors::descriptor::build_source_binding;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::{EffectOperation, Runnable};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
 };
@@ -280,7 +280,9 @@ fn run_to_writes(
 }
 
 /// Answers the row write and the empty delete; the next call is the usage update or nothing.
-fn after_rows(operation: &mut PageImportOperation) -> Result<Next<PageImportResult>, PageImportError> {
+fn after_rows(
+    operation: &mut PageImportOperation,
+) -> Result<Next<PageImportResult>, PageImportError> {
     assert_eq!(
         operation.next(IoResult::Done),
         Ok(Next::Call(IoCall::Delete(Vec::new())))

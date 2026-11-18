@@ -59,9 +59,12 @@ fn forwarding() -> ForwardGroupOperation {
 fn unsent_tries_next() {
     let mut operation = forwarding();
     let peer = operation.asked.unwrap();
-    let failed = peer_failed(peer, PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+    let failed = peer_failed(
+        peer,
+        PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
             "no route".to_string(),
-        )));
+        )),
+    );
     assert!(matches!(
         operation.next(failed),
         Ok(Next::Call(IoCall::Effect(_)))
@@ -92,9 +95,12 @@ fn every_peer_unreachable() {
     let mut operation = forwarding();
     for _ in 0..2 {
         let peer = operation.asked.unwrap();
-        let failed = peer_failed(peer, PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
-            "no route".to_string(),
-        )));
+        let failed = peer_failed(
+            peer,
+            PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+                "no route".to_string(),
+            )),
+        );
         let turn = operation.next(failed);
         if operation.asked.is_none() {
             assert_eq!(turn, Err(ForwardGroupError::Unavailable));

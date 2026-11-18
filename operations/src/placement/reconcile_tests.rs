@@ -43,9 +43,10 @@ fn refused() -> IoResult {
 }
 
 fn pulled() -> IoResult {
-    IoResult::Child(aruna_core::calls::ChildOutcome::new(
-        Ok::<bool, aruna_core::calls::IoError>(true),
-    ))
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<
+        bool,
+        aruna_core::calls::IoError,
+    >(true)))
 }
 
 fn probed(probe: GenesisProbe) -> IoResult {

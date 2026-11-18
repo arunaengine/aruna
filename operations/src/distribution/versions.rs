@@ -392,7 +392,6 @@ impl InventoryVersionsOperation {
             next_version_marker,
         })
     }
-
 }
 
 impl Operation for InventoryVersionsOperation {
@@ -414,7 +413,9 @@ impl Operation for InventoryVersionsOperation {
                     values,
                     next_start_after,
                 }) => self.scanned(values, next_start_after.is_some()),
-                Event::Storage(StorageEvent::Error { error }) => Err(IoError::Storage(error).into()),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    Err(IoError::Storage(error).into())
+                }
                 other => Err(InventoryVersionsError::Unexpected(other.label())),
             },
             State::Versions => self.versions_read(result.values()?),

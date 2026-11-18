@@ -196,7 +196,9 @@ impl Operation for NodeNameOperation {
 
     fn next(&mut self, result: IoResult) -> NameTurn {
         if self.authorized {
-            return result.child::<NodeDisplay, NodeNameError>()?.map(Next::Done);
+            return result
+                .child::<NodeDisplay, NodeNameError>()?
+                .map(Next::Done);
         }
         match result.child::<bool, AuthorizationError>()? {
             Ok(true) => Ok(self.change()),
@@ -383,7 +385,9 @@ impl Operation for NameWrite {
             Stage::Write if !self.deletes.is_empty() => {
                 done(result)?;
                 self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes))))
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
             }
             Stage::Write | Stage::Delete => {
                 done(result)?;

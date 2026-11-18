@@ -23,7 +23,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::forward::transport::{peer_answer, peer_call};
 use crate::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation, SourceConnectorResult,
 };
@@ -33,6 +32,7 @@ use crate::connectors::get_connector::{
 use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
+use crate::forward::transport::{peer_answer, peer_call};
 use crate::jobs::staging::{ReadCheckpointOperation, StagingStoreError, handed_checkpoint};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};

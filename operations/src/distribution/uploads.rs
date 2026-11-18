@@ -262,7 +262,9 @@ impl Operation for InventoryUploadsOperation {
                     values,
                     next_start_after,
                 }) => self.scanned(values, next_start_after.is_some()),
-                Event::Storage(StorageEvent::Error { error }) => Err(IoError::Storage(error).into()),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    Err(IoError::Storage(error).into())
+                }
                 other => Err(InventoryUploadsError::Unexpected(other.label())),
             },
             State::Records => self.records(result.values()?),

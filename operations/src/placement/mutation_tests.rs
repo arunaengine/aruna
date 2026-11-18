@@ -141,7 +141,9 @@ fn local_drain_kicks() {
         operation.next(outcome(Ok(realm_config()))),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    let kicked = IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<(), ApplyError>(())));
+    let kicked = IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<(), ApplyError>(
+        (),
+    )));
     assert_eq!(operation.next(kicked), Ok(Next::Done(realm_config())));
 }
 

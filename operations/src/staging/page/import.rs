@@ -298,7 +298,10 @@ impl PreparePageOperation {
         Self(page)
     }
 
-    fn prepared(&mut self, next: Next<PageImportResult>) -> Result<Next<PreparedRows>, PageImportError> {
+    fn prepared(
+        &mut self,
+        next: Next<PageImportResult>,
+    ) -> Result<Next<PreparedRows>, PageImportError> {
         match next {
             Next::Call(call) => Ok(Next::Call(call)),
             Next::Wait => Ok(Next::Wait),

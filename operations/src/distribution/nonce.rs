@@ -62,7 +62,10 @@ impl Operation for SpendNonceOperation {
     type Error = NonceError;
 
     fn first(&mut self) -> Result<Next<()>, NonceError> {
-        Ok(Next::Call(read_row(DELEGATION_NONCE_KEYSPACE, self.key.clone())))
+        Ok(Next::Call(read_row(
+            DELEGATION_NONCE_KEYSPACE,
+            self.key.clone(),
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, NonceError> {
@@ -184,10 +187,17 @@ mod tests {
     fn spends_then_prunes() {
         let key = nonce_key(50, [1; 16]);
         let mut spend = SpendNonceOperation::new([1; 16], 50, 40);
-        assert_eq!(spend.transaction(), aruna_core::operation::TransactionMode::Write);
+        assert_eq!(
+            spend.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let read = read_row(DELEGATION_NONCE_KEYSPACE, key.clone());
         assert_eq!(spend.first(), Ok(Next::Call(read)));
-        let row = (DELEGATION_NONCE_KEYSPACE.to_string(), key.into(), Vec::new().into());
+        let row = (
+            DELEGATION_NONCE_KEYSPACE.to_string(),
+            key.into(),
+            Vec::new().into(),
+        );
         let fresh = spend.next(IoResult::Values(vec![None]));
         assert_eq!(fresh, Ok(Next::Call(IoCall::Write(vec![row]))));
         let Ok(Next::Then { output: (), calls }) = spend.next(IoResult::Done) else {

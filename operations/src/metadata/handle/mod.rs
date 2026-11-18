@@ -39,8 +39,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
-pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub(crate) use self::effects::metadata_read_error;
+pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::query::query_authorized_local;
 pub use self::search::search_authorized_local;

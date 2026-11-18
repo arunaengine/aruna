@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::jobs::store::test_calls::{claim_job, insert_job, read_job_record};
 use super::*;
+use crate::jobs::store::test_calls::{claim_job, insert_job, read_job_record};
 
 pub(super) use crate::tests::incoming::*;
 

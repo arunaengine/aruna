@@ -443,7 +443,10 @@ mod tests {
         let mut operation = probing(row);
         let check = StagingSourceEffect::Check { access: access() };
         let check = IoCall::Effect(Box::new(Effect::StagingSource(check)));
-        assert_eq!(operation.next(resolved(Ok(access()))), Ok(Next::Call(check)));
+        assert_eq!(
+            operation.next(resolved(Ok(access()))),
+            Ok(Next::Call(check))
+        );
         let mark = (
             SOURCE_ROOT_KEYSPACE.to_string(),
             checked_key(SET, &digest).into(),
@@ -502,7 +505,10 @@ mod tests {
     #[test]
     fn failures_fail() {
         let failure = RootsError::from(IoError::Storage(StorageError::Timeout));
-        assert_eq!(failure, RootsError::Io(IoError::Storage(StorageError::Timeout)));
+        assert_eq!(
+            failure,
+            RootsError::Io(IoError::Storage(StorageError::Timeout))
+        );
         let (row, _) = unchecked_row("one");
         let mut operation = probing(row);
         operation.next(resolved(Ok(access()))).unwrap();

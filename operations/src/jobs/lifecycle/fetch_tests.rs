@@ -108,7 +108,11 @@ fn ends_without_holders() {
     let family = Family::new([6u8; 32]);
     let mut fetch = fetch(&family);
     fetch.first().expect("first ask");
-    let failed = || Err(PeerRequestError::Failed(MetadataError::Backend("offline".to_string())));
+    let failed = || {
+        Err(PeerRequestError::Failed(MetadataError::Backend(
+            "offline".to_string(),
+        )))
+    };
     fetch
         .next(answer(node(2), 1, failed()))
         .expect("second ask");

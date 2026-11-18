@@ -360,9 +360,9 @@ mod tests {
             Err(PromoteNodeError::KeyUncertain(_))
         ));
         assert!(matches!(
-            handoff_outcome(Err(PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
-            "no route".to_string(),
-        )))),
+            handoff_outcome(Err(PeerRequestError::NotSent(
+                aruna_core::metadata::MetadataError::Backend("no route".to_string(),)
+            ))),
             Err(PromoteNodeError::Unreachable(_))
         ));
         let refused = MetadataTransportMessage::RealmKeyStored {

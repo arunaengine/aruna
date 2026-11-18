@@ -889,7 +889,6 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
-    use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::execution::job::{
@@ -898,6 +897,7 @@ mod tests {
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::FjallStorage;

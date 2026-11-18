@@ -597,9 +597,9 @@ mod tests {
         AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditAggregate,
         AuditPageEntry, AuditPageResponse, Effect, Event, GroupEvent, GroupForm, GroupResult,
-        IoCall, IoResult, Key, ListAuditError, ListAuditOperation,
-        LocalPageOperation, MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next,
-        Operation, StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, select_peers,
+        IoCall, IoResult, Key, ListAuditError, ListAuditOperation, LocalPageOperation,
+        MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next, Operation,
+        StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::metadata::audit_entry::{admin_refusal, audit_member, outbound_admission};

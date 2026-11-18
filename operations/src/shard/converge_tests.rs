@@ -106,10 +106,7 @@ fn missing_genesis_pulls() {
 
 #[test]
 fn different_digests_pull() {
-    assert_eq!(
-        compared(1, 2, None).next(topic_known()),
-        pull_from(node(2))
-    );
+    assert_eq!(compared(1, 2, None).next(topic_known()), pull_from(node(2)));
 }
 
 #[test]

@@ -399,7 +399,10 @@ mod tests {
             ByteView::from(b"short".to_vec()),
             ByteView::from(Vec::new()),
         );
-        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let first = operation.first();
         assert!(matches!(
             &first,

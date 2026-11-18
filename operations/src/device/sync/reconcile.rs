@@ -176,7 +176,9 @@ impl ReconcileFolderOperation {
             root: self.input.folder.root.clone(),
             relative,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::LocalFile(hash)))))
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::LocalFile(
+            hash,
+        )))))
     }
 
     /// Turns every decision of the page into rows and downloads.
@@ -831,10 +833,7 @@ pub(super) mod pure_tests {
         base: Option<SyncBase>,
         queued: Option<SyncUpload>,
     ) -> ReconcilePlan {
-        assert!(matches!(
-            operation.first(),
-            Ok(Next::Call(IoCall::Read(_)))
-        ));
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
         let mut next = operation.next(stored_rows(base, queued));
         loop {
             match next.expect("the page must decide") {

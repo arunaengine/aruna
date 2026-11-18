@@ -46,7 +46,9 @@ pub(crate) fn fetch_requests(effects: Effects) -> (Vec<NodeId>, MetadataTranspor
             MetadataAnswer {
                 peer: request.peer,
                 elapsed: std::time::Duration::ZERO,
-                result: Err(PeerRequestError::Failed(MetadataError::Backend("test".to_string()))),
+                result: Err(PeerRequestError::Failed(MetadataError::Backend(
+                    "test".to_string(),
+                ))),
             },
         ))));
     }
