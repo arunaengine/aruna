@@ -156,6 +156,20 @@ pub enum BlobEffect {
     ReleaseReservation {
         id: Ulid,
     },
+    /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
+    ReconcileReservation {
+        location: BackendLocation,
+    },
+    /// Removes an in-place target no upload record or version owns any more; answered by
+    /// `DeleteFinished`.
+    DiscardTarget {
+        location: BackendLocation,
+    },
+    /// Aborts the provider uploads of an in-place target and keeps its object; answered by
+    /// `UploadAborted`.
+    AbortTarget {
+        location: BackendLocation,
+    },
     SpoolHidden {
         namespace: Ulid,
         name: String,

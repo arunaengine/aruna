@@ -188,6 +188,10 @@ pub enum BlobEvent {
     ReservationReleased {
         id: Ulid,
     },
+    /// Whether the reservation is settled; `false` keeps it for a later pass.
+    ReservationReconciled {
+        done: bool,
+    },
     HiddenSpooled {
         location: BackendLocation,
         blake3: [u8; 32],
@@ -828,6 +832,7 @@ impl Event {
                     ReadFinished,
                     DeleteFinished,
                     ReservationReleased,
+                    ReservationReconciled,
                     HiddenSpooled,
                     HiddenRead,
                     LocalSpooled,

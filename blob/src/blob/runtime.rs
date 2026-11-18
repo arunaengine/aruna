@@ -102,6 +102,9 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
         BlobEffect::ReleaseReservation { .. } => (EffectClass::Local, "release_reservation"),
+        BlobEffect::ReconcileReservation { .. } => (EffectClass::Local, "reconcile_reservation"),
+        BlobEffect::DiscardTarget { .. } => (EffectClass::Local, "discard_target"),
+        BlobEffect::AbortTarget { .. } => (EffectClass::Local, "abort_target"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
@@ -159,6 +162,9 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::HandleReplication { .. }
             | BlobEffect::ReceiveRead { .. }
             | BlobEffect::Delete { .. }
+            | BlobEffect::ReconcileReservation { .. }
+            | BlobEffect::DiscardTarget { .. }
+            | BlobEffect::AbortTarget { .. }
             | BlobEffect::DeleteHidden { .. }
             | BlobEffect::RewriteCopy { .. }
             | BlobEffect::WritePiece { .. }
@@ -389,48 +395,6 @@ impl BlobHandle {
             );
         }
         Event::Blob(blob_event)
-    }
-
-    pub async fn reconcile_reservation(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<bool, BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.reconcile_reservation(location).await
-    }
-
-    /// Removes an in-place target no upload record or version owns any more.
-    pub async fn discard_target(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<(), BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.discard_target(&location).await
-    }
-
-    /// Aborts the provider uploads of an in-place target and keeps its object.
-    pub async fn abort_target(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<(), BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.abort_target(&location).await
-    }
-
-    pub fn clear_reservation(&self, id: Ulid) {
-        self.handler.clear_active(id);
     }
 
     /// Executes one write into a folder the owner bound on this machine. The
@@ -862,6 +826,24 @@ impl BlobHandler {
             BlobEffect::ReleaseReservation { id } => {
                 self.clear_active(id);
                 BlobEvent::ReservationReleased { id }
+            }
+            BlobEffect::ReconcileReservation { location } => {
+                match Box::pin(self.reconcile_reservation(location)).await {
+                    Ok(done) => BlobEvent::ReservationReconciled { done },
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::DiscardTarget { location } => {
+                match Box::pin(self.discard_target(&location)).await {
+                    Ok(()) => BlobEvent::DeleteFinished,
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::AbortTarget { location } => {
+                match Box::pin(self.abort_target(&location)).await {
+                    Ok(()) => BlobEvent::UploadAborted,
+                    Err(error) => BlobEvent::Error(error),
+                }
             }
             BlobEffect::SpoolHidden {
                 namespace,

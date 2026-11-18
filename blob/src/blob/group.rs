@@ -160,6 +160,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::Read { location }
         | BlobEffect::ReadRange { location, .. }
         | BlobEffect::Delete { location }
+        | BlobEffect::ReconcileReservation { location }
+        | BlobEffect::DiscardTarget { location }
+        | BlobEffect::AbortTarget { location }
         | BlobEffect::ReadHiddenRange { location, .. }
         | BlobEffect::Replicate { location, .. }
         | BlobEffect::ServeRead { location, .. } => push(&mut ids, &location.backend),
