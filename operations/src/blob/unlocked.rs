@@ -350,23 +350,78 @@ impl Operation for DropReceivedOperation {
     }
 }
 
-pub(super) async fn read_value(
-    storage: &aruna_storage::StorageHandle,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Value>, PromoteError> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(PromoteError::InvalidStateEvent {
-            state: "Drop",
-            expected: "ReadResult",
-            received: (other).label(),
-        }),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::blob::BackendRef;
+
+    fn archive() -> ArchiveKey {
+        ArchiveKey::new(ulid::Ulid::from_bytes([5; 16]), BackendRef::node_default())
+    }
+
+    fn origin() -> (RealmId, NodeId) {
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        (RealmId::from_bytes([1; 32]), node)
+    }
+
+    fn owners(result: Result<Vec<VersionKey>, PromoteError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn listing() -> DropReceivedOperation {
+        let mut drop = DropReceivedOperation::mismatched(archive(), [1; 32], origin());
+        assert!(matches!(drop.first(), Ok(Next::Call(IoCall::Write(_)))));
+        assert!(matches!(
+            drop.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        drop
+    }
+
+    #[test]
+    fn no_owners_ends() {
+        assert_eq!(listing().next(owners(Ok(Vec::new()))), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn unclaimed_rejection_fails() {
+        let mut drop = DropReceivedOperation::rejected(archive(), origin(), "bad".to_string());
+        assert!(matches!(drop.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            drop.next(IoResult::Values(vec![None])),
+            Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(
+                "bad".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn stuck_owner_fails() {
+        // An owner that stays after a whole pass would loop for ever.
+        let mut drop = listing();
+        let version = VersionKey::new("bucket", "key", ulid::Ulid::from_bytes([3; 16]));
+        let turn = drop.next(owners(Ok(vec![version])));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert!(matches!(
+            drop.next(IoResult::Values(vec![None, None])),
+            Err(PromoteError::Dropped(_))
+        ));
+    }
+
+    #[test]
+    fn empty_queue_finishes() {
+        let key = BucketKeyRef::new(ulid::Ulid::from_bytes([4; 16]), 1);
+        let limits = RoCrateLimits::default();
+        let mut operation = PromoteUnlockedOperation::new(key, origin(), &limits);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(0)));
     }
 }
