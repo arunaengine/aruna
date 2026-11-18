@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::device::sync_status::ArmTimerOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -45,6 +46,10 @@ use super::repository::{
 };
 use super::rows::{
     abort_txn, commit_txn, delete_rows, read_value, scan_page, start_txn, sync_all, write_rows,
+};
+pub use super::folder_reads::{
+    folder_counters, list_actions, list_entries, list_folders, list_transfers, read_bound,
+    read_entry,
 };
 use super::{ReconcileFolderError, request_versions};
 
@@ -227,7 +232,7 @@ pub(crate) async fn finish_binding(
 ) -> Result<SyncedFolder, FolderError> {
     let _pass = super::folder_lock(folder.folder_id).await;
     // The caller's copy may be stale: a binding unbound or finished since is left alone.
-    let folder = read_bound(context, folder.folder_id).await?;
+    let folder = drive(read_bound(folder.folder_id), context).await?;
     let FolderState::Binding { create_bucket } = folder.state else {
         return Ok(folder);
     };
@@ -269,7 +274,7 @@ pub(crate) async fn finish_binding(
                 }
             })
             .await?;
-            crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+            drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
             Ok(active)
         }
         Err(
@@ -433,7 +438,7 @@ pub async fn request_sync(
     folder: &SyncedFolder,
 ) -> Result<(), FolderError> {
     check_root(context, &folder.root).await?;
-    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
     Ok(())
 }
 
@@ -478,10 +483,6 @@ fn overlaps(left: &str, right: &str) -> bool {
         || left.starts_with(&format!("{right}/"))
 }
 
-pub async fn list_folders(context: &Arc<DriverContext>) -> Result<Vec<SyncedFolder>, FolderError> {
-    scan_bound(context, None).await
-}
-
 async fn scan_bound(
     context: &Arc<DriverContext>,
     txn_id: Option<TxnId>,
@@ -504,16 +505,6 @@ async fn scan_bound(
     }
 }
 
-pub async fn read_bound(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-) -> Result<SyncedFolder, FolderError> {
-    read_value(context, SYNCED_FOLDER_KEYSPACE, folder_key(folder_id), None)
-        .await
-        .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok())
-        .ok_or(FolderError::NotFound)
-}
-
 /// Stops syncing one folder; the owner's filesystem is untouched. The folder is marked
 /// `Deleting` and the folder pass, woken here, removes it, also after a cancelled call or a restart.
 pub async fn unbind_folder(
@@ -528,7 +519,7 @@ pub async fn unbind_folder(
         })
     })
     .await?;
-    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
     Ok(())
 }
 
@@ -540,7 +531,7 @@ pub(crate) async fn finish_unbind(
     node_id: NodeId,
 ) -> Result<(), FolderError> {
     let _pass = super::folder_lock(folder_id).await;
-    let folder = read_bound(context, folder_id).await?;
+    let folder = drive(read_bound(folder_id), context).await?;
     if folder.state != FolderState::Deleting {
         return Ok(());
     }
@@ -828,151 +819,6 @@ pub(crate) async fn store_folder(
     }
 }
 
-/// One page of a folder's entries, filtered by state name when asked.
-pub async fn list_entries(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-    state: Option<&str>,
-    cursor: Option<Key>,
-) -> Result<(Vec<(String, SyncBase)>, Option<Key>), FolderError> {
-    let (values, next) = scan_page(
-        context,
-        scan_folder(SYNC_BASE_KEYSPACE, folder_id, cursor, None),
-    )
-    .await
-    .ok_or(FolderError::Unavailable)?;
-    let entries = values
-        .into_iter()
-        .filter_map(|(key, bytes)| {
-            let base = SyncBase::from_bytes(&bytes).ok()?;
-            Some((key_path(key.as_ref())?, base))
-        })
-        .filter(|(_, base)| state.is_none_or(|state| base.entry.name() == state))
-        .collect();
-    Ok((entries, next))
-}
-
-/// One entry of a folder, by its path.
-pub async fn read_entry(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-    relative: &str,
-) -> Result<SyncBase, FolderError> {
-    read_value(
-        context,
-        SYNC_BASE_KEYSPACE,
-        super::repository::base_key(folder_id, relative),
-        None,
-    )
-    .await
-    .and_then(|bytes| SyncBase::from_bytes(&bytes).ok())
-    .ok_or(FolderError::NotFound)
-}
-
-/// One page of a folder's audit log, oldest action first.
-pub async fn list_actions(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-    cursor: Option<Key>,
-) -> Result<(Vec<SyncActionRecord>, Option<Key>), FolderError> {
-    let (values, next) = scan_page(
-        context,
-        scan_folder(SYNC_LOG_KEYSPACE, folder_id, cursor, None),
-    )
-    .await
-    .ok_or(FolderError::Unavailable)?;
-    Ok((
-        values
-            .into_iter()
-            .filter_map(|(_, bytes)| SyncActionRecord::from_bytes(&bytes).ok())
-            .collect(),
-        next,
-    ))
-}
-
-/// Counts one folder's entries by state, and the uploads still queued for it.
-pub async fn folder_counters(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-) -> Result<FolderCounters, FolderError> {
-    let mut counters = FolderCounters::default();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let (values, next) = scan_page(
-            context,
-            scan_folder(SYNC_BASE_KEYSPACE, folder_id, cursor, None),
-        )
-        .await
-        .ok_or(FolderError::Unavailable)?;
-        for (_, bytes) in values {
-            let Ok(base) = SyncBase::from_bytes(&bytes) else {
-                continue;
-            };
-            match base.entry {
-                EntryState::InSync => counters.in_sync += 1,
-                EntryState::Conflict { .. } => counters.conflicts += 1,
-                EntryState::PendingReplace { .. } => counters.pending_replacements += 1,
-                EntryState::RemoteDeleted { .. } => counters.remote_deleted += 1,
-                EntryState::Error { .. } => counters.errors += 1,
-                _ => {}
-            }
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    counters.uploading = count_uploads(context, folder_id).await?;
-    Ok(counters)
-}
-
-async fn count_uploads(
-    context: &Arc<DriverContext>,
-    folder_id: Ulid,
-) -> Result<usize, FolderError> {
-    let mut cursor: Option<Key> = None;
-    let mut queued = 0usize;
-    loop {
-        let (values, next) = scan_page(
-            context,
-            scan_folder(SYNC_UPLOAD_KEYSPACE, folder_id, cursor, None),
-        )
-        .await
-        .ok_or(FolderError::Unavailable)?;
-        queued += values.len();
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return Ok(queued),
-        }
-    }
-}
-
-/// Every queued upload of this device, newest folder last.
-pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUpload>, FolderError> {
-    let mut uploads = Vec::new();
-    for folder in list_folders(context).await? {
-        let mut cursor: Option<Key> = None;
-        loop {
-            let (values, next) = scan_page(
-                context,
-                scan_folder(SYNC_UPLOAD_KEYSPACE, folder.folder_id, cursor, None),
-            )
-            .await
-            .ok_or(FolderError::Unavailable)?;
-            uploads.extend(
-                values
-                    .into_iter()
-                    .filter_map(|(_, bytes)| SyncUpload::from_bytes(&bytes).ok()),
-            );
-            match next {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-    }
-    Ok(uploads)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,10 +903,10 @@ mod tests {
             .expect("a resumed unbind finishes");
 
         assert_eq!(
-            read_bound(&context, folder.folder_id).await,
+            drive(read_bound(folder.folder_id), &context).await,
             Err(FolderError::NotFound)
         );
-        let (entries, _) = list_entries(&context, folder.folder_id, None, None)
+        let (entries, _) = drive(list_entries(folder.folder_id, None, None), &context)
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
@@ -1084,7 +930,7 @@ mod tests {
             clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
             Err(FolderError::Unavailable)
         );
-        let (entries, _) = list_entries(&context, folder_id, None, None)
+        let (entries, _) = drive(list_entries(folder_id, None, None), &context)
             .await
             .expect("the entries read");
         assert_eq!(entries.len(), 1);
@@ -1092,7 +938,7 @@ mod tests {
             clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
             Ok(())
         );
-        let (entries, _) = list_entries(&context, folder_id, None, None)
+        let (entries, _) = drive(list_entries(folder_id, None, None), &context)
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
@@ -1123,7 +969,7 @@ mod tests {
             apply_action(&context, input).await,
             Err(ActionError::Folder(FolderError::NotFound))
         ));
-        let (actions, _) = list_actions(&context, folder.folder_id, None)
+        let (actions, _) = drive(list_actions(folder.folder_id, None), &context)
             .await
             .expect("the log reads");
         assert!(actions.is_empty());
@@ -1204,7 +1050,7 @@ mod tests {
                 "{attempt}"
             );
             assert_eq!(
-                read_bound(&context, folder.folder_id).await,
+                drive(read_bound(folder.folder_id), &context).await,
                 Err(FolderError::NotFound)
             );
             assert!(
@@ -1398,7 +1244,7 @@ mod tests {
             Err(FolderError::NotFound)
         );
         assert_eq!(
-            read_bound(&context, pass.folder_id).await,
+            drive(read_bound(pass.folder_id), &context).await,
             Err(FolderError::NotFound)
         );
     }
@@ -1416,7 +1262,7 @@ mod tests {
             Err(FolderError::DownloadOnly)
         );
         assert!(
-            !read_bound(&context, folder.folder_id)
+            !drive(read_bound(folder.folder_id), &context)
                 .await
                 .expect("still bound")
                 .propagate_deletes
@@ -1472,12 +1318,12 @@ mod tests {
         drop(pass);
 
         assert_eq!(unbind.await.expect("the unbind task ends"), Ok(()));
-        let (entries, _) = list_entries(&context, folder.folder_id, None, None)
+        let (entries, _) = drive(list_entries(folder.folder_id, None, None), &context)
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
         assert_eq!(
-            read_bound(&context, folder.folder_id).await,
+            drive(read_bound(folder.folder_id), &context).await,
             Err(FolderError::NotFound)
         );
     }
@@ -1634,7 +1480,7 @@ mod tests {
                 "{target:?}"
             );
             assert_eq!(
-                read_bound(&context, folder_id).await.map(|row| row.state),
+                drive(read_bound(folder_id), &context).await.map(|row| row.state),
                 Ok(FolderState::Deleting)
             );
         }
@@ -1661,7 +1507,7 @@ mod tests {
             reserve_binding(&context, &second)
         );
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
-        let bound = list_folders(&context).await.expect("the folders list");
+        let bound = drive(list_folders(), &context).await.expect("the folders list");
         assert_eq!(bound.len(), 1);
         assert_eq!(
             reserve_binding(&context, &first).await,

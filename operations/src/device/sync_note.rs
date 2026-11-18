@@ -55,16 +55,6 @@ pub(crate) fn sync_state_key() -> Key {
     ByteView::from(SYNC_STATE_KEY.to_vec())
 }
 
-/// The state a read answer holds; an absent, unreadable or undecodable row counts as empty.
-pub(crate) fn read_state(event: &Event) -> DeviceSyncState {
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => postcard::from_bytes(bytes).unwrap_or_default(),
-        _ => DeviceSyncState::default(),
-    }
-}
-
 /// What the device records about its exchange with the realm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncNote {

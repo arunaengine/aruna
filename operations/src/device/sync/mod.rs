@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod download;
+pub mod folder_reads;
 pub mod folders;
 pub mod materialize;
 pub mod outbox;
@@ -32,6 +33,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::device::drain::DrainOutcome;
+use crate::device::sync_status::ArmTimerOperation;
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
@@ -94,7 +96,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
     let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return DrainOutcome::Deferred;
     };
-    let Ok(folders) = list_folders(context).await else {
+    let Ok(folders) = drive(list_folders(), context).await else {
         return DrainOutcome::Deferred;
     };
     let mut work = false;
@@ -151,7 +153,7 @@ pub async fn reconcile_folder(
 ) -> Result<ReconcilePlan, ReconcileFolderError> {
     let _pass = folder_lock(folder.folder_id).await;
     // A folder unbound or paused since the pass listed it is left alone.
-    let current = folders::read_bound(context, folder.folder_id).await;
+    let current = drive(folders::read_bound(folder.folder_id), context).await;
     if !matches!(current, Ok(current) if current.state == FolderState::Active) {
         return Ok(ReconcilePlan::default());
     }
@@ -391,14 +393,9 @@ pub(crate) async fn arm_upload_timer(context: &Arc<DriverContext>) {
 }
 
 async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    if let TaskEvent::Error { message, .. } =
-        task_handle.schedule_idle_timer(key, Duration::ZERO).await
-    {
-        warn!(message = %message, "Failed to arm a synced-folder timer");
-    }
+    crate::driver::drive(ArmTimerOperation::new(key), context)
+        .await
+        .ok();
 }
 
 /// Re-arms the device timers. The folder pass is armed for a bound folder and

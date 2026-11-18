@@ -318,7 +318,7 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         return 0;
     };
     let mut replayed = 0usize;
-    for entry in read_publish_entries(context).await {
+    for entry in drive(read_publish_entries(), context).await.unwrap_or_default() {
         let PublishKind::Edit { batch, .. } = &entry.kind else {
             continue;
         };
@@ -554,14 +554,12 @@ mod tests {
 
         assert!(update(Some(false)).await.is_err());
         assert!(
-            crate::device::sync_status::read_publish_entries(&context)
-                .await
+            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
                 .is_empty()
         );
         update(None).await.expect("a plain edit queues locally");
         assert_eq!(
-            crate::device::sync_status::read_publish_entries(&context)
-                .await
+            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
                 .len(),
             1
         );
@@ -585,8 +583,7 @@ mod tests {
             .expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
-            crate::device::sync_status::read_publish_entries(&context)
-                .await
+            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
                 .into_iter()
                 .filter_map(|entry| match entry.kind {
                     PublishKind::Edit { batch, .. } => Some(*batch),

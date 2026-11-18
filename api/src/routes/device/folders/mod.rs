@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -248,7 +249,7 @@ async fn folder_detail(
     state: &ServerState,
     folder: aruna_core::structs::SyncedFolder,
 ) -> ServerResult<SyncedFolderView> {
-    let counters = folder_counters(&state.get_ctx(), folder.folder_id)
+    let counters = drive(folder_counters(folder.folder_id), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     Ok(folder_view(folder, counters))
@@ -437,7 +438,7 @@ async fn list_synced_folders(
     State(state): State<Arc<ServerState>>,
     _: OwnerAuth,
 ) -> ServerResult<Json<SyncedFolderList>> {
-    let bound = list_folders(&state.get_ctx())
+    let bound = drive(list_folders(), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     let mut folders = Vec::with_capacity(bound.len());
@@ -500,7 +501,7 @@ async fn get_synced_folder(
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
     let folder_id = parse_folder_id(&folder_id)?;
-    let folder = read_bound(&state.get_ctx(), folder_id)
+    let folder = drive(read_bound(folder_id), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
@@ -790,7 +791,7 @@ async fn sync_folder(
 ) -> ServerResult<Json<SyncedFolderView>> {
     let folder_id = parse_folder_id(&folder_id)?;
     let context = state.get_ctx();
-    let folder = read_bound(&context, folder_id)
+    let folder = drive(read_bound(folder_id), &context)
         .await
         .map_err(map_folder_error)?;
     if folder.state != FolderState::Active {
@@ -857,7 +858,7 @@ async fn list_folder_entries(
 ) -> ServerResult<Json<FolderEntryPage>> {
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
-    let (entries, next) = list_entries(&state.get_ctx(), folder_id, query.state.as_deref(), cursor)
+    let (entries, next) = drive(list_entries(folder_id, query.state.as_deref(), cursor), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     Ok(Json(FolderEntryPage {
@@ -983,7 +984,7 @@ async fn act_on_entry(
             "the file changed since the owner saw it".to_string(),
         ));
     }
-    let base = read_entry(&context, folder_id, &path)
+    let base = drive(read_entry(folder_id, &path), &context)
         .await
         .map_err(map_folder_error)?;
     Ok(Json(entry_view(path, base)))
@@ -1071,7 +1072,7 @@ async fn act_on_folder(
         ));
     }
     let context = state.get_ctx();
-    let folder = read_bound(&context, folder_id)
+    let folder = drive(read_bound(folder_id), &context)
         .await
         .map_err(map_folder_error)?;
     if request.confirm != folder_name(&folder.root) {
@@ -1137,7 +1138,7 @@ async fn list_folder_actions(
 ) -> ServerResult<Json<ActionRecordPage>> {
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
-    let (actions, next) = list_actions(&state.get_ctx(), folder_id, cursor)
+    let (actions, next) = drive(list_actions(folder_id, cursor), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     Ok(Json(ActionRecordPage {
