@@ -221,5 +221,6 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
+        OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
     }
 }
