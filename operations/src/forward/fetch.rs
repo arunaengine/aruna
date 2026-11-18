@@ -11,6 +11,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect,
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
+use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -239,12 +240,13 @@ pub(crate) fn peer_reply(
         });
     };
     if answer.peer != peer {
-        return Ok(Err(PeerRequestError::Failed(
+        return Ok(Err(PeerRequestError::Failed(MetadataError::Backend(
             "the answer came from another peer".to_string(),
-        )));
+        ))));
     }
     Ok(answer.result.and_then(|bytes| {
-        decode_message(&bytes).map_err(|error| PeerRequestError::Failed(error.to_string()))
+        decode_message(&bytes)
+            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error.to_string())))
     }))
 }
 
