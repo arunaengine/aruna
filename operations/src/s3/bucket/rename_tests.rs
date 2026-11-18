@@ -492,11 +492,8 @@ fn checks_input() {
     ];
     for case in cases {
         let mut operation = RenameKeysOperation::new(case.clone());
-        assert!(operation.start().is_empty(), "{case:?}");
-        assert!(
-            matches!(operation.finalize(), Err(RenameError::Invalid(_))),
-            "{case:?}"
-        );
+        let refused = operation.first();
+        assert!(matches!(refused, Err(RenameError::Invalid(_))), "{case:?}");
     }
     assert_eq!(
         renamed_key("", "archive/", "x/y"),
@@ -854,4 +851,80 @@ async fn renames_job_pairs() {
     // The job's progress is written with the rename.
     let job_row = get(&context, LINKED_JOB_KEYSPACE, BUCKET.as_bytes().to_vec()).await;
     assert_eq!(job_row, Some(next));
+}
+
+fn plain_bucket(group_id: GroupId) -> Value {
+    let info = BucketInfo {
+        group_id,
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    info.to_bytes().unwrap().into()
+}
+
+fn bucket_rows(bucket: Option<Value>, job: Option<Value>) -> IoResult {
+    IoResult::Values(vec![bucket, None, None, None, job])
+}
+
+fn started(input: RenameInput) -> RenameKeysOperation {
+    let mut operation = RenameKeysOperation::new(input);
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    operation
+}
+
+#[test]
+fn preview_only_reads() {
+    let preview = RenameKeysOperation::new(input("a/", "b/", None, false));
+    assert_eq!(preview.transaction(), TransactionMode::ReadSnapshot);
+    let rename = RenameKeysOperation::new(input("a/", "b/", Some(vec!["a/x"]), true));
+    assert_eq!(rename.transaction(), TransactionMode::Write);
+}
+
+#[test]
+fn changed_job_refused() {
+    let mut job = input("a/", "b/", Some(vec!["a/x"]), true);
+    job.job = Some((Value::from(vec![1]), Value::from(vec![2])));
+    let turn = started(job).next(bucket_rows(
+        Some(plain_bucket(group())),
+        Some(vec![9].into()),
+    ));
+    assert_eq!(turn, Err(RenameError::Conflict(JOB_CHANGED.to_string())));
+}
+
+#[test]
+fn foreign_bucket_hidden() {
+    let other = Ulid::from_bytes([9; 16]);
+    let rename = input("a/", "b/", Some(vec!["a/x"]), true);
+    let turn = started(rename).next(bucket_rows(Some(plain_bucket(other)), None));
+    assert_eq!(turn, Err(RenameError::NotFound));
+    let rename = input("a/", "b/", Some(vec!["a/x"]), true);
+    assert_eq!(
+        started(rename).next(bucket_rows(None, None)),
+        Err(RenameError::NotFound)
+    );
+}
+
+#[test]
+fn replicating_bucket_refused() {
+    let rename = input("a/", "b/", Some(vec!["a/x"]), true);
+    let mut operation = started(rename);
+    let turn = operation.next(bucket_rows(Some(plain_bucket(group())), None));
+    assert!(matches!(
+        turn,
+        Ok(Next::Call(IoCall::Page { limit: 1, .. }))
+    ));
+    let related = IoResult::Page {
+        rows: vec![(Key::from(vec![1]), Value::from(vec![1]))],
+        next: None,
+    };
+    assert!(matches!(
+        operation.next(related),
+        Err(RenameError::Conflict(_))
+    ));
 }
