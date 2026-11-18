@@ -2,52 +2,58 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE,
 };
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::replication::ReplicationFailure;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::GroupId;
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::catch_up::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
-use super::members::{BoundRecordOperation, member_publication};
-use super::obligations::{live_obligations_exist, process_live_obligations};
+use super::catch_up::{BOOTSTRAP_POLL, BootstrapWaitingOperation, ProcessBootstrapOperation};
+use super::members::{BoundRecord, BoundRecordOperation, RecordError, member_publication};
+use super::obligations::{LiveRepairResult, ProcessObligationsOperation};
 use super::page::PAGE_RECORDS;
-use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
+use super::page::deliver::{DeliverPagesOperation, PageReport, PageTransport, pageable};
 use super::parking::{PARKED_DUE, ParkJobOperation};
-use super::plaintext::{HolderCheckOperation, job_consent};
+use super::plaintext::{HolderCheckOperation, PlaintextError, job_consent, relationship_consent};
 use super::queue::BlobQueueError;
 use super::retire::{BlobJobOutcome, RetireJobOperation};
+use super::source_rules::SourceAuthOperation;
 use super::version_replication::{
-    ReplicateScopeError, ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
+    ReplicateScopeError, ReplicateScopeOperation, ReplicateScopeResult, SourceAuthorization,
+    SourceAuthorizationError,
 };
-use crate::driver::{DriverContext, drive};
+use crate::groups::routing::{QuotaOperation, RoutingInputsError};
 use crate::notifications::watch::origin::EmitEventOperation;
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
@@ -62,6 +68,12 @@ pub(super) const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
 
 pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 
+type Turn<T> = Result<Next<T>, BlobQueueError>;
+type Job = (Vec<u8>, BlobJobRecord);
+/// This node and its realm, where it serves one.
+type Serving = Option<(NodeId, RealmId)>;
+type Relationships = HashMap<(String, Ulid), SyncRelationship>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobDrainResult {
     pub processed: usize,
@@ -71,8 +83,9 @@ pub struct BlobDrainResult {
     pub next_due_after: Option<Duration>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct BlobJobScan {
-    pub(super) jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    pub(super) jobs: Vec<Job>,
     /// The generation the scan started in.
     generation: u64,
     pub(super) has_more_due: bool,
@@ -88,124 +101,317 @@ pub(super) struct ReplicationScanCursor {
     pub(super) next_due_ms: Option<u64>,
 }
 
-pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    match next_blob_timer(storage).await {
-        Ok(None) => {}
-        Ok(Some(after)) => {
-            let event = task_handle
-                .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainReplicationQueue,
-                    after,
-                }))
-                .await;
-            if let Event::Task(TaskEvent::Error { message, .. }) = event {
+fn cursor_key() -> Key {
+    ByteView::from(REPLICATION_CURSOR_KEY.to_vec())
+}
+
+fn cursor_read() -> IoCall {
+    read_row(NODE_STATE_KEYSPACE, cursor_key())
+}
+
+fn failed(error: impl std::fmt::Display) -> BlobQueueError {
+    BlobQueueError::UnexpectedEvent(error.to_string())
+}
+
+/// Sets the drain's timer from the queue when the node starts.
+#[derive(Debug, Default, PartialEq)]
+pub struct RestoreBlobTimerOperation {
+    setting: bool,
+}
+
+impl Operation for RestoreBlobTimerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::child(NextBlobTimerOperation::new())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.setting {
+            if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
                 warn!(message = %message, "Failed to restore blob replication timer");
             }
+            return Ok(Next::Done(()));
         }
-        Err(error) => warn!(error = ?error, "Failed to scan blob replication jobs"),
+        match result.child::<Option<Duration>, BlobQueueError>()? {
+            Ok(None) => Ok(Next::Done(())),
+            Ok(Some(after)) => {
+                self.setting = true;
+                let timer = Effect::Task(TaskEffect::ResetTimer {
+                    key: TaskKey::DrainReplicationQueue,
+                    after,
+                });
+                Ok(Next::Call(timer.into()))
+            }
+            Err(error) => {
+                warn!(error = ?error, "Failed to scan blob replication jobs");
+                Ok(Next::Done(()))
+            }
+        }
     }
 }
 
-pub async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
-    if live_obligations_exist(storage).await? || bootstrap_waiting(storage).await {
-        return Ok(Some(Duration::ZERO));
-    }
-
-    let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(storage, now_ms, 1).await?;
-    if !scan.jobs.is_empty() || scan.has_more_due {
-        if scan.jobs.is_empty() {
-            advance_replication_cursor(storage, scan.next_cursor).await?;
-        }
-        return Ok(Some(Duration::ZERO));
-    }
-
-    advance_replication_cursor(storage, scan.next_cursor.clone()).await?;
-
-    Ok(scan
-        .next_due_ms
-        .map(|due_at_ms| due_after(now_ms, due_at_ms)))
+#[derive(Debug, PartialEq)]
+enum TimerStep {
+    Obligations,
+    Bootstrap,
+    Scan,
+    Cursor(Option<Duration>),
 }
 
-pub async fn process_blob_batch(
-    context: &DriverContext,
-) -> Result<BlobDrainResult, BlobQueueError> {
-    drain_batch(context, &MetadataSender(context)).await
+/// When the drain must run next, from the obligations, bootstraps and due jobs.
+#[derive(Debug, PartialEq)]
+pub struct NextBlobTimerOperation {
+    now_ms: u64,
+    step: TimerStep,
+}
+
+impl NextBlobTimerOperation {
+    pub fn new() -> Self {
+        Self {
+            now_ms: 0,
+            step: TimerStep::Obligations,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        cursor: ReplicationScanCursor,
+        after: Option<Duration>,
+    ) -> Turn<Option<Duration>> {
+        self.step = TimerStep::Cursor(after);
+        let advance = AdvanceCursorOperation::new(cursor);
+        Ok(Next::Call(IoCall::child(advance)))
+    }
+}
+
+impl Default for NextBlobTimerOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Operation for NextBlobTimerOperation {
+    type Output = Option<Duration>;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        Ok(Next::Call(IoCall::Page {
+            space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: 1,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match std::mem::replace(&mut self.step, TimerStep::Scan) {
+            TimerStep::Obligations => {
+                if !result.page()?.0.is_empty() {
+                    return Ok(Next::Done(Some(Duration::ZERO)));
+                }
+                self.step = TimerStep::Bootstrap;
+                Ok(Next::Call(IoCall::child(BootstrapWaitingOperation)))
+            }
+            TimerStep::Bootstrap => {
+                if result.child::<bool, IoError>()?.unwrap_or(false) {
+                    return Ok(Next::Done(Some(Duration::ZERO)));
+                }
+                let scan = ScanJobsOperation::new(self.now_ms, 1);
+                Ok(Next::Call(IoCall::child(scan)))
+            }
+            TimerStep::Scan => {
+                let scan = result.child::<BlobJobScan, BlobQueueError>()??;
+                if !scan.jobs.is_empty() {
+                    return Ok(Next::Done(Some(Duration::ZERO)));
+                }
+                let after = match scan.has_more_due {
+                    true => Some(Duration::ZERO),
+                    false => (scan.next_due_ms).map(|due| due_after(self.now_ms, due)),
+                };
+                self.advance(scan.next_cursor, after)
+            }
+            TimerStep::Cursor(after) => {
+                result.child::<(), BlobQueueError>()??;
+                Ok(Next::Done(after))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum BatchStep {
+    Repair,
+    Bootstrap,
+    Scan,
+    Deliver,
+    Relationships,
+    Job(Box<Job>),
+    Retired,
+    Rescheduled,
+    Parked,
+    Cursor,
 }
 
 /// One drain: obligations become jobs, member jobs of reference records go out in pages, and
 /// a bounded number of other jobs is delivered one by one.
-pub(crate) async fn drain_batch(
-    context: &DriverContext,
-    sender: &impl PageSender,
-) -> Result<BlobDrainResult, BlobQueueError> {
-    let batch_started = Instant::now();
-    let repair = process_live_obligations(context).await?;
-    let bootstrap = process_bootstrap(context).await.unwrap_or_else(|error| {
-        warn!(%error, "Distributed bucket bootstrap failed; retrying");
-        true
-    });
-    let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(&context.storage_handle, now_ms, PAGE_RECORDS).await?;
-    let mut next_due_ms = scan.next_due_ms;
-    let mut has_more_due = repair.has_more || scan.has_more_due;
-    let scan_elapsed = batch_started.elapsed();
-    let job_count = scan.jobs.len();
-    // Lag counts from the obligation, which a version's id dates, not from a retry's due time.
-    let oldest_lag_ms = (scan.jobs.iter())
-        .map(|(_, job)| now_ms.saturating_sub(job.owed_since_ms()))
-        .chain(repair.oldest_ms.map(|owed| now_ms.saturating_sub(owed)))
-        .max()
-        .unwrap_or(0);
+#[derive(Debug, PartialEq)]
+pub struct ProcessBlobBatchOperation<T> {
+    transport: T,
+    routing: NodeRouting,
+    serving: Serving,
+    started_ms: u64,
+    scan_ms: u64,
+    step: BatchStep,
+    repair: LiveRepairResult,
+    bootstrap: bool,
+    generation: u64,
+    next_cursor: ReplicationScanCursor,
+    next_due_ms: Option<u64>,
+    has_more_due: bool,
+    job_count: usize,
+    oldest_lag_ms: u64,
+    singles: VecDeque<Job>,
+    relationships: Relationships,
+    succeeded: usize,
+    failed: usize,
+}
 
-    let (paged, mut singles): (Vec<_>, Vec<_>) =
-        (scan.jobs.into_iter()).partition(|(_, job)| pageable(job));
-    let pages = deliver_pages(context, paged, sender).await?;
-    if let Some(due_at_ms) = pages.next_due_ms {
-        next_due_ms = min_due_at(next_due_ms, due_at_ms);
+type BatchTurn = Turn<BlobDrainResult>;
+
+impl<T: PageTransport> ProcessBlobBatchOperation<T> {
+    pub fn new(transport: T, routing: NodeRouting, serving: Serving) -> Self {
+        Self {
+            transport,
+            routing,
+            serving,
+            started_ms: 0,
+            scan_ms: 0,
+            step: BatchStep::Repair,
+            repair: LiveRepairResult::default(),
+            bootstrap: false,
+            generation: 0,
+            next_cursor: ReplicationScanCursor::default(),
+            next_due_ms: None,
+            has_more_due: false,
+            job_count: 0,
+            oldest_lag_ms: 0,
+            singles: VecDeque::new(),
+            relationships: HashMap::new(),
+            succeeded: 0,
+            failed: 0,
+        }
     }
-    // A record held back for a later page is still due.
-    has_more_due |= pages.later > 0;
-    singles.extend(pages.single);
-    singles.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut next_cursor = scan.next_cursor;
-    // Jobs past the single bound stay due; the next drain continues after the last one sent.
-    if singles.len() > REPLICATION_BATCH_SIZE {
-        singles.truncate(REPLICATION_BATCH_SIZE);
-        next_cursor.generation = scan.generation;
-        next_cursor.after = singles.last().map(|(key, _)| key.clone());
-        has_more_due = true;
+
+    fn call(&mut self, step: BatchStep, call: IoCall) -> BatchTurn {
+        self.step = step;
+        Ok(Next::Call(call))
     }
-    let mut succeeded = pages.delivered;
-    let mut failed = pages.failed;
-    let mut relationships = read_job_relationships(&context.storage_handle, &singles).await?;
-    for (job_key, job) in singles {
+
+    fn scanned(&mut self, scan: BlobJobScan) -> BatchTurn {
+        let now_ms = self.started_ms.max(unix_timestamp_millis());
+        self.scan_ms = now_ms.saturating_sub(self.started_ms);
+        self.next_due_ms = scan.next_due_ms;
+        self.has_more_due = self.repair.has_more || scan.has_more_due;
+        self.generation = scan.generation;
+        self.next_cursor = scan.next_cursor;
+        self.job_count = scan.jobs.len();
+        // Lag counts from the obligation, which a version's id dates, not from a retry's due
+        // time.
+        self.oldest_lag_ms = (scan.jobs.iter())
+            .map(|(_, job)| now_ms.saturating_sub(job.owed_since_ms()))
+            .chain(
+                self.repair
+                    .oldest_ms
+                    .map(|owed| now_ms.saturating_sub(owed)),
+            )
+            .max()
+            .unwrap_or(0);
+        let (paged, singles): (Vec<_>, Vec<_>) =
+            (scan.jobs.into_iter()).partition(|(_, job)| pageable(job));
+        self.singles = singles.into();
+        let deliver = DeliverPagesOperation::new(self.transport.clone(), paged);
+        self.call(BatchStep::Deliver, IoCall::child(deliver))
+    }
+
+    fn delivered(&mut self, pages: PageReport) -> BatchTurn {
+        if let Some(due_at_ms) = pages.next_due_ms {
+            self.next_due_ms = min_due_at(self.next_due_ms, due_at_ms);
+        }
+        // A record held back for a later page is still due.
+        self.has_more_due |= pages.later > 0;
+        self.singles.extend(pages.single);
+        let singles = self.singles.make_contiguous();
+        singles.sort_by(|left, right| left.0.cmp(&right.0));
+        // Jobs past the single bound stay due; the next drain continues after the last one sent.
+        if self.singles.len() > REPLICATION_BATCH_SIZE {
+            self.singles.truncate(REPLICATION_BATCH_SIZE);
+            self.next_cursor.generation = self.generation;
+            self.next_cursor.after = self.singles.back().map(|(key, _)| key.clone());
+            self.has_more_due = true;
+        }
+        self.succeeded = pages.delivered;
+        self.failed = pages.failed;
+        let read = JobRelationshipsOperation::new(self.singles.make_contiguous());
+        self.call(BatchStep::Relationships, IoCall::child(read))
+    }
+
+    fn next_job(&mut self) -> BatchTurn {
+        let Some((key, job)) = self.singles.pop_front() else {
+            let advance = AdvanceCursorOperation::new(std::mem::take(&mut self.next_cursor));
+            return self.call(BatchStep::Cursor, IoCall::child(advance));
+        };
         let relationship = job.relationship_id.and_then(|relationship_id| {
-            relationships
-                .get(&(job.input.bucket.clone(), relationship_id))
-                .cloned()
+            let id = (job.input.bucket.clone(), relationship_id);
+            self.relationships.get(&id).cloned()
         });
-        match process_blob_job(context, &job, relationship, &mut relationships).await {
+        let run = ProcessJobOperation::new(
+            job.clone(),
+            relationship,
+            self.routing.clone(),
+            self.serving,
+        );
+        self.call(BatchStep::Job(Box::new((key, job))), IoCall::child(run))
+    }
+
+    fn retire(&mut self, (key, job): Job, outcome: &BlobJobOutcome) -> BatchTurn {
+        let retire = RetireJobOperation::new(key, job, outcome, unix_timestamp_millis());
+        self.call(BatchStep::Retired, IoCall::child(retire))
+    }
+
+    fn reschedule(&mut self, (key, job): Job, error: String) -> BatchTurn {
+        let (write, due) = reschedule_call(key, &job, error, unix_timestamp_millis())?;
+        self.next_due_ms = min_due_at(self.next_due_ms, due);
+        self.failed = self.failed.saturating_add(1);
+        self.call(BatchStep::Rescheduled, write)
+    }
+
+    fn job_done(&mut self, job: Job, run: JobRun) -> BatchTurn {
+        if let (Some(id), Some((relationship, stored))) = (job.1.relationship_id, run.cached) {
+            let key = (job.1.input.bucket.clone(), id);
+            match stored {
+                true => self.relationships.insert(key, relationship),
+                false => self.relationships.remove(&key),
+            };
+        }
+        match run.result {
             Ok(outcome @ (BlobJobOutcome::Completed | BlobJobOutcome::Retired)) => {
-                let retire =
-                    RetireJobOperation::new(job_key, job, &outcome, unix_timestamp_millis());
-                drive(retire, context).await?;
-                succeeded = succeeded.saturating_add(1);
+                self.succeeded = self.succeeded.saturating_add(1);
+                self.retire(job, &outcome)
             }
             // A member job ends only once delivered or no longer owed: a bootstrap counts a
             // deleted job as delivered, so a refusal retries instead.
-            Ok(BlobJobOutcome::Failed) if job.distribution.is_some() => {
-                let refused = "the member did not take the version".to_string();
-                let retry_due_at =
-                    reschedule_blob_job(&context.storage_handle, job_key, &job, refused).await?;
-                next_due_ms = min_due_at(next_due_ms, retry_due_at);
-                failed = failed.saturating_add(1);
+            Ok(BlobJobOutcome::Failed) if job.1.distribution.is_some() => {
+                self.reschedule(job, "the member did not take the version".to_string())
             }
             Ok(outcome @ BlobJobOutcome::Failed) => {
-                let retire =
-                    RetireJobOperation::new(job_key, job, &outcome, unix_timestamp_millis());
-                drive(retire, context).await?;
-                failed = failed.saturating_add(1);
+                self.failed = self.failed.saturating_add(1);
+                self.retire(job, &outcome)
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
             Ok(BlobJobOutcome::AwaitingKey(keys)) => {
