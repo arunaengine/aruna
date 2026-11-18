@@ -536,42 +536,69 @@ mod tests {
         // Reads see the key only after the intent reached the disk.
         let turn = operation.next(write_done(Ok(())));
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::SyncAll)]
-        );
-        let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ActivateKey { ticket })]
+            asked(&turn),
+            &Effect::Blob(BlobEffect::ActivateKey { ticket })
         );
         let mut open = status(ticket);
         (open.remaining, open.max_remaining) = (None, None);
-        let effects = operation.step(Event::Blob(BlobEvent::KeyActivated {
+        let outcome = audit_record(operation.next(blob(BlobEvent::KeyActivated {
             status: open.clone(),
-        }));
-        assert_eq!(record(&effects).outcome, AuditOutcome::Applied);
-        operation.step(written());
-        assert_eq!(operation.finalize(), Ok(open));
+        })));
+        assert_eq!(outcome.outcome, AuditOutcome::Applied);
+        assert_eq!(operation.next(write_done(Ok(()))), Ok(Next::Done(open)));
+    }
 
+    #[test]
+    fn lost_intent_discards() {
         // A lost intent write leaves the key prepared nowhere and records nothing.
-        let (mut lost, ticket) = prepared();
-        lost.audit = Some(InstallAudit {
-            node_id: node,
-            actor: None,
-            now_ms: 1,
-        });
-        lost.state = InstallState::WriteIntent;
-        let error = StorageError::Timeout;
-        let effects = lost.step(Event::Storage(StorageEvent::Error { error }));
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut lost = InstallKeyOperation::new(input(None, None)).audited(node, None, 1);
+        lost.first().unwrap();
+        let ticket = ticket_of(&lost);
+        lost.next(blob(BlobEvent::KeyPrepared { ticket })).unwrap();
+        let turn = lost.next(write_done(Err(StorageError::Timeout)));
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::DiscardKey { ticket })]
+            asked(&turn),
+            &Effect::Blob(BlobEffect::DiscardKey { ticket })
         );
-        let effects = lost.step(Event::Blob(BlobEvent::KeyDiscarded { ticket }));
-        assert!(effects.is_empty());
         assert_eq!(
-            lost.finalize(),
+            lost.next(blob(BlobEvent::KeyDiscarded { ticket })),
             Err(InstallError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn outcome_moves_to_timer() {
+        // The key is active either way; a lasting outage hands the record to its retry timer.
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation = InstallKeyOperation::new(input(None, None)).audited(node, None, 1_000);
+        operation.first().unwrap();
+        let ticket = ticket_of(&operation);
+        operation
+            .next(blob(BlobEvent::KeyPrepared { ticket }))
+            .unwrap();
+        operation.next(write_done(Ok(()))).unwrap();
+        let mut open = status(ticket);
+        (open.remaining, open.max_remaining) = (None, None);
+        operation
+            .next(blob(BlobEvent::KeyActivated {
+                status: open.clone(),
+            }))
+            .unwrap();
+        for _ in 1..AUDIT_ATTEMPTS {
+            let turn = operation.next(write_done(Err(StorageError::Timeout)));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        }
+        let turn = operation.next(write_done(Err(StorageError::Timeout)));
+        let record = operation.outcome.clone().unwrap();
+        assert_eq!(asked(&turn), &retry_effect(&record));
+        let armed = aruna_core::task::TaskEvent::TimerScheduled {
+            key: retry_timer(&record),
+            after: crate::s3::bucket::audit_retry::AUDIT_RETRY,
+        };
+        assert_eq!(
+            operation.next(event(Event::Task(armed))),
+            Ok(Next::Done(open))
         );
     }
 
@@ -579,32 +606,28 @@ mod tests {
     fn failed_activation_discards() {
         let refused = || BlobError::BucketKey(BucketKeyError::Capacity);
         let (mut operation, ticket) = prepared();
-        let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
+        let turn = operation.next(blob(BlobEvent::Error(refused())));
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::DiscardKey { ticket })]
+            asked(&turn),
+            &Effect::Blob(BlobEffect::DiscardKey { ticket })
         );
-        operation.step(Event::Blob(BlobEvent::KeyDiscarded { ticket }));
-        assert_eq!(operation.finalize(), Err(InstallError::Blob(refused())));
+        assert_eq!(
+            operation.next(blob(BlobEvent::KeyDiscarded { ticket })),
+            Err(InstallError::Blob(refused()))
+        );
 
-        // An unexpected answer discards the prepared key this operation owns.
+        // An unexpected answer ends the run, whose cleanup discards the prepared key.
         let (mut stray, ticket) = prepared();
-        let effects = stray.step(Event::Blob(BlobEvent::KeyDiscarded { ticket }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::DiscardKey { ticket })]
-        );
-        assert!(matches!(
-            stray.finalize(),
-            Err(InstallError::InvalidStateEvent { .. })
-        ));
+        let turn = stray.next(blob(BlobEvent::KeyDiscarded { ticket }));
+        assert!(matches!(turn, Err(InstallError::InvalidStateEvent { .. })));
+        let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        assert_eq!(stray.abort(), vec![discard]);
 
         // A run stopped before activation discards the prepared key too.
         let (mut stopped, ticket) = prepared();
-        assert_eq!(
-            stopped.abort().as_slice(),
-            [Effect::Blob(BlobEffect::DiscardKey { ticket })]
-        );
+        let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        assert_eq!(stopped.abort(), vec![discard]);
+        assert!(stopped.abort().is_empty());
     }
 
     async fn enabled_context() -> (
