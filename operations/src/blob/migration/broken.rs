@@ -270,30 +270,107 @@ impl StoreCheckOperation {
     }
 }
 
-/// One page of a bucket's broken versions after `after`, and the key the next page starts after.
-pub async fn list_broken(
-    context: &DriverContext,
-    bucket: &str,
-    after: Option<Key>,
-    limit: usize,
-) -> Result<(Vec<(VersionKey, BrokenVersion)>, Option<Key>), String> {
-    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (rows, next) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        BROKEN_VERSION_KEYSPACE,
-        Some(prefix.into()),
+impl Operation for StoreCheckOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(read_row(
+            STORAGE_CHECK_KEYSPACE,
+            self.key.clone(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            StoreStep::Current => {
+                let stored = decode_check(result.value()?)?;
+                let started = self.record.started_at_ms;
+                if stored.is_none_or(|stored| stored.started_at_ms != started) {
+                    return Ok(Next::Done(()));
+                }
+                self.step = StoreStep::Written;
+                let row = (
+                    STORAGE_CHECK_KEYSPACE.to_string(),
+                    self.key.clone(),
+                    self.record.to_bytes()?.into(),
+                );
+                Ok(Next::Call(IoCall::Write(vec![row])))
+            }
+            StoreStep::Written => {
+                result.done()?;
+                if self.record.finished_at_ms.is_none() {
+                    return Ok(Next::Done(()));
+                }
+                self.step = StoreStep::Left;
+                let row = (CHECK_QUEUE_KEYSPACE.to_string(), self.key.clone());
+                Ok(Next::Call(IoCall::Delete(vec![row])))
+            }
+            StoreStep::Left => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+fn broken_rows(
+    rows: Vec<(Key, Value)>,
+) -> Result<VecDeque<(VersionKey, BrokenVersion)>, MigrationError> {
+    let decode = |(key, value): (Key, Value)| -> Result<_, MigrationError> {
+        let key = VersionKey::from_bytes(key.as_ref())?;
+        Ok((key, BrokenVersion::from_bytes(value.as_ref())?))
+    };
+    rows.into_iter().map(decode).collect()
+}
+
+fn broken_page(bucket: &str, after: Option<Key>, limit: usize) -> Result<IoCall, MigrationError> {
+    Ok(IoCall::Page {
+        space: BROKEN_VERSION_KEYSPACE.to_string(),
+        prefix: VersionKey::bucket_prefix(bucket)?.into(),
         after,
         limit,
-        None,
-    )
-    .await?;
-    let mut broken = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
-        let key = VersionKey::from_bytes(key.as_ref()).map_err(|error| error.to_string())?;
-        let row = BrokenVersion::from_bytes(value.as_ref()).map_err(|error| error.to_string())?;
-        broken.push((key, row));
+    })
+}
+
+/// One page of a bucket's broken versions and the key the next page starts after.
+pub type BrokenPage = (Vec<(VersionKey, BrokenVersion)>, Option<Key>);
+
+/// Lists one page of a bucket's broken versions after `after`.
+#[derive(Debug, PartialEq)]
+pub struct ListBrokenOperation {
+    bucket: String,
+    after: Option<Key>,
+    limit: usize,
+}
+
+impl ListBrokenOperation {
+    pub fn new(bucket: &str, after: Option<Key>, limit: usize) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            after,
+            limit,
+        }
     }
-    Ok((broken, next))
+}
+
+impl Operation for ListBrokenOperation {
+    type Output = BrokenPage;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<BrokenPage> {
+        let page = broken_page(&self.bucket, self.after.take(), self.limit)?;
+        Ok(Next::Call(page))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<BrokenPage> {
+        let (rows, next) = result.page()?;
+        Ok(Next::Done((broken_rows(rows)?.into(), next)))
+    }
 }
 
 /// What one cleanup request did.
@@ -310,125 +387,249 @@ pub struct Cleaned {
     pub exhausted: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum CleanStep {
+    Page,
+    Authorize(VersionKey, BrokenVersion),
+    Delete(VersionKey),
+    Cleared(VersionKey, bool),
+}
+
+/// The bucket and the actor a cleanup deletes for.
+#[derive(Debug, PartialEq)]
+struct CleanScope {
+    bucket: String,
+    group_id: GroupId,
+    realm_id: RealmId,
+    node_id: NodeId,
+    deleted_by: UserId,
+    restrictions: Option<Vec<PathRestriction>>,
+}
+
 /// Deletes up to `limit` recorded broken versions after `after`, authorized for `auth` per path,
 /// each only while its record is still the recorded one. At most `scan` rows are read;
 /// denied rows do not count toward `limit` and never name `next`.
-pub async fn clean_broken(
-    context: &DriverContext,
-    template: &crate::s3::object::delete::DeleteObjectInput,
-    auth: &aruna_core::structs::identity::auth::AuthContext,
+#[derive(Debug, PartialEq)]
+pub struct CleanBrokenOperation {
+    scope: CleanScope,
+    auth: AuthContext,
     after: Option<Key>,
     limit: usize,
     scan: usize,
-) -> Result<Cleaned, String> {
-    let (mut after, mut handled, mut examined) = (after, 0, 0);
-    let mut last = None;
-    let mut cleaned = Cleaned::default();
-    loop {
-        if examined == scan {
-            cleaned.exhausted = handled == 0;
-            cleaned.next = last;
-            return Ok(cleaned);
+    step: CleanStep,
+    rows: VecDeque<(VersionKey, BrokenVersion)>,
+    more: Option<Key>,
+    handled: usize,
+    examined: usize,
+    last: Option<Key>,
+    cleaned: Cleaned,
+}
+
+impl CleanBrokenOperation {
+    pub fn new(
+        template: &DeleteObjectInput,
+        auth: &AuthContext,
+        after: Option<Key>,
+        (limit, scan): (usize, usize),
+    ) -> Self {
+        Self {
+            scope: CleanScope {
+                bucket: template.bucket.clone(),
+                group_id: template.group_id,
+                realm_id: template.realm_id,
+                node_id: template.node_id,
+                deleted_by: template.deleted_by,
+                restrictions: auth.path_restrictions.clone(),
+            },
+            auth: auth.clone(),
+            after,
+            limit,
+            scan,
+            step: CleanStep::Page,
+            rows: VecDeque::new(),
+            more: None,
+            handled: 0,
+            examined: 0,
+            last: None,
+            cleaned: Cleaned::default(),
         }
-        let page = limit.min(scan - examined);
-        let (rows, next) = list_broken(context, &template.bucket, after.take(), page).await?;
-        for (key, row) in rows {
-            if handled == limit {
-                cleaned.next = last;
-                return Ok(cleaned);
-            }
-            examined += 1;
-            if clean_one(context, template, auth, &key, row, &mut cleaned).await? {
-                handled += 1;
-                last = Some(key.to_bytes().map_err(|error| error.to_string())?.into());
-            }
+    }
+
+    fn finish(&mut self) -> Turn<Cleaned> {
+        Ok(Next::Done(std::mem::take(&mut self.cleaned)))
+    }
+
+    fn read_page(&mut self) -> Turn<Cleaned> {
+        if self.examined == self.scan {
+            self.cleaned.exhausted = self.handled == 0;
+            self.cleaned.next = self.last.take();
+            return self.finish();
         }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(cleaned),
+        let page = self.limit.min(self.scan - self.examined);
+        self.step = CleanStep::Page;
+        let call = broken_page(&self.scope.bucket, self.after.take(), page)?;
+        Ok(Next::Call(call))
+    }
+
+    fn next_row(&mut self) -> Turn<Cleaned> {
+        let Some((key, row)) = self.rows.pop_front() else {
+            return match self.more.take() {
+                Some(next) => {
+                    self.after = Some(next);
+                    self.read_page()
+                }
+                None => self.finish(),
+            };
+        };
+        if self.handled == self.limit {
+            self.cleaned.next = self.last.take();
+            return self.finish();
+        }
+        self.examined += 1;
+        let scope = &self.scope;
+        let path = object_permission_path(
+            scope.realm_id,
+            scope.group_id,
+            scope.node_id,
+            &key.bucket,
+            &key.key,
+        );
+        let authorize = AuthorizeOperation::new(
+            scope.realm_id,
+            &self.auth,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        );
+        self.step = CleanStep::Authorize(key, row);
+        Ok(Next::Call(IoCall::child(authorize)))
+    }
+
+    fn delete(&mut self, key: VersionKey, row: BrokenVersion) -> Turn<Cleaned> {
+        let scope = &self.scope;
+        let input = DeleteObjectInput {
+            bucket: key.bucket.clone(),
+            key: key.key.clone(),
+            version_id: Some(key.version_id),
+            group_id: scope.group_id,
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            deleted_by: scope.deleted_by,
+        };
+        let delete = DeleteObjectOperation::new(input)
+            .with_restrictions(scope.restrictions.clone())
+            .with_expected(row.version);
+        self.step = CleanStep::Delete(key);
+        Ok(Next::Call(IoCall::child(delete)))
+    }
+
+    fn handled_row(&mut self, key: &VersionKey) -> Turn<Cleaned> {
+        self.handled += 1;
+        self.last = Some(key.to_bytes()?.into());
+        self.next_row()
+    }
+
+    /// A version deleted meanwhile only leaves its row behind.
+    fn deleted(
+        &mut self,
+        key: VersionKey,
+        outcome: Result<DeleteObjectResult, DeleteObjectError>,
+    ) -> Turn<Cleaned> {
+        let deleted = match outcome {
+            Ok(_) => true,
+            Err(DeleteObjectError::NoSuchVersion) => false,
+            Err(error) => {
+                if error != DeleteObjectError::VersionChanged {
+                    tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+                }
+                self.cleaned.kept += 1;
+                return self.handled_row(&key);
+            }
+        };
+        let row = (BROKEN_VERSION_KEYSPACE.to_string(), key.to_bytes()?.into());
+        self.step = CleanStep::Cleared(key, deleted);
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+}
+
+impl Operation for CleanBrokenOperation {
+    type Output = Cleaned;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Cleaned> {
+        self.read_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Cleaned> {
+        match std::mem::replace(&mut self.step, CleanStep::Page) {
+            CleanStep::Page => {
+                let (rows, more) = result.page()?;
+                self.rows = broken_rows(rows)?;
+                self.more = more;
+                self.next_row()
+            }
+            CleanStep::Authorize(key, row) => match result.child::<(), AuthorizeError>()? {
+                Ok(()) => self.delete(key, row),
+                Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+                    self.cleaned.denied += 1;
+                    self.next_row()
+                }
+                Err(error) => Err(MigrationError::failed(error)),
+            },
+            CleanStep::Delete(key) => self.deleted(key, result.child()?),
+            CleanStep::Cleared(key, deleted) => {
+                result.done()?;
+                self.cleaned.deleted += u64::from(deleted);
+                self.handled_row(&key)
+            }
         }
     }
 }
 
-/// Cleans one recorded version; `false` when the caller may not delete it.
-async fn clean_one(
-    context: &DriverContext,
-    template: &crate::s3::object::delete::DeleteObjectInput,
-    auth: &aruna_core::structs::identity::auth::AuthContext,
-    key: &VersionKey,
-    row: BrokenVersion,
-    cleaned: &mut Cleaned,
-) -> Result<bool, String> {
-    use crate::auth::error::AuthorizeError;
-    use crate::auth::request_authorization::authorize;
-    use crate::auth::request_policy::PolicyRequestExtras;
-    use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-    use aruna_core::structs::identity::auth::Permission;
-    let path = aruna_core::structs::storage::blob::object_permission_path(
-        template.realm_id,
-        template.group_id,
-        template.node_id,
-        &key.bucket,
-        &key.key,
-    );
-    let extras = PolicyRequestExtras::rest();
-    match authorize(
-        context,
-        template.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        extras,
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
-            cleaned.denied += 1;
-            return Ok(false);
-        }
-        Err(error) => return Err(error.to_string()),
-    }
-    let input = DeleteObjectInput {
-        bucket: key.bucket.clone(),
-        key: key.key.clone(),
-        version_id: Some(key.version_id),
-        group_id: template.group_id,
-        realm_id: template.realm_id,
-        node_id: template.node_id,
-        deleted_by: template.deleted_by,
-    };
-    let operation = DeleteObjectOperation::new(input)
-        .with_restrictions(auth.path_restrictions.clone())
-        .with_expected(row.version);
-    // A version deleted meanwhile only leaves its row behind.
-    let deleted = match crate::driver::drive(operation, context).await {
-        Ok(_) => true,
-        Err(DeleteObjectError::NoSuchVersion) => false,
-        Err(error) => {
-            if error != DeleteObjectError::VersionChanged {
-                tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
-            }
-            cleaned.kept += 1;
-            return Ok(true);
-        }
-    };
-    let delete = StorageEffect::Delete {
-        key_space: BROKEN_VERSION_KEYSPACE.to_string(),
-        key: key.to_bytes().map_err(|error| error.to_string())?.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => cleaned.deleted += u64::from(deleted),
-        other => {
-            return Err(format!(
-                "could not clear a broken version: {}",
-                other.label()
-            ));
-        }
-    }
-    Ok(true)
+/// Whether `key` names the current version of its object.
+#[derive(Debug, PartialEq)]
+pub struct IsCurrentOperation {
+    key: VersionKey,
 }
+
+impl IsCurrentOperation {
+    pub fn new(key: &VersionKey) -> Self {
+        Self { key: key.clone() }
+    }
+}
+
+impl Operation for IsCurrentOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        let head = BlobHeadKey::new(self.key.bucket.clone(), self.key.key.clone());
+        Ok(Next::Call(read_row(BLOB_HEAD_KEYSPACE, head.to_bytes()?)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        let current = match result.value()? {
+            Some(value) => {
+                CurrentVersionPointer::from_bytes(value.as_ref())?.version_id == self.key.version_id
+            }
+            None => false,
+        };
+        Ok(Next::Done(current))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use ulid::Ulid;
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
 
 /// Whether `key` names the current version of its object.
 pub async fn is_current(context: &DriverContext, key: &VersionKey) -> Result<bool, String> {
