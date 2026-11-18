@@ -55,7 +55,7 @@ use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::s3::imports::discovery::{
-    FileOutcome, SetDiscoveryOperation, authorized_preview,
+    AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
@@ -391,9 +391,12 @@ async fn s3_previews_discovery() {
         place(&context, name, name.as_bytes()).await;
     }
     let caller = (&context.auth, context.node_id);
-    let preview = authorized_preview(&context.driver, caller, &context.rule, &proteins(), None)
-        .await
-        .unwrap();
+    let preview = drive(
+        AuthorizedPreviewOperation::new(caller, &context.rule, &proteins(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let placed: Vec<_> = (preview.files.iter())
         .map(|file| (file.key.as_deref(), file.outcome.clone()))
         .collect();
@@ -407,9 +410,12 @@ async fn s3_previews_discovery() {
     );
     assert_eq!(preview.next, None);
     let after = Some(format!("{}/raw/b.txt", context.folder));
-    let rest = authorized_preview(&context.driver, caller, &context.rule, &proteins(), after)
-        .await
-        .unwrap();
+    let rest = drive(
+        AuthorizedPreviewOperation::new(caller, &context.rule, &proteins(), after),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(rest.files.len(), 1);
     assert_eq!(rest.files[0].key.as_deref(), Some("proteins/sub/c.faa.gz"));
 }
