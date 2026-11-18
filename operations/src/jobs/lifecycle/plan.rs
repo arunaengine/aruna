@@ -947,7 +947,8 @@ mod tests {
                     Ok::<_, GetHoldersError>(Vec::<NodeId>::new()),
                 )),
                 (PlanStep::Policies, IoCall::Child(_)) => {
-                    IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(Resolutions::new())))
+                    let resolved = Ok::<_, PolicySetError>(Resolutions::new());
+                    IoResult::Child(ChildOutcome::new(resolved))
                 }
                 (_, IoCall::Read(reads)) => IoResult::Values(vec![None; reads.len()]),
                 (step, call) => panic!("unexpected call {call:?} in {step:?}"),
