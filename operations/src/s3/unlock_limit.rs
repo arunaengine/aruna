@@ -180,7 +180,7 @@ mod tests {
             compression: Compression::Off,
             distribution: None,
         };
-        crate::s3::bucket::key::rows::authority_rows(&info, Some(settings), admins)
+        crate::s3::bucket::key::test_rows::authority_rows(&info, Some(settings), admins)
     }
 
     fn run(max_unlock_ms: Option<u64>, expected: u64) -> (UnlockLimitOperation, Step) {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key::rows::authority_rows;
+use crate::s3::bucket::key::test_rows::authority_rows;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::structs::execution::notification::NotificationOutboxRecord;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;

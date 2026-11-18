@@ -333,7 +333,7 @@ impl Operation for AuditPageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::bucket::key::rows::authority_rows;
+    use crate::s3::bucket::key::test_rows::authority_rows;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::key_audit::AuditOutcome;

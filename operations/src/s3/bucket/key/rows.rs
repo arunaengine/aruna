@@ -94,7 +94,7 @@ pub(crate) fn keyless(values: Vec<Option<Value>>) -> Vec<(Key, Option<Value>)> {
         .collect()
 }
 
-/// The state an `authority_read` returned; admins hold WRITE on the group admin path now.
+/// The state the rows of [`authority_keys`] hold; admins hold WRITE on the group admin path now.
 pub fn parse_authority(
     mut values: Vec<(Key, Option<Value>)>,
     realm_id: RealmId,
@@ -119,46 +119,6 @@ pub fn parse_authority(
         settings,
         admins,
     })
-}
-
-/// Rows an `authority_read` answers with, where `admins` hold the group admin role.
-#[cfg(test)]
-pub(crate) fn authority_rows(
-    info: &BucketInfo,
-    settings: Option<&BucketEncryption>,
-    admins: &[UserId],
-) -> Vec<(Key, Option<Value>)> {
-    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
-    let realm_id = info.created_by.realm_id;
-    let actor = Actor {
-        node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-        user_id: info.created_by,
-        realm_id,
-    };
-    let realm = RealmAuthorizationDocument {
-        realm_id,
-        roles: Default::default(),
-        operation_restrictions: Default::default(),
-    };
-    let admin = Role {
-        role_id: ulid::Ulid::from_bytes([1; 16]),
-        name: "keepers".to_string(),
-        permissions: [(group_admin_path(realm_id, info.group_id), Permission::WRITE)].into(),
-        assigned_users: admins.iter().copied().collect(),
-    };
-    let group = GroupAuthorizationDocument {
-        group_id: info.group_id,
-        roles: [(admin.role_id, admin)].into(),
-        policies: Vec::new(),
-    };
-    let row = |value: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(value)));
-    let settings = settings.map(|settings| Value::from(settings.to_bytes().unwrap()));
-    vec![
-        row(info.to_bytes().unwrap()),
-        (Key::from(Vec::new()), settings),
-        row(realm.to_bytes(&actor).unwrap()),
-        row(group.to_bytes(&actor).unwrap()),
-    ]
 }
 
 /// The bucket record and settings read together; the bucket must belong to `group_id`.
@@ -272,6 +232,7 @@ pub fn generation_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::key::test_rows::authority_rows;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::vault::UserKeyRecord;
     use aruna_core::structs::placement::record::PlacementRef;

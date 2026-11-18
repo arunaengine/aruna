@@ -160,7 +160,6 @@ pub fn iter_index_effect(
 pub fn iter_hash_page(
     blake3_hash: &[u8],
     start_after: Option<Key>,
-    txn_id: Option<TxnId>,
     limit: usize,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Iter {
