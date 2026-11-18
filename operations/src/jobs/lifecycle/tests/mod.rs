@@ -7,6 +7,7 @@ mod admission_race;
 mod cancel;
 mod capacity;
 mod family_reads;
+mod launch_admit;
 mod refusals;
 mod report;
 mod run_link;

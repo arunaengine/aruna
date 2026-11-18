@@ -904,3 +904,275 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
         matches!(&envelope.record, JobFamilyRecord::Cancel(_)) && envelope.family() == family
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::jobs::lifecycle::ids;
+    use aruna_core::scheduling::PlannedInput;
+    use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
+
+    use super::*;
+    use crate::tests::records::{Family, REALM};
+    use aruna_core::structs::placement::policy::PlacementSubject;
+
+    fn limits() -> ResourceEnvelope {
+        ResourceEnvelope {
+            max_cpu_cores: Some(8),
+            max_ram_bytes: Some(8_192),
+            max_disk_bytes: Some(16_384),
+            max_concurrent: Some(4),
+        }
+    }
+
+    /// An offer whose checks have passed up to the point under test.
+    fn prepared(family: &Family, limits: Option<ResourceEnvelope>) -> AdmitLaunchOperation {
+        let spec = family.spec();
+        let intent = family.launch(&spec, family.holder.public(), 0);
+        let record = JobFamilyRecord::Launch(Box::new(intent.clone()));
+        let frame = LaunchFrame::new(family.sign(&family.holder, record)).expect("bounded");
+        let node = LaunchNode {
+            local: family.target.public(),
+            realm_id: REALM,
+            now_ms: 4_000,
+            execution_id: Ulid::from_parts(9, 9),
+            limits,
+        };
+        let mut config = family.config.clone();
+        config.seed_job_control(family.target.public(), 0);
+        let mut operation = AdmitLaunchOperation::new(frame, node);
+        operation.config = Some(config);
+        operation.planned = Some(intent.clone());
+        operation.intent = Some(intent);
+        operation.spec = Some(spec);
+        operation
+    }
+
+    fn capability(family: &Family) -> ExecutorCapability {
+        let subject = PlacementSubject {
+            node_id: family.target.public(),
+            generation: 1,
+            location: "eu".to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        ExecutorCapability::new(family.target_id().executor_kind, subject).expect("subject")
+    }
+
+    fn declined(reason: LaunchDecline) -> AdmitNext {
+        Ok(Next::Done(LaunchAnswer::declined(reason)))
+    }
+
+    // A cancelled family is declined, and one this node already ran stays refused.
+    #[test]
+    fn decide_refuses_family() {
+        let family = Family::new([8; 32]);
+        let cancel = JobFamilyRecord::Cancel(family.cancel(&family.spec()));
+        let cancel = family.sign(&family.holder, cancel);
+        let mut operation = prepared(&family, Some(limits()));
+        assert_eq!(
+            operation.decide(vec![cancel]),
+            declined(LaunchDecline::Cancelled)
+        );
+    }
+
+    // A replayed offer answers with the stored receipt instead of reserving again.
+    #[test]
+    fn replay_settles_receipt() {
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        let intent = operation.intent.clone().expect("intent");
+        let mut receipt = family.receipt(&intent, 1);
+        receipt.launch_digest = JobRecordBody::digest(&intent).expect("digest");
+        let record = JobFamilyRecord::Receipt(Box::new(receipt));
+        let stored = family.sign(&family.target, record);
+        assert!(matches!(
+            operation.decide(vec![stored]),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.step, AdmitStep::Replay);
+    }
+
+    // An executor kind not offered here drains, and a job over its limits has no capacity.
+    #[test]
+    fn limits_decide_fit() {
+        let family = Family::new([8; 32]);
+        let capability = capability(&family);
+        let mut absent = prepared(&family, None);
+        assert_eq!(
+            absent.checked(capability.clone()),
+            declined(LaunchDecline::Draining)
+        );
+        let small = ResourceEnvelope {
+            max_cpu_cores: Some(0),
+            ..limits()
+        };
+        let mut full = prepared(&family, Some(small));
+        assert_eq!(full.checked(capability), declined(LaunchDecline::Capacity));
+    }
+
+    // The receipt names the minted run and the membership read, and is signed by this node.
+    #[test]
+    fn sign_builds_receipt() {
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        let next = operation.sign(&capability(&family), 7);
+        let Ok(Next::Call(IoCall::Effect(effect))) = next else {
+            panic!("the receipt is signed: {next:?}");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = *effect else {
+            panic!("expected an execution claim");
+        };
+        assert_eq!(claim.publisher, family.target.public());
+        let JobFamilyRecord::Receipt(receipt) = claim.record else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(receipt.membership_generation, 7);
+        assert_eq!(receipt.execution_id, Ulid::from_parts(9, 9));
+        assert_eq!(receipt.accepted_at_ms, 4_000);
+    }
+
+    // A node without a job control binding cannot admit and answers as draining.
+    #[test]
+    fn unbound_node_drains() {
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        operation.config = Some(family.config.clone());
+        assert_eq!(
+            operation.sign(&capability(&family), 0),
+            declined(LaunchDecline::Draining)
+        );
+    }
+
+    // A refused signature ends the offer; a signed receipt goes on to the commit.
+    #[test]
+    fn signature_decides_commit() {
+        let family = Family::new([8; 32]);
+        let signed = |event| IoResult::Event(Box::new(Event::Net(NetEvent::ExecutionSign(event))));
+        let answer = |event| {
+            let mut operation = prepared(&family, Some(limits()));
+            let next = operation.sign(&capability(&family), 0);
+            assert!(next.is_ok());
+            let AdmitStep::Sign(prepared) =
+                std::mem::replace(&mut operation.step, AdmitStep::Commit)
+            else {
+                panic!("the step waits for the signature");
+            };
+            operation.commit(*prepared, signed(event))
+        };
+        let refused = ExecutionSignEvent::Unavailable("no key".to_string());
+        assert_eq!(answer(refused), declined(LaunchDecline::Unauthorized));
+        let intent = family.launch(&family.spec(), family.holder.public(), 0);
+        let receipt = JobFamilyRecord::Receipt(Box::new(family.receipt(&intent, 1)));
+        let envelope = family.sign(&family.target, receipt);
+        let good = ExecutionSignEvent::Signed(Box::new(envelope));
+        assert!(matches!(answer(good), Ok(Next::Call(IoCall::Child(_)))));
+    }
+
+    #[test]
+    fn materializes_captured_inputs() {
+        // The physical row must execute the exact input, resources, backend, and retention stored.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        spec.payload.inputs.push(InputSelection {
+            source: InputSource::S3 {
+                bucket: "source".to_string(),
+                key: "reads.fastq".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "reads.fastq".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        });
+        let mut launch = family.launch(&spec, family.holder.public(), 0);
+        let version_id = Ulid::from_bytes([11u8; 16]);
+        launch.inputs.push(PlannedInput {
+            destination_key: "reads.fastq".to_string(),
+            version_id,
+            content: aruna_core::structs::execution::job::InputContent::Blake3([12u8; 32]),
+            bytes: 3,
+            policies: Vec::new(),
+            source_node_id: None,
+            transfer_ms: 0,
+            known_link: true,
+        });
+
+        let record = materialize_local(
+            &spec,
+            &launch,
+            JobId::from_bytes([10u8; 16]),
+            family.target.public(),
+            4_000,
+        )
+        .expect("launch materializes");
+        let JobPayload::Execution(payload) = record.payload else {
+            panic!("expected execution payload");
+        };
+        let InputSource::S3 {
+            version_id: pinned, ..
+        } = &payload.inputs[0].source;
+        let expected_version = version_id.to_string();
+        assert_eq!(pinned.as_deref(), Some(expected_version.as_str()));
+        assert_eq!(payload.resources.cpu_cores, Some(spec.resources.cpu_cores));
+        assert_eq!(payload.resources.ram_bytes, Some(spec.resources.ram_bytes));
+        assert_eq!(
+            payload.resources.disk_bytes,
+            Some(spec.resources.disk_bytes)
+        );
+        assert_eq!(payload.executor_constraint, Some("docker".to_string()));
+        assert_eq!(record.retention_ms, spec.retention_ms);
+    }
+
+    #[test]
+    fn disk_stays_none() {
+        // A request without a disk ceiling stores zero, which no backend accepts
+        // as a container limit.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        spec.resources.disk_bytes = 0;
+        let launch = family.launch(&spec, family.holder.public(), 0);
+
+        let record = materialize_local(
+            &spec,
+            &launch,
+            JobId::from_bytes([10u8; 16]),
+            family.target.public(),
+            4_000,
+        )
+        .expect("launch materializes");
+        let JobPayload::Execution(payload) = record.payload else {
+            panic!("expected execution payload");
+        };
+        assert_eq!(payload.resources.disk_bytes, None);
+    }
+
+    #[test]
+    fn remote_existing_rejected() {
+        // Existing workspace contents are node-local until whole-bucket staging exists.
+        let family = Family::new([8u8; 32]);
+        let mut spec = family.spec();
+        let ingress = family.holder.public();
+        spec.ingress_node_id = ingress;
+        spec.payload.workspace_outputs.push(WorkspaceOutput {
+            container_path: "/out/result.txt".to_string(),
+            dest_key: "results/result.txt".to_string(),
+        });
+        ids::store_workspace(
+            &mut spec.payload,
+            WorkspaceMode::Existing,
+            Some("existing".to_string()),
+        )
+        .expect("workspace stored");
+        spec.payload.resolve_outputs("existing", ingress);
+        let launch = family.launch(&spec, family.holder.public(), 0);
+        let physical_id = JobId::from_bytes([10u8; 16]);
+
+        assert_eq!(
+            materialize_local(&spec, &launch, physical_id, family.target.public(), 4_000),
+            Err(LaunchDecline::Unauthorized)
+        );
+    }
+}
