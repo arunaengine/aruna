@@ -213,14 +213,13 @@ pub(crate) fn scan_call(key_space: &str, prefix: Key) -> IoCall {
     }
 }
 
-pub(crate) fn full_scan(key_space: &str, prefix: Option<Key>, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix,
-        start: None,
+pub(crate) fn full_scan(key_space: &str, prefix: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.unwrap_or_else(|| Key::from(Vec::new())),
+        after: None,
         limit: u64::MAX as usize,
-        txn_id,
-    })
+    }
 }
 
 /// Whether a multipart upload of `bucket` is open; it captured the stored format of its start.
