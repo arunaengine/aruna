@@ -68,11 +68,9 @@ use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget
 use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{
-    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
-};
+use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node};
 use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
@@ -149,7 +147,10 @@ use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
-use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::replication::drain::{
+    ProcessBlobBatchOperation, REPLICATION_RETRY_AFTER, RestoreBlobTimerOperation,
+};
+use crate::replication::page::deliver::MetadataPages;
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{

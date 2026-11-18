@@ -21,7 +21,7 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::plugin_host::peer::serve_peer;
-use crate::replication::catch_up::wake_bootstrap;
+use crate::replication::catch_up::WakeBootstrapOperation;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -447,7 +447,7 @@ async fn reconcile_inbound_topics(
         warn!(%error, "Mail settings refresh stopped after a document sync");
     }
     // An installed record may name a member this node bootstraps.
-    wake_bootstrap(context).await;
+    drive(WakeBootstrapOperation::default(), context).await.ok();
     let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");

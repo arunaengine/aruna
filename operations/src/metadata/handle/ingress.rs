@@ -1019,7 +1019,9 @@ impl MetadataHandle {
                     let serve = crate::distribution::forward::serve_admission(context, peer, admit);
                     crate::driver::drive(serve, context)
                         .await
-                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
+                        .unwrap_or_else(|error| {
+                            crate::forward::transport::reject(error.to_string())
+                        })
                 })
                 .await
             }
@@ -1029,7 +1031,9 @@ impl MetadataHandle {
                     let serve = crate::distribution::forward::serve_publish(context, peer, publish);
                     crate::driver::drive(serve, context)
                         .await
-                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
+                        .unwrap_or_else(|error| {
+                            crate::forward::transport::reject(error.to_string())
+                        })
                 })
                 .await
             }
@@ -1230,10 +1234,17 @@ impl MetadataHandle {
                 (MetadataTransportMessage::StagingSpecResult { result }, None)
             }
             MetadataTransportMessage::ReferencePage { page } => {
-                let answer = Box::pin(crate::replication::page::deliver::serve_page(
-                    context, peer, *page,
-                ));
-                let answer = answer.await;
+                let serve = crate::replication::page::deliver::ServePageOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    *page,
+                );
+                let answer = crate::driver::drive(serve, context).await;
+                let answer =
+                    answer.unwrap_or_else(|error| crate::replication::page::PageAnswer::Refused {
+                        reason: error.to_string(),
+                        retry: true,
+                    });
                 (
                     MetadataTransportMessage::ReferencePageAnswer { answer },
                     None,

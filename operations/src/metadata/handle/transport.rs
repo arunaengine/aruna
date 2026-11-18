@@ -759,25 +759,6 @@ impl MetadataHandle {
         }
     }
 
-    /// Sends a reference page to a member; an error leaves its outcome unknown.
-    pub(crate) async fn request_reference_page(
-        &self,
-        node_id: NodeId,
-        page: crate::replication::page::ReferencePage,
-    ) -> Result<crate::replication::page::PageAnswer, String> {
-        let request = MetadataTransportMessage::ReferencePage {
-            page: Box::new(page),
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::ReferencePageAnswer { answer }) => Ok(answer),
-            Ok(other) => Err(format!(
-                "the member answered {}",
-                transport_message_kind(&other)
-            )),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     pub(crate) async fn request_identifier_lookup(
         &self,
         node_id: NodeId,
