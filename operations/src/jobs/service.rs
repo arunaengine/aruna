@@ -34,7 +34,7 @@ use super::REPORT_MAX_ROWS;
 use super::protocol::send_job_request;
 use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
-use super::staging::read_staging_checkpoint;
+use super::staging::{ReadCheckpointOperation, SeedCheckpointOperation};
 use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_requested};
 use super::store::key_wait::read_key_waits;
 use super::store::state::{read_artifact_tombstone, read_job_record};
@@ -176,7 +176,8 @@ pub(crate) async fn submit_handed_job(
         .await
         .map_err(|error| error.to_string())?;
     if let Some(resume) = resume {
-        super::staging::seed_checkpoint(context, job_id, resume).await?;
+        let seed = SeedCheckpointOperation::new(job_id, resume.clone());
+        drive(seed, context).await.map_err(|error| error.0)?;
     }
     submit_local_job(
         context,
@@ -647,7 +648,8 @@ async fn read_record_data(
     let record = read_owned_job(context, user_id, job_id).await?;
     let checkpoint = match &record {
         Some(record) if matches!(&record.payload, JobPayload::Staging(_)) => {
-            read_staging_checkpoint(context, job_id).await?
+            let read = ReadCheckpointOperation::new(job_id);
+            drive(read, context).await.map_err(|error| error.0)?
         }
         _ => None,
     };

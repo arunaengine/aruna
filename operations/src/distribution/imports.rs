@@ -28,7 +28,7 @@ use crate::connectors::list_connectors::{ListSourceInput, ListSourceOperation};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JOB_RETENTION_MS;
 use crate::jobs::service::submit_handed_job;
-use crate::jobs::staging::{handed_checkpoint, read_staging_checkpoint};
+use crate::jobs::staging::{ReadCheckpointOperation, handed_checkpoint};
 
 use crate::metadata::protocol::MetadataReadError;
 use crate::s3::bucket::get::GetBucketOperation;
@@ -113,7 +113,8 @@ pub(crate) async fn keep_resume(
 ) -> Result<(), String> {
     let mut jobs = Vec::new();
     for (job_id, spec) in open_imports(context, bucket).await? {
-        let at = read_staging_checkpoint(context, job_id).await?;
+        let read = ReadCheckpointOperation::new(job_id);
+        let at = drive(read, context).await.map_err(|error| error.0)?;
         keep_job(context, (transfer_id, job_id), FencedJob { spec, at }).await?;
         jobs.push(job_id);
     }
@@ -524,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn hands_over_portable() {
         use crate::distribution::test_record::{binding, record, secret, store_record};
-        use crate::jobs::staging::seed_checkpoint;
+        use crate::jobs::staging::SeedCheckpointOperation;
         use crate::tests::staging::{create_http_connector, setup_driver_context};
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::structs::execution::job::{JobRecord, StagingJobPhase, StagingWalk};
@@ -593,7 +594,8 @@ mod tests {
             current_path: None,
             errors: Vec::new(),
         };
-        seed_checkpoint(context, job_id, &at).await.unwrap();
+        let seed = SeedCheckpointOperation::new(job_id, at.clone());
+        drive(seed, context).await.unwrap();
         let transfer_id = Ulid::from_bytes([8; 16]);
         keep_resume(context, "spire", transfer_id).await.unwrap();
         // The fenced job is kept with its spec, so pruning its record loses nothing.

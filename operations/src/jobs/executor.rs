@@ -160,6 +160,7 @@ impl RangeTurns {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
@@ -220,7 +221,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::Staging(spec) => {
-            Box::pin(crate::jobs::staging::run_staging_job(ctx, spec)).await
+            Box::pin(crate::jobs::host::run_staging_job(ctx, spec)).await
         }
         JobPayload::ExportRoCrate(spec) => {
             Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await

@@ -13,6 +13,7 @@ pub mod drain;
 pub mod executor;
 pub mod export;
 pub mod harvest;
+pub mod host;
 pub mod import;
 mod import_listing;
 pub mod key_wake;
