@@ -15,11 +15,17 @@ use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::repository::check::{RequirementCheck, check_requirements};
-use aruna_operations::jobs::repository::link_queue::owner_holds;
-use aruna_operations::jobs::repository::link_store::{change_link, list_links, read_link};
+use aruna_operations::jobs::export::crate_jsonld;
+use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
+use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
+use aruna_operations::jobs::repository::link_store::{
+    ApplyChangeOperation, ListLinksOperation, ReadLinkOperation,
+};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
-use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
+use aruna_operations::jobs::repository::{
+    Action, NodeScope, TransferError, seal_token, supports,
+};
+use aruna_operations::metadata::profile::validation::check_profile;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -365,15 +371,18 @@ pub(crate) async fn requirements(
     view: &ConnectorView,
 ) -> ServerResult<RequirementCheck> {
     ensure_capable(view.connector.kind, Action::Publish)?;
-    Box::pin(check_requirements(
-        &state.get_ctx(),
-        auth,
-        document_id,
-        view,
-        state.rocrate_limits().metadata_bytes,
-    ))
-    .await
-    .map_err(|error| match error {
+    let context = state.get_ctx();
+    let metadata_bytes = state.rocrate_limits().metadata_bytes;
+    let checked = async {
+        let (jsonld, _) =
+            Box::pin(crate_jsonld(&context, auth, document_id, metadata_bytes)).await?;
+        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
+        let status = Box::pin(check_profile(&context, check.profile_iri, &jsonld))
+            .await
+            .map_err(profile_failure)?;
+        check.finish(status)
+    };
+    Box::pin(checked).await.map_err(|error| match error {
         TransferError::Permanent(message) => ServerError::BadRequestReason(message),
         _ => ServerError::ServiceUnavailableReason("the requirements could not be checked".into()),
     })
@@ -451,10 +460,13 @@ pub(in crate::routes) async fn managed(
 ) -> ServerResult<(AuthContext, RepositoryLink)> {
     let (auth, document_id) = readable(state, auth, document_id).await?;
     let link_id = parse_ulid(link_id)?;
-    let link = read_link(&state.get_ctx(), document_id, link_id)
-        .await
-        .map_err(link_error)?
-        .ok_or(ServerError::NotFound)?;
+    let link = drive(
+        ReadLinkOperation::new(document_id, link_id),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(link_error)?
+    .ok_or(ServerError::NotFound)?;
     ensure_metadata_scope(state, &auth, link.group_id, Permission::WRITE).await?;
     if link.created_by != auth.user_id {
         let admin = format!("/{}/g/{}/admin", state.get_realm_id(), link.group_id);
@@ -472,9 +484,9 @@ pub(in crate::routes) async fn change(
     link: &RepositoryLink,
     change: LinkChange,
 ) -> ServerResult<Option<RepositoryLink>> {
-    change_link(state.get_ctx().as_ref(), link, change)
-        .await
-        .map_err(link_error)
+    let context = state.get_ctx();
+    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link.clone(), change);
+    drive(operation, context.as_ref()).await.map_err(link_error)
 }
 
 /// The links a node keeps for the dataset. Holders keep replicas; only the owner queues checks.
@@ -484,11 +496,13 @@ async fn responses(
 ) -> ServerResult<Vec<RepositoryLinkResponse>> {
     let context = state.get_ctx();
     let mut views = Vec::new();
-    for (link, queued) in list_links(&context, document_id)
+    let scope = NodeScope::of(&context);
+    for (link, queued) in drive(ListLinksOperation::new(document_id), context.as_ref())
         .await
         .map_err(link_error)?
     {
-        let holds = owner_holds(&context, &link).await;
+        let holds = OwnerHoldsOperation::new(scope.clone(), &link);
+        let holds = drive(holds, context.as_ref()).await.unwrap_or(true);
         let queued = queued && link.owner_node == state.get_node_id();
         views.push(response(link, queued, holds));
     }
@@ -653,7 +667,8 @@ pub async fn create_link(
         link: Box::new(link.clone()),
         secret: Some(secret),
     };
-    let created = change_link(context.as_ref(), &link, change)
+    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link, change);
+    let created = drive(operation, context.as_ref())
         .await
         .map_err(link_error)?
         .ok_or_else(|| ServerError::InternalError("created link missing".into()))?;
