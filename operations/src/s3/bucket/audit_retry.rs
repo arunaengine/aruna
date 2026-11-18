@@ -487,7 +487,7 @@ mod tests {
 
     fn record() -> BucketAuditRecord {
         BucketAuditRecord {
-            event_id: next_event_id(5),
+            event_id: Ulid::from_parts(5, 1),
             bucket_id: Ulid::from_bytes([4; 16]),
             at_ms: 5,
             action: AuditAction::Lock,
