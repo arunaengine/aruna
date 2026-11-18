@@ -356,4 +356,92 @@ mod tests {
         assert_eq!(next_due("*/15 * * * *", after), Some(after + HOUR_MS / 4));
         assert_eq!(next_due("not cron", after), None);
     }
+
+    use crate::s3::bucket::rename::tests::rule;
+    use aruna_core::calls::ChildOutcome;
+
+    const NOW: u64 = 10 * HOUR_MS;
+
+    fn due() -> RunDueOperation {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let mut operation = RunDueOperation::new(node, 1, NOW, None);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn no_marks() -> IoResult {
+        child(Ok::<_, IoError>((Vec::<Key>::new(), true)))
+    }
+
+    fn scheduled(schedule: &str) -> BackendImport {
+        let mut rule = rule();
+        rule.schedule = Some(schedule.to_string());
+        rule.created_at = UNIX_EPOCH;
+        rule.last_started_ms = Some(NOW - 1);
+        rule
+    }
+
+    #[test]
+    fn idle_schedule_sleeps() {
+        let mut operation = due();
+        operation.next(no_marks()).unwrap();
+        let rules = child(Ok::<_, ImportRuleError>(vec![rule()]));
+        assert_eq!(operation.next(rules), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn unread_marks_retry() {
+        let mut operation = due();
+        let failed = child(Err::<(Vec<Key>, bool), _>(IoError::Conflict));
+        operation.next(failed).unwrap();
+        let rules = child(Ok::<_, ImportRuleError>(Vec::<BackendImport>::new()));
+        let retry = Duration::from_millis(BUSY_RETRY_MS);
+        assert_eq!(operation.next(rules), Ok(Next::Done(Some(retry))));
+    }
+
+    #[test]
+    fn future_rule_waits() {
+        let mut operation = due();
+        operation.next(no_marks()).unwrap();
+        let rules = vec![scheduled("0 3 * * *")];
+        let turn = operation.next(child(Ok::<_, ImportRuleError>(rules)));
+        let at = next_due("0 3 * * *", NOW - 1).unwrap();
+        let wait = Duration::from_millis(at - NOW);
+        assert_eq!(turn, Ok(Next::Done(Some(wait))));
+    }
+
+    #[test]
+    fn busy_rule_retries() {
+        let mut operation = due();
+        operation.next(no_marks()).unwrap();
+        let mut rule = scheduled("* * * * *");
+        rule.last_started_ms = Some(0);
+        let turn = operation.next(child(Ok::<_, ImportRuleError>(vec![rule])));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let running = child(Ok::<Option<JobId>, ImportRuleError>(None));
+        let retry = Duration::from_millis(BUSY_RETRY_MS);
+        assert_eq!(operation.next(running), Ok(Next::Done(Some(retry))));
+    }
+
+    #[test]
+    fn wake_only_warns() {
+        let mut wake = WakeScheduleOperation;
+        assert!(matches!(wake.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let answer = Event::Storage(aruna_core::events::StorageEvent::SyncAllFinished);
+        assert_eq!(
+            wake.next(IoResult::Event(Box::new(answer))),
+            Ok(Next::Done(()))
+        );
+    }
 }
