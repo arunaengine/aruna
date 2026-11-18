@@ -14,7 +14,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::holder_reads::collect_profile_export;
-use super::read::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, RoutedExportOperation};
+use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
+use super::routed_export::RoutedExportOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;

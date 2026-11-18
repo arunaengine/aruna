@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -19,7 +20,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::read::export_rocrate_routed;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_core::metadata::AuthToken;
 
 /// The current metadata of a local bucket: its distributed set's settings, or the row of this
@@ -96,7 +97,18 @@ pub async fn dataset_description(
         after: None,
     };
     let context = std::sync::Arc::new(context.clone());
-    match export_rocrate_routed(&context, realm_id, request, token, SUMMARY_BYTES).await {
+    match drive(
+        RoutedExportOperation::new(
+            context.net_handle.as_ref().map(|net| net.node_id()),
+            realm_id,
+            request,
+            token,
+            SUMMARY_BYTES,
+        ),
+        &context,
+    )
+    .await
+    {
         Ok(ExportMetadataResult::Summary { jsonld, .. }) => {
             describe(&jsonld).map_err(DescriptionError::Invalid)
         }

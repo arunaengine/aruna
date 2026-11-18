@@ -28,7 +28,8 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::read::{admits_profile_peer, export_profile_local};
+use aruna_operations::metadata::forward::profile_export::ProfileLocalOperation;
+use aruna_operations::metadata::forward::read::admits_profile_peer;
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use aruna_operations::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
@@ -1144,11 +1145,13 @@ async fn channel_refuses_datasets() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let refusal = export_profile_local(
+    let refusal = drive(
+        ProfileLocalOperation::new(
+            test.actor.realm_id,
+            document_id,
+            created.record.last_event_id,
+        ),
         test.context.as_ref(),
-        test.actor.realm_id,
-        document_id,
-        created.record.last_event_id,
     )
     .await
     .expect_err("a Dataset is never served on the validation channel");
@@ -1186,19 +1189,15 @@ async fn channel_fences_revision() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = Ulid::generate();
     let (profile_id, revision) = register_profile(&test, group_id, minimum_shape()).await?;
 
-    export_profile_local(
+    drive(
+        ProfileLocalOperation::new(test.actor.realm_id, profile_id, revision),
         test.context.as_ref(),
-        test.actor.realm_id,
-        profile_id,
-        revision,
     )
     .await
     .expect("the requested revision is served");
-    let refusal = export_profile_local(
+    let refusal = drive(
+        ProfileLocalOperation::new(test.actor.realm_id, profile_id, Ulid::generate()),
         test.context.as_ref(),
-        test.actor.realm_id,
-        profile_id,
-        Ulid::generate(),
     )
     .await
     .expect_err("a mismatched revision is refused");

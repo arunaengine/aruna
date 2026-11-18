@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -15,11 +16,11 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::materialization_queue::process_materialization_batch;
-use crate::testing::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::store::Txn;
+use crate::testing::drain_projection_queue;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -774,7 +775,18 @@ async fn page_of(
         after,
     };
     let realm = fixture.actor.realm_id;
-    match export_rocrate_routed(&broker.ctx, realm, request, None, bound).await? {
+    match drive(
+        RoutedExportOperation::new(
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            realm,
+            request,
+            None,
+            bound,
+        ),
+        &broker.ctx,
+    )
+    .await?
+    {
         ExportMetadataResult::Page { page, .. } => Ok(page),
         other => panic!("expected a page, got {other:?}"),
     }
@@ -1050,8 +1062,8 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::testing::project_create_events;
     use crate::metadata::record_reads::DocumentRecordOperation;
+    use crate::testing::project_create_events;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
         MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
@@ -1474,7 +1486,16 @@ async fn removal_keeps_rest() {
         offset: None,
         after: None,
     };
-    let raw = export_rocrate_routed(&broker.ctx, fixture.actor.realm_id, request, None, u64::MAX);
+    let raw = drive(
+        RoutedExportOperation::new(
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            fixture.actor.realm_id,
+            request,
+            None,
+            u64::MAX,
+        ),
+        &broker.ctx,
+    );
     let ExportMetadataResult::Raw { raw, .. } = raw.await.unwrap() else {
         panic!("expected the raw revision");
     };

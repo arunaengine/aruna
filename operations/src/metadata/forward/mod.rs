@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub(crate) mod holder_reads;
-pub(crate) mod profile_export;
+pub mod profile_export;
 pub mod read;
 pub mod route_create;
+pub mod routed_export;
 pub mod write;
 
 #[cfg(test)]

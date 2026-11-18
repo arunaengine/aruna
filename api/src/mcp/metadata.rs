@@ -22,7 +22,7 @@ use aruna_operations::metadata::api::read_types::{
 use aruna_operations::metadata::api::search::search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::forward::write::route_metadata_update;
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
@@ -757,19 +757,27 @@ pub(crate) async fn load_raw(
         after: None,
         here: false,
     };
-    let export = export_rocrate_routed(
+    let export = drive(
+        RoutedExportOperation::new(
+            server
+                .state
+                .get_ctx()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+            server.state.get_realm_id(),
+            ExportMetadataRequest {
+                document_id,
+                auth: Some(auth.clone()),
+                view: RoCrateExportView::Raw,
+                limit: None,
+                offset: None,
+                after: None,
+            },
+            crate::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
+            server.state.rocrate_limits().metadata_bytes,
+        ),
         &server.state.get_ctx(),
-        server.state.get_realm_id(),
-        ExportMetadataRequest {
-            document_id,
-            auth: Some(auth.clone()),
-            view: RoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        crate::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
-        server.state.rocrate_limits().metadata_bytes,
     )
     .await
     .map_err(crate::metadata::map_api_error)

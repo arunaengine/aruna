@@ -15,10 +15,11 @@ use aruna_operations::distribution::routing::bound_view;
 use aruna_operations::distribution::status::read_view;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use aruna_operations::metadata::forward::read::export_rocrate_here;
+use aruna_operations::metadata::forward::routed_export::ensure_export_limit;
 use aruna_operations::shares::dataset::{
     DatasetFile, FilePlace, MemberSet, NamedSets, dataset_files, named_sets,
 };
@@ -142,7 +143,13 @@ async fn export_here(
     };
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let context = state.get_ctx();
-    match export_rocrate_here(&context, state.get_realm_id(), request, metadata_bytes).await? {
+    let export = drive(
+        ExportOperation::new(state.get_realm_id(), request),
+        &context,
+    )
+    .await?;
+    ensure_export_limit(&export, metadata_bytes)?;
+    match export {
         ExportMetadataResult::Full { record, jsonld } => Ok((record, jsonld)),
         _ => Err(MetadataApiError::ServiceUnavailable),
     }

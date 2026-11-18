@@ -47,16 +47,17 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-use super::holder_reads::{AuthFailure, ReadDecision, collect_profile_export, reduce_holder_reads};
+use super::holder_reads::{
+    AuthFailure, READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, ReadDecision, collect_profile_export,
+    device_raw_revision, reduce_holder_reads,
+};
+use super::profile_export::ProfileLocalOperation;
+use super::routed_export::{ExportWithinOperation, ensure_export_limit, owner_reads};
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
 use crate::realm::peer_trust::is_sync_eligible;
 use futures_util::StreamExt;
-
-pub(super) const READ_FANOUT_LIMIT: usize = 8;
-
-pub(super) const READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
@@ -108,98 +109,6 @@ pub(super) async fn device_replica(
         .filter(ReplicaRecord::serves_reads)
 }
 
-/// Exports one document from this device's replica. The displayed render is
-/// what the device holds, and the graph views come from the local craqle graph
-/// the replica installed.
-pub(super) async fn device_export(
-    context: &Arc<DriverContext>,
-    replica: ReplicaRecord,
-    request: &ExportMetadataRequest,
-) -> Result<ExportMetadataResult, MetadataApiError> {
-    let record = replica
-        .record
-        .map(|record| *record)
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    ensure_record_readable(
-        context.as_ref(),
-        record.realm_id,
-        request.auth.as_ref(),
-        &record,
-        None,
-    )
-    .await?;
-    context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    match request.view {
-        RoCrateExportView::Full => Ok(ExportMetadataResult::Full {
-            jsonld: replica.displayed_jsonld,
-            record,
-        }),
-        RoCrateExportView::Raw => {
-            let merged = if replica.findings > 0 {
-                Some(
-                    crate::metadata::export_rocrate_jsonld(context, record.graph_iri.clone())
-                        .await
-                        .map_err(|_| MetadataApiError::ServiceUnavailable)?,
-                )
-            } else {
-                None
-            };
-            Ok(ExportMetadataResult::Raw {
-                raw: MetadataRawView {
-                    revision: device_raw_revision(
-                        &replica.displayed_jsonld,
-                        replica.dataset_digest,
-                        replica.findings,
-                        record.last_event_id,
-                        merged,
-                    ),
-                    projection_state: MaterializationState::Materialized,
-                    projected_event_id: Some(record.last_event_id),
-                },
-                dataset_digest: replica.dataset_digest,
-                record,
-            })
-        }
-        RoCrateExportView::Summary => Ok(ExportMetadataResult::Summary {
-            jsonld: crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
-                .await
-                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
-            record,
-        }),
-        RoCrateExportView::Page => Ok(ExportMetadataResult::Page {
-            page: crate::metadata::export_rocrate_page(
-                context,
-                record.graph_iri.clone(),
-                request.limit.unwrap_or(100).clamp(1, 1_000),
-                request.offset,
-                request.after.clone(),
-            )
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?,
-            record,
-        }),
-    }
-}
-
-pub(super) fn device_raw_revision(
-    displayed_jsonld: &str,
-    dataset_digest: Option<[u8; 32]>,
-    findings: u32,
-    winning_event_id: Ulid,
-    merged_jsonld: Option<String>,
-) -> MetadataRawRevision {
-    MetadataRawRevision {
-        context_digest: raw_context_digest(displayed_jsonld).unwrap_or_default(),
-        jsonld: displayed_jsonld.to_string(),
-        winning_event_id,
-        dataset_digest,
-        merged: merged_jsonld.map(|jsonld| MetadataMergedRevision { jsonld, findings }),
-    }
-}
-
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -248,20 +157,6 @@ pub async fn get_metadata_routed(
         }
         (result, _) => result,
     }
-}
-
-/// Whether a read fills this device's cache: only the owner's own unrestricted read does.
-fn owner_reads(
-    config: &RealmConfigDocument,
-    local_node: Option<NodeId>,
-    auth: Option<&AuthContext>,
-) -> bool {
-    let owner = local_node
-        .and_then(|node| node_kind(config, node))
-        .and_then(|kind| kind.owner());
-    auth.is_some_and(|auth| {
-        Some(auth.user_id) == owner && auth.path_restrictions.is_none() && !auth.federated()
-    })
 }
 
 /// The registry record a device replica holds, after the caller's own READ check.
@@ -567,352 +462,6 @@ pub(super) fn keep_status(
     }
 }
 
-/// Exports locally on a holder or forwards with the caller's bearer or
-/// peer-attested internal principal for another READ check.
-pub async fn export_rocrate_routed(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    request: ExportMetadataRequest,
-    forward_token: Option<AuthToken>,
-    metadata_bytes: u64,
-) -> Result<ExportMetadataResult, MetadataApiError> {
-    if context.net_handle.is_none() {
-        return export_within(context.as_ref(), realm_id, request, metadata_bytes).await;
-    }
-    let config = load_realm_config(context, realm_id)
-        .await
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    // Like a read, an unselected replica answers only while the realm is out of reach.
-    let cached = device_replica(context, &config, local_node, request.document_id).await;
-    let pinned = cached
-        .as_ref()
-        .is_some_and(|replica| replica.selected || replica.pending_edits > 0);
-    let keeps = owner_reads(&config, local_node, request.auth.as_ref());
-    let routed = match pinned {
-        true => Err(MetadataApiError::ServiceUnavailable),
-        false => {
-            export_routed(
-                context,
-                realm_id,
-                config,
-                local_node,
-                request.clone(),
-                forward_token,
-                metadata_bytes,
-            )
-            .await
-        }
-    };
-    match (routed, cached) {
-        (Ok(export), _) => {
-            if keeps {
-                let (ExportMetadataResult::Full { record, .. }
-                | ExportMetadataResult::Summary { record, .. }
-                | ExportMetadataResult::Page { record, .. }
-                | ExportMetadataResult::Raw { record, .. }) = &export;
-                keep_read(context, record).await;
-            }
-            Ok(export)
-        }
-        (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
-            let export = device_export(context, replica, &request).await?;
-            ensure_export_limit(&export, metadata_bytes)?;
-            Ok(export)
-        }
-        (result, _) => result,
-    }
-}
-
-/// Exports one document on its holders.
-async fn export_routed(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    config: RealmConfigDocument,
-    local_node: Option<NodeId>,
-    request: ExportMetadataRequest,
-    forward_token: Option<AuthToken>,
-    metadata_bytes: u64,
-) -> Result<ExportMetadataResult, MetadataApiError> {
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders =
-        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
-    let holder_count = holders.len();
-    let context = Arc::clone(context);
-    let metadata = context.metadata_handle.clone();
-    let request_template = request.clone();
-    let (responses, timed_out) = read_holders(holders, move |holder| {
-        let context = context.clone();
-        let metadata = metadata.clone();
-        let request = request_template.clone();
-        let forward_token = forward_token.clone();
-        Box::pin(async move {
-            if Some(holder) == local_node {
-                let export = export_within(context.as_ref(), realm_id, request, metadata_bytes);
-                export.await.map_err(read_error)
-            } else {
-                let Some(metadata) = metadata else {
-                    return Err(MetadataReadError::Unavailable);
-                };
-                match metadata
-                    .request_export(
-                        holder,
-                        MetadataTransportMessage::ForwardExportDocument {
-                            auth_token: forward_token,
-                            config_digest,
-                            document_id: request.document_id,
-                            view: request.view,
-                            metadata_bytes,
-                            limit: request.limit,
-                            offset: request.offset,
-                            after: request.after,
-                        },
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(MetadataReadError::Unavailable),
-                }
-            }
-        })
-    })
-    .await;
-    let mut not_found = 0usize;
-    let mut success = None;
-    let mut auth_error = None;
-    let (mut unavailable, mut too_large) = (timed_out, false);
-    for (_, response) in responses {
-        match response {
-            Ok(export) => {
-                success.get_or_insert(export);
-            }
-            Err(error @ (MetadataReadError::Unauthorized | MetadataReadError::Forbidden)) => {
-                auth_error.get_or_insert(error);
-            }
-            Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(MetadataReadError::Unavailable) => unavailable = true,
-            Err(MetadataReadError::TooLarge) => too_large = true,
-        }
-    }
-    let conflict = success.is_some() && not_found > 0;
-    let all_not_found = holder_count > 0 && not_found == holder_count;
-    match reduce_holder_reads(
-        success,
-        auth_error,
-        all_not_found,
-        conflict,
-        unavailable,
-        AuthFailure::Fatal,
-    ) {
-        ReadDecision::Success(export) => Ok(export),
-        ReadDecision::NotFound => Err(MetadataApiError::NotFound),
-        ReadDecision::Auth(MetadataReadError::Unauthorized) => Err(MetadataApiError::Unauthorized),
-        ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
-        // A holder that found the page too large answered for every holder of the same graph.
-        ReadDecision::Unavailable if too_large => Err(MetadataApiError::TooLarge),
-        ReadDecision::Auth(_) | ReadDecision::Unavailable => {
-            Err(MetadataApiError::ServiceUnavailable)
-        }
-    }
-}
-
-/// Serves this node's own copy for a w3id redirect that chose it; it never asks another holder.
-pub async fn export_rocrate_here(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: ExportMetadataRequest,
-    metadata_bytes: u64,
-) -> Result<ExportMetadataResult, MetadataApiError> {
-    let export = drive(ExportOperation::new(realm_id, request), context).await?;
-    ensure_export_limit(&export, metadata_bytes)?;
-    Ok(export)
-}
-
-/// Exports one document here within `metadata_bytes`. A page over the bound is asked again with
-/// half the limit, so its cursor names the last entity it holds; one entity over it is too large.
-async fn export_within(
-    context: &DriverContext,
-    realm_id: RealmId,
-    mut request: ExportMetadataRequest,
-    metadata_bytes: u64,
-) -> Result<ExportMetadataResult, MetadataApiError> {
-    loop {
-        let export = drive(ExportOperation::new(realm_id, request.clone()), context).await?;
-        let over = ensure_export_limit(&export, metadata_bytes);
-        let page = matches!(export, ExportMetadataResult::Page { .. });
-        match (
-            over,
-            request.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX),
-        ) {
-            (Ok(()), _) => return Ok(export),
-            (Err(_), limit) if page && limit > 1 => request.limit = Some(limit / 2),
-            (Err(_), _) if page => return Err(MetadataApiError::TooLarge),
-            (Err(error), _) => return Err(error),
-        }
-    }
-}
-
-pub(super) fn ensure_export_limit(
-    export: &ExportMetadataResult,
-    metadata_bytes: u64,
-) -> Result<(), MetadataApiError> {
-    let length = match export {
-        ExportMetadataResult::Full { jsonld, .. }
-        | ExportMetadataResult::Summary { jsonld, .. } => jsonld.len(),
-        // A page is read with its cursor, and a reader adds a few bytes around each entity.
-        ExportMetadataResult::Page { page, .. } => {
-            let cursor = page.next_cursor.as_ref().map_or(0, String::len);
-            page.jsonld.len() + cursor + ENTRY_ROOM * page.returned_data_entities
-        }
-        ExportMetadataResult::Raw { raw, .. } => raw.revision.jsonld.len(),
-    };
-    if u64::try_from(length).unwrap_or(u64::MAX) > metadata_bytes {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    Ok(())
-}
-
-/// Reads one registered Profile at an exact revision so a holder can validate a
-/// Dataset without a caller. Infrastructure nodes use the user-less purpose-bound
-/// channel; devices read a replica or ask under their owner's authority only.
-pub(crate) async fn export_profile_routed(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    profile_id: Ulid,
-    expected_revision: Ulid,
-) -> Result<ExportMetadataResult, MetadataReadError> {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return export_profile_local(context.as_ref(), realm_id, profile_id, expected_revision)
-            .await;
-    };
-    let local_node = net_handle.node_id();
-    let config = load_realm_config(context, realm_id)
-        .await
-        .ok_or(MetadataReadError::Unavailable)?;
-    if !is_sync_eligible(&config, local_node) {
-        return export_as_owner(context, &config, realm_id, local_node, profile_id).await;
-    }
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataReadError::Unavailable)?;
-    let placement = resolve_metadata_id(&config, realm_id, None, profile_id)
-        .map_err(|_| MetadataReadError::Unavailable)?;
-    let holders =
-        read_holder_sets(&config, &placement).map_err(|_| MetadataReadError::Unavailable)?;
-    let holder_count = holders.len();
-    let context = Arc::clone(context);
-    let metadata = context.metadata_handle.clone();
-    let (responses, timed_out) = read_holders(holders, move |holder| {
-        let context = context.clone();
-        let metadata = metadata.clone();
-        Box::pin(async move {
-            if holder == local_node {
-                return export_profile_local(
-                    context.as_ref(),
-                    realm_id,
-                    profile_id,
-                    expected_revision,
-                )
-                .await;
-            }
-            let Some(metadata) = metadata else {
-                return Err(MetadataReadError::Unavailable);
-            };
-            metadata
-                .request_export(
-                    holder,
-                    MetadataTransportMessage::ForwardExportProfile {
-                        config_digest,
-                        profile_id,
-                        expected_revision,
-                    },
-                )
-                .await
-                .unwrap_or(Err(MetadataReadError::Unavailable))
-        })
-    })
-    .await;
-    collect_profile_export(responses, holder_count, timed_out)
-}
-
-/// A device never joins the validation channel: it reads its own replica first
-/// and otherwise asks a holder as its owner, so it learns nothing its owner
-/// may not read.
-pub(super) async fn export_as_owner(
-    context: &Arc<DriverContext>,
-    config: &RealmConfigDocument,
-    realm_id: RealmId,
-    local_node: NodeId,
-    profile_id: Ulid,
-) -> Result<ExportMetadataResult, MetadataReadError> {
-    let owner = crate::realm::mutate_placement::node_kind(config, local_node)
-        .and_then(|kind| kind.owner())
-        .ok_or(MetadataReadError::Unavailable)?;
-    let auth = AuthContext {
-        user_id: owner,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    export_rocrate_routed(
-        context,
-        realm_id,
-        ExportMetadataRequest {
-            document_id: profile_id,
-            auth: Some(auth.clone()),
-            view: RoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        Some(AuthToken::internal(auth)),
-        u64::MAX,
-    )
-    .await
-    .map_err(read_error)
-}
-
-/// Serves one registered Profile with no caller at all. The `profiles/` path,
-/// the graph IRI and the revision fence are the whole authorization; every
-/// other document is reported as not found.
-pub async fn export_profile_local(
-    context: &DriverContext,
-    realm_id: RealmId,
-    profile_id: Ulid,
-    expected_revision: Ulid,
-) -> Result<ExportMetadataResult, MetadataReadError> {
-    let record = load_live_record(context, profile_id)
-        .await
-        .map_err(read_error)?;
-    if record.realm_id != realm_id
-        || record.document_id != profile_id
-        || !record.document_path.starts_with(PROFILE_DOCUMENT_PREFIX)
-        || record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id)
-    {
-        return Err(MetadataReadError::NotFound);
-    }
-    if record.last_event_id != expected_revision {
-        return Err(MetadataReadError::Unavailable);
-    }
-    let raw = drive(RawDisplayOperation::new(profile_id), context)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        .ok_or(MetadataReadError::NotFound)?;
-    if raw.revision.winning_event_id != expected_revision {
-        return Err(MetadataReadError::Unavailable);
-    }
-    let dataset_digest = raw.revision.dataset_digest;
-    Ok(ExportMetadataResult::Raw {
-        record,
-        raw,
-        dataset_digest,
-    })
-}
-
 /// Whether a peer may ask the validation channel at all. The fetch vouches for
 /// no user, so an owner-bound device is refused and only infrastructure peers
 /// of this realm are admitted.
@@ -953,8 +502,8 @@ pub(crate) async fn apply_forwarded_profile(
     if !holds_metadata_id(&config, realm_id, net_handle.node_id(), profile_id) {
         return Err(MetadataReadError::Unavailable);
     }
-    let export =
-        export_profile_local(context.as_ref(), realm_id, profile_id, expected_revision).await?;
+    let local = ProfileLocalOperation::new(realm_id, profile_id, expected_revision);
+    let export = drive(local, context.as_ref()).await?;
     ensure_export_limit(&export, local_limit).map_err(read_error)?;
     Ok((export, local_limit))
 }
@@ -1008,8 +557,9 @@ pub(crate) async fn apply_forwarded_export(
         offset,
         after,
     };
-    let export = export_within(context.as_ref(), realm_id, request, metadata_bytes);
-    Ok((export.await.map_err(read_error)?, metadata_bytes))
+    let export = ExportWithinOperation::new(realm_id, request, metadata_bytes);
+    let export = drive(export, context.as_ref()).await.map_err(read_error)?;
+    Ok((export, metadata_bytes))
 }
 
 pub(crate) async fn apply_document_query(

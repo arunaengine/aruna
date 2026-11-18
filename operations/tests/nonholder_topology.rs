@@ -46,7 +46,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,
 };
-use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::forward::write::{
     PinnedCreate, create_with_id, route_metadata_delete, route_metadata_update,
 };
@@ -1207,12 +1207,19 @@ async fn export_routed(
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed export reached a holder",
         || async {
-            match export_rocrate_routed(
+            match drive(
+                RoutedExportOperation::new(
+                    bystander
+                        .context
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                    realm.realm_id,
+                    request.clone(),
+                    Some(token.clone()),
+                    RoCrateLimits::default().metadata_bytes,
+                ),
                 &bystander.context,
-                realm.realm_id,
-                request.clone(),
-                Some(token.clone()),
-                RoCrateLimits::default().metadata_bytes,
             )
             .await
             {

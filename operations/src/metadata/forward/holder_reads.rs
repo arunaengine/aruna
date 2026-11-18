@@ -2,10 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use aruna_core::NodeId;
+use aruna_core::metadata::{MetadataMergedRevision, MetadataRawRevision, raw_context_digest};
+use ulid::Ulid;
 
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::protocol::MetadataReadError;
+
+/// Holders one routed read asks at a time.
+pub(crate) const READ_FANOUT_LIMIT: usize = 8;
+
+/// How long one holder may take to answer a routed read.
+pub(crate) const READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The raw revision a device serves from its replica.
+pub(crate) fn device_raw_revision(
+    displayed_jsonld: &str,
+    dataset_digest: Option<[u8; 32]>,
+    findings: u32,
+    winning_event_id: Ulid,
+    merged_jsonld: Option<String>,
+) -> MetadataRawRevision {
+    MetadataRawRevision {
+        context_digest: raw_context_digest(displayed_jsonld).unwrap_or_default(),
+        jsonld: displayed_jsonld.to_string(),
+        winning_event_id,
+        dataset_digest,
+        merged: merged_jsonld.map(|jsonld| MetadataMergedRevision { jsonld, findings }),
+    }
+}
 
 /// Any answer is the exact revision that was asked for, so a lagging holder's
 /// not-found never outranks a holder that served that revision.

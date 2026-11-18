@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,7 +74,7 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::list::list_visible_documents;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
+use crate::metadata::forward::read::get_metadata_routed;
 use crate::metadata::forward::write::{
     CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
@@ -198,12 +199,15 @@ impl RunBroker {
             after: None,
         };
         let token = Some(AuthToken::Internal(auth));
-        let export = export_rocrate_routed(
+        let export = drive(
+            RoutedExportOperation::new(
+                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+                self.scope.realm_id,
+                request,
+                token,
+                max_bytes as u64,
+            ),
             &self.ctx,
-            self.scope.realm_id,
-            request,
-            token,
-            max_bytes as u64,
         );
         match export.await.map_err(api_error)? {
             ExportMetadataResult::Full { record, jsonld }
@@ -740,7 +744,16 @@ impl Broker for RunBroker {
         // The holder counts the cursor and the room around each entity in this bound.
         let bound = cx.max_bytes as u64;
         let token = Some(AuthToken::Internal(auth));
-        let export = export_rocrate_routed(&self.ctx, self.scope.realm_id, request, token, bound);
+        let export = drive(
+            RoutedExportOperation::new(
+                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+                self.scope.realm_id,
+                request,
+                token,
+                bound,
+            ),
+            &self.ctx,
+        );
         let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
             return Err(unavailable("the document has no page export"));
         };
