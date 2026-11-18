@@ -9,10 +9,9 @@ use aruna_core::secrets::{Delivery, ResponseExposure};
 use super::*;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::plugins::bound::select;
 use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, secret};
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::install::{ensure_rules, read_config, retire_rules};
 use crate::plugins::rows::tests::child_result;
 use aruna_core::time::unix_timestamp_millis;
 
@@ -374,17 +373,6 @@ fn edit_actor(install: &PluginInstall) -> Actor {
     }
 }
 
-fn stamp() -> RuleStamp {
-    (
-        5,
-        [
-            Ulid::from_parts(7, 1),
-            Ulid::from_parts(7, 2),
-            Ulid::from_parts(7, 3),
-        ],
-    )
-}
-
 fn edit_of(install: &PluginInstall, guard: RuleGuard) -> EditRules {
     let name = SecretName::try_from("api".to_string()).unwrap();
     let ours = consumer(install);
@@ -394,7 +382,7 @@ fn edit_of(install: &PluginInstall, guard: RuleGuard) -> EditRules {
         (install.group_id, &name),
         (&ours, Vec::new()),
         guard,
-        stamp(),
+        5,
     )
 }
 
@@ -408,7 +396,7 @@ fn config_with(install: Option<&PluginInstall>) -> IoResult {
 }
 
 #[test]
-fn stale_guard_writes_nothing() {
+fn stale_guard_skips() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let current = RuleGuard::Revision {
         install_id: install.install_id,
@@ -453,7 +441,7 @@ fn retiring_skips_missing() {
     let mut install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     bound_group(&mut install);
     let actor = edit_actor(&install);
-    let mut retire = RetireRules::new(&actor, &install, vec![stamp()]);
+    let mut retire = RetireRules::new(&actor, &install, 5);
     assert!(matches!(retire.first(), Ok(Next::Call(IoCall::Child(_)))));
     let missing = child_result(Err::<bool, _>(RuleError::Missing));
     assert_eq!(retire.next(missing), Ok(Next::Done(())));
@@ -467,6 +455,6 @@ pub(crate) async fn edit_rules(
     rules: (&SecretConsumer, Vec<UseRule>),
     guard: RuleGuard,
 ) -> Result<bool, RuleError> {
-    let stamp = (unix_timestamp_millis(), [(); 3].map(|_| Ulid::generate()));
-    drive(EditRules::new(actor, target, rules, guard, stamp), ctx).await
+    let now_ms = unix_timestamp_millis();
+    drive(EditRules::new(actor, target, rules, guard, now_ms), ctx).await
 }

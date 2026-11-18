@@ -39,7 +39,7 @@ fn is_child<T>(next: Next<T>) -> bool {
 }
 
 #[test]
-fn admission_reads_in_order() {
+fn admission_reads_ordered() {
     let install = sample_install(Ulid::from_parts(1, 1));
     let mut admit = AdmitWork::new(&spec(&install), install.receiver);
     assert!(is_child(admit.first().unwrap()));
@@ -83,7 +83,7 @@ fn transfer_needs_request() {
 }
 
 #[test]
-fn transfer_ends_with_patterns() {
+fn transfer_ends_patterns() {
     let install = sample_install(Ulid::from_parts(1, 1));
     let mut grants = TransferGrants::upload(&install, &row_of(&install), "/s");
     let patterns = BTreeSet::from(["/s".to_string()]);
@@ -93,7 +93,7 @@ fn transfer_ends_with_patterns() {
 }
 
 #[test]
-fn job_row_of_install() {
+fn install_job_row() {
     let install = sample_install(Ulid::from_parts(1, 1));
     let row = row_of(&install);
     let id = row.work_id.to_string();

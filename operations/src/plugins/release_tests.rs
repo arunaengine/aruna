@@ -11,7 +11,7 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, a
 
 use super::*;
 use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
-use crate::plugins::install::read_config;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::store::Txn;
 use crate::secrets::SecretChange;

@@ -10,11 +10,11 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::metadata::create_document::CreateDocumentPayload;
+use crate::plugin_host::worker::tests::installed;
 use crate::plugins::cleanup::sweep_events;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::store::Txn;
-use crate::plugins::worker::tests::installed;
 
 fn pinned(fixture: &Fixture, name: &str) -> PinnedCreate {
     PinnedCreate {

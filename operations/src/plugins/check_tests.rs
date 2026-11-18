@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::pause_install;
 use crate::plugins::runs::tests::queued;
 
 fn kind(result: Result<PluginInstall, CallError>) -> Option<ErrorKind> {

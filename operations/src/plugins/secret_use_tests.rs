@@ -91,7 +91,7 @@ fn wrong_peer_audited() {
 }
 
 #[test]
-fn failed_audit_still_refuses() {
+fn failed_audit_refuses() {
     let install = bound_install("group:api");
     let mut release = release_of(&install, other_node());
     release.first().unwrap();
@@ -100,7 +100,7 @@ fn failed_audit_still_refuses() {
 }
 
 #[test]
-fn node_secret_stays_home() {
+fn node_secret_local() {
     let install = bound_install("node:api");
     let mut release = release_of(&install, install.receiver);
     release.local = other_node();
@@ -119,7 +119,7 @@ fn missing_entry_refused() {
 }
 
 #[test]
-fn held_value_not_opened() {
+fn held_value_closed() {
     let install = bound_install("group:api");
     let value = Ulid::from_parts(5, 5);
     let mut release = release_of(&install, install.receiver);
