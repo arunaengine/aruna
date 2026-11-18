@@ -683,12 +683,14 @@ dependencies = [
  "futures-util",
  "iroh",
  "irokle",
+ "lru",
  "oxrdf",
  "oxttl",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "ulid 3.0.0",
 ]
 
 [[package]]

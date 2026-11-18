@@ -422,8 +422,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    drive(DocumentRecordOperation::new(document_id), context)
-                        .await?
+                    drive(DocumentRecordOperation::new(document_id), context).await?
                 && record.updated_at_ms == updated_at_ms
             {
                 let mut record = record;

@@ -108,7 +108,7 @@ pub use handle::{
     warm_caches,
 };
 pub(crate) use handle::{
-    WritePeerError, export_rocrate_page, export_summary_jsonld, list_group_records,
-    prune_if_deleted, search_local_filtered, transport_message_kind,
+    WritePeerError, export_summary_jsonld, list_group_records, prune_if_deleted,
+    search_local_filtered, transport_message_kind,
 };
 pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};

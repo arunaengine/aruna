@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -242,10 +241,18 @@ mod tests {
             .await;
 
         let stale = make_record(document_id, Ulid::generate());
-        assert!(!drive(RecordMaterializedOperation::new(&stale), &context).await.unwrap());
+        assert!(
+            !drive(RecordMaterializedOperation::new(&stale), &context)
+                .await
+                .unwrap()
+        );
 
         let current = make_record(document_id, materialized_event);
-        assert!(drive(RecordMaterializedOperation::new(&current), &context).await.unwrap());
+        assert!(
+            drive(RecordMaterializedOperation::new(&current), &context)
+                .await
+                .unwrap()
+        );
     }
 
     mod calls {

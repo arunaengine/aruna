@@ -5,9 +5,7 @@
 use std::time::Instant;
 
 use aruna_core::events::Event;
-use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataRoCratePage,
-};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tracing::{Instrument, Span, debug_span, field};
 
@@ -278,30 +276,6 @@ pub(crate) async fn export_summary_jsonld(
         MetadataEvent::Error { error, .. } => Err(error),
         other => Err(MetadataError::Backend(format!(
             "unexpected metadata summary event: {}",
-            other.label()
-        ))),
-    }
-}
-
-/// One page of a graph's RO-Crate JSON-LD.
-pub(crate) async fn export_rocrate_page(
-    context: &DriverContext,
-    graph_iri: String,
-    limit: usize,
-    offset: Option<usize>,
-    after: Option<String>,
-) -> Result<MetadataRoCratePage, MetadataError> {
-    let effect = MetadataEffect::ExportRoCratePage {
-        graph_iri,
-        limit,
-        offset,
-        after,
-    };
-    match export(context, effect).await {
-        MetadataEvent::RoCratePageResult { page, .. } => Ok(page),
-        MetadataEvent::Error { error, .. } => Err(error),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata page event: {}",
             other.label()
         ))),
     }

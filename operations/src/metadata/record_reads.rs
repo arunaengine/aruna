@@ -138,8 +138,14 @@ mod call_tests {
             )])))
         );
         let row = Some(postcard::to_allocvec(&stored).unwrap().into());
-        assert_eq!(read.next(IoResult::Values(vec![row])), Ok(Next::Done(Some(stored))));
-        assert_eq!(read.next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        assert_eq!(
+            read.next(IoResult::Values(vec![row])),
+            Ok(Next::Done(Some(stored)))
+        );
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
         assert!(matches!(
             read.next(IoResult::Values(vec![Some(vec![0xff].into())])),
             Err(StorageReadError::Conversion(_))
@@ -168,11 +174,17 @@ mod call_tests {
         let answer = |row| read.next(IoResult::Values(vec![row]));
         assert_eq!(answer(None), Ok(Next::Done(true)));
         assert_eq!(
-            answer(status(current.last_event_id, MaterializationState::Materialized)),
+            answer(status(
+                current.last_event_id,
+                MaterializationState::Materialized
+            )),
             Ok(Next::Done(true))
         );
         assert_eq!(
-            answer(status(Ulid::from_parts(4, 4), MaterializationState::Materialized)),
+            answer(status(
+                Ulid::from_parts(4, 4),
+                MaterializationState::Materialized
+            )),
             Ok(Next::Done(false))
         );
         assert_eq!(

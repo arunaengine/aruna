@@ -67,14 +67,12 @@ use super::search_cursor::{
     SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
     query_fingerprint, resume_fetch_limit,
 };
-use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-    parse_registry_read, read_document_registry,
 };
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};

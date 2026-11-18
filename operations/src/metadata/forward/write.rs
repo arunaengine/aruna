@@ -36,7 +36,6 @@ use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
-use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataBatch;

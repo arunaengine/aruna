@@ -44,7 +44,7 @@ use crate::sync::mirror_repair::RECONCILE_GRACE;
 
 mod effects;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
-pub(crate) use self::effects::{export_rocrate_page, export_summary_jsonld, metadata_read_error};
+pub(crate) use self::effects::{export_summary_jsonld, metadata_read_error};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub(crate) use self::lifecycle::{list_group_records, prune_if_deleted};
 pub use self::query::query_authorized_local;
@@ -495,12 +495,6 @@ impl MetadataHandle {
 
     pub fn cache_registry_records(&self, records: &[MetadataRegistryRecord]) {
         self.inner.visibility_cache.upsert_registry_records(records);
-    }
-
-    pub(crate) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
-        self.inner
-            .visibility_cache
-            .upsert_at(std::slice::from_ref(&record), Some(generation));
     }
 
     pub(crate) fn remove_cached_record(&self, document_id: Ulid) {

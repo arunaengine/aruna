@@ -8,9 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{
-    DOCUMENT_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE, VALIDATION_STATUS_KEYSPACE,
-};
+use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, VALIDATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataRawRevision, MetadataValidationViolation,
     ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
@@ -22,7 +20,7 @@ use aruna_core::profile_shapes::{
 };
 use aruna_core::rows::{done, read_row, value};
 use aruna_core::storage_entries::{
-    metadata_document_key, profile_validation_entry, profile_validation_key, raw_revision_key,
+    metadata_document_key, profile_validation_entry, profile_validation_key,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;

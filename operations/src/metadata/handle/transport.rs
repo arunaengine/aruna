@@ -585,17 +585,6 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
 }
 
 impl MetadataHandle {
-    pub(crate) async fn request_export(
-        &self,
-        node_id: NodeId,
-        message: MetadataTransportMessage,
-    ) -> Result<
-        Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
-        MetadataRequestError,
-    > {
-        send_export_request(&self.inner, node_id, message).await
-    }
-
     #[tracing::instrument(
         name = "metadata.query.remote",
         level = "debug",

@@ -10,13 +10,12 @@ use super::read_types::{
 };
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DISTRIBUTED_QUERY_DEADLINE, Event, GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId,
-    ListGroupOperation, MetadataApiError, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId, Permission,
-    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect,
-    StorageEvent, StorageReadError, TxnId, Ulid, check_policy_limit, graph_lifecycle_key,
-    map_query_error, merge_pending_records, parse_registry_read, query_fingerprint,
-    read_document_registry, replica_query_nodes, warn,
+    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, ListGroupOperation, MetadataApiError,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataQueryResults, MetadataReadError,
+    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
+    REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid,
+    check_policy_limit, map_query_error, merge_pending_records, query_fingerprint,
+    replica_query_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
@@ -26,7 +25,6 @@ use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
-use aruna_core::handle::Handle;
 
 pub async fn query_metadata_document(
     context: &DriverContext,
@@ -339,39 +337,6 @@ pub(super) async fn load_claim_records(
     Ok(records)
 }
 
-pub(super) async fn is_deleted(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<bool, MetadataApiError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: graph_lifecycle_key(graph_iri),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: GraphLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            if record.graph_iri != graph_iri {
-                return Err(MetadataApiError::Internal(
-                    "metadata graph lifecycle record mismatch".to_string(),
-                ));
-            }
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-        other => Err(MetadataApiError::Internal(other.label().to_string())),
-    }
-}
-
 impl From<LiveRecordsError> for MetadataApiError {
     fn from(error: LiveRecordsError) -> Self {
         match error {
@@ -391,32 +356,6 @@ pub(crate) async fn load_live_record(
             .into_iter()
             .next()
             .ok_or(MetadataApiError::NotFound),
-        Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
-pub(super) async fn load_record_txn(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    let event = context
-        .storage_handle
-        .send_effect(read_document_registry(document_id, Some(txn_id)))
-        .await;
-    match parse_registry_read(event) {
-        Ok(Some(record)) => drive(
-            LiveRecordsOperation::new(vec![record], Some(txn_id)),
-            context,
-        )
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(MetadataApiError::NotFound),
         Ok(None) => Err(MetadataApiError::NotFound),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
         Err(StorageReadError::Conversion(error)) => {

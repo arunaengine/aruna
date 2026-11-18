@@ -11,8 +11,8 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
-    DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+    METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -54,14 +54,6 @@ pub(crate) fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id:
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&audit_id.to_bytes());
     ByteView::from(bytes)
-}
-
-pub(crate) fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
-        key: metadata_document_key(document_id),
-        txn_id,
-    })
 }
 
 pub(crate) fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
@@ -220,14 +212,6 @@ pub(crate) fn event_projection_entries(
         materialization_job,
     )?);
     Ok(writes)
-}
-
-pub(crate) fn parse_registry_read(
-    event: Event,
-) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
-    parse_storage_read(event, |bytes| {
-        postcard::from_bytes(bytes).map_err(ConversionError::from)
-    })
 }
 
 pub(crate) fn parse_status_read(

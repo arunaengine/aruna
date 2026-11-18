@@ -7,36 +7,24 @@ use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::api::export_types::GetVisibleRequest;
-use crate::metadata::api::export_types::RoCrateExportView;
-use crate::metadata::api::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::revision_read::MetadataRawView;
-use crate::metadata::revision_read::RawDisplayOperation;
 use crate::placement::process_placements::load_realm_config;
-use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata::MaterializationState;
-use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::metadata::MetadataRawRevision;
 use aruna_core::metadata::ProfileValidationStatus;
-use aruna_core::metadata::raw_context_digest;
 use aruna_core::placement::read_holder_sets;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -47,10 +35,7 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-use super::holder_reads::{
-    AuthFailure, READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, ReadDecision, collect_profile_export,
-    device_raw_revision, reduce_holder_reads,
-};
+use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
 use super::profile_export::ProfileLocalOperation;
 use super::routed_export::{ExportWithinOperation, ensure_export_limit, owner_reads};
 use crate::forward::replay::routed_record_matches;

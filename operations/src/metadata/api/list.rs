@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::export::export_summary_jsonld;
 use super::list_types::{
     ESTIMATE_MIN_LIMIT, ListVisibleRequest, ListVisibleResult, ListedMetadataDocument,
     MetadataListOrder, check_policy_limit, effective_list_limit, merge_pending_records,
@@ -16,7 +15,6 @@ use super::{
     parse_registry_iter, pending_projection_target, stream,
 };
 use crate::driver::{DriverContext, drive};
-use crate::metadata::api::export::SummaryOperation;
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
 

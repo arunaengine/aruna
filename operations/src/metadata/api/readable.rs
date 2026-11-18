@@ -12,8 +12,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
-use crate::auth::error::AuthorizationError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_core::errors::AuthorizationError;
 
 /// Whether the caller may read `record`. A public record needs only the realm and group
 /// policies; a private one needs the caller's read permission on its path and the policies too.

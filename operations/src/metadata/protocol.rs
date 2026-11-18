@@ -729,7 +729,10 @@ pub enum MetadataTransportMessage {
     /// An export answer with its body already read; the transport hands it to the operation
     /// that asked, and it never crosses the wire.
     ExportAnswer {
-        result: Result<Box<crate::metadata::api::export_types::ExportMetadataResult>, MetadataReadError>,
+        result: Result<
+            Box<crate::metadata::api::export_types::ExportMetadataResult>,
+            MetadataReadError,
+        >,
     },
 }
 
