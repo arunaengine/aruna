@@ -6,27 +6,31 @@
 use aruna_core::NodeId;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::{JobId, JobPayload, RETENTION_MS, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus, ObjectInfo, ObjectPage};
 use base64::Engine;
 use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::check::RunScope;
 use super::grants::short_path;
 use super::marks::is_marked;
 use super::rows::{StoreError, decode, delete_rows, scan_rows};
+use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
 use super::unavailable;
 use super::work::{
     SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
     install_at, read_work, summary_of, update_work, work_scan, work_state,
 };
 use crate::driver::{DriverContext, drive};
-use crate::jobs::service::find_dedup_job;
+use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::set_cancel_requested;
 use crate::jobs::store::state::read_job_record;
+use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
 
 /// Outputs of one page.
 const PAGE: usize = 100;
@@ -306,6 +310,53 @@ fn kind_name(kind: WorkKind) -> &'static str {
         WorkKind::Download => "download",
         WorkKind::Upload => "upload",
         WorkKind::Recipe => "task",
+    }
+}
+
+/// Starts or finds the work of `request` and answers its work id. The dedup key is the work id,
+/// so a repeated submission with the same payload answers the same job.
+pub(crate) async fn start_work(
+    ctx: &DriverContext,
+    scope: &RunScope,
+    request: WorkRequest,
+) -> Result<Ulid, HostError> {
+    let now_ms = unix_timestamp_millis();
+    let prepare = PrepareWork::new(scope, request, (now_ms, Ulid::generate()));
+    let (account, spec) = match drive(prepare, ctx).await? {
+        PreparedWork::Known(work_id) => return Ok(work_id),
+        PreparedWork::Submit { account, spec } => (account, *spec),
+    };
+    let (install_id, work_id) = (spec.install_id, spec.work_id);
+    let dedup = dedup_key(work_id);
+    let job_id = mint_local_job(ctx, scope.realm_id, scope.local, Some(&dedup)).await;
+    let job_id = job_id.map_err(submit_error)?;
+    let submitted = SubmitJobSpec {
+        payload: JobPayload::PluginWork(spec),
+        created_by: account,
+        owner_node_id: scope.local,
+        dedup_key: Some(dedup),
+        now_ms: unix_timestamp_millis(),
+        retention_ms: RETENTION_MS,
+        workspace_mode: WorkspaceMode::default(),
+        workspace_bucket: None,
+        active_cap: Some(WORK_ACTIVE),
+    };
+    let result = submit_local_job(ctx, submitted, job_id).await;
+    let result = result.map_err(submit_error)?;
+    let change = WorkChange::Dispatched(result.job_id);
+    let recorded = drive(update_work((install_id, work_id), change), ctx).await;
+    recorded.map_err(|error| unavailable(error.0))?;
+    Ok(work_id)
+}
+
+/// The work's row stays reserved after any refusal, so the same call submits again later.
+fn submit_error(error: SubmitJobError) -> HostError {
+    match error {
+        SubmitJobError::ActiveJobLimit { limit } => HostError::new(
+            ErrorKind::Limit,
+            format!("the install has {limit} unfinished work already"),
+        ),
+        other => unavailable(other.to_string()),
     }
 }
 

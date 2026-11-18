@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::broker::call_intent;
 use crate::plugins::copies::store_local;
+use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::unknown_row;
