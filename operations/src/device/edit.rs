@@ -3,21 +3,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE;
 use aruna_core::metadata::{
     MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
+use aruna_core::operation::{HoldScope, Operation};
+use aruna_core::rows::{done, read_row, value};
 use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use craqle::ActorId;
 use thiserror::Error;
 use tracing::warn;
@@ -28,7 +30,6 @@ use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
 use crate::device::replica::{ReplicaRecord, mark_edited};
 use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
-use crate::driver::{DriverContext, drive};
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
@@ -43,74 +44,250 @@ pub enum DeviceEditError {
     QueueFull { limit: usize },
 }
 
-/// Applies one edit to the local replica and queues it for the realm.
-///
-/// The holder merges the same craqle batch so both sides converge; the drain confirms the record.
-pub async fn apply_local_edit(
-    context: &Arc<DriverContext>,
+impl From<IoError> for DeviceEditError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn metadata_call(effect: MetadataEffect) -> IoCall {
+    IoCall::from(Effect::Metadata(effect))
+}
+
+fn metadata_event(result: IoResult) -> Result<MetadataEvent, IoError> {
+    match result.event()? {
+        Event::Metadata(event) => Ok(event),
+        other => Err(IoError::Unexpected {
+            expected: "Event::Metadata",
+            got: other.label(),
+        }),
+    }
+}
+
+fn warn_unflushed(event: &MetadataEvent) {
+    if !matches!(event, MetadataEvent::GraphFlushed) {
+        warn!(event = ?event, "Could not persist an offline edit's graph");
+    }
+}
+
+/// What the pending call of an offline edit answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditStep {
+    Actor,
+    Plan,
+    Queue,
+    Merge,
+    Flush,
+    Render,
+    Store,
+    Arm,
+}
+
+/// Applies one edit to the local replica and queues it for the realm. The holder merges the
+/// same craqle batch so both sides converge; the drain confirms the record.
+pub fn apply_local_edit(
     owner: UserId,
     node_id: NodeId,
     replica: &ReplicaRecord,
     mutation: UpdateDocumentMutation,
     issued_at: u64,
-) -> Result<MetadataRegistryRecord, DeviceEditError> {
-    let record = replica
-        .record
-        .as_deref()
-        .cloned()
-        .ok_or(DeviceEditError::NoReplica)?;
-    let authored = authored_source(mutation).ok_or_else(|| {
-        DeviceEditError::Invalid("this mutation is not authored on a device".to_string())
-    })?;
-    let _guard = match context.graph_handle.as_ref() {
-        Some(graph) => Some(graph.hold_document(record.document_id).await),
-        None => None,
-    };
-    let current = read_actor(context, record.document_id).await?;
-    let mut draft_id = Ulid::generate();
-    if let Some(current) = &current
-        && draft_id <= current.last_event_id
-    {
-        draft_id = current
-            .last_event_id
-            .increment()
-            .map_err(|_| DeviceEditError::Unavailable)?;
+) -> ApplyEditOperation {
+    ApplyEditOperation {
+        owner,
+        node_id,
+        replica: replica.clone(),
+        authored: authored_source(mutation),
+        issued_at,
+        step: EditStep::Actor,
+        record: replica.record.as_deref().cloned(),
+        pending: None,
+        batch: None,
     }
-    let actor = MetadataActor::next(current.as_ref(), record.document_id, node_id, draft_id)
-        .ok_or(DeviceEditError::Unavailable)?;
-    let mut batch = plan_local(context, &record, &authored, (actor.actor, actor.counter)).await?;
-    // Holders never get refused dots, so a new edit must not wait for them.
-    actor.strip(&mut batch.base_clock);
-    let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
-    drive(
-        EnqueueDraftOperation::new(EnqueueDraftInput { entry })
-            .with_actor(actor)
-            .with_fence(issued_at),
-        context.as_ref(),
-    )
-    .await
-    .map_err(|error| match error {
-        EnqueueDraftError::QueueFull { limit } => DeviceEditError::QueueFull { limit },
-        other => {
-            warn!(error = %other, "Could not queue an offline edit");
-            DeviceEditError::Unavailable
-        }
-    })?;
-    merge_local(context, &batch).await?;
-    request_persist(context).await;
+}
 
-    let mut edited = replica.clone();
-    edited.record = Some(Box::new(record.clone()));
-    let mut local_clock = batch.base_clock.clone();
-    local_clock.advance(ActorId::from_bytes(batch.actor), batch.counter);
-    mark_edited(&mut edited, local_clock);
-    edited.displayed_jsonld = render(context, &record.graph_iri).await?;
-    edited.dataset_digest = craqle::canonicalize_jsonld(&edited.displayed_jsonld)
-        .ok()
-        .map(|canonical| canonical.digest);
-    drive(store_replica(&edited), context).await.ok();
-    arm_drain(context).await;
-    Ok(record)
+#[derive(Debug, PartialEq)]
+pub struct ApplyEditOperation {
+    owner: UserId,
+    node_id: NodeId,
+    replica: ReplicaRecord,
+    authored: Option<MetadataBatchSource>,
+    issued_at: u64,
+    step: EditStep,
+    record: Option<MetadataRegistryRecord>,
+    pending: Option<(MetadataActor, Ulid)>,
+    batch: Option<MetadataBatch>,
+}
+
+type EditTurn = Result<Next<MetadataRegistryRecord>, DeviceEditError>;
+
+impl ApplyEditOperation {
+    fn record(&self) -> Result<&MetadataRegistryRecord, IoError> {
+        self.record.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn authored(&self) -> Result<&MetadataBatchSource, IoError> {
+        self.authored.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    /// Picks the next dot of this device's actor and plans the edit without changing the graph.
+    fn plan(&mut self, current: Option<MetadataActor>) -> EditTurn {
+        let record = self.record()?;
+        let mut draft_id = Ulid::generate();
+        if let Some(current) = &current
+            && draft_id <= current.last_event_id
+        {
+            draft_id =
+                (current.last_event_id.increment()).map_err(|_| DeviceEditError::Unavailable)?;
+        }
+        let document_id = record.document_id;
+        let actor = MetadataActor::next(current.as_ref(), document_id, self.node_id, draft_id)
+            .ok_or(DeviceEditError::Unavailable)?;
+        let plan = MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor: actor.actor,
+            counter: actor.counter,
+            source: self.authored()?.clone(),
+        };
+        self.pending = Some((actor, draft_id));
+        self.step = EditStep::Plan;
+        Ok(Next::Call(metadata_call(plan)))
+    }
+
+    /// Queues the planned batch durably; holders never get refused dots, so a new edit must
+    /// not wait for them.
+    fn queue(&mut self, event: MetadataEvent) -> EditTurn {
+        let mut batch = match event {
+            MetadataEvent::BatchPlanned { batch, .. } => batch,
+            MetadataEvent::Error {
+                error: MetadataError::InvalidInput(message),
+                ..
+            } => return Err(DeviceEditError::Invalid(message)),
+            MetadataEvent::Error {
+                error: MetadataError::Validation(violations),
+                ..
+            } => return Err(DeviceEditError::Invalid(format!("{violations:?}"))),
+            other => {
+                let document_id = self.record()?.document_id;
+                warn!(%document_id, event = ?other, "An offline edit could not be planned");
+                return Err(DeviceEditError::Unavailable);
+            }
+        };
+        let (actor, draft_id) = self.pending.take().ok_or(IoError::Unfinished)?;
+        actor.strip(&mut batch.base_clock);
+        let authored = self.authored()?.clone();
+        let entry = PublishEntry::edit(
+            draft_id,
+            self.owner,
+            self.record()?,
+            batch.clone(),
+            authored,
+        );
+        let enqueue = EnqueueDraftOperation::new(EnqueueDraftInput { entry })
+            .with_actor(actor)
+            .with_fence(self.issued_at);
+        self.batch = Some(batch);
+        self.step = EditStep::Queue;
+        Ok(Next::Call(IoCall::child(enqueue)))
+    }
+
+    fn merge(&mut self) -> EditTurn {
+        let batch = self.batch.as_ref().ok_or(IoError::Unfinished)?;
+        let merge = MetadataEffect::MergeBatch {
+            graph_iri: batch.graph_iri.clone(),
+            batch: batch.clone(),
+        };
+        self.step = EditStep::Merge;
+        Ok(Next::Call(metadata_call(merge)))
+    }
+
+    /// Stores the replica with the merged graph this device displays from now on.
+    fn store(&mut self, jsonld: String) -> EditTurn {
+        let record = self.record()?.clone();
+        let batch = self.batch.as_ref().ok_or(IoError::Unfinished)?;
+        let mut local_clock = batch.base_clock.clone();
+        local_clock.advance(ActorId::from_bytes(batch.actor), batch.counter);
+        let mut edited = self.replica.clone();
+        edited.record = Some(Box::new(record));
+        mark_edited(&mut edited, local_clock);
+        edited.dataset_digest = craqle::canonicalize_jsonld(&jsonld)
+            .ok()
+            .map(|canonical| canonical.digest);
+        edited.displayed_jsonld = jsonld;
+        self.step = EditStep::Store;
+        Ok(Next::Call(IoCall::child(store_replica(&edited))))
+    }
+}
+
+impl Operation for ApplyEditOperation {
+    type Output = MetadataRegistryRecord;
+    type Error = DeviceEditError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        let record = self.record.as_ref()?;
+        Some(HoldScope::DocumentWrite(record.document_id))
+    }
+
+    fn first(&mut self) -> EditTurn {
+        let document_id = (self.record.as_ref())
+            .ok_or(DeviceEditError::NoReplica)?
+            .document_id;
+        if self.authored.is_none() {
+            let reason = "this mutation is not authored on a device".to_string();
+            return Err(DeviceEditError::Invalid(reason));
+        }
+        Ok(Next::Call(actor_call(document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> EditTurn {
+        match self.step {
+            EditStep::Actor => self.plan(actor_answer(result)?),
+            EditStep::Plan => self.queue(metadata_event(result)?),
+            EditStep::Queue => match result.child::<PublishEntry, EnqueueDraftError>()? {
+                Ok(_) => self.merge(),
+                Err(EnqueueDraftError::QueueFull { limit }) => {
+                    Err(DeviceEditError::QueueFull { limit })
+                }
+                Err(error) => {
+                    warn!(%error, "Could not queue an offline edit");
+                    Err(DeviceEditError::Unavailable)
+                }
+            },
+            EditStep::Merge => match metadata_event(result)? {
+                MetadataEvent::BatchMerged { .. } => {
+                    self.step = EditStep::Flush;
+                    Ok(Next::Call(metadata_call(MetadataEffect::FlushGraph)))
+                }
+                other => {
+                    warn!(event = ?other, "A queued offline edit did not apply");
+                    Err(DeviceEditError::Unavailable)
+                }
+            },
+            // Best effort: a failure leaves exactly the queued work the replay covers.
+            EditStep::Flush => {
+                warn_unflushed(&metadata_event(result)?);
+                self.step = EditStep::Render;
+                let render = render(&self.record()?.graph_iri);
+                Ok(Next::Call(IoCall::child(render)))
+            }
+            EditStep::Render => self.store(result.child::<String, DeviceEditError>()??),
+            EditStep::Store => {
+                result.child::<(), IoError>()?.ok();
+                self.step = EditStep::Arm;
+                let arm = TaskEffect::ScheduleIdleTimer {
+                    key: TaskKey::DrainDeviceIntake,
+                    after: Duration::ZERO,
+                };
+                Ok(Next::Call(IoCall::from(Effect::Task(arm))))
+            }
+            // Wakes the publish drain so a reachable realm sees the edit at once.
+            EditStep::Arm => {
+                if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
+                    warn!(%message, "Failed to arm the device publish drain");
+                }
+                Ok(Next::Done(self.record.take().ok_or(IoError::Unfinished)?))
+            }
+        }
+    }
 }
 
 /// The submission behind an edit, or `None` for a mutation only a holder
@@ -130,178 +307,116 @@ fn authored_source(mutation: UpdateDocumentMutation) -> Option<MetadataBatchSour
     }
 }
 
-/// Marks an edit the realm permanently refused, so later edits start a fresh actor and
-/// never depend on it. Returns whether the actor record was updated.
-pub(super) async fn reject_edit(
-    context: &Arc<DriverContext>,
-    document_id: Ulid,
-    dot: ([u8; 32], u64),
-) -> bool {
-    let _guard = match context.graph_handle.as_ref() {
-        Some(graph) => Some(graph.hold_document(document_id).await),
-        None => None,
-    };
-    let Ok(Some(mut current)) = read_actor(context, document_id).await else {
-        return false;
-    };
-    current.reject(dot.0, dot.1);
-    let Ok((key_space, key, value)) = metadata_actor_entry(&current) else {
-        return false;
-    };
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    )
+fn actor_call(document_id: Ulid) -> IoCall {
+    read_row(METADATA_ACTOR_KEYSPACE, metadata_actor_key(document_id))
 }
 
-/// Whether an edit depends on one the realm permanently refused.
-pub(super) async fn refused_edit(
-    context: &Arc<DriverContext>,
-    document_id: Ulid,
-    dot: ([u8; 32], u64),
-) -> bool {
-    read_actor(context, document_id)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|current| current.refused(dot.0, dot.1))
+fn actor_answer(result: IoResult) -> Result<Option<MetadataActor>, DeviceEditError> {
+    value(result)?
+        .map(|bytes| postcard::from_bytes(&bytes).map_err(|_| DeviceEditError::Unavailable))
+        .transpose()
 }
 
 /// This device's CRDT actor for the document, if it edited the document before.
-async fn read_actor(
-    context: &Arc<DriverContext>,
+pub(super) fn read_actor(document_id: Ulid) -> ReadActorOperation {
+    ReadActorOperation { document_id }
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct ReadActorOperation {
     document_id: Ulid,
-) -> Result<Option<MetadataActor>, DeviceEditError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_ACTOR_KEYSPACE.to_string(),
-            key: metadata_actor_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(|_| DeviceEditError::Unavailable))
-            .transpose(),
-        _ => Err(DeviceEditError::Unavailable),
+}
+
+impl Operation for ReadActorOperation {
+    type Output = Option<MetadataActor>;
+    type Error = DeviceEditError;
+
+    fn first(&mut self) -> Result<Next<Option<MetadataActor>>, DeviceEditError> {
+        Ok(Next::Call(actor_call(self.document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<MetadataActor>>, DeviceEditError> {
+        Ok(Next::Done(actor_answer(result)?))
     }
 }
 
-/// Plans the submission under this device's actor without changing the graph.
-async fn plan_local(
-    context: &Arc<DriverContext>,
-    record: &MetadataRegistryRecord,
-    authored: &MetadataBatchSource,
+/// Marks an edit the realm permanently refused, so later edits start a fresh actor and never
+/// depend on it. Outputs whether the actor record was updated.
+pub(super) fn reject_edit(document_id: Ulid, dot: ([u8; 32], u64)) -> RejectEditOperation {
+    RejectEditOperation {
+        document_id,
+        dot,
+        writing: false,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct RejectEditOperation {
+    document_id: Ulid,
     dot: ([u8; 32], u64),
-) -> Result<MetadataBatch, DeviceEditError> {
-    let (actor, counter) = dot;
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(DeviceEditError::Unavailable)?;
-    match metadata
-        .run_effect(
-            context,
-            MetadataEffect::PlanBatch {
-                graph_iri: record.graph_iri.clone(),
-                actor,
-                counter,
-                source: authored.clone(),
-            },
-        )
-        .await
-    {
-        Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => Ok(batch),
-        Event::Metadata(MetadataEvent::Error {
-            error: MetadataError::InvalidInput(message),
-            ..
-        }) => Err(DeviceEditError::Invalid(message)),
-        Event::Metadata(MetadataEvent::Error {
-            error: MetadataError::Validation(violations),
-            ..
-        }) => Err(DeviceEditError::Invalid(format!("{violations:?}"))),
-        other => {
-            warn!(document_id = %record.document_id, event = ?other, "An offline edit could not be planned");
-            Err(DeviceEditError::Unavailable)
+    writing: bool,
+}
+
+impl Operation for RejectEditOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::DocumentWrite(self.document_id))
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(actor_call(self.document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.writing {
+            done(result)?;
+            return Ok(Next::Done(true));
         }
+        let Ok(Some(mut current)) = actor_answer(result) else {
+            return Ok(Next::Done(false));
+        };
+        current.reject(self.dot.0, self.dot.1);
+        let Ok(row) = metadata_actor_entry(&current) else {
+            return Ok(Next::Done(false));
+        };
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-/// Applies a durably queued batch to the device's local graph.
-async fn merge_local(
-    context: &Arc<DriverContext>,
-    batch: &MetadataBatch,
-) -> Result<(), DeviceEditError> {
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(DeviceEditError::Unavailable)?;
-    match metadata
-        .run_effect(
-            context,
-            MetadataEffect::MergeBatch {
-                graph_iri: batch.graph_iri.clone(),
-                batch: batch.clone(),
-            },
-        )
-        .await
-    {
-        Event::Metadata(MetadataEvent::BatchMerged { .. }) => Ok(()),
-        other => {
-            warn!(event = ?other, "A queued offline edit did not apply");
-            Err(DeviceEditError::Unavailable)
-        }
-    }
-}
-
-/// The render of the merged graph this device displays from now on.
-async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String, DeviceEditError> {
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(DeviceEditError::Unavailable)?;
-    let export = MetadataEffect::ExportRoCrate {
+/// The render of a graph as this device displays it.
+pub(super) fn render(graph_iri: &str) -> RenderGraphOperation {
+    RenderGraphOperation {
         graph_iri: graph_iri.to_string(),
-    };
-    match metadata.run_effect(context, export).await {
-        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => Ok(jsonld),
-        other => {
-            warn!(event = ?other, "Could not render an edited replica");
-            Err(DeviceEditError::Unavailable)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct RenderGraphOperation {
+    graph_iri: String,
+}
+
+impl Operation for RenderGraphOperation {
+    type Output = String;
+    type Error = DeviceEditError;
+
+    fn first(&mut self) -> Result<Next<String>, DeviceEditError> {
+        let export = MetadataEffect::ExportRoCrate {
+            graph_iri: self.graph_iri.clone(),
+        };
+        Ok(Next::Call(metadata_call(export)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<String>, DeviceEditError> {
+        match metadata_event(result)? {
+            MetadataEvent::RoCrateExportResult { jsonld, .. } => Ok(Next::Done(jsonld)),
+            other => {
+                warn!(event = ?other, "Could not render an edited replica");
+                Err(DeviceEditError::Unavailable)
+            }
         }
-    }
-}
-
-/// Wakes the publish drain so a reachable realm sees the edit at once.
-async fn arm_drain(context: &Arc<DriverContext>) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_idle_timer(TaskKey::DrainDeviceIntake, Duration::ZERO)
-        .await
-    {
-        warn!(message = %message, "Failed to arm the device publish drain");
-    }
-}
-
-/// Asks the metadata backend to make what it just wrote durable. Best effort:
-/// a failure leaves exactly the queued work the replay covers.
-async fn request_persist(context: &Arc<DriverContext>) {
-    let Some(graph) = context.graph_handle.as_ref() else {
-        return;
-    };
-    if let Err(error) = graph.flush_persistence().await {
-        warn!(error = %error, "Could not persist an offline edit's graph");
     }
 }
 
@@ -316,46 +431,91 @@ fn replays_edit(entry: &PublishEntry) -> bool {
         )
 }
 
-/// Re-merges every queued edit into this device's replicas, returning the count.
-///
-/// A crash between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
-pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return 0;
-    };
-    let mut replayed = 0usize;
-    for entry in drive(read_publish_entries(), context)
-        .await
-        .unwrap_or_default()
-    {
-        let PublishKind::Edit { batch, .. } = &entry.kind else {
-            continue;
-        };
-        if !replays_edit(&entry) {
-            continue;
-        }
-        match metadata
-            .run_effect(
-                context,
-                MetadataEffect::MergeBatch {
-                    graph_iri: batch.graph_iri.clone(),
-                    batch: (**batch).clone(),
-                },
-            )
-            .await
-        {
-            Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) => {
-                replayed += usize::from(applied);
+/// Re-merges every queued edit into this device's replicas, outputting how many applied. A crash
+/// between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
+pub fn replay_queued_edits() -> ReplayEditsOperation {
+    ReplayEditsOperation {
+        step: ReplayStep::Entries,
+        queue: VecDeque::new(),
+        asked: None,
+        replayed: 0,
+    }
+}
+
+/// What the pending call of replaying edits answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayStep {
+    Entries,
+    Merge,
+    Flush,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReplayEditsOperation {
+    step: ReplayStep,
+    queue: VecDeque<PublishEntry>,
+    asked: Option<Ulid>,
+    replayed: usize,
+}
+
+impl ReplayEditsOperation {
+    fn next_edit(&mut self) -> Result<Next<usize>, IoError> {
+        while let Some(entry) = self.queue.pop_front() {
+            let PublishKind::Edit { batch, .. } = &entry.kind else {
+                continue;
+            };
+            if !replays_edit(&entry) {
+                continue;
             }
-            other => {
-                warn!(draft_id = %entry.draft_id, event = ?other, "Could not replay a queued edit");
+            let merge = MetadataEffect::MergeBatch {
+                graph_iri: batch.graph_iri.clone(),
+                batch: (**batch).clone(),
+            };
+            self.asked = Some(entry.draft_id);
+            self.step = ReplayStep::Merge;
+            return Ok(Next::Call(metadata_call(merge)));
+        }
+        if self.replayed == 0 {
+            return Ok(Next::Done(0));
+        }
+        self.step = ReplayStep::Flush;
+        Ok(Next::Call(metadata_call(MetadataEffect::FlushGraph)))
+    }
+}
+
+impl Operation for ReplayEditsOperation {
+    type Output = usize;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<usize>, IoError> {
+        Ok(Next::Call(IoCall::child(read_publish_entries())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, IoError> {
+        match self.step {
+            ReplayStep::Entries => {
+                let entries = result.child::<Vec<PublishEntry>, IoError>()?;
+                self.queue = entries.unwrap_or_default().into();
+                self.next_edit()
+            }
+            ReplayStep::Merge => {
+                match metadata_event(result)? {
+                    MetadataEvent::BatchMerged { applied, .. } => {
+                        self.replayed += usize::from(applied);
+                    }
+                    other => {
+                        let draft_id = self.asked.take();
+                        warn!(?draft_id, event = ?other, "Could not replay a queued edit");
+                    }
+                }
+                self.next_edit()
+            }
+            ReplayStep::Flush => {
+                warn_unflushed(&metadata_event(result)?);
+                Ok(Next::Done(self.replayed))
             }
         }
     }
-    if replayed > 0 {
-        request_persist(context).await;
-    }
-    replayed
 }
 
 /// Whether this replica may take the edit locally: the owner selected it, or it is a usable copy
@@ -366,7 +526,10 @@ pub fn accepts_edits(replica: &ReplicaRecord, by_owner: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceEditError, accepts_edits, apply_local_edit, read_actor, replays_edit};
+    use super::{
+        ApplyEditOperation, DeviceEditError, EditStep, accepts_edits, apply_local_edit,
+        authored_source, read_actor, reject_edit, render, replay_queued_edits, replays_edit,
+    };
     use crate::device::publish_queue::{
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
@@ -376,6 +539,7 @@ mod tests {
     use crate::metadata::MetadataHandle;
     use crate::tests::device::record;
     use aruna_core::UserId;
+    use aruna_core::calls::IoResult;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{
@@ -588,16 +752,8 @@ mod tests {
         let (_dir, context, record) = device().await;
         let owner = UserId::local(Ulid::generate(), record.realm_id);
         for name in ["ada", "grace"] {
-            apply_local_edit(
-                &context,
-                owner,
-                node(1),
-                &replica(&record),
-                contact(name),
-                0,
-            )
-            .await
-            .expect("edit applies");
+            let edit = apply_local_edit(owner, node(1), &replica(&record), contact(name), 0);
+            drive(edit, &context).await.expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
             drive(crate::device::sync_status::read_publish_entries(), &context)
@@ -618,7 +774,7 @@ mod tests {
             actor: craqle::ActorId::from_bytes(first.actor),
             counter: 1,
         }));
-        let stored = read_actor(&context, record.document_id)
+        let stored = drive(read_actor(record.document_id), &context)
             .await
             .expect("actor readable")
             .expect("actor stored");
@@ -660,18 +816,12 @@ mod tests {
             ReplicaOrigin::Realm,
         );
         replica.record = Some(Box::new(record.clone()));
-        let before = super::render(&context, &record.graph_iri).await.unwrap();
+        let before = drive(render(&record.graph_iri), &context).await.unwrap();
 
         assert_eq!(
-            apply_local_edit(
+            drive(
+                apply_local_edit(owner, node(1), &replica, contact("ada"), 0,),
                 &context,
-                owner,
-                node(1),
-                &replica,
-                crate::metadata::update_document::UpdateDocumentMutation::UpsertContextualEntity {
-                    jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
-                },
-                0,
             )
             .await,
             Err(DeviceEditError::QueueFull {
@@ -679,9 +829,12 @@ mod tests {
             })
         );
         // The refused edit must not consume a dot either.
-        assert_eq!(read_actor(&context, record.document_id).await, Ok(None));
         assert_eq!(
-            super::render(&context, &record.graph_iri).await.unwrap(),
+            drive(read_actor(record.document_id), &context).await,
+            Ok(None)
+        );
+        assert_eq!(
+            drive(render(&record.graph_iri), &context).await.unwrap(),
             before
         );
     }
@@ -719,5 +872,86 @@ mod tests {
         );
         assert!(matches!(create.kind, PublishKind::Create));
         assert!(!replays_edit(&create));
+    }
+
+    fn editing(with_record: bool) -> ApplyEditOperation {
+        let mut read = ReplicaRecord::new(
+            record().document_id,
+            record().group_id,
+            record().document_path,
+            ReplicaOrigin::Realm,
+        );
+        if with_record {
+            read.record = Some(Box::new(record()));
+        }
+        let owner = UserId::local(Ulid::from_bytes([1; 16]), RealmId::from_bytes([3; 32]));
+        apply_local_edit(owner, node(1), &read, contact("ada"), 0)
+    }
+
+    fn metadata(event: MetadataEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Metadata(event)))
+    }
+
+    // Only a replica with a record can take an edit, and it holds the document while it does.
+    #[test]
+    fn edit_needs_record() {
+        use aruna_core::operation::{HoldScope, Operation};
+        let mut empty = editing(false);
+        assert_eq!(empty.hold_scope(), None);
+        assert_eq!(empty.first(), Err(DeviceEditError::NoReplica));
+        let held = editing(true);
+        let scope = HoldScope::DocumentWrite(record().document_id);
+        assert_eq!(held.hold_scope(), Some(scope));
+    }
+
+    // A mutation only a holder originates is refused before any read.
+    #[test]
+    fn holder_mutation_refused() {
+        use aruna_core::operation::Operation;
+        let mut edit = editing(true);
+        edit.authored = None;
+        assert!(matches!(edit.first(), Err(DeviceEditError::Invalid(_))));
+        assert!(authored_source(contact("ada")).is_some());
+    }
+
+    // A planning refusal reaches the owner and queues nothing.
+    #[test]
+    fn plan_refusal_surfaces() {
+        use aruna_core::calls::IoResult as Answer;
+        use aruna_core::metadata::MetadataError;
+        use aruna_core::operation::Operation;
+        let mut edit = editing(true);
+        edit.first().unwrap();
+        edit.next(Answer::Values(vec![None])).unwrap();
+        assert_eq!(edit.step, EditStep::Plan);
+        let refused = MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::InvalidInput("bad".to_string()),
+        };
+        let answer = edit.next(metadata(refused));
+        assert_eq!(answer, Err(DeviceEditError::Invalid("bad".to_string())));
+    }
+
+    // A refused edit without an actor row changes nothing.
+    #[test]
+    fn reject_needs_actor() {
+        use aruna_core::calls::Next;
+        use aruna_core::operation::Operation;
+        let mut reject = reject_edit(record().document_id, ([1; 32], 1));
+        reject.first().unwrap();
+        let answer = reject.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(false)));
+    }
+
+    // With no queued edit nothing merges and nothing is flushed.
+    #[test]
+    fn replay_empty_queue() {
+        use aruna_core::calls::{ChildOutcome, Next};
+        use aruna_core::operation::Operation;
+        let mut replay = replay_queued_edits();
+        replay.first().unwrap();
+        let none = Ok::<_, aruna_core::calls::IoError>(Vec::<PublishEntry>::new());
+        let answer = replay.next(IoResult::Child(ChildOutcome::new(none)));
+        assert_eq!(answer, Ok(Next::Done(0)));
     }
 }

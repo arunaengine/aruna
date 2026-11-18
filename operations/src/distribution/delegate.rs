@@ -9,15 +9,14 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{NodeRealm, RealmId};
 use aruna_core::structs::storage::distribution::delegation::{
-    BodyTrailer, Delegation, DelegationError, Payload, SignedDelegation,
+    Delegation, Payload, SignedDelegation,
 };
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 use super::accept_delegation::{AcceptDelegationOperation, DelegateError};
-use crate::driver::DriverContext;
 
 /// How long an issued delegation is valid.
 const DELEGATION_SECS: u64 = 15;
@@ -43,7 +42,7 @@ pub struct DelegationInput {
 }
 
 /// The delegation `issuer` makes for one verified request; `now` is Unix seconds.
-pub(crate) fn unsigned_delegation(
+pub fn unsigned_delegation(
     (issuer, realm_id): (NodeId, RealmId),
     input: DelegationInput,
     now: u64,
@@ -71,51 +70,17 @@ pub(crate) fn unsigned_delegation(
     }
 }
 
-/// Signs a delegation for one request with this node's key; `now` is Unix seconds.
-pub fn issue_delegation(
-    context: &DriverContext,
-    input: DelegationInput,
-    now: u64,
-) -> Result<SignedDelegation, DelegateError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or(DelegateError::Unavailable)?;
-    let delegation = unsigned_delegation((net.node_id(), *net.realm_id()), input, now);
-    let bytes = delegation
-        .signing_bytes()
-        .map_err(|_| DelegationError::Encoding)?;
-    Ok(SignedDelegation {
-        signature: net.sign(&bytes),
-        delegation,
-    })
-}
-
-/// Signs the trailer of a framed body this node forwards under the delegation with `nonce`.
-pub fn sign_body(
-    context: &DriverContext,
-    nonce: &[u8; 16],
-    trailer: &BodyTrailer,
-) -> Option<iroh::Signature> {
-    let net = context.net_handle.as_ref()?;
-    Some(net.sign(&trailer.signing_bytes(nonce)))
-}
-
 /// Accepts a delegation for this node once; see [`AcceptDelegationOperation`].
 pub fn accept_delegation(
-    context: &DriverContext,
+    ids: NodeRealm,
     signed: &SignedDelegation,
     now: u64,
 ) -> Result<AcceptDelegationOperation, DelegateError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or(DelegateError::Unavailable)?;
-    let realm_id = *net.realm_id();
+    let (node_id, realm_id) = ids.ok_or(DelegateError::Unavailable)?;
     Ok(AcceptDelegationOperation::new(
         signed.clone(),
         realm_id,
-        net.node_id(),
+        node_id,
         now,
     ))
 }

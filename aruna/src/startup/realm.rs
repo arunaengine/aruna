@@ -78,7 +78,12 @@ pub(crate) async fn prepare(
     // Devices fetch governing realm documents before serving because they run no sync.
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        && !drive(fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH), driver_ctx).await.unwrap_or(false)
+        && !drive(
+            fetch_realm_documents(driver_ctx.node_and_realm(), STARTUP_DOCUMENT_FETCH),
+            driver_ctx,
+        )
+        .await
+        .unwrap_or(false)
     {
         warn!("Serving this device from its stored realm documents for now");
     }

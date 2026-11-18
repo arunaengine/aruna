@@ -67,6 +67,8 @@ pub enum Effect {
     Compute(Box<crate::compute::effect::ComputeEffect>),
     /// A request to the host of a running job; never persisted.
     Job(crate::jobs::JobEffect),
+    /// One call to this node's Git store; never persisted.
+    Git(Box<crate::git::GitCall>),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at

@@ -138,11 +138,15 @@ async fn list_documents(
     _: OwnerAuth,
 ) -> ServerResult<Json<DeviceDocumentList>> {
     let context = state.get_ctx();
-    let replicas = drive(list_replicas(), &context).await.ok()
+    let replicas = drive(list_replicas(), &context)
+        .await
+        .ok()
         .ok_or(ServerError::ServiceUnavailable)?;
     Ok(Json(DeviceDocumentList {
         cache_budget_bytes: cache_budget(),
-        cache_used_bytes: drive(cache_usage(), &context).await.ok()
+        cache_used_bytes: drive(cache_usage(), &context)
+            .await
+            .ok()
             .ok_or(ServerError::ServiceUnavailable)?,
         documents: replicas.into_iter().map(DeviceDocument::from).collect(),
     }))
@@ -200,7 +204,13 @@ async fn set_selection(
     let document_id = Ulid::from_str(&document_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let replica = match request.selected {
-        true => drive(select_document(&context, document_id), &context).await,
+        true => {
+            drive(
+                select_document(context.node_and_realm(), document_id),
+                &context,
+            )
+            .await
+        }
         false => drive(deselect_document(document_id), &context).await,
     }
     .map_err(map_selection_error)?;

@@ -8,6 +8,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsObject;
 use aruna_core::structs::identity::auth::Permission;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::git::{self, GitError};
 use axum::Json;
 use axum::body::Body;
@@ -52,9 +53,12 @@ pub async fn batch(
     }) {
         return Err(ServerError::BadRequest);
     }
-    git::repository(&state.get_ctx(), &auth, id, permission.clone())
-        .await
-        .map_err(map_error)?;
+    drive(
+        git::repository(state.get_ctx().node_id(), &auth, id, permission.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     let objects: Vec<LfsObject> =
         serde_json::from_value(body["objects"].clone()).map_err(|_| ServerError::BadRequest)?;
     if objects.len() > 1000 {
@@ -67,7 +71,18 @@ pub async fn batch(
             return Err(ServerError::BadRequest);
         }
         let mut item = json!({"oid": object.oid, "size": object.size});
-        match git::lfs::inspect(&state.get_ctx(), &auth, id, &object, permission.clone()).await {
+        match drive(
+            git::lfs::inspect(
+                state.get_ctx().node_id(),
+                &auth,
+                id,
+                &object,
+                permission.clone(),
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        {
             Ok(Some(_)) if operation == "upload" => {}
             Ok(None) if operation == "download" => {
                 item["error"] = json!({"code":404,"message":"object not found"});
@@ -118,15 +133,18 @@ pub async fn upload(
             "LFS object exceeds limit".into(),
         ));
     }
-    git::lfs::upload(
-        &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        LfsObject { oid, size },
-        crate::routes::rocrate_import::upload_body_stream(
-            body,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+    drive(
+        git::lfs::upload(
+            (state.get_ctx().node_id(), node_routing(&state.get_ctx())),
+            &auth,
+            repository_id(&repository)?,
+            LfsObject { oid, size },
+            crate::routes::rocrate_import::upload_body_stream(
+                body,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            ),
         ),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_error)?;
@@ -147,7 +165,7 @@ pub async fn download(
     Path((repository, oid)): Path<(String, String)>,
 ) -> ServerResult<Response> {
     let (blob, size) =
-        git::lfs::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
+        git::download::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
             .await
             .map_err(map_error)?;
     Response::builder()

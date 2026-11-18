@@ -13,8 +13,13 @@ fn folder_id() -> Ulid {
 
 fn base(entry: EntryState) -> SyncBase {
     SyncBase {
+        synced: None,
+        local_version_id: None,
+        synced_at_ms: 0,
         entry,
-        ..SyncBase::default()
+        pending_at: None,
+        local: None,
+        remote: None,
     }
 }
 

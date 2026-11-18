@@ -7,6 +7,7 @@ use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsLock;
+use aruna_operations::driver::drive;
 use aruna_operations::git::{self, locks::LockOutcome};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -57,9 +58,12 @@ pub async fn create(
 ) -> ServerResult<Response> {
     let id = repository_id(&repository)?;
     Ok(
-        match git::locks::create(&state.get_ctx(), &auth, id, request.path)
-            .await
-            .map_err(map_error)?
+        match drive(
+            git::locks::create(state.get_ctx().node_id(), &auth, id, request.path),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(map_error)?
         {
             LockOutcome::Locked(lock) => reply(StatusCode::CREATED, json!({"lock": view(&lock)})),
             LockOutcome::Taken(lock) => reply(
@@ -92,9 +96,16 @@ pub async fn list(
     Path(repository): Path<String>,
     Query(filter): Query<LockFilter>,
 ) -> ServerResult<Response> {
-    let locks = git::locks::list(&state.get_ctx(), &auth, repository_id(&repository)?)
-        .await
-        .map_err(map_error)?;
+    let locks = drive(
+        git::locks::list(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     let locks: Vec<_> = locks
         .iter()
         .filter(|lock| filter.path.as_ref().is_none_or(|path| *path == lock.path))
@@ -127,17 +138,23 @@ pub async fn verify(
     Path(repository): Path<String>,
 ) -> ServerResult<Response> {
     let id = repository_id(&repository)?;
-    git::repository(
+    drive(
+        git::repository(
+            state.get_ctx().node_id(),
+            &auth,
+            id,
+            aruna_core::structs::identity::auth::Permission::WRITE,
+        ),
         &state.get_ctx(),
-        &auth,
-        id,
-        aruna_core::structs::identity::auth::Permission::WRITE,
     )
     .await
     .map_err(map_error)?;
-    let locks = git::locks::list(&state.get_ctx(), &auth, id)
-        .await
-        .map_err(map_error)?;
+    let locks = drive(
+        git::locks::list(state.get_ctx().node_id(), &auth, id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     let (ours, theirs): (Vec<_>, Vec<_>) =
         locks.iter().partition(|lock| lock.user_id == auth.user_id);
     let ours: Vec<_> = ours.into_iter().map(view).collect();
@@ -172,12 +189,15 @@ pub async fn unlock(
 ) -> ServerResult<Response> {
     let lock: Ulid = lock.parse().map_err(|_| ServerError::BadRequest)?;
     let force = body.is_some_and(|Json(body)| body.force);
-    let released = git::locks::unlock(
+    let released = drive(
+        git::locks::unlock(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+            lock,
+            force,
+        ),
         &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        lock,
-        force,
     )
     .await
     .map_err(map_error)?;

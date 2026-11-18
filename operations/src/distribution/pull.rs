@@ -193,7 +193,9 @@ impl PullMemberOperation {
         });
         // Replicas share the load by free download slots; the coordinator stays the fallback.
         if self.replicas > 1 {
-            let spread = self.choice(&self.member()?.holders[..self.replicas].to_vec());
+            let replicas = self.replicas;
+            let holders = self.member()?.holders[..replicas].to_vec();
+            let spread = self.choice(&holders);
             self.step = MemberStep::Spread;
             return Ok(Next::Call(spread));
         }

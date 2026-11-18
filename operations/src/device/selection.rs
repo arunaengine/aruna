@@ -16,7 +16,6 @@ use super::replica::{
     TrackCreatedOperation, cache_budget,
 };
 use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
-use crate::driver::DriverContext;
 use aruna_core::structs::identity::realm::NodeRealm;
 
 fn refresh_call(ids: NodeRealm, document_id: Ulid) -> IoCall {
@@ -54,9 +53,9 @@ pub struct SelectDocumentOperation {
 }
 
 /// The selection of one document; see [`SelectDocumentOperation`].
-pub fn select_document(context: &DriverContext, document_id: Ulid) -> SelectDocumentOperation {
+pub fn select_document(ids: NodeRealm, document_id: Ulid) -> SelectDocumentOperation {
     SelectDocumentOperation {
-        ids: context.node_and_realm(),
+        ids,
         document_id,
         step: SelectStep::Read,
         failure: None,

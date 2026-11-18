@@ -24,13 +24,12 @@ use super::install_graph::{InstallError, InstallGraphOperation};
 use super::replica::{ReplicaRecord, ReplicaScanError, ReplicaState};
 use super::replica_store::{list_replicas, read_replica, store_replica};
 use crate::document_repository::{config_of, realm_config};
-use aruna_core::structs::identity::realm::NodeRealm;
 use crate::forward::transport::{peer_call_within, timed_answer};
-use crate::driver::DriverContext;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.
@@ -307,9 +306,9 @@ pub struct RefreshReplicasOperation {
 }
 
 /// One refresh pass of this device; see [`RefreshReplicasOperation`].
-pub fn refresh_replicas(context: &DriverContext) -> RefreshReplicasOperation {
+pub fn refresh_replicas(ids: Option<(NodeId, RealmId)>) -> RefreshReplicasOperation {
     RefreshReplicasOperation {
-        ids: context.node_and_realm(),
+        ids,
         step: PassStep::Config,
         plan: None,
         replicas: VecDeque::new(),

@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(ordinary.next(child(absent)), Ok(Next::Done(None)));
         let mut failed = HeldRangesOperation::new("spire");
         failed.first().unwrap();
-        let error = Err::<Option<BoundRecord>, _>(RecordError::NotFinished);
+        let error = Err::<Option<BoundRecord>, _>(RecordError::from(IoError::Unfinished));
         assert!(matches!(
             failed.next(child(error)),
             Err(UsageError::Record(_))

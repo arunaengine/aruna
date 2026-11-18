@@ -120,16 +120,8 @@ pub async fn route_metadata_update(
         && accepts_edits(&replica, by_owner)
     {
         let issued_at = crate::device::publish_queue::token_issued_at(auth_token.as_ref());
-        return apply_local_edit(
-            context,
-            actor.user_id,
-            actor.node_id,
-            &replica,
-            mutation,
-            issued_at,
-        )
-        .await
-        .map_err(device_edit_error);
+        let edit = apply_local_edit(actor.user_id, actor.node_id, &replica, mutation, issued_at);
+        return drive(edit, context).await.map_err(device_edit_error);
     }
     let placement = resolve_metadata_id(
         &config,

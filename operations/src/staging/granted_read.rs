@@ -32,7 +32,7 @@ pub struct GrantedReadOperation {
 }
 
 impl GrantedReadOperation {
-    /// `ids` is this node and its realm, as `DriverContext::node_and_realm` gives them.
+    /// `ids` is this node and its realm.
     pub fn new(
         ids: Option<(NodeId, RealmId)>,
         holder: NodeId,

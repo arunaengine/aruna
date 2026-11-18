@@ -23,7 +23,6 @@ use aruna_core::types::Key;
 use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
-use crate::driver::DriverContext;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{
@@ -92,14 +91,14 @@ impl Operation for UnbindFolderOperation {
 /// Removes a `Deleting` folder. Its caller holds the folder's gate, so a pass in flight ends
 /// first and the rows it wrote are cleared too.
 pub fn finish_unbind(
-    context: &DriverContext,
+    origin: Option<(NodeId, RealmId)>,
     folder_id: Ulid,
     node_id: NodeId,
 ) -> FinishUnbindOperation {
     FinishUnbindOperation {
         folder_id,
         node_id,
-        origin: context.node_and_realm(),
+        origin,
         step: UnbindStep::Read,
         cleared: 0,
         folder: None,

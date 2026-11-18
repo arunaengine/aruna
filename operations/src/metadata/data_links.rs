@@ -329,7 +329,7 @@ pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, Da
                 let deadline = Instant::now() + RESOLVE_BUDGET;
                 match resolved(
                     drive_until(
-                        resolve_version(context, version_id, deadline),
+                        resolve_version(context.node_and_realm(), version_id, deadline),
                         context,
                         deadline,
                     )

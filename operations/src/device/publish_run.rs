@@ -27,8 +27,7 @@ use crate::device::sync::pull::ForwardPullOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
-use crate::jobs::store::attempt::{read_crate_status, read_local_crate};
-use crate::jobs::store::state::read_job_record;
+use crate::jobs::store::row_calls;
 use crate::jobs::workflow::run_crate::record_crate;
 use crate::metadata::protocol::MetadataTransportMessage;
 
@@ -82,9 +81,9 @@ pub async fn publish_run(
     input: PublishRunInput,
 ) -> Result<PublishedRun, PublishRunError> {
     let _publishing = PUBLISHING.lock().await;
-    let record = read_job_record(context, input.job_id, None)
+    let record = drive(row_calls::read_job_record(input.job_id), context)
         .await
-        .map_err(PublishRunError::Unavailable)?
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))?
         .ok_or(PublishRunError::NotFound)?;
     let JobPayload::Execution(spec) = &record.payload else {
         return Err(PublishRunError::NotFound);
@@ -95,9 +94,9 @@ pub async fn publish_run(
     if !record.state.is_terminal() {
         return Err(PublishRunError::NotFinished);
     }
-    let status = read_crate_status(context, input.job_id)
+    let status = drive(row_calls::read_crate_status(input.job_id), context)
         .await
-        .map_err(PublishRunError::Unavailable)?;
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))?;
     let saved_id = match &status {
         // A notebook session owes no crate and is no run to publish.
         None => return Err(PublishRunError::NotFound),
@@ -169,9 +168,9 @@ pub async fn publish_run(
         }
         _ => return Err(PublishRunError::Crate("interrupted".to_string())),
     }
-    let run_crate = read_crate_status(context, input.job_id)
+    let run_crate = drive(row_calls::read_crate_status(input.job_id), context)
         .await
-        .map_err(PublishRunError::Unavailable)?
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))?
         .ok_or(PublishRunError::NotFound)?;
     Ok(PublishedRun {
         outputs: copies,
@@ -186,9 +185,9 @@ pub async fn local_run_crate(
     owner: UserId,
 ) -> Result<serde_json::Value, PublishRunError> {
     // The owner is kept with the crate, so it stays readable after the job is pruned.
-    let local = read_local_crate(context, job_id)
+    let local = drive(row_calls::read_local_crate(job_id), context)
         .await
-        .map_err(PublishRunError::Unavailable)?
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))?
         .filter(|local| local.owner == owner)
         .ok_or(PublishRunError::NotFound)?;
     serde_json::from_str(&local.jsonld)

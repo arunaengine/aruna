@@ -18,7 +18,9 @@ use aruna_core::structs::storage::origin::{
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved};
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved,
+};
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::driver::{drive, drive_until};
@@ -485,7 +487,9 @@ async fn origin_answer(
         }
         let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
-            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref()).await.unwrap_or_default();
+            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref())
+                .await
+                .unwrap_or_default();
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
@@ -499,7 +503,11 @@ async fn origin_answer(
         && headers.contains_key(RELAY_HOP_HEADER)
         && !headers.contains_key(COPY_READ_HEADER)
     {
-        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
             return Err(map_guard_error(GuardError::NotCoordinator {
                 set_id: binding.set_id,
@@ -521,7 +529,11 @@ async fn origin_answer(
     if let (Err(OriginError::VersionMissing), Some(binding), None) =
         (&view, info.distribution.as_ref(), stale)
     {
-        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
@@ -716,7 +728,14 @@ async fn global_origin(
     version_id: Ulid,
 ) -> ServerResult<Json<OriginResponse>> {
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    let found = match resolved(drive_until(resolve_version(state.get_ctx().as_ref(), version_id, deadline), state.get_ctx().as_ref(), deadline).await) {
+    let found = match resolved(
+        drive_until(
+            resolve_version(state.get_ctx().node_and_realm(), version_id, deadline),
+            state.get_ctx().as_ref(),
+            deadline,
+        )
+        .await,
+    ) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Err(ServerError::NotFound),
         GlobalResolution::Unavailable => {

@@ -70,6 +70,8 @@ pub enum Event {
     Compute(Box<crate::compute::effect::ComputeAnswer>),
     /// The answer of a running job's host; never persisted.
     Job(crate::jobs::JobEvent),
+    /// Answers `Effect::Git`; never persisted.
+    Git(Box<crate::git::GitAnswer>),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -907,6 +909,7 @@ impl MetadataEvent {
                 CacheGeneration,
                 CachedGroup,
                 DocumentTitle,
+                GraphFlushed,
                 ProfileShapes,
                 ProfileChecked,
                 Error,
@@ -1103,6 +1106,7 @@ impl Event {
             Event::Hung { .. } => "Event::Hung",
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
+            Event::Git(_) => "Event::Git",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

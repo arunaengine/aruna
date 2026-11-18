@@ -1251,7 +1251,11 @@ mod tests {
         );
 
         assert_eq!(
-            drive(finish_unbind(&context, folder_id, node_id), &context).await,
+            drive(
+                finish_unbind(context.node_and_realm(), folder_id, node_id),
+                &context
+            )
+            .await,
             Ok(())
         );
         assert!(matches!(

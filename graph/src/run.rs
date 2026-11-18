@@ -65,7 +65,9 @@ impl GraphHandle {
                 return MetadataEvent::ProfileShapes { shapes: None };
             }
             // The registry cache stays with the metadata handle, which answers these first.
-            MetadataEffect::CacheGeneration
+            MetadataEffect::FlushGraph
+            | MetadataEffect::FlushGraph
+            | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
             | MetadataEffect::CachedGroup { .. } => {

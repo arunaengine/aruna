@@ -37,7 +37,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
-use crate::driver::DriverContext;
 use crate::replication::managed_read::LocalUserOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferDirectoryResult, OfferedDirectoryError, offer_directory,
@@ -121,8 +120,8 @@ fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<S
 
 /// Reconciles one folder: observes the directory, lists the realm heads, decides every entry,
 /// then writes what the decisions allow. The caller holds the folder's gate.
-pub fn folder_pass(context: &DriverContext, folder: SyncedFolder) -> FolderPassOperation {
-    let ids = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+pub fn folder_pass(ids: Option<(NodeId, RealmId)>, folder: SyncedFolder) -> FolderPassOperation {
+    let ids = ids.map(|(node_id, realm_id)| (realm_id, node_id));
     FolderPassOperation {
         ids,
         stored: folder.clone(),
@@ -452,9 +451,9 @@ pub struct SyncTimers {
 
 /// Finds the device timers to arm. The folder pass is armed for a bound folder and on every
 /// device, because it is also the beat a device fetches the realm-wide documents on.
-pub fn sync_timers(context: &DriverContext) -> SyncTimersOperation {
+pub fn sync_timers(ids: Option<(NodeId, RealmId)>) -> SyncTimersOperation {
     SyncTimersOperation {
-        realm_id: context.net_handle.as_ref().map(|net| *net.realm_id()),
+        realm_id: ids.map(|(_, realm_id)| realm_id),
         step: TimerStep::Folders,
         timers: SyncTimers::default(),
     }

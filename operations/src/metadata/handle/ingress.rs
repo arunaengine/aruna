@@ -1022,7 +1022,8 @@ impl MetadataHandle {
             }
             admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
                 Box::pin(async {
-                    let serve = crate::distribution::forward::serve_admission(context, peer, admit);
+                    let serve =
+                        crate::distribution::forward::serve_admission(context.here(), peer, admit);
                     crate::driver::drive(serve, context)
                         .await
                         .unwrap_or_else(|error| {
@@ -1034,7 +1035,11 @@ impl MetadataHandle {
             publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
             | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
                 Box::pin(async {
-                    let serve = crate::distribution::forward::serve_publish(context, peer, publish);
+                    let serve = crate::distribution::forward::serve_publish(
+                        context.node_and_realm(),
+                        peer,
+                        publish,
+                    );
                     crate::driver::drive(serve, context)
                         .await
                         .unwrap_or_else(|error| {
