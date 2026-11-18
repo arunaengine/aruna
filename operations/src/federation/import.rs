@@ -4,40 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::federation::records::ImportRecord;
-use std::collections::BTreeMap;
 
 use aruna_core::federation::Signed;
-use aruna_core::keyspaces::FEDERATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord, user_dedup_key,
-};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::job::ImportRoCrateSpec;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::transfer::{
-    ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
-};
+use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent};
 use aruna_core::{NodeId, UserId};
 use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::drive_retry;
 use crate::driver::{DriverContext, drive};
-use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
-use crate::jobs::import::upload_store::load_rocrate_upload;
-use crate::jobs::key_wake::read_row;
-use crate::jobs::store::query::find_dedup_plan;
-use crate::jobs::store::state::read_job_record;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_core::structs::execution::job::dedup_index_key;
-use aruna_core::structs::execution::job::upload_stale;
-
-const IMPORT_OPERATION: &str = "federation.import";
+use crate::federation::import_checks::{
+    AuthorizeImportOperation, BoundUploadOperation, ConfirmSourceOperation, ReadImportOperation,
+    RecheckImportOperation, ReusableUploadOperation, WriteImportOperation, answer_error,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ImportError {
@@ -69,7 +51,8 @@ pub fn header_value<T: Serialize>(value: &T) -> Result<String, serde_json::Error
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
 }
 
-/// Sends `method` for the grant's artifact to the source realm through the egress guard.
+/// Sends `method` for the grant's artifact to the source realm through the egress guard and
+/// hands back the response, whose body the caller streams.
 pub async fn source_request(
     context: &DriverContext,
     method: reqwest::Method,
@@ -96,51 +79,16 @@ pub async fn source_request(
     Ok(response)
 }
 
-/// A failed or busy source stays temporary; only other answers refuse the grant.
-fn answer_error(status: reqwest::StatusCode) -> ImportError {
-    use reqwest::StatusCode;
-    if status.is_server_error()
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-    {
-        ImportError::Unreachable(status.to_string())
-    } else {
-        ImportError::Refused(status)
-    }
-}
-
-/// Before a bound import starts or resumes: a confirmation the source gave since the last start
-/// (a pull or a push), or else a fresh confirmation of the grant by the source now.
+/// See [`ConfirmSourceOperation`].
 pub(crate) async fn confirm_source(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     timeout: std::time::Duration,
 ) -> Result<(), ImportError> {
-    let ImportRoCrateSource::Upload { upload_id } = &spec.source else {
-        return Ok(());
-    };
-    let Some(record) = read_import(context, *upload_id).await? else {
-        return Ok(());
-    };
-    let change = RecordChange::ConsumeConfirmation {
-        record_key: record_key(*upload_id),
-    };
-    let consume = || RecordOperation::new(change.clone());
-    match drive_retry(consume, context, change.key()).await {
-        Ok(RecordOutcome::Confirmed(true)) => Ok(()),
-        Ok(_) => source_request(context, reqwest::Method::HEAD, &record.grant, timeout)
-            .await
-            .map(drop),
-        Err(error) => Err(ImportError::Storage(error.to_string())),
-    }
+    drive(ConfirmSourceOperation::new(spec, timeout), context).await
 }
 
-fn record_key(upload_id: Ulid) -> Vec<u8> {
-    [&b"import/"[..], &upload_id.to_bytes()].concat()
-}
-
-/// WRITE on the destination bucket and metadata path, and the deny-only `federation.import`
-/// policies, which see `source_realm` once the source is known.
+/// See [`AuthorizeImportOperation`].
 pub async fn authorize_import(
     context: &DriverContext,
     auth: &AuthContext,
@@ -148,113 +96,20 @@ pub async fn authorize_import(
     source: Option<RealmId>,
     node_id: NodeId,
 ) -> Result<(), ImportError> {
-    let bucket = match drive(GetBucketOperation::new(destination.bucket.clone()), context).await {
-        Ok(bucket) => bucket,
-        Err(GetBucketError::NotFound) => return Err(ImportError::NoBucket),
-        Err(error) => return Err(ImportError::Storage(error.to_string())),
-    };
-    let realm_id = auth.realm_id;
-    let metadata = MetadataRegistryRecord::normalize_document_path(&destination.metadata_path);
-    let paths = [
-        bucket_permission_path(realm_id, bucket.group_id, node_id, &destination.bucket),
-        format!("/{realm_id}/g/{}/meta/{metadata}", destination.group_id),
-    ];
-    for path in paths {
-        let extras = PolicyRequestExtras {
-            operation: IMPORT_OPERATION.to_string(),
-            params: source
-                .map(|source| BTreeMap::from([("source_realm".to_string(), source.to_string())]))
-                .unwrap_or_default(),
-            ..Default::default()
-        };
-        authorize(context, realm_id, auth, &path, &Permission::WRITE, extras)
-            .await
-            .map_err(|_| ImportError::Denied)?;
-    }
-    Ok(())
+    let authorize =
+        AuthorizeImportOperation::new(auth.clone(), destination.clone(), source, node_id);
+    drive(authorize, context).await
 }
 
-fn upload_key(principal: UserId, import_key: &str) -> Vec<u8> {
-    [
-        &b"upload/"[..],
-        &principal.to_bytes(),
-        import_key.as_bytes(),
-    ]
-    .concat()
-}
-
-/// Binds a verified upload to its intent and grant, and the import key to that upload, so a
-/// retried transfer reuses it. Returns the bound upload; an earlier binding wins a race.
+/// See [`WriteImportOperation`].
 pub async fn write_import(
     context: &DriverContext,
     import_key: &str,
     upload_id: Ulid,
     record: &ImportRecord,
 ) -> Result<Ulid, ImportError> {
-    let principal = record.intent.payload.principal;
-    let bind = |stale| RecordChange::BindImport {
-        key: upload_key(principal, import_key),
-        record_key: record_key(upload_id),
-        upload_id,
-        record: record.clone(),
-        stale,
-    };
-    let mut bound = drive_binding(context, bind(None)).await?;
-    if bound != upload_id && stale_upload(context, principal, import_key, bound).await? {
-        let dedup_key = user_dedup_key(principal, import_key);
-        let stale = StaleUpload {
-            upload_id: bound,
-            dedup_key: dedup_index_key(principal, &dedup_key).to_vec(),
-            now_ms: aruna_core::time::unix_timestamp_millis(),
-        };
-        bound = drive_binding(context, bind(Some(stale))).await?;
-    }
-    // A racing upload won the key: it is reused only for the same transfer.
-    if bound != upload_id {
-        let (intent, grant) = (&record.intent.payload, &record.grant.payload);
-        check_bound(context, bound, intent, grant).await?;
-    }
-    Ok(bound)
-}
-
-/// Runs one binding change and returns the upload bound to the import key afterwards.
-async fn drive_binding(context: &DriverContext, change: RecordChange) -> Result<Ulid, ImportError> {
-    let bind = || RecordOperation::new(change.clone());
-    match drive_retry(bind, context, change.key()).await {
-        Ok(RecordOutcome::Bound(bound)) => Ok(bound),
-        Ok(other) => Err(ImportError::Storage(format!(
-            "unexpected outcome {other:?}"
-        ))),
-        Err(error) => Err(ImportError::Storage(error.to_string())),
-    }
-}
-
-/// Whether bound upload `upload_id` can no longer start an import under [`upload_stale`], with
-/// the import jobs of `principal`. The binding transaction checks it again before replacing it.
-async fn stale_upload(
-    context: &DriverContext,
-    principal: UserId,
-    import_key: &str,
-    upload_id: Ulid,
-) -> Result<bool, ImportError> {
-    let upload = load_rocrate_upload(context, upload_id)
-        .await
-        .map_err(ImportError::Storage)?;
-    let now = aruna_core::time::unix_timestamp_millis();
-    if upload.is_some() {
-        return Ok(upload_stale(upload.as_ref(), false, now));
-    }
-    let dedup_key = user_dedup_key(principal, import_key);
-    let job = find_dedup_plan(context, principal, &dedup_key, None)
-        .await
-        .map_err(ImportError::Storage)?;
-    let Some((job_id, _)) = job else {
-        return Ok(upload_stale(None, false, now));
-    };
-    let record = read_job_record(context, job_id, None)
-        .await
-        .map_err(ImportError::Storage)?;
-    Ok(upload_stale(None, record.is_some(), now))
+    let write = WriteImportOperation::new(import_key, upload_id, record.clone());
+    drive(write, context).await
 }
 
 /// The upload `principal`'s import key was bound to by an earlier transfer.
@@ -263,153 +118,37 @@ pub async fn bound_upload(
     principal: UserId,
     import_key: &str,
 ) -> Result<Option<Ulid>, ImportError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        upload_key(principal, import_key),
-    )
-    .await
-    .map_err(ImportError::Storage)?;
-    row.map(|row| {
-        let bytes = <[u8; 16]>::try_from(row.as_slice())
-            .map_err(|_| ImportError::Storage("invalid upload binding".to_string()))?;
-        Ok(Ulid::from_bytes(bytes))
-    })
-    .transpose()
+    drive(BoundUploadOperation::new(principal, import_key), context).await
 }
 
-/// Whether a stored binding and its upload belong to the same transfer as `grant` for `intent`:
-/// source, document, digests, artifact, destination and owner.
-fn same_transfer(
-    stored: &ImportRecord,
-    upload: Option<&RoCrateUploadRecord>,
-    intent: &ImportIntent,
-    grant: &ExportGrant,
-) -> bool {
-    let old = &stored.grant.payload;
-    let artifact = |blake3: &[u8; 32], size: u64| {
-        hex::encode(blake3) == grant.artifact_blake3 && size == grant.artifact_size
-    };
-    old.source == grant.source
-        && old.document_id == grant.document_id
-        && old.dataset_digest == grant.dataset_digest
-        && old.selection_digest == grant.selection_digest
-        && old.artifact_blake3 == grant.artifact_blake3
-        && old.artifact_size == grant.artifact_size
-        && stored.intent.payload.principal == intent.principal
-        && stored.intent.payload.destination == intent.destination
-        && upload.is_none_or(|upload| {
-            upload.owner == intent.principal && artifact(&upload.blake3, upload.size)
-        })
-}
-
-/// The upload an earlier transfer of the same principal and import key left on this node; a
-/// binding of another transfer is a conflict.
+/// See [`ReusableUploadOperation`].
 pub async fn reusable_upload(
     context: &DriverContext,
     intent: &ImportIntent,
     grant: &ExportGrant,
     import_key: &str,
 ) -> Result<Option<Ulid>, ImportError> {
-    let Some(upload_id) = bound_upload(context, intent.principal, import_key).await? else {
-        return Ok(None);
-    };
-    // A stale upload is replaced when the new transfer binds its own upload.
-    if stale_upload(context, intent.principal, import_key, upload_id).await? {
-        return Ok(None);
-    }
-    check_bound(context, upload_id, intent, grant).await?;
-    Ok(Some(upload_id))
-}
-
-/// Refuses a bound upload whose record or upload belongs to another transfer.
-async fn check_bound(
-    context: &DriverContext,
-    upload_id: Ulid,
-    intent: &ImportIntent,
-    grant: &ExportGrant,
-) -> Result<(), ImportError> {
-    let stored = read_import(context, upload_id)
-        .await?
-        .ok_or_else(|| ImportError::Storage("upload binding without record".to_string()))?;
-    let upload = load_rocrate_upload(context, upload_id)
-        .await
-        .map_err(ImportError::Storage)?;
-    if !same_transfer(&stored, upload.as_ref(), intent, grant) {
-        return Err(ImportError::Conflict);
-    }
-    Ok(())
+    let reuse = ReusableUploadOperation::new(intent.clone(), grant.clone(), import_key);
+    drive(reuse, context).await
 }
 
 pub async fn read_import(
     context: &DriverContext,
     upload_id: Ulid,
 ) -> Result<Option<ImportRecord>, ImportError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        record_key(upload_id),
-    )
-    .await
-    .map_err(ImportError::Storage)?;
-    row.map(|row| postcard::from_bytes(&row).map_err(|e| ImportError::Storage(e.to_string())))
-        .transpose()
+    drive(ReadImportOperation::new(upload_id), context).await
 }
 
-/// Whether an import job still matches its intent's principal and destination.
-fn bound(spec: &ImportRoCrateSpec, intent: &ImportIntent) -> bool {
-    let destination = &intent.destination;
-    let normalized = MetadataRegistryRecord::normalize_document_path;
-    spec.auth_context.user_id == intent.principal
-        && spec.target.bucket == destination.bucket
-        && spec.target.prefix == destination.prefix
-        && spec.metadata.group_id == destination.group_id
-        && normalized(&spec.metadata.path) == normalized(&destination.metadata_path)
-}
-
-/// Rechecks an import of another realm's artifact at every step; other imports pass. An expired
-/// intent or grant, or a superseded descriptor, pauses the job until a fresh consent rebinds it.
+/// See [`RecheckImportOperation`].
 pub(crate) async fn recheck_import(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     node_id: NodeId,
     now: u64,
 ) -> Result<(), ImportError> {
-    let ImportRoCrateSource::Upload { upload_id } = &spec.source else {
-        return Ok(());
-    };
-    let Some(record) = read_import(context, *upload_id).await? else {
-        return Ok(());
-    };
-    let intent = &record.intent.payload;
-    if !bound(spec, intent) {
-        return Err(ImportError::Unbound);
-    }
-    let local = spec.auth_context.realm_id;
-    let config = drive(GetConfigOperation::new(local), context)
-        .await
-        .map_err(|error| ImportError::Storage(error.to_string()))?;
-    // A credential cutoff of the principal also ends intents issued before it.
-    if config
-        .user_cutoff(&intent.principal, now)
-        .is_some_and(|cutoff| intent.issued_at < cutoff)
-    {
-        return Err(ImportError::Expired);
-    }
-    let descriptor = config.federation.ok_or(ImportError::Denied)?.descriptor;
-    check_intent(&record.intent, &local, &descriptor, None, now)
-        .and_then(|()| check_grant(&record.grant, &record.intent, now))
-        .map_err(|error| match error {
-            TransferError::BadLifetime | TransferError::StaleDescriptor => ImportError::Expired,
-            _ => ImportError::Unbound,
-        })?;
-    let source = Some(record.grant.payload.source);
-    authorize_import(
+    drive(
+        RecheckImportOperation::new(spec.clone(), node_id, now),
         context,
-        &spec.auth_context,
-        &intent.destination,
-        source,
-        node_id,
     )
     .await
 }
@@ -727,7 +466,7 @@ pub(crate) mod tests {
         assert!(!stored.confirmed);
         // The resume asks the source again; this context has no egress, so it cannot.
         let resumed = confirm_source(&context, &spec(upload_id), timeout).await;
-        assert!(matches!(resumed, Err(ImportError::Storage(_))));
+        assert!(matches!(resumed, Err(ImportError::Unreachable(_))));
     }
 
     #[test]
