@@ -369,58 +369,6 @@ fn decode_candidate(key: &Key, value: &[u8]) -> Option<(ReclaimCandidateKey, Rec
     }
 }
 
-/// Reads a tenant record once per drain. A missing record resolves to retain,
-/// which is also forced: without the record there are no credentials to delete
-/// the bytes with.
-async fn group_strategy(
-    context: &DriverContext,
-    records: &mut HashMap<Ulid, Option<GroupStorage>>,
-    backend_id: Ulid,
-) -> Result<Option<CleanupStrategy>, String> {
-    if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(backend_id) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                key: backend_key(backend_id),
-                txn_id: None,
-            })
-            .await;
-        slot.insert(
-            parse_read(event, GroupStorage::from_bytes).map_err(|error| error.to_string())?,
-        );
-    }
-    Ok(records
-        .get(&backend_id)
-        .and_then(|record| record.as_ref())
-        .map(|record| record.cleanup))
-}
-
-async fn delete_candidates(context: &DriverContext, keys: Vec<Key>) -> Result<(), String> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let deletes = keys
-        .into_iter()
-        .map(|key| (BLOB_RECLAIM_KEYSPACE.to_string(), key))
-        .collect();
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected candidate delete event: {}",
-            other.label()
-        )),
-    }
-}
-
 /// Queue depth for one backend, computed from the queues themselves so it can
 /// never drift. `truncated` reports that a scan hit its cap.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -456,56 +404,136 @@ const CLEANUP_SCAN_LIMIT: usize = 1_000;
 /// Counts one backend's queued candidates and the physical deletes still owed
 /// to it. The candidate side is a bounded prefix scan; the cleanup queue has no
 /// backend order, so that side is a capped filtered scan.
-pub async fn backend_status(
-    context: &DriverContext,
-    backend: &BackendRef,
-) -> Result<ReclaimStatus, String> {
-    let mut status = ReclaimStatus::default();
-    let (candidates, next) = iter_prefix_page(
-        &context.storage_handle,
-        BLOB_RECLAIM_KEYSPACE,
-        Some(ReclaimCandidateKey::prefix(backend).into()),
-        None,
-        STATUS_SCAN_LIMIT,
-        None,
-    )
-    .await?;
-    status.pending_candidates = candidates.len();
-    status.truncated = next.is_some();
-    for (_, value) in candidates {
-        if let Ok(candidate) = ReclaimCandidate::from_bytes(value.as_ref()) {
-            fold_oldest(&mut status.oldest_enqueued_at, candidate.enqueued_at);
+#[derive(Debug, PartialEq)]
+pub struct BackendStatusOperation {
+    backend: BackendRef,
+    status: ReclaimStatus,
+    candidates_read: bool,
+}
+
+type StatusTurn = Result<Next<ReclaimStatus>, ReclaimSweepError>;
+
+impl BackendStatusOperation {
+    pub fn new(backend: &BackendRef) -> Self {
+        Self {
+            backend: backend.clone(),
+            status: ReclaimStatus::default(),
+            candidates_read: false,
         }
     }
 
-    let (cleanups, next) = iter_prefix_page(
-        &context.storage_handle,
-        BLOB_CLEANUP_KEYSPACE,
-        None,
-        None,
-        CLEANUP_SCAN_LIMIT,
-        None,
-    )
-    .await?;
-    status.truncated = status.truncated || next.is_some();
-    for (key, value) in cleanups {
-        let Ok(
-            BlobCleanupWork::DeleteBlob { location }
-            | BlobCleanupWork::ReconcileWrite { location, .. }
-            | BlobCleanupWork::ReconcileReservation { location }
-            | BlobCleanupWork::ReleaseRenamed { location, .. },
-        ) = BlobCleanupWork::from_bytes(value.as_ref())
-        else {
-            continue;
+    fn candidates(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> StatusTurn {
+        self.status.pending_candidates = rows.len();
+        self.status.truncated = next.is_some();
+        for (_, value) in rows {
+            if let Ok(candidate) = ReclaimCandidate::from_bytes(value.as_ref()) {
+                fold_oldest(&mut self.status.oldest_enqueued_at, candidate.enqueued_at);
+            }
+        }
+        self.candidates_read = true;
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: CLEANUP_SCAN_LIMIT,
+        }))
+    }
+
+    fn cleanups(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> StatusTurn {
+        self.status.truncated = self.status.truncated || next.is_some();
+        for (key, value) in rows {
+            let Ok(
+                BlobCleanupWork::DeleteBlob { location }
+                | BlobCleanupWork::ReconcileWrite { location, .. }
+                | BlobCleanupWork::ReconcileReservation { location }
+                | BlobCleanupWork::ReleaseRenamed { location, .. },
+            ) = BlobCleanupWork::from_bytes(value.as_ref())
+            else {
+                continue;
+            };
+            if location.backend != self.backend {
+                continue;
+            }
+            self.status.queued_cleanups = self.status.queued_cleanups.saturating_add(1);
+            if let Some(queued_at) = cleanup_time(&key) {
+                fold_oldest(&mut self.status.oldest_enqueued_at, queued_at);
+            }
+        }
+        Ok(Next::Done(std::mem::take(&mut self.status)))
+    }
+}
+
+impl Operation for BackendStatusOperation {
+    type Output = ReclaimStatus;
+    type Error = ReclaimSweepError;
+
+    fn first(&mut self) -> StatusTurn {
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_RECLAIM_KEYSPACE.to_string(),
+            prefix: ReclaimCandidateKey::prefix(&self.backend).into(),
+            after: None,
+            limit: STATUS_SCAN_LIMIT,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> StatusTurn {
+        let (rows, next) = result.page()?;
+        match self.candidates_read {
+            true => self.cleanups(rows, next),
+            false => self.candidates(rows, next),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sweep() -> ReclaimSweepOperation {
+        let catalog = BackendCatalog::new("default").with_backend("default", None);
+        ReclaimSweepOperation::new(catalog, SystemTime::UNIX_EPOCH, None)
+    }
+
+    fn page(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
+    }
+
+    #[test]
+    fn empty_queues_finish() {
+        let mut operation = sweep();
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let pending = operation.next(page(Vec::new()));
+        assert!(matches!(pending, Ok(Next::Call(IoCall::Page { .. }))));
+        let done = operation.next(page(Vec::new()));
+        assert_eq!(done, Ok(Next::Done(ReclaimOutcome::default())));
+    }
+
+    #[test]
+    fn undecodable_row_dropped() {
+        let mut operation = sweep();
+        operation.first().unwrap();
+        let row = (Key::from(vec![1]), Value::from(vec![2]));
+        let turn = operation.next(page(vec![row]));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the stale row delete, got {turn:?}");
         };
-        if &location.backend != backend {
-            continue;
-        }
-        status.queued_cleanups = status.queued_cleanups.saturating_add(1);
-        if let Some(queued_at) = cleanup_time(&key) {
-            fold_oldest(&mut status.oldest_enqueued_at, queued_at);
-        }
+        assert_eq!(deletes[0].0, BLOB_RECLAIM_KEYSPACE);
+        assert_eq!(operation.outcome.dropped, 1);
     }
 
-    Ok(status)
+    #[test]
+    fn status_counts_queues() {
+        let backend = BackendRef::node_default();
+        let mut status = BackendStatusOperation::new(&backend);
+        status.first().unwrap();
+        let turn = status.next(page(Vec::new()));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        assert_eq!(
+            status.next(page(Vec::new())),
+            Ok(Next::Done(ReclaimStatus::default()))
+        );
+    }
 }
