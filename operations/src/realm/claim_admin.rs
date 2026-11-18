@@ -5,29 +5,26 @@
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentOutboxEvent;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, RoleId, TxnId};
+use aruna_core::types::{Key, KeySpace, RoleId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimInitialInput {
@@ -40,55 +37,22 @@ pub enum ClaimInitialResult {
     AlreadyClaimed,
 }
 
-#[derive(PartialEq)]
+/// What the claim transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+}
+
+/// Claims the realm admin role in one write transaction while no one holds it; a claimed role
+/// answers without a write. The caller reruns it after a lost commit.
+#[derive(Debug, PartialEq)]
 pub struct ClaimInitialOperation {
     input: ClaimInitialInput,
-    state: ClaimInitialState,
-    output: Option<Result<ClaimInitialResult, ClaimInitialError>>,
-}
-
-impl std::fmt::Debug for ClaimInitialOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClaimInitialOperation")
-            .field("input", &self.input)
-            .field("state", &self.state)
-            .field("output", &self.output)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClaimInitialState {
-    Init,
-    StartTransaction,
-    ReadAdminState {
-        txn_id: TxnId,
-    },
-    WriteAdminState {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    ScheduleDocumentDrain {
-        auth_doc: RealmAuthorizationDocument,
-    },
-    AbortTransaction,
-    AnnounceAuthDoc {
-        auth_doc: RealmAuthorizationDocument,
-    },
-    Finish,
-    Error,
+    stage: Stage,
+    claimed: Option<RealmAuthorizationDocument>,
+    deletes: Vec<(KeySpace, Key)>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -99,8 +63,6 @@ pub enum ClaimInitialError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
-    #[error("topic announcement failed: {0}")]
-    TopicAnnouncement(String),
     #[error("authorization document not found")]
     DocNotFound,
     #[error("realm_admin role not found")]
@@ -111,60 +73,44 @@ pub enum ClaimInitialError {
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: ClaimInitialState,
+        state: String,
         expected: &'static str,
         got: &'static str,
     },
 }
 
+impl From<IoError> for ClaimInitialError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ClaimInitial".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type ClaimTurn = Result<Next<ClaimInitialResult>, ClaimInitialError>;
+
 impl ClaimInitialOperation {
     pub fn new(input: ClaimInitialInput) -> Self {
         Self {
             input,
-            state: ClaimInitialState::Init,
-            output: None,
+            stage: Stage::Read,
+            claimed: None,
+            deletes: Vec::new(),
         }
-    }
-
-    fn fail(&mut self, error: ClaimInitialError) -> Effects {
-        let cleanup_effects = self.abort();
-        self.state = ClaimInitialState::Error;
-        self.output = Some(Err(error));
-        cleanup_effects
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(ClaimInitialError::UnexpectedEvent {
-            state: self.state.clone(),
-            expected,
-            got,
-        })
-    }
-
-    fn emit_auth_read(&mut self, txn_id: TxnId) -> Effects {
-        self.state = ClaimInitialState::ReadAdminState { txn_id };
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.actor.realm_id,
-        };
-        let auth_key = ByteView::from(*self.input.actor.realm_id.as_bytes());
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (AUTH_KEYSPACE.to_string(), auth_key),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
     }
 
     fn emit_auth_write(
         &mut self,
-        txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
-    ) -> Result<Effects, ClaimInitialError> {
+    ) -> ClaimTurn {
         let mut auth_doc = RealmAuthorizationDocument::from_bytes(
             &auth_doc.ok_or(ClaimInitialError::DocNotFound)?,
         )?;
@@ -176,7 +122,7 @@ impl ClaimInitialOperation {
             .ok_or(ClaimInitialError::AdminRoleMissing)?;
 
         if !role.assigned_users.is_empty() {
-            return Ok(self.abort_already_claimed(txn_id));
+            return Ok(Next::Done(ClaimInitialResult::AlreadyClaimed));
         }
 
         let target = AdminDocumentTarget::Realm {
@@ -199,13 +145,13 @@ impl ClaimInitialOperation {
             .as_ref()
             .is_some_and(|state| has_admin_assignment(state, role.role_id))
         {
-            return Ok(self.abort_already_claimed(txn_id));
+            return Ok(Next::Done(ClaimInitialResult::AlreadyClaimed));
         }
         if previous_reducer_state
             .as_ref()
             .is_some_and(|state| has_admin_conflict(state, role.role_id))
         {
-            return Ok(self.abort_already_claimed(txn_id));
+            return Ok(Next::Done(ClaimInitialResult::AlreadyClaimed));
         }
 
         let mut reducer_state = previous_reducer_state
@@ -248,251 +194,62 @@ impl ClaimInitialOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = ClaimInitialState::WriteAdminState {
-            txn_id,
-            auth_doc: auth_doc.clone(),
-            admin_outbox_written: !admin_events.is_empty(),
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.claimed = Some(auth_doc);
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn abort_already_claimed(&mut self, txn_id: TxnId) -> Effects {
-        self.state = ClaimInitialState::AbortTransaction;
-        self.output = Some(Ok(ClaimInitialResult::AlreadyClaimed));
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn emit_commit_transaction(
-        &mut self,
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        self.state = ClaimInitialState::CommitTransaction {
-            txn_id,
-            auth_doc,
-            admin_outbox_written,
-        };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn emit_auth_announce(&mut self, auth_doc: RealmAuthorizationDocument) -> Effects {
-        self.state = ClaimInitialState::AnnounceAuthDoc {
-            auth_doc: auth_doc.clone(),
-        };
-        let document = DocumentTarget::RealmAuthorization {
-            realm_id: auth_doc.realm_id,
-        };
-        smallvec![replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![document],
-        )]
-    }
-
-    fn handle_schedule(&mut self, event: Event, auth_doc: RealmAuthorizationDocument) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = ClaimInitialState::Finish;
-                self.output = Some(Ok(ClaimInitialResult::Claimed(auth_doc)));
-                smallvec![]
-            }
-            other => {
-                self.unexpected_event("admin document outbox drain timer schedule", other.label())
-            }
-        }
+    /// The claim always queues admin events; a failed drain timer leaves the outbox retryable.
+    fn finish(&mut self) -> ClaimTurn {
+        let auth_doc = self.claimed.take().ok_or(ClaimInitialError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then {
+            output: ClaimInitialResult::Claimed(auth_doc),
+            calls,
+        })
     }
 }
 
-impl EffectOperation for ClaimInitialOperation {
+impl Operation for ClaimInitialOperation {
     type Output = ClaimInitialResult;
     type Error = ClaimInitialError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ClaimInitialState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error })
-                if matches!(self.state, ClaimInitialState::CommitTransaction { .. }) =>
-            {
-                self.state = ClaimInitialState::Error;
-                self.output = Some(Err(error.into()));
-                return smallvec![];
-            }
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => other,
+    fn first(&mut self) -> ClaimTurn {
+        let target = AdminDocumentTarget::Realm {
+            realm_id: self.input.actor.realm_id,
         };
-
-        match &self.state {
-            ClaimInitialState::StartTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::TransactionStarted)", got);
-                };
-                self.emit_auth_read(txn_id)
-            }
-            ClaimInitialState::ReadAdminState { txn_id } => {
-                let txn_id = txn_id.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
-                };
-                let [(_, auth_doc_value), (_, reducer_state_value)] = values.as_slice() else {
-                    return self.unexpected_event(
-                        "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values",
-                        got,
-                    );
-                };
-
-                match self.emit_auth_write(
-                    txn_id,
-                    auth_doc_value.clone(),
-                    reducer_state_value.clone(),
-                ) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                }
-            }
-            ClaimInitialState::WriteAdminState {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-            } => {
-                let txn_id = txn_id.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
-                };
-
-                if !stale_conflict_deletes.is_empty() {
-                    self.state = ClaimInitialState::DeleteAdminConflicts {
-                        txn_id,
-                        auth_doc,
-                        admin_outbox_written,
-                    };
-                    return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: stale_conflict_deletes,
-                        txn_id: Some(txn_id),
-                    })];
-                }
-
-                self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
-            }
-            ClaimInitialState::DeleteAdminConflicts {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-            } => {
-                let txn_id = txn_id.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
-                };
-
-                self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
-            }
-            ClaimInitialState::CommitTransaction {
-                auth_doc,
-                admin_outbox_written,
-                ..
-            } => {
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.unexpected_event(
-                        "Event::Storage(StorageEvent::TransactionCommitted)",
-                        got,
-                    );
-                };
-
-                if admin_outbox_written {
-                    self.state = ClaimInitialState::ScheduleDocumentDrain { auth_doc };
-                    return smallvec![schedule_drain_effect()];
-                }
-
-                self.emit_auth_announce(auth_doc)
-            }
-            ClaimInitialState::ScheduleDocumentDrain { auth_doc } => {
-                let auth_doc = auth_doc.clone();
-                self.handle_schedule(event, auth_doc)
-            }
-            ClaimInitialState::AbortTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::TransactionAborted)", got);
-                };
-
-                self.state = ClaimInitialState::Finish;
-                smallvec![]
-            }
-            ClaimInitialState::AnnounceAuthDoc { auth_doc } => {
-                let auth_doc = auth_doc.clone();
-                let got = event.label();
-                let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
-                else {
-                    return self.unexpected_event(
-                        "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                        got,
-                    );
-                };
-
-                if let Err(error) = result {
-                    return self.fail(ClaimInitialError::TopicAnnouncement(error));
-                }
-
-                self.state = ClaimInitialState::Finish;
-                self.output = Some(Ok(ClaimInitialResult::Claimed(auth_doc.clone())));
-                smallvec![]
-            }
-            ClaimInitialState::Finish | ClaimInitialState::Error | ClaimInitialState::Init => {
-                smallvec![]
-            }
-        }
+        let auth_key = ByteView::from(*self.input.actor.realm_id.as_bytes());
+        Ok(Next::Call(IoCall::Read(vec![
+            (AUTH_KEYSPACE.to_string(), auth_key),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ClaimInitialState::Finish | ClaimInitialState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ClaimInitialError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            ClaimInitialState::ReadAdminState { txn_id }
-            | ClaimInitialState::WriteAdminState { txn_id, .. }
-            | ClaimInitialState::DeleteAdminConflicts { txn_id, .. }
-            | ClaimInitialState::CommitTransaction { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> ClaimTurn {
+        match self.stage {
+            Stage::Read => {
+                let [auth_doc, reducer] = values::<2>(result)?;
+                self.emit_auth_write(auth_doc, reducer)
             }
-            _ => smallvec![],
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
 }
@@ -569,28 +326,22 @@ fn materialize_admin_assignment(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
-        ClaimInitialState,
-    };
+    use super::{ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult};
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
-    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-    use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::TxnId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -694,20 +445,11 @@ mod tests {
         let mut operation = ClaimInitialOperation::new(ClaimInitialInput {
             actor: actor.clone(),
         });
-        let txn_id = TxnId::generate();
-        let effects = operation
-            .emit_auth_write(
-                txn_id,
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                None,
-            )
+        let turn = operation
+            .emit_auth_write(Some(auth_doc.to_bytes(&actor).unwrap().into()), None)
             .unwrap();
-        let outbox_records = match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: effect_txn_id,
-            }) => {
-                assert_eq!(*effect_txn_id, Some(txn_id));
+        let outbox_records = match turn {
+            Next::Call(IoCall::Write(writes)) => {
                 assert!(
                     writes
                         .iter()
@@ -719,7 +461,7 @@ mod tests {
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
                     .collect::<Vec<DocumentOutboxRecord>>()
             }
-            other => panic!("unexpected write effect: {other:?}"),
+            _ => panic!("expected the admin state writes"),
         };
         assert!(outbox_records.iter().any(|record| matches!(
             &record.event,
@@ -745,22 +487,11 @@ mod tests {
         let mut operation = ClaimInitialOperation::new(ClaimInitialInput {
             actor: actor.clone(),
         });
-        let txn_id = TxnId::generate();
-        let effects = operation
-            .emit_auth_write(
-                txn_id,
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                Some(postcard::to_allocvec(&previous_state).unwrap().into()),
-            )
-            .unwrap();
-        assert_eq!(
-            effects.first().unwrap(),
-            &Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        let turn = operation.emit_auth_write(
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(postcard::to_allocvec(&previous_state).unwrap().into()),
         );
-        assert_eq!(
-            operation.output,
-            Some(Ok(ClaimInitialResult::AlreadyClaimed))
-        );
+        assert_eq!(turn, Ok(Next::Done(ClaimInitialResult::AlreadyClaimed)));
     }
 
     #[test]
@@ -791,71 +522,53 @@ mod tests {
         let mut operation = ClaimInitialOperation::new(ClaimInitialInput {
             actor: claiming_actor.clone(),
         });
-        let txn_id = TxnId::generate();
-        let effects = operation
-            .emit_auth_write(
-                txn_id,
-                Some(auth_doc.to_bytes(&claiming_actor).unwrap().into()),
-                Some(postcard::to_allocvec(&previous_state).unwrap().into()),
-            )
-            .unwrap();
+        let turn = operation.emit_auth_write(
+            Some(auth_doc.to_bytes(&claiming_actor).unwrap().into()),
+            Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+        );
 
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        );
-        assert_eq!(
-            operation.output,
-            Some(Ok(ClaimInitialResult::AlreadyClaimed))
-        );
+        assert_eq!(turn, Ok(Next::Done(ClaimInitialResult::AlreadyClaimed)));
     }
 
     #[test]
     fn commit_conflict_preserved() {
-        let realm_id = RealmId::from_bytes([31u8; 32]);
-        let actor = actor(realm_id, 32, 33);
-        let (auth_doc, _) = auth_and_role(realm_id);
-        let txn_id = TxnId::generate();
-        let mut operation = ClaimInitialOperation::new(ClaimInitialInput { actor });
-        operation.state = ClaimInitialState::CommitTransaction {
-            txn_id,
-            auth_doc,
-            admin_outbox_written: false,
-        };
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.state, ClaimInitialState::Error);
+        // A lost commit reaches the caller as a conflict, which reruns the claim.
+        let conflict = ClaimInitialError::from(IoError::Conflict);
         assert_eq!(
-            operation.output,
-            Some(Err(ClaimInitialError::StorageError(
-                StorageError::TransactionConflict
-            )))
+            conflict,
+            ClaimInitialError::StorageError(StorageError::TransactionConflict)
         );
+        assert!(ClaimInitialOperation::is_conflict(&conflict));
     }
 
     #[test]
-    fn schedule_error_finishes() {
+    fn claim_wakes_drain() {
+        // The claimed document comes out with the drain wake after the commit.
         let realm_id = RealmId::from_bytes([15u8; 32]);
         let actor = actor(realm_id, 16, 17);
-        let (auth_doc, _) = auth_and_role(realm_id);
-        let mut operation = ClaimInitialOperation::new(ClaimInitialInput { actor });
-        operation.state = ClaimInitialState::ScheduleDocumentDrain {
-            auth_doc: auth_doc.clone(),
+        let (auth_doc, role) = auth_and_role(realm_id);
+        let mut operation = ClaimInitialOperation::new(ClaimInitialInput {
+            actor: actor.clone(),
+        });
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let read = IoResult::Values(vec![Some(auth_doc.to_bytes(&actor).unwrap().into()), None]);
+        assert!(matches!(
+            operation.next(read),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("expected the claimed document with the drain wake");
         };
-
-        operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainSyncOutbox),
-            message: "schedule failed".to_string(),
-        }));
-        assert_eq!(operation.state, ClaimInitialState::Finish);
-        assert_eq!(
-            operation.output,
-            Some(Ok(ClaimInitialResult::Claimed(auth_doc)))
+        let ClaimInitialResult::Claimed(claimed) = output else {
+            panic!("expected a claim");
+        };
+        assert!(
+            claimed.roles[&role.role_id]
+                .assigned_users
+                .contains(&actor.user_id)
         );
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     #[tokio::test]
