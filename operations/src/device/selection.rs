@@ -16,8 +16,8 @@ use super::replica::{
     TrackCreatedOperation, cache_budget,
 };
 use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
-use aruna_core::structs::identity::realm::NodeRealm;
 use crate::driver::DriverContext;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 fn refresh_call(ids: NodeRealm, document_id: Ulid) -> IoCall {
     IoCall::child(RefreshReplicaOperation::new(ids, document_id))
@@ -173,9 +173,9 @@ pub struct KeepReadOperation {
 }
 
 /// The keeping of one document just read; see [`KeepReadOperation`].
-pub fn keep_read(context: &DriverContext, record: &MetadataRegistryRecord) -> KeepReadOperation {
+pub fn keep_read(ids: NodeRealm, record: &MetadataRegistryRecord) -> KeepReadOperation {
     KeepReadOperation {
-        ids: context.node_and_realm(),
+        ids,
         record: record.clone(),
         budget: cache_budget(),
         step: KeepStep::Read,

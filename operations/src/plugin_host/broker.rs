@@ -47,9 +47,11 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::read::get_metadata_routed;
 use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::write::{CreateAuthorizedError, create_with_id, route_metadata_update};
+use crate::metadata::forward::routed_read::RoutedReadOperation;
+use crate::metadata::forward::write::{
+    CreateAuthorizedError, create_with_id, route_metadata_update,
+};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use crate::plugins::creates::{
@@ -449,7 +451,9 @@ impl RunBroker {
             auth: Some(auth.clone()),
         };
         let token = Some(AuthToken::Internal(auth.clone()));
-        match get_metadata_routed(&self.ctx, self.scope.realm_id, request, token).await {
+        let local_node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
+        let read = RoutedReadOperation::new(local_node, self.scope.realm_id, request, token);
+        match drive(read, &self.ctx).await {
             Ok(record) => Lookup::Found(record.establishing_event_id),
             Err(MetadataApiError::NotFound) => Lookup::Missing,
             Err(_) => Lookup::Unreachable,

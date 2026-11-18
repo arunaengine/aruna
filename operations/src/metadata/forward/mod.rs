@@ -8,6 +8,7 @@ pub mod profile_export;
 pub mod read;
 pub mod route_create;
 pub mod routed_export;
+pub mod routed_read;
 pub mod write;
 
 #[cfg(test)]
