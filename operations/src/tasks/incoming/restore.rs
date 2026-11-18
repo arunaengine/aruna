@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::federation::registration::PublishRegistrationOperation;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -287,8 +288,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        super::registration::restore_registration_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_registration_timer(&context.storage_handle, &task_handle).await;
         if stopped() {
             return;
         }
@@ -426,20 +426,18 @@ impl OperationsTaskHandler {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
             (Some(net_handle), Some(capabilities)) => {
-                if let Err(error) = super::registration::publish_registration(
-                    &self.context,
+                let publish = PublishRegistrationOperation::new(
                     *net_handle.realm_id(),
                     net_handle.node_id(),
-                    capabilities,
-                )
-                .await
-                {
+                    capabilities.clone(),
+                );
+                if let Err(error) = drive(publish, &self.context).await {
                     warn!(task_id = ?key, error = %error, "Failed to publish registry registration");
                 }
             }
             _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
         }
-        self.reschedule_timer(key, crate::federation::publish::PUBLISH_INTERVAL)
+        self.reschedule_timer(key, aruna_core::federation::PUBLISH_INTERVAL)
             .await;
     }
 
@@ -992,6 +990,26 @@ async fn restore_info_timer(task_handle: &TaskHandle) {
     });
     if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
         warn!(message = %message, "Failed to arm node info heartbeat timer");
+    }
+}
+
+/// Arms the registration timer at startup without postponing a restored due time. The due
+/// time is persisted, so repeated restarts do not keep moving the first publication.
+async fn restore_registration_timer(
+    storage: &aruna_storage::StorageHandle,
+    task_handle: &TaskHandle,
+) {
+    let effect = TaskEffect::ShortenTimer {
+        key: TaskKey::PublishRegistration,
+        after: aruna_core::federation::PUBLISH_INTERVAL,
+    };
+    if let Err(message) = persist_task_effect(storage, &effect).await {
+        warn!(message = %message, "Failed to persist registry publication timer");
+    }
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(Effect::Task(effect)).await
+    {
+        warn!(message = %message, "Failed to arm registry publication timer");
     }
 }
 

@@ -117,7 +117,6 @@ use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
-mod registration;
 mod restore;
 
 pub use outbox::drive_sync_drain;

@@ -18,7 +18,11 @@ use tracing::warn;
 use url::Url;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::federation::publish::{Publication, still_due};
+use crate::federation::publish::{Publication, PublishError, PublishOperation, still_due};
+use crate::federation::totals::{DataTotalsError, DataTotalsOperation};
+use crate::metadata::realm_counts::{
+    RealmCountError, RealmDocumentsOperation, RealmGroupsOperation,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -233,6 +237,128 @@ impl Operation for SendRegistrationOperation {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum PublishStep {
+    Decide,
+    Documents,
+    Groups,
+    Totals,
+    Send,
+}
+
+/// A count's value; a count that fails only warns and stays unknown, never zero.
+fn known<T, E: std::fmt::Display>(count: Result<T, E>, name: &'static str) -> Option<T> {
+    count
+        .inspect_err(|error| warn!(error = %error, count = name, "Realm count unavailable"))
+        .ok()
+}
+
+/// Decides what this node publishes, reads the counts a registration reports and sends it.
+/// Totals need the dataset count and the usage sum, so either one unknown omits them.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PublishRegistrationOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    capabilities: NodeCapabilities,
+    publication: Publication,
+    counts: RegistrationCounts,
+    now: u64,
+    step: PublishStep,
+}
+
+impl PublishRegistrationOperation {
+    pub(crate) fn new(realm_id: RealmId, node_id: NodeId, capabilities: NodeCapabilities) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            capabilities,
+            publication: Publication::Nothing,
+            counts: RegistrationCounts::default(),
+            now: 0,
+            step: PublishStep::Decide,
+        }
+    }
+
+    fn send(&mut self) -> SendTurn {
+        self.step = PublishStep::Send;
+        let publication = std::mem::replace(&mut self.publication, Publication::Nothing);
+        let send = SendRegistrationOperation::new(
+            (self.realm_id, self.node_id),
+            self.capabilities.clone(),
+            publication,
+            self.counts,
+            self.now,
+        );
+        Ok(Next::Call(IoCall::child(send)))
+    }
+}
+
+impl Operation for PublishRegistrationOperation {
+    type Output = ();
+    type Error = RegistrationError;
+
+    fn first(&mut self) -> SendTurn {
+        let decide = PublishOperation::new(self.realm_id, self.node_id);
+        Ok(Next::Call(IoCall::child(decide)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SendTurn {
+        match self.step {
+            PublishStep::Decide => {
+                let publication = result.child::<Publication, PublishError>()?;
+                self.publication = publication.map_err(failed)?;
+                if !matches!(self.publication, Publication::Register { .. }) {
+                    return self.send();
+                }
+                self.step = PublishStep::Documents;
+                let documents = RealmDocumentsOperation::new(self.realm_id);
+                Ok(Next::Call(IoCall::child(documents)))
+            }
+            PublishStep::Documents => {
+                let documents = result.child::<Option<u64>, RealmCountError>()?;
+                self.counts.kpis.live_datasets = known(documents, "datasets").flatten();
+                self.step = PublishStep::Groups;
+                let groups = RealmGroupsOperation::new(self.realm_id);
+                Ok(Next::Call(IoCall::child(groups)))
+            }
+            PublishStep::Groups => {
+                let groups = result.child::<u64, RealmCountError>()?;
+                self.counts.kpis.groups = known(groups, "groups");
+                if self.counts.kpis.live_datasets.is_none() {
+                    return self.send();
+                }
+                self.step = PublishStep::Totals;
+                let totals = DataTotalsOperation::new(self.node_id, Some(self.realm_id));
+                Ok(Next::Call(IoCall::child(totals)))
+            }
+            PublishStep::Totals => {
+                let totals = result.child::<(u64, u64), DataTotalsError>()?;
+                let datasets = self.counts.kpis.live_datasets;
+                if let (Some((objects, data_bytes)), Some(datasets)) =
+                    (known(totals, "totals"), datasets)
+                {
+                    self.counts.totals = Some(RealmTotals {
+                        realm_id: self.realm_id,
+                        data_bytes,
+                        objects,
+                        datasets,
+                        observed_at: self.now,
+                    });
+                }
+                self.send()
+            }
+            PublishStep::Send => {
+                result.child::<(), RegistrationError>()??;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now = now_ms / 1_000;
+    }
+}
+
 /// The totals route below a realm's registry route.
 fn totals_url(mut realm_url: Url) -> Result<Url, String> {
     realm_url
@@ -426,5 +552,151 @@ mod tests {
     fn nothing_sends_nothing() {
         let mut send = operation(Publication::Nothing, false);
         assert_eq!(send.first(), Ok(Next::Done(())));
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    fn publisher() -> PublishRegistrationOperation {
+        let mut publish = PublishRegistrationOperation::new(realm(), node(), capabilities());
+        publish.stamp(NOW * 1_000);
+        publish
+    }
+
+    /// A publisher that has decided to register and is waiting for the document count.
+    fn deciding() -> PublishRegistrationOperation {
+        let mut publish = publisher();
+        publish.first().unwrap();
+        publish
+            .next(child::<_, PublishError>(Ok(register())))
+            .unwrap();
+        publish
+    }
+
+    fn sends(publication: Publication, counts: RegistrationCounts) -> SendTurn {
+        let key = (realm(), node());
+        let send = SendRegistrationOperation::new(key, capabilities(), publication, counts, NOW);
+        Ok(Next::Call(IoCall::child(send)))
+    }
+
+    fn kpis(live_datasets: Option<u64>, groups: Option<u64>) -> RealmKpis {
+        RealmKpis {
+            live_datasets,
+            groups,
+            nodes_configured: None,
+        }
+    }
+
+    #[test]
+    fn registers_with_counts() {
+        let mut publish = publisher();
+        let decide = IoCall::child(PublishOperation::new(realm(), node()));
+        assert_eq!(publish.first(), Ok(Next::Call(decide)));
+        let documents = IoCall::child(RealmDocumentsOperation::new(realm()));
+        let answer = publish.next(child::<_, PublishError>(Ok(register())));
+        assert_eq!(answer, Ok(Next::Call(documents)));
+        let groups = IoCall::child(RealmGroupsOperation::new(realm()));
+        let answer = publish.next(child::<_, RealmCountError>(Ok(Some(4_u64))));
+        assert_eq!(answer, Ok(Next::Call(groups)));
+        let totals = IoCall::child(DataTotalsOperation::new(node(), Some(realm())));
+        let answer = publish.next(child::<_, RealmCountError>(Ok(2_u64)));
+        assert_eq!(answer, Ok(Next::Call(totals)));
+        let counts = RegistrationCounts {
+            kpis: kpis(Some(4), Some(2)),
+            totals: Some(RealmTotals {
+                realm_id: realm(),
+                data_bytes: 9,
+                objects: 5,
+                datasets: 4,
+                observed_at: NOW,
+            }),
+        };
+        let answer = publish.next(child::<_, DataTotalsError>(Ok((5_u64, 9_u64))));
+        assert_eq!(answer, sends(register(), counts));
+        let answer = publish.next(child::<(), RegistrationError>(Ok(())));
+        assert_eq!(answer, Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn failed_count_unknown() {
+        // A count that fails is reported as unknown and the totals are left out.
+        let mut publish = deciding();
+        let failed = RealmCountError::Io(IoError::Aborted);
+        publish.next(child::<Option<u64>, _>(Err(failed))).unwrap();
+        let answer = publish.next(child::<_, RealmCountError>(Ok(0_u64)));
+        let counts = RegistrationCounts {
+            kpis: kpis(None, Some(0)),
+            totals: None,
+        };
+        assert_eq!(answer, sends(register(), counts));
+    }
+
+    #[test]
+    fn missing_metadata_unknown() {
+        // Without a metadata subsystem the dataset count is unknown, never zero.
+        let mut publish = deciding();
+        publish
+            .next(child::<Option<u64>, RealmCountError>(Ok(None)))
+            .unwrap();
+        let failed = RealmCountError::Io(IoError::Aborted);
+        let answer = publish.next(child::<u64, _>(Err(failed)));
+        let counts = RegistrationCounts::default();
+        assert_eq!(answer, sends(register(), counts));
+    }
+
+    #[test]
+    fn failed_totals_send() {
+        let mut publish = deciding();
+        publish
+            .next(child::<_, RealmCountError>(Ok(Some(4_u64))))
+            .unwrap();
+        publish
+            .next(child::<_, RealmCountError>(Ok(2_u64)))
+            .unwrap();
+        let answer = publish.next(child::<(u64, u64), _>(Err(DataTotalsError::Missing)));
+        let counts = RegistrationCounts {
+            kpis: kpis(Some(4), Some(2)),
+            totals: None,
+        };
+        assert_eq!(answer, sends(register(), counts));
+    }
+
+    #[test]
+    fn withdrawal_skips_counts() {
+        let withdraw = Publication::Withdraw {
+            registry_url: url("https://registry.example.org"),
+            issued_at: 1,
+        };
+        let mut publish = publisher();
+        publish.first().unwrap();
+        let answer = publish.next(child::<_, PublishError>(Ok(withdraw.clone())));
+        assert_eq!(answer, sends(withdraw, RegistrationCounts::default()));
+    }
+
+    #[test]
+    fn failed_decision_stops() {
+        let mut publish = publisher();
+        publish.first().unwrap();
+        let answer = publish.next(child::<Publication, _>(Err(PublishError::ConfigMissing)));
+        let expected = PublishError::ConfigMissing.to_string();
+        assert_eq!(answer, Err(RegistrationError::Failed(expected)));
+    }
+
+    #[test]
+    fn refused_send_fails() {
+        let mut publish = publisher();
+        publish.first().unwrap();
+        publish
+            .next(child::<_, PublishError>(Ok(Publication::Nothing)))
+            .unwrap();
+        let refused = RegistrationError::Failed("registry answered 403".to_string());
+        let answer = publish.next(child::<(), _>(Err(refused)));
+        let expected = "registry answered 403".to_string();
+        assert_eq!(answer, Err(RegistrationError::Failed(expected)));
     }
 }
