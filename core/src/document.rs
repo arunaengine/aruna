@@ -319,14 +319,29 @@ pub enum DocumentSyncPublish {
 /// cursor is written, as `cursor_value` under `cursor_key`, only once the batch applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileBatch {
-    pub genesis: irokle::OpId,
-    /// The cursor the batch starts from, where an overflow replay resumes.
-    pub start: irokle::ActorClock,
+    /// The encoded cursor the batch starts from, where an overflow replay resumes.
+    pub start_value: ByteView,
     pub cursor_key: ByteView,
     pub cursor_value: ByteView,
     /// Ops whose payload never decoded into an event.
     pub rejections: Vec<crate::structs::SyncRejection>,
     pub events: Vec<BatchEvent>,
+}
+
+/// One step of an overflow replay over a topic's stored events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverflowPage {
+    /// The topic no longer exists on this node.
+    TopicGone,
+    /// The replay reached the topic's applied cursor.
+    Finished,
+    Page {
+        /// The encoded position this page starts from.
+        at: ByteView,
+        /// The encoded position after this page.
+        next: ByteView,
+        events: Vec<(DocumentEvent, irokle::ActorId)>,
+    },
 }
 
 /// One event of a [`ReconcileBatch`] with its publishing actor and that actor's sequence.
@@ -753,9 +768,19 @@ pub enum DocumentEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
-    /// Applies the stored events of these topics to local state; the runner
-    /// carries it out through the net handle, which also reloads realm peers.
-    ReconcileTopics { topics: Vec<irokle::TopicId> },
+    /// Reads the next causal batch of a topic above its stored applied cursor.
+    ReconcileBatch {
+        topic: irokle::TopicId,
+        stored_cursor: Option<ByteView>,
+    },
+    /// Reads the next overflow replay page of a topic from the encoded position `start`.
+    OverflowPage {
+        topic: irokle::TopicId,
+        start: ByteView,
+        applied: Option<ByteView>,
+    },
+    /// Rebuilds the peer set after a realm config change; the runner carries it out.
+    ReloadRealmPeers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,10 +799,36 @@ pub enum DocumentNetEvent {
         metadata_create_events: Vec<MetadataEventRecord>,
         metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
     },
+    /// These topics were synced with their peers and flushed; a reconcile applies them next.
+    DocumentsSynced {
+        topics: Vec<irokle::TopicId>,
+    },
+    /// The next batch of a topic, or none when the topic has nothing new to apply.
+    ReconcileBatch(Option<Box<ReconcileBatch>>),
+    OverflowPage(Box<OverflowPage>),
+    RealmPeersReloaded,
     Error {
         target: Option<DocumentTarget>,
         error: String,
     },
+}
+
+impl DocumentNetEvent {
+    /// The event that reports the outcome of a reconcile pass.
+    pub fn reconciled<E: std::fmt::Display>(result: Result<DocumentReconcileResult, E>) -> Self {
+        match result {
+            Ok(result) => Self::DocumentsReconciled {
+                applied: result.applied(),
+                targets: result.targets,
+                metadata_create_events: result.metadata_create_events,
+                metadata_graph_tombstones: result.metadata_graph_tombstones,
+            },
+            Err(error) => Self::Error {
+                target: None,
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

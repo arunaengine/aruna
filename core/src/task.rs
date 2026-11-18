@@ -106,10 +106,25 @@ pub struct PersistedTaskTimer {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskEffect {
-    ResetTimer { key: TaskKey, after: Duration },
-    ShortenTimer { key: TaskKey, after: Duration },
-    CancelTimer { key: TaskKey },
-    AbortRunningHandlers { key: TaskKey },
+    ResetTimer {
+        key: TaskKey,
+        after: Duration,
+    },
+    ShortenTimer {
+        key: TaskKey,
+        after: Duration,
+    },
+    CancelTimer {
+        key: TaskKey,
+    },
+    AbortRunningHandlers {
+        key: TaskKey,
+    },
+    /// Arms the timer unless it is armed already or its handler runs.
+    ScheduleIdleTimer {
+        key: TaskKey,
+        after: Duration,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

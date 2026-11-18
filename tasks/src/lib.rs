@@ -954,6 +954,9 @@ impl Handle for TaskHandle {
                     TaskEffect::AbortRunningHandlers { key } => {
                         self.abort_running_handlers(key).await
                     }
+                    TaskEffect::ScheduleIdleTimer { key, after } => {
+                        self.schedule_idle_timer(key, after).await
+                    }
                 };
                 Event::Task(event)
             }

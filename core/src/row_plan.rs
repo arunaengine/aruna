@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::calls::{IoCall, IoError, IoResult, Next};
-use crate::effects::{Effect, StorageEffect};
+use crate::effects::{Effect, IterStart, StorageEffect};
 use crate::events::{Event, StorageEvent};
 use crate::operation::{Operation, TransactionMode};
 use crate::rows::{all_values, done, event};
@@ -40,6 +40,7 @@ impl From<IoError> for PlanStop<IoError> {
 struct ScanRequest {
     space: KeySpace,
     prefix: Option<Key>,
+    after: Option<Key>,
     limit: usize,
 }
 
@@ -106,9 +107,21 @@ impl PlanRows {
         prefix: Option<Key>,
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, NeedsRows> {
+        self.scan_after(space, prefix, None, limit)
+    }
+
+    /// At most `limit` rows below `prefix` that sort after `after`.
+    pub fn scan_after(
+        &mut self,
+        space: &str,
+        prefix: Option<Key>,
+        after: Option<Key>,
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, NeedsRows> {
         let request = ScanRequest {
             space: space.to_string(),
             prefix,
+            after,
             limit,
         };
         match self.scans.get(&request) {
@@ -230,7 +243,7 @@ where
         let scan = StorageEffect::Iter {
             key_space: request.space,
             prefix: request.prefix,
-            start: None,
+            start: request.after.map(IterStart::After),
             limit: request.limit,
             txn_id: None,
         };
@@ -382,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_row_changes_nothing() {
+    fn missing_row_stops() {
         let mut operation = PlanOperation::new(CopyPlan);
         operation.first().unwrap();
         let values = IoResult::Values(vec![None, None]);
