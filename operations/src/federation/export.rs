@@ -3,46 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::UserId;
-use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event};
 use aruna_core::federation::Signed;
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE,
-};
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, ExportSelection, JobId};
-use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
-use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord, PinnedSource, check_issued};
+use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord};
 use ulid::Ulid;
 use url::Url;
 
-use crate::auth::bearer_token::realm_user_cutoff;
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::federation::grant::{IssueGrantConfig, IssueGrantOperation, record_key};
+use crate::federation::grant::{
+    AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation, export_access,
+    record_key,
+};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::{crate_jsonld, unheld_bucket};
-use crate::jobs::key_wake::read_row;
-use crate::replication::plaintext::HolderCheckOperation;
-
-const EXPORT_OPERATION: &str = "federation.export";
-
-fn principal(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
-}
 
 /// READ on the document and the deny-only `federation.export` policies for `audience`.
 pub async fn authorize_export(
@@ -52,24 +30,11 @@ pub async fn authorize_export(
     audience: RealmId,
     with_files: bool,
 ) -> Result<(), GrantError> {
-    let extras = PolicyRequestExtras {
-        operation: EXPORT_OPERATION.to_string(),
-        params: BTreeMap::from([
-            ("destination_realm".to_string(), audience.to_string()),
-            ("with_files".to_string(), with_files.to_string()),
-        ]),
-        ..Default::default()
-    };
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        document_path,
-        &Permission::READ,
-        extras,
-    )
-    .await
-    .map_err(|_| GrantError::Denied)
+    let access = export_access(auth, document_path, audience, with_files);
+    match drive(access, context).await {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(GrantError::Denied),
+    }
 }
 
 /// Refuses a file export at consent when a selected file has copies on this node and each needs
@@ -90,117 +55,12 @@ pub async fn check_holder(
     }
 }
 
-/// Whether bucket key generation `key` is unlocked on this node.
-async fn unlocked(context: &DriverContext, key: BucketKeyRef) -> Result<bool, GrantError> {
-    let blob = context.blob_handle.as_ref().ok_or(GrantError::Denied)?;
-    let effect = BlobEffect::ReadKeyStatus {
-        bucket_id: key.bucket_id,
-    };
-    match blob.send_blob_effect(effect).await {
-        Event::Blob(BlobEvent::KeyStatus { generations }) => Ok(generations
-            .iter()
-            .any(|status| status.key == key && status.active)),
-        other => Err(GrantError::Storage(format!(
-            "key status failed: {}",
-            other.label()
-        ))),
-    }
-}
-
-/// The active key of `bucket`, which a plain copy in an encrypting bucket is read under.
-async fn active_key(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<BucketKeyRef>, GrantError> {
-    let row = bucket.as_bytes().to_vec();
-    let row = read_row(context, BUCKET_ENCRYPTION_KEYSPACE, row)
-        .await
-        .map_err(GrantError::Storage)?;
-    let settings = BucketEncryption::from_row(row.as_deref())
-        .map_err(|error| GrantError::Storage(error.to_string()))?;
-    Ok(settings.active_key())
-}
-
-/// Whether the pinned version still exists with its hash.
-async fn pinned(context: &DriverContext, source: &PinnedSource) -> Result<bool, GrantError> {
-    let key = VersionKey::new(source.bucket.clone(), source.key.clone(), source.version_id);
-    let key = key
-        .to_bytes()
-        .map_err(|e| GrantError::Storage(e.to_string()))?;
-    let row = read_row(context, BLOB_VERSIONS_KEYSPACE, key)
-        .await
-        .map_err(GrantError::Storage)?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-    let version = BlobVersion::from_bytes(&row).map_err(|e| GrantError::Storage(e.to_string()))?;
-    Ok(version.blob_hash() == Some(&source.blake3))
-}
-
-/// Current READ on the document and every pinned version, the export policies, the pinned
-/// versions themselves, and for a copy read under a bucket key that key unlocked and held.
-async fn recheck(
-    context: &DriverContext,
-    auth: &AuthContext,
-    record: &GrantRecord,
-) -> Result<(), GrantError> {
-    let cutoff = realm_user_cutoff(&context.storage_handle, auth.realm_id, &record.principal)
-        .await
-        .map_err(|error| GrantError::Storage(error.to_string()))?;
-    // A credential cutoff of the consenting user also ends grants issued before it.
-    if cutoff.is_some_and(|cutoff| record.grant.payload.issued_at < cutoff) {
-        return Err(GrantError::Denied);
-    }
-    let audience = record.grant.payload.audience;
-    let path = &record.document_path;
-    authorize_export(context, auth, path, audience, record.with_files).await?;
-    for source in &record.sources {
-        authorize_export(context, auth, &source.path, audience, true).await?;
-        if !pinned(context, source).await? {
-            return Err(GrantError::Denied);
-        }
-        let key = match source.key_ref {
-            Some(key) => Some(key),
-            None => active_key(context, &source.bucket).await?,
-        };
-        if let Some(key) = key {
-            let holder = HolderCheckOperation::new(auth.realm_id, &source.bucket, auth.user_id);
-            let holder = drive(holder, context)
-                .await
-                .map_err(|error| GrantError::Storage(error.to_string()))?;
-            if !holder || !unlocked(context, key).await? {
-                return Err(GrantError::Denied);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Runs one transactional change of a grant record.
-async fn change_record(
-    context: &DriverContext,
-    change: RecordChange,
-) -> Result<RecordOutcome, GrantError> {
-    let run = || RecordOperation::new(change.clone());
-    drive_retry(run, context, change.key())
-        .await
-        .map_err(|error| GrantError::Storage(error.to_string()))
-}
-
 /// The grant record of `job_id`, if one was issued.
 pub async fn read_record(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<GrantRecord>, GrantError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        record_key(job_id),
-    )
-    .await
-    .map_err(GrantError::Storage)?;
-    row.map(|row| postcard::from_bytes(&row).map_err(|e| GrantError::Storage(e.to_string())))
-        .transpose()
+    drive(ReadGrantOperation::new(job_id), context).await
 }
 
 /// Inputs of a grant for a finished export into another realm.
@@ -215,15 +75,13 @@ pub struct GrantRequest<'a> {
     pub now: u64,
 }
 
-/// Issues the grant of a finished export after the current checks and stores its record. A
-/// repeated request returns the stored grant while it is valid; an expired grant needs a new
-/// intent and export.
+/// See [`IssueExportOperation`].
 pub async fn issue_grant(
     context: &DriverContext,
     request: GrantRequest<'_>,
 ) -> Result<Signed<ExportGrant>, GrantError> {
     let auth = request.auth;
-    let issue = IssueGrantOperation::new(IssueGrantConfig {
+    let config = IssueGrantConfig {
         realm_id: auth.realm_id,
         principal: auth.user_id,
         job_id: request.job_id,
@@ -233,23 +91,11 @@ pub async fn issue_grant(
         artifact_url: request.artifact_url,
         capabilities: request.capabilities.clone(),
         now: request.now,
-    });
-    let (stored, record) = drive(issue, context).await?;
-    recheck(context, auth, &record).await?;
-    if stored {
-        return Ok(record.grant);
-    }
-    let key = record_key(request.job_id);
-    // A racing request may have stored its grant or a revocation first; that one wins.
-    match change_record(context, RecordChange::StoreGrant { key, record }).await? {
-        RecordOutcome::Grant(stored) if stored.revoked => Err(GrantError::Revoked),
-        RecordOutcome::Grant(stored) => Ok(stored.grant),
-        other => Err(GrantError::Storage(format!("unexpected outcome {other:?}"))),
-    }
+    };
+    drive(IssueExportOperation::new(auth.clone(), config), context).await
 }
 
-/// Admits one artifact read by a grant: its signature, binding and lifetime, the stored record
-/// and revoked flag, and the current checks of the consenting user.
+/// See [`AdmitGrantOperation`].
 pub async fn admit_grant(
     context: &DriverContext,
     local: RealmId,
@@ -257,22 +103,18 @@ pub async fn admit_grant(
     grant: &Signed<ExportGrant>,
     now: u64,
 ) -> Result<GrantRecord, GrantError> {
-    check_issued(grant, &local, job_id.as_ulid(), now)?;
-    let record = read_record(context, job_id)
-        .await?
-        .filter(|record| record.grant == *grant)
-        .ok_or(GrantError::Missing)?;
-    if record.revoked {
-        return Err(GrantError::Revoked);
-    }
-    recheck(context, &principal(record.principal, local), &record).await?;
-    Ok(record)
+    let admit = AdmitGrantOperation::new(local, job_id, grant.clone(), now);
+    drive(admit, context).await
 }
 
 /// Revokes the grant of `job_id` for every later read; false when none was issued.
 pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool, GrantError> {
-    let key = record_key(job_id);
-    match change_record(context, RecordChange::RevokeGrant { key }).await? {
+    let change = RecordChange::RevokeGrant {
+        key: record_key(job_id),
+    };
+    let run = || RecordOperation::new(change.clone());
+    let outcome = drive_retry(run, context, change.key()).await;
+    match outcome.map_err(|error| GrantError::Storage(error.to_string()))? {
         RecordOutcome::Revoked(existed) => Ok(existed),
         other => Err(GrantError::Storage(format!("unexpected outcome {other:?}"))),
     }
@@ -281,9 +123,17 @@ pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::grant::{IssueGrantOperation, grant_principal};
+    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{
+        BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
+    use aruna_core::transfer::PinnedSource;
     use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
@@ -589,7 +439,10 @@ mod tests {
         };
         let mut operation = IssueGrantOperation::new(config);
         let revoked = postcard::to_allocvec(&revoked).unwrap();
-        assert_eq!(operation.next(read(Some(revoked))), Err(GrantError::Revoked));
+        assert_eq!(
+            operation.next(read(Some(revoked))),
+            Err(GrantError::Revoked)
+        );
     }
 
     #[tokio::test]
@@ -598,7 +451,7 @@ mod tests {
         let (_dir, context) = context();
         let record = record();
         write_record(&context, job(), &record).await.unwrap();
-        let auth = principal(record.principal, local());
+        let auth = grant_principal(record.principal, local());
         let selection = ExportSelection {
             files: Vec::new(),
             audience: record.grant.payload.audience,
