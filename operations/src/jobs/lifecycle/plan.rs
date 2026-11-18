@@ -31,13 +31,17 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
-use super::policies::ResolvePoliciesOperation;
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::holders::GetHoldersOperation;
+use super::policies::{Resolutions, ResolvePoliciesOperation};
+use crate::auth::check_permissions::CheckPermissionsConfig;
+use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::driver::{DriverContext, drive};
-use aruna_core::heartbeat::live_telemetry;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
+use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::operation::Operation;
+use aruna_core::types::Value;
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -59,8 +63,14 @@ pub enum PlanBuildError {
     Request(#[from] ids::RequestError),
 }
 
-/// Builds and runs one planning round for the stored spec. Targets already
-/// declined for this request are excluded before ranking.
+impl From<IoError> for PlanBuildError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
+/// paged inputs of the spec are read in first.
 pub async fn build_plan(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -73,28 +83,287 @@ pub async fn build_plan(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let (mut documents, unread) = advertisements(context, config).await;
-    let fresh = context.fresh_heartbeats();
-    live_telemetry(&fresh, &mut documents, now_ms);
-    let inputs = resolve_inputs(context, config, spec, local).await?;
-    let mut output_policies = inputs
-        .iter()
-        .flat_map(|input| input.policies.clone())
-        .collect::<Vec<_>>();
-    output_policies.extend(spec.output_policies.clone());
-    output_policies.sort_unstable();
-    output_policies.dedup();
-    let policies = resolve_policies(context, spec, &inputs, &output_policies, now_ms, local).await;
-    let request = plan_request(spec, inputs, output_policies, policies, now_ms)?;
-    let mut planner = Planner::new(&request, &config.compute)?;
-    let scan = candidates(context, config, spec, &documents, excluded, &mut planner).await?;
-    debug!(
-        pages = scan.pages,
-        scanned = scan.scanned,
-        unread,
-        "Screened the realm advertisements for one planning round"
-    );
-    Ok(planner.finish(unread))
+    let spec = crate::jobs::records::pages::with_inputs(context, spec)
+        .await
+        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
+    let round = PlanRound {
+        config: config.clone(),
+        spec,
+        excluded: excluded.to_vec(),
+        now_ms,
+        local,
+        fresh: context.fresh_heartbeats(),
+    };
+    drive(BuildPlanOperation::new(round), context).await
+}
+
+/// What one planning round starts from.
+#[derive(Debug, PartialEq)]
+pub struct PlanRound {
+    pub config: RealmConfigDocument,
+    /// The stored spec with its paged inputs read in.
+    pub spec: LogicalJobSpec,
+    pub excluded: Vec<ExecutionTargetId>,
+    pub now_ms: u64,
+    pub local: NodeId,
+    /// The fresh heartbeats whose telemetry overrides the advertised one.
+    pub fresh: BTreeMap<NodeId, HeldHeartbeat>,
+}
+
+#[derive(Debug, PartialEq)]
+enum PlanStep {
+    Advertisement(NodeId),
+    Holders(usize),
+    Policies,
+    PolicyRows,
+    Grant(NodeId),
+}
+
+/// Builds and runs one planning round: the advertisement of every member, the pinned inputs
+/// with their holders, the policies, and whether the submitter may run on each node. Targets
+/// already declined for this request are excluded before ranking; an unread advertisement may
+/// hold the only legal target, so the round is then a continuation, not a conclusive refusal.
+#[derive(Debug, PartialEq)]
+pub struct BuildPlanOperation {
+    round: PlanRound,
+    /// Members whose advertisement is still to read, the next one last.
+    members: Vec<NodeId>,
+    documents: BTreeMap<NodeId, NodeInfoDocument>,
+    unread: bool,
+    inputs: Vec<ResolvedInput>,
+    policies: BTreeMap<Ulid, PolicyResolution>,
+    /// Candidate nodes whose grant is still to read, the next one last.
+    targets: Vec<NodeId>,
+    /// Whether the request policies allow the submitter's write on each candidate node.
+    policy_allows: BTreeMap<NodeId, bool>,
+    allowed: BTreeMap<NodeId, bool>,
+    step: PlanStep,
+}
+
+type PlanNext = Result<Next<ExecutionPlan>, PlanBuildError>;
+
+impl BuildPlanOperation {
+    pub fn new(round: PlanRound) -> Self {
+        let (mut members, unread) = match round.config.sync_eligible_nodes() {
+            Ok(members) => (members, false),
+            Err(_) => (Vec::new(), true),
+        };
+        members.reverse();
+        Self {
+            round,
+            members,
+            documents: BTreeMap::new(),
+            unread,
+            inputs: Vec::new(),
+            policies: BTreeMap::new(),
+            targets: Vec::new(),
+            policy_allows: BTreeMap::new(),
+            allowed: BTreeMap::new(),
+            step: PlanStep::Policies,
+        }
+    }
+
+    fn advertisement(&mut self) -> PlanNext {
+        if let Some(node) = self.members.pop() {
+            self.step = PlanStep::Advertisement(node);
+            return Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![
+                node,
+            ]))));
+        }
+        live_telemetry(&self.round.fresh, &mut self.documents, self.round.now_ms);
+        self.inputs = pinned_inputs(&self.round.config, &self.round.spec)?;
+        self.holders(0)
+    }
+
+    /// Asks the DHT for the registered copies of input `index` onward; a reference has no
+    /// stored copies to find by content, so its source stays its only holder.
+    fn holders(&mut self, mut index: usize) -> PlanNext {
+        while let Some(input) = self.inputs.get(index) {
+            if let Some(blake3) = input.content.blake3() {
+                self.step = PlanStep::Holders(index);
+                let (realm_id, local) = (self.round.spec.realm_id, self.round.local);
+                let lookup = GetHoldersOperation::new(blake3, realm_id, local);
+                return Ok(Next::Call(IoCall::child(lookup)));
+            }
+            index += 1;
+        }
+        self.step = PlanStep::Policies;
+        let refs = self.inputs.iter().flat_map(|input| input.policies.clone());
+        let refs = refs
+            .chain(self.round.spec.output_policies.clone())
+            .collect();
+        let round = &self.round;
+        let resolve =
+            ResolvePoliciesOperation::new(round.spec.realm_id, round.local, round.now_ms, refs);
+        Ok(Next::Call(IoCall::child(resolve)))
+    }
+
+    /// The nodes a candidate may run on, then the request policy rows of the group.
+    fn targets(&mut self) -> PlanNext {
+        let spec = &self.round.spec;
+        let existing = ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
+        let mut targets: Vec<NodeId> = self
+            .documents
+            .keys()
+            .filter(|node| !existing || **node == spec.ingress_node_id)
+            .filter(|node| node_kind(&self.round.config, **node).is_some())
+            .copied()
+            .collect();
+        targets.reverse();
+        self.targets = targets;
+        self.step = PlanStep::PolicyRows;
+        let rows = policy_reads(spec.realm_id, Some(spec.group_id));
+        Ok(Next::Call(IoCall::Read(rows)))
+    }
+
+    /// Evaluates the request policies for every candidate node; missing state fails closed.
+    fn judge_policies(&mut self, values: Vec<Option<Value>>) {
+        let spec = &self.round.spec;
+        let evaluator = read_policies(spec.realm_id, Some(spec.group_id), values).ok();
+        for node in &self.targets {
+            let allows = evaluator.as_ref().is_some_and(|evaluator| {
+                let check = write_check(spec, *node);
+                let request = policy_request_with(
+                    &check.path,
+                    &Permission::WRITE,
+                    Some(&check.auth_context),
+                    PolicyRequestExtras::rest(),
+                );
+                evaluator.evaluate(&request).is_ok()
+            });
+            self.policy_allows.insert(*node, allows);
+        }
+    }
+
+    /// Reads the submitter's grants on the next candidate node the policies allow.
+    fn grant(&mut self) -> PlanNext {
+        while let Some(node) = self.targets.pop() {
+            let reads = match self.policy_allows.get(&node) {
+                Some(true) => write_check(&self.round.spec, node).reads().ok(),
+                _ => None,
+            };
+            match reads {
+                Some(reads) => {
+                    self.step = PlanStep::Grant(node);
+                    return Ok(Next::Call(IoCall::Read(reads)));
+                }
+                None => {
+                    self.allowed.insert(node, false);
+                }
+            }
+        }
+        self.finish()
+    }
+
+    fn finish(&mut self) -> PlanNext {
+        let round = &self.round;
+        let mut output_policies: Vec<PlacementPolicyRef> = self
+            .inputs
+            .iter()
+            .flat_map(|input| input.policies.clone())
+            .collect();
+        output_policies.extend(round.spec.output_policies.clone());
+        output_policies.sort_unstable();
+        output_policies.dedup();
+        let inputs = std::mem::take(&mut self.inputs);
+        let policies = std::mem::take(&mut self.policies);
+        let request = plan_request(&round.spec, inputs, output_policies, policies, round.now_ms)?;
+        let mut planner = Planner::new(&request, &round.config.compute)?;
+        let scan = candidates(round, &self.documents, &self.allowed, &mut planner)?;
+        debug!(
+            pages = scan.pages,
+            scanned = scan.scanned,
+            unread = self.unread,
+            "Screened the realm advertisements for one planning round"
+        );
+        Ok(Next::Done(planner.finish(self.unread)))
+    }
+}
+
+impl Operation for BuildPlanOperation {
+    type Output = ExecutionPlan;
+    type Error = PlanBuildError;
+
+    fn first(&mut self) -> PlanNext {
+        self.advertisement()
+    }
+
+    fn next(&mut self, result: IoResult) -> PlanNext {
+        match self.step {
+            PlanStep::Advertisement(node) => {
+                let read = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+                match read.map(|mut documents| documents.remove(&node)) {
+                    Ok(Some(document)) => {
+                        self.documents.insert(node, document);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(node = %node, error = %error, "Node info advertisement stayed unread");
+                        self.unread = true;
+                    }
+                }
+                self.advertisement()
+            }
+            PlanStep::Holders(index) => {
+                let registered = result
+                    .child::<Vec<NodeId>, GetHoldersError>()?
+                    .unwrap_or_else(|error| {
+                        debug!(error = %error, "Blob holder lookup found no registered copy");
+                        Vec::new()
+                    });
+                let config = &self.round.config;
+                if let Some(input) = self.inputs.get_mut(index) {
+                    merge_holders(config, &mut input.holders, registered);
+                }
+                self.holders(index + 1)
+            }
+            PlanStep::Policies => {
+                let resolved = result.child::<Resolutions, IoError>()?;
+                self.policies = resolved.unwrap_or_else(|error| {
+                    debug!(error = %error, "Placement policies stayed unresolved for planning");
+                    BTreeMap::new()
+                });
+                self.targets()
+            }
+            PlanStep::PolicyRows => {
+                let values = row_values(result)?;
+                self.judge_policies(values);
+                self.grant()
+            }
+            PlanStep::Grant(node) => {
+                let values = row_values(result)?;
+                let check = write_check(&self.round.spec, node);
+                self.allowed
+                    .insert(node, check.allowed(values).unwrap_or(false));
+                self.grant()
+            }
+        }
+    }
+}
+
+fn row_values(result: IoResult) -> Result<Vec<Option<Value>>, PlanBuildError> {
+    match result {
+        IoResult::Values(values) => Ok(values),
+        other => Err(IoError::Unexpected {
+            expected: "IoResult::Values",
+            got: other.label(),
+        }
+        .into()),
+    }
+}
+
+/// The submitter's write check on the group path of `node`.
+fn write_check(spec: &LogicalJobSpec, node: NodeId) -> CheckPermissionsConfig {
+    CheckPermissionsConfig {
+        auth_context: AuthContext {
+            user_id: spec.created_by,
+            realm_id: spec.realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        path: group_permission_path(spec.realm_id, spec.group_id, node),
+        required_permission: Permission::WRITE,
+    }
 }
 
 /// The pinned values one round screens every advertisement against.
@@ -174,14 +443,13 @@ struct Scan {
 /// One candidate per advertised backend, screened in pages of at most
 /// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
 /// standing; eligibility is decided by the planner over the whole scan.
-async fn candidates(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    spec: &LogicalJobSpec,
+fn candidates(
+    round: &PlanRound,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
-    excluded: &[ExecutionTargetId],
+    allowed: &BTreeMap<NodeId, bool>,
     planner: &mut Planner<'_>,
 ) -> Result<Scan, PlanBuildError> {
+    let (config, spec, excluded) = (&round.config, &round.spec, &round.excluded);
     let mut scan = Scan {
         pages: 0,
         scanned: 0,
@@ -199,7 +467,7 @@ async fn candidates(
             continue;
         };
         let entry = config.placement_entry(*node_id);
-        let group_allowed = target_allowed(context, spec, *node_id).await;
+        let group_allowed = allowed.get(node_id).copied().unwrap_or(false);
         let mut executors: Vec<&ExecutorCapability> = document.executors.iter().collect();
         executors.sort_unstable_by(|left, right| left.kind.as_str().cmp(right.kind.as_str()));
         for capability in executors {
@@ -242,25 +510,6 @@ fn flush(
     Ok(())
 }
 
-async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: NodeId) -> bool {
-    let auth = AuthContext {
-        user_id: spec.created_by,
-        realm_id: spec.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    authorize(
-        context,
-        spec.realm_id,
-        &auth,
-        &group_permission_path(spec.realm_id, spec.group_id, target),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
-    .await
-    .is_ok()
-}
-
 fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
     config
         .nodes
@@ -270,15 +519,11 @@ fn node_kind(config: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeK
 }
 
 /// Pins every declared input to one exact version at its stored source.
-async fn resolve_inputs(
-    context: &DriverContext,
+/// The source endpoint is each input's first holder; the registered copies follow later.
+fn pinned_inputs(
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
-    local: NodeId,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
-    let spec = &crate::jobs::records::pages::with_inputs(context, spec)
-        .await
-        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
     if spec.captured_inputs.len() != spec.payload.inputs.len() {
         return Err(PlanBuildError::Unavailable(
             "captured inputs are incomplete".to_string(),
@@ -321,15 +566,10 @@ async fn resolve_inputs(
                 reason: "captured input version changed".to_string(),
             });
         }
-        let holders = input_holders(
-            context,
-            config,
-            spec.realm_id,
-            local,
-            captured.source_node_id,
-            captured.content.blake3(),
-        )
-        .await;
+        let holders = vec![InputHolder {
+            subject: holder_subject(config, captured.source_node_id),
+            node_id: captured.source_node_id,
+        }];
         inputs.push(ResolvedInput {
             destination_key: input.dest_key.clone(),
             source: VersionedObjectArn {
@@ -379,35 +619,9 @@ pub async fn version_hash(
     }
 }
 
-/// The source endpoint owns the stored bucket/key/version, and every node the
-/// DHT lists for the same content hash holds a registered copy, so running next
-/// to one saves the transfer; a failed lookup leaves the source as the only route.
-async fn input_holders(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-    local: NodeId,
-    source_node: NodeId,
-    blake3: Option<[u8; 32]>,
-) -> Vec<InputHolder> {
-    let mut holders = vec![InputHolder {
-        subject: holder_subject(config, source_node),
-        node_id: source_node,
-    }];
-    // A reference has no stored copies to find by content, so its source is its only holder.
-    let Some(blake3) = blake3 else {
-        return holders;
-    };
-    let registered = drive(GetHoldersOperation::new(blake3, realm_id, local), context)
-        .await
-        .unwrap_or_else(|error| {
-            debug!(error = %error, "Blob holder lookup found no registered copy");
-            Vec::new()
-        });
-    merge_holders(config, &mut holders, registered);
-    holders
-}
-
+/// The source endpoint owns the stored bucket/key/version, and every node the DHT lists for
+/// the same content hash holds a registered copy, so running next to one saves the transfer; a
+/// failed lookup leaves the source as the only route.
 /// Adds the registered copies to the holder list, keeping the source endpoint
 /// first, dropping repeats, and stopping at the bound the planner accepts.
 fn merge_holders(
@@ -443,29 +657,6 @@ fn holder_subject(config: &RealmConfigDocument, node_id: NodeId) -> PlacementSub
         executor_kind: None,
         local_to_controller: false,
     }
-}
-
-/// Every distinct policy ref of the request, resolved through the ordinary
-/// verifying resolver. A ref that stays unresolved blocks a target instead of
-/// allowing it.
-async fn resolve_policies(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-    inputs: &[ResolvedInput],
-    output_policies: &[PlacementPolicyRef],
-    now_ms: u64,
-    local: NodeId,
-) -> BTreeMap<Ulid, PolicyResolution> {
-    let refs: Vec<PlacementPolicyRef> = inputs
-        .iter()
-        .flat_map(|input| input.policies.clone())
-        .chain(output_policies.iter().cloned())
-        .collect();
-    let operation = ResolvePoliciesOperation::new(spec.realm_id, local, now_ms, refs);
-    drive(operation, context).await.unwrap_or_else(|error| {
-        debug!(error = %error, "Placement policies stayed unresolved for planning");
-        BTreeMap::new()
-    })
 }
 
 /// Network mode pinned by the request tag, defaulting to no egress.
@@ -542,6 +733,22 @@ mod tests {
         }
     }
 
+    /// A round over `config` for `spec` that excludes `excluded`.
+    fn round(
+        config: &RealmConfigDocument,
+        spec: &LogicalJobSpec,
+        excluded: &[ExecutionTargetId],
+    ) -> PlanRound {
+        PlanRound {
+            config: config.clone(),
+            spec: spec.clone(),
+            excluded: excluded.to_vec(),
+            now_ms: 2_000,
+            local: node(1),
+            fresh: BTreeMap::new(),
+        }
+    }
+
     /// The pinned values of one round, with the candidates left to the scan.
     fn round_request(spec: &LogicalJobSpec) -> PlanRequest {
         plan_request(spec, Vec::new(), Vec::new(), BTreeMap::new(), 2_000)
@@ -579,9 +786,13 @@ mod tests {
         let (read, _) = advertisements(&context, config).await;
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
-        let scan = candidates(&context, config, &spec, &read, &[], &mut planner)
-            .await
-            .expect("every page continues the scan");
+        let scan = candidates(
+            &round(config, &spec, &[]),
+            &read,
+            &BTreeMap::new(),
+            &mut planner,
+        )
+        .expect("every page continues the scan");
         let cursor = planner.cursor().cloned();
         (scan, cursor, planner.finish(false))
     }
@@ -625,9 +836,13 @@ mod tests {
         assert!(!unread && read.len() == 129);
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
-        let scan = candidates(&context, &config, &spec, &read, &[], &mut planner)
-            .await
-            .expect("every page continues the scan");
+        let scan = candidates(
+            &round(&config, &spec, &[]),
+            &read,
+            &BTreeMap::new(),
+            &mut planner,
+        )
+        .expect("every page continues the scan");
 
         assert_eq!((scan.pages, scan.scanned), (2, 1_032));
         assert_eq!(planner.scanned(), 1_032);
@@ -656,9 +871,13 @@ mod tests {
         let (read, _) = advertisements(&context, &config).await;
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
-        let scan = candidates(&context, &config, &spec, &read, &excluded, &mut planner)
-            .await
-            .expect("every page continues the scan");
+        let scan = candidates(
+            &round(&config, &spec, &excluded),
+            &read,
+            &BTreeMap::new(),
+            &mut planner,
+        )
+        .expect("every page continues the scan");
 
         assert_eq!((scan.pages, scan.scanned), (2, 1_031));
     }
