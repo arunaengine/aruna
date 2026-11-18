@@ -180,10 +180,12 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    let resolved =
-        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen)
-            .await
-            .map_err(map_location_error)?;
+    let resolved = drive(
+        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_location_error)?;
     let result = run_create_metadata(
         &state,
         &auth,
@@ -196,7 +198,12 @@ pub async fn create_metadata_document(
         message,
     )
     .await?;
-    aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved).await;
+    drive(
+        aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved),
+        &state.get_ctx(),
+    )
+    .await
+    .ok();
 
     Ok((
         StatusCode::CREATED,

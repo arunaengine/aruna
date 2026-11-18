@@ -11,7 +11,7 @@ use super::versions::{
     protected, resolve, rocrate, version,
 };
 use super::{GitError, MergeConflict};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     GitEffect, GitEvent, GitSnapshot, MergeOutcome, PendingMerge, RefUpdate, ZERO_OID,
@@ -100,13 +100,16 @@ pub async fn edit(
             new: new.clone(),
         };
         let made = vec![new.clone()];
-        record_made(
+        drive(
+            record_made(
+                context,
+                auth,
+                &document,
+                vec![update],
+                (bytes, lfs),
+                (made, None),
+            ),
             context,
-            auth,
-            &document,
-            vec![update],
-            (bytes, lfs),
-            (made, None),
         )
         .await?;
     }
@@ -256,13 +259,16 @@ async fn merge_into(
         );
     }
     if !updates.is_empty() {
-        record_made(
+        drive(
+            record_made(
+                context,
+                auth,
+                document,
+                updates,
+                (bytes, Vec::new()),
+                (made, merge),
+            ),
             context,
-            auth,
-            document,
-            updates,
-            (bytes, Vec::new()),
-            (made, merge),
         )
         .await?;
     }

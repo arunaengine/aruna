@@ -297,11 +297,14 @@ async fn located(
     }
     if let (Some(location), Some(node)) = (&identity.location, node)
         && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
-        && let Ok(Some(object)) = objects::described(
+        && let Ok(Some(object)) = drive(
+            objects::described(
+                context,
+                (&location.bucket, bucket.group_id),
+                &location.key,
+                None,
+            ),
             context,
-            (&location.bucket, bucket.group_id),
-            &location.key,
-            None,
         )
         .await
         && identity.hash.is_none_or(|hash| hash == object.blake3)
@@ -372,7 +375,7 @@ pub(super) async fn linked(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
         return Vec::new();
     };
-    let location = super::location::effective(context, document)
+    let location = drive(super::location::effective(document), context)
         .await
         .map(|(location, _)| location)
         .ok();
@@ -610,10 +613,18 @@ async fn generate(
         } => Some(pack.clone()),
         _ => None,
     };
-    let publishing = publish::publish_with(context, document, user, change, (pack, Vec::new()));
+    let publishing = drive(
+        publish::publish_with(context, document, user, change, (pack, Vec::new())),
+        context,
+    );
     time_stage("git_publish", publishing).await?;
     if let Some(pack) = &marked {
-        objects::mark_imported(context, (document.document_id, user), pack).await;
+        drive(
+            objects::mark_imported((document.document_id, user), pack),
+            context,
+        )
+        .await
+        .ok();
     }
     let status = GitStatus {
         event_id,
@@ -651,7 +662,7 @@ async fn checkpoint(
         revision: state.revision,
         covered: state.coverable(),
     }));
-    publish::publish(context, document, owner, change)
+    drive(publish::publish(context, document, owner, change), context)
         .await
         .map(|_| ())
 }
@@ -892,7 +903,11 @@ pub async fn status(
     GitError,
 > {
     let store = super::store(context)?;
-    let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
+    let (document, _) = drive(
+        super::repository(context, auth, id, Permission::READ),
+        context,
+    )
+    .await?;
     // Status never waits for a first snapshot either; it reports an empty pending state.
     let (projection, pending) = match store.try_lock(id) {
         Some(guard) => {
@@ -937,7 +952,7 @@ pub async fn export(
     revision: String,
 ) -> Result<Bytes, GitError> {
     let store = super::store(context)?;
-    let document = document(context, auth, id, Permission::READ).await?;
+    let document = drive(document(auth, id, Permission::READ), context).await?;
     read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {
         document_id: id,

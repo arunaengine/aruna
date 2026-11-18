@@ -153,10 +153,12 @@ async fn original(
         })
         .map_or(UserId::nil(document.realm_id), |record| record.user_id);
     let auth = super::project::author(pusher);
-    Ok(match lfs::readable(context, &auth, &original).await {
-        true => Ok(()),
-        false => Err("the original is unreadable, so this copy may be the last one"),
-    })
+    Ok(
+        match drive(lfs::readable(context, &auth, &original), context).await {
+            true => Ok(()),
+            false => Err("the original is unreadable, so this copy may be the last one"),
+        },
+    )
 }
 
 /// Whether the exact version still exists on this node.
@@ -165,9 +167,12 @@ async fn stored(context: &DriverContext, object: &StoredObject) -> bool {
         return false;
     };
     let found = (object.bucket.as_str(), group_id);
-    objects::described(context, found, &object.key, Some(object.version_id))
-        .await
-        .is_ok_and(|described| described.is_some())
+    drive(
+        objects::described(context, found, &object.key, Some(object.version_id)),
+        context,
+    )
+    .await
+    .is_ok_and(|described| described.is_some())
 }
 
 /// Deletes the exact version through the normal S3 delete; a version that is already gone

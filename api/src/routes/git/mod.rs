@@ -16,6 +16,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::map_authorize_error;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_operations::driver::drive;
 use aruna_operations::git::{self, GitError};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -145,8 +146,11 @@ pub async fn push(
         .get("x-aruna-push-key")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    git::push::accept(&state.get_ctx(), &auth, (id, key), request, pack)
-        .await
-        .map_err(map_error)?;
+    drive(
+        git::push::accept(&state.get_ctx(), &auth, (id, key), request, pack),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }

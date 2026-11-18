@@ -502,7 +502,13 @@ pub async fn create_group(
         request_span.record("group_id", field::display(forwarded.0.group_id));
         // Cached here so the new group answers on the next read instead of
         // after the device's next realm-document fetch.
-        if !drive(install_group_docs(&actor_for(&state, &auth), &forwarded.0, &forwarded.1), &ctx).await.unwrap_or(false) {
+        if !drive(
+            install_group_docs(&actor_for(&state, &auth), &forwarded.0, &forwarded.1),
+            &ctx,
+        )
+        .await
+        .unwrap_or(false)
+        {
             warn!(group_id = %forwarded.0.group_id, "Failed to cache a forwarded group locally");
         }
         return Ok((StatusCode::CREATED, Json(forwarded.into())));
@@ -771,7 +777,7 @@ pub(crate) async fn run_get_group(
     let (group, auth_doc) = load_group(state, group_id).await?;
     let is_member = is_group_member(&auth_doc, auth.user_id);
     let dataset_location = match is_member {
-        true => group_default(&state.get_ctx(), group_id)
+        true => drive(group_default(group_id), &state.get_ctx())
             .await
             .map(|location| StorageLocationRequest {
                 bucket: location.bucket,
@@ -968,13 +974,16 @@ pub async fn set_group_location(
     refuse_group_edit(&state).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     if let Some(location) = &location {
-        check_default(&state.get_ctx(), &auth, group_id, location)
-            .await
-            .map_err(|error| match error {
-                GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
-                GitError::Authorization(error) => crate::auth::map_authorize_error(error),
-                _ => ServerError::ServiceUnavailable,
-            })?;
+        drive(
+            check_default(&state.get_ctx(), &auth, group_id, location),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| match error {
+            GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
+            GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+            _ => ServerError::ServiceUnavailable,
+        })?;
     }
     drive(
         UpdateGroupOperation::new(UpdateGroupConfig {

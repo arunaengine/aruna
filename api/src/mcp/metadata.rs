@@ -376,10 +376,13 @@ impl McpServer {
         let group_id = parse_group(&input.group_id)?;
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let ctx = self.state.get_ctx();
-        let resolved = aruna_operations::git::location::resolve(&ctx, &auth, group_id, None)
-            .await
-            .map_err(crate::routes::metadata::documents::map_location_error)
-            .map_err(server_error)?;
+        let resolved = drive(
+            aruna_operations::git::location::resolve(&ctx, &auth, group_id, None),
+            &ctx,
+        )
+        .await
+        .map_err(crate::routes::metadata::documents::map_location_error)
+        .map_err(server_error)?;
         let record = crate::metadata::run_create_metadata(
             &self.state,
             &auth,
@@ -400,7 +403,12 @@ impl McpServer {
             ),
             error => write_error(error),
         })?;
-        aruna_operations::git::location::establish(&ctx, &auth, &record, resolved).await;
+        drive(
+            aruna_operations::git::location::establish(&ctx, &auth, &record, resolved),
+            &ctx,
+        )
+        .await
+        .ok();
         let summary = crate::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,

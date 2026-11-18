@@ -50,13 +50,18 @@ pub(super) async fn target(
     ) {
         return Ok(None);
     }
-    let (location, _) = location::effective(context, document).await?;
+    let (location, _) = drive(location::effective(document), context).await?;
     // Pushed files are stored in the realm that holds the document.
     let auth = AuthContext {
         realm_id: document.realm_id,
         ..author(merge.user_id)
     };
-    let bucket = match location::writable(context, &auth, document, &location).await {
+    let bucket = match drive(
+        location::writable(context, &auth, document, &location),
+        context,
+    )
+    .await
+    {
         Ok(bucket) => Some(bucket),
         Err(error) => {
             tracing::warn!(document_id = %document.document_id, %error,
@@ -163,14 +168,18 @@ impl PushTarget {
         )
         .await?;
         let content = match LfsObject::from_pointer(&bytes) {
-            Some(pointer) => match lfs::locate(context, document, &pointer.oid).await? {
+            Some(pointer) => match drive(lfs::locate(document, &pointer.oid), context).await? {
                 Some(source) => Content::Lfs(source),
                 None => return Ok(None),
             },
             None => Content::Blob(bytes),
         };
         let sha256 = content.sha256();
-        let existing = objects::described(context, (name, bucket.group_id), &key, None).await?;
+        let existing = drive(
+            objects::described(context, (name, bucket.group_id), &key, None),
+            context,
+        )
+        .await?;
         let stored = match existing.filter(|existing| existing.sha256 == sha256) {
             Some(existing) => existing,
             None => {
@@ -224,7 +233,7 @@ impl Content {
                 (size, body)
             }
             Self::Lfs(source) => {
-                let own = objects::copy(context, document, &source.sha256).await?;
+                let own = drive(objects::copy(document, &source.sha256), context).await?;
                 let node = context.net_handle.as_ref().map(|net| net.node_id());
                 let local = own.or((Some(source.node_id) == node).then_some(source.clone()));
                 if let Some(local) = local
@@ -232,12 +241,16 @@ impl Content {
                 {
                     return copied(context, auth, (&local, group_id), (name, bucket, key)).await;
                 }
-                let holders = publish::holders(context, document).await?;
+                let holders = drive(publish::holders(context, document), context).await?;
                 let blob = objects::open(context, auth, document, &source, &holders).await?;
                 (source.size, blob)
             }
         };
-        objects::put(context, auth, (name, bucket), (key, size, &sha256), body).await
+        drive(
+            objects::put(context, auth, (name, bucket), (key, size, &sha256), body),
+            context,
+        )
+        .await
     }
 }
 
@@ -289,11 +302,14 @@ async fn copied(
     let result = copy_object(context, input)
         .await
         .map_err(|_| GitError::Unavailable)?;
-    objects::described(
+    drive(
+        objects::described(
+            context,
+            (name, bucket.group_id),
+            &key,
+            Some(result.version_id),
+        ),
         context,
-        (name, bucket.group_id),
-        &key,
-        Some(result.version_id),
     )
     .await?
     .ok_or(GitError::Unavailable)
