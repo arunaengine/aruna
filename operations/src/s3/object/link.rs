@@ -4,10 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::ops::Range;
+use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::StagingSourceError;
+use aruna_core::native_reference::DelegatedBody;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, UserAccess, object_permission_path};
 use aruna_core::structs::storage::distribution::delegation::{MAX_VALID_SECS, Payload};
 use aruna_core::structs::storage::link::LinkTarget;
@@ -21,14 +27,19 @@ use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::read_access::SourceReadError;
 use crate::jobs::read_access::SourceReadOperation;
 use crate::jobs::workflow::input_view::ViewStream;
-use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
+};
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use crate::staging::native_source::delegated_read;
-use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+use crate::staging::reference::{
+    MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
+};
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -43,8 +54,14 @@ pub enum LinkError {
     Invalid(String),
 }
 
+impl From<IoError> for LinkError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
 /// Who reads through a link, as the node that verified the request's credential saw them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkCaller {
     pub auth: AuthContext,
     /// The verified credential's id, group and expiry in Unix seconds, for delegations.
@@ -65,124 +82,33 @@ impl LinkCaller {
     }
 }
 
-/// Whether a listing may show a link: the caller may read its target.
-pub async fn target_visible(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    target: &LinkTarget,
-    local: NodeId,
-) -> Result<bool, LinkError> {
-    match head_target(context, caller, target, local).await {
-        Ok(()) => Ok(true),
-        Err(LinkError::Denied | LinkError::NotFound) => Ok(false),
-        Err(error) => Err(error),
-    }
+/// This node as a link read needs it: its id, and the ids a delegation is signed under.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkNode {
+    pub local: NodeId,
+    pub ids: Option<(NodeId, RealmId)>,
 }
 
-/// Whether the caller may HEAD the target: checked here and, for a target on another node,
-/// by that node in one delegated HEAD.
-pub async fn head_target(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    target: &LinkTarget,
-    local: NodeId,
-) -> Result<(), LinkError> {
-    authorize_target(context, &caller.auth, target, HEAD_OPERATION).await?;
-    let arn = &target.arn;
-    if arn.node_id == local {
-        return Ok(());
-    }
-    let ids = context.node_and_realm();
-    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, None, true);
-    drive(read, context)
-        .await
-        .map(|_| ())
-        .map_err(staging_error)
-}
+type LinkTurn<T> = Result<Next<T>, LinkError>;
 
-fn staging_error(error: aruna_core::errors::StagingSourceError) -> LinkError {
+fn staging_error(error: StagingSourceError) -> LinkError {
     match error {
-        aruna_core::errors::StagingSourceError::AccessDenied => LinkError::Denied,
-        aruna_core::errors::StagingSourceError::NotFound => LinkError::NotFound,
+        StagingSourceError::AccessDenied => LinkError::Denied,
+        StagingSourceError::NotFound => LinkError::NotFound,
         other => LinkError::Unavailable(other.to_string()),
     }
 }
 
-/// Whether the caller may read the target, evaluated here from the target's recorded group
-/// and the replicated roles and policies; the target's node checks again on every byte read.
-pub async fn authorize_target(
-    context: &DriverContext,
-    auth: &AuthContext,
-    target: &LinkTarget,
-    operation: &str,
-) -> Result<(), LinkError> {
-    let arn = &target.arn;
-    let path = object_permission_path(
-        auth.realm_id,
-        target.group_id,
-        arn.node_id,
-        &arn.bucket,
-        &arn.key,
-    );
-    let extras = PolicyRequestExtras::operation(operation);
-    match Box::pin(drive(
-        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
-        context,
-    ))
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(
-            AuthorizeError::PermissionDenied
-            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Err(LinkError::Denied),
-        Err(error) => Err(LinkError::Unavailable(error.to_string())),
-    }
-}
-
-/// The target's bytes, or `range` of them, at its exact version. A target on another node is
-/// read through one delegation that carries the caller this node verified.
-pub async fn read_target(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    target: &LinkTarget,
-    (local, range): (NodeId, Option<Range<u64>>),
-) -> Result<ViewStream, LinkError> {
-    authorize_target(context, &caller.auth, target, READ_OPERATION).await?;
-    let arn = &target.arn;
-    if arn.node_id == local {
-        let get = Box::pin(drive(
-            GetObjectOperation::new(GetObjectInput {
-                bucket: arn.bucket.clone(),
-                key: arn.key.clone(),
-                version_id: Some(arn.version),
-                range: range.map(|range| ObjectRangeRequest::StartEnd {
-                    start: range.start,
-                    end: range.end.saturating_sub(1),
-                }),
-                group_id: target.group_id,
-                user_identity: caller.auth.user_id,
-                realm_id: caller.auth.realm_id,
-                node_id: local,
-            }),
-            context,
-        ))
-        .await
-        .map_err(|error| LinkError::Unavailable(error.to_string()))?;
-        return Ok(get.blob);
-    }
-    let ids = context.node_and_realm();
-    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, range, false);
-    let body = drive(read, context).await.map_err(staging_error)?;
-    Ok(body.blob)
+fn unavailable(error: impl std::fmt::Display) -> LinkError {
+    LinkError::Unavailable(error.to_string())
 }
 
 /// The verified caller a delegation carries; the read fills in what it binds. A signed-out
 /// caller has no credential to bound it, so its own validity does and the target checks READ.
-fn delegation(caller: &LinkCaller, target: NodeId) -> DelegationInput {
+fn delegation(caller: &LinkCaller, target: NodeId, now_secs: u64) -> DelegationInput {
     let (credential_id, group_id, expiry) = caller.credential.clone();
     let expiry = match caller.auth.user_id.is_nil() {
-        true => aruna_core::time::unix_timestamp_secs().saturating_add(MAX_VALID_SECS),
+        true => now_secs.saturating_add(MAX_VALID_SECS),
         false => expiry,
     };
     DelegationInput {
@@ -203,7 +129,232 @@ fn delegation(caller: &LinkCaller, target: NodeId) -> DelegationInput {
     }
 }
 
+/// Whether the caller may read the target, evaluated here from the target's recorded group and
+/// the replicated roles and policies; the target's node checks again on every byte read.
+#[derive(Debug, PartialEq)]
+pub struct AuthorizeTargetOperation {
+    check: Option<AuthorizeOperation>,
+}
+
+impl AuthorizeTargetOperation {
+    pub fn new(auth: &AuthContext, target: &LinkTarget, operation: &str) -> Self {
+        let arn = &target.arn;
+        let path = object_permission_path(
+            auth.realm_id,
+            target.group_id,
+            arn.node_id,
+            &arn.bucket,
+            &arn.key,
+        );
+        let extras = PolicyRequestExtras::operation(operation);
+        let check = AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras);
+        Self { check: Some(check) }
+    }
+}
+
+impl Operation for AuthorizeTargetOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn first(&mut self) -> LinkTurn<()> {
+        let check = self.check.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LinkTurn<()> {
+        match result.child::<(), AuthorizeError>()? {
+            Ok(()) => Ok(Next::Done(())),
+            Err(
+                AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+            ) => Err(LinkError::Denied),
+            Err(error) => Err(unavailable(error)),
+        }
+    }
+}
+
+/// Whether the caller may HEAD the target: checked here and, for a target on another node, by
+/// that node in one delegated HEAD.
+#[derive(Debug, PartialEq)]
+pub struct HeadTargetOperation {
+    caller: LinkCaller,
+    target: LinkTarget,
+    node: LinkNode,
+    now_ms: u64,
+    asking: bool,
+}
+
+impl HeadTargetOperation {
+    pub fn new(caller: &LinkCaller, target: &LinkTarget, node: LinkNode) -> Self {
+        Self {
+            caller: caller.clone(),
+            target: target.clone(),
+            node,
+            now_ms: 0,
+            asking: false,
+        }
+    }
+}
+
+impl Operation for HeadTargetOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> LinkTurn<()> {
+        let check = AuthorizeTargetOperation::new(&self.caller.auth, &self.target, HEAD_OPERATION);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LinkTurn<()> {
+        if self.asking {
+            let answer = result.child::<DelegatedBody, StagingSourceError>()?;
+            answer.map_err(staging_error)?;
+            return Ok(Next::Done(()));
+        }
+        result.child::<(), LinkError>()??;
+        let arn = &self.target.arn;
+        if arn.node_id == self.node.local {
+            return Ok(Next::Done(()));
+        }
+        let caller = delegation(&self.caller, arn.node_id, self.now_ms / 1000);
+        let read = delegated_read(self.node.ids, caller, arn, None, true);
+        self.asking = true;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+}
+
+/// Whether a listing may show a link: the caller may read its target.
+#[derive(Debug, PartialEq)]
+pub struct TargetVisibleOperation {
+    head: Option<HeadTargetOperation>,
+}
+
+impl TargetVisibleOperation {
+    pub fn new(caller: &LinkCaller, target: &LinkTarget, node: LinkNode) -> Self {
+        Self {
+            head: Some(HeadTargetOperation::new(caller, target, node)),
+        }
+    }
+}
+
+impl Operation for TargetVisibleOperation {
+    type Output = bool;
+    type Error = LinkError;
+
+    fn first(&mut self) -> LinkTurn<bool> {
+        let head = self.head.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LinkTurn<bool> {
+        match result.child::<(), LinkError>()? {
+            Ok(()) => Ok(Next::Done(true)),
+            Err(LinkError::Denied | LinkError::NotFound) => Ok(Next::Done(false)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadTargetStep {
+    Authorize,
+    Local,
+    Remote,
+}
+
+/// The target's bytes, or `range` of them, at its exact version. A target on another node is
+/// read through one delegation that carries the caller this node verified.
+#[derive(Debug, PartialEq)]
+pub struct ReadTargetOperation {
+    caller: LinkCaller,
+    target: LinkTarget,
+    node: LinkNode,
+    range: Option<Range<u64>>,
+    now_ms: u64,
+    step: ReadTargetStep,
+}
+
+impl ReadTargetOperation {
+    pub fn new(
+        caller: &LinkCaller,
+        target: &LinkTarget,
+        node: LinkNode,
+        range: Option<Range<u64>>,
+    ) -> Self {
+        Self {
+            caller: caller.clone(),
+            target: target.clone(),
+            node,
+            range,
+            now_ms: 0,
+            step: ReadTargetStep::Authorize,
+        }
+    }
+
+    fn read(&mut self) -> LinkTurn<ViewStream> {
+        let arn = &self.target.arn;
+        let range = self.range.take();
+        if arn.node_id != self.node.local {
+            let caller = delegation(&self.caller, arn.node_id, self.now_ms / 1000);
+            let read = delegated_read(self.node.ids, caller, arn, range, false);
+            self.step = ReadTargetStep::Remote;
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        let get = GetObjectOperation::new(GetObjectInput {
+            bucket: arn.bucket.clone(),
+            key: arn.key.clone(),
+            version_id: Some(arn.version),
+            range: range.map(|range| ObjectRangeRequest::StartEnd {
+                start: range.start,
+                end: range.end.saturating_sub(1),
+            }),
+            group_id: self.target.group_id,
+            user_identity: self.caller.auth.user_id,
+            realm_id: self.caller.auth.realm_id,
+            node_id: self.node.local,
+        });
+        self.step = ReadTargetStep::Local;
+        Ok(Next::Call(IoCall::child(get)))
+    }
+}
+
+impl Operation for ReadTargetOperation {
+    type Output = ViewStream;
+    type Error = LinkError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> LinkTurn<ViewStream> {
+        let check = AuthorizeTargetOperation::new(&self.caller.auth, &self.target, READ_OPERATION);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LinkTurn<ViewStream> {
+        match self.step {
+            ReadTargetStep::Authorize => {
+                result.child::<(), LinkError>()??;
+                self.read()
+            }
+            ReadTargetStep::Local => {
+                let read = result.child::<GetObjectResult, GetObjectError>()?;
+                Ok(Next::Done(read.map_err(unavailable)?.blob))
+            }
+            ReadTargetStep::Remote => {
+                let read = result.child::<DelegatedBody, StagingSourceError>()?;
+                Ok(Next::Done(read.map_err(staging_error)?.blob))
+            }
+        }
+    }
+}
+
 /// Where a link should point: a node, a bucket and key there, and maybe an exact version.
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkSource {
     pub node_id: NodeId,
     pub bucket: String,
@@ -211,94 +362,15 @@ pub struct LinkSource {
     pub version: Option<Ulid>,
 }
 
-/// Writes a link at `dest` (bucket, key, its group) to the source's exact version, for a
-/// caller who may read that version now. A source on another node must name its version.
-pub async fn create_link(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    (bucket, key, group_id): (&str, &str, GroupId),
-    (local, source): (NodeId, LinkSource),
-) -> Result<Ulid, LinkError> {
-    let (target, metadata) = match source.node_id == local {
-        true => local_target(context, caller, &source).await?,
-        false => remote_target(context, caller, &source).await?,
-    };
-    let write = ReferenceWrite {
-        job_id: None,
-        preassigned_version_id: None,
-        group_id,
-        user_id: caller.auth.user_id,
-        realm_id: caller.auth.realm_id,
-        node_id: local,
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        expected_bucket: None,
-        version_source: target.binding(),
-        metadata,
-        inherited_policies: Vec::new(),
-        connector_guard: None,
-        restrictions: caller.auth.path_restrictions.clone(),
-        mirror_guards: Vec::new(),
-    };
-    let write = WriteReferenceOperation::new(write, std::time::SystemTime::now(), Ulid::generate());
-    let (version, _) = Box::pin(drive(write, context))
-        .await
-        .map_err(|error| LinkError::Unavailable(error.to_string()))?;
-    Ok(version)
-}
-
-/// A source on this node: its bucket group, the caller's right to it, and its exact version.
-async fn local_target(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    source: &LinkSource,
-) -> Result<(LinkTarget, SourceMetadata), LinkError> {
-    let object = (source.bucket.as_str(), source.key.as_str());
-    let group_id = drive(
-        SourceReadOperation::of_object(&caller.auth, source.node_id, object, HEAD_OPERATION),
-        context,
-    )
-    .await
-    .map_err(|error| match error {
-        SourceReadError::NotFound => LinkError::NotFound,
-        SourceReadError::Denied => LinkError::Denied,
-        SourceReadError::Unavailable(error) => LinkError::Unavailable(error),
-    })?;
-    let head = Box::pin(drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: source.bucket.clone(),
-            key: source.key.clone(),
-            version_id: source.version,
-        }),
-        context,
-    ))
-    .await
-    .map_err(|error| match error {
-        HeadObjectError::NoSuchKey
-        | HeadObjectError::NoSuchVersion
-        | HeadObjectError::DeleteMarker => LinkError::NotFound,
-        other => LinkError::Unavailable(other.to_string()),
-    })?;
-    let version = head
-        .resolved_version_id
-        .or(head.version_id)
-        .ok_or(LinkError::NotFound)?;
-    let metadata = SourceMetadata {
-        content_length: head
-            .location
-            .as_ref()
-            .map(|location| location.blob_size)
-            .or_else(|| {
-                head.source_metadata
-                    .as_ref()
-                    .map(|source| source.content_length)
-            })
+/// A source on this node as a link records it.
+fn local_metadata(head: &HeadObjectResult, version: Ulid) -> SourceMetadata {
+    let (location, source) = (head.location.as_ref(), head.source_metadata.as_ref());
+    SourceMetadata {
+        content_length: (location.map(|location| location.blob_size))
+            .or_else(|| source.map(|source| source.content_length))
             .unwrap_or_default(),
-        content_type: head.metadata.get(CONTENT_TYPE_KEY).cloned().or_else(|| {
-            head.source_metadata
-                .as_ref()
-                .and_then(|source| source.content_type.clone())
-        }),
+        content_type: (head.metadata.get(CONTENT_TYPE_KEY).cloned())
+            .or_else(|| source.and_then(|source| source.content_type.clone())),
         etag: Some(version.to_string()),
         last_modified: head.version_created_at,
         source_version: None,
