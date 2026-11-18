@@ -836,6 +836,75 @@ mod tests {
         .await;
     }
 
+    #[derive(Debug, PartialEq)]
+    struct NotSecret;
+
+    impl KeyRule for NotSecret {
+        fn allows(&self, key: &str) -> bool {
+            !key.starts_with("secret/")
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct NotB;
+
+    impl KeyRule for NotB {
+        fn allows(&self, key: &str) -> bool {
+            key != "b.txt"
+        }
+    }
+
+    async fn rename_page(
+        context: &DriverContext,
+        (filter, after, limit): (Option<&str>, Option<Vec<u8>>, usize),
+    ) -> Result<RenamePage, MigrationError> {
+        let query = RenameQuery {
+            filter: filter.map(str::to_string),
+            after,
+            limit,
+        };
+        let routing = node_routing(context);
+        let page = RenamePageOperation::new(routing, &rule(), (NotSecret, NotB), query);
+        drive(page, context).await
+    }
+
+    fn plain_bucket() -> IoResult {
+        IoResult::Values(vec![None])
+    }
+
+    #[test]
+    fn missing_bucket_counts_nothing() {
+        let mut count = CountMisplacedOperation::new(NodeRouting::default(), BUCKET, "");
+        assert!(matches!(count.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = count.next(plain_bucket());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let routed: Result<Option<RoutingSnapshot>, crate::blob::import_rows::ImportRowsError> =
+            Ok(None);
+        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(routed));
+        let expected = Misplaced {
+            complete: true,
+            ..Misplaced::default()
+        };
+        assert_eq!(count.next(answer), Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn missing_bucket_plans_nothing() {
+        let query = RenameQuery::default();
+        let rules = (AnyKey, AnyKey);
+        let mut plan = RenamePageOperation::new(NodeRouting::default(), &rule(), rules, query);
+        assert!(matches!(plan.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = plan.next(plain_bucket());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let routed: Result<Option<RoutingSnapshot>, crate::blob::import_rows::ImportRowsError> =
+            Ok(None);
+        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(routed));
+        let Ok(Next::Done(page)) = plan.next(answer) else {
+            panic!("a bucket without routing has no plan");
+        };
+        assert!(page.plan.complete && page.entries.is_empty());
+    }
+
     #[tokio::test]
     async fn plans_indexed_renames() {
         // The plan reads the rule's index and counts only files their version still reads.
@@ -879,17 +948,12 @@ mod tests {
         // A record whose version is gone is no work; its file keeps its name.
         let stale = format!("raw/{}_i.txt", id(20));
         recorded(&context, ("i.txt", id(20)), &stale, 17).await;
-        let readable = |key: &str| !key.starts_with("secret/");
-        let writable = |key: &str| key != "b.txt";
-        let checks = (&readable as &KeyCheck<'_>, &writable as &KeyCheck<'_>);
         let renamed = |key: &str, at: u64| {
             let from = format!("raw/{}_{key}", id(at));
             (from, format!("raw/{key}~{}", id(at)))
         };
 
-        let page = rename_page(&context, &rule(), checks, (None, None, 1))
-            .await
-            .unwrap();
+        let page = rename_page(&context, (None, None, 1)).await.unwrap();
         let plan = RenamePlan {
             files: 3,
             bytes: 8 + large,
@@ -904,31 +968,29 @@ mod tests {
         assert_eq!(page.plan, plan);
         let (from, to) = renamed("a.txt", 11);
         assert_eq!(page.entries, vec![(from, to, true)]);
-        let rest = rename_page(&context, &rule(), checks, (None, page.next, 1)).await;
+        let rest = rename_page(&context, (None, page.next, 1)).await;
         let rest = rest.unwrap();
         let (from, to) = renamed("b.txt", 12);
         assert_eq!(rest.entries, vec![(from, to, false)]);
-        let large = rename_page(&context, &rule(), checks, (None, rest.next, 1)).await;
+        let large = rename_page(&context, (None, rest.next, 1)).await;
         let large = large.unwrap();
         assert_eq!(
             large.entries,
             vec![(path, format!("raw/h.bin~{}", id(19)), true)]
         );
         // The stale record and the hidden key are not listed; no cursor follows.
-        let last = rename_page(&context, &rule(), checks, (None, large.next, 1)).await;
+        let last = rename_page(&context, (None, large.next, 1)).await;
         let last = last.unwrap();
         assert_eq!((last.entries.len(), last.next), (0, None));
         // A filter limits the plan and the pages alike.
         let filtered = (Some("b.txt"), None, 10);
-        let page = rename_page(&context, &rule(), checks, filtered)
-            .await
-            .unwrap();
+        let page = rename_page(&context, filtered).await.unwrap();
         let plan = (page.plan.files, page.plan.bytes, page.plan.taken_files);
         assert_eq!((plan, page.plan.unchanged_files), ((1, 5, 1), 0));
         assert_eq!((page.entries.len(), page.next), (1, None));
         // A storage other than S3 passes every renamed file through the node.
         linked_bucket(&context, GroupBackendKind::Gcs).await;
-        let page = rename_page(&context, &rule(), checks, (None, None, 1)).await;
+        let page = rename_page(&context, (None, None, 1)).await;
         let plan = page.unwrap().plan;
         let streamed = (plan.streamed_files, plan.streamed_bytes);
         assert_eq!(streamed, (3, 8 + COPY_PART + 1));
