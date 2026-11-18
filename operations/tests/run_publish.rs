@@ -231,7 +231,11 @@ async fn publishes_local_run() -> TestResult<()> {
         },
     };
 
-    let published = publish_run(&device.context, input()).await?;
+    let published = drive(
+        publish_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
     assert_eq!(published.outputs.len(), 1);
     assert_eq!(
         published.outputs[0].key,
@@ -247,7 +251,11 @@ async fn publishes_local_run() -> TestResult<()> {
         OUTPUT
     );
 
-    let replayed = publish_run(&device.context, input()).await?;
+    let replayed = drive(
+        publish_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
     assert_eq!(
         replayed.outputs[0].version_id,
         published.outputs[0].version_id
@@ -262,7 +270,11 @@ async fn publishes_local_run() -> TestResult<()> {
     let mut moved = input();
     moved.target.prefix = "runs/other".to_string();
     assert!(matches!(
-        publish_run(&device.context, moved).await,
+        drive(
+            publish_run(device.context.node_and_realm(), moved),
+            &device.context
+        )
+        .await,
         Err(PublishRunError::TargetChanged)
     ));
     Ok(())
@@ -308,7 +320,7 @@ async fn crate_stays_local() -> TestResult<()> {
         Some(RunCrateStatus::Local)
     );
     // The device keeps the run's crate itself, rooted at the crate folder.
-    let local = local_run_crate(&device.context, job_id, record.created_by).await?;
+    let local = drive(local_run_crate(job_id, record.created_by), &device.context).await?;
     let root = local["@graph"]
         .as_array()
         .ok_or("the crate has a graph")?
@@ -318,7 +330,7 @@ async fn crate_stays_local() -> TestResult<()> {
     assert_eq!(root["@id"], "./");
     let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
     assert!(
-        local_run_crate(&device.context, job_id, stranger)
+        drive(local_run_crate(job_id, stranger), &device.context)
             .await
             .is_err()
     );
@@ -356,7 +368,7 @@ async fn crate_stays_local() -> TestResult<()> {
             .is_none()
     );
     assert!(
-        local_run_crate(&device.context, job_id, record.created_by)
+        drive(local_run_crate(job_id, record.created_by), &device.context)
             .await
             .is_ok()
     );
@@ -387,18 +399,21 @@ async fn checks_empty_target() -> TestResult<()> {
     )
     .await?;
 
-    let refused = publish_run(
-        &device.context,
-        PublishRunInput {
-            job_id,
-            owner: realm.user_id,
-            node_id: device.node_id(),
-            target: RemoteBinding {
-                node_id: server.node_id(),
-                bucket: "missing-bucket".to_string(),
-                prefix: String::new(),
+    let refused = drive(
+        publish_run(
+            device.context.node_and_realm(),
+            PublishRunInput {
+                job_id,
+                owner: realm.user_id,
+                node_id: device.node_id(),
+                target: RemoteBinding {
+                    node_id: server.node_id(),
+                    bucket: "missing-bucket".to_string(),
+                    prefix: String::new(),
+                },
             },
-        },
+        ),
+        &device.context,
     )
     .await;
     assert!(matches!(
