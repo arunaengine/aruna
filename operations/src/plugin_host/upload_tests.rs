@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};

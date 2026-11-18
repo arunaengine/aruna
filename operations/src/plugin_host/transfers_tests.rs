@@ -5,7 +5,9 @@
 
 use crate::driver::drive;
 use crate::plugins::calls::*;
-use std::sync::atomic::AtomicUsize;
+use futures_util::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
