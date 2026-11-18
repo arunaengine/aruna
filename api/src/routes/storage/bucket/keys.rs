@@ -27,7 +27,7 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::key_wake::wake_unlocked;
+use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
 use aruna_operations::s3::bucket::key::extend::{ExtendBucketOperation, ExtendError, ExtendInput};
 use aruna_operations::s3::bucket::key::grant::{GrantError, GrantHolderOperation, GrantInput};
@@ -872,7 +872,8 @@ where
 {
     let status = drive(operation, context).await?;
     let now_ms = unix_timestamp_millis();
-    if let Err(error) = wake_unlocked(context, status.key, now_ms, origin, limits).await {
+    let wake = WakeUnlockedOperation::new(status.key, now_ms, origin, limits);
+    if let Err(error) = drive(wake, context).await {
         tracing::warn!(
             bucket_id = %status.key.bucket_id,
             generation = status.key.generation,
