@@ -26,7 +26,8 @@ mod fetch;
 mod forward;
 pub mod held;
 pub mod ids;
-pub mod ingress;
+#[cfg(test)]
+mod ingress;
 mod input_capture;
 mod input_walk;
 pub(crate) mod launch_admit;
@@ -44,7 +45,6 @@ pub mod serve_inputs;
 pub mod stage;
 mod submission_rules;
 pub mod submit_external;
-pub mod target;
 pub mod updates;
 pub mod witness;
 pub mod witness_arm;

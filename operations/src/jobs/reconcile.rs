@@ -1,14 +1,5 @@
-//! Declares the reconciler trait for job attempts whose external run was lost.
+//! Names the reconcile hook where the workflow and the runtime still import it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use aruna_core::structs::execution::job::JobRecord;
-
-/// Reconciliation seam for lost external attempts. A lost lease or node restart
-/// must never blindly requeue one (that double-runs the container); the sweep and
-/// recovery route it here. Until a reconciler is registered the job is untouched.
-#[async_trait::async_trait]
-pub trait ExternalReconciler: Send + Sync {
-    async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord);
-}
+pub use crate::tasks::job_reconcile::ExternalReconciler;

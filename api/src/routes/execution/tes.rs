@@ -27,7 +27,7 @@ use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
-use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
+use aruna_operations::jobs::local_run::LocalExecutionConfig;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
@@ -712,7 +712,7 @@ pub async fn create_task(
         };
         let context = state.get_ctx();
         return match drive(
-            LocalRunOperation::on_node(config, &context),
+            aruna_operations::tasks::job_node::local_run(config, &context),
             context.as_ref(),
         )
         .await

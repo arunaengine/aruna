@@ -5,7 +5,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
+use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
 use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
 use aruna_core::operation::Operation;
@@ -18,7 +18,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::DriverContext;
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
@@ -109,13 +108,6 @@ pub struct LocalRunOperation {
 }
 
 impl LocalRunOperation {
-    /// A run on this node: the ceilings of the backend it would select, and the realm it serves.
-    pub fn on_node(config: LocalExecutionConfig, context: &DriverContext) -> Self {
-        let constraint = config.spec.executor_constraint.as_deref();
-        let limits = backend_limits(context, constraint);
-        Self::new(config, limits, context.node_and_realm())
-    }
-
     pub fn new(
         config: LocalExecutionConfig,
         limits: Option<ResourceEnvelope>,
@@ -389,14 +381,6 @@ fn local_staging(spec: &ExecutionSpec, mode: WorkspaceMode) -> Result<(), LocalE
     Ok(())
 }
 
-/// Static ceilings of the backend this request would run on.
-fn backend_limits(context: &DriverContext, constraint: Option<&str>) -> Option<ResourceEnvelope> {
-    let registry = context.compute_handle.as_ref()?;
-    let constraint = constraint.map(ExecutorKind::from_wire);
-    let backend = registry.select(constraint.as_ref())?;
-    Some(backend.capabilities().limits)
-}
-
 /// A realm input is fetched by exact version or not at all: a device plans
 /// nothing, so the request is the only thing that can name the version.
 fn remote_version(
@@ -426,7 +410,7 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
     use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
@@ -463,7 +447,7 @@ mod tests {
         ctx: &DriverContext,
         config: LocalExecutionConfig,
     ) -> Result<SubmitJobResult, LocalExecutionError> {
-        drive(LocalRunOperation::on_node(config, ctx), ctx).await
+        drive(crate::tasks::job_node::local_run(config, ctx), ctx).await
     }
 
     const REALM: RealmId = RealmId([3u8; 32]);

@@ -1,4 +1,4 @@
-//! Holds the job run context and progress reporter, and dispatches a payload to its runner.
+//! Holds the job run outcome, its progress reporter and the turns of distribution ranges.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,21 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::calls::IoError;
-use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobResultPayload,
-};
-use aruna_core::time::unix_timestamp_millis;
-use futures_util::future::BoxFuture;
-use tokio::sync::OwnedMutexGuard;
-use tokio_util::sync::CancellationToken;
+use aruna_core::structs::execution::job::{JobError, JobPayload, JobProgress, JobResultPayload};
+use tokio::sync::futures::Notified;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::notifications::email_job::EmailJobOperation;
-use crate::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
-use crate::notifications::webhook_job::WebhookJobOperation;
+pub use crate::tasks::job_context::{JobContext, PayloadHandler};
 
 /// In-memory progress with a persisted snapshot taken on flush and lease renew.
 #[derive(Clone)]
@@ -82,8 +72,8 @@ impl ProgressReporter {
     }
 
     /// Completes once a checkpoint asked for its progress to be persisted.
-    pub async fn flush_requested(&self) {
-        self.inner.flush.notified().await
+    pub fn flush_requested(&self) -> Notified<'_> {
+        self.inner.flush.notified()
     }
 
     pub fn checkpointed(&self) -> bool {
@@ -104,64 +94,23 @@ impl ProgressReporter {
     }
 }
 
-pub struct JobContext {
-    pub driver: Arc<DriverContext>,
-    pub job_id: JobId,
-    pub owner_node_id: NodeId,
-    pub claim_token: ulid::Ulid,
-    pub final_attempt: bool,
-    /// User-initiated cancel: terminal `Cancelled` plus cleanup.
-    pub cancel: CancellationToken,
-    /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
-    pub shutdown: CancellationToken,
-    pub progress: ProgressReporter,
-    pub range_turns: RangeTurns,
-    /// Runs the payload kinds that other domains own, as the node wiring registered them.
-    pub handlers: Vec<Arc<dyn PayloadHandler>>,
-}
-
-/// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring
-/// registers one per owning domain.
-pub trait PayloadHandler: Send + Sync {
-    /// Runs one job, or `None` when this handler does not own the payload.
-    fn run<'a>(
-        &'a self,
-        ctx: &'a JobContext,
-        payload: &'a JobPayload,
-    ) -> Option<BoxFuture<'a, JobRunOutcome>>;
-
-    /// Whether the job prune keeps this job for now.
-    fn keeps_job<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        payload: &'a JobPayload,
-    ) -> BoxFuture<'a, Result<bool, String>>;
-}
-
 /// One turn per distribution range, shared by every job on this node: page imports into one
 /// range commit one at a time instead of conflicting on the range's key sample.
 #[derive(Clone, Debug, Default)]
 pub struct RangeTurns(Arc<Mutex<HashMap<(Ulid, Ulid), Turn>>>);
 
-type Turn = Arc<tokio::sync::Mutex<()>>;
+pub(crate) type Turn = Arc<tokio::sync::Mutex<()>>;
 
 impl RangeTurns {
-    /// Waits for the turns of `ranges`, keyed by set and range, in key order; they end when
-    /// the guards drop.
-    pub async fn take(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<OwnedMutexGuard<()>> {
-        let turns: Vec<_> = {
-            let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            // A turn nobody holds or waits for is dropped.
-            map.retain(|_, turn| Arc::strong_count(turn) > 1);
-            (ranges.iter())
-                .map(|range| map.entry(*range).or_default().clone())
-                .collect()
-        };
-        let mut guards = Vec::with_capacity(turns.len());
-        for turn in turns {
-            guards.push(turn.lock_owned().await);
-        }
-        guards
+    /// The turns of `ranges`, keyed by set and range, in key order. Holding every lock in this
+    /// order is what lets jobs share ranges; the turns end when the guards drop.
+    pub(crate) fn turn_locks(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<Turn> {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // A turn nobody holds or waits for is dropped.
+        map.retain(|_, turn| Arc::strong_count(turn) > 1);
+        (ranges.iter())
+            .map(|range| map.entry(*range).or_default().clone())
+            .collect()
     }
 }
 
@@ -181,114 +130,6 @@ pub enum JobRunOutcome {
     /// The outcome cannot be known and the effect must not run again: the job ends
     /// `Indeterminate` and locally exhausted, never `Failed`.
     Undecided(JobError),
-}
-
-/// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
-/// payloads never reach here: the runtime routes them to the fenced external path
-/// before this seam.
-pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunOutcome {
-    // Each payload is boxed, so this future and every future that holds it stay small.
-    match payload {
-        JobPayload::Probe {
-            steps,
-            step_sleep_ms,
-            fail_at,
-            panic_at,
-            cleanup_marker,
-        } => {
-            Box::pin(run_probe(
-                ctx,
-                *steps,
-                *step_sleep_ms,
-                *fail_at,
-                *panic_at,
-                cleanup_marker.as_deref(),
-            ))
-            .await
-        }
-        JobPayload::WriteRunCrate { for_job } => {
-            let write = crate::jobs::workflow::run_crate::WriteCrateOperation::new(
-                *for_job,
-                ctx.driver.node_and_realm(),
-            );
-            let result = Box::pin(crate::driver::drive(write, &ctx.driver)).await;
-            crate::jobs::workflow::run_crate::crate_outcome(result)
-        }
-        JobPayload::TerminalCleanup {
-            for_job,
-            attempt,
-            access_key,
-        } => {
-            let cleanup = crate::jobs::workflow::cleanup::TerminalCleanupOperation::new(
-                *for_job,
-                ctx.claim_token,
-                attempt.clone(),
-                access_key,
-            );
-            let result = Box::pin(crate::driver::drive(cleanup, &ctx.driver)).await;
-            crate::jobs::workflow::cleanup::cleanup_outcome(result)
-        }
-        JobPayload::Staging(spec) => Box::pin(crate::jobs::host::run_staging_job(ctx, spec)).await,
-        JobPayload::ExportRoCrate(spec) => {
-            Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await
-        }
-        JobPayload::ImportRoCrate(spec) => {
-            Box::pin(crate::jobs::import::run_rocrate_import(ctx, spec)).await
-        }
-        JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
-            Box::pin(crate::driver::drive(
-                crate::jobs::harvest::HarvestJobOperation::new(
-                    crate::jobs::repository::NodeScope::of(&ctx.driver),
-                    crate::jobs::repository::JobScope::of(ctx),
-                    spec.clone(),
-                ),
-                &ctx.driver,
-            ))
-            .await,
-        ),
-        JobPayload::MintPersistentId(spec) => {
-            Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
-        }
-        JobPayload::StoragePurge(spec) => {
-            Box::pin(crate::jobs::host::run_storage_purge(ctx, spec, false)).await
-        }
-        JobPayload::StoragePurgeFiles(spec) => {
-            Box::pin(crate::jobs::host::run_storage_purge(ctx, spec, true)).await
-        }
-        JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
-        JobPayload::BackendImport(spec) => {
-            Box::pin(crate::jobs::host::run_backend_import(ctx, spec)).await
-        }
-        JobPayload::RegisterIdentifiers(spec) => {
-            Box::pin(crate::jobs::persistent_id::run_register_identifiers(
-                ctx, spec,
-            ))
-            .await
-        }
-        JobPayload::WebhookDelivery(spec) => {
-            let now_ms = unix_timestamp_millis();
-            let job = WebhookJobOperation::new(spec.clone(), delivery_node(ctx), now_ms);
-            Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
-        }
-        JobPayload::EmailDelivery(spec) => {
-            let now_ms = unix_timestamp_millis();
-            let job = EmailJobOperation::new(spec.clone(), delivery_node(ctx), now_ms);
-            Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
-        }
-        JobPayload::PluginWork(_) => {
-            let handled = (ctx.handlers.iter()).find_map(|handler| handler.run(ctx, payload));
-            match handled {
-                Some(run) => run.await,
-                None => JobRunOutcome::Failed(JobError::permanent(
-                    "no handler is registered for this payload",
-                )),
-            }
-        }
-        // Guard: an execution job must run through the external attempt path.
-        JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
-            "execution payload dispatched through the in-process seam",
-        )),
-    }
 }
 
 /// Idempotent cleanup hook run on the cancellation path. Execution/crate payloads
@@ -317,84 +158,4 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::EmailDelivery(_)
         | JobPayload::PluginWork(_) => {}
     }
-}
-
-/// The node a delivery job decides for.
-fn delivery_node(ctx: &JobContext) -> NodeId {
-    (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id())
-}
-
-/// Runs a delivery job until it ends, is cancelled or the node shuts down. A node without a
-/// metadata transport cannot open secrets, so the job waits; a failed run may pass on a retry.
-async fn run_delivery(
-    ctx: &JobContext,
-    delivery: impl Future<Output = Result<DeliveryOutcome, IoError>>,
-) -> JobRunOutcome {
-    if ctx.driver.metadata_handle.is_none() || ctx.driver.outbound_handle.is_none() {
-        return JobRunOutcome::DeferredFor(
-            JobError::retryable("the metadata transport is unavailable"),
-            Duration::from_millis(BACKOFF_START_MS),
-        );
-    }
-    tokio::select! {
-        biased;
-        () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
-        () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
-        outcome = delivery => match outcome {
-            Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
-            Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
-            Ok(DeliveryOutcome::DeferredFor(error, delay)) => {
-                JobRunOutcome::DeferredFor(error, delay)
-            }
-            Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
-        },
-    }
-}
-
-async fn run_probe(
-    ctx: &JobContext,
-    steps: u32,
-    step_sleep_ms: u64,
-    fail_at: Option<u32>,
-    panic_at: Option<u32>,
-    cleanup_marker: Option<&str>,
-) -> JobRunOutcome {
-    ctx.progress.set_total(steps as u64);
-    if let Some(marker) = cleanup_marker {
-        let _ = std::fs::write(marker, b"running");
-    }
-    for step in 0..steps {
-        // A zero-sleep probe never awaits otherwise, so it would starve everything else
-        // sharing its worker until the whole run finished.
-        tokio::task::yield_now().await;
-        if ctx.cancel.is_cancelled() {
-            return JobRunOutcome::Cancelled;
-        }
-        if ctx.shutdown.is_cancelled() {
-            return JobRunOutcome::Interrupted;
-        }
-        if panic_at == Some(step) {
-            panic!("probe panic at step {step}");
-        }
-        if fail_at == Some(step) {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "probe failed at step {step}"
-            )));
-        }
-        if step_sleep_ms > 0 {
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
-                _ = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
-                _ = tokio::time::sleep(Duration::from_millis(step_sleep_ms)) => {}
-            }
-        }
-        ctx.progress.advance(1);
-    }
-    if let Some(marker) = cleanup_marker {
-        let _ = std::fs::remove_file(marker);
-    }
-    JobRunOutcome::Succeeded(JobResultPayload::Probe {
-        completed_steps: steps,
-    })
 }

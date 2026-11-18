@@ -31,16 +31,15 @@ use crate::jobs::lifecycle::family_reads::{
     FamilyLogOperation, FamilyReportOperation, FamilyStatusOperation, SessionJobOperation,
 };
 use crate::jobs::lifecycle::ids::SubmissionScope;
-use crate::jobs::lifecycle::ingress::ingress_node;
 use crate::jobs::lifecycle::launch_admit::{
     AcceptLaunchOperation, AdmitLaunchOperation, LaunchAnswer,
 };
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, FamilyReport};
 use crate::jobs::lifecycle::submit_external::{ExternalSubmission, SubmitExternalOperation};
-use crate::jobs::lifecycle::target::launch_node;
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::submit::SubmitJobError;
+use crate::tasks::job_node::{ingress_node, launch_node};
 
 pub(super) async fn family_report(
     context: &DriverContext,

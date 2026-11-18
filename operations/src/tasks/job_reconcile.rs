@@ -1,0 +1,14 @@
+//! Declares the hook the job runner calls for attempts whose external run was lost.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::driver::DriverContext;
+use aruna_core::structs::execution::job::JobRecord;
+
+/// Reconciliation seam for lost external attempts. A lost lease or node restart
+/// must never blindly requeue one (that double-runs the container); the sweep and
+/// recovery route it here. Until a reconciler is registered the job is untouched.
+#[async_trait::async_trait]
+pub trait ExternalReconciler: Send + Sync {
+    async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord);
+}
