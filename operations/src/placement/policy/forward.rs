@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{authorize_forwarded_caller, forward_auth_error};
-use crate::forward::routing::forward_to_holders;
+use crate::forward::entry::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::policy::create::{

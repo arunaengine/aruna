@@ -1,4 +1,4 @@
-//! The async entry points of forwarded token revokes and realm admin relays.
+//! The async entry points of the forwarding operations.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,17 +8,25 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{authorize_forwarded_caller, authorize_write, forward_auth_error};
 use crate::forward::realm::{ApplyRelayOperation, RelayAdminOperation};
+use crate::forward::replay::{
+    CreateRowsOperation, DeletedHereOperation, HeldRecordError, HeldRecordOperation, replay_answer,
+};
+use crate::forward::routing::ForwardHoldersOperation;
 use crate::forward::token::ForwardRevokeOperation;
-use crate::forward::transport::{ForwardError, local_identity, reject};
+use crate::forward::transport::{ForwardError, MetadataWriteError, local_identity, reject};
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
+use crate::metadata::record_reads::load_document_record;
 use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::document::DocumentTarget;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_secs;
 use std::sync::Arc;
 use tracing::warn;
@@ -159,4 +167,60 @@ pub(crate) async fn apply_token_revoke(
         Err(RevokeTokenError::CapacityReached) => MetadataTransportMessage::TokenRevocationCapacity,
         Err(error) => reject(format!("token revocation failed: {error}")),
     }
+}
+
+/// Offers a metadata write to its holders in rank order.
+pub(crate) async fn forward_to_holders(
+    context: &Arc<DriverContext>,
+    holders: &[NodeId],
+    message: MetadataTransportMessage,
+    local_miss: Option<NodeId>,
+    local_capacity: bool,
+) -> Result<MetadataTransportMessage, MetadataWriteError> {
+    let local = local_identity(context).map(|(node_id, _)| node_id);
+    let forward =
+        ForwardHoldersOperation::new(local, holders, &message, local_miss, local_capacity);
+    Ok(drive(forward, context).await?)
+}
+
+/// The stored answer when a forwarded create was already applied here.
+pub(crate) async fn forwarded_create_replay(
+    context: &Arc<DriverContext>,
+    config: &CreateDocumentConfig,
+) -> Result<Option<MetadataTransportMessage>, String> {
+    let rows = drive(CreateRowsOperation::new(config.document_id), context)
+        .await
+        .map_err(|error| format!("metadata create replay read failed: {error}"))?;
+    rows.map(|rows| replay_answer(config, rows)).transpose()
+}
+
+/// Whether the document was created here and is now gone.
+pub(crate) async fn document_deleted_here(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    drive(DeletedHereOperation::new(document_id), context)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)
+}
+
+/// The document's registry record, whatever this node's holdership of it.
+pub(crate) async fn existing_record(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, String> {
+    load_document_record(context.as_ref(), document_id)
+        .await
+        .map_err(|error| format!("metadata registry read failed: {error:?}"))
+}
+
+/// Loads a document only when this node holds its current structured placement.
+pub(crate) async fn held_record(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    local_node_id: NodeId,
+    document_id: Ulid,
+) -> Result<MetadataRegistryRecord, HeldRecordError> {
+    let held = HeldRecordOperation::new(config.clone(), local_node_id, document_id);
+    drive(held, context).await
 }

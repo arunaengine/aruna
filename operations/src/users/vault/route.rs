@@ -20,7 +20,7 @@ use super::write::{
 };
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::forward::routing::forward_to_holders;
+use crate::forward::entry::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
