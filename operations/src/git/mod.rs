@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod access;
 mod calls;
 pub mod changes;
 pub mod cleanup;
@@ -18,22 +19,17 @@ pub mod push;
 mod records;
 pub mod snapshot;
 pub mod state;
+#[cfg(test)]
+mod testing;
 pub mod versions;
 
+pub use self::access::{DocumentAccessOperation, RepositoryOperation, document, repository};
 use self::changes::PropertyConflict;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
+use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
-use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};
-use aruna_core::handle::Handle;
+use aruna_core::git::{GitEffect, GitEvent, GitRequest};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::dataset_location::default_bucket;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use thiserror::Error;
@@ -85,57 +81,6 @@ pub struct MergeConflict {
     pub properties: Vec<PropertyConflict>,
 }
 
-pub async fn document(
-    context: &DriverContext,
-    auth: &AuthContext,
-    id: Ulid,
-    permission: Permission,
-) -> Result<MetadataRegistryRecord, GitError> {
-    let record = drive(DocumentRecordOperation::new(id), context)
-        .await
-        .map_err(|_| GitError::Unavailable)?
-        .ok_or(GitError::NotFound)?;
-    drive(
-        AuthorizeOperation::new(
-            record.realm_id,
-            auth,
-            &record.permission_path,
-            &permission,
-            PolicyRequestExtras::rest(),
-        ),
-        context,
-    )
-    .await?;
-    let lifecycle = parse_lifecycle_read(
-        context
-            .storage_handle
-            .send_effect(read_lifecycle_effect(&record.graph_iri, None))
-            .await,
-    )
-    .map_err(|_| GitError::Unavailable)?;
-    if lifecycle.is_some_and(|state| state.is_deleted()) {
-        return Err(GitError::NotFound);
-    }
-    Ok(record)
-}
-
-/// The document's repository on this holder; new LFS content goes to the node's dataset bucket.
-pub async fn repository(
-    context: &DriverContext,
-    auth: &AuthContext,
-    id: Ulid,
-    permission: Permission,
-) -> Result<(MetadataRegistryRecord, GitRepository), GitError> {
-    let document = document(context, auth, id, permission).await?;
-    publish::holders(context, &document).await?;
-    let repository = GitRepository {
-        document_id: id,
-        group_id: document.group_id,
-        bucket: default_bucket(document.group_id),
-    };
-    Ok((document, repository))
-}
-
 /// The node's Git store, which startup installs on the blob handle.
 pub(crate) fn store(context: &DriverContext) -> Result<&GitStore, GitError> {
     (context.blob_handle.as_ref())
@@ -157,8 +102,11 @@ pub async fn transport(
             Permission::READ
         };
     let write = permission == Permission::WRITE;
-    let (document, repository) =
-        repository(context, auth, request.repository.document_id, permission).await?;
+    let (document, repository) = drive(
+        repository(context, auth, request.repository.document_id, permission),
+        context,
+    )
+    .await?;
     if repository != request.repository {
         return Err(GitError::Conflict);
     }
