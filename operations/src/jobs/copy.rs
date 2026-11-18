@@ -12,10 +12,10 @@ use aruna_core::structs::storage::blob::BucketInfo;
 
 use super::executor::{JobContext, JobRunOutcome};
 use crate::document_repository::GetConfigOperation;
-use crate::driver::drive;
+use crate::driver::{drive, node_routing};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -52,28 +52,31 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
     }
 
     let pulled = Arc::new(AtomicU64::new(0));
-    let copy = copy_object_tracked(
+    let copy = drive(
+        CopyObjectOperation::new(
+            CopyObjectInput {
+                source_bucket: spec.source_bucket.clone(),
+                source_key: spec.source_key.clone(),
+                source_version_id: spec.source_version_id,
+                source_group_id: spec.source_group_id,
+                source_auth_context: spec.auth_context.clone(),
+                dest_bucket: spec.dest_bucket.clone(),
+                dest_key: spec.dest_key.clone(),
+                user_id: spec.auth_context.user_id,
+                group_id: spec.group_id,
+                realm_id: spec.auth_context.realm_id,
+                node_id: spec.node_id,
+                quota_ceiling,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: spec.auth_context.path_restrictions.clone(),
+                references: CopyReferences::Materialize,
+                job_id: Some(ctx.job_id.as_ulid()),
+            },
+            node_routing(&ctx.driver),
+        )
+        .with_progress(pulled.clone()),
         &ctx.driver,
-        CopyObjectInput {
-            source_bucket: spec.source_bucket.clone(),
-            source_key: spec.source_key.clone(),
-            source_version_id: spec.source_version_id,
-            source_group_id: spec.source_group_id,
-            source_auth_context: spec.auth_context.clone(),
-            dest_bucket: spec.dest_bucket.clone(),
-            dest_key: spec.dest_key.clone(),
-            user_id: spec.auth_context.user_id,
-            group_id: spec.group_id,
-            realm_id: spec.auth_context.realm_id,
-            node_id: spec.node_id,
-            quota_ceiling,
-            conditions: CopySourceConditions::default(),
-            metadata: None,
-            restrictions: spec.auth_context.path_restrictions.clone(),
-            references: CopyReferences::Materialize,
-            job_id: Some(ctx.job_id.as_ulid()),
-        },
-        Some(pulled.clone()),
     );
     tokio::pin!(copy);
     let mut tick = tokio::time::interval(PROGRESS_TICK);

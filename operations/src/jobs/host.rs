@@ -23,7 +23,7 @@ use super::staging::{StagingJobOperation, StagingRun};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::read::GetRoutedOperation;
 
 /// The running job's signals and shared state, as its operations reach them through effects.
 struct ContextHost {
@@ -91,7 +91,11 @@ impl JobHost for ContextHost {
                 realm_id: read.realm_id,
                 node_id: read.node_id,
             };
-            let found = get_object_routed(&self.driver, input, read.restrictions).await;
+            let found = drive(
+                GetRoutedOperation::new(input, read.restrictions, None),
+                &self.driver,
+            )
+            .await;
             match found {
                 Ok(found) => Ok(ObjectBody {
                     version_id: found.resolved_version_id.or(found.version_id),

@@ -15,7 +15,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::GetObjectInput;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::read::GetRoutedOperation;
 use aruna_core::NodeId;
 use aruna_core::git::{
     GitPack, GitPackRecord, GitRecord, LOCAL_OBJECTS, MAX_PACK_BYTES, StoredObject, git_pack_key,
@@ -307,10 +307,13 @@ pub async fn open(
             realm_id: auth.realm_id,
             node_id: node,
         };
-        return get_object_routed(context, input, auth.path_restrictions.clone())
-            .await
-            .map(|result| result.blob)
-            .map_err(|_| GitError::Unavailable);
+        return drive(
+            GetRoutedOperation::new(input, auth.path_restrictions.clone(), None),
+            context,
+        )
+        .await
+        .map(|result| result.blob)
+        .map_err(|_| GitError::Unavailable);
     }
     let exact = BaoReadTarget::ExactVersion(VersionedObjectArn {
         realm_id: auth.realm_id,
