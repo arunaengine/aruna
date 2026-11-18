@@ -629,3 +629,261 @@ impl Operation for CaptureInputsOperation {
         self.capture_next()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{REALM, captured_input, node, user};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::{Compression, StoredFormat};
+    use aruna_core::structs::storage::multipart::MultipartChecksumType;
+
+    const GROUP: Ulid = Ulid::from_parts(2, 2);
+    const VERSION: Ulid = Ulid::from_parts(7, 7);
+
+    fn caller() -> CaptureCaller {
+        CaptureCaller {
+            input: InputCaller {
+                created_by: user(),
+                realm_id: REALM,
+                local: node(1),
+            },
+            submission_id: SubmissionId([4; 32]),
+            expires_at: 10,
+            bearer: None,
+        }
+    }
+
+    fn input(key: &str) -> InputSelection {
+        InputSelection {
+            source: InputSource::S3 {
+                bucket: "b".to_string(),
+                key: key.to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: key.to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some(format!("/in/{key}")),
+            name: None,
+            description: None,
+        }
+    }
+
+    fn head() -> HeadObjectResult {
+        HeadObjectResult {
+            location: None,
+            metadata: Default::default(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: Some(VERSION),
+            resolved_version_id: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: Default::default(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        }
+    }
+
+    fn info() -> BucketInfo {
+        BucketInfo {
+            group_id: GROUP,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        }
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn capture() -> CaptureInputOperation {
+        CaptureInputOperation::new(caller(), input("k"), None)
+    }
+
+    fn calls_child<T: std::fmt::Debug>(next: Result<Next<T>, SubmitJobError>) {
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))), "{next:?}");
+    }
+
+    // One input passes every step in order, and the grant is what this node signs.
+    #[test]
+    fn capture_walks_steps() {
+        let mut operation = capture();
+        calls_child(operation.first());
+        calls_child(operation.next(child(Ok::<_, HeadObjectError>(head()))));
+        let hash = Ok::<_, IoError>(Some([9u8; 32]));
+        calls_child(operation.next(child(hash)));
+        calls_child(operation.next(child(Ok::<_, SourceReadError>(GROUP))));
+        calls_child(operation.next(child(Err::<GroupId, _>(SourceReadError::Denied))));
+        calls_child(operation.next(child(Ok::<_, GetBucketError>(info()))));
+        let database = Ok::<Option<CapturedDatabase>, DatabaseError>(None);
+        calls_child(operation.next(child(database)));
+        let failed = ReleaseError::Unavailable("down".to_string());
+        let signing = operation.next(child(Err::<MembersOutput, _>(failed)));
+        let Ok(Next::Call(IoCall::Effect(effect))) = signing else {
+            panic!("the grant is signed last: {signing:?}");
+        };
+        let Effect::Net(NetEffect::GrantSign(grant)) = *effect else {
+            panic!("expected a grant");
+        };
+        assert_eq!((grant.issuer, grant.expires_at), (node(1), 10));
+        let answer = IoResult::Event(Box::new(Event::Net(NetEvent::GrantSign(None))));
+        let Ok(Next::Done(captured)) = operation.next(answer) else {
+            panic!("the capture is complete");
+        };
+        assert_eq!(captured.version_id, VERSION);
+        assert_eq!(captured.content, InputContent::Blake3([9; 32]));
+        assert_eq!(captured.source_group_id, GROUP);
+        assert!(!captured.public && !captured.releases_complete);
+    }
+
+    // A definite miss is the submitter's error; any other head failure can be retried.
+    #[test]
+    fn head_failure_kinds() {
+        let failed = |error| {
+            let mut operation = capture();
+            operation.first().expect("head");
+            operation.next(child(Err::<HeadObjectResult, _>(error)))
+        };
+        let missing = failed(HeadObjectError::NoSuchKey);
+        assert!(
+            matches!(missing, Err(SubmitJobError::InvalidWorkspace(reason))
+            if reason.contains("s3://b/k"))
+        );
+        let broken = failed(HeadObjectError::HeadObjectFailed);
+        assert!(matches!(
+            broken,
+            Err(SubmitJobError::PlacementUnavailable(_))
+        ));
+    }
+
+    // An unreadable version record counts as no hash, so only a reference could still pass.
+    #[test]
+    fn unread_hash_needs_reference() {
+        let mut operation = capture();
+        operation.first().expect("head");
+        calls_child(operation.next(child(Ok::<_, HeadObjectError>(head()))));
+        let unread = operation.next(child(Err::<Option<[u8; 32]>, _>(IoError::Unfinished)));
+        assert!(matches!(unread, Err(SubmitJobError::InvalidWorkspace(_))));
+    }
+
+    // Metadata an earlier input of the bucket read is not read again.
+    #[test]
+    fn known_database_skips_read() {
+        let mut operation = CaptureInputOperation::new(caller(), input("k"), Some(None));
+        operation.step = CaptureStep::Bucket(Readable {
+            located: Located {
+                version: VERSION,
+                content: InputContent::Blake3([1; 32]),
+                source_pin: None,
+                bytes: 1,
+                policies: Vec::new(),
+            },
+            group_id: GROUP,
+            public: true,
+        });
+        calls_child(operation.next(child(Ok::<_, GetBucketError>(info()))));
+        assert!(matches!(operation.step, CaptureStep::Releases(_, None)));
+    }
+
+    // Inputs are captured in order and remember what their bucket's metadata was.
+    #[test]
+    fn inputs_share_database() {
+        let inputs = vec![input("a"), input("b")];
+        let mut operation = CaptureInputsOperation::new(caller(), inputs.clone());
+        calls_child(operation.first());
+        let first = captured_input(&inputs[0], node(1));
+        calls_child(operation.next(child(Ok::<_, SubmitJobError>(first.clone()))));
+        assert_eq!(operation.databases.get("b"), Some(&None));
+        let second = captured_input(&inputs[1], node(1));
+        let done = operation.next(child(Ok::<_, SubmitJobError>(second.clone())));
+        assert_eq!(done, Ok(Next::Done(vec![first, second])));
+    }
+
+    fn database() -> ReadableDatabaseOperation {
+        ReadableDatabaseOperation::new(&caller(), "b", &info())
+    }
+
+    // A caller without the documents' grant sees no metadata, and the run still starts.
+    #[test]
+    fn denied_omits_metadata() {
+        let mut operation = database();
+        let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+            panic!("the grants and policies are read");
+        };
+        let rows = IoResult::Values(vec![None; reads.len()]);
+        assert_eq!(operation.next(rows), Ok(Next::Done(None)));
+    }
+
+    // Metadata without a dataset is complete; with one, the summary is read next.
+    #[test]
+    fn dataset_read_follows() {
+        let read = |metadata: BucketMetadata| {
+            let mut operation = database();
+            operation.step = DatabaseStep::Metadata;
+            let answer = child(Ok::<_, BucketMetadataError>(Some(metadata)));
+            (operation.next(answer), operation)
+        };
+        let (plain, _) = read(BucketMetadata::default());
+        assert!(matches!(plain, Ok(Next::Done(Some(_)))));
+        let dataset = Some(Ulid::from_parts(5, 5));
+        let linked = BucketMetadata {
+            dataset,
+            ..BucketMetadata::default()
+        };
+        let (next, operation) = read(linked);
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(operation.step, DatabaseStep::Summary(_)));
+    }
+
+    // An unreadable dataset leaves the description empty; an unavailable one fails.
+    #[test]
+    fn summary_failure_kinds() {
+        let read = |error| {
+            let mut operation = database();
+            operation.step = DatabaseStep::Summary(BucketMetadata::default());
+            operation.next(child(Err::<DatasetDescription, _>(error)))
+        };
+        assert!(matches!(
+            read(DescriptionError::Unreadable),
+            Ok(Next::Done(Some(_)))
+        ));
+        assert!(read(DescriptionError::Unavailable).is_err());
+    }
+
+    // The hash comes from a materialized version; other rows give none.
+    #[test]
+    fn version_hash_decodes() {
+        let answer = |row: Option<Vec<u8>>| {
+            let mut operation = VersionHashOperation::new("b", "k", VERSION);
+            assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+            operation.next(IoResult::Values(vec![row.map(Value::from)]))
+        };
+        let version = BlobVersion::materialized(
+            [3; 32],
+            BackendRef::node_default(),
+            StoredFormat::default().encoding(),
+            std::time::SystemTime::UNIX_EPOCH,
+            user(),
+            None,
+        );
+        let row = postcard::to_allocvec(&version).unwrap();
+        assert_eq!(answer(Some(row)), Ok(Next::Done(Some([3; 32]))));
+        assert_eq!(answer(Some(vec![255])), Ok(Next::Done(None)));
+        assert_eq!(answer(None), Ok(Next::Done(None)));
+    }
+}
