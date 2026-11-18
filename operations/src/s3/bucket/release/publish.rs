@@ -41,7 +41,8 @@ use ulid::Ulid;
 
 use super::access::LoadAccessOperation;
 use super::{
-    Access, BucketScope, MembersConfig, MembersOutput, ReleaseError, ReleaseMembersOperation,
+    Access, BucketScope, MembersConfig, MembersOutput, OwnedScope, ReleaseError,
+    ReleaseMembersOperation,
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
@@ -211,35 +212,6 @@ const ROW_PAGE: usize = 256;
 /// How long one question to a range's coordinator may take in all.
 const HOLDER_DEADLINE: Duration = Duration::from_secs(60);
 
-/// A bucket's identity, kept by the operations that outlive their caller's borrow.
-#[derive(Clone, Debug, PartialEq)]
-struct ReleaseScope {
-    realm_id: RealmId,
-    node_id: NodeId,
-    bucket: String,
-    info: BucketInfo,
-}
-
-impl ReleaseScope {
-    fn of(scope: BucketScope<'_>) -> Self {
-        Self {
-            realm_id: scope.realm_id,
-            node_id: scope.node_id,
-            bucket: scope.bucket.to_string(),
-            info: scope.info.clone(),
-        }
-    }
-
-    fn view(&self) -> BucketScope<'_> {
-        BucketScope {
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            bucket: &self.bucket,
-            info: &self.info,
-        }
-    }
-}
-
 /// One page of release files and the key the next page starts after.
 pub type FilesPage = (Vec<ReleaseFile>, Option<String>);
 
@@ -248,7 +220,7 @@ pub type FilesPage = (Vec<ReleaseFile>, Option<String>);
 /// every file, or nothing is published.
 #[derive(Debug, PartialEq)]
 pub struct ReleaseFilesOperation {
-    scope: ReleaseScope,
+    scope: OwnedScope,
     access: Access,
     prefix: String,
     skip: String,
@@ -270,7 +242,7 @@ impl ReleaseFilesOperation {
         (range, after): (Option<&KeyRange>, Option<String>),
     ) -> Self {
         Self {
-            scope: ReleaseScope::of(scope),
+            scope: OwnedScope::of(scope),
             access: access.clone(),
             prefix: prefix.to_string(),
             skip: skip.to_string(),
@@ -331,7 +303,7 @@ impl ReleaseFilesOperation {
 
     /// Every field comes from the one version the origin read pinned.
     fn add_file(&mut self, key: String, origin: OriginView) {
-        let Some(version) = self.scope.view().exact(&key, origin.version_id) else {
+        let Some(version) = self.scope.scope().exact(&key, origin.version_id) else {
             return;
         };
         let pin = origin.source.map(|source| {
@@ -380,7 +352,7 @@ impl Operation for ReleaseFilesOperation {
 /// Every current file under a prefix in a range, page by page.
 #[derive(Debug, PartialEq)]
 struct AllFilesOperation {
-    scope: ReleaseScope,
+    scope: OwnedScope,
     access: Access,
     prefix: String,
     skip: String,
@@ -392,7 +364,7 @@ impl AllFilesOperation {
     fn page(&self, after: Option<String>) -> IoCall {
         let asked = (self.prefix.as_str(), self.skip.as_str());
         let at = (self.range.as_ref(), after);
-        let page = ReleaseFilesOperation::new(self.scope.view(), &self.access, asked, at);
+        let page = ReleaseFilesOperation::new(self.scope.scope(), &self.access, asked, at);
         IoCall::child(page)
     }
 }
@@ -463,7 +435,7 @@ enum CoordinatedStep {
 /// coordinator lists now refuses the publish, since a copy may be behind.
 #[derive(Debug, PartialEq)]
 struct CoordinatedFilesOperation {
-    scope: ReleaseScope,
+    scope: OwnedScope,
     access: Access,
     input: PublishInput,
     plans: VecDeque<RangePlan>,
@@ -513,7 +485,7 @@ fn holder_reply(result: IoResult) -> Result<Result<HolderAnswer, MetadataReadErr
 }
 
 impl CoordinatedFilesOperation {
-    fn new(scope: ReleaseScope, access: Access, input: PublishInput) -> Self {
+    fn new(scope: OwnedScope, access: Access, input: PublishInput) -> Self {
         Self {
             scope,
             access,
@@ -695,7 +667,7 @@ enum PutStep {
 /// given.
 #[derive(Debug, PartialEq)]
 struct PutCrateOperation {
-    scope: ReleaseScope,
+    scope: OwnedScope,
     input: PublishInput,
     routing: NodeRouting,
     bytes: Vec<u8>,
@@ -841,7 +813,7 @@ enum PublishStep {
 /// identical release is already the key's head.
 #[derive(Debug, PartialEq)]
 pub struct PublishReleaseOperation {
-    scope: ReleaseScope,
+    scope: OwnedScope,
     input: PublishInput,
     routing: NodeRouting,
     files: usize,
@@ -858,7 +830,7 @@ type ReleaseTurn = PublishTurn<Published>;
 impl PublishReleaseOperation {
     pub fn new(scope: BucketScope<'_>, input: PublishInput, routing: NodeRouting) -> Self {
         Self {
-            scope: ReleaseScope::of(scope),
+            scope: OwnedScope::of(scope),
             input,
             routing,
             files: 0,
@@ -881,7 +853,7 @@ impl PublishReleaseOperation {
     }
 
     fn load_access(&mut self) -> ReleaseTurn {
-        let load = LoadAccessOperation::new(self.scope.view(), &self.input.auth);
+        let load = LoadAccessOperation::new(self.scope.scope(), &self.input.auth);
         self.step = PublishStep::Access;
         Ok(Next::Call(IoCall::child(load)))
     }
@@ -1102,7 +1074,7 @@ pub struct HolderAnswerOperation {
     auth: AuthContext,
     bucket: String,
     ask: Option<HolderAsk>,
-    scope: Option<ReleaseScope>,
+    scope: Option<OwnedScope>,
     access: Option<Access>,
     step: HolderStep,
 }
@@ -1135,7 +1107,7 @@ impl HolderAnswerOperation {
         }
     }
 
-    fn scope(&self) -> Result<&ReleaseScope, IoError> {
+    fn scope(&self) -> Result<&OwnedScope, IoError> {
         self.scope.as_ref().ok_or(IoError::Unfinished)
     }
 
@@ -1211,7 +1183,7 @@ impl HolderAnswerOperation {
         let scope = self.scope()?;
         let names = (asked.prefix.as_str(), asked.skip.as_str());
         let page = (Some(range), asked.after);
-        let list = ReleaseFilesOperation::new(scope.view(), self.access()?, names, page);
+        let list = ReleaseFilesOperation::new(scope.scope(), self.access()?, names, page);
         self.step = HolderStep::Files;
         Ok(Next::Call(IoCall::child(list)))
     }
@@ -1230,13 +1202,13 @@ impl Operation for HolderAnswerOperation {
         match std::mem::replace(&mut self.step, HolderStep::Files) {
             HolderStep::Bucket => {
                 let info = result.child::<BucketInfo, GetBucketError>()?;
-                let scope = ReleaseScope {
+                let scope = OwnedScope {
                     realm_id: self.realm_id,
                     node_id: self.node_id,
                     bucket: self.bucket.clone(),
                     info: info.map_err(unavailable)?,
                 };
-                let load = LoadAccessOperation::new(scope.view(), &self.auth);
+                let load = LoadAccessOperation::new(scope.scope(), &self.auth);
                 self.scope = Some(scope);
                 self.step = HolderStep::Access;
                 Ok(Next::Call(IoCall::child(load)))

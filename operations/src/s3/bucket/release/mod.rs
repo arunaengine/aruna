@@ -86,6 +86,35 @@ impl BucketScope<'_> {
     }
 }
 
+/// A bucket's identity, kept by the operations that run after their caller's borrow ended.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedScope {
+    pub(crate) realm_id: RealmId,
+    pub(crate) node_id: NodeId,
+    pub(crate) bucket: String,
+    pub(crate) info: BucketInfo,
+}
+
+impl OwnedScope {
+    pub(crate) fn of(scope: BucketScope<'_>) -> Self {
+        Self {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            bucket: scope.bucket.to_string(),
+            info: scope.info.clone(),
+        }
+    }
+
+    pub(crate) fn scope(&self) -> BucketScope<'_> {
+        BucketScope {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            bucket: &self.bucket,
+            info: &self.info,
+        }
+    }
+}
+
 fn exact_id(
     realm_id: RealmId,
     node_id: NodeId,
