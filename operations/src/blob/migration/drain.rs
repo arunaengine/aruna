@@ -1200,125 +1200,374 @@ impl HandOverOperation {
     }
 }
 
-/// Runs `version` once more as a rename, which adopts a copy that reached its new name, then
-/// retires `intents`; a copy no version reads goes to the release first. `true` once settled,
-/// `false` while the version cannot run yet.
-pub async fn settle_move(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-    intents: &[(Vec<u8>, WriteIntent)],
-) -> Result<bool, String> {
-    let storage = &context.storage_handle;
-    let key: Key = version
-        .to_bytes()
-        .map_err(|error| error.to_string())?
-        .into();
-    let read = StorageEffect::Read {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: None,
-    };
-    let present = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-        other => {
-            return Err(format!(
-                "could not read the moved version: {}",
-                other.label()
-            ));
-        }
-    };
-    let routing = match present {
-        true => move_routing(context, &version.bucket).await?,
-        false => None,
-    };
-    let Some(routing) = routing else {
-        return retire_intents(context, version, intents).await;
-    };
-    let earlier = read_earlier(context, &routing).await?;
-    let operation =
-        MigrateVersionOperation::new(version.clone(), Compression::Off, SystemTime::now())
-            .with_routing(routing)
-            .with_earlier(earlier);
-    // A run that ends on its own decided the version's file; any intent it leaves is stale.
-    match crate::driver::drive(operation, context).await {
-        Ok(_) => retire_intents(context, version, intents).await,
-        // A copy the storage check records as broken never moves, so its intents are stale too.
-        Err(_) if is_broken(context, &key).await => {
-            let (bucket, version_id) = (version.bucket.as_str(), version.version_id);
-            tracing::warn!(bucket, %version_id, "A moved version has no stored copy");
-            retire_intents(context, version, intents).await
-        }
-        Err(error) => {
-            tracing::warn!(%error, "A move did not settle yet");
-            Ok(false)
+impl Operation for HandOverOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        Ok(Next::Call(routing_call(self.routing.clone(), &self.bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, HandStep::Page) {
+            HandStep::Routing => {
+                let Some(routing) = routing_result(result)? else {
+                    return self.store(None, true);
+                };
+                self.rules = (routing.imports.iter())
+                    .filter(|rule| rule.bucket == self.bucket)
+                    .map(|rule| rule.import_id)
+                    .collect();
+                self.rules.sort();
+                self.step = HandStep::Place;
+                let read = read_row(MOVE_HANDOVER_KEYSPACE, bucket_key(&self.bucket));
+                Ok(Next::Call(read))
+            }
+            HandStep::Place => {
+                let stored = decode_handover(result.value()?)?;
+                let started_ms = self.started_ms;
+                let stored = stored.filter(|handover| handover.started_ms == started_ms);
+                self.place = Some(stored.unwrap_or(Handover {
+                    started_ms,
+                    import_id: self.rules.first().copied(),
+                    after: None,
+                }));
+                self.next_page()
+            }
+            HandStep::Page => {
+                let (rows, next) = result.page()?;
+                self.page_read(rows, next)
+            }
+            HandStep::Written => {
+                result.done()?;
+                self.advance_place()
+            }
+            HandStep::Stored(finished) => {
+                result.done()?;
+                Ok(Next::Done(finished))
+            }
         }
     }
 }
 
-/// Retires the intents of a settled move; a copy one of them proves that no version reads is
-/// handed to the release of renamed files at its exact backend version first.
-async fn retire_intents(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-    intents: &[(Vec<u8>, WriteIntent)],
-) -> Result<bool, String> {
-    let read_path = read_path(context, version).await?;
-    for (key, intent) in intents {
-        // The key is the rule, the path, a zero byte and the version id.
-        let (Some(import), Some(path)) = (key.get(..16), key.get(16..key.len().saturating_sub(17)))
-        else {
-            continue;
+#[derive(Debug, PartialEq)]
+enum StoreStep {
+    Current,
+    Progress,
+    Ahead,
+    Request,
+    Left,
+}
+
+/// Stores the progress, with the rows a run finished ahead of its cursor where given, unless a
+/// newer setting replaced the record. A finished migration leaves the queue and its rename
+/// request with its last progress; the request of an aborted rename stays to show the abort.
+#[derive(Debug, PartialEq)]
+pub(super) struct StoreMigrationOperation {
+    key: Key,
+    record: CompressionMigration,
+    ahead: Option<MigrationAhead>,
+    step: StoreStep,
+}
+
+impl StoreMigrationOperation {
+    pub(super) fn new(
+        bucket: &str,
+        record: CompressionMigration,
+        ahead: Option<MigrationAhead>,
+    ) -> Self {
+        Self {
+            key: bucket_key(bucket),
+            record,
+            ahead,
+            step: StoreStep::Current,
+        }
+    }
+
+    /// The rows go in the transaction of the progress, so they count exactly when it does;
+    /// without any the row goes.
+    fn store_ahead(&mut self) -> Turn<()> {
+        let Some(ahead) = self.ahead.take() else {
+            return self.leave();
         };
-        let path = String::from_utf8_lossy(path).into_owned();
-        if read_path.as_deref() == Some(path.as_str()) {
-            continue;
+        self.step = StoreStep::Ahead;
+        let space = MIGRATION_AHEAD_KEYSPACE.to_string();
+        let key = self.key.clone();
+        if ahead.rows.is_empty() {
+            return Ok(Next::Call(IoCall::Delete(vec![(space, key)])));
         }
-        let import = Ulid::from_bytes(import.try_into().map_err(|_| "bad intent key")?);
-        if !abandon(context, (key, intent, import), path).await? {
-            return Ok(false);
-        }
+        Ok(Next::Call(IoCall::Write(vec![(
+            space,
+            key,
+            ahead.to_bytes()?.into(),
+        )])))
     }
-    let keys: Vec<Vec<u8>> = intents.iter().map(|(key, _)| key.clone()).collect();
-    drop_intents(context, &keys).await
+
+    fn leave(&mut self) -> Turn<()> {
+        if self.record.finished_at_ms.is_none() {
+            return Ok(Next::Done(()));
+        }
+        self.step = StoreStep::Request;
+        Ok(Next::Call(read_row(RENAME_MOVE_KEYSPACE, self.key.clone())))
+    }
 }
 
-/// The path of the linked file `version` reads now, if any.
-async fn read_path(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-) -> Result<Option<String>, String> {
-    let key = version.to_bytes().map_err(|error| error.to_string())?;
-    let read = StorageEffect::Read {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(format!("could not read a version: {}", other.label())),
-    };
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let blob = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-    let Some(location) = blob.location_key() else {
-        return Ok(None);
-    };
-    let Effect::Storage(read) = blob_location_read(&location, None) else {
-        return Err("unexpected location read".to_string());
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| BackendLocation::from_bytes(&value).map(|found| found.backend_path))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read a location: {}", other.label())),
+impl Operation for StoreMigrationOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        let read = read_row(COMPRESSION_MIGRATION_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            StoreStep::Current => {
+                let Some(stored) = decode_progress(result.value()?)? else {
+                    return Ok(Next::Done(()));
+                };
+                // An aborted move keeps the end its abort wrote.
+                let record = &self.record;
+                if stored.started_at_ms != record.started_at_ms
+                    || stored.target != record.target
+                    || stored.finished_at_ms.is_some()
+                {
+                    return Ok(Next::Done(()));
+                }
+                self.step = StoreStep::Progress;
+                let row = (
+                    COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+                    self.key.clone(),
+                    record.to_bytes().map_err(MigrationError::failed)?.into(),
+                );
+                Ok(Next::Call(IoCall::Write(vec![row])))
+            }
+            StoreStep::Progress => {
+                result.done()?;
+                self.store_ahead()
+            }
+            StoreStep::Ahead => {
+                result.done()?;
+                self.leave()
+            }
+            StoreStep::Request => {
+                let request = result.value()?;
+                let request = request.as_deref().map(RenameRequest::from_bytes);
+                let aborted = request.is_some_and(|request| {
+                    request.is_ok_and(|request| request.aborted_at_ms.is_some())
+                });
+                let mut deletes = vec![(COMPRESSION_QUEUE_KEYSPACE.to_string(), self.key.clone())];
+                if !aborted {
+                    deletes.push((RENAME_MOVE_KEYSPACE.to_string(), self.key.clone()));
+                }
+                self.step = StoreStep::Left;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            StoreStep::Left => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SettleStep {
+    Version,
+    Routing,
+    Earlier(Box<RoutingSnapshot>),
+    Migrate,
+    Check(String),
+    ReadVersion,
+    ReadLocation,
+    Abandon,
+    Dropped,
+}
+
+/// Runs a version once more as a rename, which adopts a copy that reached its new name, then
+/// retires its intents; a copy no version reads goes to the release first. Outputs `true` once
+/// settled, `false` while the version cannot run yet.
+#[derive(Debug, PartialEq)]
+pub struct SettleMoveOperation {
+    routing: NodeRouting,
+    version: VersionKey,
+    intents: VecDeque<(Vec<u8>, WriteIntent)>,
+    keys: Vec<Vec<u8>>,
+    read_path: Option<String>,
+    now_ms: u64,
+    step: SettleStep,
+}
+
+type SettleTurn = Turn<bool>;
+
+impl SettleMoveOperation {
+    pub fn new(
+        routing: NodeRouting,
+        version: &VersionKey,
+        intents: Vec<(Vec<u8>, WriteIntent)>,
+    ) -> Self {
+        Self {
+            routing,
+            version: version.clone(),
+            keys: intents.iter().map(|(key, _)| key.clone()).collect(),
+            intents: intents.into(),
+            read_path: None,
+            now_ms: 0,
+            step: SettleStep::Version,
+        }
+    }
+
+    fn call(&mut self, step: SettleStep, call: IoCall) -> SettleTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn version_row(&self) -> Result<IoCall, MigrationError> {
+        Ok(read_row(BLOB_VERSIONS_KEYSPACE, self.version.to_bytes()?))
+    }
+
+    /// Retires the intents of a settled move, starting from the file the version reads now.
+    fn retire(&mut self) -> SettleTurn {
+        let read = self.version_row()?;
+        self.call(SettleStep::ReadVersion, read)
+    }
+
+    fn version_read(&mut self, value: Option<Value>) -> SettleTurn {
+        let Some(value) = value else {
+            return self.next_intent();
+        };
+        let Some(location) = BlobVersion::from_bytes(&value)?.location_key() else {
+            return self.next_intent();
+        };
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, location.to_bytes());
+        self.call(SettleStep::ReadLocation, read)
+    }
+
+    /// The next intent whose file no version reads goes to the release.
+    fn next_intent(&mut self) -> SettleTurn {
+        while let Some((key, intent)) = self.intents.pop_front() {
+            // The key is the rule, the path, a zero byte and the version id.
+            let end = key.len().saturating_sub(17);
+            let (Some(import), Some(path)) = (key.get(..16), key.get(16..end)) else {
+                continue;
+            };
+            let path = String::from_utf8_lossy(path).into_owned();
+            if self.read_path.as_deref() == Some(path.as_str()) {
+                continue;
+            }
+            let import = <[u8; 16]>::try_from(import).map_err(MigrationError::failed)?;
+            let abandon = AbandonOperation::new(key, intent, Ulid::from_bytes(import), path);
+            return self.call(SettleStep::Abandon, IoCall::child(abandon));
+        }
+        let deletes = (self.keys.iter())
+            .map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key.clone().into()))
+            .collect();
+        self.call(SettleStep::Dropped, IoCall::Delete(deletes))
+    }
+
+    fn migrated(&mut self, moved: Result<MigrateOutcome, MigrateVersionError>) -> SettleTurn {
+        match moved {
+            // A run that ends on its own decided the version's file; any intent it leaves is
+            // stale.
+            Ok(_) => self.retire(),
+            Err(error) => {
+                let check = CheckVersionOperation::new(self.version.clone(), self.now_ms);
+                self.call(SettleStep::Check(error.to_string()), IoCall::child(check))
+            }
+        }
+    }
+}
+
+impl Operation for SettleMoveOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> SettleTurn {
+        Ok(Next::Call(self.version_row()?))
+    }
+
+    fn next(&mut self, result: IoResult) -> SettleTurn {
+        match std::mem::replace(&mut self.step, SettleStep::Migrate) {
+            SettleStep::Version => {
+                if result.value()?.is_none() {
+                    return self.retire();
+                }
+                let call = routing_call(self.routing.clone(), &self.version.bucket);
+                self.call(SettleStep::Routing, call)
+            }
+            SettleStep::Routing => {
+                let Some(routing) = routing_result(result)? else {
+                    return self.retire();
+                };
+                let earlier = EarlierPatternsOperation::new(&routing);
+                self.call(
+                    SettleStep::Earlier(Box::new(routing)),
+                    IoCall::child(earlier),
+                )
+            }
+            SettleStep::Earlier(routing) => {
+                let earlier = result.child::<Earlier, MigrationError>()??;
+                let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+                let version = self.version.clone();
+                let migrate = MigrateVersionOperation::new(version, Compression::Off, now)
+                    .with_routing(*routing)
+                    .with_earlier(earlier);
+                self.call(SettleStep::Migrate, IoCall::child(migrate))
+            }
+            SettleStep::Migrate => self.migrated(result.child()?),
+            SettleStep::Check(error) => {
+                // A copy the storage check records as broken never moves, so its intents are
+                // stale too.
+                let checked = result.child::<CheckOutcome, CheckVersionError>()?;
+                if matches!(checked, Ok(CheckOutcome::Broken(_))) {
+                    let (bucket, version_id) = (&self.version.bucket, self.version.version_id);
+                    tracing::warn!(%bucket, %version_id, "A moved version has no stored copy");
+                    return self.retire();
+                }
+                tracing::warn!(%error, "A move did not settle yet");
+                Ok(Next::Done(false))
+            }
+            SettleStep::ReadVersion => self.version_read(result.value()?),
+            SettleStep::ReadLocation => {
+                self.read_path = result
+                    .value()?
+                    .map(|value| BackendLocation::from_bytes(&value))
+                    .transpose()?
+                    .map(|found| found.backend_path);
+                self.next_intent()
+            }
+            SettleStep::Abandon => match result.child::<bool, MigrationError>()?? {
+                true => self.next_intent(),
+                false => Ok(Next::Done(false)),
+            },
+            SettleStep::Dropped => {
+                result.done()?;
+                Ok(Next::Done(true))
+            }
+        }
     }
 }
 
 /// The cleanup key of the release of an abandoned copy: its intent, a tag and its version.
 pub(super) fn release_key(intent_row: &[u8], version: &str) -> Vec<u8> {
     [intent_row, &[1], version.as_bytes()].concat()
+}
+
+#[derive(Debug, PartialEq)]
+enum AbandonStep {
+    Stat,
+    Dropped,
+    Copies(Box<BackendLocation>, String, Option<String>, PrefixPages),
+    Queued,
 }
 
 /// Queues the release of the file at `path`, once per intent and version, if it has a backend
