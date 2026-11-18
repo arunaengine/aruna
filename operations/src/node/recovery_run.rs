@@ -429,3 +429,221 @@ impl Operation for RecoveryOperation {
         self.now_ms = now_ms;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use irokle::TopicId;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::shard::recovery::RecoveryState;
+    use crate::shard::restore_plan::ShardRestorePass;
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([7; 32])
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    fn recovery(stop: RecoveryStop) -> (RecoveryOperation, RecoveryStatus) {
+        let config = RecoveryConfig {
+            realm_id: realm(),
+            node_id: node(),
+            publish_full_usage: false,
+        };
+        let status = RecoveryStatus::new();
+        let operation = RecoveryOperation::serving(config, Some(realm()), status.clone(), stop);
+        (operation, status)
+    }
+
+    fn clean_pass() -> ShardRestorePass {
+        ShardRestorePass {
+            wrapped: true,
+            enumerated: true,
+            ..ShardRestorePass::default()
+        }
+    }
+
+    fn blocked_pass() -> ShardRestorePass {
+        ShardRestorePass {
+            unresolved_topics: [TopicId::from_bytes([3; 32])].into(),
+            error: Some(RecoveryError::PeerUnavailable),
+            ..clean_pass()
+        }
+    }
+
+    fn passed(pass: ShardRestorePass) -> IoResult {
+        child::<RestoredPass, IoError>(Ok((pass, ShardRestoreCursor::default())))
+    }
+
+    fn pass_call() -> IoCall {
+        let pass = RestorePassOperation::new(
+            node(),
+            realm(),
+            ShardRestoreCursor::default(),
+            RecoveryStop::default(),
+        );
+        IoCall::child(pass)
+    }
+
+    /// A recovery past its placement and presence phases, waiting for the first pass again.
+    fn settled() -> (RecoveryOperation, RecoveryStatus) {
+        let (mut operation, status) = recovery(RecoveryStop::default());
+        operation.reconcile_placements = false;
+        operation.announce_presence = false;
+        operation.first().unwrap();
+        (operation, status)
+    }
+
+    #[test]
+    fn phases_then_converges() {
+        let (mut operation, status) = recovery(RecoveryStop::default());
+        assert_eq!(operation.first(), Ok(Next::Call(pass_call())));
+        assert_eq!(status.snapshot().state, RecoveryState::Running);
+        let reconcile = ReconcilePlacementsOperation::new(realm(), node(), false);
+        let turn = operation.next(passed(clean_pass()));
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(reconcile))));
+        let presence = PresencePhaseOperation::new(realm(), node());
+        let clean = PlacementReconcileOutcome::default();
+        let turn = operation.next(child::<_, IoError>(Ok(clean)));
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(presence))));
+        let done = operation.next(child::<_, IoError>(Ok(phase_done())));
+        assert_eq!(done, Ok(Next::Done(())));
+        assert_eq!(status.snapshot().state, RecoveryState::Converged);
+        assert_eq!(status.pass_total(RecoveryOutcome::Success), 1);
+    }
+
+    #[test]
+    fn full_usage_published() {
+        let (mut operation, status) = recovery(RecoveryStop::default());
+        operation.publish_usage = true;
+        operation.reconcile_placements = false;
+        operation.announce_presence = false;
+        operation.first().unwrap();
+        let turn = operation.next(passed(clean_pass()));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let failed = UsagePublishError::from(IoError::Aborted);
+        let turn = operation.next(child::<PublishedUsage, _>(Err(failed)));
+        assert_eq!(turn, Ok(Next::Call(IoCall::Delay(RECOVERY_RETRY_BASE))));
+        assert!(operation.publish_usage, "a failed publish stays pending");
+        assert_eq!(status.snapshot().last_error, Some(RecoveryError::Storage));
+    }
+
+    #[test]
+    fn unfinished_pass_continues() {
+        let (mut operation, status) = settled();
+        let partial = ShardRestorePass {
+            wrapped: false,
+            unvisited_topics: 4,
+            ..clean_pass()
+        };
+        let turn = operation.next(passed(partial));
+        assert_eq!(turn, Ok(Next::Call(pass_call())));
+        assert_eq!(status.snapshot().topics_remaining, 4);
+        assert_eq!(status.pass_total(RecoveryOutcome::Partial), 1);
+    }
+
+    #[test]
+    fn blocked_pass_retries() {
+        let (mut operation, status) = settled();
+        let turn = operation.next(passed(blocked_pass()));
+        assert_eq!(turn, Ok(Next::Call(IoCall::Delay(RECOVERY_RETRY_BASE))));
+        assert_eq!(status.snapshot().state, RecoveryState::Degraded);
+        assert_eq!(operation.next(IoResult::Woke), Ok(Next::Call(pass_call())));
+    }
+
+    #[test]
+    fn long_wait_steps() {
+        let (mut operation, _status) = settled();
+        operation.attempts = 40;
+        let turn = operation.next(passed(blocked_pass()));
+        assert_eq!(turn, Ok(Next::Call(IoCall::Delay(STOP_CHECK))));
+        assert_eq!(operation.waiting, RECOVERY_RETRY_MAX - STOP_CHECK);
+    }
+
+    #[test]
+    fn stop_ends_wait() {
+        let token = CancellationToken::new();
+        let (mut operation, _status) = recovery(RecoveryStop::new(token.clone()));
+        operation.reconcile_placements = false;
+        operation.announce_presence = false;
+        operation.first().unwrap();
+        operation.attempts = 40;
+        operation.next(passed(blocked_pass())).unwrap();
+        token.cancel();
+        assert_eq!(operation.next(IoResult::Woke), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn stopped_before_pass() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let (mut operation, status) = recovery(RecoveryStop::new(token));
+        assert_eq!(operation.first(), Ok(Next::Done(())));
+        assert_eq!(status.snapshot().state, RecoveryState::Pending);
+    }
+
+    #[test]
+    fn failed_pass_retries() {
+        let (mut operation, status) = settled();
+        let failed = child::<RestoredPass, IoError>(Err(IoError::Aborted));
+        let turn = operation.next(failed);
+        assert_eq!(turn, Ok(Next::Call(IoCall::Delay(RECOVERY_RETRY_BASE))));
+        let error = status.snapshot().last_error;
+        assert_eq!(error, Some(RecoveryError::PeerUnavailable));
+    }
+
+    #[test]
+    fn device_skips_announce() {
+        let mut presence = PresencePhaseOperation::new(realm(), node());
+        presence.first().unwrap();
+        let mut config = RealmConfigDocument::new(realm(), Vec::new(), 1);
+        let owner = UserId::nil(realm());
+        config.ensure_node(node(), RealmNodeKind::User { owner });
+        let turn = presence.next(child::<_, GetConfigError>(Ok(config)));
+        assert_eq!(turn, Ok(Next::Done(phase_done())));
+    }
+
+    #[test]
+    fn server_announces_presence() {
+        let mut presence = PresencePhaseOperation::new(realm(), node());
+        presence.first().unwrap();
+        let mut config = RealmConfigDocument::new(realm(), Vec::new(), 1);
+        config.ensure_node(node(), RealmNodeKind::Server);
+        let announce = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+            realm_id: realm(),
+            node_id: node(),
+            schedule_refresh: true,
+        });
+        let turn = presence.next(child::<_, GetConfigError>(Ok(config)));
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(announce))));
+        let failed = AnnouncePresenceError::from(IoError::Aborted);
+        let turn = presence.next(child::<(), _>(Err(failed)));
+        let expected = phase_failed(RecoveryError::PeerUnavailable);
+        assert_eq!(turn, Ok(Next::Done(expected)));
+    }
+
+    // Backoff climbs from the base to the cap and never past it, so a peer that
+    // stays down cannot keep the driver hot.
+    #[test]
+    fn recovery_backoff_caps() {
+        let backoff =
+            |attempts| capped_backoff(RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, attempts, 0);
+        assert_eq!(backoff(0), RECOVERY_RETRY_BASE);
+        assert!(backoff(1) > backoff(0));
+        assert_eq!(backoff(40), RECOVERY_RETRY_MAX);
+    }
+}
