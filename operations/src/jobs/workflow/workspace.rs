@@ -1113,14 +1113,16 @@ async fn remote_source(
     let Some(blake3) = captured.content.blake3() else {
         return Box::pin(granted_source(context, captured)).await;
     };
-    let staged = crate::jobs::lifecycle::stage::stage_remote_input(
-        context,
+    let stage = crate::jobs::lifecycle::stage::StageInputOperation::new(
         record,
         input,
         captured.version_id,
         blake3,
-    )
-    .await?;
+        context.node_and_realm(),
+    );
+    let staged = crate::driver::drive(stage, context)
+        .await
+        .map_err(|error| error.0)?;
     if staged.size != captured.bytes {
         return Err(JobError::permanent(
             "staged input size differs from the captured input".to_string(),

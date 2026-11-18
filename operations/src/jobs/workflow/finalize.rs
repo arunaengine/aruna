@@ -19,7 +19,7 @@ use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::super::output_record::store_outputs;
+use super::super::output_record::StoreOutputsOperation;
 use super::super::store::attempt::{
     read_attempt_control, record_attempt_started, transition_to_cancelling,
 };
@@ -541,7 +541,14 @@ async fn store_or_fail(
             return None;
         }
     };
-    match Box::pin(store_outputs(context, &record, control, outputs)).await {
+    let store = StoreOutputsOperation::new(
+        &record,
+        control,
+        outputs,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    match Box::pin(drive(store, context)).await {
         Ok(digest) => Some(digest),
         Err(error)
             if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent =>

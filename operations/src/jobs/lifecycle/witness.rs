@@ -20,7 +20,6 @@ use super::witness_arm::{
     ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange, WitnessDeadline,
     deadline_index_key, deadline_key,
 };
-pub(crate) use super::witness_round::suppressed;
 pub use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
 use crate::driver::DriverContext;
 use crate::jobs::store::JobMutationError;
@@ -236,7 +235,11 @@ mod tests {
     use crate::tests::records::{Family, context};
     use aruna_core::calls::ChildOutcome;
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
         IoResult::Child(ChildOutcome::new(result))
     }
 

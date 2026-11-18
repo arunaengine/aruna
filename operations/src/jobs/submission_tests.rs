@@ -24,8 +24,9 @@ use super::job_cancel::CancelJobOutcome;
 use super::job_reads::tests::{cancel_owned_job, read_owned_job, read_owned_report};
 use super::job_reports::{JobReportLookup, ReportQuery};
 use super::runtime::JobsRuntime;
-use super::store::query::insert_job;
-use super::store::state::{preserve_artifact_tombstone, read_job_record};
+use crate::jobs::store::test_calls::insert_job;
+use super::store::row_calls::preserve_artifact_tombstone;
+use crate::jobs::store::test_calls::read_job_record;
 use super::submit::{SubmitJobError, SubmitJobResult};
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
 use super::submit_local::DedupLookupOperation;
@@ -356,7 +357,7 @@ async fn tombstone_preserves_gone() {
     };
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let job_id = JobId::from_bytes([3u8; 16]);
-    preserve_artifact_tombstone(&context, job_id, owner, 10)
+    drive(preserve_artifact_tombstone(job_id, owner, 10), &context)
         .await
         .unwrap();
 

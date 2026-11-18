@@ -21,8 +21,8 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::store::query::find_dedup_job;
-use aruna_operations::jobs::store::state::read_job_record;
+use crate::job_calls::find_dedup_job;
+use crate::job_calls::read_job_record;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;

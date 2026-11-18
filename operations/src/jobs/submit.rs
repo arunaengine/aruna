@@ -655,7 +655,7 @@ impl Operation for SubmitJobOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::store::state::read_job_record;
+    use crate::jobs::store::test_calls::read_job_record;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
@@ -1124,17 +1124,17 @@ mod tests {
         );
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::test_calls::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
+        crate::jobs::store::test_calls::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
+        crate::jobs::store::test_calls::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1202,17 +1202,17 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::test_calls::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
+        crate::jobs::store::test_calls::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
+        crate::jobs::store::test_calls::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1320,7 +1320,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
+            crate::jobs::store::test_calls::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1351,7 +1351,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
+            crate::jobs::store::test_calls::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1387,7 +1387,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
+            crate::jobs::store::test_calls::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1404,7 +1404,7 @@ mod tests {
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
-        crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
+        crate::jobs::store::test_calls::claim_job(&ctx, first.job_id, node_id(3), 2_000)
             .await
             .unwrap();
         let claimed = read_job_record(&ctx, first.job_id, None)
@@ -1412,10 +1412,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
+        crate::jobs::store::test_calls::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
+        crate::jobs::store::test_calls::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 

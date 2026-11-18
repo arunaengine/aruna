@@ -456,3 +456,23 @@ pub async fn serve_launch_offer(
         .await
         .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable)
 }
+
+/// Reads one stored row as bytes.
+pub async fn read_row(
+    context: &DriverContext,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, String> {
+    let effect = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|value| value.to_vec()))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {}", other.label())),
+    }
+}

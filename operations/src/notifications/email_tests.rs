@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::query::find_dedup_plan;
+use crate::jobs::store::test_calls::find_dedup_plan;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::opt_in::{EmailOptIn, SetEmailOperation};

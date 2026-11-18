@@ -941,7 +941,7 @@ pub async fn control_purge(
     use crate::job_service::{CancelJobOutcome, cancel_owned_job};
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+    let record = crate::job_service::read_job_record(&context, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
@@ -1006,7 +1006,7 @@ async fn purge_job(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+    let record = crate::job_service::read_job_record(&context, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
@@ -1053,7 +1053,7 @@ pub async fn get_purge(
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+        crate::job_service::read_job_record(&state.get_ctx(), job_id)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?
             .ok_or(ServerError::NotFound)?;
@@ -1072,7 +1072,7 @@ async fn purge_ended(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+        crate::job_service::read_job_record(&state.get_ctx(), job_id)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))

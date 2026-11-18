@@ -5,7 +5,7 @@
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::inbound::initialize_incoming_fixture;
-use crate::jobs::store::query::find_dedup_plan;
+use crate::jobs::store::test_calls::find_dedup_plan;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,
     validate_watch_events, verify_node_origin,

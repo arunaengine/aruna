@@ -44,12 +44,11 @@ use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use crate::job_calls::put_purge_checkpoint;
+use crate::job_calls::insert_job;
+use aruna_operations::jobs::store::state::ClaimOutcome;
+use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running};
 use aruna_operations::jobs::host::run_storage_purge;
-use aruna_operations::jobs::store::put_purge_checkpoint;
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::{
-    ClaimOutcome, claim_job, complete_job, fail_job, transition_to_running,
-};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
@@ -1096,7 +1095,7 @@ async fn cancelled_queue_releases() {
         .await
         .unwrap();
     let stored =
-        aruna_operations::jobs::store::state::read_job_record(&context.driver, job_id, None)
+        crate::job_calls::read_job_record(&context.driver, job_id, None)
             .await
             .unwrap()
             .unwrap();

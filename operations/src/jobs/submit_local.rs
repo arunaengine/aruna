@@ -682,10 +682,6 @@ mod tests {
         assert_eq!(done, Ok(Next::Done(result())));
     }
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
-        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
-    }
-
     // A dedup row without its job record names nothing.
     #[test]
     fn dedup_needs_record() {

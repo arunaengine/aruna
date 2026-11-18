@@ -428,10 +428,12 @@ pub(crate) mod tests {
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::executor::PayloadHandler;
-    use crate::jobs::store::put_job_entry;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, transition_to_running};
-    use crate::jobs::store::state::{preserve_artifact_tombstone, read_job_record};
+    use crate::jobs::store::test_calls::put_job_entry;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::test_calls::read_job_record;
+    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
+    use crate::storage_read::iter_prefix_page;
     use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
@@ -451,6 +453,7 @@ pub(crate) mod tests {
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::FjallStorage;
+    use byteview::ByteView;
     use std::sync::Arc;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -478,7 +481,11 @@ pub(crate) mod tests {
         drive(prune, context).await.map_err(|error| error.0)
     }
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
         IoResult::Child(ChildOutcome::new(result))
     }
 
@@ -769,11 +776,9 @@ pub(crate) mod tests {
         let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([8u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
-        preserve_artifact_tombstone(
+        drive(
+            preserve_artifact_tombstone(job_id, owner, unix_timestamp_millis().saturating_sub(1)),
             &context,
-            job_id,
-            owner,
-            unix_timestamp_millis().saturating_sub(1),
         )
         .await
         .unwrap();

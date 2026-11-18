@@ -22,7 +22,7 @@ use futures_util::future::BoxFuture;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
-use crate::jobs::key_wake::version_wait;
+use crate::jobs::key_locks::VersionWaitOperation;
 use crate::plugins::check::CopyGrants;
 use crate::plugins::objects::{LocalObject, Unmarked};
 use crate::plugins::work::holds_job;
@@ -240,10 +240,10 @@ pub(super) async fn key_wait(
     };
     let version = VersionKey::new(bucket, key, version_id);
     let place = (ctx.owner_node_id, install.group_id);
-    match version_wait(&ctx.driver, place, &version).await {
+    match drive(VersionWaitOperation::new(place, version), &ctx.driver).await {
         Ok(Some(wait)) => JobRunOutcome::AwaitingKey(vec![wait]),
         Ok(None) => deferred("the source bucket was unlocked meanwhile".into()),
-        Err(error) => deferred(error),
+        Err(error) => deferred(error.0),
     }
 }
 
