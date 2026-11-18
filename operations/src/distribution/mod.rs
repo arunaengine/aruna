@@ -40,6 +40,7 @@ pub mod source_keep;
 pub mod source_plan;
 pub mod split;
 pub mod status;
+mod status_view;
 #[cfg(test)]
 pub(crate) mod test_record;
 #[cfg(test)]
