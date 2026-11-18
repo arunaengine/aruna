@@ -1100,10 +1100,7 @@ mod pure_tests {
     fn unknown_version_empty() {
         // An unknown version is no copy anywhere, not a copy in an unknown state.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(None));
-        verify(&mut operation);
-
-        let local = operation.finalize().unwrap();
+        let local = done(operation.next(read_result(None)));
         assert!(local.blake3.is_none());
         assert!(!local.summary.held);
         assert_eq!(local.summary.version_id, None);
@@ -1113,10 +1110,9 @@ mod pure_tests {
     fn carries_bucket_record() {
         // The caller must fan out from the record the answer was authorized on.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(None));
-        verify(&mut operation);
+        let local = done(operation.next(read_result(None)));
 
-        assert_eq!(operation.finalize().unwrap().bucket, Some(bucket_info()));
+        assert_eq!(local.bucket, Some(bucket_info()));
     }
 
     #[test]
@@ -1133,12 +1129,11 @@ mod pure_tests {
             request.auth_context.user_id = user_id;
             request.auth_context.realm_id = serving_realm;
             let mut operation = LocationSummaryOperation::new_local(node_id(5), request);
-            let effects = operation.start();
-            assert_eq!(operation.is_complete(), !accepted);
+            let turn = operation.first();
             if accepted {
-                assert!(!effects.is_empty());
+                assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
             } else {
-                assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+                denied(turn);
             }
         }
     }
@@ -1147,116 +1142,40 @@ mod pure_tests {
     fn replaced_bucket_denied() {
         // A bucket deleted and recreated under another group must not answer to
         // a caller authorized against the generation the read started on.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
         let replaced = BucketInfo {
             group_id: Ulid::from_bytes([9u8; 16]),
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             ..bucket_info()
         };
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
-        values[0].1 = Some(replaced.to_bytes().unwrap().into());
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        denied(child.next(with_row(0, Some(replaced.to_bytes().unwrap().into()))));
     }
 
     #[test]
     fn deleted_bucket_fails() {
         // A bucket that vanished mid-read has no answer to give.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
-        values[0].1 = None;
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(with_row(0, None)));
     }
 
     #[test]
     fn local_refuses_denied() {
         // Without a stream there is no one to answer, so the read just fails.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        );
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        operation.step(refused_batch());
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (mut parent, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(refused_batch()));
+        denied(parent.next(snapshot_denied()));
+        assert!(parent.abort().is_empty());
     }
 
     #[test]
     fn policy_refuses_denied() {
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(false);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        operation.step(policy_batch());
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (_, mut child) = reading(false, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(policy_batch()));
     }
 
     #[test]
     fn policy_snapshot_denies() {
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
         let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         realm.request_policies.push(RequestPolicy {
             policy_id: Ulid::from(12u128),
@@ -1266,31 +1185,61 @@ mod pure_tests {
             expression: "true".to_string(),
             enabled: true,
         });
-        values[1].1 = Some(postcard::to_allocvec(&realm).unwrap().into());
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let realm = postcard::to_allocvec(&realm).unwrap();
+        denied(child.next(with_row(1, Some(realm.into()))));
     }
 
     #[test]
     fn answers_on_stream() {
         // The peer path must never reply before the permission check passed.
         let stream_id = Ulid::from_bytes([5u8; 16]);
+        let peer = node_id(4);
         let mut operation = LocationSummaryOperation::new_incoming(
-            node_id(4),
+            peer,
             node_id(5),
             stream_id,
             request(Some(Ulid::from_bytes([3u8; 16]))),
-        );
-        let effects = operation.start();
-
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected a realm read first, got {effects:?}")
+        )
+        .with_policy(true);
+        let turn = operation.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected a realm read first, got {turn:?}")
         };
-        assert_eq!(key_space, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+        assert_eq!(reads[0].0, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+
+        // The answer goes out after the snapshot, and the run ends once the stream is closed.
+        operation.next(read_result(Some(peer_realm(peer)))).unwrap();
+        let mut child = enter_snapshot(&mut operation, bucket_info().to_bytes().unwrap());
+        let mut batch = policy_batch();
+        let IoResult::Values(values) = &mut batch else {
+            unreachable!();
+        };
+        values[1] = Some(peer_realm(peer).into());
+        child.next(batch).unwrap();
+        let local = done(child.next(read_result(None)));
+        let outcome = ChildOutcome::new(Ok::<_, LocationSummaryError>(local.clone()));
+        let turn = operation.next(IoResult::Child(outcome));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+            panic!("expected the summary, got {turn:?}")
+        };
+        assert_eq!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::LocationSummaryResponse(local.summary.clone())
+        );
+        let turn = operation.next(event(BlobEvent::MessageSent { stream_id }));
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::CloseConnection { .. })
+        ));
+        let closed = operation.next(event(BlobEvent::ConnectionClosed { stream_id }));
+        assert_eq!(done(closed), local);
+        assert!(operation.abort().is_empty());
+    }
+
+    fn peer_realm(peer: aruna_core::NodeId) -> Vec<u8> {
+        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        realm.ensure_node(peer, RealmNodeKind::Server);
+        postcard::to_allocvec(&realm).unwrap()
     }
 
     #[test]
@@ -1298,8 +1247,6 @@ mod pure_tests {
         // A peer removed in the fenced realm snapshot must not disclose data.
         let peer = node_id(4);
         let stream_id = Ulid::from(13u128);
-        let mut initial = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        initial.ensure_node(peer, RealmNodeKind::Server);
         let mut operation = LocationSummaryOperation::new_incoming(
             peer,
             node_id(5),
@@ -1307,38 +1254,23 @@ mod pure_tests {
             request(Some(Ulid::from_bytes([3u8; 16]))),
         )
         .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(postcard::to_allocvec(&initial).unwrap())));
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(14u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
+        operation.first().unwrap();
+        operation.next(read_result(Some(peer_realm(peer)))).unwrap();
+        let mut child = enter_snapshot(&mut operation, bucket_info().to_bytes().unwrap());
         let current = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        values[1].1 = Some(postcard::to_allocvec(&current).unwrap().into());
-        let effects = operation.step(batch);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(14u128),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::SendMessage { .. })]
-        ));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
-            stream_id,
-        }));
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionClosed { stream_id },
-        ));
+        let current = postcard::to_allocvec(&current).unwrap();
+        denied(child.next(with_row(1, Some(current.into()))));
 
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let turn = operation.next(snapshot_denied());
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::SendMessage { .. })
+        ));
+        operation
+            .next(event(BlobEvent::MessageSent { stream_id }))
+            .unwrap();
+        denied(operation.next(event(BlobEvent::ConnectionClosed { stream_id })));
+        assert!(operation.abort().is_empty());
     }
 
     #[test]
@@ -1346,9 +1278,7 @@ mod pure_tests {
         // A refused peer must say so, so the caller does not read it as offline.
         let stream_id = Ulid::from_bytes([5u8; 16]);
         let peer = node_id(4);
-        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        realm.ensure_node(peer, RealmNodeKind::Server);
-        let realm = postcard::to_allocvec(&realm).unwrap();
+        let realm = peer_realm(peer);
         let mut operation = LocationSummaryOperation::new_incoming(
             peer,
             node_id(5),
@@ -1356,39 +1286,31 @@ mod pure_tests {
             request(Some(Ulid::from_bytes([3u8; 16]))),
         )
         .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(realm.clone())));
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        let txn_id = Ulid::from(14u128);
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        // The caller's roles are read with the policy rows, in the same transaction.
-        let [
-            Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: read_txn,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the policy read, got {effects:?}")
+        operation.first().unwrap();
+        operation.next(read_result(Some(realm.clone()))).unwrap();
+        operation
+            .next(read_result(Some(bucket_info().to_bytes().unwrap())))
+            .unwrap();
+        // The caller's roles are read with the policy rows, in the same snapshot.
+        let mut child = operation.snapshot_child();
+        let turn = child.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the policy read, got {turn:?}")
         };
-        assert_eq!((reads.len(), *read_txn), (5, Some(txn_id)));
-        let mut batch = refused_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+        assert_eq!(reads.len(), 5);
+        let IoResult::Values(mut values) = refused_batch() else {
             unreachable!();
         };
-        values[1].1 = Some(realm.into());
-        operation.step(batch);
+        values[1] = Some(realm.into());
+        denied(child.next(IoResult::Values(values)));
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-
-        let [Effect::Blob(aruna_core::effects::BlobEffect::SendMessage { payload, .. })] =
-            effects.as_slice()
-        else {
-            panic!("expected an explicit denial, got {effects:?}")
+        let turn = operation.next(snapshot_denied());
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+            panic!("expected an explicit denial, got {turn:?}")
         };
         assert_eq!(
-            crate::replication::protocol::VersionReplicationMessage::from_bytes(payload).unwrap(),
-            crate::replication::protocol::VersionReplicationMessage::LocationSummaryDenied
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::LocationSummaryDenied
         );
     }
 
@@ -1402,14 +1324,14 @@ mod pure_tests {
             stream_id,
             request(None),
         );
-        operation.state = super::SummaryState::Close;
+        operation.state = SummaryState::Close;
 
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionClosed {
-                stream_id: Ulid::from_bytes([6u8; 16]),
-            },
-        ));
+        let turn = operation.next(event(BlobEvent::ConnectionClosed {
+            stream_id: Ulid::from_bytes([6u8; 16]),
+        }));
 
-        assert_eq!(operation.state, super::SummaryState::Error);
+        assert!(matches!(turn, Err(LocationSummaryError::Unexpected { .. })));
+        assert_eq!(operation.abort().len(), 1);
+        assert!(operation.abort().is_empty());
     }
 }
