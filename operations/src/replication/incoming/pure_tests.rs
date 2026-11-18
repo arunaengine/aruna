@@ -4024,10 +4024,7 @@ fn encrypted_replacement_quota() {
     op.state = IncomingVersionState::ReadReplacedBlob;
     let mut old = make_location();
     old.blob_size -= 1;
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(old.to_bytes().unwrap().into()),
-    }));
+    op.next(row(Some(old.to_bytes().unwrap().into()))).unwrap();
     assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
 
     let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
@@ -4036,10 +4033,8 @@ fn encrypted_replacement_quota() {
         grace_factor_percent: 100,
         ..QuotaConfig::default()
     };
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(postcard::to_allocvec(&config).unwrap().into()),
-    }));
+    op.next(row(Some(postcard::to_allocvec(&config).unwrap().into())))
+        .unwrap();
     assert_eq!(op.state, IncomingVersionState::ReadAbe);
     assert_eq!(op.quota_ceiling, Some(1));
 
@@ -4055,10 +4050,9 @@ fn encrypted_replacement_quota() {
         plan.key,
     );
     op.received_blob = Some(ReceivedBlob::reserved(location));
-    op.txn_id = Some(Ulid::from_parts(99, 99));
     op.envelope_bytes = 10;
     op.replaced_logical_bytes += 11;
-    op.start_commit_quota();
+    op.start_commit_quota().unwrap();
     assert_eq!(op.state, IncomingVersionState::UpdateUsage);
 }
 
@@ -4095,20 +4089,16 @@ fn mapped_refuses_replicas() {
     let bucket_info = make_bucket_info(test_group_id());
     op.manifest_policy = Some(op.target_authorization_path(bucket_info.group_id));
     op.writer_policy = Some(op.target_authorization_path(bucket_info.group_id));
-    op.start();
-    op.step(bucket_read(Some(bucket_info.to_bytes().unwrap().into())));
-    load_routing(&mut op, inputs);
-    let mut effects = Default::default();
-    for _ in 0..2 {
-        effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
-    }
+    op.first().unwrap();
+    op.next(bucket_read(Some(bucket_info.to_bytes().unwrap().into())))
+        .unwrap();
+    load_routing(&mut op, inputs).unwrap();
+    op.next(row(None)).unwrap();
+    let effects = op.next(row(None));
     // The refusal comes before any copy is probed or any byte is invited.
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         "A bucket stored 1:1 in a provider bucket cannot receive replicas yet.",
     );
 }
@@ -4136,7 +4126,6 @@ fn keeps_pull_receipt() {
         None,
         "an ordinary bucket keeps none"
     );
-    operation.txn_id = Some(trace_txn_id());
     operation.destination_binding = Some(DistributionBinding {
         set_id: Ulid::from_bytes([3; 16]),
         member_id: Ulid::from_bytes([4; 16]),
@@ -4146,11 +4135,10 @@ fn keeps_pull_receipt() {
     let key = tagged_receipt((&target.0, &target.1), &operation.manifest.metadata, true);
     assert_eq!(
         operation.pull_receipt(),
-        Some(Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
-            key: key.unwrap().into(),
-            value: version_id.to_bytes().to_vec().into(),
-            txn_id: Some(trace_txn_id()),
-        }))
+        Some((
+            SYNC_RECEIPT_KEYSPACE.to_string(),
+            key.unwrap().into(),
+            version_id.to_bytes().to_vec().into(),
+        ))
     );
 }
