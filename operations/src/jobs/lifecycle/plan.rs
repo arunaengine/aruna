@@ -921,4 +921,49 @@ mod tests {
         );
         assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);
     }
+
+    /// Answers every call of one round: no member advertises, no copy is registered, no
+    /// policy resolves and no policy row exists.
+    fn quiet_round(operation: &mut BuildPlanOperation) -> (usize, ExecutionPlan) {
+        use aruna_core::calls::ChildOutcome;
+        let mut turn = operation.first();
+        let mut unread = 0;
+        loop {
+            let call = match turn.expect("the round continues") {
+                Next::Call(call) => call,
+                Next::Done(plan) => return (unread, plan),
+                other => panic!("unexpected turn {other:?}"),
+            };
+            let answer = match (&operation.step, call) {
+                (PlanStep::Advertisement(_), IoCall::Child(_)) => {
+                    unread += 1;
+                    let error = NodeInfoError::Decode("unreadable".to_string());
+                    IoResult::Child(ChildOutcome::new(Err::<
+                        BTreeMap<NodeId, NodeInfoDocument>,
+                        _,
+                    >(error)))
+                }
+                (PlanStep::Holders(_), IoCall::Child(_)) => IoResult::Child(ChildOutcome::new(
+                    Ok::<_, GetHoldersError>(Vec::<NodeId>::new()),
+                )),
+                (PlanStep::Policies, IoCall::Child(_)) => {
+                    IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(Resolutions::new())))
+                }
+                (_, IoCall::Read(reads)) => IoResult::Values(vec![None; reads.len()]),
+                (step, call) => panic!("unexpected call {call:?} in {step:?}"),
+            };
+            turn = operation.next(answer);
+        }
+    }
+
+    // A round reads every member's advertisement; one it cannot read leaves the round retryable.
+    #[test]
+    fn unread_round_retries() {
+        let family = Family::new([4u8; 32]);
+        let config = family.config.clone();
+        let mut operation = BuildPlanOperation::new(round(&config, &family.spec(), &[]));
+        let (unread, plan) = quiet_round(&mut operation);
+        assert_eq!(unread, config.sync_eligible_nodes().expect("members").len());
+        assert!(unread > 0 && plan.selected.is_none() && plan.retryable);
+    }
 }
