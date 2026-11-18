@@ -4792,7 +4792,10 @@ async fn lookup_hides_private() {
         identifiers,
         occurred_at_ms: aruna_core::time::unix_timestamp_millis(),
     };
-    let node = (test.state.get_realm_id(), ctx.node_and_realm().map(|(node, _)| node));
+    let node = (
+        test.state.get_realm_id(),
+        ctx.node_and_realm().map(|(node, _)| node),
+    );
     let caller = (None, Some(test.auth.clone()));
     let add = PidRouteOperation::new(node, document_id, request, caller);
     let (_, changed) = aruna_operations::driver::drive(add, ctx.as_ref())

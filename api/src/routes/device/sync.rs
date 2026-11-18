@@ -190,8 +190,13 @@ async fn get_sync_status(
     _: OwnerAuth,
 ) -> ServerResult<Json<DeviceSyncStatus>> {
     let context = state.get_ctx();
-    let mut status: DeviceSyncStatus = drive(sync_status(), &context).await.unwrap_or_default().into();
-    status.removed_from_realm = drive(realm_removed(state.get_realm_id()), &context).await.unwrap_or(false);
+    let mut status: DeviceSyncStatus = drive(sync_status(), &context)
+        .await
+        .unwrap_or_default()
+        .into();
+    status.removed_from_realm = drive(realm_removed(state.get_realm_id()), &context)
+        .await
+        .unwrap_or(false);
     Ok(Json(status))
 }
 
@@ -223,7 +228,9 @@ async fn run_sync(
     State(state): State<Arc<ServerState>>,
     _: OwnerAuth,
 ) -> ServerResult<(axum::http::StatusCode, Json<DeviceSyncRun>)> {
-    drive(start_sync_run(), &state.get_ctx()).await.unwrap_or(false);
+    drive(start_sync_run(), &state.get_ctx())
+        .await
+        .unwrap_or(false);
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(DeviceSyncRun { started: true }),

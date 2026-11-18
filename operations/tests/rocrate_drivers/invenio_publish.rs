@@ -15,8 +15,8 @@ use super::*;
 use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::driver::drive;
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::metadata::revision_read::RawViewOperation;
 
 async fn push_now(
@@ -132,10 +132,9 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
         .0
         .active_job
         .ok_or("no push")?;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, job_id, None)
-            .await?
-            .ok_or("push job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
         return Err("push job is not an export".into());
     };
@@ -168,10 +167,9 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     let started = current(&fixture, &link).await.0;
     let job_id = started.active_job.ok_or("no push")?;
     let storage = &fixture.context.storage_handle;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, job_id, None)
-            .await?
-            .ok_or("push job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
         return Err("push job is not an export".into());
     };
@@ -378,13 +376,9 @@ async fn community_reviews_first() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(accepted.remote.record_id.as_deref(), Some("1"));
     // The review published outside a push, so accepting it registers the record's identifiers.
     let key = format!("identifiers/{}/1", link.link_id);
-    let queued = crate::job_calls::find_dedup_plan(
-        &fixture.context,
-        link.created_by,
-        key.as_bytes(),
-        None,
-    )
-    .await?;
+    let queued =
+        crate::job_calls::find_dedup_plan(&fixture.context, link.created_by, key.as_bytes(), None)
+            .await?;
     assert!(queued.is_some(), "no identifier registration queued");
 
     // Later versions publish directly.
@@ -492,10 +486,9 @@ async fn removal_cancels_push() -> Result<(), Box<dyn std::error::Error>> {
     let running = current(&fixture, &link).await.0;
     let job_id = running.active_job.ok_or("no push")?;
     change_link(fixture.context.as_ref(), &running, LinkChange::Delete).await?;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, job_id, None)
-            .await?
-            .ok_or("push job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
         return Err("push job is not an export".into());
     };

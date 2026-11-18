@@ -1057,11 +1057,10 @@ pub async fn get_purge(
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
-    let record =
-        crate::job_service::read_job_record(&state.get_ctx(), job_id)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?
-            .ok_or(ServerError::NotFound)?;
+    let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1076,10 +1075,9 @@ async fn purge_ended(
     state: &ServerState,
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
-    let record =
-        crate::job_service::read_job_record(&state.get_ctx(), job_id)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?;
+    let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
 }
 

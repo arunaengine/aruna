@@ -16,8 +16,8 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::testing::project_logged_events;
 use aruna_operations::tasks::incoming::start_task_queues;
+use aruna_operations::testing::project_logged_events;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;

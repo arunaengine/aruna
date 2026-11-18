@@ -1132,7 +1132,9 @@ pub(crate) async fn run_realm_info(
     // A device holds no peer node-info document, so the list a realm node
     // installed on it is what the portal is offered there.
     if management_urls.is_empty() {
-        management_urls = drive(installed_management_urls(config.realm_id), &state.get_ctx()).await.unwrap_or_default();
+        management_urls = drive(installed_management_urls(config.realm_id), &state.get_ctx())
+            .await
+            .unwrap_or_default();
     }
 
     let public_nodes = public_nodes(
@@ -1238,7 +1240,9 @@ async fn node_names(
         state.node_capabilities(),
         aruna_core::structs::identity::auth::NodeCapabilities::User { .. }
     ) {
-        return drive(installed_displays(realm_id), &state.get_ctx()).await.unwrap_or_default();
+        return drive(installed_displays(realm_id), &state.get_ctx())
+            .await
+            .unwrap_or_default();
     }
     drive(ReadNamesOperation::new(realm_id), &state.get_ctx())
         .await

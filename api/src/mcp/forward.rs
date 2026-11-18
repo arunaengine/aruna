@@ -156,7 +156,9 @@ impl McpServer {
         }
         let mut members = Vec::new();
         if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
-            members = drive(key_holders(set_id, key), &context).await.unwrap_or_default();
+            members = drive(key_holders(set_id, key), &context)
+                .await
+                .unwrap_or_default();
         }
         pick_node(here, (named, info.is_some(), routed), &holders, &members)
             .map_err(|error| route_error(error, bucket, &missed))

@@ -349,7 +349,12 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         "Live revision after remote edit"
     );
 
-    let event = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)), &fixture.context).await.map(|(_, revision)| revision)?
+    let event = aruna_operations::driver::drive(
+        aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
+        &fixture.context,
+    )
+    .await
+    .map(|(_, revision)| revision)?
     .ok_or("revision missing")?
     .winning_event_id;
     Box::pin(super::driven::start_push(
@@ -450,7 +455,12 @@ async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     succeeded(run_push(&fixture, &link).await?);
     let pushed = current(&fixture, &link).await.0;
     let draft = pushed.remote.draft_id.clone().ok_or("no draft")?;
-    let event = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)), &fixture.context).await.map(|(_, revision)| revision)?
+    let event = aruna_operations::driver::drive(
+        aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
+        &fixture.context,
+    )
+    .await
+    .map(|(_, revision)| revision)?
     .ok_or("revision missing")?
     .winning_event_id;
     Box::pin(super::driven::start_push(
@@ -540,10 +550,9 @@ async fn complete(
     let JobRunOutcome::Succeeded(result) = outcome else {
         return Ok(());
     };
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, ctx.job_id, None)
-            .await?
-            .ok_or("job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, ctx.job_id, None)
+        .await?
+        .ok_or("job missing")?;
     crate::job_calls::complete_job(
         &fixture.context,
         ctx.job_id,
@@ -670,7 +679,12 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         assert!(count > 0, "{mode:?} imported nothing");
         replay_event_log(fixture.context.as_ref()).await?;
         process_materialization_batch(fixture.context.as_ref()).await?;
-        let crate_json = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(document), &fixture.context).await.map(|(_, revision)| revision)?
+        let crate_json = aruna_operations::driver::drive(
+            aruna_operations::metadata::revision_read::RawViewOperation::revision(document),
+            &fixture.context,
+        )
+        .await
+        .map(|(_, revision)| revision)?
         .ok_or("imported crate missing")?
         .jsonld;
         assert!(crate_json.contains(&doi), "{mode:?} crate lacks {doi}");
@@ -841,7 +855,12 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pulled.remote.record_id.as_deref(), Some(second.id.as_str()));
     assert_eq!(pulled.remote.identifier, second.identifier);
     assert_eq!(pulled.pull_reason(), None);
-    let revision = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(2)), &fixture.context).await.map(|(_, revision)| revision)?
+    let revision = aruna_operations::driver::drive(
+        aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(2)),
+        &fixture.context,
+    )
+    .await
+    .map(|(_, revision)| revision)?
     .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     let mut versions = crate_versions(&document);
@@ -879,10 +898,9 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         update.auth_context.user_id,
     ))
     .await?;
-    let mapping =
-        crate::metadata_calls::read_mapping(&fixture.context, doc_id(2))
-            .await?
-            .ok_or("pulled dataset has no mapping")?;
+    let mapping = crate::metadata_calls::read_mapping(&fixture.context, doc_id(2))
+        .await?
+        .ok_or("pulled dataset has no mapping")?;
     let doi = second.identifier.as_deref().ok_or("v2 has no DOI")?;
     assert!(
         mapping

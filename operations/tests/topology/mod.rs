@@ -58,7 +58,6 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::testing::{project_logged_events, replay_event_log};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::ExpandPlacementOperation;
 use aruna_operations::placement::mutation::PlacementMutationOperation;
@@ -69,6 +68,7 @@ use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_operations::testing::sync_topics;
+use aruna_operations::testing::{project_logged_events, replay_event_log};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;

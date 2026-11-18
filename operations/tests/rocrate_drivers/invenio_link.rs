@@ -8,6 +8,7 @@ use super::driven::seal_link_token;
 use super::remote::{RemoteServer, remote};
 use super::*;
 use crate::job_calls::submit_export_job;
+use crate::job_calls::{complete_job, fail_job};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::repository::{
@@ -17,7 +18,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use crate::job_calls::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
@@ -202,10 +202,9 @@ pub(super) async fn run_push(
         .0
         .active_job
         .ok_or("no running push")?;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, job_id, None)
-            .await?
-            .ok_or("push job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
         return Err("push job is not an export".into());
     };
@@ -308,18 +307,13 @@ pub(super) async fn run_registration(
     created_by: UserId,
 ) -> Result<AuthContext, Box<dyn std::error::Error>> {
     let key = format!("identifiers/{for_job}");
-    let (job_id, _) = crate::job_calls::find_dedup_plan(
-        &fixture.context,
-        created_by,
-        key.as_bytes(),
-        None,
-    )
-    .await?
-    .ok_or("no registration queued")?;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, job_id, None)
+    let (job_id, _) =
+        crate::job_calls::find_dedup_plan(&fixture.context, created_by, key.as_bytes(), None)
             .await?
-            .ok_or("registration job missing")?;
+            .ok_or("no registration queued")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .ok_or("registration job missing")?;
     let JobPayload::RegisterIdentifiers(spec) = record.payload.clone() else {
         return Err("queued job is not a registration".into());
     };
@@ -424,11 +418,10 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .0
         .active_job
         .ok_or("no push")?;
-    let pusher =
-        crate::job_calls::read_job_record(&fixture.context, push_job, None)
-            .await?
-            .ok_or("push job missing")?
-            .created_by;
+    let pusher = crate::job_calls::read_job_record(&fixture.context, push_job, None)
+        .await?
+        .ok_or("push job missing")?
+        .created_by;
     succeeded(run_push(&fixture, &link).await?);
     let (published, _) = current(&fixture, &link).await;
     assert!(published.remote.published && published.remote.draft_id.is_none());
@@ -969,8 +962,8 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::driven::{current_event, start_push};
-    use aruna_operations::jobs::store::job_calls::CancelRequestOutcome;
     use crate::job_calls::set_cancel_requested;
+    use aruna_operations::jobs::store::job_calls::CancelRequestOutcome;
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;
         let server = remote(LINK_TOKEN).await;

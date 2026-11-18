@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::IoError;
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::tests::routes::{test_state, test_storage};
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};

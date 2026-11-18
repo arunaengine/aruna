@@ -856,9 +856,12 @@ async fn rollback_before_cleanup() {
     // Repair finished the rollback before the route saw its refused activation.
     let (_storage_dir, state, auth, _) = test_state().await;
     let relationship = claimed_create(&state).await;
-    drive(DrainRepairsOperation::new(state.get_node_id()), &state.get_ctx())
-        .await
-        .unwrap();
+    drive(
+        DrainRepairsOperation::new(state.get_node_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());
 
     let error = activate_sync(&state, &relationship).await.unwrap_err();
@@ -885,9 +888,12 @@ async fn claim_during_cleanup() {
             .await
             .is_some_and(|record| record.rollback)
     );
-    drive(DrainRepairsOperation::new(state.get_node_id()), &state.get_ctx())
-        .await
-        .unwrap();
+    drive(
+        DrainRepairsOperation::new(state.get_node_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());
     assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 0);
     assert_eq!(row_count(&state, RELATIONSHIP_IN_KEYSPACE).await, 0);

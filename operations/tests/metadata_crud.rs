@@ -37,14 +37,14 @@ use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
-    schedule_projection_drain,
-};
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::tasks::incoming::start_task_queues;
+use aruna_operations::testing::{
+    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
+    schedule_projection_drain,
+};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

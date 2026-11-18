@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
 use super::*;
+use aruna_operations::driver::drive;
 
 #[tokio::test]
 async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,10 +40,9 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         spec.auth_context.user_id,
     ))
     .await?;
-    let mapping =
-        crate::metadata_calls::read_mapping(&fixture.context, doc_id(1))
-            .await?
-            .expect("created document has a mapping");
+    let mapping = crate::metadata_calls::read_mapping(&fixture.context, doc_id(1))
+        .await?
+        .expect("created document has a mapping");
     let identifiers = mapping
         .secondary_identifiers
         .iter()
@@ -560,10 +559,9 @@ async fn start_update(
     .ok_or("link missing")?;
     assert_eq!(link.pull_reason(), Some("update_available"));
     let pull = Box::pin(start_pull(&fixture.context, &link)).await?;
-    let record =
-        crate::job_calls::read_job_record(&fixture.context, pull, None)
-            .await?
-            .ok_or("pull job missing")?;
+    let record = crate::job_calls::read_job_record(&fixture.context, pull, None)
+        .await?
+        .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
         return Err("pull job is not an import".into());
     };

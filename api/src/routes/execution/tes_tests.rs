@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use axum::body::to_bytes;
 
+use crate::job_test_calls::insert_job;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::id::NodeId;
@@ -22,7 +23,6 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use crate::job_test_calls::insert_job;
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 
@@ -1705,12 +1705,9 @@ async fn basic_scopes_tasks() {
     for (job_id, group_id) in [(visible_id, group), (hidden_id, sibling)] {
         let (spec, _) =
             map_execution_spec(&sample_task(group_id), None, ExecutionTarget::Realm).unwrap();
-        insert_job(
-            &state.get_ctx(),
-            &execution_record(job_id, owner, spec),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+            .await
+            .unwrap();
     }
 
     let visible = get_task(
@@ -1830,12 +1827,9 @@ async fn lists_derived_tags() {
     ] {
         let (spec, _) =
             map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
-        insert_job(
-            &state.get_ctx(),
-            &execution_record(job_id, owner, spec),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+            .await
+            .unwrap();
     }
 
     let raw_query = format!("tag_key=aruna-engine.org%2Fjob-id&tag_value={target}");
@@ -1878,12 +1872,9 @@ async fn get_resolves() {
     )
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &execution_record(job_id, owner, spec),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+        .await
+        .unwrap();
 
     let response = get_task(
         State(state.clone()),
@@ -1926,12 +1917,9 @@ async fn cancel_maps_through() {
     )
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &execution_record(job_id, owner, spec),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+        .await
+        .unwrap();
 
     let ok = cancel_task(
         State(state.clone()),

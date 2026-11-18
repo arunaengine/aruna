@@ -321,15 +321,11 @@ async fn confirms_hidden_dataset() {
         aruna_operations::driver::drive(links, context.as_ref())
     };
 
-    let named = links_local(&other, request(Some(dataset)))
-        .await
-        .unwrap();
+    let named = links_local(&other, request(Some(dataset))).await.unwrap();
     assert!(named.documents.is_empty());
     assert!(named.hidden && named.confirmed);
     let unrelated = Some(Ulid::from_bytes([61; 16]));
-    let page = links_local(&other, request(unrelated))
-        .await
-        .unwrap();
+    let page = links_local(&other, request(unrelated)).await.unwrap();
     assert!(page.hidden && !page.confirmed);
     let reader = links_local(&test.auth, request(Some(dataset)))
         .await

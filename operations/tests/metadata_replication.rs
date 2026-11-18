@@ -42,7 +42,6 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -57,6 +56,7 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::testing::{read_outbox_records, reconcile_topics};
 use tokio::time::sleep;
 use ulid::Ulid;

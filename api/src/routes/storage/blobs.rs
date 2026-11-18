@@ -673,7 +673,10 @@ pub async fn blob_locations(
     }
     // Members that keep the key's range hold its versions under the bucket's name.
     if let Some(binding) = info.distribution.as_ref() {
-        for node_id in drive(key_holders(binding.set_id, &query.path), &ctx).await.unwrap_or_default() {
+        for node_id in drive(key_holders(binding.set_id, &query.path), &ctx)
+            .await
+            .unwrap_or_default()
+        {
             if node_id != local_node {
                 let destination = (node_id, query.bucket.clone(), query.path.clone());
                 expected.insert(destination.clone());
