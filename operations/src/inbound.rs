@@ -23,15 +23,18 @@ use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::plugin_host::peer::serve_peer;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
+use crate::staging::native_source::PrepareReferenceOperation;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::triggers::{PeerInput, peer_operation};
+use aruna_blob::native;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::task::TaskKey;
@@ -596,7 +599,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(self.handle_metadata_stream(stream, node_id)).await;
                 }
                 Alpn::NativeReference => {
-                    Box::pin(crate::sync::native_serve::handle_native_stream(
+                    Box::pin(answer_native_stream(
                         self.context.as_ref(),
                         stream,
                         node_id,
@@ -694,6 +697,30 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
+}
+
+/// Answers one native reference stream with what its request prepared.
+async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(request) = native::read_request(&mut stream, peer).await else {
+        return;
+    };
+    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
+    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
+    let (response, body) = match drive(prepare, context).await {
+        Ok(prepared) => {
+            // Only a caller read names the group; a sync relationship knows its own bucket.
+            let response = match prepared.group_id.filter(|_| !relationship) {
+                None => NativeReferenceResponse::Content(prepared.metadata),
+                Some(group_id) => NativeReferenceResponse::Described {
+                    metadata: prepared.metadata,
+                    group_id,
+                },
+            };
+            (response, prepared.body)
+        }
+        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
+    };
+    native::write_answer(stream, peer, &response, body).await;
 }
 
 /// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
