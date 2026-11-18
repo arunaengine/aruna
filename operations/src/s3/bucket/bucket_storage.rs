@@ -2,22 +2,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::node_routing;
-use crate::driver::{DriverContext, drive};
-use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::storage_routing::GroupInputsOperation;
-use crate::s3::bucket::bucket_jobs::{ActiveJob, active_job};
-use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
+use crate::groups::storage_routing::{GroupInputsError, GroupInputsOperation};
+use crate::s3::bucket::bucket_jobs::{ActiveJob, ActiveJobError, ActiveJobOperation};
+use crate::s3::bucket::list::{
+    ListBucketsError, ListBucketsInput, ListBucketsOperation, ListBucketsResult,
+};
+use crate::s3::imports::{ImportRuleError, ListImportsOperation};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::group_backend::{GroupStorage, path_bucket};
-use aruna_core::structs::storage::routing::{RoutingSnapshot, resolve_backend};
-use aruna_core::types::GroupId;
-use std::collections::HashMap;
+use aruna_core::structs::storage::routing::{
+    GroupRoutingInputs, NodeRouting, RoutingSnapshot, resolve_backend,
+};
+use aruna_core::types::{GroupId, Value};
+use std::collections::{HashMap, VecDeque};
+use thiserror::Error;
 use ulid::Ulid;
 
 /// Where one bucket stores new uploads, and the job that runs or is paused on it.
@@ -39,87 +45,223 @@ pub struct BucketStorage {
 /// Links and mapping rows of a group the listing reads at most.
 const LINK_CAP: usize = 10_000;
 
-/// One page of the group's buckets with their storage and job, and the next page's cursor. The
-/// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
-pub async fn list_bucket_storage(
-    context: &DriverContext,
-    group_id: GroupId,
-    (after, limit): (Option<String>, usize),
-) -> Result<(Vec<BucketStorage>, Option<String>), String> {
-    let input = ListBucketsInput {
-        group_id,
-        prefix: None,
-        continuation_token: after,
-        max_buckets: Some(limit),
-    };
-    let page = drive(ListBucketsOperation::new(input), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let inputs = GroupInputsOperation::new(group_id).capped(LINK_CAP);
-    let inputs = drive(inputs, context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let encrypted = encrypted_buckets(context, &page.buckets).await?;
-    // Jobs show for every rule, also one whose write storage routing leaves out.
-    let rules = crate::s3::imports::list_imports(context, group_id).await;
-    let rules = rules.map_err(|error| error.to_string())?;
-    let mut snapshot = node_routing(context)
-        .snapshot(group_id)
-        .with_group_inputs(inputs);
-    let mut storages = HashMap::new();
-    let mut found = Vec::with_capacity(page.buckets.len());
-    for ((bucket, info), encrypted) in page.buckets.into_iter().zip(encrypted) {
-        snapshot.bucket_rules = info.storage_routing;
-        snapshot.compression = info.compression;
-        let encoded = encrypted || info.compression != Compression::Off;
-        let destination = destination(&snapshot, &bucket, encoded);
-        if let Some(id) = destination.backend_id
-            && let std::collections::hash_map::Entry::Vacant(entry) = storages.entry(id)
-        {
-            let record = drive(GetBackendOperation::new(id), context).await;
-            let record = record.map_err(|error| error.to_string())?;
-            entry.insert(record.filter(|record| record.group_id == group_id));
-        }
-        let job = active_job(context, &bucket, &rules).await?;
-        found.push(BucketStorage {
-            job,
-            ..named(destination, &storages)
-        });
-    }
-    Ok((found, page.continuation_token))
+#[derive(Debug, Error, PartialEq)]
+pub enum BucketStorageError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Buckets(#[from] ListBucketsError),
+    #[error(transparent)]
+    Inputs(#[from] GroupInputsError),
+    #[error(transparent)]
+    Imports(#[from] ImportRuleError),
+    #[error(transparent)]
+    Backend(#[from] GroupQueryError),
+    #[error(transparent)]
+    Job(#[from] ActiveJobError),
 }
 
-/// Whether each bucket of the page encrypts its new uploads.
-async fn encrypted_buckets(
-    context: &DriverContext,
-    buckets: &[(String, BucketInfo)],
-) -> Result<Vec<bool>, String> {
-    if buckets.is_empty() {
-        return Ok(Vec::new());
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StorageStep {
+    Buckets,
+    Inputs,
+    Encryption,
+    Imports,
+    Backend(Ulid),
+    Job,
+}
+
+/// One bucket of the page, on its way through the steps.
+#[derive(Debug, PartialEq)]
+struct PageBucket {
+    name: String,
+    info: BucketInfo,
+    encrypted: bool,
+}
+
+/// One page of buckets and the cursor of the next.
+pub type BucketStoragePage = (Vec<BucketStorage>, Option<String>);
+
+type StorageTurn = Result<Next<BucketStoragePage>, BucketStorageError>;
+
+/// One page of the group's buckets with their storage and job, and the next page's cursor. The
+/// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
+#[derive(Debug, PartialEq)]
+pub struct ListBucketStorageOperation {
+    group_id: GroupId,
+    after: Option<String>,
+    limit: usize,
+    routing: NodeRouting,
+    step: StorageStep,
+    names: Vec<(String, BucketInfo)>,
+    token: Option<String>,
+    inputs: Option<GroupRoutingInputs>,
+    snapshot: Option<RoutingSnapshot>,
+    rules: Vec<BackendImport>,
+    buckets: VecDeque<PageBucket>,
+    /// The bucket whose job is being read, with where it stores uploads.
+    current: Option<BucketStorage>,
+    storages: HashMap<Ulid, Option<GroupStorage>>,
+    found: Vec<BucketStorage>,
+}
+
+impl ListBucketStorageOperation {
+    pub fn new(
+        routing: NodeRouting,
+        group_id: GroupId,
+        (after, limit): (Option<String>, usize),
+    ) -> Self {
+        Self {
+            group_id,
+            after,
+            limit,
+            routing,
+            step: StorageStep::Buckets,
+            names: Vec::new(),
+            token: None,
+            inputs: None,
+            snapshot: None,
+            rules: Vec::new(),
+            buckets: VecDeque::new(),
+            current: None,
+            storages: HashMap::new(),
+            found: Vec::new(),
+        }
     }
-    let reads = (buckets.iter())
-        .map(|(bucket, _)| {
-            let key = bucket.as_bytes().to_vec().into();
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
-        })
-        .collect();
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let Event::Storage(StorageEvent::BatchReadResult { values }) =
-        context.storage_handle.send_storage_effect(read).await
-    else {
-        return Err("could not read the encryption of the buckets".to_string());
-    };
-    values
-        .into_iter()
-        .map(|(_, row)| {
-            let settings = BucketEncryption::from_row(row.as_deref());
-            settings.map(|settings| settings.is_encrypted())
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|error| error.to_string())
+
+    fn call(&mut self, step: StorageStep, call: IoCall) -> StorageTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn listed(&mut self, page: ListBucketsResult) -> StorageTurn {
+        self.names = page.buckets;
+        self.token = page.continuation_token;
+        let inputs = GroupInputsOperation::new(self.group_id).capped(LINK_CAP);
+        self.call(StorageStep::Inputs, IoCall::child(inputs))
+    }
+
+    /// Whether each bucket of the page encrypts its new uploads.
+    fn read_encryption(&mut self) -> StorageTurn {
+        if self.names.is_empty() {
+            return self.encryption_read(Vec::new());
+        }
+        let reads = (self.names.iter())
+            .map(|(bucket, _)| {
+                let key = bucket.as_bytes().to_vec().into();
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.call(StorageStep::Encryption, IoCall::Read(reads))
+    }
+
+    fn encryption_read(&mut self, rows: Vec<Option<Value>>) -> StorageTurn {
+        let names = std::mem::take(&mut self.names);
+        for ((name, info), row) in names.into_iter().zip(rows) {
+            let encrypted = BucketEncryption::from_row(row.as_deref())?.is_encrypted();
+            self.buckets.push_back(PageBucket {
+                name,
+                info,
+                encrypted,
+            });
+        }
+        // Jobs show for every rule, also one whose write storage routing leaves out.
+        let imports = ListImportsOperation::new(self.group_id);
+        self.call(StorageStep::Imports, IoCall::child(imports))
+    }
+
+    fn imports_read(&mut self, rules: Vec<BackendImport>) -> StorageTurn {
+        self.rules = rules;
+        let inputs = self.inputs.take().unwrap_or_default();
+        let snapshot = self.routing.snapshot(self.group_id);
+        self.snapshot = Some(snapshot.with_group_inputs(inputs));
+        self.next_bucket()
+    }
+
+    fn next_bucket(&mut self) -> StorageTurn {
+        let Some(bucket) = self.buckets.pop_front() else {
+            let found = std::mem::take(&mut self.found);
+            return Ok(Next::Done((found, self.token.take())));
+        };
+        let snapshot = self.snapshot.as_mut().ok_or(IoError::Unexpected {
+            expected: "the routing snapshot",
+            got: "none",
+        })?;
+        snapshot.bucket_rules = bucket.info.storage_routing;
+        snapshot.compression = bucket.info.compression;
+        let encoded = bucket.encrypted || bucket.info.compression != Compression::Off;
+        let target = destination(snapshot, &bucket.name, encoded);
+        let unknown = (target.backend_id).filter(|id| !self.storages.contains_key(id));
+        self.current = Some(target);
+        match unknown {
+            Some(id) => {
+                let backend = GetBackendOperation::new(id);
+                self.call(StorageStep::Backend(id), IoCall::child(backend))
+            }
+            None => self.read_job(),
+        }
+    }
+
+    fn read_job(&mut self) -> StorageTurn {
+        let current = self.current.as_ref().ok_or(IoError::Unexpected {
+            expected: "the current bucket",
+            got: "none",
+        })?;
+        let job = ActiveJobOperation::new(&current.bucket, &self.rules);
+        self.call(StorageStep::Job, IoCall::child(job))
+    }
+
+    fn job_read(&mut self, job: Option<ActiveJob>) -> StorageTurn {
+        if let Some(current) = self.current.take() {
+            let mut found = named(current, &self.storages);
+            found.job = job;
+            self.found.push(found);
+        }
+        self.next_bucket()
+    }
+}
+
+impl Operation for ListBucketStorageOperation {
+    type Output = BucketStoragePage;
+    type Error = BucketStorageError;
+
+    fn first(&mut self) -> StorageTurn {
+        let list = ListBucketsOperation::new(ListBucketsInput {
+            group_id: self.group_id,
+            prefix: None,
+            continuation_token: self.after.take(),
+            max_buckets: Some(self.limit),
+        });
+        self.call(StorageStep::Buckets, IoCall::child(list))
+    }
+
+    fn next(&mut self, result: IoResult) -> StorageTurn {
+        match self.step {
+            StorageStep::Buckets => {
+                self.listed(result.child::<ListBucketsResult, ListBucketsError>()??)
+            }
+            StorageStep::Inputs => {
+                self.inputs = Some(result.child::<GroupRoutingInputs, GroupInputsError>()??);
+                self.read_encryption()
+            }
+            StorageStep::Encryption => self.encryption_read(result.values()?),
+            StorageStep::Imports => {
+                self.imports_read(result.child::<Vec<BackendImport>, ImportRuleError>()??)
+            }
+            StorageStep::Backend(id) => {
+                let record = result.child::<Option<GroupStorage>, GroupQueryError>()??;
+                let group_id = self.group_id;
+                let record = record.filter(|record| record.group_id == group_id);
+                self.storages.insert(id, record);
+                self.read_job()
+            }
+            StorageStep::Job => {
+                self.job_read(result.child::<Option<ActiveJob>, ActiveJobError>()??)
+            }
+        }
+    }
 }
 
 /// Where uploads of `bucket` go: a whole-bucket link's write folder, else the backend an
@@ -264,5 +406,30 @@ mod tests {
             ),
             (Some(WRITES), true, Some("aruna-spire"))
         );
+    }
+
+    #[test]
+    fn empty_page_ends() {
+        use aruna_core::calls::ChildOutcome;
+        let group = Ulid::from_parts(1, 1);
+        let mut operation =
+            ListBucketStorageOperation::new(NodeRouting::default(), group, (None, 5));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let page = Ok::<_, ListBucketsError>(ListBucketsResult {
+            buckets: Vec::new(),
+            continuation_token: None,
+        });
+        operation
+            .next(IoResult::Child(ChildOutcome::new(page)))
+            .unwrap();
+        let inputs = Ok::<_, GroupInputsError>(GroupRoutingInputs::default());
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(inputs)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let imports = Ok::<_, ImportRuleError>(Vec::<BackendImport>::new());
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(imports)));
+        assert_eq!(turn, Ok(Next::Done((Vec::new(), None))));
     }
 }

@@ -746,7 +746,8 @@ pub async fn list_group_buckets(
     Path(group_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
-    use aruna_operations::s3::bucket::bucket_storage::list_bucket_storage;
+    use aruna_operations::driver::node_routing;
+    use aruna_operations::s3::bucket::bucket_storage::ListBucketStorageOperation;
     use aruna_operations::s3::bucket::list::bucket_cursor;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
@@ -761,7 +762,9 @@ pub async fn list_group_buckets(
     let (mut readable, mut after, mut more) = (Vec::new(), page.after, false);
     for _ in 0..HIDDEN_PAGES {
         let wanted = (after.take(), limit - readable.len());
-        let (buckets, token) = list_bucket_storage(&state.get_ctx(), group_id, wanted)
+        let context = state.get_ctx();
+        let list = ListBucketStorageOperation::new(node_routing(&context), group_id, wanted);
+        let (buckets, token) = drive(list, &context)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?;
         for found in buckets {

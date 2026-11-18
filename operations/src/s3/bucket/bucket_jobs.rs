@@ -2,20 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::pause::PausedOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::jobs::store::state::read_job_record;
+use crate::blob::pause::{PauseError, PausedOperation};
 use crate::s3::imports::cron::is_running;
-use crate::s3::imports::last_run;
-use aruna_core::effects::StorageEffect;
+use crate::s3::imports::{ImportRuleError, LastRun, LastRunOperation};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, JOB_KEYSPACE, LINKED_JOB_KEYSPACE, PURGE_FENCE_KEYSPACE,
     RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, STORAGE_CHECK_KEYSPACE, TRANSITION_KEYSPACE,
 };
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
+use aruna_core::structs::execution::job::{JobId, JobRecord, job_record_key};
 use aruna_core::structs::storage::backend_import::{BackendImport, RenameRequest, RenameTotal};
 use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_core::structs::storage::format::CompressionMigration;
@@ -23,6 +21,18 @@ use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTas
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::types::{Key, Value};
+use std::collections::VecDeque;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ActiveJobError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(transparent)]
+    Paused(#[from] PauseError),
+    #[error(transparent)]
+    Import(#[from] ImportRuleError),
+}
 
 /// What the job of a bucket does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,71 +174,119 @@ impl Rows {
     }
 }
 
-/// The job that runs or is paused on `bucket`: the one its job rows tell, else a running purge,
-/// else a running import run of one of the bucket's rules among `imports`.
-pub async fn active_job(
-    context: &DriverContext,
-    bucket: &str,
-    imports: &[BackendImport],
-) -> Result<Option<ActiveJob>, String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let reads = SPACES.map(|space| (space.to_string(), key.clone())).into();
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let Event::Storage(StorageEvent::BatchReadResult { values }) =
-        context.storage_handle.send_storage_effect(read).await
-    else {
-        return Err("could not read the jobs of the bucket".to_string());
-    };
-    let values = values.into_iter().map(|(_, value)| value).collect();
-    let rows = match Rows::parse(values) {
-        Ok(rows) => rows,
-        // A job row that cannot be read hides the bucket's job, never the whole listing.
-        Err(error) => {
-            tracing::warn!(bucket, %error, "A job row of the bucket cannot be read");
-            return Ok(None);
-        }
-    };
-    if let Some(job) = rows.active() {
-        return Ok(Some(job));
-    }
-    if let Some(fence) = rows.fence
-        && let Some(job) = purge_job(context, fence.job_id).await?
-    {
-        return Ok(Some(job));
-    }
-    for rule in imports.iter().filter(|rule| rule.bucket == bucket) {
-        let run = last_run(context, rule).await;
-        let run = run.map_err(|error| error.to_string())?;
-        if let Some(run) = run.filter(|run| is_running(run.state)) {
-            let counts = run.checkpoint;
-            let done = counts.imported.saturating_add(counts.skipped);
-            return Ok(Some(ActiveJob::running(
-                JobKind::Import,
-                done,
-                counts.failed,
-            )));
-        }
-    }
-    Ok(None)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JobStep {
+    Rows,
+    PurgeRecord(JobId),
+    PurgePaused(u64),
+    LastRun,
 }
 
-/// The purge holding the bucket's write fence while its job runs. A purge counts no failures:
-/// a failure retries or ends the whole job.
-async fn purge_job(context: &DriverContext, job_id: JobId) -> Result<Option<ActiveJob>, String> {
-    let record = read_job_record(context, job_id, None).await?;
-    let Some(record) = record.filter(|record| is_running(record.state)) else {
-        return Ok(None);
-    };
-    let paused = drive(PausedOperation::new(job_id.as_ulid()), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(Some(ActiveJob {
-        paused,
-        ..ActiveJob::running(JobKind::Purge, record.progress.current, 0)
-    }))
+type JobTurn = Result<Next<Option<ActiveJob>>, ActiveJobError>;
+
+/// The job that runs or is paused on `bucket`: the one its job rows tell, else a running purge,
+/// else a running import run of one of the bucket's rules among `imports`.
+#[derive(Debug, PartialEq)]
+pub struct ActiveJobOperation {
+    bucket: String,
+    rules: VecDeque<BackendImport>,
+    step: JobStep,
+}
+
+impl ActiveJobOperation {
+    pub fn new(bucket: &str, imports: &[BackendImport]) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            rules: (imports.iter())
+                .filter(|rule| rule.bucket == bucket)
+                .cloned()
+                .collect(),
+            step: JobStep::Rows,
+        }
+    }
+
+    fn call(&mut self, step: JobStep, call: IoCall) -> JobTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn rows_read(&mut self, values: Vec<Option<Value>>) -> JobTurn {
+        let rows = match Rows::parse(values) {
+            Ok(rows) => rows,
+            // A job row that cannot be read hides the bucket's job, never the whole listing.
+            Err(error) => {
+                tracing::warn!(bucket = %self.bucket, %error, "A job row of the bucket cannot be read");
+                return Ok(Next::Done(None));
+            }
+        };
+        if let Some(job) = rows.active() {
+            return Ok(Next::Done(Some(job)));
+        }
+        match rows.fence {
+            Some(fence) => {
+                let read = read_row(JOB_KEYSPACE, job_record_key(fence.job_id));
+                self.call(JobStep::PurgeRecord(fence.job_id), read)
+            }
+            None => self.next_rule(),
+        }
+    }
+
+    /// The purge holding the bucket's write fence while its job runs. A malformed job row is
+    /// retained for offline recovery and reads as absent.
+    fn purge_read(&mut self, job_id: JobId, value: Option<Value>) -> JobTurn {
+        let record = value.and_then(|value| JobRecord::from_bytes(&value).ok());
+        let Some(record) = record.filter(|record| is_running(record.state)) else {
+            return self.next_rule();
+        };
+        let paused = PausedOperation::new(job_id.as_ulid());
+        let done = record.progress.current;
+        self.call(JobStep::PurgePaused(done), IoCall::child(paused))
+    }
+
+    fn next_rule(&mut self) -> JobTurn {
+        let Some(rule) = self.rules.pop_front() else {
+            return Ok(Next::Done(None));
+        };
+        let run = LastRunOperation::new(&rule);
+        self.call(JobStep::LastRun, IoCall::child(run))
+    }
+
+    fn run_read(&mut self, run: Option<LastRun>) -> JobTurn {
+        let Some(run) = run.filter(|run| is_running(run.state)) else {
+            return self.next_rule();
+        };
+        let counts = run.checkpoint;
+        let done = counts.imported.saturating_add(counts.skipped);
+        let job = ActiveJob::running(JobKind::Import, done, counts.failed);
+        Ok(Next::Done(Some(job)))
+    }
+}
+
+impl Operation for ActiveJobOperation {
+    type Output = Option<ActiveJob>;
+    type Error = ActiveJobError;
+
+    fn first(&mut self) -> JobTurn {
+        let key: Key = self.bucket.as_bytes().to_vec().into();
+        let reads = SPACES.map(|space| (space.to_string(), key.clone())).into();
+        self.call(JobStep::Rows, IoCall::Read(reads))
+    }
+
+    fn next(&mut self, result: IoResult) -> JobTurn {
+        match self.step {
+            JobStep::Rows => self.rows_read(result.values()?),
+            JobStep::PurgeRecord(job_id) => self.purge_read(job_id, result.value()?),
+            // A purge counts no failures: a failure retries or ends the whole job.
+            JobStep::PurgePaused(done) => {
+                let paused = result.child::<bool, PauseError>()??;
+                Ok(Next::Done(Some(ActiveJob {
+                    paused,
+                    ..ActiveJob::running(JobKind::Purge, done, 0)
+                })))
+            }
+            JobStep::LastRun => self.run_read(result.child::<Option<LastRun>, ImportRuleError>()??),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,19 +410,47 @@ mod tests {
         assert_eq!(rows.active(), None);
     }
 
-    #[tokio::test]
-    async fn hides_unreadable_job() {
+    fn no_rows() -> IoResult {
+        IoResult::Values(vec![None; SPACES.len()])
+    }
+
+    #[test]
+    fn hides_unreadable_job() {
         // A job row that cannot be read, such as one of an older layout, hides only that job.
-        let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
-        let write = StorageEffect::Write {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: b"b".to_vec().into(),
-            value: vec![0xff; 3].into(),
-            txn_id: None,
-        };
-        storage.send_storage_effect(write).await;
-        assert_eq!(active_job(&context, "b", &[]).await, Ok(None));
+        let mut operation = ActiveJobOperation::new("b", &[]);
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let mut values = vec![None; SPACES.len()];
+        values[0] = Some(Value::from(vec![0xff; 3]));
+        let turn = operation.next(IoResult::Values(values));
+        assert_eq!(turn, Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn no_rows_no_job() {
+        let mut operation = ActiveJobOperation::new("b", &[]);
+        operation.first().unwrap();
+        assert_eq!(operation.next(no_rows()), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn other_buckets_skipped() {
+        let mut rule = crate::s3::bucket::rename::tests::rule();
+        rule.bucket = "other".to_string();
+        let mut operation = ActiveJobOperation::new("b", &[rule]);
+        operation.first().unwrap();
+        assert_eq!(operation.next(no_rows()), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn finished_run_passes() {
+        let mut rule = crate::s3::bucket::rename::tests::rule();
+        rule.bucket = "b".to_string();
+        let mut operation = ActiveJobOperation::new("b", &[rule]);
+        operation.first().unwrap();
+        let turn = operation.next(no_rows());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let none = Ok::<Option<LastRun>, ImportRuleError>(None);
+        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(none));
+        assert_eq!(operation.next(answer), Ok(Next::Done(None)));
     }
 }
