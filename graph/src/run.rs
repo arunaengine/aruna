@@ -66,7 +66,6 @@ impl GraphHandle {
             }
             // The registry cache stays with the metadata handle, which answers these first.
             MetadataEffect::FlushGraph
-            | MetadataEffect::FlushGraph
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
@@ -963,6 +962,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CachedGroup { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
+        | MetadataEffect::FlushGraph
         | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs

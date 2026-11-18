@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::api::MetadataApiError;
@@ -14,8 +13,6 @@ use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
-use crate::metadata::create_document::CreateDocumentPayload;
-use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
@@ -26,12 +23,9 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use aruna_core::NodeId;
-use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
 use thiserror::Error;
@@ -51,7 +45,6 @@ use crate::forward::transport::MetadataWriteError;
 use crate::forward::transport::forwarded_unavailable;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
-use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
 

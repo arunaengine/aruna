@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
+use aruna_core::audit::{AuditPageBatch, AuditPageRequest, AuditPageResponse, MAX_AUDIT_PEERS};
 use aruna_core::effects::AuditPageEffect;
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::id::NodeId;
@@ -13,6 +13,7 @@ use std::time::Duration;
 use tracing::trace;
 
 use crate::driver::DriverContext;
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
 const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
@@ -60,11 +61,9 @@ pub(super) async fn dispatch_audit_page(
             } else {
                 deadline
             };
-            let result = tokio::time::timeout_at(
-                peer_deadline,
-                crate::metadata::audit_entry::send_audit_request(context, node, request),
-            )
-            .await;
+            let result =
+                tokio::time::timeout_at(peer_deadline, send_audit_request(context, node, request))
+                    .await;
             (node, result)
         }
     }))
@@ -99,6 +98,26 @@ pub(super) async fn dispatch_audit_page(
         batch.mark_missing(node);
     }
     Event::Net(NetEvent::AuditPages(batch))
+}
+
+/// Adapter I/O for [`AuditPageEffect`]: requests one node's local page over the
+/// metadata control transport. Kept out of the sans-I/O operation.
+async fn send_audit_request(
+    context: &DriverContext,
+    node: NodeId,
+    request: AuditPageRequest,
+) -> Result<AuditPageResponse, MetadataReadError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    match metadata
+        .request_forwarded_write(node, MetadataTransportMessage::ForwardAuditPage { request })
+        .await
+    {
+        Ok(MetadataTransportMessage::ForwardedAuditPage { result }) => result,
+        Ok(_) | Err(_) => Err(MetadataReadError::Unavailable),
+    }
 }
 
 #[cfg(test)]
