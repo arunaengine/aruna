@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
@@ -17,7 +18,9 @@ use crate::events::Event;
 use crate::id::NodeId;
 use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
+use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
 use crate::stream::{BackendStream, StreamError};
+use crate::structs::execution::job::RoCrateLimits;
 use crate::structs::execution::job::{
     InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
     JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
@@ -25,6 +28,7 @@ use crate::structs::execution::job::{
 use crate::structs::execution::table::GzipCursor;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
@@ -477,10 +481,87 @@ pub enum JobEffect {
     UntilStop(Box<dyn SubOperation>),
     /// Reads a stream to its end; answered by `JobEvent::Collected`.
     Collect(ByteStream),
+    /// Reads a stream of at most `limit` bytes; answered by `JobEvent::CollectedUpTo`.
+    CollectUpTo { stream: ByteStream, limit: u64 },
     /// Feeds `work` until its cursor holds the next chunk; answered by `JobEvent::GzipFilled`.
     FillGzip(GzipWork),
     /// Opens an object as the job's submitter; answered by `JobEvent::Object`.
     ReadObject(Box<ObjectRead>),
+    /// Makes a stream fail once the job stops; answered by `JobEvent::Stream`.
+    StoppableStream(ByteStream),
+    /// Inspects a stored archive; answered by `JobEvent::ArchiveInspected`.
+    InspectArchive(Box<ArchiveRead>),
+    /// Opens the expanded bytes of one archive entry; answered by `JobEvent::ArchiveEntry`.
+    OpenArchiveEntry(Box<ArchiveEntryRead>),
+    /// Starts a new archive; answered by `JobEvent::ZipOpened`.
+    OpenZip,
+    /// Writes one whole entry; answered by `JobEvent::ZipWritten`.
+    ZipWhole {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        bytes: Vec<u8>,
+    },
+    /// Writes one entry from a stream until it ends or the job stops; answered by
+    /// `JobEvent::ZipStreamed`.
+    ZipStream {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        stream: ByteStream,
+    },
+    /// Ends the archive; answered by `JobEvent::ZipClosed`.
+    ZipClose(ZipWork),
+}
+
+/// One stored archive to inspect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveRead {
+    pub location: BackendLocation,
+    pub size: u64,
+    pub eln: bool,
+    pub limits: RoCrateLimits,
+    /// The size limit of the metadata file, when it is to be read as well.
+    pub metadata_bytes: Option<u64>,
+}
+
+/// One entry of a stored archive to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveEntryRead {
+    pub location: BackendLocation,
+    pub size: u64,
+    pub data_offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub compression: ArchiveCompression,
+}
+
+/// An archive being written, kept by the adapter between its entries.
+pub struct ZipWork(pub Box<dyn Any + Send>);
+
+impl fmt::Debug for ZipWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZipWork").finish_non_exhaustive()
+    }
+}
+
+/// Equal only to itself: a writer has no comparable state.
+impl PartialEq for ZipWork {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(&*self.0, &*other.0)
+    }
+}
+
+/// Why writing an entry from a stream ended early.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ZipFailure {
+    Stopped,
+    /// The source stream failed; `corrupt` when its bytes failed their integrity check.
+    Source {
+        corrupt: bool,
+        message: String,
+    },
+    Sink(String),
 }
 
 /// A stream of bytes read from a source or an object.
@@ -579,9 +660,27 @@ pub enum JobEvent {
     Finished(Box<Event>),
     Stopped,
     Collected(Result<Vec<u8>, String>),
+    /// The bytes read, `None` when the stream held more than the limit.
+    CollectedUpTo(Result<Option<Vec<u8>>, String>),
     GzipFilled {
         work: GzipWork,
         result: Result<(), GzipBroken>,
     },
     Object(Result<ObjectBody, ObjectReadFailure>),
+    Stream(ByteStream),
+    ArchiveInspected(Result<(ArchiveInspection, Option<String>), String>),
+    ArchiveEntry(Result<ByteStream, String>),
+    ZipOpened {
+        zip: ZipWork,
+        stream: ByteStream,
+    },
+    ZipWritten {
+        zip: Option<ZipWork>,
+        result: Result<(), String>,
+    },
+    ZipStreamed {
+        zip: Option<ZipWork>,
+        result: Result<[u8; 32], ZipFailure>,
+    },
+    ZipClosed(Result<(), String>),
 }
