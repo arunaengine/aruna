@@ -15,7 +15,7 @@ use crate::groups::backends::{RecordReadError, parse_read};
 use crate::jobs::backend_import::read_checkpoint;
 use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
-use aruna_core::calls::IoError;
+use aruna_core::calls::{IoCall, IoError};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_PATTERN_KEYSPACE};
@@ -181,30 +181,26 @@ impl LinkScan {
         }
     }
 
-    pub(crate) fn page(&self, start: Option<Key>, txn_id: Option<TxnId>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            prefix: Some(self.group_id.to_bytes().to_vec().into()),
-            start: start.map(IterStart::After),
+    pub(crate) fn page(&self, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: self.group_id.to_bytes().to_vec().into(),
+            after,
             limit: RULE_PAGE,
-            txn_id,
-        })]
+        }
     }
 
-    /// The next page while one is left and no link is found; `None` once `linked` is final.
+    /// The next page while one is left and no link is found; `None` ends the scan.
     pub(crate) fn scanned(
         &mut self,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-        txn_id: Option<TxnId>,
-    ) -> Result<Option<Effects>, ConversionError> {
+    ) -> Result<Option<IoCall>, ConversionError> {
         for (_, value) in values {
             let rule = BackendImport::from_bytes(&value)?;
-            self.linked |= rule.bucket == self.bucket && rule.mapped_bucket().is_some();
+            self.linked |= rule.bucket == self.bucket && rule.mapped;
         }
-        Ok(next
-            .filter(|_| !self.linked)
-            .map(|next| self.page(Some(next), txn_id)))
+        Ok(next.filter(|_| !self.linked).map(|next| self.page(Some(next))))
     }
 }
 
