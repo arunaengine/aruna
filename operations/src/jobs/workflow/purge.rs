@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod audit;
-
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
@@ -28,11 +26,11 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::types::Key;
 use ulid::Ulid;
 
-use self::audit::{WriteAuditOperation, purge_audit_record};
 use super::super::executor::JobRunOutcome;
 use super::super::store::JobMutationError;
 use super::super::store::job_calls::{RenewOutcome, flush_progress, put_purge_checkpoint};
 use super::super::store::row_calls::read_purge_checkpoint;
+use super::storage_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -1212,4 +1210,5 @@ impl Operation for PurgeJobOperation {
 }
 
 #[cfg(test)]
+#[path = "purge_tests.rs"]
 mod tests;
