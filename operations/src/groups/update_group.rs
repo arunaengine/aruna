@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, DISPLAY_NAME_PATH};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -18,10 +19,8 @@ use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
@@ -62,39 +61,15 @@ pub enum GroupChange {
 #[derive(Debug, PartialEq)]
 pub struct UpdateGroupOperation {
     config: UpdateGroupConfig,
-    txn_id: Option<TxnId>,
-    /// Bucket the group rows publish onto, read inside the write transaction.
-    fence: aruna_core::placement::fence::WriteFence,
     state: UpdateGroupState,
-    conflicts: u8,
-    output: Option<Result<Group, UpdateGroupError>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Which check or write the update waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum UpdateGroupState {
-    Init,
     AuthGroupAdmin,
     AuthRealmAdmin,
-    StartTransaction,
-    ReadCurrent,
-    WriteGroupState {
-        group: Group,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        group: Group,
-    },
-    ReadBucketFence {
-        group: Group,
-    },
-    CommitTransaction {
-        group: Group,
-    },
-    ScheduleOutboxDrain {
-        group: Group,
-    },
-    Finish,
-    Error,
+    Write,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -109,8 +84,6 @@ pub enum UpdateGroupError {
     InvalidLocation,
     #[error("stored group id does not match the requested group id")]
     GroupIdMismatch,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("the group's bucket cut over to a new holder set; retry the rename")]
     PlacementFenced,
     #[error(transparent)]
@@ -129,37 +102,147 @@ pub enum UpdateGroupError {
     NotFinished,
 }
 
+impl From<IoError> for UpdateGroupError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "UpdateGroup".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type UpdateTurn = Result<Next<Group>, UpdateGroupError>;
+
+/// The admin event the change applies; an invalid name or location is refused.
+fn admin_change(config: &UpdateGroupConfig) -> Result<AdminDocumentOperation, UpdateGroupError> {
+    match &config.change {
+        GroupChange::Name(name) => normalize_group_name(name)
+            .map(|display_name| AdminDocumentOperation::DisplayNameSet { display_name })
+            .ok_or(UpdateGroupError::InvalidDisplayName),
+        GroupChange::Location(Some(location)) if !location.valid() => {
+            Err(UpdateGroupError::InvalidLocation)
+        }
+        GroupChange::Location(location) => Ok(AdminDocumentOperation::GroupLocationSet {
+            location: location.clone(),
+        }),
+    }
+}
+
 impl UpdateGroupOperation {
     pub fn new(config: UpdateGroupConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            fence: Default::default(),
-            state: UpdateGroupState::Init,
-            conflicts: 0,
-            output: None,
+            state: UpdateGroupState::AuthGroupAdmin,
         }
     }
 
-    /// A conflicted commit already discarded its transaction, so the retry
-    /// opens a fresh one and rereads every row, including the realm config.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.fence = Default::default();
-        self.start()
+    fn check_permission(&self, path: String) -> Next<Group> {
+        Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path,
+                required_permission: Permission::WRITE,
+            },
+        )))
     }
 
-    fn admin_change(&self) -> Result<AdminDocumentOperation, UpdateGroupError> {
-        match &self.config.change {
-            GroupChange::Name(name) => normalize_group_name(name)
-                .map(|display_name| AdminDocumentOperation::DisplayNameSet { display_name })
-                .ok_or(UpdateGroupError::InvalidDisplayName),
-            GroupChange::Location(Some(location)) if !location.valid() => {
-                Err(UpdateGroupError::InvalidLocation)
+    /// The write reruns from its read after a lost commit, which also rereads the realm config.
+    fn write(&mut self) -> Next<Group> {
+        self.state = UpdateGroupState::Write;
+        let config = self.config.clone();
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || GroupUpdate::new(config.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(child))
+    }
+
+    fn handle_auth(&mut self, allowed: Result<bool, AuthorizationError>) -> UpdateTurn {
+        match allowed {
+            Ok(true) => Ok(self.write()),
+            // Realm admins may rename a group they are not a member of, so a refused
+            // group-admin check falls back to the realm group administration path.
+            Ok(false) if self.state == UpdateGroupState::AuthGroupAdmin => {
+                self.state = UpdateGroupState::AuthRealmAdmin;
+                let path = format!("/{}/admin/groups", self.config.actor.realm_id);
+                Ok(self.check_permission(path))
             }
-            GroupChange::Location(location) => Ok(AdminDocumentOperation::GroupLocationSet {
-                location: location.clone(),
-            }),
+            Ok(false) => Err(UpdateGroupError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Group rename authorization check failed");
+                match error {
+                    AuthorizationError::StorageError(error) => Err(error.into()),
+                    _ => Err(UpdateGroupError::Unauthorized),
+                }
+            }
+        }
+    }
+}
+
+impl Operation for UpdateGroupOperation {
+    type Output = Group;
+    type Error = UpdateGroupError;
+
+    fn first(&mut self) -> UpdateTurn {
+        if self.config.auth_context.realm_id != self.config.actor.realm_id
+            || self.config.auth_context.user_id != self.config.actor.user_id
+        {
+            return Err(UpdateGroupError::Unauthorized);
+        }
+        admin_change(&self.config)?;
+        Ok(self.check_permission(format!(
+            "/{}/g/{}/admin",
+            self.config.actor.realm_id, self.config.group_id
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> UpdateTurn {
+        match self.state {
+            UpdateGroupState::AuthGroupAdmin | UpdateGroupState::AuthRealmAdmin => {
+                let allowed = result.child::<bool, AuthorizationError>()?;
+                self.handle_auth(allowed)
+            }
+            UpdateGroupState::Write => result.child::<Group, UpdateGroupError>()?.map(Next::Done),
+        }
+    }
+}
+
+/// What the rename transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+    Fence,
+}
+
+/// Reads the group, its admin state and the realm config, then stores the change and its queued
+/// admin event, and takes the bucket fence, in one write transaction.
+#[derive(Debug, PartialEq)]
+struct GroupUpdate {
+    config: UpdateGroupConfig,
+    /// Bucket the group rows publish onto, read inside the write transaction.
+    fence: aruna_core::placement::fence::WriteFence,
+    stage: Stage,
+    group: Option<Group>,
+    deletes: Vec<(KeySpace, Key)>,
+}
+
+impl GroupUpdate {
+    fn new(config: UpdateGroupConfig) -> Self {
+        Self {
+            config,
+            fence: Default::default(),
+            stage: Stage::Read,
+            group: None,
+            deletes: Vec::new(),
         }
     }
 
@@ -175,57 +258,13 @@ impl UpdateGroupOperation {
         }
     }
 
-    fn check_permission(&self, path: String) -> Effects {
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path,
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
-    }
-
-    /// Realm admins may rename a group they are not a member of, so a refused
-    /// group-admin check falls back to the realm group administration path.
-    fn emit_realm_auth(&mut self) -> Effects {
-        self.state = UpdateGroupState::AuthRealmAdmin;
-        self.check_permission(format!("/{}/admin/groups", self.config.actor.realm_id))
-    }
-
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = UpdateGroupState::ReadCurrent;
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    GROUP_KEYSPACE.to_string(),
-                    ByteView::from(self.config.group_id.to_bytes()),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    ByteView::from(*self.config.actor.realm_id.as_bytes()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_write_state(
         &mut self,
         group_value: Option<Value>,
         reducer_state_value: Option<Value>,
         realm_config_value: Option<Value>,
-    ) -> Result<Effects, UpdateGroupError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(UpdateGroupError::MissingTransaction);
-        };
-        let change = self.admin_change()?;
+    ) -> UpdateTurn {
+        let change = admin_change(&self.config)?;
         let group_value = group_value.ok_or(UpdateGroupError::GroupNotFound)?;
         let mut group = Group::from_bytes(&group_value)?;
         if group.group_id != self.config.group_id || group.realm_id != self.config.actor.realm_id {
@@ -291,243 +330,88 @@ impl UpdateGroupOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = UpdateGroupState::WriteGroupState {
-            group,
-            stale_conflict_deletes,
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.group = Some(group);
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    /// Takes the bucket's fence inside the transaction before committing, so a
-    /// departing holder's close rejects or conflicts this write.
-    fn emit_commit_transaction(&mut self, group: Group) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(UpdateGroupError::MissingTransaction);
-        };
+    /// Takes the bucket's fence inside the transaction before committing, so a departing holder's
+    /// close rejects or conflicts this write.
+    fn fence_or_finish(&mut self) -> UpdateTurn {
         if self.fence.is_empty() {
-            return self.emit_commit(group);
+            return self.finish();
         }
-        self.state = UpdateGroupState::ReadBucketFence { group };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
+        self.stage = Stage::Fence;
+        Ok(Next::Call(IoCall::Read(self.fence.reads())))
     }
 
-    fn emit_commit(&mut self, group: Group) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(UpdateGroupError::MissingTransaction);
-        };
-        self.state = UpdateGroupState::CommitTransaction { group };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: UpdateGroupError) -> Effects {
-        let cleanup = self.abort();
-        self.state = UpdateGroupState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(UpdateGroupError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-
-    fn handle_auth(&mut self, event: Event, allow_fallback: bool) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected_event("authorization result", got);
-        };
-        match allowed {
-            Ok(true) => {
-                self.state = UpdateGroupState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-            Ok(false) if allow_fallback => self.emit_realm_auth(),
-            Ok(false) => self.fail(UpdateGroupError::Unauthorized),
-            Err(error) => {
-                warn!(error = %error, "Group rename authorization check failed");
-                match error {
-                    AuthorizationError::StorageError(error) => {
-                        self.fail(UpdateGroupError::StorageError(error))
-                    }
-                    _ => self.fail(UpdateGroupError::Unauthorized),
-                }
-            }
-        }
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> UpdateTurn {
+        let output = self.group.take().ok_or(UpdateGroupError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for UpdateGroupOperation {
+impl Operation for GroupUpdate {
     type Output = Group;
     type Error = UpdateGroupError;
 
-    fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id
-            || self.config.auth_context.user_id != self.config.actor.user_id
-        {
-            return self.fail(UpdateGroupError::Unauthorized);
-        }
-        if let Err(error) = self.admin_change() {
-            return self.fail(error);
-        }
-        self.state = UpdateGroupState::AuthGroupAdmin;
-        self.check_permission(format!(
-            "/{}/g/{}/admin",
-            self.config.actor.realm_id, self.config.group_id
-        ))
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            UpdateGroupState::AuthGroupAdmin => self.handle_auth(event, true),
-            UpdateGroupState::AuthRealmAdmin => self.handle_auth(event, false),
-            UpdateGroupState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            UpdateGroupState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [
-                        (_, group_value),
-                        (_, reducer_state_value),
-                        (_, realm_config_value),
-                    ] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "storage batch read result with group, admin state, and realm config",
-                            "a batch of another length",
-                        );
-                    };
-                    match self.emit_write_state(
-                        group_value.clone(),
-                        reducer_state_value.clone(),
-                        realm_config_value.clone(),
-                    ) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            UpdateGroupState::WriteGroupState {
-                group,
-                stale_conflict_deletes,
-            } => {
-                let group = group.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(UpdateGroupError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = UpdateGroupState::DeleteAdminConflicts { group };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit_transaction(group)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
-            }
-            UpdateGroupState::DeleteAdminConflicts { group } => {
-                let group = group.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit_transaction(group)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
-            }
-            UpdateGroupState::ReadBucketFence { group } => {
-                let group = group.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                        if self.fence.admits(&values) {
-                            self.emit_commit(group)
-                        } else {
-                            self.fail(UpdateGroupError::PlacementFenced)
-                        }
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("bucket fence read result", other.label()),
-                }
-            }
-            UpdateGroupState::CommitTransaction { group } => {
-                let group = group.clone();
-                match event {
-                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                        self.txn_id = None;
-                        self.output = Some(Ok(group.clone()));
-                        self.state = UpdateGroupState::ScheduleOutboxDrain { group };
-                        smallvec![schedule_drain_effect()]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => {
-                        self.txn_id = None;
-                        if error == StorageError::TransactionConflict
-                            && self.conflicts < super::CONFLICT_RETRIES
-                        {
-                            return self.restart_after_conflict();
-                        }
-                        self.fail(error.into())
-                    }
-                    other => self.unexpected_event("transaction commit result", other.label()),
-                }
-            }
-            UpdateGroupState::ScheduleOutboxDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = UpdateGroupState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document outbox drain; durable outbox remains retryable");
-                    self.state = UpdateGroupState::Finish;
-                    smallvec![]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            UpdateGroupState::Init | UpdateGroupState::Finish | UpdateGroupState::Error => {
-                let got = event.label();
-                self.unexpected_event("no event", got)
-            }
-        }
+    fn conflict_retries() -> u32 {
+        super::CONFLICT_RETRIES as u32
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            UpdateGroupState::Finish | UpdateGroupState::Error
-        )
+    fn first(&mut self) -> UpdateTurn {
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                GROUP_KEYSPACE.to_string(),
+                ByteView::from(self.config.group_id.to_bytes()),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*self.config.actor.realm_id.as_bytes()),
+            ),
+        ])))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(UpdateGroupError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> UpdateTurn {
+        match self.stage {
+            Stage::Read => {
+                let [group, reducer, config] = values::<3>(result)?;
+                self.emit_write_state(group, reducer, config)
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.fence_or_finish()
+            }
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(UpdateGroupError::NotFinished);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(UpdateGroupError::PlacementFenced);
+                }
+                self.finish()
+            }
         }
     }
 }
@@ -544,24 +428,22 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, UpdateGroupState};
+    use super::{GroupUpdate, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::errors::{AuthorizationError, StorageError};
     use aruna_core::keyspaces::{
         DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::{GroupId, TxnId};
+    use aruna_core::types::GroupId;
     use byteview::ByteView;
     use ulid::Ulid;
 
@@ -609,66 +491,57 @@ mod pure_tests {
         }
     }
 
-    fn read_values() -> Vec<(ByteView, Option<ByteView>)> {
-        let target = AdminDocumentTarget::Group { group_id: group() };
+    /// The group row, no admin state yet, and no realm config.
+    fn read_values() -> Vec<Option<ByteView>> {
         vec![
-            (
-                ByteView::from(group().to_bytes()),
-                Some(stored_group().to_bytes(&actor()).unwrap().into()),
-            ),
-            (reducer_state_key(&target), None),
-            (ByteView::from(*realm().as_bytes()), None),
+            Some(stored_group().to_bytes(&actor()).unwrap().into()),
+            None,
+            None,
         ]
     }
 
     fn authorize(
         operation: &mut UpdateGroupOperation,
         allowed: bool,
-    ) -> aruna_core::types::Effects {
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult {
-                allowed: Ok(allowed),
-            },
-        ))
+    ) -> Result<Next<Group>, UpdateGroupError> {
+        let checked = Ok::<_, AuthorizationError>(allowed);
+        operation.next(IoResult::Child(ChildOutcome::new(checked)))
+    }
+
+    fn checked(name: &str) -> UpdateGroupOperation {
+        let mut operation = UpdateGroupOperation::new(config(name));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation
     }
 
     #[test]
     fn renames_and_queues() {
-        let mut operation = UpdateGroupOperation::new(config("  Platform  "));
+        let mut operation = checked("  Platform  ");
         assert!(matches!(
-            operation.start().first(),
-            Some(Effect::SubOperation(_))
-        ));
-        assert!(matches!(
-            authorize(&mut operation, true).first(),
-            Some(Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            }))
+            authorize(&mut operation, true),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
 
-        let txn_id = TxnId::generate();
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let mut write = GroupUpdate::new(config("  Platform  "));
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        let Ok(Next::Call(IoCall::Read(reads))) = write.first() else {
+            panic!("expected the group reads");
+        };
         let target = AdminDocumentTarget::Group { group_id: group() };
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchRead { reads, txn_id: id }) => {
-                assert_eq!(*id, Some(txn_id));
-                assert_eq!(reads.len(), 3);
-                assert_eq!(reads[0].0, GROUP_KEYSPACE);
-                assert_eq!(reads[0].1.as_ref(), group().to_bytes().as_slice());
-                assert_eq!(reads[1].0, DOCUMENT_STATE_KEYSPACE);
-                assert_eq!(reads[1].1, reducer_state_key(&target));
-                assert_eq!(reads[2].0, REALM_CONFIG_KEYSPACE);
-            }
-            other => panic!("unexpected read effect: {other:?}"),
-        }
+        assert_eq!(reads.len(), 3);
+        assert_eq!(reads[0].0, GROUP_KEYSPACE);
+        assert_eq!(reads[0].1.as_ref(), group().to_bytes().as_slice());
+        assert_eq!(reads[1].0, DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(reads[1].1, reducer_state_key(&target));
+        assert_eq!(reads[2].0, REALM_CONFIG_KEYSPACE);
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: read_values(),
-        }));
+        let written = write.next(IoResult::Values(read_values()));
         let document = DocumentTarget::GroupAuthorization { group_id: group() };
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
-                assert_eq!(*id, Some(txn_id));
+        match written {
+            Ok(Next::Call(IoCall::Write(writes))) => {
                 let group_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == GROUP_KEYSPACE)
@@ -706,130 +579,75 @@ mod pure_tests {
                         )
                 ));
             }
-            other => panic!("unexpected write effect: {other:?}"),
+            _ => panic!("expected the group writes"),
         }
 
-        assert!(matches!(
-            operation
-                .step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }))
-                .first(),
-            Some(Effect::Storage(StorageEffect::CommitTransaction { .. }))
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::Task(_))));
-        assert!(
-            operation
-                .step(Event::Task(TaskEvent::TimerScheduled {
-                    key: TaskKey::DrainSyncOutbox,
-                    after: std::time::Duration::ZERO,
-                }))
-                .is_empty()
-        );
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap().display_name, "Platform");
+        let Ok(Next::Then { output, calls }) = write.next(IoResult::Done) else {
+            panic!("expected the renamed group with the drain wake");
+        };
+        assert_eq!(output.display_name, "Platform");
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     #[test]
     fn realm_admin_fallback() {
         // A realm admin who is not a group member renames through the realm path.
-        let mut operation = UpdateGroupOperation::new(config("Platform"));
-        operation.start();
+        let mut operation = checked("Platform");
         assert!(matches!(
-            authorize(&mut operation, false).first(),
-            Some(Effect::SubOperation(_))
+            authorize(&mut operation, false),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
         assert!(matches!(
-            authorize(&mut operation, true).first(),
-            Some(Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            }))
+            authorize(&mut operation, true),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
     }
 
     #[test]
     fn rejects_unauthorized_actor() {
-        let mut operation = UpdateGroupOperation::new(config("Platform"));
-        operation.start();
-        authorize(&mut operation, false);
-        assert!(authorize(&mut operation, false).is_empty());
-        assert_eq!(operation.finalize(), Err(UpdateGroupError::Unauthorized));
+        let mut operation = checked("Platform");
+        authorize(&mut operation, false).unwrap();
+        assert_eq!(
+            authorize(&mut operation, false).err(),
+            Some(UpdateGroupError::Unauthorized)
+        );
     }
 
     #[test]
     fn rejects_invalid_name() {
         for name in ["   ", &"n".repeat(257)] {
             let mut operation = UpdateGroupOperation::new(config(name));
-            assert!(operation.start().is_empty());
             assert_eq!(
-                operation.finalize(),
-                Err(UpdateGroupError::InvalidDisplayName)
+                operation.first().err(),
+                Some(UpdateGroupError::InvalidDisplayName)
             );
         }
     }
 
     #[test]
     fn reports_missing_group() {
-        let mut operation = UpdateGroupOperation::new(config("Platform"));
-        operation.start();
-        authorize(&mut operation, true);
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let mut write = GroupUpdate::new(config("Platform"));
+        write.first().unwrap();
         let mut values = read_values();
-        values[0].1 = None;
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        assert_eq!(operation.finalize(), Err(UpdateGroupError::GroupNotFound));
-    }
-
-    #[test]
-    fn retries_commit_conflict() {
-        let mut operation = UpdateGroupOperation::new(config("Platform"));
-        let commit = |operation: &mut UpdateGroupOperation| {
-            operation.txn_id = Some(TxnId::generate());
-            operation.state = UpdateGroupState::CommitTransaction {
-                group: stored_group(),
-            };
-            operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }))
-        };
-
-        for _ in 0..crate::groups::CONFLICT_RETRIES {
-            let effects = commit(&mut operation);
-            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-            assert_eq!(operation.state, UpdateGroupState::AuthGroupAdmin);
-            assert_eq!(operation.txn_id, None);
-        }
-        assert!(commit(&mut operation).is_empty());
+        values[0] = None;
         assert_eq!(
-            operation.finalize(),
-            Err(UpdateGroupError::StorageError(
-                StorageError::TransactionConflict
-            ))
+            write.next(IoResult::Values(values)).err(),
+            Some(UpdateGroupError::GroupNotFound)
         );
     }
 
     #[test]
-    fn aborts_open_transaction() {
-        let mut operation = UpdateGroupOperation::new(config("Platform"));
-        operation.start();
-        authorize(&mut operation, true);
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::TransactionConflict,
-        }));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { txn_id: id }))
-                if *id == txn_id
-        ));
+    fn retries_commit_conflict() {
+        // A lost commit reruns the whole write, reading the realm config again.
+        let conflict = UpdateGroupError::from(IoError::Conflict);
+        assert_eq!(
+            conflict,
+            UpdateGroupError::StorageError(StorageError::TransactionConflict)
+        );
+        assert!(GroupUpdate::is_conflict(&conflict));
+        assert_eq!(
+            GroupUpdate::conflict_retries(),
+            crate::groups::CONFLICT_RETRIES as u32
+        );
     }
 }
