@@ -15,6 +15,7 @@ use super::records::RecordStoreError;
 use super::records::verify::FamilyView;
 
 pub mod admit;
+pub mod admit_here;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
