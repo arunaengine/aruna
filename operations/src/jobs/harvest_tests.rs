@@ -377,10 +377,26 @@ fn provenance(state: HarvestRecordState, datestamp: u64) -> HarvestProvenance {
 }
 
 fn apply(deleted: bool) -> ApplyRecordOperation {
-    let mut operation =
-        ApplyRecordOperation::new(source(), actor(), oai_record("oai:1", deleted), 100);
+    let mut operation = ApplyRecordOperation::new(
+        source(),
+        actor(),
+        local(),
+        oai_record("oai:1", deleted),
+        100,
+    );
     operation.first().unwrap();
     operation
+}
+
+fn local() -> Option<NodeId> {
+    Some(link().owner_node)
+}
+
+fn created() -> IoResult {
+    child::<_, MetadataWriteError>(Ok(CreateDocumentResult {
+        record: registry_record(),
+        event_id: Ulid::from_bytes([3; 16]),
+    }))
 }
 
 fn routed(answer: Result<(), HarvestWriteFailure>) -> IoResult {
@@ -424,7 +440,8 @@ fn updating() -> ApplyRecordOperation {
 
 #[test]
 fn empty_identifier_skips() {
-    let mut operation = ApplyRecordOperation::new(source(), actor(), oai_record("", false), 1);
+    let mut operation =
+        ApplyRecordOperation::new(source(), actor(), local(), oai_record("", false), 1);
     assert_eq!(operation.first(), Ok(Next::Done(RecordApplied::Skipped)));
 }
 
@@ -462,12 +479,10 @@ fn pending_row_first() {
         operation.next(written()),
         Ok(Next::Call(IoCall::Child(_)))
     ));
+    let create = operation.create_call(document()).unwrap();
+    assert_eq!(operation.next(allowed()), Ok(Next::Call(create)));
     assert!(matches!(
-        operation.next(allowed()),
-        Ok(Next::Call(IoCall::Effect(_)))
-    ));
-    assert!(matches!(
-        operation.next(routed(Ok(()))),
+        operation.next(created()),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     assert_eq!(
@@ -486,8 +501,11 @@ fn existing_document_updated() {
     let pending = provenance(HarvestRecordState::PendingCreate, 50);
     operation.next(read_answer(Some(&pending))).unwrap();
     operation.next(allowed()).unwrap();
+    let exists = child::<CreateDocumentResult, MetadataWriteError>(Err(
+        MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists),
+    ));
     assert_eq!(
-        operation.next(routed(Err(HarvestWriteFailure::AlreadyExists))),
+        operation.next(exists),
         Ok(Next::Call(ApplyRecordOperation::registry_call(document())))
     );
     assert!(matches!(
@@ -583,12 +601,13 @@ fn withdrawn_record_tombstones() {
         operation.next(read_answer::<MetadataRegistryRecord>(None)),
         Ok(Next::Call(ApplyRecordOperation::pending_call(document())))
     );
-    assert!(matches!(
+    assert_eq!(
         operation.next(nothing_pending()),
-        Ok(Next::Call(IoCall::Effect(_)))
-    ));
+        Ok(Next::Call(operation.delete_call(document(), None)))
+    );
+    let absent = child::<(), MetadataWriteError>(Err(MetadataWriteError::NotFound));
     assert!(matches!(
-        operation.next(routed(Err(HarvestWriteFailure::NotFound))),
+        operation.next(absent),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     assert_eq!(
@@ -673,4 +692,17 @@ fn access_time_measured() {
     operation.next(read_answer(Some(&live))).unwrap();
     operation.stamp(NOW_MS + 7);
     assert_eq!(operation.access_elapsed(), Duration::from_millis(7));
+}
+
+#[test]
+fn failed_delete_sorted() {
+    let mut operation = apply(true);
+    operation.row = Some(provenance(HarvestRecordState::Live, 50));
+    operation.step = ApplyStep::Delete(document());
+    let failed =
+        child::<(), MetadataWriteError>(Err(MetadataWriteError::Undeliverable("no holder".into())));
+    let Err(HarvestFailure::Job(error)) = operation.next(failed) else {
+        panic!("a failed delete ends the record");
+    };
+    assert!(error.message.starts_with("harvest apply: "));
 }

@@ -842,7 +842,7 @@ pub enum NetEffect {
     /// Verifies a token that may already be revoked and reads its claims; answers
     /// `NetEvent::RevocationClaims`.
     RevocationClaims(Box<crate::metadata::AuthToken>),
-    /// Routes one harvest metadata write to the document's holders; answers
+    /// Routes one harvest metadata update to the document's holders; answers
     /// `NetEvent::HarvestWrite`.
     HarvestWrite(Box<crate::repository::remote::HarvestWrite>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.

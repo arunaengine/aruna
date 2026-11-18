@@ -527,7 +527,7 @@ pub enum NetEvent {
     WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
     /// The verified claims of a token named for revocation, or why it is invalid.
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
-    /// The end of a routed harvest metadata write.
+    /// The end of a routed harvest metadata update.
     HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,

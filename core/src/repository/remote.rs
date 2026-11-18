@@ -25,7 +25,6 @@ use crate::structs::identity::auth::{Actor, AuthContext};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-use crate::types::GroupId;
 
 /// What an operation needs to know about this node; the caller reads it before the run.
 #[derive(Clone, Debug, PartialEq)]
@@ -336,37 +335,19 @@ pub enum RemoteFailure {
     Retryable(String),
 }
 
-/// One metadata write of a harvest job, routed to the document's holders.
+/// One metadata update of a harvest job, routed to the document's holders.
 #[derive(Clone, Debug, PartialEq)]
-pub enum HarvestWrite {
-    Create {
-        actor: Actor,
-        owner: AuthContext,
-        group_id: GroupId,
-        document_id: Ulid,
-        document_path: String,
-        jsonld: String,
-    },
-    Update {
-        actor: Actor,
-        owner: AuthContext,
-        record: Option<Box<MetadataRegistryRecord>>,
-        document_id: Ulid,
-        jsonld: String,
-    },
-    Delete {
-        actor: Actor,
-        owner: AuthContext,
-        record: Option<Box<MetadataRegistryRecord>>,
-        document_id: Ulid,
-    },
+pub struct HarvestWrite {
+    pub actor: Actor,
+    pub owner: AuthContext,
+    pub record: Option<Box<MetadataRegistryRecord>>,
+    pub document_id: Ulid,
+    pub jsonld: String,
 }
 
-/// How a routed harvest write failed, sorted for the job's retry decision.
+/// How a routed harvest update failed, sorted for the job's retry decision.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum HarvestWriteFailure {
-    #[error("document already exists")]
-    AlreadyExists,
     #[error("metadata document not found")]
     NotFound,
     #[error("{0}")]

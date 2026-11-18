@@ -5,10 +5,12 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::remote::{
     HarvestWrite, HarvestWriteFailure, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure,
@@ -36,6 +38,7 @@ use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
+use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
     OaiPage, OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
@@ -48,7 +51,13 @@ use crate::harvest::repository::{
 };
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::JobRunOutcome;
-use crate::metadata::create_document::mint_document_for;
+use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
+use crate::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    CreateDocumentResult, mint_document_for,
+};
+use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::routed_write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
@@ -358,7 +367,14 @@ impl HarvestJobOperation {
             .actor
             .clone()
             .ok_or_else(|| permanent("net plane unavailable for harvest"))?;
-        let apply = ApplyRecordOperation::new(self.source()?.clone(), actor, record, datestamp_ms);
+        let local_node = self.scope.node.map(|(node, _)| node);
+        let apply = ApplyRecordOperation::new(
+            self.source()?.clone(),
+            actor,
+            local_node,
+            record,
+            datestamp_ms,
+        );
         self.step = HarvestStep::Record;
         Ok(Next::Call(IoCall::child(apply)))
     }
@@ -554,6 +570,7 @@ enum ApplyStep {
 pub(crate) struct ApplyRecordOperation {
     source: HarvestSource,
     actor: Actor,
+    local_node: Option<NodeId>,
     record: OaiRecord,
     datestamp_ms: u64,
     row: Option<HarvestProvenance>,
@@ -568,12 +585,14 @@ impl ApplyRecordOperation {
     pub(crate) fn new(
         source: HarvestSource,
         actor: Actor,
+        local_node: Option<NodeId>,
         record: OaiRecord,
         datestamp_ms: u64,
     ) -> Self {
         Self {
             source,
             actor,
+            local_node,
             record,
             datestamp_ms,
             row: None,
@@ -668,20 +687,40 @@ impl ApplyRecordOperation {
         Ok(Next::Call(call))
     }
 
-    fn routed(&self, write: HarvestWrite) -> IoCall {
-        IoCall::Effect(Box::new(Effect::Net(NetEffect::HarvestWrite(Box::new(
-            write,
-        )))))
+    /// Harvest writes run as the source owner, after the access check.
+    fn owner_token(&self) -> Option<AuthToken> {
+        Some(AuthToken::internal(self.owner()))
+    }
+
+    fn create_call(&self, document_id: Ulid) -> Result<IoCall, HarvestFailure> {
+        let create = CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+            actor: self.actor.clone(),
+            group_id: self.source.group_id,
+            document_id,
+            document_path: self.path()?,
+            public: false,
+            payload: CreateDocumentPayload::RoCrate {
+                jsonld: dc_to_jsonld(&self.record),
+            },
+        });
+        Ok(IoCall::child(RouteCreateOperation::new(
+            create,
+            self.local_node,
+            self.owner_token(),
+        )))
     }
 
     fn update_call(&self, document_id: Ulid, record: Option<MetadataRegistryRecord>) -> IoCall {
-        self.routed(HarvestWrite::Update {
+        let write = HarvestWrite {
             actor: self.actor.clone(),
             owner: self.owner(),
             record: record.map(Box::new),
             document_id,
             jsonld: dc_to_jsonld(&self.record),
-        })
+        };
+        IoCall::Effect(Box::new(Effect::Net(NetEffect::HarvestWrite(Box::new(
+            write,
+        )))))
     }
 
     fn registry_call(document_id: Ulid) -> IoCall {
@@ -700,12 +739,12 @@ impl ApplyRecordOperation {
     }
 
     fn delete_call(&self, document_id: Ulid, record: Option<MetadataRegistryRecord>) -> IoCall {
-        self.routed(HarvestWrite::Delete {
-            actor: self.actor.clone(),
-            owner: self.owner(),
-            record: record.map(Box::new),
+        IoCall::child(RouteDeleteOperation::new(
+            (self.actor.clone(), self.local_node),
+            record,
             document_id,
-        })
+            self.owner_token(),
+        ))
     }
 
     fn decide(&mut self, existing: Option<HarvestProvenance>) -> ApplyTurn {
@@ -839,27 +878,22 @@ impl Operation for ApplyRecordOperation {
             }
             ApplyStep::CreateAccess(document_id) => {
                 self.access_result(result)?;
-                let write = HarvestWrite::Create {
-                    actor: self.actor.clone(),
-                    owner: self.owner(),
-                    group_id: self.source.group_id,
-                    document_id,
-                    document_path: self.path()?,
-                    jsonld: dc_to_jsonld(&self.record),
-                };
+                let call = self.create_call(document_id)?;
                 self.step = ApplyStep::Create(document_id);
-                Ok(Next::Call(self.routed(write)))
+                Ok(Next::Call(call))
             }
-            ApplyStep::Create(document_id) => match routed_result(result)? {
-                Ok(()) => self.finish_live(document_id, RecordApplied::Minted),
-                // A create the pending identity already committed under a different payload:
-                // the id is resolved, and the newer content lands as an update.
-                Err(HarvestWriteFailure::AlreadyExists) => {
-                    self.step = ApplyStep::CreateStored(document_id);
-                    Ok(Next::Call(Self::registry_call(document_id)))
+            ApplyStep::Create(document_id) => {
+                match result.child::<CreateDocumentResult, MetadataWriteError>()? {
+                    Ok(_) => self.finish_live(document_id, RecordApplied::Minted),
+                    // A create the pending identity already committed under a different payload:
+                    // the id is resolved, and the newer content lands as an update.
+                    Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
+                        self.step = ApplyStep::CreateStored(document_id);
+                        Ok(Next::Call(Self::registry_call(document_id)))
+                    }
+                    Err(error) => Err(write_failure(error)),
                 }
-                Err(error) => Err(apply_failure(error)),
-            },
+            }
             ApplyStep::CreateStored(document_id) => {
                 let stored = stored_record(result)?;
                 let call = self.update_call(document_id, stored);
@@ -930,11 +964,11 @@ impl Operation for ApplyRecordOperation {
                 Ok(Next::Call(call))
             }
             ApplyStep::Delete(document_id) => {
-                match routed_result(result)? {
+                match result.child::<(), MetadataWriteError>()? {
                     // Every holder reporting the document absent is the same evidence as a
                     // delete this run performed.
-                    Ok(()) | Err(HarvestWriteFailure::NotFound) => {}
-                    Err(error) => return Err(apply_failure(error)),
+                    Ok(()) | Err(MetadataWriteError::NotFound) => {}
+                    Err(error) => return Err(write_failure(error)),
                 }
                 let row = self.row()?;
                 row.meta_resource_id = document_id;
@@ -1011,10 +1045,19 @@ fn apply_failure(error: HarvestWriteFailure) -> HarvestFailure {
         HarvestWriteFailure::Rejected(violations) => permanent(format!(
             "harvest record rejected by validation: {violations:?}"
         )),
-        error @ (HarvestWriteFailure::NotFound | HarvestWriteFailure::AlreadyExists) => {
+        error @ HarvestWriteFailure::NotFound => {
             permanent(format!("harvest apply failed: {error}"))
         }
     }
+}
+
+/// How a metadata create or delete of this job failed, sorted like a routed update.
+fn write_failure(error: MetadataWriteError) -> HarvestFailure {
+    apply_failure(match classify_metadata(error) {
+        MetadataFailure::Retryable(message) => HarvestWriteFailure::Retryable(message),
+        MetadataFailure::Permanent(message) => HarvestWriteFailure::Permanent(message),
+        MetadataFailure::Validation(violations) => HarvestWriteFailure::Rejected(violations),
+    })
 }
 
 #[cfg(test)]

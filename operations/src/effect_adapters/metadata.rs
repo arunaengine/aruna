@@ -15,15 +15,11 @@ use std::future::{Future, ready};
 use std::pin::Pin;
 use tokio::time::{Instant, timeout};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::forward::transport::MetadataWriteError;
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
-use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-};
 use crate::metadata::forward::read::dataset_summary;
-use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
+use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
 use crate::metadata::update_document::UpdateDocumentMutation;
 
@@ -53,7 +49,7 @@ pub(super) fn dispatch_summary(
     })
 }
 
-// A boxed future for the same reason: the routed write drives operations again.
+// A boxed future for the same reason: the routed update drives operations again.
 pub(super) fn dispatch_harvest_write(
     write: HarvestWrite,
     context: &DriverContext,
@@ -70,74 +66,26 @@ async fn routed_write(
     context: &DriverContext,
 ) -> Result<(), MetadataWriteError> {
     let context = std::sync::Arc::new(context.clone());
-    match write {
-        HarvestWrite::Create {
-            actor,
-            owner,
-            group_id,
-            document_id,
-            document_path,
-            jsonld,
-        } => {
-            let operation = CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path,
-                public: false,
-                payload: CreateDocumentPayload::RoCrate { jsonld },
-            });
-            let token = Some(AuthToken::internal(owner));
-            let local = context.net_handle.as_ref().map(|net| net.node_id());
-            let route = RouteCreateOperation::new(operation, local, token);
-            Box::pin(drive(route, context.as_ref())).await?;
-        }
-        HarvestWrite::Update {
-            actor,
-            owner,
-            record,
-            document_id,
-            jsonld,
-        } => {
-            Box::pin(route_metadata_update(
-                &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                None,
-                UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-                None,
-                Some(AuthToken::internal(owner)),
-                None,
-            ))
-            .await?;
-        }
-        HarvestWrite::Delete {
-            actor,
-            owner,
-            record,
-            document_id,
-        } => {
-            let token = Some(AuthToken::internal(owner));
-            Box::pin(route_metadata_delete(
-                &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                token,
-            ))
-            .await?;
-        }
-    }
+    Box::pin(route_metadata_update(
+        &context,
+        write.actor,
+        write.record.as_deref(),
+        write.document_id,
+        None,
+        UpdateDocumentMutation::ReplaceRoCrate {
+            jsonld: write.jsonld,
+        },
+        None,
+        Some(AuthToken::internal(write.owner)),
+        None,
+    ))
+    .await?;
     Ok(())
 }
 
 fn harvest_failure(error: MetadataWriteError) -> HarvestWriteFailure {
     match error {
         MetadataWriteError::NotFound => HarvestWriteFailure::NotFound,
-        MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists) => {
-            HarvestWriteFailure::AlreadyExists
-        }
         error => match classify_metadata(error) {
             MetadataFailure::Retryable(message) => HarvestWriteFailure::Retryable(message),
             MetadataFailure::Permanent(message) => HarvestWriteFailure::Permanent(message),
