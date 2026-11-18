@@ -97,7 +97,7 @@ impl KeyOperation {
     }
     /// Continues only while the token's credential is live, the recipient's, in the bucket's
     /// group and issued by this node; reading it here makes a revocation conflict.
-    pub(super) fn credential_read(&mut self, value: Option<Value>) -> Effects {
+    pub(super) fn credential_read(&mut self, value: Option<Value>) -> KeyTurn {
         let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now);
         let live = value
             .and_then(|v| UserAccess::from_bytes(&v).ok())
@@ -121,13 +121,11 @@ impl KeyOperation {
             _ => None,
         }
     }
-    pub(super) fn records_read(&mut self, event: Event) -> Effects {
+    pub(super) fn records_read(&mut self, result: IoResult) -> KeyTurn {
         let action = self.action.clone();
-        match (action, event) {
-            (
-                KeyAction::Publish(submitted),
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
+        match (action, result) {
+            (KeyAction::Publish(submitted), IoResult::Values(read)) => {
+                let value = read.into_iter().next().flatten();
                 if !self.snapshot.as_ref().is_some_and(|s| s.holder)
                     || self.auth.path_restrictions.is_some()
                     || submitted.context.issuer != KeyIssuer::User(self.auth.user_id)
@@ -146,13 +144,12 @@ impl KeyOperation {
                     Err(error) => self.fail(error),
                 }
             }
-            (
-                KeyAction::Request(scope),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.request_read(scope, values),
+            (KeyAction::Request(scope), IoResult::Page { rows: values, .. }) => {
+                self.request_read(scope, values)
+            }
             (
                 KeyAction::Member(_) | KeyAction::Token { .. } | KeyAction::Writes(_),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
+                IoResult::Page { rows: values, .. },
             ) => match self.scopes.pop() {
                 Some(scope) => {
                     self.group_epoch = self.groups.pop();
@@ -160,7 +157,7 @@ impl KeyOperation {
                 }
                 None => self.fail(AbeError::Context),
             },
-            (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (KeyAction::Open(_), IoResult::Page { rows: values, .. }) => {
                 let next = page_end(&values);
                 let mut requests = Vec::new();
                 for (key, value) in values.into_iter().take(MAX_REQUESTS) {
@@ -177,7 +174,7 @@ impl KeyOperation {
                 self.result = Some(KeyResult::Requests(requests, next));
                 self.flush()
             }
-            (KeyAction::Grants(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (KeyAction::Grants(_), IoResult::Page { rows: values, .. }) => {
                 let next = page_end(&values);
                 let mut grants = Vec::new();
                 for (key, value) in values.into_iter().take(MAX_REQUESTS) {
@@ -204,7 +201,7 @@ impl KeyOperation {
             _ => self.fail(AbeError::Context),
         }
     }
-    fn request_read(&mut self, scope: KeyScope, values: Vec<(Key, Value)>) -> Effects {
+    fn request_read(&mut self, scope: KeyScope, values: Vec<(Key, Value)>) -> KeyTurn {
         if let Err(error) = self.scope_allowed(&scope) {
             return self.fail(error);
         }
@@ -281,17 +278,16 @@ impl KeyOperation {
             let prefix = request.prefix();
             self.request = Some(request);
             self.state = State::Reuse;
-            return smallvec![Effect::Storage(StorageEffect::Iter {
-                key_space: ABE_GRANT_KEYSPACE.to_string(),
-                prefix: Some(prefix.into()),
-                start: None,
+            return Ok(Next::Call(IoCall::Page {
+                space: ABE_GRANT_KEYSPACE.to_string(),
+                prefix: prefix.into(),
+                after: None,
                 limit: MAX_REQUESTS + 1,
-                txn_id: self.txn
-            })];
+            }));
         }
         self.issue(request)
     }
-    pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let (Some(mut request), Some(snapshot)) = (self.request.take(), self.snapshot.as_ref())
         else {
             return self.fail(KeyError::Missing);
@@ -385,7 +381,7 @@ impl KeyOperation {
         }
         self.issue(request)
     }
-    fn issue(&mut self, request: KeyRequest) -> Effects {
+    fn issue(&mut self, request: KeyRequest) -> KeyTurn {
         if let Err(error) = request.to_bytes() {
             return self.fail(error);
         }
@@ -397,27 +393,25 @@ impl KeyOperation {
         self.state = State::Issue;
         let issuer = KeyIssuer::Node(self.node);
         let context = GrantContext { request, issuer };
-        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(
-            context
-        ))))]
+        let issue = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(context))));
+        Ok(Next::Call(IoCall::Effect(Box::new(issue))))
     }
-    pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> Effects {
+    pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> KeyTurn {
         if let Err(error) = self.current_request(&grant.context.request) {
             return self.fail(error);
         }
         let prefix = grant.context.request.prefix();
         self.result = Some(KeyResult::Grant(grant));
         self.state = State::Count;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ABE_GRANT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: MAX_REQUESTS + 1,
-            txn_id: self.txn
-        })]
+        }))
     }
     /// Writes the grant only while the recipient stores fewer than `MAX_REQUESTS` grants.
-    pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let Some(KeyResult::Grant(grant)) = self.result.take() else {
             return self.fail(AbeError::Context);
         };
@@ -460,21 +454,20 @@ impl KeyOperation {
         self.flush()
     }
     /// Scans the recipient's grants again for the next batch of `request`'s scope.
-    pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> Effects {
+    pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> KeyTurn {
         request.request_id = Ulid::generate();
         request.created_at_ms = self.now;
         let prefix = request.prefix();
         self.request = Some(request);
         self.state = State::Reuse;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ABE_GRANT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: MAX_REQUESTS + 1,
-            txn_id: self.txn
-        })]
+        }))
     }
-    pub(super) fn write_request(&mut self, request: KeyRequest) -> Effects {
+    pub(super) fn write_request(&mut self, request: KeyRequest) -> KeyTurn {
         let bytes = match request.to_bytes() {
             Ok(v) => v,
             Err(error) => return self.fail(error),
@@ -502,7 +495,7 @@ impl KeyOperation {
 
 impl KeyOperation {
     /// Records the finished scope, then starts the next or notifies holders of new requests.
-    pub(super) fn next_scope(&mut self) -> Effects {
+    pub(super) fn next_scope(&mut self) -> KeyTurn {
         if let Some(KeyResult::Request(request)) = self.result.take() {
             self.opened.push(request.request_id);
             self.fresh |= !self.reused;
@@ -521,20 +514,19 @@ impl KeyOperation {
         self.flush()
     }
     /// Reads the bucket holders, including a caller who holds the bucket key.
-    pub(super) fn holders(&mut self) -> Option<Effects> {
+    pub(super) fn holders(&mut self) -> Option<KeyTurn> {
         let snapshot = self.snapshot.as_ref()?;
         let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
-        Some(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Some(Ok(Next::Call(IoCall::Page {
+            space: BUCKET_HOLDER_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: usize::MAX,
-            txn_id: self.txn
-        })])
+        })))
     }
     /// Tells every current holder except the member that the member waits for keys.
-    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
             return self.fail(KeyError::Missing);
         };
