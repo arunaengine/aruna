@@ -80,7 +80,9 @@ pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema,
+)]
 pub struct ObjectOutput {
     pub key: String,
     /// The current version, so a selection can pin exactly what was listed.

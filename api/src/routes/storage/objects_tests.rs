@@ -116,7 +116,7 @@ async fn refuses_bad_listings() {
     )
     .await;
     assert!(matches!(stranger, Err(ServerError::Forbidden)));
-    let from = encode_resume::<()>(&Resume::From("m".to_string())).unwrap();
+    let from = encode_resume(&Resume::From("m".to_string())).unwrap();
     let cursor = list(
         &node,
         &node.owner,
@@ -429,7 +429,7 @@ async fn hides_link_folders() {
         key: "a.md".to_string(),
         group: None,
     };
-    assert_eq!(decode_resume::<()>(&cursor).unwrap(), after);
+    assert_eq!(decode_resume(&cursor).unwrap(), after);
 }
 
 #[tokio::test]
@@ -473,10 +473,7 @@ async fn merges_past_hidden() {
     .unwrap();
     assert!(second.objects.is_empty() && second.prefixes.is_empty());
     let cursor = second.next_cursor.expect("the hidden run goes on");
-    assert!(matches!(
-        decode_resume::<()>(&cursor),
-        Ok(Resume::Hidden { .. })
-    ));
+    assert!(matches!(decode_resume(&cursor), Ok(Resume::Hidden { .. })));
     let third = list(
         &node,
         &node.owner,
@@ -525,7 +522,7 @@ async fn cursor_names_copy() {
     // A copy that sealed its range is named as a copy, so a member resuming there asks it as
     // one while the coordinator is down.
     let (_node, cursor, _) = sealed_copy_page().await;
-    let resume = decode_resume::<()>(&cursor).unwrap();
+    let resume = decode_resume(&cursor).unwrap();
     assert!(
         matches!(resume, Resume::Hidden { copy: true, .. }),
         "{resume:?}"

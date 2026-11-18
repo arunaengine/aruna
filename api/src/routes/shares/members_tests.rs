@@ -312,7 +312,7 @@ async fn serving_policy_hides() {
         let Some(next) = listed.next_cursor else {
             break;
         };
-        if let Ok(Resume::After { key, group }) = decode_resume::<()>(&next) {
+        if let Ok(Resume::After { key, group }) = decode_resume(&next) {
             assert!(
                 !key.contains("private") && group.is_none_or(|group| !group.contains("private"))
             );
