@@ -105,7 +105,7 @@ async fn ask_record<A, T>(
     context: &DriverContext,
     binding: &DistributionBinding,
     args: A,
-    decide: Decide<(DistributionBinding, A), T>,
+    decide: Decide<Bound<A>, T>,
 ) -> Result<T, GuardError>
 where
     A: Send + Debug + PartialEq + 'static,
@@ -120,7 +120,7 @@ async fn ask_authority<A, T>(
     context: &DriverContext,
     binding: &DistributionBinding,
     args: A,
-    decide: Decide<(DistributionBinding, A), T>,
+    decide: Decide<Bound<A>, T>,
 ) -> Result<T, GuardError>
 where
     A: Send + Debug + PartialEq + 'static,
@@ -130,112 +130,181 @@ where
     ask(context, reads, (binding.clone(), args), decide).await
 }
 
-/// Where a read of a bound bucket is answered, from this node's record.
-pub async fn route_read(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    key: &str,
-    listing: bool,
+type Bound<A> = (DistributionBinding, A);
+
+fn read_route(
+    (binding, (key, listing)): &Bound<(String, bool)>,
+    rows: &[Option<Value>],
 ) -> Result<ReadRoute, GuardError> {
-    let args = (key.to_string(), listing);
-    ask_record(context, binding, args, |(binding, (key, listing)), rows| {
-        read_target(binding, key, *listing, row(rows, 0))
-    })
-    .await
+    read_target(binding, key, *listing, row(rows, 0))
 }
 
-/// Where a write to `key` of a bound bucket goes, from this node's record; transports use it
-/// to forward a write before its bytes move.
-pub async fn route_write(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    key: &str,
+fn write_route(
+    (binding, (key, completion)): &Bound<(String, bool)>,
+    rows: &[Option<Value>],
 ) -> Result<WriteRoute, GuardError> {
-    route_for(context, binding, key, false).await
+    target_for(binding, key, (row(rows, 0), row(rows, 1)), *completion)
 }
 
-/// Where a request on an open upload of `key` goes; a range fence in its upload grace period
-/// keeps it on this node, so the upload can still complete.
-pub async fn route_upload(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    key: &str,
-) -> Result<WriteRoute, GuardError> {
-    route_for(context, binding, key, true).await
-}
-
-async fn route_for(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    key: &str,
-    completion: bool,
-) -> Result<WriteRoute, GuardError> {
-    let args = (key.to_string(), completion);
-    ask_authority(
-        context,
-        binding,
-        args,
-        |(binding, (key, completion)), rows| {
-            target_for(binding, key, (row(rows, 0), row(rows, 1)), *completion)
-        },
-    )
-    .await
-}
-
-/// This node's record of the bound set, when the bucket is still the admitted member.
-pub async fn bound_view(
-    context: &DriverContext,
-    binding: &DistributionBinding,
+fn held_view(
+    (binding, ()): &Bound<()>,
+    rows: &[Option<Value>],
 ) -> Result<DistributionView, GuardError> {
-    ask_record(context, binding, (), |(binding, ()), rows| {
-        bound(binding, rows)
-    })
-    .await
+    bound(binding, rows)
 }
 
-/// This node's fence row of the set.
-pub async fn local_fence(context: &DriverContext, set_id: Ulid) -> Result<LocalFence, GuardError> {
-    let key = LocalFence::key(set_id).into();
-    let reads = vec![(DISTRIBUTION_FENCE_KEYSPACE.to_string(), key)];
-    ask(context, reads, (), |(), rows| {
-        Ok(LocalFence::decode(row(rows, 0))?)
-    })
-    .await
+fn fence_row(_: &(), rows: &[Option<Value>]) -> Result<LocalFence, GuardError> {
+    Ok(LocalFence::decode(row(rows, 0))?)
 }
 
-/// The range id and node of the coordinator of `key`'s range, or `None` when this member
-/// coordinates it and has not fenced it for a transfer.
-pub async fn read_coordinator(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    key: &str,
+fn coordinator_of(
+    (binding, key): &Bound<String>,
+    rows: &[Option<Value>],
 ) -> Result<Option<(Ulid, NodeId)>, GuardError> {
-    let args = key.to_string();
-    ask_authority(context, binding, args, |(binding, key), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        let set_id = binding.set_id;
-        let range = snapshot.range_for(key).ok_or(RouteError::NoRange(set_id))?;
-        if range.coordinator == binding.member_id {
-            LocalFence::decode(row(rows, 1))?.check_read(snapshot, range)?;
-            return Ok(None);
-        }
-        let coordinator = snapshot
-            .member(range.coordinator)
-            .ok_or(RouteError::NoRange(set_id))?;
-        Ok(Some((range.range_id, coordinator.node_id)))
-    })
-    .await
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    let set_id = binding.set_id;
+    let range = snapshot.range_for(key).ok_or(RouteError::NoRange(set_id))?;
+    if range.coordinator == binding.member_id {
+        LocalFence::decode(row(rows, 1))?.check_read(snapshot, range)?;
+        return Ok(None);
+    }
+    let coordinator = snapshot
+        .member(range.coordinator)
+        .ok_or(RouteError::NoRange(set_id))?;
+    Ok(Some((range.range_id, coordinator.node_id)))
 }
 
-/// Names a new upload of `key` by the range and epoch this member coordinates it under.
-pub async fn upload_tag(
-    context: &DriverContext,
+fn upload_held(
+    (binding, (key, tag)): &Bound<(String, UploadTag)>,
+    rows: &[Option<Value>],
+) -> Result<(), GuardError> {
+    let view = bound(binding, rows)?;
+    Ok(view
+        .snapshot()
+        .upload_authority(binding.member_id, key, tag)?)
+}
+
+fn listed_tags(
+    (binding, uploads): &Bound<Vec<(String, Ulid)>>,
+    rows: &[Option<Value>],
+) -> Result<Vec<UploadTag>, GuardError> {
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    uploads
+        .iter()
+        .map(|(key, upload_id)| {
+            let range = snapshot
+                .range_for(key)
+                .ok_or(RouteError::NoRange(binding.set_id))?;
+            Ok(UploadTag {
+                upload_id: *upload_id,
+                set_id: binding.set_id,
+                range_id: range.range_id,
+                epoch: range.epoch,
+            })
+        })
+        .collect()
+}
+
+fn range_coordinated(
+    (binding, (range_id, key)): &Bound<(Ulid, String)>,
+    rows: &[Option<Value>],
+) -> Result<(), GuardError> {
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    let range = snapshot.resolve(*range_id, key)?;
+    if range.coordinator == binding.member_id {
+        return Ok(());
+    }
+    let node_id = snapshot
+        .member(range.coordinator)
+        .map(|member| member.node_id)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    Err(GuardError::NotCoordinator {
+        set_id: binding.set_id,
+        range_id: range.range_id,
+        node_id,
+    })
+}
+
+fn range_kept(
+    (binding, (range_id, key)): &Bound<(Ulid, String)>,
+    rows: &[Option<Value>],
+) -> Result<(), GuardError> {
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    let range = snapshot.resolve(*range_id, key)?;
+    match (snapshot.record_holders(range).iter())
+        .any(|member| member.member_id == binding.member_id)
+    {
+        true => Ok(()),
+        false => Err(GuardError::Route(RouteError::StaleRange(range.range_id))),
+    }
+}
+
+type Interval = (String, Option<String>);
+
+fn listed_interval(
+    (binding, (lower, upper)): &Bound<Interval>,
+    rows: &[Option<Value>],
+) -> Result<bool, GuardError> {
+    let view = bound(binding, rows)?;
+    let fence = LocalFence::decode(row(rows, 1))?;
+    let interval = (lower.as_str(), upper.as_deref());
+    Ok(view
+        .snapshot()
+        .lists_interval(binding.member_id, interval, &fence))
+}
+
+fn copied_interval(
+    (binding, (lower, upper)): &Bound<Interval>,
+    rows: &[Option<Value>],
+) -> Result<bool, GuardError> {
+    let view = bound(binding, rows)?;
+    let interval = (lower.as_str(), upper.as_deref());
+    Ok(view.snapshot().copies_interval(binding.member_id, interval))
+}
+
+fn range_readers(
+    (binding, key): &Bound<String>,
+    rows: &[Option<Value>],
+) -> Result<(Ulid, bool, Vec<NodeId>), GuardError> {
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    let range = snapshot
+        .range_for(key)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    let here =
+        (snapshot.record_holders(range).iter()).any(|member| member.member_id == binding.member_id);
+    let copies = (snapshot.copy_holders(range).into_iter())
+        .filter(|member| member.member_id != binding.member_id)
+        .map(|member| member.node_id)
+        .collect();
+    Ok((range.range_id, here, copies))
+}
+
+fn range_holders(
+    (binding, key): &Bound<String>,
+    rows: &[Option<Value>],
+) -> Result<Vec<NodeId>, GuardError> {
+    let view = bound(binding, rows)?;
+    let snapshot = view.snapshot();
+    let range = snapshot
+        .range_for(key)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    Ok((snapshot.record_holders(range).into_iter())
+        .map(|member| member.node_id)
+        .collect())
+}
+
+/// The tag of a new upload of a key this member coordinates.
+fn tag_of(
     binding: &DistributionBinding,
-    key: &str,
     upload_id: Ulid,
+    route: WriteRoute,
 ) -> Result<UploadTag, GuardError> {
-    match route_write(context, binding, key).await? {
+    match route {
         WriteRoute::Local { range_id, epoch } => Ok(UploadTag {
             upload_id,
             set_id: binding.set_id,
@@ -252,6 +321,75 @@ pub async fn upload_tag(
     }
 }
 
+fn interval(lower: &str, upper: Option<&str>) -> Interval {
+    (lower.to_string(), upper.map(str::to_string))
+}
+
+/// Where a read of a bound bucket is answered, from this node's record.
+pub async fn route_read(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    listing: bool,
+) -> Result<ReadRoute, GuardError> {
+    ask_record(context, binding, (key.to_string(), listing), read_route).await
+}
+
+/// Where a write to `key` of a bound bucket goes, from this node's record; transports use it
+/// to forward a write before its bytes move.
+pub async fn route_write(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<WriteRoute, GuardError> {
+    ask_authority(context, binding, (key.to_string(), false), write_route).await
+}
+
+/// Where a request on an open upload of `key` goes; a range fence in its upload grace period
+/// keeps it on this node, so the upload can still complete.
+pub async fn route_upload(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<WriteRoute, GuardError> {
+    ask_authority(context, binding, (key.to_string(), true), write_route).await
+}
+
+/// This node's record of the bound set, when the bucket is still the admitted member.
+pub async fn bound_view(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+) -> Result<DistributionView, GuardError> {
+    ask_record(context, binding, (), held_view).await
+}
+
+/// This node's fence row of the set.
+pub async fn local_fence(context: &DriverContext, set_id: Ulid) -> Result<LocalFence, GuardError> {
+    let key = LocalFence::key(set_id).into();
+    let reads = vec![(DISTRIBUTION_FENCE_KEYSPACE.to_string(), key)];
+    ask(context, reads, (), fence_row).await
+}
+
+/// The range id and node of the coordinator of `key`'s range, or `None` when this member
+/// coordinates it and has not fenced it for a transfer.
+pub async fn read_coordinator(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<Option<(Ulid, NodeId)>, GuardError> {
+    ask_authority(context, binding, key.to_string(), coordinator_of).await
+}
+
+/// Names a new upload of `key` by the range and epoch this member coordinates it under.
+pub async fn upload_tag(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    upload_id: Ulid,
+) -> Result<UploadTag, GuardError> {
+    tag_of(binding, upload_id, route_write(context, binding, key).await?)
+}
+
 /// Whether this member still holds the authority the upload `tag` was opened under: the key's
 /// range descends from the named one, at the same epoch, coordinated here.
 pub async fn upload_route(
@@ -260,14 +398,7 @@ pub async fn upload_route(
     key: &str,
     tag: &UploadTag,
 ) -> Result<(), GuardError> {
-    let args = (key.to_string(), tag.clone());
-    ask_record(context, binding, args, |(binding, (key, tag)), rows| {
-        let view = bound(binding, rows)?;
-        Ok(view
-            .snapshot()
-            .upload_authority(binding.member_id, key, tag)?)
-    })
-    .await
+    ask_record(context, binding, (key.to_string(), tag.clone()), upload_held).await
 }
 
 /// The tags of listed uploads, from the range and epoch that hold each key now.
@@ -276,26 +407,7 @@ pub async fn upload_tags(
     binding: &DistributionBinding,
     uploads: &[(String, Ulid)],
 ) -> Result<Vec<UploadTag>, GuardError> {
-    let args = uploads.to_vec();
-    ask_record(context, binding, args, |(binding, uploads), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        uploads
-            .iter()
-            .map(|(key, upload_id)| {
-                let range = snapshot
-                    .range_for(key)
-                    .ok_or(RouteError::NoRange(binding.set_id))?;
-                Ok(UploadTag {
-                    upload_id: *upload_id,
-                    set_id: binding.set_id,
-                    range_id: range.range_id,
-                    epoch: range.epoch,
-                })
-            })
-            .collect()
-    })
-    .await
+    ask_record(context, binding, uploads.to_vec(), listed_tags).await
 }
 
 /// Resolves the range a forwarded request names to the key's range, which this member must
@@ -306,25 +418,7 @@ pub async fn delegated_range(
     range_id: Ulid,
     key: &str,
 ) -> Result<(), GuardError> {
-    let args = (range_id, key.to_string());
-    ask_record(context, binding, args, |(binding, (range_id, key)), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        let range = snapshot.resolve(*range_id, key)?;
-        if range.coordinator == binding.member_id {
-            return Ok(());
-        }
-        let node_id = snapshot
-            .member(range.coordinator)
-            .map(|member| member.node_id)
-            .ok_or(RouteError::NoRange(binding.set_id))?;
-        Err(GuardError::NotCoordinator {
-            set_id: binding.set_id,
-            range_id: range.range_id,
-            node_id,
-        })
-    })
-    .await
+    ask_record(context, binding, (range_id, key.to_string()), range_coordinated).await
 }
 
 /// Resolves the range a forwarded read names to the key's range, whose records this ready
@@ -335,19 +429,7 @@ pub async fn delegated_read(
     range_id: Ulid,
     key: &str,
 ) -> Result<(), GuardError> {
-    let args = (range_id, key.to_string());
-    ask_record(context, binding, args, |(binding, (range_id, key)), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        let range = snapshot.resolve(*range_id, key)?;
-        match (snapshot.record_holders(range).iter())
-            .any(|member| member.member_id == binding.member_id)
-        {
-            true => Ok(()),
-            false => Err(GuardError::Route(RouteError::StaleRange(range.range_id))),
-        }
-    })
-    .await
+    ask_record(context, binding, (range_id, key.to_string()), range_kept).await
 }
 
 /// Whether this member answers listings of every key in `[lower, upper)` from its records.
@@ -357,16 +439,7 @@ pub async fn lists_interval(
     lower: &str,
     upper: Option<&str>,
 ) -> Result<bool, GuardError> {
-    let args = (lower.to_string(), upper.map(str::to_string));
-    ask_authority(context, binding, args, |(binding, (lower, upper)), rows| {
-        let view = bound(binding, rows)?;
-        let fence = LocalFence::decode(row(rows, 1))?;
-        let interval = (lower.as_str(), upper.as_deref());
-        Ok(view
-            .snapshot()
-            .lists_interval(binding.member_id, interval, &fence))
-    })
-    .await
+    ask_authority(context, binding, interval(lower, upper), listed_interval).await
 }
 
 /// Whether this member, as a ready copy, may answer listings of every key in `[lower, upper)`
@@ -377,13 +450,7 @@ pub async fn copies_interval(
     lower: &str,
     upper: Option<&str>,
 ) -> Result<bool, GuardError> {
-    let args = (lower.to_string(), upper.map(str::to_string));
-    ask_record(context, binding, args, |(binding, (lower, upper)), rows| {
-        let view = bound(binding, rows)?;
-        let interval = (lower.as_str(), upper.as_deref());
-        Ok(view.snapshot().copies_interval(binding.member_id, interval))
-    })
-    .await
+    ask_record(context, binding, interval(lower, upper), copied_interval).await
 }
 
 /// Who answers a read of `key` while its range's coordinator cannot: the range, whether this
@@ -393,22 +460,7 @@ pub async fn copy_readers(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<(Ulid, bool, Vec<NodeId>), GuardError> {
-    let args = key.to_string();
-    ask_record(context, binding, args, |(binding, key), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        let range = snapshot
-            .range_for(key)
-            .ok_or(RouteError::NoRange(binding.set_id))?;
-        let here = (snapshot.record_holders(range).iter())
-            .any(|member| member.member_id == binding.member_id);
-        let copies = (snapshot.copy_holders(range).into_iter())
-            .filter(|member| member.member_id != binding.member_id)
-            .map(|member| member.node_id)
-            .collect();
-        Ok((range.range_id, here, copies))
-    })
-    .await
+    ask_record(context, binding, key.to_string(), range_readers).await
 }
 
 /// The nodes that answer reads of `key`'s range from their own records, coordinator last.
@@ -417,18 +469,7 @@ pub async fn record_holders(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<Vec<NodeId>, GuardError> {
-    let args = key.to_string();
-    ask_record(context, binding, args, |(binding, key), rows| {
-        let view = bound(binding, rows)?;
-        let snapshot = view.snapshot();
-        let range = snapshot
-            .range_for(key)
-            .ok_or(RouteError::NoRange(binding.set_id))?;
-        Ok((snapshot.record_holders(range).into_iter())
-            .map(|member| member.node_id)
-            .collect())
-    })
-    .await
+    ask_record(context, binding, key.to_string(), range_holders).await
 }
 
 #[cfg(test)]
