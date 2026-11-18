@@ -651,15 +651,35 @@ pub(crate) mod tests {
             bucket_id: Some(Ulid::from_bytes([5; 16])),
             ..Default::default()
         };
-        let effects = keys.step(read_result(Some(retained.to_bytes().unwrap())));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
-        keys.step(timeout());
+        let turn = keys.next(read_result(Some(retained.to_bytes().unwrap())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let unreadable = IoResult::Page {
+            rows: vec![(b"key".to_vec().into(), vec![0xff].into())],
+            next: None,
+        };
+        assert!(keys.next(unreadable).is_err());
+    }
+
+    #[test]
+    fn consent_store_calls() {
+        // The request row is written or deleted by the one call the operation was given.
+        let row = b"row".to_vec();
+        let write = consent_write(row.clone(), user(1)).unwrap();
+        let mut store = ConsentStoreOperation::new(write);
         assert_eq!(
-            keys.finalize(),
-            Err(PlaintextError::Storage(StorageError::Timeout))
+            store.first(),
+            Ok(Next::Call(IoCall::Write(vec![
+                consent_row(row.clone(), user(1)).unwrap()
+            ])))
+        );
+        assert_eq!(store.next(IoResult::Done), Ok(Next::Done(())));
+        let mut delete = ConsentStoreOperation::new(consent_delete(row.clone()));
+        assert_eq!(
+            delete.first(),
+            Ok(Next::Call(IoCall::Delete(vec![(
+                PLAINTEXT_COPY_KEYSPACE.to_string(),
+                row.into()
+            )])))
         );
     }
 
@@ -667,78 +687,32 @@ pub(crate) mod tests {
     fn encryption_check_modes() {
         // Without `retained` the settings decide alone; an unencrypted bucket without keys is plain.
         let mut settings = EncryptionCheckOperation::new("plain", false);
-        settings.start();
-        assert!(settings.step(read_result(None)).is_empty());
-        assert_eq!(settings.finalize(), Ok(false));
+        settings.first().unwrap();
+        assert_eq!(settings.next(read_result(None)), Ok(Next::Done(false)));
         let mut retained = EncryptionCheckOperation::new("plain", true);
-        retained.start();
-        assert!(retained.step(read_result(None)).is_empty());
-        assert_eq!(retained.finalize(), Ok(false));
+        retained.first().unwrap();
+        assert_eq!(retained.next(read_result(None)), Ok(Next::Done(false)));
     }
 
     #[test]
-    fn operations_reject_events() {
-        let realm = RealmId::from_bytes([3; 32]);
-        let read_or_error = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        let holder = || {
-            let mut operation = HolderCheckOperation::new(realm, "sealed", user(1));
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(holder, sample_events, read_or_error).is_empty());
-        let consent = || {
-            let mut operation = ConsentReadOperation::new(b"row".to_vec());
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(consent, sample_events, read_or_error).is_empty());
-        let encryption = || {
-            let mut operation = EncryptionCheckOperation::new("b", true);
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(encryption, sample_events, read_or_error).is_empty());
-        let store = || {
-            let mut operation = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(store, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. }
-                        | StorageEvent::DeleteResult { .. }
-                        | StorageEvent::Error { .. }
-                )
-            )
-        });
-        assert!(!refused.is_empty());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        // Every check only reads, so no phase has cleanup.
+    fn wrong_results_fail() {
+        // Every check only reads, so a wrong answer fails it and leaves nothing to clean up.
         let realm = RealmId::from_bytes([3; 32]);
         let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
-        holder.start();
-        check_abort(&mut holder, &[]);
-        rejects_finalize(holder);
+        holder.first().unwrap();
+        assert!(holder.next(IoResult::Done).is_err());
+        assert!(holder.abort().is_empty());
         let mut consent = ConsentReadOperation::new(b"row".to_vec());
-        check_abort(&mut consent, &[]);
-        rejects_finalize(consent);
-        let mut encryption = EncryptionCheckOperation::new("b", false);
-        encryption.start();
-        check_abort(&mut encryption, &[]);
-        rejects_finalize(encryption);
+        consent.first().unwrap();
+        assert!(consent.next(IoResult::Done).is_err());
+        assert!(consent.abort().is_empty());
+        let mut encryption = EncryptionCheckOperation::new("b", true);
+        encryption.first().unwrap();
+        assert!(encryption.next(IoResult::Done).is_err());
+        assert!(encryption.abort().is_empty());
         let mut store = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
-        store.start();
-        check_abort(&mut store, &[]);
-        rejects_finalize(store);
+        store.first().unwrap();
+        assert!(store.next(read_result(None)).is_err());
+        assert!(store.abort().is_empty());
     }
 }
