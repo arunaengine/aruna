@@ -18,6 +18,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::s3::bucket::key::lock::answers_timer;
+
 /// Writes of an audit record inside its operation before the record moves to a retry timer.
 pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
 /// How long a record that could not be stored waits before its next write.
@@ -110,11 +112,93 @@ pub enum AuditError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("unexpected answer while keeping an audit record: {0}")]
+    Unexpected(&'static str),
 }
 
 impl From<IoError> for AuditError {
     fn from(error: IoError) -> Self {
         Self::Storage(error.into())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum KeepState {
+    Write,
+    ArmTimers,
+}
+
+/// Stores audit records that must not be lost: a failed batch is retried, and records a lasting
+/// outage keeps from storage move to retry timers. Outputs whether the batch was stored.
+#[derive(Debug, PartialEq)]
+pub(crate) struct KeepAudit {
+    records: Vec<BucketAuditRecord>,
+    state: KeepState,
+    attempts: u32,
+    timers: VecDeque<BucketAuditRecord>,
+    waiting: Option<TaskKey>,
+}
+
+type KeepTurn = Result<Next<bool>, AuditError>;
+
+impl KeepAudit {
+    pub(crate) fn new(records: Vec<BucketAuditRecord>) -> Self {
+        Self {
+            records,
+            state: KeepState::Write,
+            attempts: 0,
+            timers: VecDeque::new(),
+            waiting: None,
+        }
+    }
+
+    fn write(&mut self) -> KeepTurn {
+        let write = AuditWrite::batch(&self.records, false)?;
+        self.attempts += 1;
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    fn written(&mut self, written: Result<(), StorageError>) -> KeepTurn {
+        if written.is_ok() {
+            return Ok(Next::Done(true));
+        }
+        if self.attempts < AUDIT_ATTEMPTS {
+            return self.write();
+        }
+        self.state = KeepState::ArmTimers;
+        self.timers = std::mem::take(&mut self.records).into();
+        self.next_timer()
+    }
+
+    fn next_timer(&mut self) -> KeepTurn {
+        let Some(record) = self.timers.pop_front() else {
+            return Ok(Next::Done(false));
+        };
+        self.waiting = Some(retry_timer(&record));
+        Ok(Next::Call(retry_effect(&record).into()))
+    }
+}
+
+impl Operation for KeepAudit {
+    type Output = bool;
+    type Error = AuditError;
+
+    fn first(&mut self) -> KeepTurn {
+        self.write()
+    }
+
+    fn next(&mut self, result: IoResult) -> KeepTurn {
+        if self.state == KeepState::Write {
+            return self.written(result.child::<(), StorageError>()?);
+        }
+        match result.event()? {
+            Event::Task(event)
+                if (self.waiting.as_ref()).is_some_and(|key| answers_timer(&event, key)) =>
+            {
+                self.next_timer()
+            }
+            other => Err(AuditError::Unexpected(other.label())),
+        }
     }
 }
 
@@ -468,6 +552,48 @@ mod tests {
         let mut plain = AuditWrite::new(&record(), false).unwrap();
         plain.first().unwrap();
         assert_eq!(plain.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    fn written(result: Result<(), StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    #[test]
+    fn keep_stores_batch() {
+        let mut keep = KeepAudit::new(vec![record()]);
+        assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(keep.next(written(Ok(()))), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn keep_moves_to_timers() {
+        // A failed batch is retried; a lasting outage hands each record to its retry timer.
+        let (first, second) = (record(), record());
+        let mut keep = KeepAudit::new(vec![first.clone(), second.clone()]);
+        keep.first().unwrap();
+        for _ in 1..AUDIT_ATTEMPTS {
+            let retry = keep.next(written(Err(StorageError::Timeout)));
+            assert!(matches!(retry, Ok(Next::Call(IoCall::Child(_)))));
+        }
+        let mut turn = keep.next(written(Err(StorageError::Timeout)));
+        for kept in [first, second] {
+            assert_eq!(turn, Ok(Next::Call(retry_effect(&kept).into())));
+            let armed = Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+                key: retry_timer(&kept),
+                after: AUDIT_RETRY,
+            });
+            turn = keep.next(IoResult::Event(Box::new(armed)));
+        }
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn keep_refuses_stray() {
+        let mut keep = KeepAudit::new(vec![record()]);
+        keep.state = KeepState::ArmTimers;
+        keep.waiting = Some(retry_timer(&record()));
+        let stray = IoResult::Event(Box::new(Event::Search()));
+        assert!(matches!(keep.next(stray), Err(AuditError::Unexpected(_))));
     }
 
     #[test]
