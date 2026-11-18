@@ -1,12 +1,11 @@
 //! Builds the local node's shard manifest from a prefix scan plus the topic digest and cursor.
-//! It also groups the shard client, inbound server, protocol and verification modules.
+//! It also groups the shard client, inbound server and verification modules.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod client;
 pub mod incoming;
 pub(crate) mod manifest;
-pub mod protocol;
 pub mod verify;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -115,7 +114,6 @@ impl Operation for AssembleManifestOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::effect_adapters::shard::frontier_root;
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -288,7 +286,7 @@ mod tests {
             .unwrap();
         let mut frontier = irokle::ActorClock::default();
         frontier.observe(actor_id, 2);
-        let root = frontier_root(net, topic, &frontier).unwrap();
+        let root = net.shard_frontier_root(topic, &frontier).unwrap();
         oplog
             .create_event_op(
                 topic,
@@ -300,7 +298,7 @@ mod tests {
                 node.signer(),
             )
             .unwrap();
-        assert_eq!(root, frontier_root(net, topic, &frontier).unwrap());
+        assert_eq!(root, net.shard_frontier_root(topic, &frontier).unwrap());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use aruna_core::operation::Operation;
 use aruna_core::placement::{bucket_membership, resolve_shard_holders};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_net::shard_manifest::ShardTransportMessage;
 
-use super::protocol::ShardTransportMessage;
 use super::{AssembleManifestOperation, ManifestError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 
