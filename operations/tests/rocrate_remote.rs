@@ -53,7 +53,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::testing::replay_event_log;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;

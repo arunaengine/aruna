@@ -74,7 +74,7 @@ use super::runs::{
 use super::waiting::SettleWaiting;
 use super::work::{WorkRow, WorkState, prune_work, work_scan};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::projector::dot_applied;
+use crate::metadata::projection::DotAppliedOperation;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -796,7 +796,7 @@ pub(crate) async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<
     };
     let applied = match (event.kind, facts.batch.take()) {
         (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
-        (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
+        (_, Some((graph_iri, batch))) => drive(DotAppliedOperation::new(&graph_iri, &batch), ctx)
             .await
             .map_err(|error| StoreError(error.to_string()))?,
         (_, None) => facts.logged && facts.materialized(|id| id == event_id),

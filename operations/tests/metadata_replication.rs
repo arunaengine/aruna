@@ -42,7 +42,7 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
+use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,

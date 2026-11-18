@@ -33,7 +33,7 @@ use aruna_operations::metadata::persistent_id::forward::{
     mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 use aruna_operations::metadata::persistent_id::read_mapping;
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::testing::replay_event_log;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use ulid::Ulid;

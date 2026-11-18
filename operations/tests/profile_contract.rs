@@ -40,8 +40,8 @@ use aruna_operations::metadata::update_document::{
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::metadata::{
     MetadataHandle, materialization_queue::process_materialization_batch,
-    projector::drain_projection_queue,
 };
+use aruna_operations::testing::drain_projection_queue;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

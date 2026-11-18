@@ -80,10 +80,28 @@ use crate::metadata::materialization_queue::{
     materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
     restore_materialization_timer,
 };
-use crate::metadata::projector::{
-    PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events, project_logged_events,
-    replay_event_log, restore_projection_timer,
+use crate::metadata::projection::{
+    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
+    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
 };
+
+/// Replays the whole event log into the registry projection, one page at a time.
+async fn replay_event_log(
+    context: &crate::driver::DriverContext,
+) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    loop {
+        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let (count, next) = crate::driver::drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(projected),
+        }
+    }
+}
 use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };

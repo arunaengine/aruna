@@ -12,7 +12,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::testing::replay_event_log;
 use ulid::Ulid;
 
 use crate::topology::document_present;

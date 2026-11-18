@@ -31,7 +31,7 @@ pub(crate) mod object_version;
 pub mod persistent_id;
 pub(crate) mod pid_transition;
 pub mod profile;
-pub mod projector;
+pub mod projection;
 pub(crate) mod protocol;
 pub mod provenance;
 pub(crate) mod prune_jobs;

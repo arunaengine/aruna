@@ -15,7 +15,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::materialization_queue::process_materialization_batch;
-use crate::metadata::projector::drain_projection_queue;
+use crate::testing::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
@@ -1050,7 +1050,7 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::projector::project_create_events;
+    use crate::testing::project_create_events;
     use crate::metadata::record_reads::DocumentRecordOperation;
     use aruna_core::events::Event;
     use aruna_core::metadata::{

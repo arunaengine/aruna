@@ -10,10 +10,10 @@ use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::task::TaskKey;
 use tracing::{debug, error, warn};
 
-use crate::driver::DriverContext;
-use crate::metadata::projector::{
-    MetadataProjectionError, PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
-    schedule_projection_drain,
+use crate::driver::{DriverContext, drive};
+use crate::metadata::projection::{
+    MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
+    ProjectLoggedOperation, ProjectionWakeOperation, max_clock_skew,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
 
@@ -42,7 +42,8 @@ pub(crate) async fn apply_metadata(
     {
         if retry {
             error!(error = ?projection, "Failed to project metadata create events after inbound document sync reconciliation");
-            if let Err(error) = schedule_projection_drain(context, PROJECTION_RETRY_AFTER).await {
+            let wake = ProjectionWakeOperation::new(PROJECTION_RETRY_AFTER);
+            if let Err(error) = drive(wake, context).await {
                 warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
             }
         } else {
@@ -67,7 +68,8 @@ async fn project_reconciled(
     events: Vec<MetadataEventRecord>,
 ) -> Result<usize, MetadataProjectionError> {
     if !events.is_empty() {
-        return project_create_events(context, events, node_id).await;
+        let project = ProjectEventsOperation::new(events, node_id, max_clock_skew());
+        return drive(project, context).await;
     }
     let pairs: Vec<_> = targets
         .into_iter()
@@ -82,7 +84,8 @@ async fn project_reconciled(
     if pairs.is_empty() {
         return Ok(0);
     }
-    project_logged_events(context, pairs).await
+    let project = ProjectLoggedOperation::new(pairs, false, node_id, max_clock_skew());
+    Ok(drive(project, context).await?.projected)
 }
 
 /// Reconciles the metadata store with document sync and prunes deleted graphs.

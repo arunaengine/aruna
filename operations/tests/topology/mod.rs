@@ -57,7 +57,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
+use aruna_operations::testing::{project_logged_events, replay_event_log};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::mutation::drive_placement_mutation;

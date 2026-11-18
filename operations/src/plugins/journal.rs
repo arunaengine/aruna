@@ -258,7 +258,7 @@ mod tests {
         .await
         .unwrap();
         for _ in 0..3 {
-            crate::metadata::projector::drain_projection_queue(&ctx)
+            crate::testing::drain_projection_queue(&ctx)
                 .await
                 .unwrap();
         }

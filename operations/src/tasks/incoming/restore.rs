@@ -46,7 +46,9 @@ async fn durable_rearm_loop(
         restore_watch_interest(&context, &task_handle).await;
         crate::node::node_info::restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
         if ticks.is_multiple_of(DEAD_LETTER_TICKS) {
@@ -58,11 +60,7 @@ async fn durable_rearm_loop(
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
         restore_mirror_timer(&context, &task_handle).await;
-        crate::jobs::repository::link_queue::restore_link_timer(
-            &context,
-            &task_handle,
-        )
-        .await;
+        crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
     }
 }
 
@@ -300,7 +298,9 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         if stopped() {
             return;
         }
@@ -529,7 +529,9 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
-        match drain_projection_queue(&self.context).await {
+        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
+        let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+        match drive(drain, &self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
                     .await;
@@ -747,13 +749,8 @@ impl OperationsTaskHandler {
                     warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
                     continue;
                 };
-                if let Err(error) = release_job(
-                    &self.context,
-                    record.job_id,
-                    token,
-                    unix_timestamp_millis(),
-                )
-                .await
+                if let Err(error) =
+                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }

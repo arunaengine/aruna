@@ -1169,11 +1169,11 @@ mod authorization_tests {
 
     async fn drain_metadata_background(state: &ServerState) {
         let ctx = state.get_ctx();
-        let drained = aruna_operations::metadata::projector::drain_projection_queue(ctx.as_ref())
+        let drained = aruna_operations::testing::drain_projection_queue(ctx.as_ref())
             .await
             .unwrap();
         if drained.markers_examined == 0 {
-            aruna_operations::metadata::projector::replay_event_log(ctx.as_ref())
+            aruna_operations::testing::replay_event_log(ctx.as_ref())
                 .await
                 .unwrap();
         }
