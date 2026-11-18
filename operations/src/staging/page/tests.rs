@@ -4,6 +4,9 @@
 
 use super::*;
 use crate::connectors::descriptor::build_source_binding;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::operation::{EffectOperation, Runnable};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
 use aruna_core::UserId;
@@ -36,10 +39,6 @@ const JOB_CREATED_MS: u64 = 1_000_000;
 
 fn token() -> Ulid {
     Ulid::from_bytes([7; 16])
-}
-
-fn txn() -> TxnId {
-    Ulid::from_bytes([9; 16])
 }
 
 fn node() -> NodeId {
@@ -179,66 +178,59 @@ fn value(bytes: Vec<u8>) -> Option<Value> {
     Some(ByteView::from(bytes))
 }
 
-fn guards(fence: Option<Value>, record: &JobRecord) -> Event {
-    let values = vec![
-        (Key::from(b"fence".to_vec()), fence),
-        (
-            Key::from(b"bucket".to_vec()),
-            value(bucket().to_bytes().unwrap()),
-        ),
-        (
-            Key::from(b"connector".to_vec()),
-            value(connector().to_bytes().unwrap()),
-        ),
-        (Key::from(b"job".to_vec()), claim(record)),
-    ];
-    Event::Storage(StorageEvent::BatchReadResult { values })
+fn guard_values(fence: Option<Value>, record: &JobRecord) -> Vec<Option<Value>> {
+    vec![
+        fence,
+        value(bucket().to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(record),
+    ]
+}
+
+fn guards(fence: Option<Value>, record: &JobRecord) -> IoResult {
+    IoResult::Values(guard_values(fence, record))
+}
+
+fn range_page(next: Option<Key>) -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: next,
+    })))
 }
 
 /// Answers the head interval read as holding too many other keys, then the head reads with
 /// `heads` in entry order.
-fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> Effects {
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: Some(Key::from(b"other".to_vec())),
-    }));
+fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> IoCall {
+    let other = Some(Key::from(b"other".to_vec()));
+    let reads = operation.next(range_page(other));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == heads.len()
+        reads,
+        Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == heads.len()
     ));
-    let values = (heads.into_iter())
-        .map(|head| (Key::from(b"head".to_vec()), head))
-        .collect();
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    called(operation.next(IoResult::Values(heads)))
+}
+
+fn called(next: Result<Next<PageImportResult>, PageImportError>) -> IoCall {
+    match next {
+        Ok(Next::Call(call)) => call,
+        other => panic!("expected a call, got {other:?}"),
+    }
 }
 
 /// The answer to the relationship read: `count` relationships replicate the bucket.
-fn relationships(count: usize) -> Event {
+fn relationships(count: usize) -> IoResult {
     let row = || (Key::from(b"rel".to_vec()), ByteView::from(Vec::new()));
-    Event::Storage(StorageEvent::IterResult {
-        values: (0..count).map(|_| row()).collect(),
-        next_start_after: None,
-    })
+    IoResult::Page {
+        rows: (0..count).map(|_| row()).collect(),
+        next: None,
+    }
 }
 
-fn no_secret() -> Event {
-    Event::Storage(StorageEvent::VaultResult {
+fn no_secret() -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::VaultResult {
         entry: SourceConnectorSecret::vault_entry(connector().connector_id),
         secret: None,
-    })
-}
-
-fn scheduled(key: TaskKey) -> Event {
-    Event::Task(TaskEvent::TimerScheduled {
-        key,
-        after: Duration::ZERO,
-    })
-}
-
-fn written() -> Event {
-    Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    })
+    })))
 }
 
 fn head(version_id: Ulid) -> Option<Value> {
@@ -269,34 +261,43 @@ fn run_to_writes(
     heads: Vec<Option<Value>>,
     versions: Option<Vec<Option<Value>>>,
 ) -> Vec<(KeySpace, Key, Value)> {
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == GUARD_READS
-    ));
-    operation.step(guards(None, &record(token())));
-    answer_heads(operation, heads);
-    operation.step(relationships(1));
-    let mut effects = operation.step(no_secret());
-    if let Some(versions) = versions {
-        let values = versions
-            .into_iter()
-            .map(|version| (Key::from(b"version".to_vec()), version))
-            .collect();
-        effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    }
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+        panic!("expected the guard reads");
     };
-    writes.clone()
+    assert_eq!(reads.len(), GUARD_READS);
+    operation.next(guards(None, &record(token()))).unwrap();
+    answer_heads(operation, heads);
+    operation.next(relationships(1)).unwrap();
+    let mut call = called(operation.next(no_secret()));
+    if let Some(versions) = versions {
+        call = called(operation.next(IoResult::Values(versions)));
+    }
+    let IoCall::Write(writes) = call else {
+        panic!("expected the page rows, got {call:?}");
+    };
+    writes
+}
+
+/// Answers the row write and the empty delete; the next call is the usage update or nothing.
+fn after_rows(operation: &mut PageImportOperation) -> Result<Next<PageImportResult>, PageImportError> {
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(Vec::new())))
+    );
+    operation.next(IoResult::Done)
+}
+
+/// Answers the usage write and the dirty markers, and takes the outcome with its wake-ups.
+fn after_usage(operation: &mut PageImportOperation) -> (PageImportResult, Vec<IoCall>) {
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Write(_)))
+    ));
+    match operation.next(IoResult::Done) {
+        Ok(Next::Then { output, calls }) => (output, calls),
+        other => panic!("expected the outcome, got {other:?}"),
+    }
 }
 
 fn rows_in(writes: &[(KeySpace, Key, Value)], key_space: &str) -> usize {
@@ -317,14 +318,11 @@ fn page_registers_atomically() {
     assert_eq!(rows_in(&writes, CONNECTOR_REFERENCE_KEYSPACE), 2);
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
-    let effects = operation.step(written());
-    let [
-        Effect::Storage(StorageEffect::AddUsage {
-            deltas, buckets, ..
-        }),
-    ] = effects.as_slice()
+    let Ok(Next::Call(IoCall::AddUsage {
+        deltas, buckets, ..
+    })) = after_rows(&mut operation)
     else {
-        panic!("expected one usage update, got {effects:?}");
+        panic!("expected one usage update");
     };
     assert!(
         deltas
@@ -339,31 +337,24 @@ fn page_registers_atomically() {
         (bucket.objects, bucket.versions, bucket.referenced_bytes),
         (2, 2, 6)
     );
-    operation.step(written());
+    let (result, wakes) = after_usage(&mut operation);
+    let [publish, drain] = wakes.as_slice() else {
+        panic!("expected two wake-ups, got {wakes:?}");
+    };
     assert!(matches!(
-        operation.step(written()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        publish,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishUsageSnapshots,
+            ..
+        }))
     ));
     assert!(matches!(
-        operation
-            .step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: txn()
-            }))
-            .as_slice(),
-        [Effect::Task(_)]
-    ));
-    assert!(matches!(
-        operation
-            .step(scheduled(TaskKey::PublishUsageSnapshots))
-            .as_slice(),
-        [Effect::Task(TaskEffect::ResetTimer {
+        drain,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::DrainReplicationQueue,
             ..
-        })]
+        }))
     ));
-    operation.step(scheduled(TaskKey::DrainReplicationQueue));
-
-    let result = operation.finalize().unwrap();
     assert_eq!(
         (result.registered, result.unchanged, result.kept),
         (2, 0, 0)
@@ -405,18 +396,9 @@ fn replay_counts_once() {
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     // Nothing new is registered, so no usage moves and no publication is scheduled.
-    assert!(matches!(
-        operation.step(written()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    assert!(
-        operation
-            .step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: txn()
-            }))
-            .is_empty()
-    );
-    let result = operation.finalize().unwrap();
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
     assert_eq!((result.registered, result.unchanged), (0, 1));
 }
 
@@ -424,27 +406,16 @@ fn replay_counts_once() {
 fn prepare(entries: Vec<PageEntry>) -> PreparedRows {
     let heads = entries.iter().map(|_| None).collect();
     let mut operation = PreparePageOperation::new(input(entries));
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
+    assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
     answer_heads(&mut operation.0, heads);
-    operation.step(relationships(1));
+    operation.next(relationships(1)).unwrap();
     // The snapshot ends without a write.
-    assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    operation.finalize().unwrap()
+    match operation.next(no_secret()) {
+        Ok(Next::Done(prepared)) => prepared,
+        other => panic!("expected the prepared rows, got {other:?}"),
+    }
 }
 
 // Rows prepared before the turn are written when the transaction reads what they were built
@@ -496,23 +467,15 @@ fn newer_write_kept() {
 
     // Only the head written before the job started is replaced.
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 1);
-    let effects = operation.step(written());
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-        panic!("expected one usage update, got {effects:?}");
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = after_rows(&mut operation) else {
+        panic!("expected one usage update");
     };
     assert!(
         deltas
             .iter()
             .all(|(_, delta)| delta.objects == 0 && delta.referenced_bytes == 3)
     );
-    operation.step(written());
-    operation.step(written());
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    operation.step(scheduled(TaskKey::PublishUsageSnapshots));
-    operation.step(scheduled(TaskKey::DrainReplicationQueue));
-    let result = operation.finalize().unwrap();
+    let (result, _) = after_usage(&mut operation);
     assert_eq!((result.registered, result.kept), (1, 1));
     assert_eq!(result.checkpoint.items_failed, 1);
     assert_eq!(result.checkpoint.errors[0].target_key, newer.target_key);
@@ -532,11 +495,9 @@ fn newer_same_kept() {
     );
 
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
-    operation.step(written());
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    let result = operation.finalize().unwrap();
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
     assert_eq!((result.registered, result.kept), (0, 1));
 }
 
@@ -558,22 +519,10 @@ fn guards_abort_page() {
             PageImportError::ClaimLost,
         ),
     ];
-    for (event, expected) in cases {
+    for (read, expected) in cases {
         let mut operation = PageImportOperation::new(input(vec![entry("a")]));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-
-        assert!(matches!(
-            operation.step(event).as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: txn(),
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(expected));
+        operation.first().unwrap();
+        assert_eq!(operation.next(read), Err(expected));
     }
 }
 
@@ -583,22 +532,14 @@ fn changed_secret_aborts() {
         secret_fingerprint: Some([1; 16]),
         ..input(vec![entry("a")])
     });
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
     answer_heads(&mut operation, vec![None]);
-    operation.step(relationships(1));
-
-    assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: txn(),
-    }));
-    assert_eq!(operation.finalize(), Err(PageImportError::ConnectorChanged));
+    operation.next(relationships(1)).unwrap();
+    assert_eq!(
+        operation.next(no_secret()),
+        Err(PageImportError::ConnectorChanged)
+    );
 }
 
 // The heads of a page are read as one interval of its keys; an empty interval proves every
@@ -608,80 +549,57 @@ fn interval_proves_absence() {
     use aruna_core::effects::{IterEnd, IterStart};
     use aruna_core::structs::storage::blob::BlobHeadKey;
     let mut operation = PageImportOperation::new(input(vec![entry("b"), entry("a")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
+    operation.first().unwrap();
 
-    let effects = operation.step(guards(None, &record(token())));
+    let call = called(operation.next(guards(None, &record(token()))));
 
     let key = |name| Key::from(BlobHeadKey::new("imports", name).to_bytes().unwrap());
-    let [Effect::Storage(StorageEffect::IterRange { start, end, .. })] = effects.as_slice() else {
-        panic!("expected one head interval read, got {effects:?}");
+    let IoCall::Effect(read) = call else {
+        panic!("expected one head interval read, got {call:?}");
+    };
+    let Effect::Storage(StorageEffect::IterRange {
+        start, end, txn_id, ..
+    }) = *read
+    else {
+        panic!("expected one head interval read, got {read:?}");
     };
     assert_eq!(
-        (start, end),
-        (&IterStart::At(key("a")), &IterEnd::Through(key("b")))
+        (start, end, txn_id),
+        (IterStart::At(key("a")), IterEnd::Through(key("b")), None)
     );
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    }));
-    operation.step(relationships(1));
-    let effects = operation.step(no_secret());
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    operation.next(range_page(None)).unwrap();
+    operation.next(relationships(1)).unwrap();
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
     };
-    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
 }
 
 // A bucket nothing replicates gets no replication obligation per imported file.
 #[test]
 fn obligations_need_downstream() {
     let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
-    let effects = answer_heads(&mut operation, vec![None, None]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter {
-            limit: 1,
-            txn_id: Some(_),
-            ..
-        })]
-    ));
-    operation.step(relationships(0));
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
+    let call = answer_heads(&mut operation, vec![None, None]);
+    assert!(matches!(call, IoCall::Page { limit: 1, .. }));
+    operation.next(relationships(0)).unwrap();
 
-    let effects = operation.step(no_secret());
-
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
     };
-    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
-    assert_eq!(rows_in(writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
 }
 
+// An answer of another kind than the pending read fails the page.
 #[test]
 fn page_rejects_event() {
     let mut operation = PageImportOperation::new(input(vec![entry("a")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-
+    operation.first().unwrap();
     assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: txn(),
-    }));
-    assert!(matches!(
-        operation.finalize(),
-        Err(PageImportError::UnexpectedEvent { .. })
+        operation.next(no_secret()),
+        Err(PageImportError::Storage(_))
     ));
 }
 
@@ -691,11 +609,8 @@ fn page_bounds_entries() {
         .map(|index| entry(&index.to_string()))
         .collect();
     let mut operation = PageImportOperation::new(input(entries));
-
-    assert!(operation.start().is_empty());
-    assert!(operation.is_complete());
     assert_eq!(
-        operation.finalize(),
+        operation.first(),
         Err(PageImportError::TooManyEntries(MAX_PAGE_ENTRIES + 1))
     );
 }
@@ -720,7 +635,8 @@ async fn flush_keeps_page() {
         connector,
         expected_bucket,
         ..input(vec![entry("a")])
-    });
+    })
+    .into_machine();
 
     let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
     while let Some(effect) = pending.pop_front() {
@@ -1218,23 +1134,45 @@ async fn entry_sizes_measured() {
     print_sizes("plain", &before, &after, ENTRIES);
 }
 
-/// Drives `operation` against `handle` and counts its storage request/response exchanges.
+/// Answers one storage or timer effect and counts the storage exchange.
+async fn exchange(
+    effect: Effect,
+    handle: &aruna_storage::StorageHandle,
+    exchanges: &mut usize,
+) -> Event {
+    match effect {
+        Effect::Storage(effect) => {
+            *exchanges += 1;
+            handle.send_storage_effect(effect).await
+        }
+        Effect::Task(
+            TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+        ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+/// Drives `operation` against `handle` and counts its storage request/response exchanges,
+/// those of the reads it runs as children included.
 async fn count_exchanges(
-    mut operation: PageImportOperation,
+    operation: PageImportOperation,
     handle: &aruna_storage::StorageHandle,
 ) -> (usize, Result<PageImportResult, PageImportError>) {
+    let mut operation = operation.into_machine();
     let mut exchanges = 0;
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = effects.pop_front() {
         let event = match effect {
-            Effect::Storage(effect) => {
-                exchanges += 1;
-                handle.send_storage_effect(effect).await
+            Effect::SubOperation(mut child) => {
+                let mut inner: std::collections::VecDeque<Effect> =
+                    child.start().into_iter().collect();
+                while let Some(effect) = inner.pop_front() {
+                    let event = exchange(effect, handle, &mut exchanges).await;
+                    inner.extend(child.step(event));
+                }
+                child.finalize()
             }
-            Effect::Task(
-                TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
-            ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
-            other => panic!("unexpected effect: {other:?}"),
+            effect => exchange(effect, handle, &mut exchanges).await,
         };
         effects.extend(operation.step(event));
     }
@@ -1325,13 +1263,8 @@ fn mirror_connector_rechecked() {
     let reads = crate::staging::page::rows::guard_reads(&input).unwrap();
     assert_eq!(reads.len(), GUARD_READS + 1);
     let values = |found: Option<&SourceConnector>| {
-        let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
-            guards(None, &record(token()))
-        else {
-            unreachable!()
-        };
-        let found = found.map(|connector| connector.to_bytes().unwrap().into());
-        values.push((Key::from(b"mirror".to_vec()), found));
+        let mut values = guard_values(None, &record(token()));
+        values.push(found.map(|connector| connector.to_bytes().unwrap().into()));
         values
     };
     let check = crate::staging::page::rows::check_guards;

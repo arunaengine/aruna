@@ -633,10 +633,10 @@ mod tests {
     ) -> Result<PageImportResult, PageImportError> {
         use aruna_core::effects::{Effect, StorageEffect};
         use aruna_core::events::Event;
-        use aruna_core::operation::EffectOperation;
+        use aruna_core::operation::{EffectOperation, Runnable};
         use aruna_core::task::{TaskEffect, TaskEvent};
         let handle = &ctx.driver.storage_handle;
-        let mut operation = PageImportOperation::new(input);
+        let mut operation = PageImportOperation::new(input).into_machine();
         let mut effects: std::collections::VecDeque<Effect> =
             operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
