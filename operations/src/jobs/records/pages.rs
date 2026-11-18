@@ -3,25 +3,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::rows::{done, read_row, value};
 use aruna_core::scheduling::PlannedInput;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputPage, InputSelection, JobFamilyRecord, LaunchIntent, LogicalJobSpec,
     PageEntries, PageError, PageManifest, SubmissionId, launch_entries, needs_pages, paginate,
-    spec_entries,
+    spec_entries, verify_chain,
 };
-use aruna_core::types::Key;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::driver::DriverContext;
-use crate::realm::load_config::load_realm_config;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
-use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::execution::job::record_keys::submission_prefix;
+
+/// Upper bound of one page request; the transport's own step limits end it earlier.
+const FETCH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// This node and the realm it serves, when it has a network.
+pub type ServingNode = Option<(NodeId, RealmId)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PageReadError {
@@ -33,18 +45,23 @@ pub enum PageReadError {
     Storage(String),
 }
 
+impl From<IoError> for PageReadError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
 fn page_key(submission: &SubmissionId, digest: &[u8; 32]) -> Key {
     let mut key = submission_prefix(*submission).to_vec();
     key.extend_from_slice(digest);
     Key::from(key.as_slice())
 }
 
-/// Stores pages under their digests. A page is immutable, so a rewrite is a no-op.
-pub async fn store_pages(
-    context: &DriverContext,
+/// The rows that keep `pages` under their digests. A page is immutable, so a rewrite is a no-op.
+pub(crate) fn page_rows(
     submission: &SubmissionId,
     pages: &[InputPage],
-) -> Result<(), PageReadError> {
+) -> Result<Vec<(KeySpace, Key, Value)>, PageReadError> {
     let mut writes = Vec::with_capacity(pages.len());
     for page in pages {
         let digest = page.digest().map_err(PageError::from)?;
@@ -56,239 +73,120 @@ pub async fn store_pages(
             value.into(),
         ));
     }
-    let effect = StorageEffect::BatchWrite {
-        writes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(PageReadError::Storage(other.label().to_string())),
-    }
+    Ok(writes)
 }
 
-/// The page this node keeps under `digest`, checked against that digest.
-async fn local_page(
-    context: &DriverContext,
-    submission: &SubmissionId,
-    digest: &[u8; 32],
-) -> Result<Option<InputPage>, PageReadError> {
-    let effect = StorageEffect::Read {
-        key_space: INPUT_PAGE_KEYSPACE.to_string(),
-        key: page_key(submission, digest),
-        txn_id: None,
-    };
-    let bytes = match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(PageReadError::Storage(other.label().to_string())),
-    };
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
+/// The page a stored row holds, checked against the digest it is kept under.
+fn stored_page(row: &[u8], digest: &[u8; 32]) -> Result<InputPage, PageReadError> {
     let page: InputPage =
-        postcard::from_bytes(&bytes).map_err(|error| PageReadError::Storage(error.to_string()))?;
+        postcard::from_bytes(row).map_err(|error| PageReadError::Storage(error.to_string()))?;
     match page.digest().map_err(PageError::from)? == *digest {
-        true => Ok(Some(page)),
+        true => Ok(page),
         false => Err(PageError::Digest { index: page.index }.into()),
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum ChainStep {
+    Local([u8; 32]),
+    Fetch([u8; 32], usize),
+    Keep(Box<InputPage>),
+}
+
 /// Every page of `manifest`, read here or fetched from `peers` in order and kept here.
 /// Each page must hash to the digest its predecessor or the manifest names.
-pub async fn load_chain(
-    context: &DriverContext,
-    submission: &SubmissionId,
-    manifest: &PageManifest,
-    peers: &[NodeId],
-) -> Result<Vec<InputPage>, PageReadError> {
-    let mut pages = Vec::with_capacity(manifest.pages as usize);
-    let mut next = (manifest.pages > 0).then_some(manifest.first);
-    while let Some(digest) = next {
-        let index = pages.len() as u32;
-        if index >= manifest.pages {
+#[derive(Debug, PartialEq)]
+pub struct LoadChainOperation {
+    submission: SubmissionId,
+    manifest: PageManifest,
+    peers: Vec<NodeId>,
+    pages: Vec<InputPage>,
+    step: Option<ChainStep>,
+}
+
+type ChainNext = Result<Next<Vec<InputPage>>, PageReadError>;
+
+impl LoadChainOperation {
+    pub fn new(submission: SubmissionId, manifest: PageManifest, peers: Vec<NodeId>) -> Self {
+        Self {
+            submission,
+            manifest,
+            peers,
+            pages: Vec::with_capacity(manifest.pages as usize),
+            step: None,
+        }
+    }
+
+    fn index(&self) -> u32 {
+        self.pages.len() as u32
+    }
+
+    fn read_next(&mut self) -> ChainNext {
+        let digest = match self.pages.last() {
+            Some(page) => page.next,
+            None => (self.manifest.pages > 0).then_some(self.manifest.first),
+        };
+        let Some(digest) = digest else {
+            verify_chain(&self.manifest, &self.pages)?;
+            return Ok(Next::Done(std::mem::take(&mut self.pages)));
+        };
+        if self.index() >= self.manifest.pages {
             return Err(PageError::Chain.into());
         }
-        let page = match local_page(context, submission, &digest).await? {
-            Some(page) => page,
-            None => {
-                let page = fetch_page(context, submission, &digest, peers)
-                    .await
-                    .ok_or(PageReadError::Unavailable { index })?;
-                store_pages(context, submission, std::slice::from_ref(&page)).await?;
-                page
-            }
-        };
-        next = page.next;
-        pages.push(page);
+        self.step = Some(ChainStep::Local(digest));
+        let key = page_key(&self.submission, &digest);
+        Ok(Next::Call(read_row(INPUT_PAGE_KEYSPACE, key)))
     }
-    aruna_core::structs::execution::job::verify_chain(manifest, &pages)?;
-    Ok(pages)
-}
 
-async fn fetch_page(
-    context: &DriverContext,
-    submission: &SubmissionId,
-    digest: &[u8; 32],
-    peers: &[NodeId],
-) -> Option<InputPage> {
-    let metadata = context.metadata_handle.as_ref()?;
-    for peer in peers {
-        match metadata
-            .request_input_page(*peer, *submission, *digest)
-            .await
-        {
-            Ok(Some(page)) if page.digest().ok().as_ref() == Some(digest) => return Some(page),
-            Ok(_) => continue,
-            Err(error) => debug!(peer = %peer, error = %error, "Input page fetch failed"),
+    /// Asks the next peer that can still be asked; a frame that cannot be built skips it.
+    fn fetch(&mut self, digest: [u8; 32], mut peer: usize) -> ChainNext {
+        let message = MetadataTransportMessage::JobInputPage {
+            submission: self.submission,
+            digest,
+        };
+        while let Some(node) = self.peers.get(peer) {
+            match encode_message(&message) {
+                Ok(frame) => {
+                    self.step = Some(ChainStep::Fetch(digest, peer));
+                    let request = MetadataRequestEffect {
+                        peer: *node,
+                        frame,
+                        timeout: FETCH_DEADLINE,
+                    };
+                    let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
+                    return Ok(Next::Call(IoCall::Effect(Box::new(effect))));
+                }
+                Err(error) => debug!(peer = %node, error = %error, "Input page request not built"),
+            }
+            peer += 1;
+        }
+        let index = self.index();
+        Err(PageReadError::Unavailable { index })
+    }
+
+    fn fetched(&mut self, digest: [u8; 32], peer: usize, result: IoResult) -> ChainNext {
+        let expected = "Event::Net(NetEvent::MetadataAnswer)";
+        let IoResult::Event(event) = result else {
+            let got = result.label();
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = *event else {
+            let got = "another event";
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        match answered_page(*answer, &digest) {
+            Ok(Some(page)) => {
+                let rows = page_rows(&self.submission, std::slice::from_ref(&page))?;
+                self.step = Some(ChainStep::Keep(Box::new(page)));
+                Ok(Next::Call(IoCall::Write(rows)))
+            }
+            Ok(None) => self.fetch(digest, peer + 1),
+            Err(error) => {
+                debug!(peer = %self.peers[peer], error = %error, "Input page fetch failed");
+                self.fetch(digest, peer + 1)
+            }
         }
     }
-    None
-}
-
-/// The other holders of the submission's family, which keep its pages with its records.
-async fn family_holders(context: &DriverContext, submission: SubmissionId) -> Vec<NodeId> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Vec::new();
-    };
-    let Some(config) = load_realm_config(context, *net.realm_id()).await else {
-        return Vec::new();
-    };
-    let holders = (config.family_placement(submission))
-        .map(|placement| resolve_shard_holders(&config, &placement))
-        .unwrap_or_default();
-    holders
-        .into_iter()
-        .filter(|holder| *holder != net.node_id())
-        .collect()
-}
-
-/// Keeps the pages a record binds, fetched from the peer that sent it, the nodes it names or
-/// the family holders. A holder acknowledges such a record only once this succeeds.
-pub async fn keep_pages(
-    context: &DriverContext,
-    record: &JobFamilyRecord,
-    peer: NodeId,
-) -> Result<(), PageReadError> {
-    let (submission, manifest, mut peers) = match record {
-        JobFamilyRecord::Spec(spec) => (
-            spec.submission_id,
-            spec.input_pages,
-            vec![
-                peer,
-                spec.admission.admitting_node_id,
-                spec.ingress_node_id,
-                spec.origin_node_id,
-            ],
-        ),
-        JobFamilyRecord::Launch(launch) => (
-            launch.submission_id,
-            launch.input_pages,
-            vec![peer, launch.scheduler_node_id],
-        ),
-        _ => return Ok(()),
-    };
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
-    peers.extend(family_holders(context, submission).await);
-    load_chain(context, &submission, &manifest, &peers).await?;
-    Ok(())
-}
-
-/// The spec with its paged inputs filled in, read here, from the nodes that admitted it or
-/// from the family holders.
-pub async fn with_inputs(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-) -> Result<LogicalJobSpec, PageReadError> {
-    let Some(manifest) = spec.input_pages else {
-        return Ok(spec.clone());
-    };
-    let mut peers = vec![
-        spec.admission.admitting_node_id,
-        spec.ingress_node_id,
-        spec.origin_node_id,
-    ];
-    peers.extend(family_holders(context, spec.submission_id).await);
-    let pages = load_chain(context, &spec.submission_id, &manifest, &peers).await?;
-    let (inputs, captured): (Vec<_>, Vec<_>) = spec_entries(pages)?.into_iter().unzip();
-    let mut filled = spec.clone();
-    filled.payload.inputs = inputs;
-    filled.captured_inputs = captured;
-    Ok(filled)
-}
-
-/// The launch's planned inputs, inline or read from its scheduler or the family holders.
-pub async fn planned_inputs(
-    context: &DriverContext,
-    launch: &LaunchIntent,
-) -> Result<Vec<PlannedInput>, PageReadError> {
-    let Some(manifest) = launch.input_pages else {
-        return Ok(launch.inputs.clone());
-    };
-    let mut peers = vec![launch.scheduler_node_id];
-    peers.extend(family_holders(context, launch.submission_id).await);
-    let pages = load_chain(context, &launch.submission_id, &manifest, &peers).await?;
-    Ok(launch_entries(pages)?)
-}
-
-/// Moves a request's inputs into pages kept here when they would not fit its record.
-pub async fn page_request(
-    context: &DriverContext,
-    submission: &SubmissionId,
-    inputs: &mut Vec<InputSelection>,
-    captured: &mut Vec<CapturedInput>,
-) -> Result<Option<PageManifest>, PageReadError> {
-    let mut pairs = Vec::with_capacity(inputs.len());
-    for input in inputs.iter() {
-        let capture = captured
-            .iter()
-            .find(|capture| capture.destination_key == input.dest_key)
-            .ok_or(PageError::Chain)?;
-        pairs.push((input.clone(), capture.clone()));
-    }
-    if !needs_pages(&pairs).map_err(PageError::from)? {
-        return Ok(None);
-    }
-    let (manifest, pages) = paginate(&pairs, PageEntries::Spec).map_err(PageError::from)?;
-    store_pages(context, submission, &pages).await?;
-    inputs.clear();
-    captured.clear();
-    Ok(Some(manifest))
-}
-
-/// Moves a launch's planned inputs into pages kept here when they would not fit its record.
-pub async fn page_launch(
-    context: &DriverContext,
-    launch: &mut LaunchIntent,
-) -> Result<(), PageReadError> {
-    if !needs_pages(&launch.inputs).map_err(PageError::from)? {
-        return Ok(());
-    }
-    let (manifest, pages) =
-        paginate(&launch.inputs, PageEntries::Launch).map_err(PageError::from)?;
-    store_pages(context, &launch.submission_id, &pages).await?;
-    launch.inputs.clear();
-    launch.input_pages = Some(manifest);
-    Ok(())
-}
-
-/// Serves one page to a realm infrastructure node; a device never reads another's inputs.
-pub async fn serve_page(
-    context: &DriverContext,
-    peer: NodeId,
-    submission: SubmissionId,
-    digest: [u8; 32],
-) -> Option<Box<InputPage>> {
-    let realm_id = context.net_handle.as_ref().map(|net| *net.realm_id())?;
-    let config = load_realm_config(context, realm_id).await?;
-    if !is_sync_eligible(&config, peer) {
-        return None;
-    }
-    local_page(context, &submission, &digest)
-        .await
-        .ok()
-        .flatten()
-        .map(Box::new)
 }
 
 #[cfg(test)]
