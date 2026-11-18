@@ -5,6 +5,7 @@
 use super::*;
 use aruna_core::UserId;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
@@ -2490,4 +2491,294 @@ fn list_reads_bare_rows() {
     assert_eq!(cursor, None);
     let mut empty = ListJobsOperation::new(owner, None, 0, |_: &JobRecord| true);
     assert_eq!(empty.first(), Ok(Next::Done((Vec::new(), None))));
+}
+
+// A launch start marks the current attempt's launch record once, in the job mutation's run.
+#[test]
+fn marks_launch_once() {
+    use super::mark_start::MarkStartOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let mut record = queued_record(job_id(2_000));
+    record.attempt_intent = Some(AttemptIntent {
+        attempt_no: 1,
+        external_name: "attempt".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:digest".to_string(),
+        attempt_epoch: 3,
+    });
+    let mut rows = seeded_rows(&record);
+    let key = attempt_control_key(record.job_id, 3);
+    let launch = LaunchRecord {
+        node_id: node_id(7),
+        executor_kind: "docker".to_string(),
+        location: String::new(),
+        resources: Default::default(),
+        workdir: None,
+        env: Default::default(),
+        started_at_ms: None,
+    };
+    let row = (LAUNCH_RECORD_KEYSPACE.to_string(), key.to_vec());
+    rows.insert(row.clone(), launch.to_bytes().unwrap());
+    let mut touch = |record: &mut JobRecord| {
+        record.updated_at_ms = 2_500;
+        Ok(JobMutation::Persist)
+    };
+    let mark = MarkStartOperation::new(record.job_id, &mut touch, 2_600);
+    let marked = run_in_memory(mark, &mut rows).unwrap();
+    assert_eq!(marked.updated_at_ms, 2_500);
+    let stored = LaunchRecord::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(stored.started_at_ms, Some(2_600));
+
+    let mut again = |_: &mut JobRecord| Ok(JobMutation::Skip);
+    let mark = MarkStartOperation::new(record.job_id, &mut again, 2_900);
+    run_in_memory(mark, &mut rows).unwrap();
+    let kept = LaunchRecord::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(kept.started_at_ms, Some(2_600));
+}
+
+// Only a lost conflict runs again, and the last one reports the exhausted retries.
+#[tokio::test(start_paused = true)]
+async fn retries_conflicts() {
+    let retry = settle_attempt::<()>(Err(JobMutationError::Conflict), 0, "spent").await;
+    assert_eq!(retry, None);
+    let last = MUTATE_MAX_ATTEMPTS - 1;
+    let spent = settle_attempt::<()>(Err(JobMutationError::Conflict), last, "spent").await;
+    assert_eq!(
+        spent,
+        Some(Err(JobMutationError::Storage("spent".to_string())))
+    );
+    let refused = settle_attempt::<()>(Err(JobMutationError::NotFound), 0, "spent").await;
+    assert_eq!(refused, Some(Err(JobMutationError::NotFound)));
+}
+
+fn draft() -> AttemptIntent {
+    AttemptIntent {
+        attempt_no: 1,
+        external_name: "aruna-test-a1".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:0".to_string(),
+        attempt_epoch: 0,
+    }
+}
+
+fn has_row(rows: &mutation::Rows, space: &str, key: &[u8]) -> bool {
+    rows.contains_key(&(space.to_string(), key.to_vec()))
+}
+
+// A settled job other than a run leaves the list; an unfinished or foreign one stays.
+#[test]
+fn delete_hides_settled() {
+    use super::mutation::{run_in_memory, seeded_rows};
+    use super::run_delete::DeleteRunOperation;
+    let mut record = queued_record(job_id(1_000));
+    let (owner, id) = (record.created_by, record.job_id);
+    let mut rows = seeded_rows(&record);
+    let delete = DeleteRunOperation::new(owner, id, true);
+    assert_eq!(delete.transaction(), TransactionMode::Write);
+    let unfinished = run_in_memory(delete, &mut rows);
+    assert_eq!(unfinished, Ok(RunDelete::Unfinished(JobState::Queued)));
+    let stranger = UserId::new(Ulid::from_bytes([9u8; 16]), RealmId([1u8; 32]));
+    let foreign = DeleteRunOperation::new(stranger, id, true);
+    assert_eq!(run_in_memory(foreign, &mut rows), Ok(RunDelete::NotFound));
+
+    record.state = JobState::Succeeded;
+    let mut rows = seeded_rows(&record);
+    let listed = owner_index_key(owner, record.created_at_ms, id);
+    let hidden = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(hidden, Ok(RunDelete::Deleted));
+    assert!(!has_row(&rows, JOB_INDEX_KEYSPACE, &listed));
+    assert!(has_row(&rows, JOB_KEYSPACE, &job_record_key(id)));
+    let again = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(again, Ok(RunDelete::NotFound));
+}
+
+// A finished run goes with its entries once recorded; a queued cleanup or a missing record keeps it.
+#[test]
+fn delete_removes_run() {
+    use super::mutation::{run_in_memory, seeded_rows};
+    use super::run_delete::DeleteRunOperation;
+    let record = execution_record(
+        job_id(1_000),
+        Ulid::from_bytes([5u8; 16]),
+        JobState::Succeeded,
+    );
+    let (owner, id) = (record.created_by, record.job_id);
+    let mut rows = seeded_rows(&record);
+    let entry = job_entry_key(id, b"a");
+    rows.insert((JOB_ENTRY_KEYSPACE.to_string(), entry.to_vec()), vec![1]);
+
+    let unrecorded = run_in_memory(DeleteRunOperation::new(owner, id, false), &mut rows);
+    assert!(matches!(unrecorded, Ok(RunDelete::Unrecorded(_))));
+    let mut pending = rows.clone();
+    pending.extend(seeded_rows(&queued_record(cleanup_job_id(id))));
+    let cleanup = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut pending);
+    assert_eq!(cleanup, Ok(RunDelete::CleanupPending));
+
+    let deleted = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(deleted, Ok(RunDelete::Deleted));
+    assert!(!has_row(&rows, JOB_KEYSPACE, &job_record_key(id)));
+    assert!(!has_row(&rows, JOB_ENTRY_KEYSPACE, &entry));
+}
+
+// Only the claim token holder writes and deletes a running job's rows.
+#[test]
+fn rows_fenced_by_claim() {
+    use super::job_rows::PutRowsOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let mut rows = seeded_rows(&record);
+    let key = ByteView::from(b"state".to_vec());
+    let write = vec![(
+        STAGING_STATE_KEYSPACE.to_string(),
+        key.clone(),
+        ByteView::from(vec![1]),
+    )];
+    let before = rows.clone();
+    let stranger = PutRowsOperation::new(
+        record.job_id,
+        Ulid::from_bytes([6u8; 16]),
+        write.clone(),
+        Vec::new(),
+    );
+    assert_eq!(
+        run_in_memory(stranger, &mut rows),
+        Err(JobMutationError::TokenMismatch)
+    );
+    assert_eq!(rows, before);
+
+    let put = PutRowsOperation::new(record.job_id, token, write, Vec::new());
+    assert_eq!(put.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(put, &mut rows), Ok(()));
+    assert!(has_row(&rows, STAGING_STATE_KEYSPACE, &key));
+    let gone = vec![(STAGING_STATE_KEYSPACE.to_string(), key.clone())];
+    let delete = PutRowsOperation::new(record.job_id, token, Vec::new(), gone);
+    assert_eq!(run_in_memory(delete, &mut rows), Ok(()));
+    assert!(!has_row(&rows, STAGING_STATE_KEYSPACE, &key));
+}
+
+// A running job adds report entries under its claim; a settled report is frozen.
+#[test]
+fn entries_need_live_claim() {
+    use super::job_rows::PutEntryOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let mut record = running_record(job_id(1_000), token, 10_000);
+    let value = ByteView::from(vec![7]);
+    let missing = PutEntryOperation::new(record.job_id, token, b"e", value.clone());
+    assert_eq!(
+        run_in_memory(missing, &mut Default::default()),
+        Err(JobMutationError::NotFound)
+    );
+
+    let mut rows = seeded_rows(&record);
+    let put = PutEntryOperation::new(record.job_id, token, b"e", value.clone());
+    assert_eq!(put.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(put, &mut rows), Ok(()));
+    assert!(has_row(
+        &rows,
+        JOB_ENTRY_KEYSPACE,
+        &job_entry_key(record.job_id, b"e")
+    ));
+    let stranger = PutEntryOperation::new(
+        record.job_id,
+        Ulid::from_bytes([6u8; 16]),
+        b"f",
+        value.clone(),
+    );
+    assert_eq!(
+        run_in_memory(stranger, &mut rows),
+        Err(JobMutationError::TokenMismatch)
+    );
+
+    record.state = JobState::Succeeded;
+    let mut rows = seeded_rows(&record);
+    let frozen = PutEntryOperation::new(record.job_id, token, b"e", value);
+    assert_eq!(
+        run_in_memory(frozen, &mut rows),
+        Err(JobMutationError::ReportFrozen)
+    );
+}
+
+// A new intent takes the next epoch with its control and launch rows; the same intent replays.
+#[test]
+fn intent_takes_epoch() {
+    use super::attempt_intent::RecordIntentOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let id = record.job_id;
+    let mut rows = seeded_rows(&record);
+    let execution = Ulid::from_bytes([8u8; 16]);
+    let launch = Some(sample_launch());
+    let intent = RecordIntentOperation::new((id, token), draft(), execution, launch.clone(), 2_000);
+    assert_eq!(intent.transaction(), TransactionMode::Write);
+    let commit = run_in_memory(intent, &mut rows).expect("intent recorded");
+    assert_eq!(commit.control.execution_id, execution);
+    assert_eq!(
+        commit.record.next_attempt_epoch,
+        record.next_attempt_epoch + 1
+    );
+    let key = attempt_control_key(id, commit.control.attempt_epoch);
+    assert!(has_row(&rows, ATTEMPT_CONTROL_KEYSPACE, &key));
+    assert!(has_row(&rows, LAUNCH_RECORD_KEYSPACE, &key));
+
+    let other = Ulid::from_bytes([9u8; 16]);
+    let replay = RecordIntentOperation::new((id, token), draft(), other, None, 3_000);
+    assert_eq!(run_in_memory(replay, &mut rows), Ok(commit));
+    let mut changed = draft();
+    changed.attempt_no = 2;
+    let conflict = RecordIntentOperation::new((id, token), changed, other, None, 3_000);
+    assert_eq!(
+        run_in_memory(conflict, &mut rows),
+        Err(JobMutationError::IntentConflict)
+    );
+}
+
+// A control change writes both rows; a job without an intent has no control to change.
+#[test]
+fn control_changes_with_job() {
+    use super::attempt_intent::RecordIntentOperation;
+    use super::control_mutation::MutateControlOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let id = record.job_id;
+    let mut rows = seeded_rows(&record);
+    let mut bump = |record: &mut JobRecord, control: &mut AttemptControl| {
+        record.updated_at_ms = 4_000;
+        control.controller_generation += 1;
+        Ok(JobMutation::Persist)
+    };
+    let early = MutateControlOperation::new(id, Vec::new(), &mut bump);
+    assert_eq!(early.transaction(), TransactionMode::Write);
+    assert_eq!(
+        run_in_memory(early, &mut rows),
+        Err(JobMutationError::MissingControl)
+    );
+
+    let intent = RecordIntentOperation::new(
+        (id, token),
+        draft(),
+        Ulid::from_bytes([8u8; 16]),
+        None,
+        2_000,
+    );
+    let commit = run_in_memory(intent, &mut rows).expect("intent recorded");
+    let extra = (
+        STAGING_STATE_KEYSPACE.to_string(),
+        ByteView::from(b"x".to_vec()),
+        ByteView::from(vec![1]),
+    );
+    let change = MutateControlOperation::new(id, vec![extra], &mut bump);
+    let (changed, control) = run_in_memory(change, &mut rows).expect("control changed");
+    assert_eq!(changed.updated_at_ms, 4_000);
+    assert_eq!(
+        control.controller_generation,
+        commit.control.controller_generation + 1
+    );
+    let key = attempt_control_key(id, control.attempt_epoch);
+    let stored = &rows[&(ATTEMPT_CONTROL_KEYSPACE.to_string(), key)];
+    assert_eq!(AttemptControl::from_bytes(stored).unwrap(), control);
+    assert!(has_row(&rows, STAGING_STATE_KEYSPACE, b"x"));
 }
