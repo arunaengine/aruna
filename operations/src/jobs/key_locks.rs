@@ -627,3 +627,231 @@ impl Operation for ParkLockedOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{REALM, captured_input, node, payload, user};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, JobPayload};
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn key(seed: u8) -> BucketKeyRef {
+        BucketKeyRef {
+            bucket_id: Ulid::from_parts(u64::from(seed), 1),
+            generation: 1,
+        }
+    }
+
+    fn wait(seed: u8) -> KeyWait {
+        KeyWait {
+            node_id: node(1),
+            bucket: "b".to_string(),
+            group_id: None,
+            key: key(seed),
+        }
+    }
+
+    fn input(source: NodeId) -> CapturedInput {
+        let selection = InputSelection {
+            source: InputSource::S3 {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "k".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        };
+        captured_input(&selection, source)
+    }
+
+    fn record(inputs: Vec<CapturedInput>) -> JobRecord {
+        let mut record = JobRecord::new(
+            JobId::from_bytes([3; 16]),
+            JobPayload::Execution(payload()),
+            user(),
+            node(1),
+            1,
+            1,
+            None,
+        );
+        record.captured_inputs = inputs;
+        record
+    }
+
+    fn park(record: &JobRecord) -> ParkLockedOperation {
+        let token = Ulid::from_parts(4, 4);
+        ParkLockedOperation::new(record, token, (node(1), Some((node(1), REALM))), 9)
+    }
+
+    fn calls_child(next: ParkNext) {
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))), "{next:?}");
+    }
+
+    // Only an active unlock of exactly this key counts; a missing blob handle holds none.
+    #[test]
+    fn unlock_needs_status() {
+        let mut check = KeyUnlockedOperation::new(key(1));
+        assert!(matches!(check.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        assert_eq!(check.next(IoResult::Done), Ok(Next::Done(false)));
+    }
+
+    // An alias page continues only when it came back full.
+    #[test]
+    fn short_page_ends() {
+        let mut read = AliasPageOperation::new([1; 32], node(1), None);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let done = read.next(IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        });
+        assert_eq!(done, Ok(Next::Done((Vec::new(), None))));
+    }
+
+    // The walk follows pages until the aliases end without the version.
+    #[test]
+    fn alias_walk_pages() {
+        let mut find = FindAliasOperation::new([1; 32], Ulid::from_parts(1, 1), node(1));
+        find.first().expect("the first page is read");
+        let more = child(Ok::<AliasPage, KeyCheckError>((
+            Vec::new(),
+            Some(Key::from(vec![1])),
+        )));
+        assert!(matches!(find.next(more), Ok(Next::Call(IoCall::Child(_)))));
+        let end = child(Ok::<AliasPage, KeyCheckError>((Vec::new(), None)));
+        assert_eq!(find.next(end), Ok(Next::Done(None)));
+    }
+
+    fn version_wait() -> VersionWaitOperation {
+        let version = VersionKey::new("b", "k", Ulid::from_parts(1, 1));
+        VersionWaitOperation::new((node(1), Ulid::from_parts(2, 2)), version)
+    }
+
+    // A version that does not exist here needs no key.
+    #[test]
+    fn missing_version_free() {
+        let mut wait = version_wait();
+        assert!(matches!(wait.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = wait.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(None)));
+    }
+
+    // A locked key becomes a wait naming this node and bucket; an unlocked one none.
+    #[test]
+    fn locked_key_waits() {
+        let answer = |unlocked: bool| {
+            let mut wait = version_wait();
+            wait.step = WaitStep::Unlocked(key(1));
+            wait.next(child(Ok::<_, IoError>(unlocked)))
+        };
+        assert_eq!(answer(true), Ok(Next::Done(None)));
+        let Ok(Next::Done(Some(found))) = answer(false) else {
+            panic!("a locked key is waited for");
+        };
+        assert_eq!((found.node_id, found.key), (node(1), key(1)));
+    }
+
+    // Inputs of other nodes are not checked here, and the same key is waited for once.
+    #[test]
+    fn local_inputs_only() {
+        let inputs = [input(node(2))];
+        let mut none = LockedInputsOperation::new(&inputs, node(1));
+        assert_eq!(none.first(), Ok(Next::Done(Vec::new())));
+        let inputs = [input(node(1)), input(node(1))];
+        let mut locked = LockedInputsOperation::new(&inputs, node(1));
+        locked.first().expect("the alias is looked up");
+        locked.step = LockedStep::Wait;
+        locked
+            .next(child(Ok::<_, KeyCheckError>(Some(wait(1)))))
+            .expect("the next input follows");
+        locked.step = LockedStep::Wait;
+        let done = locked.next(child(Ok::<_, KeyCheckError>(Some(wait(1)))));
+        assert_eq!(done, Ok(Next::Done(vec![wait(1)])));
+    }
+
+    // Without a network no other node can be asked.
+    #[test]
+    fn offline_asks_nobody() {
+        let auth = AuthContext::anonymous(REALM);
+        let target = WaitTarget::Content { blake3: [1; 32] };
+        let job = JobId::from_bytes([3; 16]);
+        let mut ask = AskWaitsOperation::new(&auth, job, node(2), &[target], None);
+        assert_eq!(ask.first(), Ok(Next::Done(Vec::new())));
+    }
+
+    // A node names its own keys only, and a failed request adds nothing.
+    #[test]
+    fn answers_filtered_by_node() {
+        let auth = AuthContext::anonymous(REALM);
+        let target = WaitTarget::Content { blake3: [1; 32] };
+        let job = JobId::from_bytes([3; 16]);
+        let mut ask =
+            AskWaitsOperation::new(&auth, job, node(1), &[target], Some((node(2), REALM)));
+        assert!(matches!(ask.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let mut foreign = wait(2);
+        foreign.node_id = node(5);
+        let locked = JobResponse::KeysLocked(vec![wait(1), foreign]);
+        let answer = child(Ok::<_, JobRouteError>(JobRouteOutcome::Remote(locked)));
+        assert_eq!(ask.next(answer), Ok(Next::Done(vec![wait(1)])));
+    }
+
+    // Any error other than a locked key leaves the job to its caller.
+    #[test]
+    fn other_errors_continue() {
+        let job = record(Vec::new());
+        let error = JobError::retryable("disk");
+        let token = Ulid::from_parts(4, 4);
+        let mut operation = ParkLockedOperation::on_error(&job, token, (node(1), None), &error, 9);
+        assert_eq!(operation.first(), Ok(Next::Done(false)));
+    }
+
+    // A failed local check continues, and no locked key means nothing to park on.
+    #[test]
+    fn nothing_to_park() {
+        let job = record(Vec::new());
+        let mut failed = park(&job);
+        calls_child(failed.first());
+        let error = Err::<Vec<KeyWait>, _>(KeyCheckError("down".to_string()));
+        assert_eq!(failed.next(child(error)), Ok(Next::Done(false)));
+        let mut free = park(&job);
+        free.first().expect("the local keys are checked");
+        let none = child(Ok::<_, KeyCheckError>(Vec::<KeyWait>::new()));
+        assert_eq!(free.next(none), Ok(Next::Done(false)));
+    }
+
+    // A lost claim means the job no longer runs here; a key already open wakes it again.
+    #[test]
+    fn park_outcomes() {
+        let job = record(Vec::new());
+        let parked = || {
+            let mut operation = park(&job);
+            operation.first().expect("the local keys are checked");
+            let waits = child(Ok::<_, KeyCheckError>(vec![wait(1)]));
+            calls_child(operation.next(waits));
+            operation
+        };
+        let mut lost = parked();
+        let refused = Err::<AwaitOutcome, _>(JobMutationError::TokenMismatch);
+        assert_eq!(lost.next(child(refused)), Ok(Next::Done(true)));
+        let mut skipped = parked();
+        let answer = Ok::<_, JobMutationError>(AwaitOutcome::Skipped);
+        assert_eq!(skipped.next(child(answer)), Ok(Next::Done(false)));
+        let mut open = parked();
+        let answer = Ok::<_, JobMutationError>(AwaitOutcome::Parked(job.clone()));
+        calls_child(open.next(child(answer)));
+        calls_child(open.next(child(Ok::<_, IoError>(true))));
+        let woken = child(Ok::<_, JobMutationError>(true));
+        assert_eq!(open.next(woken), Ok(Next::Done(true)));
+    }
+}
