@@ -32,6 +32,7 @@ mod refresh;
 pub mod replica_shares;
 pub mod resolve;
 pub mod roots;
+mod route_query;
 pub mod routing;
 pub mod sharding;
 pub mod source_keep;
