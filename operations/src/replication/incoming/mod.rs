@@ -12,8 +12,8 @@ use crate::distribution::inventory::{AddedVersion, InventoryChange, version_writ
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
-    split_drift_reads, union_refs, write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, drift_reads,
+    gate_decision, split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
@@ -27,6 +27,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
+use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
@@ -415,7 +416,6 @@ pub struct IncomingVersionOperation {
     /// Destination details of this node. Absent means no governed replica may be
     /// materialized or registered here.
     gate_context: Option<GateContext>,
-    gate: Option<PolicyGateOperation>,
     /// Refs the gate admitted: the manifest's set unioned with what the local
     /// version already carried, so a sender cannot drop an inherited ref.
     gated_refs: Vec<PlacementPolicyRef>,
@@ -486,7 +486,6 @@ impl IncomingVersionOperation {
             manifest_policy: None,
             writer_policy: None,
             gate_context: None,
-            gate: None,
             gated_refs: Vec::new(),
             gated_bucket: None,
             pending_negotiation: None,
@@ -1393,43 +1392,34 @@ impl IncomingVersionOperation {
             .map(|gated| gated.stored_under(self.gate_context.as_ref(), !refs.is_empty()));
         match write_gate(self.gate_context.as_ref(), &refs, self.destination_group_id) {
             Ok(None) => self.reply_negotiation(result),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
+            Ok(Some(gate)) => {
                 self.pending_negotiation = Some(result);
                 self.state = IncomingVersionState::PolicyGate;
-                match complete {
-                    true => self.finish_gate(),
-                    false => effects,
-                }
+                let child =
+                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
+                smallvec![Effect::SubOperation(child)]
             }
             Err(error) => self.reject_negotiation(error.into()),
         }
     }
 
     fn accept_policy_gate(&mut self, event: Event) -> Effects {
-        let Some(gate) = self.gate.as_mut() else {
+        let Event::Child(outcome) = event else {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
-                expected: "an active placement gate",
+                expected: "the placement gate outcome",
                 received: event.label(),
             });
         };
-        let effects = gate.step(event);
-        match gate.is_complete() {
-            true => self.finish_gate(),
-            false => effects,
-        }
-    }
-
-    fn finish_gate(&mut self) -> Effects {
-        let (Some(gate), Some(result)) = (self.gate.take(), self.pending_negotiation.take()) else {
+        let Some(result) = self.pending_negotiation.take() else {
             return self.fail(IncomingVersionError::GateNotPending);
         };
-        let outcome = match gate.finalize() {
-            Ok(outcome) => outcome,
-            Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
+        let outcome = match outcome.take::<PolicyGateOutcome, ReadPolicyError>() {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(error)) => {
+                return self.reject_negotiation(PolicyGateError::from(error).into());
+            }
+            None => return self.fail(PolicyGateError::InvalidEvent.into()),
         };
         match gate_decision(outcome) {
             Ok(()) => self.reply_negotiation(result),
