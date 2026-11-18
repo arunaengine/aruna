@@ -476,3 +476,154 @@ fn remote_targets(record: &JobRecord, node_id: NodeId) -> BTreeMap<NodeId, Vec<W
     }
     by_node
 }
+
+#[derive(Debug, PartialEq)]
+enum ParkStep {
+    Local,
+    Remote,
+    Park(Vec<BucketKeyRef>),
+    Unlocked(Vec<BucketKeyRef>, BucketKeyRef),
+    Wake(Vec<BucketKeyRef>),
+}
+
+/// Parks a claimed job whose inputs need locked keys. Answers true when the job no longer runs
+/// here: it is parked, or its claim is gone. A cancel request or a failed check continues.
+#[derive(Debug, PartialEq)]
+pub struct ParkLockedOperation {
+    record: JobRecord,
+    token: Ulid,
+    node_id: NodeId,
+    serving: ServingNode,
+    now_ms: u64,
+    only_locked: Option<bool>,
+    remote: Vec<(NodeId, Vec<WaitTarget>)>,
+    waits: Vec<KeyWait>,
+    step: ParkStep,
+}
+
+type ParkNext = Result<Next<bool>, IoError>;
+
+impl ParkLockedOperation {
+    pub fn new(
+        record: &JobRecord,
+        token: Ulid,
+        (node_id, serving): (NodeId, ServingNode),
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            remote: remote_targets(record, node_id).into_iter().rev().collect(),
+            record: record.clone(),
+            token,
+            node_id,
+            serving,
+            now_ms,
+            only_locked: None,
+            waits: Vec::new(),
+            step: ParkStep::Local,
+        }
+    }
+
+    /// Parks a job whose preparation hit a key locked after the precheck, before any attempt
+    /// intent exists. Any other error answers false and is left to the caller.
+    pub fn on_error(
+        record: &JobRecord,
+        token: Ulid,
+        node: (NodeId, ServingNode),
+        error: &JobError,
+        now_ms: u64,
+    ) -> Self {
+        let mut operation = Self::new(record, token, node, now_ms);
+        operation.only_locked = Some(error.locked);
+        operation
+    }
+
+    fn ask_next(&mut self) -> ParkNext {
+        let Some((node, targets)) = self.remote.pop() else {
+            return self.park();
+        };
+        self.step = ParkStep::Remote;
+        let auth = owner_auth(&self.record, self.serving);
+        let job_id = self.record.job_id;
+        let ask = AskWaitsOperation::new(&auth, job_id, node, &targets, self.serving);
+        Ok(Next::Call(IoCall::child(ask)))
+    }
+
+    fn park(&mut self) -> ParkNext {
+        if self.waits.is_empty() {
+            return Ok(Next::Done(false));
+        }
+        let waits = std::mem::take(&mut self.waits);
+        self.step = ParkStep::Park(waits.iter().map(|wait| wait.key).collect());
+        let park = park_job(self.record.job_id, self.token, self.now_ms, waits);
+        Ok(Next::Call(IoCall::child(park)))
+    }
+
+    /// A key unlocked while the job parked wakes it here; no unlock call would.
+    fn check_next(&mut self, mut keys: Vec<BucketKeyRef>) -> ParkNext {
+        let Some(key) = keys.pop() else {
+            return Ok(Next::Done(true));
+        };
+        self.step = ParkStep::Unlocked(keys, key);
+        Ok(Next::Call(IoCall::child(KeyUnlockedOperation::new(key))))
+    }
+}
+
+impl Operation for ParkLockedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> ParkNext {
+        if self.only_locked == Some(false) {
+            return Ok(Next::Done(false));
+        }
+        let local = LockedInputsOperation::new(&self.record.captured_inputs, self.node_id);
+        Ok(Next::Call(IoCall::child(local)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ParkNext {
+        let job_id = self.record.job_id;
+        match std::mem::replace(&mut self.step, ParkStep::Local) {
+            ParkStep::Local => match result.child::<Vec<KeyWait>, KeyCheckError>()? {
+                Ok(waits) => {
+                    self.waits = waits;
+                    self.ask_next()
+                }
+                Err(error) => {
+                    warn!(job_id = %job_id, %error, "Input key check failed; staging decides");
+                    Ok(Next::Done(false))
+                }
+            },
+            ParkStep::Remote => {
+                let waits = result.child::<Vec<KeyWait>, IoError>()?;
+                self.waits.extend(waits.unwrap_or_default());
+                self.ask_next()
+            }
+            ParkStep::Park(mut keys) => match result.child::<AwaitOutcome, JobMutationError>()? {
+                Ok(AwaitOutcome::Parked(_)) => {
+                    keys.reverse();
+                    self.check_next(keys)
+                }
+                Ok(AwaitOutcome::Skipped) => Ok(Next::Done(false)),
+                Err(JobMutationError::TokenMismatch) => Ok(Next::Done(true)),
+                Err(error) => {
+                    warn!(job_id = %job_id, %error, "Failed to park job for a bucket key");
+                    Ok(Next::Done(false))
+                }
+            },
+            ParkStep::Unlocked(keys, key) => {
+                if !result.child::<bool, IoError>()?.unwrap_or(false) {
+                    return self.check_next(keys);
+                }
+                self.step = ParkStep::Wake(keys);
+                let wake = satisfy_key_wait(job_id, key, self.now_ms);
+                Ok(Next::Call(IoCall::child(wake)))
+            }
+            ParkStep::Wake(keys) => {
+                if let Err(error) = result.child::<bool, JobMutationError>()? {
+                    warn!(job_id = %job_id, %error, "Failed to wake parked job");
+                }
+                self.check_next(keys)
+            }
+        }
+    }
+}
