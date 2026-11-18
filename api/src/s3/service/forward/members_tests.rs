@@ -365,10 +365,12 @@ async fn origin_of(
 ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
     let node = &members.nodes[on];
     let local = (members.realm_id, node.node_id());
-    let view =
-        aruna_operations::s3::object::origin::read_origin(&node.context, local, BUCKET, key, None)
-            .await
-            .unwrap();
+    let view = aruna_operations::driver::drive(
+        aruna_operations::s3::object::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
+        &node.context,
+    )
+    .await
+    .unwrap();
     view.origin
 }
 

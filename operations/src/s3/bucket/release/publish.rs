@@ -51,7 +51,7 @@ use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
-use crate::s3::object::origin::{OriginError, read_origin};
+use crate::s3::object::origin::{OriginError, ReadOriginOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::object::read::GetRoutedOperation;
 use aruna_core::metadata::AuthToken;
@@ -246,9 +246,12 @@ pub async fn release_files(
                 return Err(PublishError::Forbidden(UNREADABLE));
             }
             let place = (scope.realm_id, scope.node_id);
-            let origin = read_origin(context, place, scope.bucket, &key, None)
-                .await
-                .map_err(|error| unavailable(&error))?;
+            let origin = drive(
+                ReadOriginOperation::new(place.0, scope.bucket, &key, None),
+                context,
+            )
+            .await
+            .map_err(|error| unavailable(&error))?;
             let Some(version) = scope.exact(&key, origin.version_id) else {
                 continue;
             };
@@ -325,7 +328,12 @@ pub async fn publish_release(
     // A concurrent publish moves the head; the next pass then finds its release or conflicts.
     for _ in 0..2 {
         let place = (realm_id, scope.node_id);
-        let head = match read_origin(context, place, scope.bucket, &input.key, None).await {
+        let head = match drive(
+            ReadOriginOperation::new(place.0, scope.bucket, &input.key, None),
+            context,
+        )
+        .await
+        {
             Ok(current) if current.content_hash == Some(hash) => {
                 let rows = release_rows(context, scope.bucket).await?;
                 let same = rows.iter().any(|(version_id, pointer)| {

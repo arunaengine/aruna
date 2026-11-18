@@ -58,7 +58,7 @@ use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::origin::read_origin;
+use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -190,7 +190,11 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(result.failed, 0);
     // The import job wrote the file, not an upload by its owner.
     let place = (fixture.actor.realm_id, fixture.actor.node_id);
-    let origin = read_origin(&fixture.context, place, BUCKET, TARGET_KEY, None).await?;
+    let origin = drive(
+        ReadOriginOperation::new(place.0, BUCKET, TARGET_KEY, None),
+        &fixture.context,
+    )
+    .await?;
     assert_eq!(
         origin.origin,
         Some(VersionOrigin::Source {
