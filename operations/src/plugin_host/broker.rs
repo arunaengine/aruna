@@ -33,7 +33,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::jobs::{cancel_job, job_outputs, job_row, job_status, start_work};
-use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::read_config;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -71,7 +70,7 @@ use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::intents::{begin, unknown_row, written};
 use crate::plugins::objects::{LocalObject, Unmarked};
 use crate::plugins::outgoing::{
-    declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
+    SendConnection, declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
 };
 use crate::plugins::rate::take_call;
 use crate::plugins::rows::write_rows;
@@ -82,6 +81,7 @@ use crate::plugins::work::RequestContext;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::entity_patch::craqle_patch_request;
+use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 
 /// Entries of one metadata or object listing page.
@@ -90,8 +90,6 @@ const PAGE: usize = 100;
 /// The host side of one run.
 pub struct RunBroker {
     ctx: Arc<DriverContext>,
-    /// Sends connection requests; the node's screened egress client unless a test replaces it.
-    outbound: Arc<dyn Outbound>,
     /// The secrets this run holds, reused while their value is unchanged.
     held: tokio::sync::Mutex<HeldSecrets>,
     /// The values handed to the code, removed from the text the run keeps.
@@ -108,7 +106,6 @@ impl RunBroker {
         let mut lines = scope.run.clone();
         lines.log.clear();
         Self {
-            outbound: Arc::new(Egress(ctx.blob_handle.clone())),
             held: tokio::sync::Mutex::default(),
             shown: Mutex::default(),
             ctx,
@@ -116,12 +113,6 @@ impl RunBroker {
             scope,
             changed: AtomicBool::new(false),
         }
-    }
-
-    /// The broker with another sender for connection requests.
-    pub fn with_outbound(mut self, outbound: Arc<dyn Outbound>) -> Self {
-        self.outbound = outbound;
-        self
     }
 
     /// The log lines the guest wrote, within the run's bounds.
@@ -1194,14 +1185,15 @@ impl RunBroker {
             return Err(HostError::new(ErrorKind::Denied, narrower));
         }
         let Some(intent) = ready.intent else {
-            let answer = self.outbound.send(ready.outgoing, ready.body).await;
-            let answer = answer.map_err(send_refusal)?;
+            let send = SendConnection::new(ready.outgoing, ready.body);
+            let answer = drive(send, &self.ctx).await.map_err(send_refusal)?;
             return Ok(whole(&ready.fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return stored_whole(&reply);
         }
-        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
+        let send = SendConnection::new(ready.outgoing, ready.body);
+        let outcome = match drive(send, &self.ctx).await {
             Ok(answer) => {
                 let shown = whole(&ready.fields, &answer);
                 let head: usize = (shown.headers.iter())
@@ -1212,9 +1204,9 @@ impl RunBroker {
                     false => whole_text(&shown),
                 })
             }
-            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(CallEnd::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(CallEnd::Maybe(why)),
+            Err(ConnectionError::TooLarge { status }) => Ok(too_large(status)),
+            Err(ConnectionError::NotSent(why)) => Err(CallEnd::None(unavailable(why))),
+            Err(ConnectionError::Unknown(why)) => Err(CallEnd::Maybe(why)),
         };
         stored_whole(&self.record(&intent, outcome).await?)
     }
@@ -1372,7 +1364,7 @@ fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostE
 }
 
 /// The whole answer as the code may see it, with echoes of the secret removed.
-fn whole(fields: &SecretFields, answer: &Answer) -> Response {
+fn whole(fields: &SecretFields, answer: &ConnectionAnswer) -> Response {
     let shown = expose_response(
         &ResponseExposure::Full,
         fields,
@@ -1390,9 +1382,9 @@ fn whole(fields: &SecretFields, answer: &Answer) -> Response {
 }
 
 /// A send that has no stored intent: an answer that does not fit is a limit, others unavailable.
-fn send_refusal(error: SendError) -> HostError {
+fn send_refusal(error: ConnectionError) -> HostError {
     match error {
-        SendError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
+        ConnectionError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
         error => unavailable(error.to_string()),
     }
 }

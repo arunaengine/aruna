@@ -1,17 +1,12 @@
-//! Moves bytes between a plugin connection and the receiver's buckets for plugin work: every
-//! attempt checks the grants, the connection and the secret's rule again before a byte moves.
+//! Moves bytes between a plugin connection and the receiver's buckets for plugin work: the
+//! operations decide each step, the outbound backend carries the bytes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aruna_core::errors::ConversionError;
-use aruna_core::injection::{OutgoingRequest, expose_response};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::secrets::{ResponseExposure, SecretFields};
-use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec, UploadForm};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -19,8 +14,7 @@ use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{Field, HostError, Response};
-use futures_util::StreamExt;
+use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
@@ -28,14 +22,13 @@ use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::placement::policy::GateOperation;
-use crate::plugins::held::PrepareRequest;
-use crate::plugins::objects::{LocalObject, Unmarked};
-use crate::plugins::outgoing::whole_text;
-use crate::plugins::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
-use crate::plugins::work_calls::TransferGrants;
+use crate::plugins::transfer_steps::{
+    KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply,
+    check_answer, send_end, source_gone, write_failure,
+};
+use crate::plugins::work::{WorkChange, WorkRow, begin_send, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 
 /// What a download writes: its target, the version minted once, expected digests and a bound.
 pub struct Download<'a> {
@@ -43,6 +36,25 @@ pub struct Download<'a> {
     pub version_id: Ulid,
     pub checksums: &'a [(ChecksumAlgorithm, Vec<u8>)],
     pub max_bytes: Option<u64>,
+}
+
+fn outcome(end: TransferEnd) -> JobRunOutcome {
+    match end {
+        TransferEnd::Done { bytes, version } => {
+            JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
+                bytes,
+                version_id: Some(version),
+            })
+        }
+        TransferEnd::Refused(error) => refused(error),
+        TransferEnd::Retry(message) => retryable(message),
+        TransferEnd::Permanent(message) => permanent(message),
+        TransferEnd::Undecided(message) => JobRunOutcome::Undecided(JobError::retryable(message)),
+    }
+}
+
+fn outbound(ctx: &JobContext) -> Result<&OutboundHandle, JobRunOutcome> {
+    (ctx.driver.outbound_handle.as_ref()).ok_or_else(|| retryable("this node sends no requests"))
 }
 
 /// Downloads the answer of the row's request into a new version of the target, as the account
@@ -53,101 +65,51 @@ pub async fn download_work(
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
     download: Download<'_>,
 ) -> JobRunOutcome {
-    let patterns = match drive(
-        TransferGrants::download(install, row, download.target),
-        &ctx.driver,
-    )
-    .await
-    {
-        Ok(found) => found,
-        Err(error) => return refused(error),
+    let node = (spec.realm_id, ctx.owner_node_id);
+    let work = TransferWork {
+        node,
+        config,
+        install,
+        row,
     };
-    let place = (spec.realm_id, ctx.owner_node_id);
-    let object = LocalObject::new(place, install, download.target);
-    let (bucket, key) = match drive(object, &ctx.driver).await {
-        Ok(found) => found,
-        Err(error) => return refused(error),
-    };
-    // An earlier attempt that committed the version and lost its answer is done; nothing is sent.
-    match committed(ctx, (&bucket, &key), download.version_id).await {
-        Ok(Some(bytes)) => {
-            ctx.progress.set_current(bytes);
-            return JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
-                bytes,
-                version_id: Some(download.version_id),
-            });
+    let prepare = PrepareDownload::new(work, download.target, download.version_id);
+    let plan = match drive(prepare, &ctx.driver).await {
+        Ok(plan) => plan,
+        Err(end) => {
+            if let TransferEnd::Done { bytes, .. } = &end {
+                ctx.progress.set_current(*bytes);
+            }
+            return outcome(end);
         }
-        Ok(None) => {}
-        Err(error) => return retryable(error.to_string()),
-    }
-    let request = prepared(ctx, (install, config, row)).await;
-    let (outgoing, exposure, _) = match request {
-        Ok(prepared) => prepared,
-        Err(error) => return refused(error),
     };
-    // The whole answer ends up in a bucket, so only a rule that shows it whole allows it.
-    if exposure != ResponseExposure::Full {
-        return permanent("this connection does not expose its whole answer");
-    }
-    let Some(blob) = ctx.driver.blob_handle.as_ref() else {
-        return retryable("this node sends no requests");
+    let backend = match outbound(ctx) {
+        Ok(backend) => backend,
+        Err(outcome) => return outcome,
     };
-    let builder = match blob.repository_request(reqwest::Method::GET, outgoing.url) {
-        Ok(builder) => builder,
-        Err(error) => return permanent(error.to_string()),
-    };
-    let builder = (outgoing.headers.iter()).fold(builder, |builder, (name, value)| {
-        builder.header(name, value)
-    });
-    let response = tokio::select! {
-        sent = builder.send() => sent,
+    let opened = tokio::select! {
+        opened = backend.open_download(plan.outgoing, download.max_bytes) => opened,
         _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
         _ = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
     };
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => return retryable(error.without_url().to_string()),
+    let opened = match opened {
+        Ok(opened) => opened,
+        Err(TransferError::Refused(why)) => return permanent(why),
+        Err(error) => return retryable(error.to_string()),
     };
-    let status = response.status().as_u16();
-    match status {
-        200..=299 => {}
-        408 | 429 | 500..=599 => return retryable(format!("the service answered {status}")),
-        _ => return permanent(format!("the service answered {status}")),
+    if let Err(end) = check_answer(opened.status, opened.length, download.max_bytes) {
+        return outcome(end);
     }
-    let length = response.content_length();
-    if let (Some(length), Some(bound)) = (length, download.max_bytes)
-        && length > bound
-    {
-        return permanent(too_large(bound));
-    }
-    let content_type = (response.headers().get(reqwest::header::CONTENT_TYPE))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let pulled = Arc::new(AtomicU64::new(0));
-    let (over, broken) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
+    let routing = SnapshotOperation::new(
+        &node_routing(&ctx.driver),
+        install.group_id,
+        BucketRules::Named(plan.bucket.clone()),
     );
-    let counted = counted(response, download.max_bytes, &pulled, (&over, &broken));
-    let routing = match drive(
-        SnapshotOperation::new(
-            &node_routing(&ctx.driver),
-            install.group_id,
-            BucketRules::Named(bucket.to_string()),
-        ),
-        &ctx.driver,
-    )
-    .await
-    {
+    let routing = match drive(routing, &ctx.driver).await {
         Ok(routing) => routing,
         Err(error) => return retryable(error.to_string()),
     };
-    let gate = match drive(
-        GateOperation::new(spec.realm_id, unix_timestamp_millis()),
-        &ctx.driver,
-    )
-    .await
-    {
+    let gate = GateOperation::new(spec.realm_id, unix_timestamp_millis());
+    let gate = match drive(gate, &ctx.driver).await {
         Ok(gate) => gate,
         Err(error) => return retryable(error.to_string()),
     };
@@ -157,21 +119,21 @@ pub async fn download_work(
             digest: digest.clone(),
         })
         .collect();
-    let metadata: HashMap<String, String> = content_type
+    let metadata: HashMap<String, String> = (opened.content_type)
         .map(|kind| (CONTENT_TYPE_KEY.to_string(), kind))
         .into_iter()
         .collect();
-    let auth = account(install, &patterns);
+    let auth = account(install, &plan.patterns);
     let mut put = PutObjectOperation::new(PutObjectConfig {
         user_id: install.account,
         group_id: install.group_id,
         realm_id: spec.realm_id,
         node_id: ctx.owner_node_id,
         request: PutObjectInput {
-            bucket,
-            key,
-            content_length: length,
-            body: Some(counted),
+            bucket: plan.bucket,
+            key: plan.key,
+            content_length: opened.length,
+            body: Some(opened.body),
         },
         expected_checksums,
         checksum_type: None,
@@ -190,13 +152,14 @@ pub async fn download_work(
     if let Some(gate) = gate {
         put = put.with_gate(gate);
     }
+    let meter = opened.meter;
     let written = drive(put, &ctx.driver);
     tokio::pin!(written);
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     let result = loop {
         tokio::select! {
             result = &mut written => break result,
-            _ = tick.tick() => ctx.progress.set_current(pulled.load(Ordering::Relaxed)),
+            _ = tick.tick() => ctx.progress.set_current(meter.pulled()),
             _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
             _ = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
         }
@@ -209,30 +172,10 @@ pub async fn download_work(
                 version_id: Some(put.version_id),
             })
         }
-        Err(_) if over.load(Ordering::Relaxed) => {
-            permanent(too_large(download.max_bytes.unwrap_or_default()))
+        Err(error) => {
+            let body = (meter.over(), meter.broken());
+            outcome(write_failure(&error, body, download.max_bytes))
         }
-        Err(error) if broken.load(Ordering::Relaxed) => retryable(error.to_string()),
-        Err(error @ PutObjectError::StorageError(_)) => retryable(error.to_string()),
-        Err(error) => permanent(error.to_string()),
-    }
-}
-
-/// The size of version `version_id` of the target, if it was committed.
-async fn committed(
-    ctx: &JobContext,
-    (bucket, key): (&str, &str),
-    version_id: Ulid,
-) -> Result<Option<u64>, HeadObjectError> {
-    let head = HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: Some(version_id),
-    };
-    match drive(HeadObjectOperation::new(head), &ctx.driver).await {
-        Ok(head) => Ok(Some(head.location.map_or(0, |location| location.blob_size))),
-        Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => Ok(None),
-        Err(error) => Err(error),
     }
 }
 
@@ -255,39 +198,20 @@ pub async fn upload_work(
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
     upload: Upload<'_>,
 ) -> JobRunOutcome {
-    let patterns = match drive(
-        TransferGrants::upload(install, row, upload.source),
-        &ctx.driver,
-    )
-    .await
-    {
-        Ok(found) => found,
-        Err(error) => return refused(error),
+    let node = (spec.realm_id, ctx.owner_node_id);
+    let work = TransferWork {
+        node,
+        config,
+        install,
+        row,
     };
-    let again = (row.context.as_ref()).is_some_and(|context| context.method == "PUT");
-    // A request begun or answered before decides without the source, which may be gone by now.
-    let earlier = decided(row.boundary.as_ref(), again);
-    if let Some(outcome) = earlier.and_then(|send| ended(send, again)) {
-        return outcome;
-    }
-    let place = (spec.realm_id, ctx.owner_node_id);
-    let object = LocalObject::new(place, install, upload.source);
-    let (bucket, key) = match drive(object, &ctx.driver).await {
-        Ok(found) => found,
-        Err(error) => return refused(error),
+    let prepare = PrepareUpload::new(work, upload.source, upload.version);
+    let plan = match drive(prepare, &ctx.driver).await {
+        Ok(plan) => plan,
+        Err(end) => return outcome(end),
     };
-    // The version checked is the version sent, so a newer marked one never slips in.
-    let readable = Unmarked::new((&bucket, &key), upload.version);
-    let version = match drive(readable, &ctx.driver).await {
-        Ok(Some(version)) => version,
-        Ok(None) => return permanent("the object to upload is gone"),
-        Err(error) => return refused(error),
-    };
-    let (outgoing, exposure, fields) = match prepared(ctx, (install, config, row)).await {
-        Ok(prepared) => prepared,
-        Err(error) => return refused(error),
-    };
-    let auth = account(install, &patterns);
+    let auth = account(install, &plan.patterns);
+    let (bucket, key, version) = (plan.bucket.clone(), plan.key.clone(), plan.version);
     let read = GetObjectInput {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -306,140 +230,62 @@ pub async fn upload_work(
             return key_wait(ctx, install, (bucket, key, Some(version))).await;
         }
         Err(GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion) => {
-            return permanent("the object to upload is gone");
+            return outcome(source_gone());
         }
         Err(error) => return retryable(error.to_string()),
     };
     let size = source.info.size;
     let ids = (spec.install_id, spec.work_id);
-    match drive(begin_send(ids, again), &ctx.driver).await {
+    match drive(begin_send(ids, plan.again), &ctx.driver).await {
         Ok(Some(send)) => {
-            if let Some(outcome) = ended(send, again) {
-                return outcome;
+            if let Some(end) = send_end(send, plan.again) {
+                return outcome(end);
             }
         }
         Ok(None) => return permanent("the plugin work is no longer recorded"),
         Err(error) => return retryable(error.0),
     }
-    let Some(blob) = ctx.driver.blob_handle.as_ref() else {
-        return retryable("this node sends no requests");
+    let backend = match outbound(ctx) {
+        Ok(backend) => backend,
+        Err(outcome) => return outcome,
     };
-    let method = reqwest::Method::from_bytes(outgoing.method.as_bytes());
-    let method = method.unwrap_or(reqwest::Method::PUT);
-    let builder = match blob.repository_request(method, outgoing.url) {
-        Ok(builder) => builder,
-        Err(error) => return permanent(error.to_string()),
+    let body = UploadBody {
+        bytes: source.blob,
+        size,
+        form: upload.form.cloned(),
     };
-    let builder = (outgoing.headers.iter()).fold(builder, |builder, (name, value)| {
-        builder.header(name, value)
-    });
-    let body = reqwest::Body::wrap_stream(source.blob);
-    let builder = match upload.form {
-        None => builder
-            .header(reqwest::header::CONTENT_LENGTH, size)
-            .body(body),
-        Some(form) => {
-            let file = reqwest::multipart::Part::stream_with_length(body, size);
-            let file = file.file_name(form.file_name.clone());
-            let multipart = (form.fields.iter()).fold(
-                reqwest::multipart::Form::new(),
-                |multipart, (name, value)| multipart.text(name.clone(), value.clone()),
-            );
-            builder.multipart(multipart.part(form.file_field.clone(), file))
-        }
-    };
-    let response = tokio::select! {
-        sent = builder.send() => sent,
+    let request = plan.request.outgoing.clone();
+    let answer = tokio::select! {
+        answer = backend.send_upload(request, body, MAX_REPLY) => answer,
         _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
         _ = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
     };
-    let mut response = match response {
-        Ok(response) => response,
-        Err(error) if error.is_connect() => {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(TransferError::Refused(why)) => return permanent(why),
+        Err(TransferError::NotConnected(why)) => {
             // Nothing reached the service, so the boundary goes back and a later attempt sends.
             let reopened = drive(update_work(ids, WorkChange::Reopened), &ctx.driver);
             if let Err(error) = reopened.await {
                 return retryable(error.0);
             }
-            return retryable(error.without_url().to_string());
+            return retryable(why);
         }
         // A PUT may go twice, so one whose answer broke off is tried again.
-        Err(error) if again => return retryable(error.without_url().to_string()),
-        Err(error) => {
-            let unknown = format!("the upload may have been sent: {}", error.without_url());
+        Err(TransferError::Broken(why)) if plan.again => return retryable(why),
+        Err(TransferError::Broken(why)) => {
+            let unknown = format!("the upload may have been sent: {why}");
             return JobRunOutcome::Undecided(JobError::retryable(unknown));
         }
     };
-    let status = response.status().as_u16();
-    let headers: Vec<(String, String)> = (response.headers().iter())
-        .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
-        .collect();
-    let mut answer = Vec::new();
-    let mut whole = true;
-    // A reply that breaks off or passes the bound is not kept, so no cut-off reply looks whole.
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if answer.len() + chunk.len() <= MAX_REPLY => {
-                answer.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Ok(Some(_)) | Err(_) => {
-                whole = false;
-                break;
-            }
-        }
-    }
-    // The reply is kept as the rule shows it now; one too large for the bound keeps no body.
-    let reply = whole.then(|| {
-        let shown = expose_response(&exposure, &fields, status, &headers, &answer);
-        let headers = (shown.headers.into_iter()).map(|(name, value)| Field { name, value });
-        let shown = Response {
-            status: shown.status,
-            headers: headers.collect(),
-            body: shown.body.unwrap_or_default(),
-        };
-        whole_text(&shown)
-    });
-    let answer = WorkChange::Sent {
-        status,
-        reply,
-        bytes: size,
-        version,
+    let reply = UploadReply {
+        status: answer.status,
+        headers: answer.headers,
+        body: answer.body,
     };
-    if let Err(error) = drive(update_work(ids, answer), &ctx.driver).await {
-        return retryable(error.0);
-    }
-    sent(status, again, (size, version))
-}
-
-/// How an upload ends that an earlier attempt decided: unknown after a begun request that may
-/// not go twice, else by the kept answer. `None` when the attempt sends.
-fn ended(send: Send, again: bool) -> Option<JobRunOutcome> {
-    match send {
-        Send::Now => None,
-        Send::Undecided => {
-            let unknown = "the upload may have been sent; its outcome is unknown";
-            Some(JobRunOutcome::Undecided(JobError::retryable(unknown)))
-        }
-        Send::Answered {
-            status,
-            bytes,
-            version,
-            ..
-        } => Some(sent(status, again, (bytes, version))),
-    }
-}
-
-/// How an answered upload ends: a 2xx succeeds; a request that may go twice is tried again
-/// after a timeout, a throttle or a server error; anything else fails.
-fn sent(status: u16, again: bool, (size, version): (u64, Ulid)) -> JobRunOutcome {
-    match status {
-        200..=299 => JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
-            bytes: size,
-            version_id: Some(version),
-        }),
-        _ if again && retried(status) => retryable(format!("the service answered {status}")),
-        _ => permanent(format!("the service answered {status}")),
+    let keep = KeepReply::new(ids, plan, size, reply);
+    match drive(keep, &ctx.driver).await {
+        Ok(end) | Err(end) => outcome(end),
     }
 }
 
@@ -448,48 +294,6 @@ fn locked(error: &GetObjectError) -> bool {
         error,
         GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
     )
-}
-
-/// The row's request checked against the install's current manifest, with the connection's
-/// secret released and added; the exposure is the one the rule allows now.
-async fn prepared(
-    ctx: &JobContext,
-    (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-) -> Result<(OutgoingRequest, ResponseExposure, SecretFields), HostError> {
-    let config = Arc::new(config.clone());
-    let prepare = PrepareRequest::new(config, ctx.owner_node_id, install, row);
-    let prepared = drive(prepare, &ctx.driver).await.map_err(|error| error.0)?;
-    Ok((prepared.outgoing, prepared.exposure, prepared.fields))
-}
-
-/// The answer's body as a put stream that counts its bytes, ends with an error past `bound`, and
-/// notes a broken transfer apart from a refused one.
-fn counted(
-    response: reqwest::Response,
-    bound: Option<u64>,
-    pulled: &Arc<AtomicU64>,
-    (over, broken): (&Arc<AtomicBool>, &Arc<AtomicBool>),
-) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
-    let (pulled, over, broken) = (pulled.clone(), over.clone(), broken.clone());
-    let stream = response.bytes_stream().map(move |chunk| {
-        let chunk = chunk.map_err(|error| {
-            broken.store(true, Ordering::Relaxed);
-            std::io::Error::other(error.without_url().to_string())
-        })?;
-        let total = pulled.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-        if bound.is_some_and(|bound| total > bound) {
-            over.store(true, Ordering::Relaxed);
-            return Err(std::io::Error::other(
-                "the answer is larger than its size limit",
-            ));
-        }
-        Ok(chunk)
-    });
-    BackendStream::new(stream)
-}
-
-fn too_large(bound: u64) -> String {
-    format!("the answer is larger than its size limit of {bound} bytes")
 }
 
 fn retryable(message: impl Into<String>) -> JobRunOutcome {

@@ -378,12 +378,14 @@ async fn bounded_and_restarted() {
     let install = installed(&fixture).await;
     let run = admitted(&fixture, &install, 1, "spin").await;
     let first = worker(&fixture);
+    let busy = |n| Ulid::from_parts(900, n);
     for n in 0..RUNS_PARALLEL as u128 {
-        let busy = (install.install_id, CancellationToken::new());
-        first.running().insert(Ulid::from_parts(900, n), busy);
+        first.supervisor.admit(busy(n), install.install_id);
     }
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 0);
-    first.running().clear();
+    for n in 0..RUNS_PARALLEL as u128 {
+        first.supervisor.finish(busy(n));
+    }
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 1);
     first.stop().await;
     let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
