@@ -60,12 +60,6 @@ impl FencedWrite {
         })]
     }
 
-    /// Whether the transaction has not started yet.
-    #[cfg(test)]
-    pub(crate) fn starting(&self) -> bool {
-        self.step == Step::Start
-    }
-
     /// How the write ended, once it did.
     pub(crate) fn outcome(&self) -> Option<&Fenced> {
         self.outcome.as_ref().filter(|_| self.step == Step::Done)
