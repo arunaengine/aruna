@@ -22,6 +22,8 @@ pub enum OutboundEffect {
     Mail(Box<MailRequest>),
     /// Reads or changes the in-memory delay of the deliveries to one owner and channel.
     Backoff(BackoffRequest),
+    /// Drops the cached mail sender unless it belongs to this profile revision.
+    RefreshMail(Option<Ulid>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub enum OutboundEvent {
     Backoff {
         stored: Option<StoredBackoff>,
     },
+    MailRefreshed,
 }
 
 /// A failure of one outbound call; its text never holds an address, a body or a credential.

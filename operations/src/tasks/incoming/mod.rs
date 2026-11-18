@@ -89,6 +89,7 @@ use crate::metadata::prune_queue::{
 };
 use crate::node::node_info::observe_placement;
 use crate::node::usage_publish::restore_usage_timer;
+use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;

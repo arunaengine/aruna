@@ -163,8 +163,8 @@ impl SettingValue {
     }
 }
 
-/// One new register write; ids and time come from the caller.
-#[derive(Debug, PartialEq)]
+/// One new register write.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SettingWrite {
     pub owner: UserId,
     pub local: NodeId,
@@ -175,6 +175,18 @@ pub struct SettingWrite {
 }
 
 impl SettingWrite {
+    /// A write of `value` with new ids.
+    pub fn new(owner: UserId, local: NodeId, now_ms: u64, value: SettingValue) -> Self {
+        Self {
+            owner,
+            local,
+            write_id: Ulid::generate(),
+            event_id: Ulid::generate(),
+            now_ms,
+            value,
+        }
+    }
+
     /// The stored bytes of this write with `stamp`; a secret is sealed to the realm key.
     fn bytes(&self, stamp: RegisterStamp) -> Result<Vec<u8>, SettingError> {
         let owner = self.owner;
