@@ -47,7 +47,7 @@ use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::GateOperation;
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::live_queue::complete_put;
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
@@ -609,18 +609,21 @@ async fn put_crate(
         Err(PutObjectError::FenceTaken) => return Err(PublishError::Conflict(CHANGED.to_string())),
         Err(error) => return Err(failed(&error)),
     };
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            auth: input.auth.clone(),
+            group_id: scope.info.group_id,
+            bucket: scope.bucket.to_string(),
+            key: input.key.clone(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
         context,
-        scope.realm_id,
-        scope.node_id,
-        input.auth.clone(),
-        scope.info.group_id,
-        scope.bucket.to_string(),
-        input.key.clone(),
-        result.version_id,
-        result.location.blob_size,
     )
-    .await;
+    .await
+    .ok();
     Ok(Some(result.version_id))
 }
 

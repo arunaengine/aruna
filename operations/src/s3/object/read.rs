@@ -44,7 +44,7 @@ use crate::distribution::source_keep::keep_first;
 use crate::distribution::source_plan::SourceKeep;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::{local_is_user, managed_read};
+use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{LookupError, summary_from_read};
@@ -141,7 +141,10 @@ pub async fn get_object_token(
     else {
         return result;
     };
-    if !local_is_user(context, realm_id).await {
+    if !drive(LocalUserOperation::new(realm_id), context)
+        .await
+        .unwrap_or(false)
+    {
         return Err(GetObjectError::GetObjectFailed);
     }
     let read = RoutedRead {
@@ -438,7 +441,10 @@ pub async fn get_object_info(
             metadata,
             version_created_at,
             source_policies,
-        }) if local_is_user(context, realm_id).await => {
+        }) if drive(LocalUserOperation::new(realm_id), context)
+            .await
+            .unwrap_or(false) =>
+        {
             let read = RoutedRead {
                 user_id,
                 realm_id,
@@ -586,7 +592,7 @@ async fn routed_blob(
             known_refs: Vec::new(),
             range: None,
         };
-        match failures.consider(managed_read(context, holder, request).await) {
+        match failures.consider(drive(ManagedReadOperation::new(holder, request), context).await) {
             Some(BaoReadOutput::Stream {
                 blob,
                 size,
@@ -637,7 +643,7 @@ async fn routed_metadata(
             known_refs: Vec::new(),
             range: None,
         };
-        match managed_read(context, holder, request).await {
+        match drive(ManagedReadOperation::new(holder, request), context).await {
             Ok(BaoReadOutput::Metadata {
                 size, etag, hashes, ..
             }) => {

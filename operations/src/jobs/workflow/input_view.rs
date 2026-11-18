@@ -26,7 +26,7 @@ use crate::jobs::key_wake::read_row;
 use crate::jobs::read_access::SourceReadError;
 use crate::jobs::source_read::authorize_read;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::visible::SCAN_BUDGET;
@@ -392,7 +392,7 @@ pub async fn head_entry(
     match entry.captured.content.blake3() {
         Some(blake3) => {
             let request = managed_request(context, record, entry, Some(blake3), true, None);
-            managed_read(context, source, request)
+            drive(ManagedReadOperation::new(source, request), context)
                 .await
                 .map(|_| ())
                 .map_err(managed_error)
@@ -445,7 +445,7 @@ pub async fn read_entry(
     match entry.captured.content.blake3() {
         Some(blake3) => {
             let request = managed_request(context, record, entry, Some(blake3), false, range);
-            match managed_read(context, source, request).await {
+            match drive(ManagedReadOperation::new(source, request), context).await {
                 Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),
                 Ok(BaoReadOutput::Metadata { .. }) => Err(ViewError::Unavailable(
                     "the holder sent no bytes".to_string(),

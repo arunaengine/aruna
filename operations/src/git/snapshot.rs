@@ -14,7 +14,7 @@ use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::materialization_queue::capture_pending;
 use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::GetObjectInput;
@@ -177,7 +177,7 @@ async fn resolve(
             known_refs: Vec::new(),
             range: None,
         };
-        match managed_read(context, exact.node_id, request).await {
+        match drive(ManagedReadOperation::new(exact.node_id, request), context).await {
             Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None, None),
             _ => return Err(GitError::NotFound),
         }

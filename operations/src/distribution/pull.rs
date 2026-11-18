@@ -39,7 +39,7 @@ use super::keep::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectResult};
 use crate::s3::object::read::HolderFailures;
@@ -299,7 +299,7 @@ async fn from_holders(
             known_refs: Vec::new(),
             range: range.clone(),
         };
-        let result = managed_read(context, *holder, read).await;
+        let result = drive(ManagedReadOperation::new(*holder, read), context).await;
         // A holder that failed to serve is skipped by the next holder choices for a while.
         if matches!(
             result,

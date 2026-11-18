@@ -43,9 +43,10 @@ use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::peer_acts_for;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::live_queue::{complete_put, queue_live};
-use crate::replication::managed_read::managed_read;
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use crate::replication::queue::LiveVersionInput;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -473,16 +474,19 @@ async fn delete_target(
         debug!(error = %error, "A forwarded sync delete failed");
         SyncRefusal::Unavailable
     })?;
-    queue_live(
+    drive(
+        QueueLiveOperation::new(LiveVersionInput {
+            local_node_id: node_id,
+            auth_context: auth.clone(),
+            bucket: request.target_bucket.clone(),
+            key: request.target_key.clone(),
+            version_id: result.version_id,
+            delete_marker: result.delete_marker,
+        }),
         context,
-        node_id,
-        auth.clone(),
-        request.target_bucket.clone(),
-        request.target_key.clone(),
-        result.version_id,
-        result.delete_marker,
     )
-    .await;
+    .await
+    .ok();
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,
@@ -509,7 +513,12 @@ async fn commit_pull(
         known_refs: Vec::new(),
         range: None,
     };
-    let blob = match managed_read(context, request.source.node_id, read).await {
+    let blob = match drive(
+        ManagedReadOperation::new(request.source.node_id, read),
+        context,
+    )
+    .await
+    {
         Ok(BaoReadOutput::Stream { blob, .. }) => counted(blob, bytes_done.clone()),
         // A metadata-only answer to a full read is a broken exchange, not an
         // absent object: parking the upload on it would lose the file.
@@ -559,18 +568,21 @@ async fn commit_pull(
         debug!(error = %error, "A forwarded sync pull could not be written");
         SyncRefusal::Unavailable
     })?;
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: auth.realm_id,
+            node_id,
+            auth: auth.clone(),
+            group_id: bucket.group_id,
+            bucket: request.target_bucket.clone(),
+            key: request.target_key.clone(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
         context,
-        auth.realm_id,
-        node_id,
-        auth.clone(),
-        bucket.group_id,
-        request.target_bucket.clone(),
-        request.target_key.clone(),
-        result.version_id,
-        result.location.blob_size,
     )
-    .await;
+    .await
+    .ok();
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,

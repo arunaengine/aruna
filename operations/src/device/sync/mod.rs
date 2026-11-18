@@ -33,6 +33,7 @@ use tracing::warn;
 
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 
@@ -425,7 +426,12 @@ async fn local_is_device(context: &Arc<DriverContext>) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return false;
     };
-    crate::replication::managed_read::local_is_user(context, *net_handle.realm_id()).await
+    drive(
+        crate::replication::managed_read::LocalUserOperation::new(*net_handle.realm_id()),
+        context,
+    )
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(test)]

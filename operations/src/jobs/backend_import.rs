@@ -50,7 +50,7 @@ use crate::jobs::blob_request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::placement::policy::GateOperation;
 use crate::placement::policy::{GateContext, PolicyGateError};
-use crate::replication::live_queue::complete_put;
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::imports::discovery::read_discovery;
 use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
@@ -566,18 +566,21 @@ async fn import_object(
     // As for any put, a failed queue write after the commit leaves the obligation for repair.
     let auth = spec.auth_context.clone();
     let (realm_id, group_id, bucket) = (auth.realm_id, rule.group_id, rule.bucket.clone());
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id,
+            node_id: spec.node_id,
+            auth,
+            group_id,
+            bucket,
+            key,
+            version_id,
+            size_bytes: size,
+        }),
         &ctx.driver,
-        realm_id,
-        spec.node_id,
-        auth,
-        group_id,
-        bucket,
-        key,
-        version_id,
-        size,
     )
-    .await;
+    .await
+    .ok();
     Ok(Outcome::Imported)
 }
 
@@ -970,18 +973,21 @@ async fn recover(
                 let (realm_id, group_id) = (auth.realm_id, rule.group_id);
                 let (bucket, node_id) = (rule.bucket.clone(), spec.node_id);
                 let key = key.clone();
-                complete_put(
+                drive(
+                    CompletePutOperation::new(CompletePutInput {
+                        realm_id,
+                        node_id,
+                        auth,
+                        group_id,
+                        bucket,
+                        key,
+                        version_id,
+                        size_bytes: size,
+                    }),
                     &ctx.driver,
-                    realm_id,
-                    node_id,
-                    auth,
-                    group_id,
-                    bucket,
-                    key,
-                    version_id,
-                    size,
                 )
-                .await;
+                .await
+                .ok();
             }
             if alias.is_none() {
                 return Ok(Some(Outcome::Imported));
@@ -1402,18 +1408,21 @@ async fn add_version(
         let (realm_id, group_id) = (auth.realm_id, rule.group_id);
         let (bucket, node_id) = (rule.bucket.clone(), spec.node_id);
         let key = key.to_string();
-        complete_put(
+        drive(
+            CompletePutOperation::new(CompletePutInput {
+                realm_id,
+                node_id,
+                auth,
+                group_id,
+                bucket,
+                key,
+                version_id,
+                size_bytes: size,
+            }),
             &ctx.driver,
-            realm_id,
-            node_id,
-            auth,
-            group_id,
-            bucket,
-            key,
-            version_id,
-            size,
         )
-        .await;
+        .await
+        .ok();
     }
     Ok(Outcome::Imported)
 }
