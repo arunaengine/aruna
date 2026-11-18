@@ -375,22 +375,140 @@ impl ReadOriginOperation {
             step: OriginStep::Bucket,
         }
     }
-    let source_url = view
-        .source
-        .as_ref()
-        .and_then(|source| source.url.as_deref());
-    view.identifiers = parser.map_or_else(Vec::new, |parser| parser.find(key, source_url));
-    view.projection.extend(
-        view.identifiers
-            .iter()
-            .map(|found| OriginProjection::Identifier {
-                name: found.name.clone(),
-                value: found.value.clone(),
-                url: found.url.clone(),
-            }),
-    );
-    view.bucket_metadata = metadata;
-    Ok(view)
+
+    /// The size of one version: its blob location row, or a reference's cached observation.
+    fn read_size(&mut self) -> ReadTurn {
+        let (_, version) = self.version.as_ref().ok_or(IoError::Unfinished)?;
+        if let BlobVersionState::Reference {
+            cached_metadata, ..
+        } = &version.state
+        {
+            let size = cached_metadata.content_length;
+            return self.sized(Some(size));
+        }
+        let Some(location) = version.location_key() else {
+            return self.sized(None);
+        };
+        self.step = OriginStep::Size;
+        Ok(Next::Call(read_row(
+            BLOB_LOCATIONS_KEYSPACE,
+            location.to_bytes(),
+        )))
+    }
+
+    /// Asks for the display name of every connector of the bucket's group that is here.
+    fn sized(&mut self, size: Option<u64>) -> ReadTurn {
+        let (version_id, version) = self.version.take().ok_or(IoError::Unfinished)?;
+        let global = (self.info.as_ref())
+            .and_then(|info| info.distribution.as_ref())
+            .map(|_| GlobalId::Version {
+                realm_id: self.realm_id,
+                version_id,
+            });
+        let mut view = view(version_id, global, version);
+        view.size = size;
+        let group_id = self.info.as_ref().ok_or(IoError::Unfinished)?.group_id;
+        let (mut slots, mut reads) = (Vec::new(), Vec::new());
+        let places = view.source.iter().flat_map(|source| source.sources.iter());
+        for (slot, place) in places.enumerate() {
+            if let Some(connector_id) = place.connector_id {
+                let key = source_connector_key(group_id, connector_id).to_vec();
+                reads.push((SOURCE_INDEX_KEYSPACE.to_string(), Key::from(key)));
+                slots.push(slot);
+            }
+        }
+        self.view = Some(view);
+        if reads.is_empty() {
+            return self.finish();
+        }
+        self.step = OriginStep::Connectors(slots);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn finish(&mut self) -> ReadTurn {
+        let mut view = self.view.take().ok_or(IoError::Unfinished)?;
+        let metadata = self.metadata.take();
+        let parser = (metadata.as_ref())
+            .and_then(|metadata| metadata.parser.as_ref())
+            .and_then(|parser| CompiledParser::compile(parser).ok());
+        let source_url = (view.source.as_ref()).and_then(|source| source.url.as_deref());
+        view.identifiers =
+            parser.map_or_else(Vec::new, |parser| parser.find(&self.key, source_url));
+        view.projection.extend(
+            view.identifiers
+                .iter()
+                .map(|found| OriginProjection::Identifier {
+                    name: found.name.clone(),
+                    value: found.value.clone(),
+                    url: found.url.clone(),
+                }),
+        );
+        view.bucket_metadata = metadata;
+        Ok(Next::Done(view))
+    }
+}
+
+impl Operation for ReadOriginOperation {
+    type Output = OriginView;
+    type Error = OriginError;
+
+    fn first(&mut self) -> ReadTurn {
+        let bucket = GetBucketOperation::new(self.bucket.clone());
+        Ok(Next::Call(IoCall::child(bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ReadTurn {
+        match std::mem::replace(&mut self.step, OriginStep::Version) {
+            OriginStep::Bucket => {
+                let info =
+                    (result.child::<BucketInfo, GetBucketError>()?).map_err(
+                        |error| match error {
+                            GetBucketError::NotFound => OriginError::BucketMissing,
+                            other => storage(other),
+                        },
+                    )?;
+                self.info = Some(info);
+                let read = ReadVersionOperation::new(&self.bucket, &self.key, self.version_id);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            OriginStep::Version => {
+                self.version = Some(result.child::<(Ulid, BlobVersion), OriginError>()??);
+                let info = self.info.as_ref().ok_or(IoError::Unfinished)?;
+                let metadata = BucketMetadataOperation::new(&self.bucket, info);
+                self.step = OriginStep::Metadata;
+                Ok(Next::Call(IoCall::child(metadata)))
+            }
+            OriginStep::Metadata => {
+                let metadata = result.child::<Option<BucketMetadata>, BucketMetadataError>()?;
+                self.metadata = metadata.map_err(storage)?;
+                self.read_size()
+            }
+            OriginStep::Size => {
+                let size = match result.value()? {
+                    Some(value) => {
+                        let location = BackendLocation::from_bytes(&value).map_err(storage)?;
+                        Some(location.blob_size)
+                    }
+                    None => None,
+                };
+                self.sized(size)
+            }
+            OriginStep::Connectors(slots) => {
+                let view = self.view.as_mut().ok_or(IoError::Unfinished)?;
+                let source = view.source.as_mut().ok_or(IoError::Unfinished)?;
+                for (slot, value) in slots.into_iter().zip(result.values()?) {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let connector = SourceConnector::from_bytes(&value).map_err(storage)?;
+                    if let Some(place) = source.sources.get_mut(slot) {
+                        place.connector_name = Some(connector.name);
+                    }
+                }
+                self.finish()
+            }
+        }
+    }
 }
 
 fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> OriginView {
@@ -464,7 +582,6 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
     }
 }
 
-/// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
 /// Current files one runs lookup reads at most; a larger scope answers incomplete.
 const RUN_SCAN_LIMIT: usize = 5000;
 /// Runs one lookup names at most.
@@ -478,176 +595,150 @@ pub struct BucketRuns {
     pub complete: bool,
 }
 
-/// The runs that wrote the current files of `bucket` under `prefix` that are `readable` to the
-/// caller, from their origins.
-pub async fn bucket_runs(
-    context: &DriverContext,
-    bucket: &str,
-    prefix: &str,
-    readable: impl Fn(&str) -> bool,
-) -> Result<BucketRuns, OriginError> {
-    let storage =
-        |error: aruna_core::errors::ConversionError| OriginError::Storage(error.to_string());
-    let scope = BlobHeadKey::object_prefix(bucket, prefix).map_err(storage)?;
-    let (mut runs, mut after, mut scanned) = (std::collections::BTreeSet::new(), None, 0);
-    let complete = loop {
-        let page = RUN_SCAN_LIMIT.saturating_sub(scanned).min(500);
-        let iter = StorageEffect::Iter {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: Some(scope.clone().into()),
-            start: after.take().map(aruna_core::effects::IterStart::After),
-            limit: page,
-            txn_id: None,
+/// The runs that wrote the current files of a bucket under a prefix that `rule` lets the caller
+/// read, from their origins.
+#[derive(Debug, PartialEq)]
+pub struct BucketRunsOperation<R> {
+    bucket: String,
+    scope: Vec<u8>,
+    rule: R,
+    runs: BTreeSet<Ulid>,
+    after: Option<Key>,
+    next: Option<Key>,
+    scanned: usize,
+    reading: bool,
+}
+
+impl<R: KeyRule> BucketRunsOperation<R> {
+    pub fn new(bucket: &str, prefix: &str, rule: R) -> Result<Self, OriginError> {
+        Ok(Self {
+            bucket: bucket.to_string(),
+            scope: BlobHeadKey::object_prefix(bucket, prefix).map_err(storage)?,
+            rule,
+            runs: BTreeSet::new(),
+            after: None,
+            next: None,
+            scanned: 0,
+            reading: false,
+        })
+    }
+
+    fn page(&mut self) -> OriginTurn<BucketRuns> {
+        self.reading = false;
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Key::from(self.scope.clone()),
+            after: self.after.take(),
+            limit: RUN_SCAN_LIMIT.saturating_sub(self.scanned).min(500),
+        }))
+    }
+
+    fn page_done(&mut self) -> OriginTurn<BucketRuns> {
+        let next = self.next.take();
+        let complete = match next {
+            None => true,
+            Some(_) if self.scanned >= RUN_SCAN_LIMIT => false,
+            next => {
+                self.after = next;
+                return self.page();
+            }
         };
-        let (heads, next) = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            other => return Err(OriginError::Storage(other.label().to_string())),
-        };
-        scanned += heads.len();
+        let runs = std::mem::take(&mut self.runs);
+        Ok(Next::Done(BucketRuns {
+            complete: complete && runs.len() <= RUN_LIMIT,
+            run_ids: runs.into_iter().rev().take(RUN_LIMIT).collect(),
+        }))
+    }
+}
+
+impl<R: KeyRule> Operation for BucketRunsOperation<R> {
+    type Output = BucketRuns;
+    type Error = OriginError;
+
+    fn first(&mut self) -> OriginTurn<BucketRuns> {
+        self.page()
+    }
+
+    fn next(&mut self, result: IoResult) -> OriginTurn<BucketRuns> {
+        if self.reading {
+            for value in result.values()?.into_iter().flatten() {
+                let version = BlobVersion::from_bytes(&value).map_err(storage)?;
+                if let Some(VersionOrigin::Job { run_id, .. }) = version.origin {
+                    self.runs.insert(run_id);
+                }
+            }
+            return self.page_done();
+        }
+        let (heads, next) = result.page()?;
+        self.scanned += heads.len();
+        self.next = next;
+        let mut reads = Vec::new();
         for (head, pointer) in heads {
             let key = BlobHeadKey::from_bytes(&head).map_err(storage)?;
-            if !readable(&key.key) {
+            if !self.rule.allows(&key.key) {
                 continue;
             }
             let pointer = CurrentVersionPointer::from_bytes(&pointer).map_err(storage)?;
-            let row = VersionKey::new(bucket, &key.key, pointer.version_id).to_bytes();
-            let Some(value) = read(context, BLOB_VERSIONS_KEYSPACE, row.map_err(storage)?).await?
-            else {
-                continue;
-            };
-            let version = BlobVersion::from_bytes(&value).map_err(storage)?;
-            if let Some(VersionOrigin::Job { run_id, .. }) = version.origin {
-                runs.insert(run_id);
-            }
-        }
-        match next {
-            None => break true,
-            Some(_) if scanned >= RUN_SCAN_LIMIT => break false,
-            next => after = next,
-        }
-    };
-    let complete = complete && runs.len() <= RUN_LIMIT;
-    let run_ids = runs.into_iter().rev().take(RUN_LIMIT).collect();
-    Ok(BucketRuns { run_ids, complete })
-}
-
-async fn read_version(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Option<Ulid>,
-) -> Result<(Ulid, BlobVersion), OriginError> {
-    let version_id = match version_id {
-        Some(version_id) => version_id,
-        None => {
-            let head = BlobHeadKey::new(bucket, key)
+            let row = VersionKey::new(&self.bucket, &key.key, pointer.version_id)
                 .to_bytes()
-                .map_err(|error| OriginError::Storage(error.to_string()))?;
-            let value = read(context, BLOB_HEAD_KEYSPACE, head)
-                .await?
-                .ok_or(OriginError::VersionMissing)?;
-            CurrentVersionPointer::from_bytes(&value)
-                .map_err(|error| OriginError::Storage(error.to_string()))?
-                .version_id
+                .map_err(storage)?;
+            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(row)));
         }
-    };
-    let row = VersionKey::new(bucket, key, version_id)
-        .to_bytes()
-        .map_err(|error| OriginError::Storage(error.to_string()))?;
-    let value = read(context, BLOB_VERSIONS_KEYSPACE, row)
-        .await?
-        .ok_or(OriginError::VersionMissing)?;
-    let version =
-        BlobVersion::from_bytes(&value).map_err(|error| OriginError::Storage(error.to_string()))?;
-    // The source's public address comes from the root this node keeps once.
-    let version = hydrate_version(context, version)
-        .await
-        .map_err(OriginError::Storage)?;
-    Ok((version_id, version))
-}
-
-/// The size of one version: its blob location row, or a reference's cached observation.
-async fn version_size(
-    context: &DriverContext,
-    version: &BlobVersion,
-) -> Result<Option<u64>, OriginError> {
-    if let BlobVersionState::Reference {
-        cached_metadata, ..
-    } = &version.state
-    {
-        return Ok(Some(cached_metadata.content_length));
+        if reads.is_empty() {
+            return self.page_done();
+        }
+        self.reading = true;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
-    let Some(location) = version.location_key() else {
-        return Ok(None);
-    };
-    let Some(value) = read(context, BLOB_LOCATIONS_KEYSPACE, location.to_bytes()).await? else {
-        return Ok(None);
-    };
-    let location = BackendLocation::from_bytes(&value)
-        .map_err(|error| OriginError::Storage(error.to_string()))?;
-    Ok(Some(location.blob_size))
-}
-
-/// The display name of a connector of the bucket's group on this node, when it is here.
-async fn connector_name(
-    context: &DriverContext,
-    group_id: GroupId,
-    connector_id: Option<Ulid>,
-) -> Result<Option<String>, OriginError> {
-    let Some(connector_id) = connector_id else {
-        return Ok(None);
-    };
-    let key = source_connector_key(group_id, connector_id).to_vec();
-    let Some(value) = read(context, SOURCE_INDEX_KEYSPACE, key).await? else {
-        return Ok(None);
-    };
-    SourceConnector::from_bytes(&value)
-        .map(|connector| Some(connector.name))
-        .map_err(|error| OriginError::Storage(error.to_string()))
-}
-
-async fn read(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, OriginError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(OriginError::Storage(error.to_string()))
-        }
-        other => Err(OriginError::Storage(other.label().to_string())),
-    }
-}
-
-/// Puts the root's settings back into a version read with a compact binding.
-async fn hydrate_version(
-    context: &DriverContext,
-    version: BlobVersion,
-) -> Result<BlobVersion, String> {
-    let Some(digest) = named_root(&version) else {
-        return Ok(version);
-    };
-    let read = read_root(digest, None);
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let root = parse_root(event).map_err(|error| error.to_string())?;
-    let root = root.ok_or_else(|| "the source root record is missing".to_string())?;
-    hydrated(version, &root)
 }
 
 #[cfg(test)]
-#[path = "origin_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::blob::migration::misplaced::AnyKey;
+    use aruna_core::calls::ChildOutcome;
+
+    #[test]
+    fn missing_bucket_reported() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut read = ReadOriginOperation::new(realm_id, "b", "k", None);
+        read.first().unwrap();
+        let missing: Result<BucketInfo, GetBucketError> = Err(GetBucketError::NotFound);
+        let answer = read.next(IoResult::Child(ChildOutcome::new(missing)));
+        assert_eq!(answer, Err(OriginError::BucketMissing));
+    }
+
+    #[test]
+    fn absent_head_reported() {
+        let mut read = ReadVersionOperation::new("b", "k", None);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = read.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Err(OriginError::VersionMissing));
+    }
+
+    #[test]
+    fn wrong_health_answer() {
+        let group_id = Ulid::from_bytes([2; 16]);
+        let mut health = SourceHealthOperation::new(group_id, ("b", "k"), None);
+        health.first().unwrap();
+        health.step = HealthStep::Measure;
+        let wrong = Event::Delayed;
+        let answer = health.next(IoResult::Event(Box::new(wrong)));
+        assert_eq!(answer, Err(storage("no source health answer")));
+    }
+
+    #[test]
+    fn empty_scope_completes() {
+        let mut runs = BucketRunsOperation::new("b", "", AnyKey).unwrap();
+        assert!(matches!(runs.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let expected = BucketRuns {
+            run_ids: Vec::new(),
+            complete: true,
+        };
+        assert_eq!(runs.next(page), Ok(Next::Done(expected)));
+    }
+}
