@@ -486,6 +486,10 @@ pub enum NetEvent {
         Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
     ),
     InboxWoken,
+    /// This node's id, or `None` on a node without a net handle.
+    LocalNode(Option<crate::NodeId>),
+    /// This node's id and the holders its watch interest matches; `None` without a net handle.
+    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
     /// The signed read grant, or `None` when this node cannot sign it.
@@ -931,6 +935,8 @@ impl Event {
                     GrantSign,
                     Notification,
                     InboxWoken,
+                    LocalNode,
+                    WatchHolders,
                     Heartbeat,
                     Recorded,
                 }

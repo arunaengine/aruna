@@ -801,6 +801,14 @@ pub enum NetEffect {
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
     RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Asks for this node's id; answers `NetEvent::LocalNode`.
+    LocalNode,
+    /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
+    WatchHolders {
+        realm_id: crate::structs::identity::realm::RealmId,
+        path: String,
+        kind: crate::structs::execution::notification_watch::WatchEventKind,
+    },
     /// Notes a watch a local user just created on `holder`, so events reach the holder before
     /// its interest digest arrives.
     RegisterInterest {
