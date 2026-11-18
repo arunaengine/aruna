@@ -4,113 +4,66 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::JobRecordFrame;
-use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSelection, JobAdmissionRecord, JobFamilyId,
-    JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec,
-    LogicalJobState, OutputDestination, SubmissionClaim, SubmissionId, WorkspaceMode, spec_entries,
+    CapturedInput, ExecutionSpec, InputContent, InputSelection, SubmissionId, WorkspaceMode,
+    spec_entries,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{
-    BucketInfo, bucket_permission_path, group_permission_path,
+    BlobVersion, BlobVersionState, BucketInfo, VersionKey, bucket_permission_path,
+    group_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
-use aruna_core::structs::storage::dataset_description::DatasetDescription;
-use aruna_core::structs::storage::origin::SourcePin;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::read_grant::{
     GrantScope, HEAD_OPERATION, READ_OPERATION, ReadGrant,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::warn;
 use ulid::Ulid;
 
-use super::admit::{
-    AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
+use super::admit_here::{
+    AcceptedSubmission, AdmitHereOperation, LocalAdmission, placement_failure,
 };
-use super::ids::{
-    RequestIdentity, SubmissionRequest, SubmissionScope, effective_resources, store_workspace,
+use super::forward::ForwardSubmissionOperation;
+use super::ids;
+use super::ids::{RequestIdentity, SubmissionRequest, SubmissionScope, store_workspace};
+use super::output_policies::OutputPoliciesOperation;
+use super::submission_rules::{
+    admitted_description, batch_len, caller_of, exact_version, family_view, fits,
+    forwarded_request_fits, input_reference, is_device, is_directory, pin_outputs,
+    reference_content, reference_shape, refusal_of, resolve_answer, resolver_admits, source_error,
 };
-use super::witness::arm_family;
-use super::{LifecycleError, ids};
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::pages::{load_chain, page_request};
-use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::service::{mint_local_job, validate_execution};
-use crate::jobs::source_read::{SourceReadError, authorize_read, issue_grant, public_read};
+use crate::jobs::service::mint_local_job;
+use crate::jobs::source_read::{authorize_read, issue_grant, public_read};
 use crate::jobs::submit::SubmitJobError;
+use crate::jobs::submit_execution::validate_execution;
 use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::load_realm_config;
-use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
-use crate::s3::bucket::dataset::{DescriptionError, bucket_metadata, dataset_description};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::realm::peer_trust::peer_acts_for;
+use crate::s3::bucket::dataset::{bucket_metadata, dataset_description};
+use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::release::read::release_members;
 use crate::s3::bucket::release::{BucketScope, MembershipCaller};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
-use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::storage::release::MembershipQuery;
-
-/// Launches one witness may spend on a request over its whole lifetime. It is
-/// stored in the immutable spec, so a later config change cannot widen it.
-const LAUNCHES_PER_WITNESS: u32 = 3;
-
-/// What the caller learns about an accepted submission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptedSubmission {
-    /// The canonical alias of this request family at the accepting holder.
-    pub job_id: JobId,
-    /// False when a matching claim already existed.
-    pub created: bool,
-    pub submission_id: SubmissionId,
-    /// The family's state at this accept: `Queued` for a fresh admission, and
-    /// what this holder currently reduces for a replay of a request that may
-    /// already be running or finished.
-    pub state: LogicalJobState,
-}
-
-/// What one resolve request or answer may carry: half a transport message, so the bearer and
-/// the envelope always fit beside it.
-const RESOLVE_BATCH_BYTES: usize = crate::metadata::protocol::MAX_MESSAGE_SIZE / 2;
-
-/// Adds `item` to a batch of `size` encoded bytes when it still fits one resolve batch.
-fn fits(size: &mut usize, item: &impl Serialize) -> bool {
-    let bytes = postcard::experimental::serialized_size(item).unwrap_or(usize::MAX);
-    match size
-        .checked_add(bytes)
-        .filter(|total| *total <= RESOLVE_BATCH_BYTES)
-    {
-        Some(total) => {
-            *size = total;
-            true
-        }
-        None => false,
-    }
-}
-
-/// How many leading `items` fit one resolve batch.
-fn batch_len<T: Serialize>(items: &[T]) -> usize {
-    let mut size = 0;
-    items
-        .iter()
-        .take_while(|item| fits(&mut size, *item))
-        .count()
-}
 
 /// Resolves inputs this node holds for an ingress, under a bearer validated here, so grants
 /// vouch only for an identity this node checked. Each answer is an input after its links with
@@ -194,70 +147,6 @@ pub async fn serve_input_resolve(
     Ok(answers)
 }
 
-/// Whether `node` answered `asked` faithfully: the same destination, pinned to the version it
-/// captured there, and a new source only behind a link that names the asked version there.
-fn answers_input(
-    asked: &InputSelection,
-    (selection, captured): &(InputSelection, CapturedInput),
-    node: NodeId,
-) -> bool {
-    use aruna_core::structs::execution::job::InputSource;
-    let pin = |input: &InputSelection| {
-        let InputSource::S3 { version_id, .. } = &input.source;
-        version_id
-            .as_deref()
-            .and_then(|v| Ulid::from_string(v).ok())
-    };
-    let InputSource::S3 { bucket, key, .. } = &asked.source;
-    // A source asked without a version is answered at the version captured there.
-    let same_source = |selection: &InputSelection| {
-        let InputSource::S3 {
-            bucket: answered,
-            key: answered_key,
-            ..
-        } = &selection.source;
-        answered == bucket
-            && answered_key == key
-            && pin(asked).is_none_or(|v| pin(selection) == Some(v))
-    };
-    let source_kept = match &captured.link {
-        None => same_source(selection),
-        Some(link) => {
-            link.node_id == node
-                && link.bucket == *bucket
-                && link.key == *key
-                && pin(asked).is_none_or(|version| link.version == version)
-        }
-    };
-    source_kept
-        && pin(selection) == Some(captured.version_id)
-        && selection.dest_key == asked.dest_key
-        && selection.mode == asked.mode
-        && selection.container_path == asked.container_path
-        && selection.source_node_id == Some(node)
-        && captured.destination_key == asked.dest_key
-        && captured.source_node_id == node
-}
-
-/// Whether a validated bearer may have inputs resolved and granted for it: its own user, this
-/// realm, a realm node asking, and no path restriction. Grants and reads run unrestricted, so a
-/// restricted bearer is refused, as submissions refuse restricted credentials.
-fn resolver_admits(
-    auth: &AuthContext,
-    created_by: UserId,
-    config: &RealmConfigDocument,
-    peer: NodeId,
-) -> Result<(), SubmissionRefusal> {
-    match auth.user_id == created_by
-        && auth.realm_id == config.realm_id
-        && auth.path_restrictions.is_none()
-        && is_sync_eligible(config, peer)
-    {
-        true => Ok(()),
-        false => Err(SubmissionRefusal::Unauthorized),
-    }
-}
-
 /// Normalizes, authorizes, and admits one external execution request.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_external_job(
@@ -295,7 +184,7 @@ pub async fn submit_external_job(
     }
     if !labels.is_empty() {
         // Only a complete read of the advertisements proves that no executor carries a label.
-        let (documents, unread) = super::plan::advertisements(context, &config).await;
+        let (documents, unread) = advertisements(context, &config).await;
         if let Some(label) = super::plan::missing_label(&documents, &labels).filter(|_| !unread) {
             return Err(SubmitJobError::InvalidWorkspace(format!(
                 "no executor in the realm carries the label `{}={}`",
@@ -331,27 +220,7 @@ pub async fn submit_external_job(
     if view.holds(local) {
         return admit_here(context, &request, &identity, &config, local).await;
     }
-    forward_once(context, &request, &identity, &view, local, auth_token).await
-}
-
-/// Whether `node_id` is a user device: it carries no shared realm
-/// responsibility, holds nothing, and therefore admits nothing.
-fn is_device(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    !is_sync_eligible(config, node_id)
-}
-
-/// Pins every declared output to the node that will admit the request and write
-/// its results.
-fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
-    for output in &mut spec.file_outputs {
-        output.destination_node_id = Some(node_id);
-    }
-    let (mode, bucket) = ids::workspace_of(spec);
-    if mode == WorkspaceMode::Existing
-        && let Some(bucket) = bucket
-    {
-        spec.resolve_outputs(&bucket, node_id);
-    }
+    forward_once(context, (&request, &identity), &view, local, auth_token).await
 }
 
 /// A device forwards without resolving anything: it holds none of the objects it
@@ -372,103 +241,7 @@ async fn forward_device(
     }
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
     let view = family_view(config, &identity)?;
-    forward_once(context, &request, &identity, &view, local, auth_token).await
-}
-
-/// Validates the shape of every input reference without requiring the object to
-/// be present here. Local presence is the admitting holder's check.
-fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
-    for input in &spec.inputs {
-        let aruna_core::structs::execution::job::InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        if bucket.trim().is_empty() || key.trim().is_empty() {
-            return Err(SubmitJobError::InvalidWorkspace(
-                "input reference needs a bucket and a key".to_string(),
-            ));
-        }
-        if let Some(version) = version_id {
-            Ulid::from_string(version)
-                .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-/// How a refusal names the input it is about. Only the object reference is
-/// named; a credential never reaches a reason string.
-fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String {
-    match version_id {
-        Some(version) => format!("s3://{bucket}/{key}?versionId={version}"),
-        None => format!("s3://{bucket}/{key}"),
-    }
-}
-
-/// A reference version without a content hash, served by GetObject while its source still
-/// matches the recorded observation: a strong ETag on a source that enforces `If-Match` binds
-/// every range, so only that input may be mounted. Anything else is not materialized.
-fn reference_content(
-    reference: &str,
-    head: &crate::s3::object::head::HeadObjectResult,
-) -> Result<(InputContent, Option<SourcePin>), SubmitJobError> {
-    let refused = |reason: &str| SubmitJobError::InvalidWorkspace(format!("{reference}: {reason}"));
-    let (Some(binding), Some(metadata), None) =
-        (&head.source_binding, &head.source_metadata, &head.location)
-    else {
-        return Err(refused("input is not materialized"));
-    };
-    let range_bound = binding.descriptor.kind.enforces_if_match()
-        && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
-    let pin = SourcePin::of(&binding.descriptor);
-    let content = InputContent::Reference {
-        etag: metadata.etag.clone(),
-        range_bound,
-    };
-    Ok((content, Some(pin)))
-}
-
-/// Who resolves inputs: the caller, the submission its grants name, and when they end.
-fn caller_of(
-    created_by: UserId,
-    scope: &SubmissionScope,
-    retention_ms: u64,
-) -> (UserId, SubmissionId, u64) {
-    let expires_at = (unix_timestamp_millis().saturating_add(retention_ms)) / 1000;
-    (
-        created_by,
-        ids::submission_of(created_by, scope),
-        expires_at,
-    )
-}
-
-/// A denied read is the caller's own; anything undecided may clear on a retry.
-fn source_error(reference: &str, error: SourceReadError) -> SubmitJobError {
-    match error {
-        SourceReadError::NotFound => {
-            SubmitJobError::InvalidWorkspace(format!("{reference}: input bucket not found"))
-        }
-        SourceReadError::Denied => SubmitJobError::InputDenied(reference.to_string()),
-        SourceReadError::Unavailable(error) => {
-            SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"))
-        }
-    }
-}
-
-/// An input the caller names on another node must name its exact version there too.
-fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError> {
-    let aruna_core::structs::execution::job::InputSource::S3 {
-        bucket,
-        key,
-        version_id,
-    } = &input.source;
-    match version_id.as_deref().map(Ulid::from_string) {
-        Some(Ok(_)) => Ok(()),
-        _ => Err(SubmitJobError::InvalidWorkspace(format!(
-            "s3://{bucket}/{key}: an input on another node must name its exact version"
-        ))),
-    }
+    forward_once(context, (&request, &identity), &view, local, auth_token).await
 }
 
 /// Points a local input of a distributed bucket at the member that coordinates its key, so it
@@ -578,7 +351,9 @@ async fn resolve_inputs(
             captured
         })
         .collect();
-    let output_policies = resolve_outputs(context, spec, local).await?;
+    let output_policies = drive(OutputPoliciesOperation::new(spec, local), context)
+        .await
+        .map_err(placement_failure)?;
     Ok((
         here.into_iter().chain(remote_inputs).collect(),
         captured_inputs,
@@ -661,12 +436,6 @@ async fn follow_link(
         input.source_node_id = (target.arn.node_id != local).then_some(target.arn.node_id);
     }
     Ok((input, first))
-}
-
-/// A directory input names a key prefix, marked by its trailing `/`.
-fn is_directory(input: &InputSelection) -> bool {
-    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source;
-    key.ends_with('/') && input.dest_key.ends_with('/')
 }
 
 /// One pinned input per object below a directory input's prefix, at the current version, each
@@ -802,43 +571,6 @@ async fn remote_captures(
     Ok(answered)
 }
 
-/// The answers of one resolve request: a non-empty prefix of `batch`, each faithful to it.
-fn resolve_answer(
-    answer: Result<Result<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal>, String>,
-    batch: &[InputSelection],
-    node: NodeId,
-) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
-    let answer = answer.map_err(|error| {
-        SubmitJobError::PlacementUnavailable(format!("input node {node}: {error}"))
-    })?;
-    let captured = match answer {
-        Ok(captured) => captured,
-        Err(SubmissionRefusal::Invalid { reason }) => {
-            return Err(SubmitJobError::InvalidWorkspace(reason));
-        }
-        Err(SubmissionRefusal::Unauthorized) => {
-            return Err(SubmitJobError::InputDenied(format!(
-                "inputs on node {node}"
-            )));
-        }
-        Err(refusal) => {
-            return Err(SubmitJobError::PlacementUnavailable(format!(
-                "input node {node} refused: {refusal:?}"
-            )));
-        }
-    };
-    // The node answers a prefix of the asked inputs, each pinned to a version it holds.
-    let exact = !captured.is_empty()
-        && captured.len() <= batch.len()
-        && (captured.iter().zip(batch)).all(|(answer, asked)| answers_input(asked, answer, node));
-    match exact {
-        true => Ok(captured),
-        false => Err(SubmitJobError::PlacementUnavailable(format!(
-            "input node {node} answered other versions"
-        ))),
-    }
-}
-
 /// Captures inputs this node holds: each is read like an S3 GET by the caller, pinned to an
 /// exact version and granted for later exact reads, with its bucket's metadata and the releases
 /// that pin it. `bearer` lets range coordinators answer release membership.
@@ -896,7 +628,7 @@ async fn capture_inputs(
             .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
         let blake3 = match blake3 {
             Some(hash) => Some(hash),
-            None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version).await,
+            None => version_hash(context, bucket, key, version).await,
         };
         let (content, source_pin) = match blake3 {
             Some(hash) => (InputContent::Blake3(hash), None),
@@ -1039,17 +771,6 @@ async fn readable_metadata(
     Ok(Some(CapturedDatabase::new(metadata, described)))
 }
 
-/// The description a run captures: empty only when the dataset definitely gives none.
-fn admitted_description(
-    read: Result<DatasetDescription, DescriptionError>,
-) -> Result<DatasetDescription, String> {
-    match read {
-        Ok(described) => Ok(described),
-        Err(DescriptionError::Unreadable | DescriptionError::Invalid(_)) => Ok(Default::default()),
-        Err(error @ DescriptionError::Unavailable) => Err(error.to_string()),
-    }
-}
-
 /// The releases that pin one input version, checked with the caller's own access; a check that
 /// fails leaves them unproven rather than refusing the run.
 async fn input_releases(
@@ -1072,64 +793,6 @@ async fn input_releases(
     }
 }
 
-/// The placement refs of every bucket the run writes into; all live on the ingress node.
-async fn resolve_outputs(
-    context: &DriverContext,
-    spec: &ExecutionSpec,
-    local: NodeId,
-) -> Result<Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>, SubmitJobError> {
-    let mut buckets = std::collections::BTreeSet::new();
-    for output in &spec.file_outputs {
-        if output.destination_node_id != Some(local) {
-            return Err(SubmitJobError::InvalidWorkspace(
-                "output destination endpoint is invalid".to_string(),
-            ));
-        }
-        let OutputDestination::S3 { bucket, .. } = &output.destination;
-        buckets.insert(bucket.clone());
-    }
-    let (mode, workspace) = ids::workspace_of(spec);
-    if mode == WorkspaceMode::Existing
-        && let Some(bucket) = workspace
-    {
-        buckets.insert(bucket);
-    }
-    let mut output_policies = Vec::new();
-    for bucket in buckets {
-        let info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
-            Ok(info) => info,
-            Err(GetBucketError::NotFound) => {
-                return Err(SubmitJobError::InvalidWorkspace(format!(
-                    "s3://{bucket}: output bucket not found"
-                )));
-            }
-            Err(
-                error @ (GetBucketError::ConversionError(_)
-                | GetBucketError::InvalidStateEvent { .. }),
-            ) => {
-                return Err(SubmitJobError::InvalidWorkspace(format!(
-                    "s3://{bucket}: {error}"
-                )));
-            }
-            Err(error) => {
-                return Err(SubmitJobError::PlacementUnavailable(format!(
-                    "s3://{bucket}: {error}"
-                )));
-            }
-        };
-        if info.group_id != spec.group_id {
-            return Err(SubmitJobError::InvalidWorkspace(format!(
-                "s3://{bucket}: output bucket is outside the execution group"
-            )));
-        }
-        output_policies.extend(info.placement_policies);
-    }
-    output_policies =
-        aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(&output_policies)
-            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-    Ok(output_policies)
-}
-
 /// The realm config this node synchronized plus its own identity.
 async fn local_view(
     context: &DriverContext,
@@ -1144,20 +807,7 @@ async fn local_view(
     Ok((config, net.node_id()))
 }
 
-/// The unconflicted family view. A view this node cannot resolve is an
-/// availability failure, never an accepted job.
-fn family_view(
-    config: &RealmConfigDocument,
-    identity: &RequestIdentity,
-) -> Result<FamilyView, SubmitJobError> {
-    FamilyView::resolve(config, config.realm_id, identity.family()).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("job family placement is unavailable".to_string())
-    })
-}
-
-/// Mints the alias, signs the immutable spec and its claim, and commits them.
-/// The answered alias is canonical at this accept: a fresh admission holds the
-/// only claim, and a replay settles on the already-reduced claim.
+/// Mints the alias and admits the submission here; see [`AdmitHereOperation`].
 async fn admit_here(
     context: &DriverContext,
     request: &SubmissionRequest,
@@ -1165,313 +815,34 @@ async fn admit_here(
     config: &RealmConfigDocument,
     local: NodeId,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
-    let now_ms = unix_timestamp_millis();
-    let placement = config
-        .family_placement(identity.submission_id)
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let job_id = mint_local_job(
-        context,
-        config.realm_id,
+    let subject = Some(identity.submission_id.0.as_slice());
+    let job_id = mint_local_job(context, config.realm_id, local, subject).await?;
+    let admission = LocalAdmission {
+        request: request.clone(),
+        identity: *identity,
+        config: config.clone(),
         local,
-        Some(&identity.submission_id.0),
-    )
-    .await?;
-    let spec = LogicalJobSpec {
-        submission_id: identity.submission_id,
         job_id,
-        origin_node_id: local,
-        ingress_node_id: request.ingress_node_id,
-        realm_id: config.realm_id,
-        group_id: request.spec.group_id,
-        created_by: request.created_by,
-        created_at_ms: now_ms,
-        payload: request.spec.clone(),
-        request_digest: identity.request_digest,
-        spec_digest: [0u8; 32],
-        resources: effective_resources(&request.spec),
-        retention_ms: request.retention_ms,
-        retry: JobRetryPolicy {
-            launches_per_witness: LAUNCHES_PER_WITNESS,
-        },
-        admission: JobAdmissionRecord {
-            submission_id: identity.submission_id,
-            request_digest: identity.request_digest,
-            job_id,
-            group_id: request.spec.group_id,
-            admitting_node_id: local,
-            // The realm config publishes no membership generation yet; the
-            // departure round fills it. Zero is unstamped, not an epoch claim.
-            membership_generation: 0,
-            resources: effective_resources(&request.spec),
-            admitted_at_ms: now_ms,
-        },
-        captured_inputs: request.captured_inputs.clone(),
-        input_pages: request.input_pages,
-        output_policies: request.output_policies.clone(),
-        placement,
-    }
-    .store_digest()
-    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let claim = SubmissionClaim {
-        submission_id: identity.submission_id,
-        job_id,
-        request_digest: identity.request_digest,
-        spec_digest: spec.spec_digest,
-        committing_node_id: local,
-        accepted_at_ms: now_ms,
+        now_ms: unix_timestamp_millis(),
+        fresh: context.fresh_heartbeats(),
     };
-    let spec_frame = sign_frame(
-        context,
-        config.realm_id,
-        JobFamilyRecord::Spec(Box::new(spec)),
-    )?;
-    let claim_frame = sign_frame(context, config.realm_id, JobFamilyRecord::Claim(claim))?;
-    let candidate = AdmissionCandidate {
-        job_id,
-        spec: spec_frame,
-        claim: claim_frame,
-    };
-    let admitted =
-        admit_with_quota(context, config, local, request, identity, candidate, now_ms).await?;
-    let state = match admitted.created {
-        true => LogicalJobState::Queued,
-        false => observed_state(context, admitted.family).await,
-    };
-    // Scheduling and replication are armed only after the claim is durable, so
-    // a failed commit never leaves a round pointing at a family that is absent.
-    arm_family(context, identity.family(), now_ms).await;
-    super::outbox::timers::kick(context).await;
-    Ok(AcceptedSubmission {
-        job_id: admitted.job_id,
-        created: admitted.created,
-        submission_id: identity.submission_id,
-        state,
-    })
-}
-
-/// The state this holder currently reduces for `family`. The cached projection
-/// answers when current; otherwise the family is reduced once from its records.
-/// A family this node cannot fully reduce is reported as indeterminate.
-async fn observed_state(context: &DriverContext, family: JobFamilyId) -> LogicalJobState {
-    let cached = match cached_projection(context, &family).await {
-        Ok(cached) => cached,
-        Err(error) => {
-            warn!(error = %error, "Replayed submission could not read its projection cache");
-            None
-        }
-    };
-    let projection = match cached {
-        Some(cache) if !cache.stale => cache.projection,
-        _ => match drive(
-            ProjectFamilyOperation::new(ProjectFamilyConfig {
-                family: FamilyRef::Family(family),
-                now_ms: unix_timestamp_millis(),
-                rebuild: false,
-            }),
-            context,
-        )
+    drive(AdmitHereOperation::new(admission), context)
         .await
-        {
-            Ok(projected) if projected.truncated => {
-                warn!("Replayed submission reduced only part of its family");
-                None
-            }
-            Ok(projected) => projected.projection,
-            Err(error) => {
-                warn!(error = %error, "Replayed submission could not reduce its family");
-                None
-            }
-        },
-    };
-    projection.map_or(LogicalJobState::Indeterminate, |projection| {
-        projection.state
-    })
+        .map_err(placement_failure)
 }
 
-async fn cached_projection(
-    context: &DriverContext,
-    family: &JobFamilyId,
-) -> Result<Option<ProjectionCache>, String> {
-    let (page, _) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_PROJECTION_KEYSPACE,
-        Some(family_prefix(family)),
-        None,
-        1,
-        None,
-    )
-    .await?;
-    Ok(page
-        .first()
-        .and_then(|(_, value)| ProjectionCache::decode(value)))
-}
-
-/// Admission transactions one submission runs before it reports the group as
-/// unavailable. Only a conflict with a concurrent admission is retried.
-const ADMISSION_ATTEMPTS: usize = 3;
-
-/// Decides the standing quota and commits the admission. A replay is settled
-/// from already-held records and never reads the quota view; a lost transaction
-/// against a concurrent submission of the same group is retried.
-async fn admit_with_quota(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    request: &SubmissionRequest,
-    identity: &RequestIdentity,
-    candidate: AdmissionCandidate,
-    now_ms: u64,
-) -> Result<AdmittedSubmission, SubmitJobError> {
-    for attempt in 0..ADMISSION_ATTEMPTS {
-        let (quota_refusal, quota_revision) = match has_claim(context, &identity.family()).await? {
-            true => (None, None),
-            false => crate::jobs::quota::quota_refusal(
-                context,
-                config,
-                local,
-                request.spec.group_id,
-                &effective_resources(&request.spec),
-            )
-            .await
-            .map_err(SubmitJobError::PlacementUnavailable)?,
-        };
-        let admitted = drive(
-            AdmitSubmissionOperation::new(AdmitSubmissionConfig {
-                realm_id: config.realm_id,
-                local_node_id: local,
-                submission_id: identity.submission_id,
-                request_digest: identity.request_digest,
-                candidate: Box::new(candidate.clone()),
-                now_ms,
-                quota_refusal,
-                quota_revision,
-            }),
-            context,
-        )
-        .await;
-        match admitted {
-            Ok(admitted) => return Ok(admitted),
-            Err(LifecycleError::Storage(StorageError::TransactionConflict))
-                if attempt + 1 < ADMISSION_ATTEMPTS =>
-            {
-                debug!(group_id = %request.spec.group_id, "Retrying an admission a concurrent one won");
-            }
-            Err(error) => return Err(admission_error(error)),
-        }
-    }
-    Err(SubmitJobError::PlacementUnavailable(
-        "admission exhausted conflict retries".to_string(),
-    ))
-}
-
-/// Whether this node already holds a claim for `family`, which makes the
-/// admission a replay that settles inside its own transaction.
-async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool, SubmitJobError> {
-    let (page, _) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_RECORD_KEYSPACE,
-        Some(kind_prefix(family, JobRecordKind::Claim)),
-        None,
-        1,
-        None,
-    )
-    .await
-    .map_err(SubmitJobError::PlacementUnavailable)?;
-    Ok(!page.is_empty())
-}
-
-fn sign_frame(
-    context: &DriverContext,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-    record: JobFamilyRecord,
-) -> Result<JobRecordFrame, SubmitJobError> {
-    let net = context.net_handle.as_ref().ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("network handle unavailable".to_string())
-    })?;
-    let envelope = JobRecordEnvelope::signed_with(realm_id, record, net.node_id(), |message| {
-        net.sign(message)
-    })
-    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    JobRecordFrame::new(envelope)
-        .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))
-}
-
-fn admission_error(error: LifecycleError) -> SubmitJobError {
-    match error {
-        LifecycleError::IdempotencyConflict { existing_job_id } => {
-            SubmitJobError::JobPlanConflict { existing_job_id }
-        }
-        LifecycleError::QuotaDenied(reason) => SubmitJobError::QuotaDenied(reason),
-        LifecycleError::GroupWrite(error) => SubmitJobError::GroupWrite(error),
-        error => SubmitJobError::PlacementUnavailable(error.to_string()),
-    }
-}
-
-/// Forwards the complete request and its preassigned identity one hop. The
-/// holder revalidates the caller and recomputes the identity itself, so this
-/// node never becomes the authority for a job it does not hold.
+/// Forwards the request to the other holders; see [`ForwardSubmissionOperation`].
 async fn forward_once(
     context: &DriverContext,
-    request: &SubmissionRequest,
-    identity: &RequestIdentity,
+    (request, identity): (&SubmissionRequest, &RequestIdentity),
     view: &FamilyView,
     local: NodeId,
     auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
-    let (Some(metadata), Some(auth_token)) = (context.metadata_handle.as_ref(), auth_token) else {
-        return Err(SubmitJobError::PlacementUnavailable(
-            "forwarding a submission needs the caller's token".to_string(),
-        ));
-    };
-    for holder in view.holders().iter().filter(|holder| **holder != local) {
-        let message = MetadataTransportMessage::ForwardJobSubmission {
-            auth_token: auth_token.clone(),
-            submission_id: identity.submission_id,
-            request: Box::new(request.clone()),
-        };
-        let reply = match metadata.request_forwarded_write(*holder, message).await {
-            Ok(reply) => reply,
-            Err(error) => {
-                debug!(peer = %holder, error = %error, "Submission forwarding failed");
-                continue;
-            }
-        };
-        match reply {
-            MetadataTransportMessage::ForwardedJobSubmission { result: Ok(ack) } => {
-                return Ok(AcceptedSubmission {
-                    job_id: ack.job_id,
-                    created: ack.created,
-                    submission_id: identity.submission_id,
-                    state: ack.state,
-                });
-            }
-            MetadataTransportMessage::ForwardedJobSubmission {
-                result: Err(SubmissionRefusal::Conflict { existing_job_id }),
-            } => return Err(SubmitJobError::JobPlanConflict { existing_job_id }),
-            MetadataTransportMessage::ForwardedJobSubmission {
-                result: Err(SubmissionRefusal::Unauthorized),
-            } => return Err(SubmitJobError::AuthorityDenied),
-            // A holder that read the request and refused it answers for every
-            // holder; retrying the rest would only repeat the refusal.
-            MetadataTransportMessage::ForwardedJobSubmission {
-                result: Err(SubmissionRefusal::Invalid { reason }),
-            } => return Err(SubmitJobError::InvalidWorkspace(reason)),
-            MetadataTransportMessage::ForwardedJobSubmission {
-                result: Err(reason),
-            } => {
-                debug!(peer = %holder, reason = ?reason, "Family holder refused the submission");
-            }
-            MetadataTransportMessage::ForwardedWriteUnavailable => continue,
-            other => warn!(
-                peer = %holder,
-                reply = crate::metadata::transport_message_kind(&other),
-                "Unexpected submission forwarding reply"
-            ),
-        }
-    }
-    Err(SubmitJobError::PlacementUnavailable(
-        "no job family holder accepted the submission".to_string(),
-    ))
+    let holders = view.holders().iter().copied();
+    let holders = holders.filter(|holder| *holder != local).collect();
+    let forward = ForwardSubmissionOperation::new(request, identity, holders, auth_token);
+    drive(forward, context).await.map_err(placement_failure)
 }
 
 /// Serves one forwarded submission. The caller's token, the identity, and this
@@ -1544,24 +915,7 @@ async fn admit_forwarded(
         }
         false => peer,
     };
-    if request.captured_inputs.len() != request.spec.inputs.len()
-        || request.captured_inputs.iter().any(|captured| {
-            !request
-                .spec
-                .inputs
-                .iter()
-                .any(|input| input.dest_key == captured.destination_key)
-        })
-        || request.ingress_node_id != ingress
-        || !sources_match(&request.spec.inputs, &request.captured_inputs, ingress)
-        || request
-            .spec
-            .file_outputs
-            .iter()
-            .any(|output| output.destination_node_id != Some(request.ingress_node_id))
-        || (ids::workspace_of(&request.spec).0 == WorkspaceMode::Existing
-            && !request.spec.workspace_outputs.is_empty())
-    {
+    if !forwarded_request_fits(&request, ingress) {
         return Err(SubmissionRefusal::IdentityMismatch);
     }
     let identity = request
@@ -1613,16 +967,6 @@ async fn page_inputs(
     Ok(())
 }
 
-/// Whether each capture comes from the node its input names, or from ingress when it names none.
-fn sources_match(inputs: &[InputSelection], captured: &[CapturedInput], ingress: NodeId) -> bool {
-    captured.iter().all(|captured| {
-        inputs.iter().any(|input| {
-            input.dest_key == captured.destination_key
-                && input.source_node_id.unwrap_or(ingress) == captured.source_node_id
-        })
-    })
-}
-
 /// Normalizes a device submission at the holder: the outputs are pinned here and
 /// the referenced inputs are resolved against this node's own objects, so the
 /// recomputed identity covers names only this node assigned.
@@ -1647,17 +991,6 @@ async fn pin_device_request(
     Ok(())
 }
 
-/// A request this holder could not read is unavailable, so the device tries the
-/// next holder; one it read and must refuse is definitively invalid.
-fn refusal_of(error: SubmitJobError) -> SubmissionRefusal {
-    match error {
-        SubmitJobError::PlacementUnavailable(_) => SubmissionRefusal::Unavailable,
-        other => SubmissionRefusal::Invalid {
-            reason: other.to_string(),
-        },
-    }
-}
-
 async fn authorize_group(
     context: &DriverContext,
     auth: &AuthContext,
@@ -1675,27 +1008,80 @@ async fn authorize_group(
     .await
 }
 
+/// Node-info documents of every sync-eligible realm member that has one, and
+/// whether a read failed. An unread advertisement may hold the only legal
+/// target, so the round is a continuation rather than a conclusive refusal.
+pub(super) async fn advertisements(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
+    let mut documents = BTreeMap::new();
+    let Ok(members) = config.sync_eligible_nodes() else {
+        return (documents, true);
+    };
+    let mut unread = false;
+    for node_id in members {
+        let read = drive(ReadInfoOperation::new(vec![node_id]), context).await;
+        match read.map(|mut documents| documents.remove(&node_id)) {
+            Ok(Some(document)) => {
+                documents.insert(node_id, document);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(node = %node_id, error = %error, "Node info advertisement stayed unread");
+                unread = true;
+            }
+        }
+    }
+    (documents, unread)
+}
+
+/// The blake3 of a version this node does not hold locally, read from the
+/// replicated version record.
+async fn version_hash(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version: Ulid,
+) -> Option<[u8; 32]> {
+    let version_key = VersionKey::new(bucket, key, version).to_bytes().ok()?;
+    let event = context
+        .storage_handle
+        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
+            key_space: aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version_key.into(),
+            txn_id: None,
+        })
+        .await;
+    let aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+        value: Some(bytes),
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    match postcard::from_bytes::<BlobVersion>(&bytes).ok()?.state {
+        BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::lifecycle::submission_rules::{answers_input, sources_match};
+    use crate::s3::bucket::dataset::DescriptionError;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::structs::execution::job::OutputDestination;
     use aruna_core::structs::execution::job::{
         InputMode, InputSelection, InputSource, OutputSelection, WorkspaceOutput,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::types::Key;
+    use aruna_core::structs::storage::dataset_description::DatasetDescription;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
     use crate::tests::records::{node, payload};
-
-    fn family(seed: u8) -> JobFamilyId {
-        JobFamilyId {
-            submission_id: SubmissionId([seed; 32]),
-            request_digest: [seed; 32],
-        }
-    }
 
     #[test]
     fn unavailable_dataset_retries() {
@@ -1775,124 +1161,6 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         }
-    }
-
-    async fn write_claim(context: &DriverContext, realm_id: RealmId, family: JobFamilyId) {
-        let job_id = JobId::from_bytes([7u8; 16]);
-        let claim = SubmissionClaim {
-            submission_id: family.submission_id,
-            job_id,
-            request_digest: family.request_digest,
-            spec_digest: [0u8; 32],
-            committing_node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-            accepted_at_ms: 1,
-        };
-        let envelope = JobRecordEnvelope::sign(
-            realm_id,
-            JobFamilyRecord::Claim(claim),
-            &iroh::SecretKey::from_bytes(&[1u8; 32]),
-        )
-        .expect("record signs");
-        let mut key = kind_prefix(&family, JobRecordKind::Claim).to_vec();
-        key.extend_from_slice(&[0u8; 40]);
-        write_row(
-            context,
-            FAMILY_RECORD_KEYSPACE,
-            Key::from(key.as_slice()),
-            postcard::to_allocvec(&envelope).unwrap(),
-        )
-        .await;
-    }
-
-    async fn write_projection(
-        context: &DriverContext,
-        family: JobFamilyId,
-        state: LogicalJobState,
-    ) {
-        let cache = ProjectionCache {
-            version: aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION,
-            revision: 1,
-            stale: false,
-            projection: Some(aruna_core::structs::execution::job::JobProjection {
-                submission_id: family.submission_id,
-                request_digest: family.request_digest,
-                canonical_job_id: JobId::from_bytes([7u8; 16]),
-                aliases: Vec::new(),
-                state,
-                canonical_execution_id: None,
-                executions: Vec::new(),
-                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new())
-                    .expect("empty outputs"),
-                cancel_requested: false,
-            }),
-        };
-        write_row(
-            context,
-            FAMILY_PROJECTION_KEYSPACE,
-            family_prefix(&family),
-            postcard::to_allocvec(&cache).unwrap(),
-        )
-        .await;
-    }
-
-    async fn write_row(context: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn replay_skips_quota() {
-        // A family this node already claimed is a replay: the admission settles
-        // from its own records, so no quota view is read for it.
-        let dir = tempdir().unwrap();
-        let context = test_ctx(dir.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([3u8; 32]);
-
-        assert!(!has_claim(&context, &family(1)).await.unwrap());
-
-        write_claim(&context, realm_id, family(1)).await;
-
-        assert!(has_claim(&context, &family(1)).await.unwrap());
-        assert!(!has_claim(&context, &family(2)).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn replay_reports_state() {
-        // A replay answers with the family's observed state, so a request that
-        // is already running or finished is never reported as freshly queued.
-        let dir = tempdir().unwrap();
-        let context = test_ctx(dir.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([4u8; 32]);
-        write_claim(&context, realm_id, family(1)).await;
-
-        write_projection(&context, family(1), LogicalJobState::Running).await;
-        assert_eq!(
-            observed_state(&context, family(1)).await,
-            LogicalJobState::Running
-        );
-
-        write_projection(&context, family(1), LogicalJobState::Succeeded).await;
-        assert_eq!(
-            observed_state(&context, family(1)).await,
-            LogicalJobState::Succeeded
-        );
-
-        // A family this node cannot reduce is indeterminate, never queued.
-        assert_eq!(
-            observed_state(&context, family(2)).await,
-            LogicalJobState::Indeterminate
-        );
     }
 
     fn s3_input(bucket: &str, key: &str, version: Option<&str>) -> InputSelection {

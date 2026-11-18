@@ -88,7 +88,9 @@ async fn quarantine_keeps_placement() {
 
 #[tokio::test]
 async fn quarantine_retains_families() {
-    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventKind, WatchEventMask, WatchSubscription,
+    };
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");

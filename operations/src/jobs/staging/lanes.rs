@@ -896,7 +896,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&ctx.driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&ctx.driver, &record)
             .await
             .unwrap();
         JobContext {
@@ -909,6 +909,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: ctx.range_turns.clone(),
+            handlers: Default::default(),
         }
     }
 
@@ -1037,7 +1038,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&driver, &record)
             .await
             .unwrap();
         let ctx = JobContext {
@@ -1050,6 +1051,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
+            handlers: Default::default(),
         };
         (ctx, spec, test._tempdir)
     }

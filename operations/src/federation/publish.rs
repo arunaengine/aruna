@@ -306,7 +306,6 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
-    use aruna_core::handle::Handle;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::time::unix_timestamp_secs;
     use ed25519_dalek::SigningKey;

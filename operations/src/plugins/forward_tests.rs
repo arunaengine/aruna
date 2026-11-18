@@ -95,7 +95,7 @@ async fn decided_rows() {
         .unwrap();
     assert_eq!(receiver.batches(), 1);
     let failing = |_, _| std::future::ready(Err::<Decisions, _>("down".to_string()));
-    let later = now + MAX_BACKOFF_MS;
+    let later = now + u64::try_from(MAX_BACKOFF.as_millis()).unwrap();
     send_outbox(&fixture.ctx, &config, later, &mut backoff, failing)
         .await
         .unwrap();

@@ -11,7 +11,6 @@ use aruna_core::structs::execution::job::{
     ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -45,7 +44,7 @@ impl ComputeReconciler {
 
 #[async_trait::async_trait]
 impl ExternalReconciler for ComputeReconciler {
-    async fn reconcile_lost_attempt(&self, storage: &StorageHandle, record: JobRecord) {
+    async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord) {
         let job_id = record.job_id;
         let JobPayload::Execution(mut spec) = record.payload.clone() else {
             return;
@@ -53,7 +52,7 @@ impl ExternalReconciler for ComputeReconciler {
 
         // Take over with a fresh claim token, but only if the old holder is really gone.
         let (adopted, control) = match adopt_external_attempt(
-            storage,
+            context,
             job_id,
             holder(&self.context),
             unix_timestamp_millis(),
@@ -77,7 +76,7 @@ impl ExternalReconciler for ComputeReconciler {
         // No durable attempt intent means the attempt was never submitted; release
         // the adopted lease without charging an attempt.
         let Some(intent) = adopted.attempt_intent.clone() else {
-            let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
+            let _ = release_job(context, job_id, token, unix_timestamp_millis()).await;
             return;
         };
 
@@ -95,7 +94,7 @@ impl ExternalReconciler for ComputeReconciler {
             // terminalize a healthy container: hand it back with an expired lease instead.
             warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
             if let Err(error) =
-                handoff_external_attempt(storage, job_id, token, unix_timestamp_millis()).await
+                handoff_external_attempt(context, job_id, token, unix_timestamp_millis()).await
             {
                 warn!(job_id = %job_id, error = %error, "Failed to hand back an unreconciled attempt");
             }
@@ -128,7 +127,7 @@ impl ExternalReconciler for ComputeReconciler {
 
         if adopted.cancel_requested {
             let _ = with_execution_heartbeat(
-                storage.clone(),
+                context.clone(),
                 job_id,
                 token,
                 CancellationToken::new(),
@@ -152,7 +151,7 @@ impl ExternalReconciler for ComputeReconciler {
             _ => None,
         };
         if let Some(started_at_ms) = started_at_ms
-            && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
+            && let Err(error) = record_attempt_started(context, job_id, token, started_at_ms).await
         {
             warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
             park_attempt(
@@ -171,7 +170,7 @@ impl ExternalReconciler for ComputeReconciler {
         ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
         {
             let running = match begin_external_running(
-                storage,
+                context,
                 job_id,
                 token,
                 started_at_ms,
@@ -193,7 +192,7 @@ impl ExternalReconciler for ComputeReconciler {
             };
             if running.cancel_requested {
                 let _ = with_execution_heartbeat(
-                    storage.clone(),
+                    context.clone(),
                     job_id,
                     token,
                     CancellationToken::new(),
@@ -242,7 +241,7 @@ impl ExternalReconciler for ComputeReconciler {
                 }
                 let cancel = CancellationToken::new();
                 let finalized = with_execution_heartbeat(
-                    storage.clone(),
+                    context.clone(),
                     job_id,
                     token,
                     cancel.clone(),
@@ -300,7 +299,7 @@ impl ExternalReconciler for ComputeReconciler {
             }
             ReconcileEvidence::Tombstoned(tombstone) => {
                 if record_attempt_tombstone(
-                    storage,
+                    context,
                     job_id,
                     token,
                     fence.attempt_epoch,
@@ -358,13 +357,8 @@ impl ComputeReconciler {
         };
         if !self.runtime.upgrade().is_some_and(|runtime| {
             runtime.spawn_recovered(self.context.clone(), &record, supervisor)
-        }) && let Err(error) = handoff_external_attempt(
-            &self.context.storage_handle,
-            job_id,
-            token,
-            unix_timestamp_millis(),
-        )
-        .await
+        }) && let Err(error) =
+            handoff_external_attempt(&self.context, job_id, token, unix_timestamp_millis()).await
         {
             warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
         }
@@ -384,7 +378,7 @@ pub(super) async fn resume_attempt(
     record: JobRecord,
     cancel: CancellationToken,
 ) {
-    let current = match read_job_record(&context.storage_handle, job_id, None).await {
+    let current = match read_job_record(&context, job_id, None).await {
         Ok(Some(record)) => record,
         Ok(None) => return,
         Err(error) => {
@@ -394,7 +388,7 @@ pub(super) async fn resume_attempt(
     };
     if current.cancel_requested {
         let _ = with_execution_heartbeat(
-            context.storage_handle.clone(),
+            context.as_ref().clone(),
             job_id,
             token,
             cancel,
@@ -407,7 +401,7 @@ pub(super) async fn resume_attempt(
     }
     if matches!(phase, AttemptPhase::Submitted) {
         let resumed = with_execution_heartbeat(
-            context.storage_handle.clone(),
+            context.as_ref().clone(),
             job_id,
             token,
             cancel.clone(),
@@ -474,14 +468,14 @@ pub(super) async fn resume_attempt(
                     }
                 };
                 if let Some(started_at_ms) = status.started_at_ms
-                    && record_attempt_started(&context.storage_handle, job_id, token, started_at_ms)
+                    && record_attempt_started(&context, job_id, token, started_at_ms)
                         .await
                         .is_err()
                 {
                     return false;
                 }
                 let running = match begin_external_running(
-                    &context.storage_handle,
+                    &context,
                     job_id,
                     token,
                     status.started_at_ms,
@@ -594,9 +588,9 @@ mod tests {
             claim_token: token,
             lease_expires_ms: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
         record_attempt_intent(
-            &storage,
+            &context,
             job_id,
             token,
             AttemptIntent {
@@ -614,14 +608,14 @@ mod tests {
         .unwrap();
 
         let runtime = JobsRuntime::new();
-        let reconciler = ComputeReconciler::new(context, Arc::downgrade(&runtime));
+        let reconciler = ComputeReconciler::new(context.clone(), Arc::downgrade(&runtime));
         for sweep in 0..(JOB_MAX_ATTEMPTS + 2) {
-            let lost = read_job_record(&storage, job_id, None)
+            let lost = read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap();
-            reconciler.reconcile_lost_attempt(&storage, lost).await;
-            let after = read_job_record(&storage, job_id, None)
+            reconciler.reconcile_lost_attempt(&context, lost).await;
+            let after = read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap();

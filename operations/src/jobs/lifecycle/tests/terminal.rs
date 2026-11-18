@@ -16,8 +16,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::lifecycle::publish::{publish_state, publish_terminal};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use crate::jobs::lifecycle::updates::{publish_state, publish_terminal};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
@@ -172,7 +172,7 @@ async fn publishes_terminal_success() {
         attempt_epoch: 0,
     };
     let commit = record_attempt_intent(
-        &ctx.storage_handle,
+        &ctx,
         physical(),
         TOKEN,
         intent,
@@ -184,14 +184,9 @@ async fn publishes_terminal_success() {
     .expect("attempt intent commits");
     let executor = family.target.public();
     let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = reserve_output_commits(
-        &ctx.storage_handle,
-        physical(),
-        &destinations,
-        &Default::default(),
-    )
-    .await
-    .expect("output commits reserved");
+    let control = reserve_output_commits(&ctx, physical(), &destinations, &Default::default())
+        .await
+        .expect("output commits reserved");
     let outputs = vec![OutputObject {
         node_id: executor,
         bucket: "ws".to_string(),

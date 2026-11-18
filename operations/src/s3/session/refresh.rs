@@ -9,7 +9,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{PreviousCredential, S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{GroupId, Value};
@@ -175,8 +175,8 @@ impl Operation for RefreshS3Operation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -216,7 +216,10 @@ mod tests {
             panic!("expected the session and index read");
         };
         assert_eq!(reads.len(), 2);
-        assert!(refresh.transaction());
+        assert_eq!(
+            refresh.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let missing = refresh.next(IoResult::Values(vec![None, None]));
         assert_eq!(missing, Err(S3SessionError::NotFound));
         let short = refresh.next(IoResult::Values(vec![None]));

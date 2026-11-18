@@ -249,7 +249,7 @@ pub(crate) async fn bind_upload(
         expires_at_ms: 0,
         ..record.clone()
     };
-    write_rocrate_upload(&context.storage_handle, &losing)
+    write_rocrate_upload(&context, &losing)
         .await
         .map_err(ServerError::ServiceUnavailableReason)?;
     let bound = bound.map_err(import_refused)?;

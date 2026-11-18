@@ -10,10 +10,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::storage_entries::registry_delete_entries;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
+    ImportRoCrateTarget, JobState, LogicalJobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
@@ -24,6 +25,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
+use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
@@ -198,6 +201,84 @@ async fn record_routes_owner() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn holder_admits_submission() -> TestResult<()> {
+    // A holder of the family signs and commits the submission through the node key, and a
+    // retry settles on the same alias. A node that holds nothing cannot admit it here.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let submit = async |node: &TestNode| {
+        submit_external_job(
+            node.context.as_ref(),
+            execution_spec(44),
+            realm.user_id,
+            Some("holder-admission".to_string()),
+            WorkspaceMode::None,
+            None,
+            aruna_operations::jobs::JOB_RETENTION_MS,
+            None,
+        )
+        .await
+    };
+    let mut accepted = None;
+    for node in &realm.nodes {
+        if let Ok(first) = submit(node).await {
+            accepted = Some((node, first));
+            break;
+        }
+    }
+    let (holder, first) = accepted.ok_or("no node admitted the submission")?;
+    assert!(first.created);
+    assert_eq!(first.state, LogicalJobState::Queued);
+    let retried = submit(holder).await?;
+    assert!(!retried.created);
+    assert_eq!(retried.job_id, first.job_id);
+    assert_eq!(retried.state, LogicalJobState::Queued);
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonholder_forwards_submission() -> TestResult<()> {
+    // A node outside the family's holders needs the caller's token and forwards the request;
+    // a holder revalidates it and answers for the same submission.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let mut spec = execution_spec(45);
+    spec.group_id = realm.seed_group().await?;
+    let submit = async |node: &TestNode, token: Option<AuthToken>| {
+        submit_external_job(
+            node.context.as_ref(),
+            spec.clone(),
+            realm.user_id,
+            Some("forwarded-admission".to_string()),
+            WorkspaceMode::None,
+            None,
+            aruna_operations::jobs::JOB_RETENTION_MS,
+            token,
+        )
+        .await
+    };
+    let scope = SubmissionScope::Keyed("forwarded-admission".to_string());
+    let placement = realm
+        .config
+        .family_placement(submission_of(realm.user_id, &scope))?;
+    let holders = resolve_shard_holders(&realm.config, &placement);
+    let relay = realm
+        .nodes
+        .iter()
+        .find(|node| node.is_sync_eligible() && !holders.contains(&node.node_id()))
+        .ok_or("every realm node holds the family")?;
+    let refused = submit(relay, None).await;
+    assert!(matches!(
+        refused,
+        Err(SubmitJobError::PlacementUnavailable(_))
+    ));
+    let forwarded = submit(relay, Some(realm.bearer_token())).await?;
+    assert!(forwarded.created);
+    assert_eq!(forwarded.state, LogicalJobState::Queued);
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn origin_scoped_dedup() -> TestResult<()> {
     // Idempotency is per-origin by contract: a retry through the same origin
     // dedups in its local transaction; a different origin creates its own job.
@@ -256,13 +337,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
     // on their origin, nothing was reserved on any other node.
     let dedup_key = user_dedup_key(realm.user_id, "origin-scoped-retry");
     for (index, node) in realm.nodes.iter().enumerate() {
-        let row = find_dedup_job(
-            &node.context.storage_handle,
-            realm.user_id,
-            &dedup_key,
-            None,
-        )
-        .await?;
+        let row = find_dedup_job(&node.context, realm.user_id, &dedup_key, None).await?;
         match index {
             0 => assert_eq!(row, Some(first.job_id)),
             1 => assert_eq!(row, Some(elsewhere.job_id)),
@@ -302,8 +377,8 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };
-    let storage = &node.context.storage_handle;
-    aruna_operations::jobs::import::upload_store::write_rocrate_upload(storage, &record).await?;
+    aruna_operations::jobs::import::upload_store::write_rocrate_upload(&node.context, &record)
+        .await?;
     Ok(())
 }
 
@@ -393,13 +468,8 @@ async fn owner_claims() -> TestResult<()> {
     .await?;
     let passive = realm.node(1);
 
-    let passive_result = drain_job_batch(
-        &passive.context.storage_handle,
-        passive.node_id(),
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
+    let passive_result =
+        drain_job_batch(&passive.context, passive.node_id(), JOB_BUDGET, None).await?;
     assert!(passive_result.claimed.is_empty());
     assert!(
         read_owned_job(passive.context.as_ref(), realm.user_id, submitted.job_id)
@@ -408,13 +478,8 @@ async fn owner_claims() -> TestResult<()> {
         "a non-owner has nothing to claim"
     );
 
-    let owner_result = drain_job_batch(
-        &ingress.context.storage_handle,
-        ingress.node_id(),
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
+    let owner_result =
+        drain_job_batch(&ingress.context, ingress.node_id(), JOB_BUDGET, None).await?;
     assert_eq!(owner_result.claimed.len(), 1);
     assert_eq!(owner_result.claimed[0].job_id, submitted.job_id);
     assert_eq!(owner_result.claimed[0].owner_node_id, ingress.node_id());
@@ -478,13 +543,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = drain_job_batch(
-            &node.context.storage_handle,
-            node.node_id(),
-            JOB_BUDGET,
-            None,
-        )
-        .await?;
+        let result = drain_job_batch(&node.context, node.node_id(), JOB_BUDGET, None).await?;
         assert!(result.claimed.is_empty(), "a non-owner must never claim");
         assert!(
             read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)
@@ -495,7 +554,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
     }
 
     let owner = realm.find(owner_id);
-    let result = drain_job_batch(&owner.context.storage_handle, owner_id, JOB_BUDGET, None).await?;
+    let result = drain_job_batch(&owner.context, owner_id, JOB_BUDGET, None).await?;
     assert_eq!(
         result.claimed.len(),
         1,
@@ -577,13 +636,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = drain_job_batch(
-            &node.context.storage_handle,
-            node.node_id(),
-            JOB_BUDGET,
-            None,
-        )
-        .await?;
+        let result = drain_job_batch(&node.context, node.node_id(), JOB_BUDGET, None).await?;
         assert!(result.claimed.is_empty(), "no survivor may adopt the job");
         assert!(
             read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)

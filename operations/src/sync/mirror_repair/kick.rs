@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
@@ -27,21 +27,24 @@ impl Operation for KickRepairOperation {
     type Error = SyncMirrorError;
 
     fn first(&mut self) -> Result<Next<()>, SyncMirrorError> {
-        Ok(Next::Call(IoCall::Effect(Effect::Task(
-            TaskEffect::ShortenTimer {
-                key: TaskKey::DrainMirrorRepair,
-                after: Duration::ZERO,
-            },
-        ))))
+        let shorten = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::DrainMirrorRepair,
+            after: Duration::ZERO,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(shorten))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
-        match result {
-            IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. })) => Ok(Next::Done(())),
-            IoResult::Event(Event::Task(TaskEvent::Error { message, .. })) => {
-                Err(SyncMirrorError::Mirror(message))
-            }
-            other => Err(unexpected("TaskEvent::TimerScheduled", &other)),
+        let IoResult::Event(event) = result else {
+            return Err(unexpected("TaskEvent::TimerScheduled", &result));
+        };
+        match *event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(())),
+            Event::Task(TaskEvent::Error { message, .. }) => Err(SyncMirrorError::Mirror(message)),
+            other => Err(SyncMirrorError::Io(IoError::Unexpected {
+                expected: "TaskEvent::TimerScheduled",
+                got: other.label(),
+            })),
         }
     }
 }
@@ -49,7 +52,10 @@ impl Operation for KickRepairOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::calls::IoError;
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
 
     #[test]
     fn shortens_timer() {
@@ -60,14 +66,14 @@ mod tests {
         };
         assert_eq!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Task(shorten))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Task(shorten)))))
         );
         let scheduled = TaskEvent::TimerScheduled {
             key: TaskKey::DrainMirrorRepair,
             after: Duration::ZERO,
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Task(scheduled))),
+            operation.next(event(Event::Task(scheduled))),
             Ok(Next::Done(()))
         );
     }
@@ -79,14 +85,14 @@ mod tests {
             message: "stopped".to_string(),
         };
         assert_eq!(
-            KickRepairOperation::new().next(IoResult::Event(Event::Task(refused))),
+            KickRepairOperation::new().next(event(Event::Task(refused))),
             Err(SyncMirrorError::Mirror("stopped".to_string()))
         );
         let cancelled = TaskEvent::TimerCancelled {
             key: TaskKey::DrainMirrorRepair,
         };
         assert!(matches!(
-            KickRepairOperation::new().next(IoResult::Event(Event::Task(cancelled))),
+            KickRepairOperation::new().next(event(Event::Task(cancelled))),
             Err(SyncMirrorError::Io(IoError::Unexpected { .. }))
         ));
     }

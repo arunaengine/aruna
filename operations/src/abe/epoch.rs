@@ -21,7 +21,7 @@ pub(super) fn parse_progress(value: &[u8]) -> Option<(u64, bool, Vec<u8>)> {
 impl KeyOperation {
     /// Raises the epoch and restarts reissue in one transaction; a due marker written meanwhile
     /// conflicts with it and stays due.
-    pub(super) fn raise(&mut self, instant: bool) -> Effects {
+    pub(super) fn raise(&mut self, instant: bool) -> KeyTurn {
         let Some(snapshot) = &self.snapshot else {
             return self.fail(KeyError::Missing);
         };
@@ -62,7 +62,7 @@ impl KeyOperation {
     }
     /// Node issuance consumes a due raise first while the node can issue: its key is node managed
     /// or unlocked. Otherwise requests wait for a holder, whose run raises first.
-    pub(super) fn due_check(&mut self) -> Effects {
+    pub(super) fn due_check(&mut self) -> KeyTurn {
         if self.managed {
             return self.raise_first();
         }
@@ -71,9 +71,10 @@ impl KeyOperation {
         };
         let bucket_id = snapshot.parameters.key.bucket_id;
         self.state = State::Unlock;
-        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id })]
+        let status = Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id });
+        Ok(Next::Call(IoCall::Effect(Box::new(status))))
     }
-    pub(super) fn raise_first(&mut self) -> Effects {
+    pub(super) fn raise_first(&mut self) -> KeyTurn {
         if let Err(error) = self.raised() {
             return self.fail(error);
         }

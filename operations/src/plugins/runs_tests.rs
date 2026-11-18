@@ -328,7 +328,7 @@ fn admission_bound() {
         panic!("an admission counts the install's queue");
     };
     assert_eq!(
-        (space, prefix),
+        (space.as_str(), prefix.to_vec()),
         (PLUGIN_QUEUE_KEYSPACE, install.to_bytes().to_vec())
     );
     let rows = admission
@@ -411,6 +411,10 @@ fn resolve_decisions() {
     let Next::Call(IoCall::Delete(keys)) = plan.next(IoResult::Done).unwrap() else {
         panic!("an ended run leaves the queue");
     };
+    let keys: Vec<_> = keys
+        .iter()
+        .map(|(space, key)| (space.as_str(), key.to_vec()))
+        .collect();
     assert_eq!(
         keys,
         [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]

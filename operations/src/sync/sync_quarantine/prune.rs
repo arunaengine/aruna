@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::SYNC_QUARANTINE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use aruna_core::structs::{SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -116,8 +116,8 @@ impl Operation for PruneQuarantineOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -147,7 +147,10 @@ mod tests {
 
     fn scanning() -> PruneQuarantineOperation {
         let mut operation = PruneQuarantineOperation::new(QuarantinePageRequest::default());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(
             operation.first(),
             Ok(Next::Call(page_call(&QuarantinePageRequest::default())))

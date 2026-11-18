@@ -4,12 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,18 +20,12 @@ pub enum VersionKeyError {
     Transport(String),
     #[error("the member sent an unexpected answer")]
     Unexpected,
-    #[error("the version key lookup was aborted")]
-    Aborted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum KeyState {
-    Open,
-    Send,
-    Read,
-    Close,
-    Finish,
-    Error,
+impl From<IoError> for VersionKeyError {
+    fn from(error: IoError) -> Self {
+        Self::Transport(error.to_string())
+    }
 }
 
 /// What a member answered.
@@ -47,14 +40,19 @@ pub enum MemberAnswer {
     },
 }
 
-/// One lookup at `node_id`.
+/// One lookup at `node_id`. A run that fails with the connection open closes it on abort.
 #[derive(Debug, PartialEq)]
 pub struct VersionKeyOperation {
     node_id: NodeId,
     message: VersionReplicationMessage,
+    /// The open connection, until its close is asked for.
     stream_id: Option<Ulid>,
-    state: KeyState,
-    output: Option<Result<MemberAnswer, VersionKeyError>>,
+    sent: bool,
+    answer: Option<MemberAnswer>,
+}
+
+fn blob(effect: BlobEffect) -> Next<MemberAnswer> {
+    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
 }
 
 impl VersionKeyOperation {
@@ -67,8 +65,8 @@ impl VersionKeyOperation {
                 version_id,
             },
             stream_id: None,
-            state: KeyState::Open,
-            output: None,
+            sent: false,
+            answer: None,
         }
     }
 
@@ -84,93 +82,71 @@ impl VersionKeyOperation {
         }
     }
 
-    fn fail(&mut self, error: VersionKeyError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = KeyState::Error;
-        match self.stream_id.take() {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
+    /// The member's answer to this lookup's request, if it is one.
+    fn answer(&self, payload: &[u8]) -> Option<MemberAnswer> {
+        match (&self.message, VersionReplicationMessage::from_bytes(payload)) {
+            (
+                VersionReplicationMessage::VersionKeyRequest { .. },
+                Ok(VersionReplicationMessage::VersionKeyResponse(key)),
+            ) => Some(MemberAnswer::Key(key)),
+            (
+                VersionReplicationMessage::ContentRequest { .. },
+                Ok(VersionReplicationMessage::ContentResponse { versions, more }),
+            ) => Some(MemberAnswer::Versions { versions, more }),
+            _ => None,
         }
     }
 }
 
-impl EffectOperation for VersionKeyOperation {
+impl Operation for VersionKeyOperation {
     type Output = MemberAnswer;
     type Error = VersionKeyError;
 
-    fn start(&mut self) -> Effects {
-        self.state = KeyState::Open;
-        smallvec![Effect::Blob(BlobEffect::OpenConnection {
+    fn first(&mut self) -> Result<Next<MemberAnswer>, VersionKeyError> {
+        Ok(blob(BlobEffect::OpenConnection {
             node_id: self.node_id,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::Error(error)) = &event {
-            return self.fail(VersionKeyError::Transport(error.to_string()));
-        }
-        match (self.state, event) {
-            (KeyState::Open, Event::Blob(BlobEvent::ConnectionEstablished { stream_id })) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<MemberAnswer>, VersionKeyError> {
+        let event = match result.event()? {
+            Event::Blob(BlobEvent::Error(error)) => {
+                return Err(VersionKeyError::Transport(error.to_string()));
+            }
+            Event::Blob(event) => event,
+            _ => return Err(VersionKeyError::Unexpected),
+        };
+        let ours = |stream_id: Ulid| Some(stream_id) == self.stream_id;
+        match event {
+            BlobEvent::ConnectionEstablished { stream_id } if self.stream_id.is_none() => {
                 self.stream_id = Some(stream_id);
-                let Ok(payload) = self.message.to_bytes() else {
-                    return self.fail(VersionKeyError::Unexpected);
-                };
-                self.state = KeyState::Send;
-                smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+                let payload = (self.message.to_bytes()).map_err(|_| VersionKeyError::Unexpected)?;
+                Ok(blob(BlobEffect::SendMessage { stream_id, payload }))
             }
-            (KeyState::Send, Event::Blob(BlobEvent::MessageSent { stream_id }))
-                if Some(stream_id) == self.stream_id =>
-            {
-                self.state = KeyState::Read;
-                smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
+            BlobEvent::MessageSent { stream_id } if ours(stream_id) && !self.sent => {
+                self.sent = true;
+                Ok(blob(BlobEffect::ReadMessage { stream_id }))
             }
-            (KeyState::Read, Event::Blob(BlobEvent::MessageReceived { stream_id, payload }))
-                if Some(stream_id) == self.stream_id =>
-            {
-                let answer = match (
-                    &self.message,
-                    VersionReplicationMessage::from_bytes(&payload),
-                ) {
-                    (
-                        VersionReplicationMessage::VersionKeyRequest { .. },
-                        Ok(VersionReplicationMessage::VersionKeyResponse(key)),
-                    ) => MemberAnswer::Key(key),
-                    (
-                        VersionReplicationMessage::ContentRequest { .. },
-                        Ok(VersionReplicationMessage::ContentResponse { versions, more }),
-                    ) => MemberAnswer::Versions { versions, more },
-                    _ => return self.fail(VersionKeyError::Unexpected),
-                };
-                self.output = Some(Ok(answer));
-                self.state = KeyState::Close;
-                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+            BlobEvent::MessageReceived { stream_id, payload } if ours(stream_id) && self.sent => {
+                self.answer = Some(self.answer(&payload).ok_or(VersionKeyError::Unexpected)?);
+                self.stream_id = None;
+                Ok(blob(BlobEffect::CloseConnection { stream_id }))
             }
-            (KeyState::Close, Event::Blob(BlobEvent::ConnectionClosed { stream_id }))
-                if Some(stream_id) == self.stream_id =>
-            {
-                self.state = KeyState::Finish;
-                smallvec![]
+            BlobEvent::ConnectionClosed { .. } if self.stream_id.is_none() => {
+                self.answer.take().map(Next::Done).ok_or(VersionKeyError::Unexpected)
             }
-            (KeyState::Finish | KeyState::Error, _) => smallvec![],
-            _ => self.fail(VersionKeyError::Unexpected),
+            _ => Err(VersionKeyError::Unexpected),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, KeyState::Finish | KeyState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(VersionKeyError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.output.get_or_insert(Err(VersionKeyError::Aborted));
-        self.state = KeyState::Error;
-        match self.stream_id.take() {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
-        }
+    fn abort(&mut self) -> Vec<IoCall> {
+        (self.stream_id.take())
+            .map(|stream_id| {
+                let close = BlobEffect::CloseConnection { stream_id };
+                IoCall::Effect(Box::new(Effect::Blob(close)))
+            })
+            .into_iter()
+            .collect()
     }
 }
 
@@ -178,29 +154,39 @@ impl EffectOperation for VersionKeyOperation {
 mod tests {
     use super::*;
 
-    fn operation() -> VersionKeyOperation {
-        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
-        let set = Ulid::from_bytes([2; 16]);
-        VersionKeyOperation::new(
-            node,
-            RealmId::from_bytes([3; 32]),
-            set,
-            Ulid::from_bytes([4; 16]),
-        )
+    const STREAM: Ulid = Ulid::from_bytes([5; 16]);
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
-    fn answered(payload: Vec<u8>) -> VersionKeyOperation {
-        let stream_id = Ulid::from_bytes([5; 16]);
-        let mut operation = operation();
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageReceived {
-            stream_id,
+    fn operation() -> VersionKeyOperation {
+        let set = Ulid::from_bytes([2; 16]);
+        VersionKeyOperation::new(node(), RealmId::from_bytes([3; 32]), set, Ulid::from_bytes([4; 16]))
+    }
+
+    fn event(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    /// Runs the lookup through a member answering `payload`.
+    fn ask(
+        mut operation: VersionKeyOperation,
+        payload: Vec<u8>,
+    ) -> Result<MemberAnswer, VersionKeyError> {
+        operation.first()?;
+        operation.next(event(BlobEvent::ConnectionEstablished { stream_id: STREAM }))?;
+        operation.next(event(BlobEvent::MessageSent { stream_id: STREAM }))?;
+        let received = BlobEvent::MessageReceived {
+            stream_id: STREAM,
             payload,
-        }));
-        operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-        operation
+        };
+        let close = operation.next(event(received))?;
+        assert_eq!(close, blob(BlobEffect::CloseConnection { stream_id: STREAM }));
+        match operation.next(event(BlobEvent::ConnectionClosed { stream_id: STREAM }))? {
+            Next::Done(answer) => Ok(answer),
+            other => panic!("expected the answer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -208,10 +194,8 @@ mod tests {
         let payload = VersionReplicationMessage::VersionKeyResponse(Some("a/b".to_string()))
             .to_bytes()
             .unwrap();
-        let operation = answered(payload);
-        assert!(operation.is_complete());
         assert_eq!(
-            operation.finalize(),
+            ask(operation(), payload),
             Ok(MemberAnswer::Key(Some("a/b".to_string())))
         );
     }
@@ -221,45 +205,57 @@ mod tests {
         let payload = VersionReplicationMessage::LocationSummaryDenied
             .to_bytes()
             .unwrap();
-        assert_eq!(
-            answered(payload).finalize(),
-            Err(VersionKeyError::Unexpected)
-        );
+        let mut lookup = operation();
+        lookup.first().unwrap();
+        lookup
+            .next(event(BlobEvent::ConnectionEstablished { stream_id: STREAM }))
+            .unwrap();
+        lookup
+            .next(event(BlobEvent::MessageSent { stream_id: STREAM }))
+            .unwrap();
+        let received = BlobEvent::MessageReceived {
+            stream_id: STREAM,
+            payload,
+        };
+        assert_eq!(lookup.next(event(received)), Err(VersionKeyError::Unexpected));
+        // The failed run closes the open connection on abort.
+        let close = BlobEffect::CloseConnection { stream_id: STREAM };
+        let close = IoCall::Effect(Box::new(Effect::Blob(close)));
+        assert_eq!(lookup.abort(), vec![close]);
+        assert!(lookup.abort().is_empty());
     }
 
     #[test]
     fn content_needs_answer() {
-        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let realm = RealmId::from_bytes([3; 32]);
-        let stream_id = Ulid::from_bytes([5; 16]);
-        let ask = |payload: Vec<u8>| {
-            let mut operation =
-                VersionKeyOperation::content(node, realm, Ulid::from_bytes([2; 16]), [7; 32]);
-            operation.start();
-            operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-            operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-            operation.step(Event::Blob(BlobEvent::MessageReceived {
-                stream_id,
-                payload,
-            }));
-            operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-            operation.finalize()
-        };
+        let content = || VersionKeyOperation::content(node(), realm, Ulid::from_bytes([2; 16]), [7; 32]);
         let versions = vec![(Ulid::from_bytes([4; 16]), "a".to_string())];
         let answer = VersionReplicationMessage::ContentResponse {
             versions: versions.clone(),
             more: false,
         };
         assert_eq!(
-            ask(answer.to_bytes().unwrap()),
+            ask(content(), answer.to_bytes().unwrap()),
             Ok(MemberAnswer::Versions {
                 versions,
                 more: false
             })
         );
         let key = VersionReplicationMessage::VersionKeyResponse(None);
+        let mut lookup = content();
+        lookup.first().unwrap();
+        lookup
+            .next(event(BlobEvent::ConnectionEstablished { stream_id: STREAM }))
+            .unwrap();
+        lookup
+            .next(event(BlobEvent::MessageSent { stream_id: STREAM }))
+            .unwrap();
+        let received = BlobEvent::MessageReceived {
+            stream_id: STREAM,
+            payload: key.to_bytes().unwrap(),
+        };
         assert_eq!(
-            ask(key.to_bytes().unwrap()),
+            lookup.next(event(received)),
             Err(VersionKeyError::Unexpected),
             "a key answer never stands for a content answer"
         );
@@ -268,14 +264,14 @@ mod tests {
     #[test]
     fn foreign_stream_fails() {
         // An event of another stream is never taken for this lookup's answer.
-        let mut operation = operation();
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished {
-            stream_id: Ulid::from_bytes([5; 16]),
-        }));
-        operation.step(Event::Blob(BlobEvent::MessageSent {
+        let mut lookup = operation();
+        lookup.first().unwrap();
+        lookup
+            .next(event(BlobEvent::ConnectionEstablished { stream_id: STREAM }))
+            .unwrap();
+        let foreign = BlobEvent::MessageSent {
             stream_id: Ulid::from_bytes([6; 16]),
-        }));
-        assert_eq!(operation.finalize(), Err(VersionKeyError::Unexpected));
+        };
+        assert_eq!(lookup.next(event(foreign)), Err(VersionKeyError::Unexpected));
     }
 }

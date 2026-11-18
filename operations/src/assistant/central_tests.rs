@@ -51,7 +51,10 @@ fn usage_value(usage: Option<AssistantUsage>) -> IoResult {
 #[test]
 fn sets_when_unchanged() {
     let mut operation = SetCentralOperation::new(Some(central("Realm")), None);
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert_eq!(
         operation.first().unwrap(),
         Next::Call(IoCall::Read(vec![central_row()]))
@@ -87,7 +90,7 @@ fn wrong_result_fails() {
     operation.first().unwrap();
     assert!(matches!(
         operation.next(IoResult::Done),
-        Err(CentralStoreError::Io(IoError::Unexpected { .. }))
+        Err(CentralStoreError::Storage(StorageError::ReadError(_)))
     ));
 }
 
@@ -95,7 +98,10 @@ fn wrong_result_fails() {
 fn charge_writes_count() {
     let today = utc_day(86_400 * 3 + 5);
     let mut operation = ChargeUsageOperation::new(user(), today, Some(2));
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     operation.first().unwrap();
     let next = operation.next(usage_value(Some(AssistantUsage {
         day: today,

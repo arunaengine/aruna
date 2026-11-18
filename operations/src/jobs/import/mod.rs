@@ -410,7 +410,7 @@ async fn acquire_source(
         }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = claim_rocrate_upload(
-                &ctx.driver.storage_handle,
+                &ctx.driver,
                 *upload_id,
                 spec.auth_context.user_id,
                 ctx.job_id,
@@ -1312,7 +1312,7 @@ async fn cleanup_source(
             .await
             .map_err(ImportFailure::Retryable)?;
         if let Some(upload_id) = input.upload_id {
-            delete_rocrate_upload(&ctx.driver.storage_handle, upload_id, ctx.job_id)
+            delete_rocrate_upload(&ctx.driver, upload_id, ctx.job_id)
                 .await
                 .map_err(ImportFailure::Retryable)?;
         }
@@ -1822,15 +1822,9 @@ async fn put_report(
     entry_key: &[u8],
     row: &ImportReportRow,
 ) -> Result<(), ImportFailure> {
-    put_job_entry(
-        &ctx.driver.storage_handle,
-        ctx.job_id,
-        ctx.claim_token,
-        entry_key,
-        row,
-    )
-    .await
-    .map_err(|error| ImportFailure::Retryable(error.to_string()))
+    put_job_entry(&ctx.driver, ctx.job_id, ctx.claim_token, entry_key, row)
+        .await
+        .map_err(|error| ImportFailure::Retryable(error.to_string()))
 }
 
 fn system_report_key(entry_key: &str) -> Vec<u8> {
@@ -1892,7 +1886,7 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
     let mut rows = HashMap::new();
     let mut cursor = None;
     loop {
-        let (page, next) = list_job_entries(&ctx.driver.storage_handle, ctx.job_id, cursor, 512)
+        let (page, next) = list_job_entries(&ctx.driver, ctx.job_id, cursor, 512)
             .await
             .map_err(ImportFailure::Retryable)?;
         for (entry_key, value) in page {
@@ -1912,7 +1906,7 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
     read_state(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         JOB_STATE_KEYSPACE,
         ByteView::from(ctx.job_id.to_bytes().to_vec()),
         "import checkpoint",
@@ -1922,7 +1916,7 @@ async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, S
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
     read_state(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         JOB_STATE_KEYSPACE,
         rocrate_plan_key(ctx.job_id),
         "import plan",
@@ -1932,7 +1926,7 @@ async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
 
 async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String> {
     put_state(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         ctx.job_id,
         ctx.claim_token,
         JOB_STATE_KEYSPACE,

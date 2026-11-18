@@ -652,12 +652,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::{
         NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
-        S3_BUCKET_KEYSPACE,
     };
     use aruna_core::plugin_runs::{SourceEvent, SourceKind};
     use aruna_core::structs::{SyncMode, SyncRelationship, SyncState};
     use aruna_storage::StorageHandle;
-    use tracing::info;
 
     use super::super::drain::{
         REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor, job_source_auth,
@@ -698,10 +696,9 @@ mod tests {
     use super::super::obligations::{
         OBLIGATION_BATCH_SIZE, REPLICATION_JOB_LIMIT, REPLICATION_RELATIONSHIP_LIMIT,
         delete_live_obligation, process_live_obligations, read_relationships_limit,
-        retire_obligations, write_live_jobs, write_live_obligation,
+        retire_obligations, write_live_jobs,
     };
     use super::super::version_replication::SourceAuthorizationError;
-    use crate::plugins::store::Txn;
     use crate::sync::mirror_repair::StoreStatusOperation;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
@@ -3107,7 +3104,7 @@ mod tests {
             ..Default::default()
         });
         for record in [obligation("fresh"), continued.clone()] {
-            super::write_live_obligation(&storage, &record)
+            super::super::obligations::write_live_obligation(&storage, &record)
                 .await
                 .unwrap();
         }
@@ -3173,7 +3170,7 @@ mod tests {
             relationship_id: Ulid::from(9u128),
             hop_count: 4,
         }));
-        super::write_live_obligation(&storage, &record)
+        super::super::obligations::write_live_obligation(&storage, &record)
             .await
             .expect("obligation persists");
 
@@ -3198,7 +3195,7 @@ mod tests {
             false,
         );
         record.continuation = Some(LiveReplicationContinuation::default());
-        super::write_live_obligation(&storage, &record)
+        super::super::obligations::write_live_obligation(&storage, &record)
             .await
             .expect("obligation persists");
         let key = live_obligation_key(&record)
@@ -3241,7 +3238,7 @@ mod tests {
             relationships_complete: false,
             members_done: false,
         });
-        super::write_live_obligation(&storage, &record)
+        super::super::obligations::write_live_obligation(&storage, &record)
             .await
             .expect("obligation persists");
         let mut stale = record.clone();
@@ -3251,7 +3248,7 @@ mod tests {
             members_done: false,
         });
 
-        super::write_live_obligation(&storage, &stale)
+        super::super::obligations::write_live_obligation(&storage, &stale)
             .await
             .expect("stale write is a no-op");
 

@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -125,8 +125,8 @@ impl Operation for StoreProgressOperation {
         self.stored(result.value()?)
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -217,7 +217,10 @@ mod tests {
         let mut operation = operation(false, None);
         let read = vec![(LINKED_JOB_KEYSPACE.to_string(), b"bucket".to_vec().into())];
         assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let answer = operation.next(stored(Some(job(1, LinkedState::Running))));
         assert_eq!(answer, Ok(write(progressed(LinkedState::Running))));
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));

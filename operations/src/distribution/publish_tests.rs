@@ -134,9 +134,40 @@ fn signed_reply(effects: &Effects) -> Event {
     ))))
 }
 
+/// The rows of the admin check: the realm and the owner group's authorization documents. The
+/// caller administers the group only when `allowed`.
 fn authorized(allowed: bool) -> Event {
-    Event::SubOperation(SubOperationEvent::AuthorizationResult {
-        allowed: Ok(allowed),
+    use aruna_core::structs::identity::auth::Role;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use std::collections::{HashMap, HashSet};
+    let actor = Actor {
+        node_id: secret(PUBLISHER).public(),
+        user_id: auth().user_id,
+        realm_id: realm(),
+    };
+    let group_id = root().owner_group;
+    let admin = Role {
+        role_id: Ulid::from_bytes([91; 16]),
+        name: "admin".to_string(),
+        permissions: HashMap::from([(format!("/{}/g/{group_id}/**", realm()), Permission::WRITE)]),
+        assigned_users: allowed
+            .then_some(auth().user_id)
+            .into_iter()
+            .collect::<HashSet<_>>(),
+    };
+    let group = GroupAuthorizationDocument {
+        group_id,
+        roles: HashMap::from([(admin.role_id, admin)]),
+        policies: Vec::new(),
+    };
+    let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm());
+    let row = |bytes: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(bytes)));
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            row(realm_doc.to_bytes(&actor).unwrap()),
+            row(group.to_bytes(&actor).unwrap()),
+        ],
     })
 }
 
@@ -144,7 +175,13 @@ fn authorized(allowed: bool) -> Event {
 fn head_outbox_atomic() {
     let mut operation = operation(PUBLISHER, create());
     let effects = begin(&mut operation, [None, None, Some(config_value()), None]);
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead {
+            txn_id: Some(_),
+            ..
+        })]
+    ));
     let effects = operation.step(authorized(true));
     let effects = operation.step(signed_reply(&effects));
     let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
@@ -321,7 +358,13 @@ fn repeated_activation_answers() {
         None,
     ];
     let effects = begin(&mut operation, values);
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead {
+            txn_id: Some(_),
+            ..
+        })]
+    ));
     let effects = operation.step(authorized(true));
     assert!(matches!(
         effects.as_slice(),

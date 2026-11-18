@@ -3,29 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::s3::listing::{ListMarker, build_page, retain_after_marker};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListUploadsState {
-    Init,
-    StartTransaction,
-    ReadUploads,
-    CommitTransaction,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListUploadsError {
@@ -35,19 +22,20 @@ pub enum ListUploadsError {
     ConversionError(#[from] ConversionError),
     #[error("multipart upload scan budget exhausted")]
     ScanBudgetExceeded,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: ListUploadsState,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
-    #[error("ListMultipartUploads failed")]
-    ListUploadsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("ListMultipartUploads failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for ListUploadsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<ListUploadsResult>, ListUploadsError>;
 
 #[derive(Debug, PartialEq)]
 pub struct ListUploadsInput {
@@ -71,15 +59,12 @@ pub struct ListUploadsResult {
 #[derive(Debug, PartialEq)]
 pub struct ListUploadsOperation {
     input: ListUploadsInput,
-    state: ListUploadsState,
-    txn_id: Option<Ulid>,
     uploads: Vec<MultipartUpload>,
     scan_cursor: Option<Key>,
     scan_rows: usize,
     scan_round_limit: usize,
     max_scan_rows: usize,
     include_in_progress: bool,
-    output: Option<Result<ListUploadsResult, ListUploadsError>>,
 }
 
 impl ListUploadsOperation {
@@ -90,15 +75,12 @@ impl ListUploadsOperation {
     pub fn new(input: ListUploadsInput) -> Self {
         Self {
             input,
-            state: ListUploadsState::Init,
-            txn_id: None,
             uploads: Vec::new(),
             scan_cursor: None,
             scan_rows: 0,
             scan_round_limit: Self::SCAN_ROUND_LIMIT,
             max_scan_rows: Self::MAX_SCAN_ROWS,
             include_in_progress: false,
-            output: None,
         }
     }
 
@@ -128,61 +110,17 @@ impl ListUploadsOperation {
         self
     }
 
-    fn emit_error(&mut self, error: ListUploadsError) -> Effects {
-        self.state = ListUploadsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        // Mirror the key listings: max_uploads=0 returns an empty,
-        // non-truncated result instead of truncating without a resume marker.
-        if self.input.max_uploads == 0 {
-            self.state = ListUploadsState::Finish;
-            self.output = Some(Ok(ListUploadsResult {
-                uploads: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_key_marker: None,
-                next_upload_marker: None,
-            }));
-            return smallvec![];
-        }
-
-        self.state = ListUploadsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event.label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        self.issue_upload_round()
-    }
-
-    fn issue_upload_round(&mut self) -> Effects {
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
-        };
+    fn upload_round(&mut self) -> Step {
+        let remaining = self.max_scan_rows.saturating_sub(self.scan_rows);
         if remaining == 0 {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
-        self.state = ListUploadsState::ReadUploads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.scan_cursor.take().map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: UPLOAD_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.scan_cursor.take(),
             limit: self.scan_round_limit.min(remaining),
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
     fn prefix(&self) -> Option<&str> {
@@ -192,32 +130,15 @@ impl ListUploadsOperation {
             .filter(|prefix| !prefix.is_empty())
     }
 
-    fn handle_uploads_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event.label(),
-            });
-        };
-
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
-        };
+    fn uploads_read(&mut self, values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Step {
+        let remaining = self.max_scan_rows.saturating_sub(self.scan_rows);
         if values.len() > remaining {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
         self.scan_rows += values.len();
 
         for (_key, value) in values {
-            let record = match MultipartUpload::from_bytes(value.as_ref()) {
-                Ok(record) => record,
-                Err(err) => return self.emit_error(err.into()),
-            };
+            let record = MultipartUpload::from_bytes(value.as_ref())?;
             if record.bucket != self.input.bucket
                 || (!self.include_in_progress && record.status != MultipartUploadStatus::Open)
             {
@@ -235,17 +156,17 @@ impl ListUploadsOperation {
         self.uploads = uploads;
 
         if next_start_after.is_none() {
-            return self.finish_upload_scan();
+            return Ok(self.finish_upload_scan());
         }
         if self.scan_rows >= self.max_scan_rows {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
 
         self.scan_cursor = next_start_after;
-        self.issue_upload_round()
+        self.upload_round()
     }
 
-    fn finish_upload_scan(&mut self) -> Effects {
+    fn finish_upload_scan(&mut self) -> Next<ListUploadsResult> {
         let mut uploads = std::mem::take(&mut self.uploads);
         uploads.sort_by(|left, right| {
             left.key
@@ -270,11 +191,7 @@ impl ListUploadsOperation {
         );
     }
 
-    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListUploadsError::NoTransactionFound);
-        };
-
+    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Next<ListUploadsResult> {
         let page = build_page(
             &uploads,
             self.input.max_uploads,
@@ -291,70 +208,43 @@ impl ListUploadsOperation {
             None => (None, None),
         };
 
-        self.state = ListUploadsState::CommitTransaction;
-        self.output = Some(Ok(ListUploadsResult {
+        Next::Done(ListUploadsResult {
             uploads: page.entries,
             common_prefixes: page.prefixes,
             is_truncated: page.truncated,
             next_key_marker,
             next_upload_marker,
-        }));
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event.label(),
-            });
-        };
-
-        self.state = ListUploadsState::Finish;
-        smallvec![]
+        })
     }
 }
 
-impl EffectOperation for ListUploadsOperation {
+impl Operation for ListUploadsOperation {
     type Output = ListUploadsResult;
     type Error = ListUploadsError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListUploadsError::StorageError(error));
+    fn first(&mut self) -> Step {
+        // Mirror the key listings: max_uploads=0 returns an empty,
+        // non-truncated result instead of truncating without a resume marker.
+        if self.input.max_uploads == 0 {
+            return Ok(Next::Done(ListUploadsResult {
+                uploads: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_upload_marker: None,
+            }));
         }
-
-        match self.state {
-            ListUploadsState::Init => self.handle_init(),
-            ListUploadsState::StartTransaction => self.handle_transaction_started(event),
-            ListUploadsState::ReadUploads => self.handle_uploads_read(event),
-            ListUploadsState::CommitTransaction => self.handle_transaction_committed(event),
-            ListUploadsState::Finish | ListUploadsState::Error => smallvec![],
-        }
+        self.upload_round()
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListUploadsState::Finish | ListUploadsState::Error
-        )
+    fn next(&mut self, result: IoResult) -> Step {
+        let (values, next) = result.page()?;
+        self.uploads_read(values, next)
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListUploadsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    /// The upload pages are read in one snapshot, so a state change between pages never shows.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 

@@ -6,15 +6,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
@@ -27,10 +28,9 @@ use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
@@ -163,64 +163,48 @@ pub enum SubmitJobError {
     RangeMoving(ulid::Ulid),
 }
 
+impl From<IoError> for SubmitJobError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::UnexpectedEvent(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SubmitState {
-    Init,
-    StartTransaction,
-    GroupFence {
-        txn_id: TxnId,
-    },
-    ReadDedup {
-        txn_id: TxnId,
-    },
+    Start,
+    GroupFence,
+    ReadDedup,
     VerifyDedup {
-        txn_id: TxnId,
         job_id: JobId,
         digest_matches: bool,
     },
-    CheckActive {
-        txn_id: TxnId,
-    },
-    ClaimUpload {
-        txn_id: TxnId,
-    },
+    CheckActive,
+    ClaimUpload,
     /// Reads the rule of a backend import run, then the run it last started.
-    ReadImport {
-        txn_id: TxnId,
-    },
-    CheckImportRun {
-        txn_id: TxnId,
-    },
+    ReadImport,
+    CheckImportRun,
     /// Reads a harvest source, then the run it last started.
-    ReadSource {
-        txn_id: TxnId,
-    },
-    CheckSourceRun {
-        txn_id: TxnId,
-    },
+    ReadSource,
+    CheckSourceRun,
     /// Reads the destination of a staging job, then the record of its distributed set.
-    ReadBucket {
-        txn_id: TxnId,
-    },
+    ReadBucket,
     ReadRecord {
-        txn_id: TxnId,
         set_id: ulid::Ulid,
         member_id: ulid::Ulid,
     },
-    WriteJob {
-        txn_id: Option<TxnId>,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-    },
-    ScheduleDrain,
-    Finish,
-    Error,
+    WriteJob,
 }
 
-/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the
+type Step = Result<Next<SubmitJobResult>, SubmitJobError>;
+
+/// Call-driven submit; a live `job_dedup_index` entry short-circuits to the
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
 /// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
+/// Every check reads in the write transaction the job row commits in.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -238,7 +222,6 @@ pub struct SubmitJobOperation {
     staging_checked: bool,
     active_cap: Option<u32>,
     state: SubmitState,
-    output: Option<Result<SubmitJobResult, SubmitJobError>>,
 }
 
 impl SubmitJobOperation {
@@ -283,197 +266,107 @@ impl SubmitJobOperation {
             source_claim: None,
             staging_checked: false,
             active_cap,
-            state: SubmitState::Init,
-            output: None,
+            state: SubmitState::Start,
         }
     }
 
-    fn fail(&mut self, error: SubmitJobError) -> Effects {
-        let txn_id = match self.state {
-            SubmitState::GroupFence { txn_id } => Some(txn_id),
-            SubmitState::ReadDedup { txn_id }
-            | SubmitState::VerifyDedup { txn_id, .. }
-            | SubmitState::CheckActive { txn_id }
-            | SubmitState::ClaimUpload { txn_id }
-            | SubmitState::ReadImport { txn_id }
-            | SubmitState::CheckImportRun { txn_id }
-            | SubmitState::ReadSource { txn_id }
-            | SubmitState::CheckSourceRun { txn_id }
-            | SubmitState::ReadBucket { txn_id }
-            | SubmitState::ReadRecord { txn_id, .. }
-            | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
-            SubmitState::WriteJob { txn_id } => txn_id,
-            _ => None,
-        };
-        self.state = SubmitState::Error;
-        self.output = Some(Err(error));
-        txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
-    }
-
-    fn start_transaction(&mut self) -> Effects {
-        self.group_checked = false;
-        self.upload_checked = false;
-        self.upload_claim = None;
-        self.import_checked = false;
-        self.import_rule = None;
-        self.import_claim = None;
-        self.source_checked = false;
-        self.harvest_source = None;
-        self.source_claim = None;
-        self.staging_checked = false;
-        self.state = SubmitState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn begin(&mut self) -> Effects {
-        if self.record.dedup_key.is_some()
+    /// Whether a check reads before the job is written, so the job commits with what it read.
+    fn checks(&self) -> bool {
+        self.record.dedup_key.is_some()
             || self.active_cap.is_some()
             || self.record.payload.owner_group().is_some()
-        {
-            self.start_transaction()
-        } else {
-            self.write_job(None)
-        }
+            || self.upload().is_some()
+            || matches!(
+                self.record.payload,
+                JobPayload::BackendImport(_) | JobPayload::Harvest(_) | JobPayload::Staging(_)
+            )
     }
 
-    fn read_dedup(&mut self, txn_id: TxnId) -> Effects {
+    /// Reads one row in the next state.
+    fn read(&mut self, state: SubmitState, key_space: &str, key: Key) -> Step {
+        self.state = state;
+        Ok(Next::Call(IoCall::Read(vec![(key_space.to_string(), key)])))
+    }
+
+    fn read_dedup(&mut self) -> Step {
         let Some(dedup_key) = self.record.dedup_key.clone() else {
-            return self.check_active(txn_id);
+            return self.check_active();
         };
-        self.state = SubmitState::ReadDedup { txn_id };
         // Must use the same index-key builder `job_insert_entries` uses, which decides
         // owner prefixing per key, or the reservation read misses its own row.
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: DEDUP_INDEX_KEYSPACE.to_string(),
-            key: dedup_index_key(self.record.created_by, &dedup_key),
-            txn_id: Some(txn_id),
-        })]
+        let key = dedup_index_key(self.record.created_by, &dedup_key);
+        self.read(SubmitState::ReadDedup, DEDUP_INDEX_KEYSPACE, key)
     }
 
-    fn check_active(&mut self, txn_id: TxnId) -> Effects {
+    fn check_active(&mut self) -> Step {
         let Some(limit) = self.active_cap else {
-            return self.write_job(Some(txn_id));
+            return self.write_job();
         };
         // Only the kinds that hold a slot can be counted against one.
         let Some(kind) = ActiveJobKind::of(&self.record.payload) else {
-            return self.write_job(Some(txn_id));
+            return self.write_job();
         };
-        self.state = SubmitState::CheckActive { txn_id };
         if limit == 0 {
-            return self.fail(SubmitJobError::ActiveJobLimit { limit });
+            return Err(SubmitJobError::ActiveJobLimit { limit });
         }
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ACTIVE_USER_KEYSPACE.to_string(),
-            prefix: Some(job_active_prefix(self.record.created_by, kind)),
-            start: None,
+        self.state = SubmitState::CheckActive;
+        Ok(Next::Call(IoCall::Page {
+            space: ACTIVE_USER_KEYSPACE.to_string(),
+            prefix: job_active_prefix(self.record.created_by, kind),
+            after: None,
             limit: limit as usize,
-            txn_id: Some(txn_id),
-        })]
+        }))
     }
 
-    fn verify_dedup(&mut self, txn_id: TxnId, job_id: JobId, digest_matches: bool) -> Effects {
-        self.state = SubmitState::VerifyDedup {
-            txn_id,
+    fn verify_dedup(&mut self, job_id: JobId, digest_matches: bool) -> Step {
+        let state = SubmitState::VerifyDedup {
             job_id,
             digest_matches,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_KEYSPACE.to_string(),
-            key: job_record_key(job_id),
-            txn_id: Some(txn_id),
-        })]
+        self.read(state, JOB_KEYSPACE, job_record_key(job_id))
     }
 
-    fn write_job(&mut self, txn_id: Option<TxnId>) -> Effects {
+    fn write_job(&mut self) -> Step {
         if !self.group_checked
             && let Some(group_id) = self.record.payload.owner_group()
         {
-            let Some(txn_id) = txn_id else {
-                return self.start_transaction();
-            };
-            self.state = SubmitState::GroupFence { txn_id };
             let (key_space, key) = crate::groups::fence::group_fence_key(group_id);
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space,
-                key,
-                txn_id: Some(txn_id)
-            })];
+            return self.read(SubmitState::GroupFence, &key_space, key);
         }
         // An upload-backed import claims its upload with the job, so it keeps it across expiry.
         if !self.upload_checked
             && let Some(upload_id) = self.upload()
         {
-            let Some(txn_id) = txn_id else {
-                return self.start_transaction();
-            };
-            self.state = SubmitState::ClaimUpload { txn_id };
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-                key: upload_key(upload_id),
-                txn_id: Some(txn_id),
-            })];
+            let key = upload_key(upload_id);
+            return self.read(SubmitState::ClaimUpload, ROCRATE_UPLOAD_KEYSPACE, key);
         }
         // A rule records its run with the job, so two starts never both pass the check.
         if !self.import_checked
             && let JobPayload::BackendImport(spec) = &self.record.payload
         {
-            let Some(txn_id) = txn_id else {
-                return self.start_transaction();
-            };
             let key = import_key(spec.group_id, spec.import_id);
-            self.state = SubmitState::ReadImport { txn_id };
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })];
+            return self.read(SubmitState::ReadImport, BACKEND_IMPORT_KEYSPACE, key);
         }
         // A harvest source records its run with the job, the same way.
         if !self.source_checked
             && let JobPayload::Harvest(spec) = &self.record.payload
         {
-            let Some(txn_id) = txn_id else {
-                return self.start_transaction();
-            };
             let key = source_key(spec.group_id, spec.source_id);
-            self.state = SubmitState::ReadSource { txn_id };
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: HARVEST_SOURCE_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })];
+            return self.read(SubmitState::ReadSource, HARVEST_SOURCE_KEYSPACE, key);
         }
         // A staging job waits while a range of its distributed destination moves away.
         if !self.staging_checked
             && let JobPayload::Staging(spec) = &self.record.payload
         {
-            let Some(txn_id) = txn_id else {
-                return self.start_transaction();
-            };
             let key = spec.bucket.as_bytes().into();
-            self.state = SubmitState::ReadBucket { txn_id };
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })];
+            return self.read(SubmitState::ReadBucket, S3_BUCKET_KEYSPACE, key);
         }
-        let mut writes = match job_insert_entries(&self.record) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
+        let mut writes = job_insert_entries(&self.record)?;
         writes.extend(self.upload_claim.clone());
         writes.extend(self.import_claim.clone());
         writes.extend(self.source_claim.clone());
-        self.state = SubmitState::WriteJob { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id,
-        })]
+        self.state = SubmitState::WriteJob;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn upload(&self) -> Option<ulid::Ulid> {
@@ -511,169 +404,158 @@ impl SubmitJobOperation {
     }
 
     /// Reads the run the rule last started, or records this job when it has none.
-    fn import_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
-        let Some(value) = value else {
-            return self.fail(SubmitJobError::ImportMissing);
-        };
-        let rule = match BackendImport::from_bytes(value) {
-            Ok(rule) => rule,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn import_read(&mut self, value: Option<&[u8]>) -> Step {
+        let value = value.ok_or(SubmitJobError::ImportMissing)?;
+        let rule = BackendImport::from_bytes(value)?;
         let Some(last_job) = rule.last_job else {
-            return self.claim_import(txn_id, rule);
+            return self.claim_import(rule);
         };
         self.import_rule = Some(rule);
-        self.state = SubmitState::CheckImportRun { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_KEYSPACE.to_string(),
-            key: job_record_key(last_job),
-            txn_id: Some(txn_id),
-        })]
+        self.read(
+            SubmitState::CheckImportRun,
+            JOB_KEYSPACE,
+            job_record_key(last_job),
+        )
     }
 
     /// A pruned last run no longer holds the rule.
-    fn import_run_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
-        let Some(rule) = self.import_rule.take() else {
-            return self.fail(SubmitJobError::UnexpectedEvent(
-                "import run check without a rule".to_string(),
-            ));
-        };
-        match value.map(JobRecord::from_bytes).transpose() {
-            Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::ImportRunning),
-            Ok(_) => self.claim_import(txn_id, rule),
-            Err(error) => self.fail(error.into()),
+    fn import_run_read(&mut self, value: Option<&[u8]>) -> Step {
+        let rule = self.import_rule.take().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("import run check without a rule".to_string())
+        })?;
+        match value.map(JobRecord::from_bytes).transpose()? {
+            Some(last) if is_running(last.state) => Err(SubmitJobError::ImportRunning),
+            _ => self.claim_import(rule),
         }
     }
 
-    fn claim_import(&mut self, txn_id: TxnId, mut rule: BackendImport) -> Effects {
+    fn claim_import(&mut self, mut rule: BackendImport) -> Step {
         rule.last_job = Some(self.record.job_id);
         rule.last_started_ms = Some(self.record.created_at_ms);
-        match rule.to_bytes() {
-            Ok(value) => {
-                let key_space = BACKEND_IMPORT_KEYSPACE.to_string();
-                self.import_claim = Some((key_space, rule.key(), value.into()));
-                self.import_checked = true;
-                self.write_job(Some(txn_id))
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let value = rule.to_bytes()?;
+        let key_space = BACKEND_IMPORT_KEYSPACE.to_string();
+        self.import_claim = Some((key_space, rule.key(), value.into()));
+        self.import_checked = true;
+        self.write_job()
     }
 
     /// Reads the run the source last started, or records this job when it has none.
-    fn source_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
-        let Some(value) = value else {
-            return self.fail(SubmitJobError::SourceMissing);
-        };
-        let source = match HarvestSource::from_bytes(value) {
-            Ok(source) => source,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn source_read(&mut self, value: Option<&[u8]>) -> Step {
+        let value = value.ok_or(SubmitJobError::SourceMissing)?;
+        let source = HarvestSource::from_bytes(value)?;
         let Some(last_job) = source.last_job else {
-            return self.claim_source(txn_id, source);
+            return self.claim_source(source);
         };
         self.harvest_source = Some(source);
-        self.state = SubmitState::CheckSourceRun { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_KEYSPACE.to_string(),
-            key: job_record_key(last_job),
-            txn_id: Some(txn_id),
-        })]
+        self.read(
+            SubmitState::CheckSourceRun,
+            JOB_KEYSPACE,
+            job_record_key(last_job),
+        )
     }
 
-    fn source_run_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
-        let Some(source) = self.harvest_source.take() else {
-            return self.fail(SubmitJobError::UnexpectedEvent(
-                "source run check without a source".to_string(),
-            ));
-        };
-        match value.map(JobRecord::from_bytes).transpose() {
-            Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::SourceRunning),
-            Ok(_) => self.claim_source(txn_id, source),
-            Err(error) => self.fail(error.into()),
+    fn source_run_read(&mut self, value: Option<&[u8]>) -> Step {
+        let source = self.harvest_source.take().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("source run check without a source".to_string())
+        })?;
+        match value.map(JobRecord::from_bytes).transpose()? {
+            Some(last) if is_running(last.state) => Err(SubmitJobError::SourceRunning),
+            _ => self.claim_source(source),
         }
     }
 
-    fn claim_source(&mut self, txn_id: TxnId, mut source: HarvestSource) -> Effects {
+    fn claim_source(&mut self, mut source: HarvestSource) -> Step {
         source.last_job = Some(self.record.job_id);
-        match source.to_bytes() {
-            Ok(value) => {
-                let key = source_key(source.group_id, source.source_id);
-                let key_space = HARVEST_SOURCE_KEYSPACE.to_string();
-                self.source_claim = Some((key_space, key, value.into()));
-                self.source_checked = true;
-                self.write_job(Some(txn_id))
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let value = source.to_bytes()?;
+        let key = source_key(source.group_id, source.source_id);
+        let key_space = HARVEST_SOURCE_KEYSPACE.to_string();
+        self.source_claim = Some((key_space, key, value.into()));
+        self.source_checked = true;
+        self.write_job()
     }
 
     /// A destination that is gone or not distributed needs no record.
-    fn bucket_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
-        let binding = match value.map(BucketInfo::from_bytes).transpose() {
-            Ok(bucket) => bucket.and_then(|bucket| bucket.distribution),
-            Err(error) => return self.fail(error.into()),
-        };
-        let Some(binding) = binding else {
+    fn bucket_read(&mut self, value: Option<&[u8]>) -> Step {
+        let bucket = value.map(BucketInfo::from_bytes).transpose()?;
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution) else {
             self.staging_checked = true;
-            return self.write_job(Some(txn_id));
+            return self.write_job();
         };
-        self.state = SubmitState::ReadRecord {
-            txn_id,
+        let state = SubmitState::ReadRecord {
             set_id: binding.set_id,
             member_id: binding.member_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            key: binding.set_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
+        let key = binding.set_id.to_bytes().to_vec().into();
+        self.read(state, DISTRIBUTION_KEYSPACE, key)
     }
 
     /// Refuses the job while the record lists a transfer away from this member: the transfer
     /// hands over only jobs admitted before it opened.
     fn record_read(
         &mut self,
-        txn_id: TxnId,
         (set_id, member_id): (ulid::Ulid, ulid::Ulid),
         value: Option<&[u8]>,
-    ) -> Effects {
-        let view = match value.map(DistributionView::from_bytes).transpose() {
-            Ok(view) => view,
-            Err(error) => return self.fail(error.into()),
-        };
+    ) -> Step {
+        let view = value.map(DistributionView::from_bytes).transpose()?;
         let transfers = (view.as_ref()).map(|view| &view.snapshot().lifecycle.transfers);
         if transfers.is_some_and(|open| open.iter().any(|transfer| transfer.from == member_id)) {
-            return self.fail(SubmitJobError::RangeMoving(set_id));
+            return Err(SubmitJobError::RangeMoving(set_id));
         }
         self.staging_checked = true;
-        self.write_job(Some(txn_id))
+        self.write_job()
     }
 
-    fn schedule_drain(&mut self) -> Effects {
-        self.state = SubmitState::ScheduleDrain;
-        smallvec![schedule_drain_effect()]
+    /// Reads the job a live dedup row points at, or checks the active cap when there is none.
+    fn dedup_read(&mut self, value: Option<Value>) -> Step {
+        let Some(value) = value else {
+            return self.check_active();
+        };
+        match parse_dedup_value(value.as_ref()) {
+            // Same key and plan is idempotent; a different plan is a conflict. Either way
+            // the target record is verified first so no ghost row answers for a dead job.
+            Ok((existing_job_id, existing_digest)) => {
+                let digest_matches = self.record.plan_digest.unwrap_or_default() == existing_digest;
+                self.verify_dedup(existing_job_id, digest_matches)
+            }
+            Err(_) => self.check_active(),
+        }
     }
 
-    fn after_write(&mut self) -> Effects {
-        self.schedule_drain()
+    fn verified(&mut self, job_id: JobId, digest_matches: bool, value: Option<Value>) -> Step {
+        let Some(value) = value else {
+            warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
+            return self.check_active();
+        };
+        match JobRecord::from_bytes(&value) {
+            Ok(_) if digest_matches => Ok(Next::Done(SubmitJobResult {
+                job_id,
+                created: false,
+            })),
+            Ok(_) => Err(SubmitJobError::JobPlanConflict {
+                existing_job_id: job_id,
+            }),
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
+                self.check_active()
+            }
+        }
     }
 
-    fn finish_existing(&mut self, txn_id: TxnId, job_id: JobId) -> Effects {
-        self.state = SubmitState::Finish;
-        self.output = Some(Ok(SubmitJobResult {
-            job_id,
-            created: false,
-        }));
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    /// Applies the upload claim rule to the stored upload `value` for this job.
+    fn claim_read(&mut self, value: Option<&[u8]>) -> Step {
+        let upload_id = self.upload().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("upload claim without an upload".to_string())
+        })?;
+        self.claim(upload_id, value)?;
+        self.write_job()
     }
 
-    fn finish_created(&mut self) -> Effects {
-        self.state = SubmitState::Finish;
-        self.output = Some(Ok(SubmitJobResult {
-            job_id: self.record.job_id,
-            created: true,
-        }));
-        smallvec![]
+    fn active_read(&mut self, rows: usize) -> Step {
+        let limit = self.active_cap.unwrap_or_default();
+        if rows >= limit as usize {
+            return Err(SubmitJobError::ActiveJobLimit { limit });
+        }
+        self.write_job()
     }
 }
 
@@ -698,223 +580,74 @@ fn workspace_plan_digest(
     *hasher.finalize().as_bytes()
 }
 
-impl EffectOperation for SubmitJobOperation {
+impl Operation for SubmitJobOperation {
     type Output = SubmitJobResult;
     type Error = SubmitJobError;
 
-    fn start(&mut self) -> Effects {
-        self.begin()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            SubmitState::Init => {
-                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
-            }
-            SubmitState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.read_dedup(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::GroupFence { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match aruna_core::structs::identity::group_delete::check_group_write(
-                        value.as_deref(),
-                    ) {
-                        Ok(()) => {
-                            self.group_checked = true;
-                            self.write_job(Some(txn_id))
-                        }
-                        Err(error) => self.fail(error.into()),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ReadDedup { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match parse_dedup_value(value.as_ref()) {
-                    // Same key and plan is idempotent; a different plan is a conflict. Either way
-                    // the target record is verified first so no ghost row answers for a dead job.
-                    Ok((existing_job_id, existing_digest)) => {
-                        let digest_matches =
-                            self.record.plan_digest.unwrap_or_default() == existing_digest;
-                        self.verify_dedup(txn_id, existing_job_id, digest_matches)
-                    }
-                    Err(_) => self.check_active(txn_id),
-                },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    self.check_active(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::VerifyDedup {
-                txn_id,
-                job_id,
-                digest_matches,
-            } => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match JobRecord::from_bytes(&value) {
-                    Ok(_) if digest_matches => self.finish_existing(txn_id, job_id),
-                    Ok(_) => self.fail(SubmitJobError::JobPlanConflict {
-                        existing_job_id: job_id,
-                    }),
-                    Err(error) => {
-                        warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
-                        self.check_active(txn_id)
-                    }
-                },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
-                    self.check_active(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::CheckActive { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    let limit = self.active_cap.unwrap_or_default();
-                    if values.len() >= limit as usize {
-                        self.fail(SubmitJobError::ActiveJobLimit { limit })
-                    } else {
-                        self.write_job(Some(txn_id))
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ClaimUpload { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(upload_id) = self.upload() else {
-                        return self.fail(SubmitJobError::UnexpectedEvent(
-                            "upload claim without an upload".to_string(),
-                        ));
-                    };
-                    match self.claim(upload_id, value.as_deref()) {
-                        Ok(()) => self.write_job(Some(txn_id)),
-                        Err(error) => self.fail(error.into()),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ReadImport { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.import_read(txn_id, value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::CheckImportRun { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.import_run_read(txn_id, value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ReadSource { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.source_read(txn_id, value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::CheckSourceRun { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.source_run_read(txn_id, value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ReadBucket { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.bucket_read(txn_id, value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ReadRecord {
-                txn_id,
-                set_id,
-                member_id,
-            } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.record_read(txn_id, (set_id, member_id), value.as_deref())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::WriteJob { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
-                    Some(txn_id) => {
-                        self.state = SubmitState::CommitTransaction { txn_id };
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.after_write(),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::CommitTransaction { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.after_write(),
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) => self.start_transaction(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
-            },
-            SubmitState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_created(),
-                Event::Task(TaskEvent::Error { .. }) => {
-                    warn!("Job persisted but drain scheduling returned an error");
-                    self.finish_created()
-                }
-                other => {
-                    warn!(event = ?other, "Job persisted but drain scheduling returned an unexpected event");
-                    self.finish_created()
-                }
-            },
-            SubmitState::Finish | SubmitState::Error => {
-                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
-            }
+    fn transaction(&self) -> TransactionMode {
+        match self.checks() {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SubmitState::Finish | SubmitState::Error)
+    /// A lost commit always runs again with fresh reads, as the submit has always done.
+    fn on_conflict(&mut self, _attempt: u32) -> AfterConflict<SubmitJobResult> {
+        AfterConflict::Rerun
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SubmitJobError::UnexpectedEvent(
-            "submit operation finished without output".to_string(),
-        )))
+    fn first(&mut self) -> Step {
+        match self.checks() {
+            true => self.read_dedup(),
+            false => self.write_job(),
+        }
     }
 
-    fn abort(&mut self) -> Effects {
-        let txn_id = match self.state {
-            SubmitState::GroupFence { txn_id } => Some(txn_id),
-            SubmitState::ReadDedup { txn_id }
-            | SubmitState::VerifyDedup { txn_id, .. }
-            | SubmitState::CheckActive { txn_id }
-            | SubmitState::ClaimUpload { txn_id }
-            | SubmitState::ReadImport { txn_id }
-            | SubmitState::CheckImportRun { txn_id }
-            | SubmitState::ReadSource { txn_id }
-            | SubmitState::CheckSourceRun { txn_id }
-            | SubmitState::ReadBucket { txn_id }
-            | SubmitState::ReadRecord { txn_id, .. }
-            | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
-            SubmitState::WriteJob { txn_id } => txn_id,
-            _ => None,
-        };
-        txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+    fn next(&mut self, result: IoResult) -> Step {
+        let state = self.state.clone();
+        if let SubmitState::CheckActive = state {
+            let IoResult::Page { rows, .. } = result else {
+                return Err(SubmitJobError::UnexpectedEvent(result.label().to_string()));
+            };
+            return self.active_read(rows.len());
+        }
+        if let SubmitState::WriteJob = state {
+            let IoResult::Done = result else {
+                return Err(SubmitJobError::UnexpectedEvent(result.label().to_string()));
+            };
+            // Kick the drain so the job is claimed promptly; a lost timer only delays it.
+            let output = SubmitJobResult {
+                job_id: self.record.job_id,
+                created: true,
+            };
+            let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+            return Ok(Next::Then { output, calls });
+        }
+        let [value] = values::<1>(result)?;
+        match state {
+            SubmitState::GroupFence => {
+                aruna_core::structs::identity::group_delete::check_group_write(value.as_deref())?;
+                self.group_checked = true;
+                self.write_job()
+            }
+            SubmitState::ReadDedup => self.dedup_read(value),
+            SubmitState::VerifyDedup {
+                job_id,
+                digest_matches,
+            } => self.verified(job_id, digest_matches, value),
+            SubmitState::ClaimUpload => self.claim_read(value.as_deref()),
+            SubmitState::ReadImport => self.import_read(value.as_deref()),
+            SubmitState::CheckImportRun => self.import_run_read(value.as_deref()),
+            SubmitState::ReadSource => self.source_read(value.as_deref()),
+            SubmitState::CheckSourceRun => self.source_run_read(value.as_deref()),
+            SubmitState::ReadBucket => self.bucket_read(value.as_deref()),
+            SubmitState::ReadRecord { set_id, member_id } => {
+                self.record_read((set_id, member_id), value.as_deref())
+            }
+            SubmitState::Start | SubmitState::CheckActive | SubmitState::WriteJob => Err(
+                SubmitJobError::UnexpectedEvent("a result before the first call".to_string()),
+            ),
+        }
     }
 }
 
@@ -923,8 +656,9 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::state::read_job_record;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
-    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
         ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
@@ -967,13 +701,38 @@ mod tests {
         SubmitJobOperation::new(spec, job_id)
     }
 
-    // An event before `start` is refused instead of starting the submission.
+    // A plain job writes its rows without a transaction, then kicks the drain after them.
     #[test]
-    fn rejects_unstarted_event() {
-        use aruna_core::operation_check::{rejects_events, sample_events};
-        let fresh = || operation(spec(None));
-        let refusals = rejects_events(fresh, sample_events, |_| false);
-        assert_eq!(refusals.len(), sample_events().len());
+    fn plain_job_writes() {
+        let mut operation = operation(spec(None));
+        assert_eq!(operation.transaction(), TransactionMode::None);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("the write ends the submit");
+        };
+        assert!(output.created);
+        assert_eq!(
+            calls,
+            vec![IoCall::Effect(Box::new(schedule_drain_effect()))]
+        );
+    }
+
+    // A deduplicated job reads its dedup row first, in a write transaction that reruns on conflict.
+    #[test]
+    fn dedup_reads_first() {
+        let mut operation = operation(spec(Some(b"key".to_vec())));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert!(
+            matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 1)
+        );
+        assert_eq!(operation.on_conflict(9), AfterConflict::Rerun);
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(SubmitJobError::UnexpectedEvent(_))
+        ));
     }
 
     fn spec(dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
@@ -1052,7 +811,7 @@ mod tests {
 
     /// Points the import of `spec` at upload `[seed; 16]` and stores it unclaimed until `expires`.
     async fn seed_upload(
-        storage: &StorageHandle,
+        context: &DriverContext,
         spec: &mut SubmitJobSpec,
         seed: u8,
         expires: u64,
@@ -1064,7 +823,7 @@ mod tests {
         import.source = ImportRoCrateSource::Upload { upload_id };
         let record =
             crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::upload_store::write_rocrate_upload(storage, &record)
+        crate::jobs::import::upload_store::write_rocrate_upload(context, &record)
             .await
             .unwrap();
         upload_id
@@ -1086,12 +845,19 @@ mod tests {
         assert_eq!(first.payload.plan_digest(), second.payload.plan_digest());
     }
 
-    async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
-        crate::storage_read::iter_prefix_page(storage, key_space, None, None, 64, None)
-            .await
-            .expect("scan")
-            .0
-            .len()
+    async fn count_keyspace(context: &DriverContext, key_space: &str) -> usize {
+        crate::storage_read::iter_prefix_page(
+            &context.storage_handle,
+            key_space,
+            None,
+            None,
+            64,
+            None,
+        )
+        .await
+        .expect("scan")
+        .0
+        .len()
     }
 
     #[tokio::test]
@@ -1107,7 +873,7 @@ mod tests {
         };
 
         let result = drive(operation(submission), &ctx).await.unwrap();
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -1125,7 +891,7 @@ mod tests {
         submission.retention_ms = 42;
 
         let result = drive(operation(submission), &ctx).await.unwrap();
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -1154,8 +920,9 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
     }
 
-    async fn write_raw(storage: &StorageHandle, key_space: &str, key: ByteView, value: ByteView) {
-        match storage
+    async fn write_raw(context: &DriverContext, key_space: &str, key: ByteView, value: ByteView) {
+        match context
+            .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: key_space.to_string(),
                 key,
@@ -1198,7 +965,7 @@ mod tests {
 
         let key = source_key(source.group_id, source.source_id);
         let value = ByteView::from(source.to_bytes().unwrap());
-        write_raw(&storage, HARVEST_SOURCE_KEYSPACE, key.clone(), value).await;
+        write_raw(&ctx, HARVEST_SOURCE_KEYSPACE, key.clone(), value).await;
         let first = drive(operation(run()), &ctx).await.unwrap();
         let event = storage
             .send_storage_effect(StorageEffect::Read {
@@ -1219,7 +986,7 @@ mod tests {
         // While the first run is queued, a second run of the source is refused.
         let second = drive(operation(run()), &ctx).await;
         assert_eq!(second, Err(SubmitJobError::SourceRunning));
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1263,7 +1030,7 @@ mod tests {
         assert_eq!(missing, Err(SubmitJobError::ImportMissing));
 
         let value = ByteView::from(rule.to_bytes().unwrap());
-        write_raw(&storage, BACKEND_IMPORT_KEYSPACE, rule.key(), value).await;
+        write_raw(&ctx, BACKEND_IMPORT_KEYSPACE, rule.key(), value).await;
         let first = drive(operation(run()), &ctx).await.unwrap();
         let rule_key = rule.key();
         let stored = |storage: StorageHandle| {
@@ -1292,7 +1059,7 @@ mod tests {
         // While the first run is queued, a second start is refused and records nothing.
         let second = drive(operation(run()), &ctx).await;
         assert_eq!(second, Err(SubmitJobError::ImportRunning));
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
         assert_eq!(stored(storage).await.last_job, Some(first.job_id));
     }
 
@@ -1307,14 +1074,14 @@ mod tests {
             .expect("submit succeeds");
         assert!(result.created);
 
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .expect("job persisted");
         assert_eq!(record.state, JobState::Queued);
-        assert_eq!(count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, JOB_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count_keyspace(&ctx, SCHEDULE_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -1327,7 +1094,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.created);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 1);
 
         let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
@@ -1335,7 +1102,7 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.job_id, first.job_id);
         // No duplicate record created.
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1344,7 +1111,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(1, None);
-        seed_upload(&storage, &mut first, 3, u64::MAX).await;
+        seed_upload(&ctx, &mut first, 3, u64::MAX).await;
         let first = drive(operation(first), &ctx).await.unwrap();
 
         assert_eq!(
@@ -1353,22 +1120,22 @@ mod tests {
         );
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
         let mut third = rocrate_spec(1, None);
-        seed_upload(&storage, &mut third, 6, u64::MAX).await;
+        seed_upload(&ctx, &mut third, 6, u64::MAX).await;
         assert!(drive(operation(third), &ctx).await.unwrap().created);
     }
 
@@ -1380,14 +1147,13 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
-        let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
+        let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored =
-            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload_id).await;
+        let stored = crate::jobs::import::upload_store::read_rocrate_upload(&ctx, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
         let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(
-            &storage,
+            &ctx,
             upload_id,
             owner,
             created.job_id,
@@ -1400,11 +1166,11 @@ mod tests {
         let claimed = Err(SubmitJobError::Upload(UploadClaimError::AlreadyClaimed));
         assert_eq!(drive(operation(other), &ctx).await, claimed);
         let mut late = rocrate_spec(4, Some(b"late".to_vec()));
-        seed_upload(&storage, &mut late, 6, 1_000).await;
+        seed_upload(&ctx, &mut late, 6, 1_000).await;
         let expired = Err(SubmitJobError::Upload(UploadClaimError::Expired));
         assert_eq!(drive(operation(late), &ctx).await, expired);
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1413,7 +1179,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut submission = rocrate_spec(1, Some(b"import".to_vec()));
-        seed_upload(&storage, &mut submission, 3, u64::MAX).await;
+        seed_upload(&ctx, &mut submission, 3, u64::MAX).await;
         let first = drive(operation(submission.clone()), &ctx).await.unwrap();
         let second = drive(operation(submission.clone()), &ctx).await.unwrap();
 
@@ -1422,17 +1188,17 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1458,7 +1224,7 @@ mod tests {
         assert!(first.created);
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 2);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 2);
     }
 
     // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
@@ -1491,7 +1257,7 @@ mod tests {
             }
         );
         // The original job is untouched and no second record was written.
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     // Perf budget: a non-dedup submit is one atomic batch write of <=4 keys plus a
@@ -1511,10 +1277,10 @@ mod tests {
             "submit performs exactly one storage request"
         );
 
-        let keys = count_keyspace(&storage, JOB_KEYSPACE).await
-            + count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await;
+        let keys = count_keyspace(&ctx, JOB_KEYSPACE).await
+            + count_keyspace(&ctx, SCHEDULE_INDEX_KEYSPACE).await
+            + count_keyspace(&ctx, JOB_INDEX_KEYSPACE).await
+            + count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await;
         assert!(keys <= 4, "submit writes at most four keys, got {keys}");
     }
 
@@ -1529,7 +1295,7 @@ mod tests {
         let created_by = submission.created_by;
         let digest = submission.payload.plan_digest();
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
@@ -1540,7 +1306,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1558,7 +1324,7 @@ mod tests {
         let submission = spec(Some(b"k".to_vec()));
         let created_by = submission.created_by;
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, [0xAB; 32])),
@@ -1571,7 +1337,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1589,14 +1355,14 @@ mod tests {
         let created_by = submission.created_by;
         let digest = submission.payload.plan_digest();
         write_raw(
-            &storage,
+            &ctx,
             JOB_KEYSPACE,
             job_record_key(ghost),
             ByteView::from(vec![1, 2, 3]),
         )
         .await;
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
@@ -1607,7 +1373,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1624,18 +1390,18 @@ mod tests {
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
-        crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+        crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
             .await
             .unwrap();
-        let claimed = read_job_record(&storage, first.job_id, None)
+        let claimed = read_job_record(&ctx, first.job_id, None)
             .await
             .unwrap()
             .unwrap();
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1644,25 +1410,5 @@ mod tests {
             .unwrap();
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
-    }
-
-    // A state that expects no event must reject one instead of ignoring it.
-    #[test]
-    fn terminal_rejects_event() {
-        let make = || {
-            let mut operation = operation(spec(None));
-            operation.start();
-            operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: TxnId::generate(),
-            }));
-            operation
-        };
-        for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            let SubmitJobError::UnexpectedEvent(got) = error else {
-                panic!("a terminal state must reject a stray event");
-            };
-            assert_eq!(got, label);
-        }
     }
 }

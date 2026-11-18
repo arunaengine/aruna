@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use thiserror::Error;
 use ulid::Ulid;
@@ -76,8 +76,8 @@ impl Operation for DeleteDraftOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -131,7 +131,10 @@ mod tests {
         use aruna_core::operation::Operation;
         let entry = entry();
         let mut delete = DeleteDraftOperation::new(entry.draft_id);
-        assert!(delete.transaction());
+        assert_eq!(
+            delete.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         delete.first().unwrap();
         let (_, _, value) = publish_entry(&entry).unwrap();
         let key = publish_key(entry.draft_id);

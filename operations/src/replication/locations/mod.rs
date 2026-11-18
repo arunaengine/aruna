@@ -35,7 +35,17 @@ pub enum LocationSummaryError {
     #[error("peer did not answer before the request deadline")]
     Aborted,
     #[error("could not read the locations: {0}")]
-    Io(#[from] IoError),
+    Io(IoError),
+}
+
+/// A run cut off at its deadline counts as a peer that did not answer in time.
+impl From<IoError> for LocationSummaryError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } => Self::Aborted,
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[cfg(test)]

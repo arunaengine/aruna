@@ -71,6 +71,8 @@ enum SweepPhase {
     Scanning(Table, Scan),
     /// Sends the deletes of a table; the next table follows.
     Deleting(Option<Table>),
+    /// The sweep ended; another answer is refused.
+    Finished,
 }
 
 /// The tables a sweep reads, in order.
@@ -175,12 +177,13 @@ impl Operation for SweepEvents {
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
             SweepPhase::Scanning(_, scan) => Ok(Next::Call(scan.ask())),
-            SweepPhase::Deleting(_) => Err(StoreError("swept twice".into())),
+            SweepPhase::Deleting(_) | SweepPhase::Finished => Err(StoreError("swept twice".into())),
         }
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
-        match std::mem::replace(&mut self.phase, SweepPhase::Deleting(None)) {
+        match std::mem::replace(&mut self.phase, SweepPhase::Finished) {
+            SweepPhase::Finished => Err(StoreError("swept twice".into())),
             SweepPhase::Deleting(next) => {
                 done(answer)?;
                 Ok(self.advance(next))

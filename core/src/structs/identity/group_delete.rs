@@ -187,6 +187,17 @@ impl From<ConversionError> for GroupDeletionError {
     }
 }
 
+/// A lost transaction is a conflict to retry; any other runner failure leaves deletion unavailable.
+impl From<crate::calls::IoError> for GroupDeletionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => StorageError::TransactionConflict.into(),
+            crate::calls::IoError::Storage(error) => error.into(),
+            error => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupDeleteRecord {
     pub plan: GroupDeletePlan,
@@ -227,6 +238,17 @@ pub enum GroupWriteError {
     /// A row the write must create already exists.
     #[error("the record already exists")]
     Taken,
+}
+
+/// A storage fault or conflict stays a storage error; any other runner failure is unexpected.
+impl From<crate::calls::IoError> for GroupWriteError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            crate::calls::IoError::Storage(error) => Self::Storage(error),
+            _ => Self::Unexpected,
+        }
+    }
 }
 
 pub fn check_group_write(value: Option<&[u8]>) -> Result<(), GroupWriteError> {

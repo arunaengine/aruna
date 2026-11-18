@@ -7,15 +7,18 @@ use crate::auth::check_permissions::permission_check;
 use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
 use crate::placement::policy::foreign_owner;
-use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
-use crate::s3::policy::successor::{
-    CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+use crate::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
+use crate::s3::policy::successor::{
+    CapturedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child, mint_outcome,
+};
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, SubOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
@@ -177,11 +180,10 @@ pub struct PolicyBulkOperation {
     binding: Option<DistributionBinding>,
     authority: (Option<Value>, Option<Value>),
     run: Option<PolicyBulkRun>,
-    resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
     candidates: Vec<Candidate>,
     index: usize,
-    mint: Option<MintSuccessorOperation>,
+    mint: Option<Box<dyn SubOperation>>,
     /// Outcome of a mint that is still cleaning up.
     settled: Option<Result<SuccessorOutcome, SuccessorError>>,
     /// The status the closing transaction writes once the pass has finished.
@@ -215,7 +217,6 @@ impl PolicyBulkOperation {
             binding: None,
             authority: (None, None),
             run: None,
-            resolver: None,
             resolved: BTreeMap::new(),
             candidates: Vec::new(),
             index: 0,
@@ -394,7 +395,7 @@ impl PolicyBulkOperation {
             .as_ref()
             .map(|run| run.target_refs.clone())
             .unwrap_or_default();
-        let mut resolver = PolicySetResolver::new(
+        let resolver = PolicySetResolver::new(
             self.config.auth_context.realm_id,
             self.config.subject.node_id,
             self.config.now_ms,
@@ -403,24 +404,29 @@ impl PolicyBulkOperation {
             ResolveMode::Lenient,
             &refs,
         );
-        let step = resolver.start();
-        self.resolver = Some(resolver);
         self.state = BulkState::Resolve;
-        self.after_resolve(step)
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            resolver,
+            |result| { Event::Child(ChildOutcome::new(result)) }
+        ))]
     }
 
-    fn after_resolve(&mut self, step: ResolveStep) -> Effects {
-        match step {
-            ResolveStep::Pending(effects) => effects,
-            ResolveStep::Done | ResolveStep::Failed(..) => {
-                if let Some(resolver) = self.resolver.take() {
-                    self.resolved.extend(resolver.into_resolutions());
-                }
-                match foreign_owner(&self.resolved, self.config.group_id) {
-                    Some(policy_id) => self.fail(BulkError::ForeignPolicy { policy_id }),
-                    None => self.read_record(),
-                }
-            }
+    fn after_resolve(&mut self, resolved: Resolutions) -> Effects {
+        self.resolved.extend(resolved);
+        match foreign_owner(&self.resolved, self.config.group_id) {
+            Some(policy_id) => self.fail(BulkError::ForeignPolicy { policy_id }),
+            None => self.read_record(),
+        }
+    }
+
+    /// The lenient resolver child's resolutions; an unreadable outcome resolves nothing.
+    fn resolutions(event: Event) -> Resolutions {
+        let Event::Child(outcome) = event else {
+            return Resolutions::new();
+        };
+        match outcome.take::<Resolutions, PolicySetError>() {
+            Some(Ok(resolved)) => resolved,
+            _ => Resolutions::new(),
         }
     }
 
@@ -588,29 +594,18 @@ impl PolicyBulkOperation {
         if refs.is_empty() {
             return self.read_intents();
         }
-        let mut resolver = PolicySetResolver::new(
+        let resolver = PolicySetResolver::new(
             self.config.auth_context.realm_id,
             self.config.subject.node_id,
             self.config.now_ms,
             ResolveMode::Lenient,
             &refs,
         );
-        let step = resolver.start();
-        self.resolver = Some(resolver);
         self.state = BulkState::ResolveUnion;
-        self.after_union(step)
-    }
-
-    fn after_union(&mut self, step: ResolveStep) -> Effects {
-        match step {
-            ResolveStep::Pending(effects) => effects,
-            ResolveStep::Done | ResolveStep::Failed(..) => {
-                if let Some(resolver) = self.resolver.take() {
-                    self.resolved.extend(resolver.into_resolutions());
-                }
-                self.read_intents()
-            }
-        }
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            resolver,
+            |result| { Event::Child(ChildOutcome::new(result)) }
+        ))]
     }
 
     fn read_intents(&mut self) -> Effects {
@@ -710,7 +705,7 @@ impl PolicyBulkOperation {
             }),
             intent: Some(intent),
         };
-        let mut mint = MintSuccessorOperation::new(plan);
+        let mut mint = mint_child(plan);
         let effects = mint.start();
         self.mint = Some(mint);
         self.state = BulkState::Mint;
@@ -927,22 +922,13 @@ impl EffectOperation for PolicyBulkOperation {
                 };
                 self.after_capture()
             }
-            BulkState::Resolve => {
-                let Some(resolver) = self.resolver.as_mut() else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                let step = resolver.step(event);
-                self.after_resolve(step)
-            }
+            BulkState::Resolve => self.after_resolve(Self::resolutions(event)),
             BulkState::ReadRecord => self.handle_record(event),
             BulkState::ScanHeads => self.handle_heads(event),
             BulkState::ReadVersions => self.handle_versions(event),
             BulkState::ResolveUnion => {
-                let Some(resolver) = self.resolver.as_mut() else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                let step = resolver.step(event);
-                self.after_union(step)
+                self.resolved.extend(Self::resolutions(event));
+                self.read_intents()
             }
             BulkState::ReadIntents => self.handle_intents(event),
             BulkState::Mint => {
@@ -956,7 +942,7 @@ impl EffectOperation for PolicyBulkOperation {
                 let Some(mint) = self.mint.take() else {
                     return self.fail(BulkError::InvalidEvent);
                 };
-                let outcome = mint.finalize();
+                let outcome = mint_outcome(mint.finalize());
                 if effects.is_empty() {
                     return self.record_outcome(outcome);
                 }
@@ -1009,10 +995,7 @@ impl EffectOperation for PolicyBulkOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let mut effects: Effects = match self.resolver.as_mut() {
-            Some(resolver) => resolver.abort(),
-            None => smallvec![],
-        };
+        let mut effects: Effects = smallvec![];
         if let Some(mint) = self.mint.as_mut() {
             effects.extend(mint.abort());
         }

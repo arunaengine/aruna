@@ -8,15 +8,16 @@ use crate::sync::outbox_record::{
 use aruna_core::admin_documents::{
     AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::group::{
@@ -25,12 +26,10 @@ use aruna_core::structs::identity::group::{
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{trace, warn};
+use tracing::trace;
 use ulid::Ulid;
 
 use super::CONFLICT_RETRIES;
@@ -47,87 +46,105 @@ pub struct CreateGroupConfig {
     pub owner_cap: Option<u32>,
 }
 
-#[derive(PartialEq)]
+/// The created group and its authorization document.
+pub type CreatedGroup = (Group, GroupAuthorizationDocument);
+
+type CreateTurn = Result<Next<CreatedGroup>, CreateGroupError>;
+
+/// Checks the name, then creates the group in a write transaction that reruns after a lost
+/// conflict with a fresh group id.
+#[derive(Debug, PartialEq)]
 pub struct CreateGroupOperation {
     config: CreateGroupConfig,
-    group: Option<Group>,
-    auth_doc: Option<GroupAuthorizationDocument>,
-    realm_config: Option<RealmConfigDocument>,
-    /// Bucket the group's authorization rows publish onto, read inside the
-    /// write transaction.
-    fence: aruna_core::placement::fence::WriteFence,
-    state: CreateGroupState,
-    txn_id: Option<Ulid>,
-    conflicts: u8,
-    output: Option<Result<(Group, GroupAuthorizationDocument), CreateGroupError>>,
-}
-
-impl std::fmt::Debug for CreateGroupOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CreateGroupOperation")
-            .field("config", &self.config)
-            .field("group", &self.group)
-            .field("auth_doc", &self.auth_doc)
-            .field("state", &self.state)
-            .field("txn_id", &self.txn_id)
-            .field("output", &self.output)
-            .finish()
-    }
 }
 
 impl CreateGroupOperation {
     pub fn new(config: CreateGroupConfig) -> Self {
-        CreateGroupOperation {
+        CreateGroupOperation { config }
+    }
+}
+
+impl Operation for CreateGroupOperation {
+    type Output = CreatedGroup;
+    type Error = CreateGroupError;
+
+    fn first(&mut self) -> CreateTurn {
+        let trimmed = normalize_group_name(&self.config.display_name)
+            .ok_or(CreateGroupError::InvalidDisplayName)?;
+        self.config.display_name = trimmed;
+        let config = self.config.clone();
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || GroupCreate::new(config.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Ok(Next::Call(IoCall::Child(child)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CreateTurn {
+        result
+            .child::<CreatedGroup, CreateGroupError>()?
+            .map(Next::Done)
+    }
+}
+
+/// What the create transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Config,
+    CountOwned,
+    Write,
+    Fence,
+}
+
+/// Reads the realm config and the owner's groups against the cap, then writes the group, its
+/// owner index, its authorization document and the seeded admin events, and takes the bucket
+/// fence, in one write transaction.
+#[derive(Debug, PartialEq)]
+struct GroupCreate {
+    config: CreateGroupConfig,
+    group: Option<Group>,
+    auth_doc: Option<GroupAuthorizationDocument>,
+    realm_config: Option<RealmConfigDocument>,
+    /// Bucket the group's authorization rows publish onto, read inside the write transaction.
+    fence: aruna_core::placement::fence::WriteFence,
+    stage: Stage,
+}
+
+impl GroupCreate {
+    fn new(config: CreateGroupConfig) -> Self {
+        Self {
             config,
             group: None,
             auth_doc: None,
             realm_config: None,
             fence: Default::default(),
-            state: CreateGroupState::Init,
-            txn_id: None,
-            conflicts: 0,
-            output: None,
-        }
-    }
-    #[tracing::instrument(name = "group.create.emit_count_owned", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_owned_count(&mut self, cap: u32) -> Effects {
-        self.state = CreateGroupState::CountOwnedGroups;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OWNER_INDEX_KEYSPACE.to_string(),
-            prefix: Some(owner_group_prefix(self.config.actor.user_id).into()),
-            start: None,
-            limit: cap as usize,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    #[tracing::instrument(name = "group.create.handle_count_owned", level = "debug", skip(self, event), fields(state = ?self.state))]
-    fn handle_owned_count(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::CountOwnedGroups,
-                "Event::Storage(StorageEvent::IterResult)",
-                got,
-            );
-        };
-        let cap = self.config.owner_cap.unwrap_or(u32::MAX);
-        if values.len() >= cap as usize {
-            let cleanup_effects = self.abort();
-            return self.fail_with_cleanup(
-                CreateGroupError::GroupLimitReached { limit: cap },
-                cleanup_effects,
-            );
-        }
-        self.state = CreateGroupState::CreateGroup;
-        match self.emit_create_group() {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+            stage: Stage::Config,
         }
     }
 
-    #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
-    fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
+    fn handle_config(&mut self, value: Option<Value>) -> CreateTurn {
+        self.realm_config = value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()?;
+        match self.config.owner_cap {
+            Some(0) => Err(CreateGroupError::GroupLimitReached { limit: 0 }),
+            Some(cap) => {
+                self.stage = Stage::CountOwned;
+                Ok(Next::Call(IoCall::Page {
+                    space: OWNER_INDEX_KEYSPACE.to_string(),
+                    prefix: owner_group_prefix(self.config.actor.user_id).into(),
+                    after: None,
+                    limit: cap as usize,
+                }))
+            }
+            None => self.write(),
+        }
+    }
+
+    /// A new group with its default roles, owned by the actor.
+    fn prepare(&mut self) -> Group {
         let group_id = Ulid::generate();
         let auth_doc = GroupAuthorizationDocument::default_group_doc(
             self.config.actor.user_id,
@@ -141,10 +158,15 @@ impl CreateGroupOperation {
             realm_id: self.config.actor.realm_id,
             owner: self.config.actor.user_id,
         };
-
         self.auth_doc = Some(auth_doc);
         self.group = Some(group.clone());
+        group
+    }
 
+    /// The group row, its owner index entry, its authorization document and the seeded admin
+    /// state and events.
+    fn writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
+        let group = self.prepare();
         trace!(
             event = "group.create.started",
             group_id = %group.group_id,
@@ -152,42 +174,37 @@ impl CreateGroupOperation {
             user_id = %self.config.actor.user_id,
             "Creating group"
         );
-
-        let key = group_id.to_bytes().into();
-
-        let value = group.to_bytes(&self.config.actor)?.into();
-
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: GROUP_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: self.txn_id,
-        })])
-    }
-
-    #[tracing::instrument(name = "group.create.emit_auth_doc", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_auth_create(&mut self) -> Result<Effects, CreateGroupError> {
-        let txn_id = self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
-
-        let group_id = self
-            .group
-            .as_ref()
-            .ok_or(CreateGroupError::GroupNotFound)?
-            .group_id;
+        self.resolve_fence();
         let auth_doc = self
             .auth_doc
             .as_ref()
             .ok_or(CreateGroupError::DocNotFound)?;
-
-        let key = group_id.to_bytes().into();
-        let value = auth_doc.to_bytes(&self.config.actor)?.into();
-        let mut writes = vec![(AUTH_KEYSPACE.to_string(), key, value)];
+        let key: ByteView = group.group_id.to_bytes().into();
+        let mut writes = vec![
+            (
+                GROUP_KEYSPACE.to_string(),
+                key.clone(),
+                group.to_bytes(&self.config.actor)?.into(),
+            ),
+            (
+                OWNER_INDEX_KEYSPACE.to_string(),
+                owner_group_key(self.config.actor.user_id, group.group_id).into(),
+                ByteView::from(Vec::new()),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                key,
+                auth_doc.to_bytes(&self.config.actor)?.into(),
+            ),
+        ];
         writes.extend(self.reducer_seed_writes()?);
+        Ok(writes)
+    }
 
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+    fn write(&mut self) -> CreateTurn {
+        let writes = self.writes()?;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
@@ -269,195 +286,6 @@ impl CreateGroupOperation {
         Ok(writes)
     }
 
-    fn finish_after_schedule(&mut self) -> Effects {
-        if let Some(group) = &self.group
-            && let Some(auth) = &self.auth_doc
-        {
-            trace!(
-                event = "group.create.completed",
-                group_id = %group.group_id,
-                realm_id = %group.realm_id,
-                "Created group and queued admin document operations"
-            );
-            self.state = CreateGroupState::Finish;
-            self.output = Some(Ok((group.clone(), auth.clone())));
-            smallvec![]
-        } else {
-            self.fail(CreateGroupError::GroupNotFound)
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.fail", level = "debug", skip(self), fields(state = ?self.state, error = %err))]
-    fn fail(&mut self, err: CreateGroupError) -> Effects {
-        self.state = CreateGroupState::Error;
-        self.output = Some(Err(err));
-        smallvec![]
-    }
-
-    #[tracing::instrument(name = "group.create.fail_with_cleanup", level = "debug", skip(self, cleanup_effects), fields(state = ?self.state, error = %err))]
-    fn fail_with_cleanup(&mut self, err: CreateGroupError, cleanup_effects: Effects) -> Effects {
-        self.state = CreateGroupState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    #[tracing::instrument(name = "group.create.unexpected_event", level = "debug", skip(self, got), fields(current_state = ?self.state, expected, got = %got))]
-    fn unexpected_event(
-        &mut self,
-        state: CreateGroupState,
-        expected: &'static str,
-        got: &'static str,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            CreateGroupError::UnexpectedEvent {
-                state,
-                expected,
-                got,
-            },
-            cleanup_effects,
-        )
-    }
-
-    #[tracing::instrument(name = "group.create.catch_storage_error", level = "trace", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if matches!(error, StorageError::TransactionConflict)
-                && self.conflicts < CONFLICT_RETRIES
-            {
-                return Err(self.restart_after_conflict());
-            }
-            return Err(self.fail(error.into()));
-        }
-
-        Ok(event)
-    }
-
-    /// A conflicting transaction is already rolled back, so the retry opens a
-    /// fresh one and rebuilds every value that was read inside the old one.
-    #[tracing::instrument(name = "group.create.restart", level = "debug", skip(self), fields(state = ?self.state, conflicts = self.conflicts))]
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.txn_id = None;
-        self.group = None;
-        self.auth_doc = None;
-        self.realm_config = None;
-        self.fence = Default::default();
-        self.start()
-    }
-
-    #[tracing::instrument(name = "group.create.handle_start_transaction", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::StartTransaction,
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                got,
-            );
-        };
-
-        self.txn_id = Some(txn_id);
-        self.state = CreateGroupState::ReadRealmConfig;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(*self.config.actor.realm_id.as_bytes()),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_realm_config(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::ReadRealmConfig,
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
-        };
-        self.realm_config = match value
-            .as_deref()
-            .map(RealmConfigDocument::from_bytes)
-            .transpose()
-        {
-            Ok(config) => config,
-            Err(error) => {
-                let cleanup_effects = self.abort();
-                return self.fail_with_cleanup(error.into(), cleanup_effects);
-            }
-        };
-
-        match self.config.owner_cap {
-            Some(0) => {
-                let cleanup_effects = self.abort();
-                self.fail_with_cleanup(
-                    CreateGroupError::GroupLimitReached { limit: 0 },
-                    cleanup_effects,
-                )
-            }
-            Some(cap) => self.emit_owned_count(cap),
-            None => {
-                self.state = CreateGroupState::CreateGroup;
-                match self.emit_create_group() {
-                    Ok(effects) => effects,
-                    Err(err) => self.fail(err),
-                }
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.handle_group_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_create_group(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::CreateGroup,
-                "Event::Storage(StorageEvent::WriteResult)",
-                got,
-            );
-        };
-
-        self.state = CreateGroupState::WriteOwnerIndex;
-        match self.emit_owner_index() {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.emit_owner_index", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_owner_index(&mut self) -> Result<Effects, CreateGroupError> {
-        let group_id = self
-            .group
-            .as_ref()
-            .ok_or(CreateGroupError::GroupNotFound)?
-            .group_id;
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: OWNER_INDEX_KEYSPACE.to_string(),
-            key: owner_group_key(self.config.actor.user_id, group_id).into(),
-            value: ByteView::from(Vec::new()),
-            txn_id: self.txn_id,
-        })])
-    }
-
-    #[tracing::instrument(name = "group.create.handle_owner_index_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_owner_index(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::WriteOwnerIndex,
-                "Event::Storage(StorageEvent::WriteResult)",
-                got,
-            );
-        };
-
-        self.state = CreateGroupState::CreateRoles;
-        self.resolve_fence();
-        match self.emit_auth_create() {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
     /// The group's authorization bucket and the generation it resolves at.
     fn resolve_fence(&mut self) {
         let (Some(config), Some(group)) = (self.realm_config.as_ref(), self.group.as_ref()) else {
@@ -471,88 +299,80 @@ impl CreateGroupOperation {
             .add(self.config.actor.realm_id, config, [placement]);
     }
 
-    fn handle_bucket_fence(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::ReadBucketFence,
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
-        };
-        if !self.fence.admits(&values) {
-            return self.fail(CreateGroupError::PlacementFenced);
+    /// The fence joins this transaction's read set, so a departing holder's close conflicts an
+    /// uncommitted write; a failed drain timer leaves the durable outbox retryable.
+    fn fence_or_finish(&mut self) -> CreateTurn {
+        if !self.fence.is_empty() {
+            self.stage = Stage::Fence;
+            return Ok(Next::Call(IoCall::Read(self.fence.reads())));
         }
-        self.commit_transaction()
+        self.finish()
     }
 
-    fn commit_transaction(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateGroupError::NoTransactionFound);
+    fn finish(&mut self) -> CreateTurn {
+        let (Some(group), Some(auth)) = (self.group.clone(), self.auth_doc.clone()) else {
+            return Err(CreateGroupError::GroupNotFound);
         };
-        self.state = CreateGroupState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        trace!(
+            event = "group.create.completed",
+            group_id = %group.group_id,
+            realm_id = %group.realm_id,
+            "Created group and queued admin document operations"
+        );
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then {
+            output: (group, auth),
+            calls,
+        })
+    }
+}
+
+impl Operation for GroupCreate {
+    type Output = CreatedGroup;
+    type Error = CreateGroupError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    #[tracing::instrument(name = "group.create.handle_auth_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_create_roles(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::CreateRoles,
-                "Event::Storage(StorageEvent::BatchWriteResult)",
-                got,
-            );
-        };
-
-        if self.fence.is_empty() {
-            return self.commit_transaction();
-        }
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateGroupError::NoTransactionFound);
-        };
-        // The fence joins this transaction's read set, so a departing holder's
-        // close conflicts an uncommitted write.
-        self.state = CreateGroupState::ReadBucketFence;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
+    fn conflict_retries() -> u32 {
+        CONFLICT_RETRIES as u32
     }
 
-    #[tracing::instrument(name = "group.create.handle_commit", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_commit_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::CommitTransaction,
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            );
-        };
-
-        if self.group.is_some() && self.auth_doc.is_some() {
-            self.state = CreateGroupState::ScheduleSyncDrain;
-            smallvec![schedule_drain_effect()]
-        } else {
-            self.fail(CreateGroupError::GroupNotFound)
-        }
+    fn first(&mut self) -> CreateTurn {
+        Ok(Next::Call(IoCall::Read(vec![(
+            REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*self.config.actor.realm_id.as_bytes()),
+        )])))
     }
 
-    fn handle_drain_schedule(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_schedule(),
-            // The group is committed either way; the outbox drains on its next
-            // wake, so a scheduling failure only delays replication.
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                warn!(%message, "Group document outbox drain was not scheduled");
-                self.finish_after_schedule()
+    fn next(&mut self, result: IoResult) -> CreateTurn {
+        match self.stage {
+            Stage::Config => {
+                let [value] = values::<1>(result)?;
+                self.handle_config(value)
             }
-            other => self.unexpected_event(
-                CreateGroupState::ScheduleSyncDrain,
-                "Event::Task(TaskEvent::TimerScheduled)",
-                other.label(),
-            ),
+            Stage::CountOwned => {
+                let (rows, _) = result.page()?;
+                let cap = self.config.owner_cap.unwrap_or(u32::MAX);
+                if rows.len() >= cap as usize {
+                    return Err(CreateGroupError::GroupLimitReached { limit: cap });
+                }
+                self.write()
+            }
+            Stage::Write => {
+                done(result)?;
+                self.fence_or_finish()
+            }
+            Stage::Fence => {
+                let values = result.values()?;
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(CreateGroupError::PlacementFenced);
+                }
+                self.finish()
+            }
         }
     }
 }
@@ -567,22 +387,6 @@ fn sorted_roles(auth_doc: &GroupAuthorizationDocument) -> Vec<&Role> {
     roles
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CreateGroupState {
-    Init,
-    StartTransaction,
-    ReadRealmConfig,
-    CountOwnedGroups,
-    CreateGroup,
-    WriteOwnerIndex,
-    CreateRoles,
-    ReadBucketFence,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateGroupError {
     #[error(transparent)]
@@ -595,8 +399,6 @@ pub enum CreateGroupError {
     DocNotFound,
     #[error("No admin role found")]
     AdminNotFound,
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("No group found")]
     GroupNotFound,
     #[error("the group's bucket cut over to a new holder set; retry the create")]
@@ -609,70 +411,23 @@ pub enum CreateGroupError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: CreateGroupState,
+        state: String,
         expected: &'static str,
         got: &'static str,
     },
 }
 
-impl EffectOperation for CreateGroupOperation {
-    type Output = (Group, GroupAuthorizationDocument);
-
-    type Error = CreateGroupError;
-
-    #[tracing::instrument(name = "group.create.start", level = "debug", skip(self), fields(group_name = %self.config.display_name))]
-    fn start(&mut self) -> Effects {
-        let Some(trimmed) = normalize_group_name(&self.config.display_name) else {
-            return self.fail(CreateGroupError::InvalidDisplayName);
-        };
-        self.config.display_name = trimmed;
-        self.state = CreateGroupState::StartTransaction;
-
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    #[tracing::instrument(name = "group.create.step", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.catch_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            CreateGroupState::StartTransaction => self.handle_start_transaction(event),
-            CreateGroupState::ReadRealmConfig => self.handle_realm_config(event),
-            CreateGroupState::CountOwnedGroups => self.handle_owned_count(event),
-            CreateGroupState::CreateGroup => self.handle_create_group(event),
-            CreateGroupState::WriteOwnerIndex => self.handle_owner_index(event),
-            CreateGroupState::CreateRoles => self.handle_create_roles(event),
-            CreateGroupState::ReadBucketFence => self.handle_bucket_fence(event),
-            CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateGroupState::ScheduleSyncDrain => self.handle_drain_schedule(event),
-            CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateGroupState::Finish | CreateGroupState::Error
-        )
-    }
-
-    #[tracing::instrument(name = "group.create.finalize", level = "debug", skip(self), fields(state = ?self.state))]
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateGroupError::NotFinished)?
-    }
-
-    #[tracing::instrument(name = "group.create.abort", level = "debug", skip(self), fields(state = ?self.state, txn_id = ?self.txn_id))]
-    fn abort(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+impl From<IoError> for CreateGroupError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreateGroup".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
         }
     }
 }
@@ -680,29 +435,28 @@ impl EffectOperation for CreateGroupOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
-    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::groups::create_group::{
+        CreateGroupConfig, CreateGroupError, CreateGroupOperation, GroupCreate,
+    };
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-    use aruna_core::types::{Key, KeySpace, TxnId, Value};
+    use aruna_core::types::{Key, KeySpace, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use std::collections::{BTreeSet, HashSet};
-    use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -722,19 +476,6 @@ mod test {
         }
     }
 
-    fn batch_writes(effects: &[Effect], txn_id: TxnId) -> &Vec<(KeySpace, Key, Value)> {
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: effect_txn_id,
-            }) => {
-                assert_eq!(*effect_txn_id, Some(txn_id));
-                writes
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-    }
-
     fn write_values<'a>(writes: &'a [(KeySpace, Key, Value)], keyspace: &str) -> Vec<&'a Value> {
         writes
             .iter()
@@ -745,58 +486,16 @@ mod test {
 
     #[test]
     fn retries_commit_conflict() {
-        // A background writer's SSI conflict reopens the transaction; only an
-        // exhausted budget surfaces the conflict to the caller.
-        let realm_id = RealmId([3; 32]);
-        let actor = actor(realm_id, 1, 2);
-        let txn_id = Ulid::from_bytes([4; 16]);
-        let mut operation = ready_to_schedule(actor, txn_id);
-        let conflict = || {
-            Event::Storage(StorageEvent::Error {
-                error: aruna_core::errors::StorageError::TransactionConflict,
-            })
-        };
-
-        for _ in 0..super::CONFLICT_RETRIES {
-            let effects = operation.step(conflict());
-            assert!(matches!(
-                effects.first(),
-                Some(Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                }))
-            ));
-            assert!(operation.txn_id.is_none());
-        }
-
-        let effects = operation.step(conflict());
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(super::CreateGroupError::StorageError(
-                aruna_core::errors::StorageError::TransactionConflict
-            ))
-        ));
-    }
-
-    fn ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateGroupOperation {
-        let auth_doc = GroupAuthorizationDocument::default_group_doc(
-            actor.user_id,
-            actor.realm_id,
-            Ulid::from_bytes([9; 16]),
+        // A background writer's conflict reruns the whole write; only an exhausted budget surfaces
+        // the conflict to the caller.
+        let conflict = CreateGroupError::from(IoError::Conflict);
+        assert!(GroupCreate::is_conflict(&conflict));
+        assert_eq!(
+            GroupCreate::conflict_retries(),
+            super::CONFLICT_RETRIES as u32
         );
-        let group = Group {
-            display_name: "Test group".to_string(),
-            group_id: auth_doc.group_id,
-            realm_id: actor.realm_id,
-            roles: auth_doc.roles.keys().copied().collect(),
-            owner: actor.user_id,
-        };
-        let mut operation = CreateGroupOperation::new(config(actor));
-        operation.txn_id = Some(txn_id);
-        operation.group = Some(group);
-        operation.auth_doc = Some(auth_doc);
-        operation.state = super::CreateGroupState::CommitTransaction;
-        operation
+        let write = GroupCreate::new(config(actor(RealmId([3; 32]), 1, 2)));
+        assert_eq!(write.transaction(), TransactionMode::Write);
     }
 
     /// A realm whose buckets are activated at generation one, so a create
@@ -828,49 +527,27 @@ mod test {
         config
     }
 
-    /// Steps a create to the bucket fence read and answers it with `closed`.
+    /// Runs a create to the bucket fence read and answers it with `closed`.
     fn step_to_fence(
-        operation: &mut CreateGroupOperation,
+        write: &mut GroupCreate,
         actor: &Actor,
-        txn_id: TxnId,
         closed: Option<u64>,
-    ) -> aruna_core::types::Effects {
+    ) -> Result<Next<(Group, GroupAuthorizationDocument)>, CreateGroupError> {
         let config = activated_config(actor);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(actor.realm_id.as_bytes().to_vec()),
-            value: Some(config.to_bytes(actor).unwrap().into()),
-        }));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let [
-            Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: read,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("the transaction batch-reads the bucket fence, got {effects:?}");
+        write.first().unwrap();
+        let stored = IoResult::Values(vec![Some(config.to_bytes(actor).unwrap().into())]);
+        assert!(matches!(
+            write.next(stored),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Call(IoCall::Read(reads))) = write.next(IoResult::Done) else {
+            panic!("the transaction reads the bucket fence");
         };
-        assert_eq!(*read, Some(txn_id));
         let values = reads
             .iter()
-            .map(|(_, key)| {
-                (
-                    key.clone(),
-                    closed.map(|generation| Value::from(generation.to_be_bytes().to_vec())),
-                )
-            })
+            .map(|_| closed.map(|generation| Value::from(generation.to_be_bytes().to_vec())))
             .collect();
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+        write.next(IoResult::Values(values))
     }
 
     #[test]
@@ -879,15 +556,11 @@ mod test {
         // admin row, so the drain can bound the predecessor set.
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::generate();
-        let mut operation = CreateGroupOperation::new(config(actor.clone()));
+        let mut write = GroupCreate::new(config(actor.clone()));
 
-        let effects = step_to_fence(&mut operation, &actor, txn_id, None);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        let writes = operation.reducer_seed_writes().unwrap();
+        let finished = step_to_fence(&mut write, &actor, None);
+        assert!(matches!(finished, Ok(Next::Then { .. })));
+        let writes = write.reducer_seed_writes().unwrap();
         let records = write_values(&writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
@@ -904,69 +577,43 @@ mod test {
         // commit a row the drained bucket can no longer publish.
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::generate();
-        let mut operation = CreateGroupOperation::new(config(actor.clone()));
+        let mut write = GroupCreate::new(config(actor.clone()));
 
-        let effects = step_to_fence(&mut operation, &actor, txn_id, Some(1));
-        assert!(
-            !effects.iter().any(|effect| matches!(
-                effect,
-                Effect::Storage(StorageEffect::CommitTransaction { .. })
-            )),
-            "a fenced create never commits, got {effects:?}"
-        );
-        assert_eq!(
-            operation.finalize().unwrap_err(),
-            super::CreateGroupError::PlacementFenced
-        );
+        let fenced = step_to_fence(&mut write, &actor, Some(1));
+        assert_eq!(fenced.err(), Some(CreateGroupError::PlacementFenced));
     }
 
     #[test]
     fn seeds_reducer_outbox() {
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::generate();
-        let mut operation = CreateGroupOperation::new(config(actor.clone()));
-        operation.txn_id = Some(txn_id);
+        let mut write = GroupCreate::new(config(actor.clone()));
+        let writes = write.writes().unwrap();
+        let group = write.group.clone().unwrap();
+        let auth_doc = write.auth_doc.clone().unwrap();
+        let stored_group =
+            Group::from_bytes(write_values(&writes, GROUP_KEYSPACE)[0].as_ref()).unwrap();
+        assert_eq!(
+            stored_group.roles,
+            auth_doc.roles.keys().copied().collect::<HashSet<_>>()
+        );
+        assert!(!stored_group.roles.is_empty());
 
-        let group_effects = operation.emit_create_group().unwrap();
-        let group = operation.group.as_ref().unwrap().clone();
-        let auth_doc = operation.auth_doc.as_ref().unwrap().clone();
-        match group_effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                value,
-                txn_id: effect_txn_id,
-                ..
-            }) => {
-                assert_eq!(key_space, GROUP_KEYSPACE);
-                assert_eq!(*effect_txn_id, Some(txn_id));
-                let stored_group = Group::from_bytes(value.as_ref()).unwrap();
-                assert_eq!(
-                    stored_group.roles,
-                    auth_doc.roles.keys().copied().collect::<HashSet<_>>()
-                );
-                assert!(!stored_group.roles.is_empty());
-            }
-            other => panic!("unexpected group write effect: {other:?}"),
-        }
-
-        let effects = operation.emit_auth_create().unwrap();
-        let writes = batch_writes(&effects, txn_id);
         let target = AdminDocumentTarget::Group {
             group_id: group.group_id,
         };
         let reducer_state = postcard::from_bytes::<AdminDocumentState>(
-            write_values(writes, DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
+            write_values(&writes, DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
         )
         .unwrap();
-        let outbox_records = write_values(writes, SYNC_OUTBOX_KEYSPACE)
+        let outbox_records = write_values(&writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        let stored_auth =
-            GroupAuthorizationDocument::from_bytes(write_values(writes, AUTH_KEYSPACE)[0].as_ref())
-                .unwrap();
+        let stored_auth = GroupAuthorizationDocument::from_bytes(
+            write_values(&writes, AUTH_KEYSPACE)[0].as_ref(),
+        )
+        .unwrap();
 
         assert_eq!(stored_auth, auth_doc);
         assert_eq!(reducer_state.target, target);
@@ -1067,30 +714,16 @@ mod test {
 
     #[test]
     fn schedule_finishes() {
+        // Without a realm config nothing is fenced: the write commits and wakes the drain.
         let realm_id = RealmId::from_bytes([5; 32]);
-        let actor = actor(realm_id, 6, 7);
-        let txn_id = TxnId::generate();
-        let mut operation = ready_to_schedule(actor, txn_id);
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert_eq!(operation.state, super::CreateGroupState::ScheduleSyncDrain);
-        assert_eq!(
-            effects.first(),
-            Some(&Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::DrainSyncOutbox,
-                after: Duration::ZERO,
-            }))
-        );
-
-        let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainSyncOutbox),
-            message: "schedule failed".to_string(),
-        }));
-        assert_eq!(operation.state, super::CreateGroupState::Finish);
-        assert!(effects.is_empty());
-        assert!(operation.output.as_ref().is_some_and(Result::is_ok));
+        let mut write = GroupCreate::new(config(actor(realm_id, 6, 7)));
+        write.first().unwrap();
+        write.next(IoResult::Values(vec![None])).unwrap();
+        let Ok(Next::Then { output, calls }) = write.next(IoResult::Done) else {
+            panic!("expected the group with the drain wake");
+        };
+        assert_eq!(output.0.display_name, "Test group");
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     #[tokio::test]

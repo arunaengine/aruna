@@ -218,7 +218,7 @@ pub async fn active_job(
 /// The purge holding the bucket's write fence while its job runs. A purge counts no failures:
 /// a failure retries or ends the whole job.
 async fn purge_job(context: &DriverContext, job_id: JobId) -> Result<Option<ActiveJob>, String> {
-    let record = read_job_record(&context.storage_handle, job_id, None).await?;
+    let record = read_job_record(context, job_id, None).await?;
     let Some(record) = record.filter(|record| is_running(record.state)) else {
         return Ok(None);
     };

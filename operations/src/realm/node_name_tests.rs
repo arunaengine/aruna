@@ -2,12 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_core::task::TaskKey;
 use ulid::Ulid;
 
 use super::*;
@@ -72,41 +69,36 @@ fn named(name: Option<&str>) -> Result<NodeDisplay, NodeNameError> {
     })
 }
 
-/// Drives the operation to its stored reducer state, given the state it reads.
+/// Runs the checks of the operation, then its write transaction to the stored reducer state,
+/// given the state it reads; returns the write and its turn.
 fn drive_write(
     operation: &mut NodeNameOperation,
     stored: Option<&AdminDocumentState>,
     serving: RealmNodeKind,
-) -> Effects {
-    let mut effects = operation.start();
-    if matches!(effects.first(), Some(Effect::SubOperation(_))) {
-        effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+) -> (NameWrite, NameTurn) {
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    if !operation.authorized {
+        let allowed = IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(true)));
+        assert!(matches!(
+            operation.next(allowed),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
     }
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction { .. })]
-    ));
-    let txn_id = Ulid::from_bytes([9; 16]);
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ));
+    let mut write = operation.write();
+    assert_eq!(write.transaction(), TransactionMode::Write);
+    assert!(matches!(write.first(), Ok(Next::Call(IoCall::Read(_)))));
     let state = stored.map(|state| postcard::to_allocvec(state).unwrap().into());
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (Key::from(&b"config"[..]), Some(document_bytes(serving))),
-            (Key::from(&b"state"[..]), state),
-        ],
-    }))
+    let turn = write.next(IoResult::Values(vec![Some(document_bytes(serving)), state]));
+    (write, turn)
 }
 
-/// The reducer state a batch write stores.
-fn written_state(effects: &Effects) -> AdminDocumentState {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected one batch write, got {effects:?}");
+/// The reducer state a write stores.
+fn written_state(turn: &NameTurn) -> AdminDocumentState {
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected one batch write");
     };
     writes
         .iter()
@@ -115,33 +107,28 @@ fn written_state(effects: &Effects) -> AdminDocumentState {
         .expect("reducer state is written")
 }
 
-fn finish(mut operation: NodeNameOperation) -> Result<NodeDisplay, NodeNameError> {
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    let txn_id = Ulid::from_bytes([9; 16]);
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainSyncOutbox,
-        after: Duration::ZERO,
-    }));
-    assert!(operation.is_complete());
-    operation.finalize()
+/// The reducer state the operation's write stores.
+fn written(
+    operation: &mut NodeNameOperation,
+    stored: Option<&AdminDocumentState>,
+    serving: RealmNodeKind,
+) -> AdminDocumentState {
+    written_state(&drive_write(operation, stored, serving).1)
 }
 
-fn refusal(operation: NodeNameOperation, effects: Effects) -> NodeNameError {
-    assert!(effects.iter().all(|effect| matches!(
-        effect,
-        Effect::Storage(StorageEffect::AbortTransaction { .. })
-    )));
-    assert!(operation.is_complete());
-    operation.finalize().unwrap_err()
+/// Answers the write; the shown names come only with the drain wake after the commit.
+fn finish(mut write: NameWrite) -> Result<NodeDisplay, NodeNameError> {
+    match write.next(IoResult::Done)? {
+        Next::Then { output, calls } => {
+            assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
+            Ok(output)
+        }
+        _ => panic!("expected the shown names after the commit"),
+    }
+}
+
+fn refusal(turn: NameTurn) -> NodeNameError {
+    turn.err().expect("the write is refused")
 }
 
 #[test]
@@ -153,19 +140,19 @@ fn admin_sets_name() {
         NameScope::RealmAdmin,
         user(1),
     ));
-    let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
+    let (operation_write, effects) = drive_write(&mut operation, None, RealmNodeKind::Management);
     let state = written_state(&effects);
     assert_eq!(
         state.materialized_node_names(),
         BTreeMap::from([(node(2), "Giessen storage 1".to_string())])
     );
-    assert_eq!(finish(operation), named(Some("Giessen storage 1")));
+    assert_eq!(finish(operation_write), named(Some("Giessen storage 1")));
 }
 
 #[test]
-fn retry_rereads_config() {
-    // A commit lost to a background config write reads again and keeps a name set elsewhere.
-    let document = document_bytes(RealmNodeKind::Management).to_vec();
+fn write_keeps_newer() {
+    // The write builds on the admin state it reads, so a name set elsewhere survives; a commit
+    // lost to a background config write reruns the whole write.
     let target = aruna_core::admin_documents::AdminDocumentTarget::RealmConfig { realm_id: REALM };
     let mut elsewhere = aruna_core::reducer::AdminDocumentState::new(target);
     let laptop = AdminDocumentOperation::NodeNameSet {
@@ -173,27 +160,17 @@ fn retry_rereads_config() {
         display_name: Some("laptop".to_string()),
     };
     elsewhere.apply_operation(&actor(), laptop).unwrap();
-    let (_, _, state) = reducer_state_entry(&elsewhere).unwrap();
     let mut operation = NodeNameOperation::new(config(
         node(2),
         Some("store"),
         NameScope::RealmAdmin,
         user(1),
     ));
-    let writes = crate::realm::commit_retry::conflict_then_write(
-        &mut operation,
-        vec![Some(document.clone()), None],
-        vec![Some(document), Some(state.to_vec())],
-    );
-    let (_, _, written) = writes
-        .iter()
-        .find(|(space, _, _)| space == aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE)
-        .expect("the retry rewrites the reducer state");
-    let names = decode_reducer_state(written)
-        .unwrap()
+    let names = written(&mut operation, Some(&elsewhere), RealmNodeKind::Management)
         .materialized_node_names();
     assert_eq!(names.get(&node(3)).map(String::as_str), Some("laptop"));
     assert_eq!(names.get(&node(2)).map(String::as_str), Some("store"));
+    crate::realm::commit_retry::retries_conflicts::<NameWrite>();
 }
 
 #[test]
@@ -201,12 +178,13 @@ fn admin_clears_name() {
     // A clear must replace the stored name, not leave it behind.
     let mut first =
         NodeNameOperation::new(config(node(2), Some("old"), NameScope::RealmAdmin, user(1)));
-    let stored = written_state(&drive_write(&mut first, None, RealmNodeKind::Management));
+    let stored = written(&mut first, None, RealmNodeKind::Management);
     let mut operation =
         NodeNameOperation::new(config(node(2), None, NameScope::RealmAdmin, user(1)));
-    let effects = drive_write(&mut operation, Some(&stored), RealmNodeKind::Management);
+    let (operation_write, effects) =
+        drive_write(&mut operation, Some(&stored), RealmNodeKind::Management);
     assert!(written_state(&effects).materialized_node_names().is_empty());
-    assert_eq!(finish(operation), named(None));
+    assert_eq!(finish(operation_write), named(None));
 }
 
 #[test]
@@ -214,12 +192,12 @@ fn owner_names_device() {
     // The owner needs no admin grant for its own device, so no permission check runs.
     let mut operation =
         NodeNameOperation::new(config(node(3), Some("Laptop"), NameScope::Owner, user(3)));
-    let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
+    let (operation_write, effects) = drive_write(&mut operation, None, RealmNodeKind::Management);
     assert_eq!(
         written_state(&effects).materialized_node_names(),
         BTreeMap::from([(node(3), "Laptop".to_string())])
     );
-    assert_eq!(finish(operation), named(Some("Laptop")));
+    assert_eq!(finish(operation_write), named(Some("Laptop")));
 }
 
 #[test]
@@ -229,9 +207,7 @@ fn refuses_invalid_name() {
     for name in ["   ", "bell\u{7}", long.as_str()] {
         let mut operation =
             NodeNameOperation::new(config(node(2), Some(name), NameScope::RealmAdmin, user(1)));
-        let effects = operation.start();
-        assert!(effects.is_empty());
-        assert_eq!(refusal(operation, effects), NodeNameError::InvalidName);
+        assert_eq!(operation.first().err(), Some(NodeNameError::InvalidName));
     }
 }
 
@@ -243,9 +219,9 @@ fn refuses_unknown_node() {
         NameScope::RealmAdmin,
         user(1),
     ));
-    let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
+    let (_, effects) = drive_write(&mut operation, None, RealmNodeKind::Management);
     assert_eq!(
-        refusal(operation, effects),
+        refusal(effects),
         NodeNameError::UnknownNode { node_id: node(7) }
     );
 }
@@ -256,11 +232,8 @@ fn refuses_foreign_nodes() {
     for (node_id, caller) in [(node(3), user(4)), (node(2), user(3))] {
         let mut operation =
             NodeNameOperation::new(config(node_id, Some("mine"), NameScope::Owner, caller));
-        let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
-        assert_eq!(
-            refusal(operation, effects),
-            NodeNameError::UnknownNode { node_id }
-        );
+        let (_, effects) = drive_write(&mut operation, None, RealmNodeKind::Management);
+        assert_eq!(refusal(effects), NodeNameError::UnknownNode { node_id });
     }
 }
 
@@ -269,13 +242,11 @@ fn refuses_unauthorized_callers() {
     let mut operation =
         NodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
     assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::SubOperation(_)]
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
     ));
-    let effects = operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-    ));
-    assert_eq!(refusal(operation, effects), NodeNameError::Unauthorized);
+    let denied = IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(false)));
+    assert_eq!(operation.next(denied), Err(NodeNameError::Unauthorized));
 
     // A delegated token cannot speak for the owner.
     let mut delegated = config(node(3), Some("x"), NameScope::Owner, user(3));
@@ -284,8 +255,7 @@ fn refuses_unauthorized_callers() {
         permission: Permission::WRITE,
     }]);
     let mut operation = NodeNameOperation::new(delegated);
-    let effects = operation.start();
-    assert_eq!(refusal(operation, effects), NodeNameError::Unauthorized);
+    assert_eq!(operation.first().err(), Some(NodeNameError::Unauthorized));
 }
 
 #[test]
@@ -293,22 +263,18 @@ fn refuses_server_origin() {
     // Peers drop realm config events from other origins, so only a management node writes.
     let mut operation =
         NodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
-    let effects = drive_write(&mut operation, None, RealmNodeKind::Server);
-    assert_eq!(
-        refusal(operation, effects),
-        NodeNameError::NotManagementNode
-    );
+    let (_, effects) = drive_write(&mut operation, None, RealmNodeKind::Server);
+    assert_eq!(refusal(effects), NodeNameError::NotManagementNode);
 }
 
 #[test]
 fn reads_stored_names() {
     let mut empty = ReadNamesOperation::new(REALM);
-    empty.start();
-    empty.step(Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(&b"state"[..]),
-        value: None,
-    }));
-    assert_eq!(empty.finalize(), Ok(NodeDisplays::default()));
+    empty.first().unwrap();
+    assert_eq!(
+        empty.next(IoResult::Values(vec![None])),
+        Ok(Next::Done(NodeDisplays::default()))
+    );
 
     let mut named = NodeNameOperation::new(config(
         node(2),
@@ -316,14 +282,13 @@ fn reads_stored_names() {
         NameScope::RealmAdmin,
         user(1),
     ));
-    let stored = written_state(&drive_write(&mut named, None, RealmNodeKind::Management));
+    let stored = written(&mut named, None, RealmNodeKind::Management);
     let mut operation = ReadNamesOperation::new(REALM);
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(&b"state"[..]),
-        value: Some(postcard::to_allocvec(&stored).unwrap().into()),
-    }));
-    let displays = operation.finalize().unwrap();
+    operation.first().unwrap();
+    let value = IoResult::Values(vec![Some(postcard::to_allocvec(&stored).unwrap().into())]);
+    let Ok(Next::Done(displays)) = operation.next(value) else {
+        panic!("expected the stored names");
+    };
     assert_eq!(
         displays.names,
         BTreeMap::from([(node(2), "Giessen".to_string())])
@@ -346,7 +311,7 @@ fn places_merge_clear() {
         place: Some(Some(" Giessen ".to_string())),
         coordinates: None,
     });
-    let stored = written_state(&drive_write(&mut first, None, RealmNodeKind::Management));
+    let stored = written(&mut first, None, RealmNodeKind::Management);
     let place = |name: &str, coordinates| NodePlace {
         name: Some(name.to_string()),
         coordinates,
@@ -360,7 +325,7 @@ fn places_merge_clear() {
         coordinates: Some(giessen),
         ..NodeChange::default()
     });
-    let effects = drive_write(&mut moved, Some(&stored), RealmNodeKind::Management);
+    let (moved_write, effects) = drive_write(&mut moved, Some(&stored), RealmNodeKind::Management);
     let stored = written_state(&effects);
     assert_eq!(stored.materialized_node_names()[&node(2)], "Storage 1");
     assert_eq!(
@@ -368,7 +333,7 @@ fn places_merge_clear() {
         place("Giessen", giessen)
     );
     assert_eq!(
-        finish(moved),
+        finish(moved_write),
         Ok(NodeDisplay {
             name: Some("Storage 1".to_string()),
             place: Some(place("Giessen", giessen)),
@@ -380,11 +345,7 @@ fn places_merge_clear() {
         coordinates: Some(None),
         ..NodeChange::default()
     });
-    let stored = written_state(&drive_write(
-        &mut cleared,
-        Some(&stored),
-        RealmNodeKind::Management,
-    ));
+    let stored = written(&mut cleared, Some(&stored), RealmNodeKind::Management);
     assert!(stored.materialized_node_places().is_empty());
     assert_eq!(stored.materialized_node_names()[&node(2)], "Storage 1");
 }
@@ -414,7 +375,6 @@ fn refuses_invalid_places() {
     ];
     for (change, error) in changes {
         let mut operation = placed(change);
-        let effects = operation.start();
-        assert_eq!(refusal(operation, effects), error);
+        assert_eq!(operation.first().err(), Some(error));
     }
 }

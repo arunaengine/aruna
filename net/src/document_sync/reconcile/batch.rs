@@ -26,7 +26,8 @@ use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event}
 use super::parked::Handled;
 use super::satisfied_dependencies;
 use super::shared::{SharedOutcome, apply_shared_event, apply_watch_event};
-use super::validate::{AdminEventValidation, ConfigValidationCache, validate_admin_event};
+use super::validate::{ConfigValidationCache, validate_admin_event};
+use aruna_core::config_authority::AdminEventValidation;
 
 #[derive(Default)]
 pub(super) struct BatchOutcome {

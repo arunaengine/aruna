@@ -1,4 +1,4 @@
-//! Drives link changes through their transaction without storage I/O.
+//! Drives link changes through their calls and results without storage I/O.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,9 +14,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::task::TaskEvent;
 
-const TXN: Ulid = Ulid::from_bytes([7; 16]);
 const NOW_MS: u64 = 1_700_000_000_000;
 
 fn now() -> SystemTime {
@@ -80,8 +78,8 @@ fn operation(change: LinkChange) -> ChangeLinkOperation {
     ChangeLinkOperation::new(link.document_id, link.link_id, change, now())
 }
 
-/// Runs the operation up to the effects that follow reading the stored link.
-fn read(op: &mut ChangeLinkOperation, stored: Option<&RepositoryLink>) -> Effects {
+/// Runs the operation up to the step that follows reading the stored link.
+fn read(op: &mut ChangeLinkOperation, stored: Option<&RepositoryLink>) -> Step {
     read_queued(op, stored, None)
 }
 
@@ -90,43 +88,21 @@ fn read_queued(
     op: &mut ChangeLinkOperation,
     stored: Option<&RepositoryLink>,
     queued: Option<&LinkQueueEntry>,
-) -> Effects {
-    assert!(matches!(
-        op.start()[..],
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-    let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TXN,
-    }));
-    let [
-        Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(TXN),
-        }),
-    ] = &effects[..]
-    else {
-        panic!("expected the link and queue read, got {effects:?}");
+) -> Step {
+    assert_eq!(op.transaction(), TransactionMode::Write);
+    let Ok(Next::Call(IoCall::Read(reads))) = op.first() else {
+        panic!("expected the link and queue read");
     };
     let read = reads.iter().map(|row| row.0.as_str()).collect::<Vec<_>>();
     assert_eq!(read, [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]);
-    op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                ByteView::from(vec![]),
-                stored.map(|link| ByteView::from(link.to_bytes().unwrap())),
-            ),
-            (
-                ByteView::from(vec![]),
-                queued.map(|entry| ByteView::from(postcard::to_allocvec(entry).unwrap())),
-            ),
-        ],
-    }))
+    op.next(IoResult::Values(vec![
+        stored.map(|link| ByteView::from(link.to_bytes().unwrap())),
+        queued.map(|entry| ByteView::from(postcard::to_allocvec(entry).unwrap())),
+    ]))
 }
 
-fn queued_entry(effects: &Effects) -> Option<LinkQueueEntry> {
-    written(effects)
+fn queued_entry(step: &Step) -> Option<LinkQueueEntry> {
+    written(step)
         .into_iter()
         .find(|row| row.0 == LINK_QUEUE_KEYSPACE)
         .map(|row| postcard::from_bytes(&row.2).unwrap())
@@ -136,50 +112,42 @@ fn keyspaces<T>(rows: &[(String, Key, T)]) -> Vec<&str> {
     rows.iter().map(|row| row.0.as_str()).collect()
 }
 
-fn written(effects: &Effects) -> Vec<(String, Key, Value)> {
-    match &effects[..] {
-        [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] => {
-            assert_eq!(*txn_id, Some(TXN));
-            writes.clone()
-        }
+fn written(step: &Step) -> Vec<(String, Key, Value)> {
+    match step {
+        Ok(Next::Call(IoCall::Write(writes))) => writes.clone(),
         other => panic!("expected one batch write, got {other:?}"),
     }
 }
 
-fn commit(op: &mut ChangeLinkOperation, effects: Effects) -> Effects {
-    let effects = match &effects[..] {
-        [Effect::Storage(StorageEffect::BatchWrite { .. })] => {
-            op.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: vec![],
-            }))
-        }
-        _ => effects,
-    };
-    let effects = match &effects[..] {
-        [Effect::Storage(StorageEffect::BatchDelete { .. })] => {
-            op.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: vec![],
-            }))
-        }
-        _ => effects,
-    };
-    assert!(matches!(
-        effects[..],
-        [Effect::Storage(StorageEffect::CommitTransaction {
-            txn_id: TXN
-        })]
-    ));
-    op.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: TXN,
-    }))
+/// The delete that follows the written rows.
+fn deleted(op: &mut ChangeLinkOperation, step: &Step) -> Vec<(String, Key)> {
+    written(step);
+    match op.next(IoResult::Done) {
+        Ok(Next::Call(IoCall::Delete(deletes))) => deletes,
+        other => panic!("expected one batch delete, got {other:?}"),
+    }
 }
 
-fn schedules(effects: &Effects) -> bool {
-    matches!(
-        &effects[..],
-        [Effect::Task(TaskEffect::ResetTimer { key: TaskKey::DrainLinkQueue, after })]
-            if after.is_zero()
-    )
+/// Answers the write and the delete; the result is the operation's last step.
+fn commit(op: &mut ChangeLinkOperation, step: Step) -> Step {
+    written(&step);
+    let step = op.next(IoResult::Done);
+    assert!(matches!(step, Ok(Next::Call(IoCall::Delete(_)))));
+    op.next(IoResult::Done)
+}
+
+/// The link as the change left it, or the error that ended it.
+fn outcome(step: Step) -> Result<Option<RepositoryLink>, LinkError> {
+    match step {
+        Ok(Next::Done(link) | Next::Then { output: link, .. }) => Ok(link),
+        Ok(other) => panic!("expected an outcome, got {other:?}"),
+        Err(error) => Err(error),
+    }
+}
+
+fn schedules(step: &Step) -> bool {
+    let drain = IoCall::Effect(Box::new(schedule_drain(Duration::ZERO)));
+    matches!(step, Ok(Next::Then { calls, .. }) if calls.first() == Some(&drain))
 }
 
 #[test]
@@ -189,8 +157,8 @@ fn create_writes_rows() {
         link: Box::new(link.clone()),
         secret: Some(secret(link.link_id)),
     });
-    let effects = read(&mut op, None);
-    let rows = written(&effects);
+    let step = read(&mut op, None);
+    let rows = written(&step);
     assert_eq!(
         keyspaces(&rows),
         [
@@ -204,15 +172,9 @@ fn create_writes_rows() {
         rows.iter()
             .all(|row| !String::from_utf8_lossy(&row.2).contains("link-token"))
     );
-    let effects = commit(&mut op, effects);
-    assert!(schedules(&effects));
-    assert!(!op.is_complete());
-    op.step(Event::Task(TaskEvent::Error {
-        key: None,
-        message: "no task handle".into(),
-    }));
-    assert!(op.is_complete());
-    let created = op.finalize().unwrap().unwrap();
+    let step = commit(&mut op, step);
+    assert!(schedules(&step));
+    let created = outcome(step).unwrap().unwrap();
     assert!(
         created.generation > 0,
         "the stored row carries a sync generation"
@@ -233,37 +195,24 @@ fn create_refuses_duplicates() {
         link: Box::new(link.clone()),
         secret: Some(secret(link.link_id)),
     });
-    let effects = read(&mut op, Some(&link));
-    assert!(matches!(
-        effects[..],
-        [Effect::Storage(StorageEffect::AbortTransaction {
-            txn_id: TXN
-        })]
-    ));
-    op.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(op.finalize(), Err(LinkError::Exists));
+    assert_eq!(outcome(read(&mut op, Some(&link))), Err(LinkError::Exists));
 
     let mut foreign = operation(LinkChange::Create {
         link: Box::new(link),
         secret: Some(secret(Ulid::from_bytes([9; 16]))),
     });
-    read(&mut foreign, None);
-    foreign.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(foreign.finalize(), Err(LinkError::ForeignToken));
+    assert_eq!(
+        outcome(read(&mut foreign, None)),
+        Err(LinkError::ForeignToken)
+    );
 }
 
 #[test]
 fn delete_removes_secret() {
     let link = link();
     let mut op = operation(LinkChange::Delete);
-    let effects = read(&mut op, Some(&link));
-    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = &effects[..] else {
-        panic!("expected one batch delete, got {effects:?}");
-    };
+    let step = read(&mut op, Some(&link));
+    let deletes = deleted(&mut op, &step);
     let spaces = deletes.iter().map(|row| row.0.as_str()).collect::<Vec<_>>();
     assert_eq!(
         spaces,
@@ -274,46 +223,28 @@ fn delete_removes_secret() {
             LINK_CONNECTOR_KEYSPACE
         ]
     );
-    let effects = commit(&mut op, effects);
-    assert!(effects.is_empty() && op.is_complete());
-    assert_eq!(op.finalize(), Ok(None));
+    assert_eq!(outcome(op.next(IoResult::Done)), Ok(None));
 
     let mut missing = operation(LinkChange::Delete);
-    read(&mut missing, None);
-    missing.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(missing.finalize(), Err(LinkError::NotFound));
+    assert_eq!(outcome(read(&mut missing, None)), Err(LinkError::NotFound));
 }
 
 #[test]
-fn rejects_unexpected_events() {
+fn rejects_unexpected_results() {
     let mut op = operation(LinkChange::Delete);
-    op.start();
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: vec![],
-    }));
-    assert!(effects.is_empty() && op.is_complete());
-    assert!(matches!(op.finalize(), Err(LinkError::Unexpected(_))));
+    op.first().expect("link read");
+    assert!(matches!(
+        outcome(op.next(IoResult::Done)),
+        Err(LinkError::Unexpected(_))
+    ));
 
     let mut op = operation(LinkChange::Delete);
-    op.start();
-    op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TXN,
-    }));
-    let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
-        entries: vec![],
-    }));
+    let step = read(&mut op, Some(&link()));
+    written(&step);
     assert!(matches!(
-        effects[..],
-        [Effect::Storage(StorageEffect::AbortTransaction {
-            txn_id: TXN
-        })]
+        outcome(op.next(IoResult::Values(Vec::new()))),
+        Err(LinkError::Unexpected(_))
     ));
-    op.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert!(matches!(op.finalize(), Err(LinkError::Unexpected(_))));
 }
 
 #[test]
@@ -326,8 +257,8 @@ fn begin_keeps_check() {
         settle_only: false,
     };
     let mut op = operation(LinkChange::Begin(job(1)));
-    let effects = read_queued(&mut op, Some(&stored), Some(&due));
-    let rows = written(&effects);
+    let step = read_queued(&mut op, Some(&stored), Some(&due));
+    let rows = written(&step);
     assert_eq!(
         keyspaces(&rows),
         [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
@@ -336,7 +267,7 @@ fn begin_keeps_check() {
     let entry: LinkQueueEntry = postcard::from_bytes(&rows[1].2).unwrap();
     assert_eq!(entry.due_at_ms, NOW_MS + ACTIVE_RETRY_MS);
     assert!(entry.settle_only);
-    assert!(schedules(&commit(&mut op, effects)));
+    assert!(schedules(&commit(&mut op, step)));
 
     stored.active_job = Some(job(1));
     // The push ends without anything to look at, so its kept check goes too.
@@ -345,23 +276,17 @@ fn begin_keeps_check() {
         outcome: Box::new(PushOutcome::Cancelled),
         requeue: false,
     });
-    let effects = read_queued(&mut op, Some(&stored), Some(&entry));
-    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: vec![],
-    }));
-    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = &effects[..] else {
-        panic!("expected the kept check delete, got {effects:?}");
-    };
+    let step = read_queued(&mut op, Some(&stored), Some(&entry));
+    assert_eq!(keyspaces(&written(&step)), [REPOSITORY_LINK_KEYSPACE]);
+    let deletes = deleted(&mut op, &step);
     assert_eq!(deletes.len(), 1);
     assert_eq!(deletes[0].0, LINK_QUEUE_KEYSPACE);
 
     let mut busy = operation(LinkChange::Begin(job(2)));
-    read(&mut busy, Some(&stored));
-    busy.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(busy.finalize(), Err(LinkError::Busy(LinkBusy)));
+    assert_eq!(
+        outcome(read(&mut busy, Some(&stored))),
+        Err(LinkError::Busy(LinkBusy))
+    );
 }
 
 #[test]
@@ -399,18 +324,12 @@ fn finish_requeues_enabled() {
             }),
             requeue,
         });
-        let effects = read(&mut op, Some(&stored));
-        let rows = written(&effects);
+        let step = read(&mut op, Some(&stored));
+        let rows = written(&step);
         assert_eq!(rows.iter().any(|row| row.0 == LINK_QUEUE_KEYSPACE), queued);
-        let effects = commit(&mut op, effects);
-        assert_eq!(schedules(&effects), queued);
-        if queued {
-            op.step(Event::Task(TaskEvent::Error {
-                key: None,
-                message: String::new(),
-            }));
-        }
-        let link = op.finalize().unwrap().unwrap();
+        let step = commit(&mut op, step);
+        assert_eq!(schedules(&step), queued);
+        let link = outcome(step).unwrap().unwrap();
         assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
         assert_eq!(link.active_job, None);
     }
@@ -423,9 +342,9 @@ fn rotate_resumes_rejected() {
         reason: LinkFailure::TokenRejected,
     };
     let mut op = operation(LinkChange::Rotate(secret(stored.link_id)));
-    let effects = read(&mut op, Some(&stored));
+    let step = read(&mut op, Some(&stored));
     assert_eq!(
-        keyspaces(&written(&effects)),
+        keyspaces(&written(&step)),
         [
             LINK_SECRET_KEYSPACE,
             REPOSITORY_LINK_KEYSPACE,
@@ -433,11 +352,10 @@ fn rotate_resumes_rejected() {
         ]
     );
     let mut foreign = operation(LinkChange::Rotate(secret(Ulid::from_bytes([9; 16]))));
-    read(&mut foreign, Some(&stored));
-    foreign.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(foreign.finalize(), Err(LinkError::ForeignToken));
+    assert_eq!(
+        outcome(read(&mut foreign, Some(&stored))),
+        Err(LinkError::ForeignToken)
+    );
 }
 
 #[test]
@@ -447,11 +365,11 @@ fn patch_pauses_quietly() {
         paused: Some(true),
         ..LinkPatch::default()
     }));
-    let effects = read(&mut op, Some(&stored));
-    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
-    let effects = commit(&mut op, effects);
-    assert!(effects.is_empty());
-    assert_eq!(op.finalize().unwrap().unwrap().status, LinkStatus::Paused);
+    let step = read(&mut op, Some(&stored));
+    assert_eq!(keyspaces(&written(&step)), [REPOSITORY_LINK_KEYSPACE]);
+    let step = commit(&mut op, step);
+    assert!(matches!(step, Ok(Next::Done(_))));
+    assert_eq!(outcome(step).unwrap().unwrap().status, LinkStatus::Paused);
 }
 
 fn route(generation: u64) -> MappingRoute {
@@ -472,17 +390,15 @@ fn fenced(
     op: &mut ChangeLinkOperation,
     stored: Option<&RepositoryLink>,
     fence: Option<u64>,
-) -> Effects {
-    let effects = read(op, stored);
+) -> Step {
+    let step = read(op, stored);
     assert!(matches!(
-        &effects[..],
-        [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(TXN), .. })]
-            if key_space == WRITE_FENCE_KEYSPACE
+        &step,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == WRITE_FENCE_KEYSPACE
     ));
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: ByteView::from(vec![]),
-        value: fence.map(|closed| ByteView::from(closed.to_be_bytes().to_vec())),
-    }))
+    op.next(IoResult::Values(vec![
+        fence.map(|closed| ByteView::from(closed.to_be_bytes().to_vec())),
+    ]))
 }
 
 fn outbox_event(rows: &[(String, Key, Value)]) -> DocumentOutboxEvent {
@@ -504,8 +420,8 @@ fn routed_changes_replicate() {
         secret: Some(secret(link.link_id)),
     })
     .routed(Some(route.clone()));
-    let effects = fenced(&mut op, None, Some(2));
-    let rows = written(&effects);
+    let step = fenced(&mut op, None, Some(2));
+    let rows = written(&step);
     for keyspace in [
         SYNC_REVISION_KEYSPACE,
         SHARD_MANIFEST_KEYSPACE,
@@ -516,15 +432,12 @@ fn routed_changes_replicate() {
             "{keyspace} row missing"
         );
     }
-    let effects = commit(&mut op, effects);
-    assert_eq!(effects.len(), 2, "link and outbox drains are scheduled");
-    for _ in 0..2 {
-        op.step(Event::Task(TaskEvent::Error {
-            key: None,
-            message: "no task handle".into(),
-        }));
-    }
-    let created = op.finalize().unwrap().unwrap();
+    let step = commit(&mut op, step);
+    assert!(
+        matches!(&step, Ok(Next::Then { calls, .. }) if calls.len() == 2),
+        "link and outbox drains are scheduled"
+    );
+    let created = outcome(step).unwrap().unwrap();
     assert!(created.generation > 0);
     let DocumentOutboxEvent::Upsert { bytes, change } = outbox_event(&rows) else {
         panic!("create publishes an upsert");
@@ -534,8 +447,8 @@ fn routed_changes_replicate() {
 
     // A delete keeps a tombstone that orders after the last stored change.
     let mut op = operation(LinkChange::Delete).routed(Some(route.clone()));
-    let effects = fenced(&mut op, Some(&created), None);
-    let rows = written(&effects);
+    let step = fenced(&mut op, Some(&created), None);
+    let rows = written(&step);
     let DocumentOutboxEvent::Delete { change } = outbox_event(&rows) else {
         panic!("delete publishes a delete");
     };
@@ -548,28 +461,8 @@ fn routed_changes_replicate() {
 fn closed_fence_refuses() {
     let link = link();
     let mut op = operation(LinkChange::Patch(LinkPatch::default())).routed(Some(route(3)));
-    let effects = fenced(&mut op, Some(&link), Some(3));
-    assert!(matches!(
-        effects[..],
-        [Effect::Storage(StorageEffect::AbortTransaction {
-            txn_id: TXN
-        })]
-    ));
-    op.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(op.finalize(), Err(LinkError::Fenced));
-}
-
-#[test]
-fn aborting_rejects_events() {
-    let mut op = operation(LinkChange::Delete);
-    read(&mut op, None);
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: vec![],
-    }));
-    assert!(effects.is_empty() && op.is_complete());
-    assert!(matches!(op.finalize(), Err(LinkError::Unexpected(_))));
+    let step = fenced(&mut op, Some(&link), Some(3));
+    assert_eq!(outcome(step), Err(LinkError::Fenced));
 }
 
 #[test]
@@ -599,14 +492,14 @@ fn finish_requeues_link() {
     };
     let mut stored = link();
     stored.active_job = Some(job(1));
-    let effects = read(&mut operation(finish(&record)), Some(&stored));
-    let entry = queued_entry(&effects).expect("a pending review is polled");
+    let step = read(&mut operation(finish(&record)), Some(&stored));
+    let entry = queued_entry(&step).expect("a pending review is polled");
     assert_eq!(entry.due_at_ms, NOW_MS + REVIEW_POLL_MS);
 
     record.in_review = false;
     stored.auto_publish = true;
-    let effects = read(&mut operation(finish(&record)), Some(&stored));
-    let entry = queued_entry(&effects).expect("auto_publish waits for a quiet draft");
+    let step = read(&mut operation(finish(&record)), Some(&stored));
+    let entry = queued_entry(&step).expect("auto_publish waits for a quiet draft");
     assert_eq!(
         entry.due_at_ms,
         NOW_MS + aruna_core::repository::PUBLISH_QUIET_MS
@@ -620,8 +513,8 @@ fn finish_requeues_link() {
         settle_only: false,
     };
     let mut op = operation(finish(&record));
-    let effects = read_queued(&mut op, Some(&stored), Some(&earlier));
-    assert_eq!(queued_entry(&effects), Some(earlier));
+    let step = read_queued(&mut op, Some(&stored), Some(&earlier));
+    assert_eq!(queued_entry(&step), Some(earlier));
 }
 
 #[test]
@@ -644,19 +537,17 @@ fn draft_needs_push() {
         record: Box::new(record.clone()),
     };
     let mut op = operation(change());
-    read(&mut op, Some(&link()));
-    op.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TXN,
-    }));
-    assert_eq!(op.finalize(), Err(LinkError::Busy(LinkBusy)));
+    assert_eq!(
+        outcome(read(&mut op, Some(&link()))),
+        Err(LinkError::Busy(LinkBusy))
+    );
 
     let mut stored = link();
     stored.active_job = Some(job(1));
     let mut op = operation(change());
-    let effects = read(&mut op, Some(&stored));
-    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
-    commit(&mut op, effects);
-    let link = op.finalize().unwrap().unwrap();
+    let step = read(&mut op, Some(&stored));
+    assert_eq!(keyspaces(&written(&step)), [REPOSITORY_LINK_KEYSPACE]);
+    let link = outcome(commit(&mut op, step)).unwrap().unwrap();
     assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
     assert_eq!(link.remote.revision_id, Some(4));
 }
@@ -690,8 +581,8 @@ fn pull_never_pushes() {
         link: Box::new(link.clone()),
         secret: None,
     });
-    let effects = read(&mut op, None);
-    let rows = written(&effects);
+    let step = read(&mut op, None);
+    let rows = written(&step);
     assert_eq!(
         keyspaces(&rows),
         [
@@ -703,7 +594,7 @@ fn pull_never_pushes() {
     // The queue row holds the first repository check, not a push.
     let entry: LinkQueueEntry = postcard::from_bytes(&rows[2].2).unwrap();
     assert_eq!(entry.due_at_ms, 5_000);
-    assert!(schedules(&commit(&mut op, effects)));
+    assert!(schedules(&commit(&mut op, step)));
     // Resuming a pull link checks the repository now instead of queueing a push.
     let mut paused = link.clone();
     paused.status = LinkStatus::Paused;
@@ -711,8 +602,8 @@ fn pull_never_pushes() {
         paused: Some(false),
         ..LinkPatch::default()
     }));
-    let effects = read(&mut op, Some(&paused));
-    let rows = written(&effects);
+    let step = read(&mut op, Some(&paused));
+    let rows = written(&step);
     assert_eq!(
         keyspaces(&rows),
         [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
@@ -723,7 +614,7 @@ fn pull_never_pushes() {
         .as_millis() as u64;
     let stored = RepositoryLink::from_bytes(&rows[0].2).unwrap();
     assert_eq!(stored.pull().unwrap().next_check_ms, 5_000.min(now_ms));
-    assert!(schedules(&commit(&mut op, effects)));
+    assert!(schedules(&commit(&mut op, step)));
 }
 
 #[test]
@@ -736,8 +627,8 @@ fn check_replaces_row() {
         first_at_ms: 1_000,
         settle_only: false,
     };
-    let effects = read_queued(&mut op, Some(&pulling()), Some(&queued));
-    let rows = written(&effects);
+    let step = read_queued(&mut op, Some(&pulling()), Some(&queued));
+    let rows = written(&step);
     assert_eq!(
         keyspaces(&rows),
         [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
@@ -751,14 +642,50 @@ fn check_replaces_row() {
     let mut paused = pulling();
     paused.status = LinkStatus::Paused;
     let mut op = operation(LinkChange::Checked(PullCheck::Unavailable));
-    let effects = read_queued(&mut op, Some(&paused), Some(&queued));
-    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: vec![],
-    }));
-    assert!(matches!(
-        &effects[..],
-        [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
-            if deletes.iter().map(|row| row.0.as_str()).eq([LINK_QUEUE_KEYSPACE])
-    ));
+    let step = read_queued(&mut op, Some(&paused), Some(&queued));
+    assert_eq!(keyspaces(&written(&step)), [REPOSITORY_LINK_KEYSPACE]);
+    let deletes = deleted(&mut op, &step);
+    assert!(
+        deletes
+            .iter()
+            .map(|row| row.0.as_str())
+            .eq([LINK_QUEUE_KEYSPACE])
+    );
+}
+
+fn queue_entry(due_at_ms: u64) -> LinkQueueEntry {
+    LinkQueueEntry {
+        document_id: Ulid::from_bytes([4u8; 16]),
+        due_at_ms,
+        first_at_ms: 90,
+        settle_only: false,
+    }
+}
+
+// An unchanged check goes; a rewritten one stays, due no later than the retry; a removed one stays
+// removed.
+#[test]
+fn settles_queued_check() {
+    use crate::jobs::store::mutation::{Rows, run_in_memory};
+    let link_id = Ulid::from_bytes([5u8; 16]);
+    let (space, key, queued) = queue_row(link_id, &queue_entry(100)).unwrap();
+    let row = (space.clone(), key.to_vec());
+    let mut rows = Rows::from([(row.clone(), queued.to_vec())]);
+    let delete = SettleCheckOperation::new(link_id, queued.clone(), None);
+    assert_eq!(delete.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(delete, &mut rows), Ok(()));
+    assert!(rows.is_empty());
+    let gone = SettleCheckOperation::new(link_id, queued.clone(), Some(500));
+    assert_eq!(run_in_memory(gone, &mut rows), Ok(()));
+    assert!(rows.is_empty());
+
+    let (_, _, newer) = queue_row(link_id, &queue_entry(300)).unwrap();
+    let mut rows = Rows::from([(row.clone(), newer.to_vec())]);
+    let kept = SettleCheckOperation::new(link_id, queued.clone(), None);
+    assert_eq!(run_in_memory(kept, &mut rows), Ok(()));
+    assert_eq!(rows[&row], newer.to_vec());
+    let retry = SettleCheckOperation::new(link_id, queued, Some(200));
+    assert_eq!(run_in_memory(retry, &mut rows), Ok(()));
+    let moved: LinkQueueEntry = postcard::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(moved.due_at_ms, 200);
 }

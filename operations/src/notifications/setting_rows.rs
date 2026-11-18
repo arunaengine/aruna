@@ -323,10 +323,14 @@ impl Operation for WriteSettingOperation {
             }
             (WriteState::Store(bytes), IoResult::Done) => {
                 self.state = WriteState::Schedule(bytes);
-                Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
+                Ok(Next::Call(IoCall::from(schedule_drain_effect())))
             }
             // The write is stored; a failed schedule waits for the drain's own re-arm.
-            (WriteState::Schedule(bytes), IoResult::Event(Event::Task(_))) => Ok(Next::Done(bytes)),
+            (WriteState::Schedule(bytes), IoResult::Event(event))
+                if matches!(*event, Event::Task(_)) =>
+            {
+                Ok(Next::Done(bytes))
+            }
             (_, other) => Err(unexpected("a setting scan, write or schedule", &other).into()),
         }
     }

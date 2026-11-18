@@ -69,7 +69,10 @@ fn pending_holders_sealed() {
         key: BucketKeyRef::new(BUCKET_ID, 2),
         lookups: BTreeMap::from(lookups),
     });
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 4));
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),

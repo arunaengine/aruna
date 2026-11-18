@@ -10,10 +10,13 @@ mod mirrors;
 mod table;
 mod walk;
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use aruna_blob::pace::{Pace, paced};
+use aruna_core::calls::IoError;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobError, JobErrorKind, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint,
     StagingJobPhase, StagingJobSpec,
@@ -24,6 +27,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
 
+use self::limiter::Retried;
 use self::manifest::read_manifest_chunk;
 use self::walk::{
     PageFailure, check_access, clear_queue, finish_failed, item_phase, record_failure, start_walk,
@@ -58,7 +62,7 @@ async fn read_main(
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
     read_state(
-        &context.storage_handle,
+        context,
         STAGING_STATE_KEYSPACE,
         checkpoint_key(job_id, None),
         "staging checkpoint read",
@@ -543,15 +547,9 @@ pub(super) async fn persist_slot(
         checkpoint_key(ctx.job_id, slot),
         ByteView::from(value),
     ));
-    put_job_rows(
-        &ctx.driver.storage_handle,
-        ctx.job_id,
-        ctx.claim_token,
-        writes,
-        deletes,
-    )
-    .await
-    .map_err(|error| error.to_string())
+    put_job_rows(&ctx.driver, ctx.job_id, ctx.claim_token, writes, deletes)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.
@@ -588,6 +586,32 @@ fn conflict_error(message: impl Into<String>) -> JobRunOutcome {
 
 fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
+}
+
+/// Sends a source request of a table import again after a transient answer; `transient` tells
+/// a retryable failure. Other jobs send once. A cancel or shutdown ends the waiting.
+async fn retried<I, O>(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    input: I,
+    build: fn(I) -> O,
+    transient: fn(&O::Error) -> bool,
+) -> Result<O::Output, O::Error>
+where
+    I: Clone + Debug + PartialEq + Send + 'static,
+    O: Operation + 'static,
+    O::Output: PartialEq + 'static,
+    O::Error: 'static,
+{
+    let operation = Retried::new(spec, input, build, transient);
+    if spec.table.is_none() {
+        return drive(operation, &ctx.driver).await;
+    }
+    tokio::select! {
+        result = drive(operation, &ctx.driver) => result,
+        _ = ctx.cancel.cancelled() => Err(IoError::Aborted.into()),
+        _ = ctx.shutdown.cancelled() => Err(IoError::Aborted.into()),
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +792,7 @@ mod pure_tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
+            handlers: Default::default(),
         };
 
         let pinned = StagingJobSpec {

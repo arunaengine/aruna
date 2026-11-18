@@ -5,12 +5,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
@@ -18,6 +16,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::types::Value;
+use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 
 use crate::s3::bucket::seal_missing::{SealMissingError, SealMissingInput, SealMissingOperation};
@@ -119,22 +118,20 @@ impl SealPublishedOperation {
             lookups: BTreeMap::from([(user_id, KeyLookup::Keys(vec![self.record.clone()]))]),
         };
         self.state = SealState::Seal;
-        self.current = Some(bucket.clone());
-        let seal = SealMissingOperation::new(input);
-        let child = boxed_suboperation(seal, move |result| {
-            let sealed = match result {
-                Ok(users) => users.contains(&user_id),
-                Err(SealMissingError::Blob(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
-                    false
-                }
-                Err(error) => {
-                    tracing::warn!(%bucket, %error, "could not seal a copy for a new user key");
-                    false
-                }
-            };
-            Event::SubOperation(SubOperationEvent::CopySealed { sealed })
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        self.current = Some(bucket);
+        Ok(Next::Call(IoCall::child(SealMissingOperation::new(input))))
+    }
+
+    /// Whether the seal made a copy for the publisher; a locked bucket is skipped quietly.
+    fn copy_sealed(&self, bucket: &str, result: Result<Vec<UserId>, SealMissingError>) -> bool {
+        match result {
+            Ok(users) => users.contains(&self.record.user_id),
+            Err(SealMissingError::Blob(BlobError::BucketKey(BucketKeyError::Locked(_)))) => false,
+            Err(error) => {
+                tracing::warn!(%bucket, %error, "could not seal a copy for a new user key");
+                false
+            }
+        }
     }
 }
 
@@ -150,21 +147,14 @@ impl Operation for SealPublishedOperation {
         match self.state {
             SealState::ScanSettings => self.page_read(result),
             SealState::ReadBucket => self.bucket_read(result.value()?),
-            SealState::Seal => match result.event()? {
-                Event::SubOperation(SubOperationEvent::CopySealed { sealed }) => {
-                    if let Some(bucket) = self.current.take()
-                        && sealed
-                    {
-                        self.sealed.push(bucket);
-                    }
-                    Ok(self.next_bucket())
+            SealState::Seal => {
+                let result = result.child::<Vec<UserId>, SealMissingError>()?;
+                let bucket = self.current.take().ok_or(IoError::Unfinished)?;
+                if self.copy_sealed(&bucket, result) {
+                    self.sealed.push(bucket);
                 }
-                other => Err(IoError::Unexpected {
-                    expected: "SubOperationEvent::CopySealed",
-                    got: other.label(),
-                }
-                .into()),
-            },
+                Ok(self.next_bucket())
+            }
         }
     }
 }
@@ -180,7 +170,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, KEY_COPY_KEYSPACE};
     use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::structs::placement::record::PlacementRef;

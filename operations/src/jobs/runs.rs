@@ -44,7 +44,7 @@ pub async fn read_run(
     auth: &AuthContext,
     run_id: JobId,
 ) -> Result<RunView, RunReadError> {
-    let link = read_run_link(&context.storage_handle, run_id)
+    let link = read_run_link(context, run_id)
         .await
         .map_err(RunReadError::Unavailable)?
         .ok_or(RunReadError::NotFound)?;
@@ -70,7 +70,7 @@ pub async fn read_run(
         }
     }
     let run_crate_status = match submitter {
-        true => read_crate_status(&context.storage_handle, run_id)
+        true => read_crate_status(context, run_id)
             .await
             .map_err(RunReadError::Unavailable)?
             .map(|status| status.to_public_json()),

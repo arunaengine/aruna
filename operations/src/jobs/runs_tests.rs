@@ -119,7 +119,7 @@ async fn run_read_rights() {
     let status = RunCrateStatus::Written {
         resource: document_id.to_string(),
     };
-    put_crate_outcome(&context.storage_handle, run_id, &status, &link)
+    put_crate_outcome(&context, run_id, &status, &link)
         .await
         .unwrap();
     let read = |auth: AuthContext, run_id| {
@@ -161,7 +161,7 @@ async fn run_read_rights() {
         run_crate: None,
         ..link.clone()
     };
-    put_crate_outcome(&context.storage_handle, denied_run, &denied, &missing)
+    put_crate_outcome(&context, denied_run, &denied, &missing)
         .await
         .unwrap();
     let own = read(auth(submitter, realm_id), denied_run).await.unwrap();

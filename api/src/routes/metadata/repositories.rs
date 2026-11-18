@@ -407,8 +407,7 @@ fn create_error(error: CreateConnectorError) -> ServerError {
         CreateConnectorError::GroupWrite(_)
         | CreateConnectorError::Storage(_)
         | CreateConnectorError::Conversion(_)
-        | CreateConnectorError::Failed
-        | CreateConnectorError::Io(_) => ServerError::InternalError(error.into()),
+        | CreateConnectorError::Failed => ServerError::InternalError(error.into()),
         CreateConnectorError::EmptyName
         | CreateConnectorError::EmptyEndpoint
         | CreateConnectorError::AmbiguousEndpoint

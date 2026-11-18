@@ -27,15 +27,14 @@ async fn run_link_lasts() {
         .await
         .expect("offer is decided")
         .expect("admitted");
-    let storage = &ctx.storage_handle;
 
-    let link = read_run_link(storage, physical).await.unwrap().unwrap();
+    let link = read_run_link(&ctx, physical).await.unwrap().unwrap();
     assert_eq!(link.family, Some(family.family()));
     assert_eq!(link.logical_job_id, Some(logical));
     assert_eq!(link.run_crate, None);
 
     // Status and link land in one batch; before it, neither is final.
-    assert_eq!(read_crate_status(storage, physical).await.unwrap(), None);
+    assert_eq!(read_crate_status(&ctx, physical).await.unwrap(), None);
     let document_id = Ulid::from_bytes([7; 16]);
     let written = RunCrateStatus::Written {
         resource: document_id.to_string(),
@@ -44,30 +43,30 @@ async fn run_link_lasts() {
         run_crate: Some(document_id),
         ..link
     };
-    put_crate_outcome(storage, physical, &written, &completed)
+    put_crate_outcome(&ctx, physical, &written, &completed)
         .await
         .unwrap();
     assert_eq!(
-        read_crate_status(storage, physical).await.unwrap(),
+        read_crate_status(&ctx, physical).await.unwrap(),
         Some(written)
     );
 
-    let record = read_job_record(storage, physical, None)
+    let record = read_job_record(&ctx, physical, None)
         .await
         .unwrap()
         .unwrap();
-    batch_delete(storage, prune_delete_entries(&record), None)
+    batch_delete(&ctx, prune_delete_entries(&record), None)
         .await
         .unwrap();
     assert!(
-        read_job_record(storage, physical, None)
+        read_job_record(&ctx, physical, None)
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(read_crate_status(storage, physical).await.unwrap(), None);
-    let kept = read_run_link(storage, physical).await.unwrap();
+    assert_eq!(read_crate_status(&ctx, physical).await.unwrap(), None);
+    let kept = read_run_link(&ctx, physical).await.unwrap();
     assert_eq!(kept, Some(completed));
-    let unknown = read_run_link(storage, JobId::from_bytes([3; 16])).await;
+    let unknown = read_run_link(&ctx, JobId::from_bytes([3; 16])).await;
     assert_eq!(unknown.unwrap(), None);
 }

@@ -6,16 +6,16 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::group_delete::{GroupDeletionError, MembershipFence};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::types::TxnId;
 use ulid::Ulid;
 
 use super::check::CheckOperation;
@@ -168,25 +168,18 @@ async fn check_scans_devices() {
 }
 
 #[test]
-fn check_finishes_first() {
+fn check_scans_snapshot() {
+    // Every table is paged in one read snapshot; empty pages throughout end the check.
     let mut check = CheckOperation::new(Ulid::from_bytes([4; 16]), SystemTime::UNIX_EPOCH);
-    let txn_id = TxnId::default();
-    check.start();
-    let mut effects = check.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    while !matches!(
-        effects.first(),
-        Some(Effect::Storage(StorageEffect::CommitTransaction { .. }))
-    ) {
-        effects = check.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
+    assert_eq!(check.transaction(), TransactionMode::ReadSnapshot);
+    let mut turn = check.first();
+    while let Ok(Next::Call(IoCall::Page { .. })) = turn {
+        turn = check.next(IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        });
     }
-    assert!(!check.is_complete());
-    assert!(matches!(
-        check.finalize(),
-        Err(GroupDeletionError::Unavailable(_))
-    ));
+    assert_eq!(turn, Ok(Next::Done(())));
 }
 
 #[tokio::test]

@@ -42,10 +42,12 @@ impl Operation for BlobRequest {
 
     fn first(&mut self) -> Result<Next<BlobEvent>, BlobError> {
         match (self.answer, self.effect.take()) {
-            (Some(_), Some(effect)) => Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(
-                effect,
-            ))))),
-            (None, _) => Err(BlobError::ReadError("not a listing or hashing request".into())),
+            (Some(_), Some(effect)) => {
+                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect)))))
+            }
+            (None, _) => Err(BlobError::ReadError(
+                "not a listing or hashing request".into(),
+            )),
             (Some(_), None) => Err(BlobError::ReadError("request already sent".into())),
         }
     }

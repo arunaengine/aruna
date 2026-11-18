@@ -162,9 +162,8 @@ async fn finished_run(
         stderr: String::new(),
         output_digest: None,
     });
-    let storage = &device.context.storage_handle;
-    insert_job(storage, &record).await?;
-    put_crate_status(storage, job_id, &status).await?;
+    insert_job(&device.context, &record).await?;
+    put_crate_status(&device.context, job_id, &status).await?;
     Ok(job_id)
 }
 
@@ -250,7 +249,7 @@ async fn publishes_local_run() -> TestResult<()> {
     );
     assert_eq!(replayed.run_crate, published.run_crate);
     assert_eq!(
-        read_crate_status(&device.context.storage_handle, job_id).await?,
+        read_crate_status(&device.context, job_id).await?,
         Some(published.run_crate)
     );
 
@@ -279,7 +278,7 @@ async fn crate_stays_local() -> TestResult<()> {
         RunCrateStatus::Pending,
     )
     .await?;
-    let record = read_job_record(storage, job_id, None)
+    let record = read_job_record(&device.context, job_id, None)
         .await?
         .ok_or("the run is stored")?;
     let context = || JobContext {
@@ -292,6 +291,7 @@ async fn crate_stays_local() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        handlers: Default::default(),
     };
 
     assert!(matches!(
@@ -299,7 +299,7 @@ async fn crate_stays_local() -> TestResult<()> {
         JobRunOutcome::Succeeded(JobResultPayload::RunCrate { ref resource }) if resource == "local"
     ));
     assert_eq!(
-        read_crate_status(storage, job_id).await?,
+        read_crate_status(&device.context, job_id).await?,
         Some(RunCrateStatus::Local)
     );
     // The device keeps the run's crate itself, rooted at the crate folder.
@@ -318,7 +318,7 @@ async fn crate_stays_local() -> TestResult<()> {
             .is_err()
     );
 
-    put_crate_status(storage, job_id, &RunCrateStatus::Pending).await?;
+    put_crate_status(&device.context, job_id, &RunCrateStatus::Pending).await?;
     let target = DocumentTarget::RealmConfig {
         realm_id: realm.realm_id,
     };
@@ -334,7 +334,7 @@ async fn crate_stays_local() -> TestResult<()> {
         JobRunOutcome::Deferred(_)
     ));
     assert_eq!(
-        read_crate_status(storage, job_id).await?,
+        read_crate_status(&device.context, job_id).await?,
         Some(RunCrateStatus::Pending)
     );
     // Pruning the job record leaves the local crate readable by its owner.
@@ -345,7 +345,11 @@ async fn crate_stays_local() -> TestResult<()> {
             txn_id: None,
         })
         .await;
-    assert!(read_job_record(storage, job_id, None).await?.is_none());
+    assert!(
+        read_job_record(&device.context, job_id, None)
+            .await?
+            .is_none()
+    );
     assert!(
         local_run_crate(&device.context, job_id, record.created_by)
             .await
@@ -393,7 +397,7 @@ async fn checks_empty_target() -> TestResult<()> {
         })
     ));
     assert_eq!(
-        read_crate_status(&device.context.storage_handle, job_id).await?,
+        read_crate_status(&device.context, job_id).await?,
         Some(RunCrateStatus::Local)
     );
     Ok(())
@@ -416,7 +420,7 @@ async fn crate_redrive_links() -> TestResult<()> {
         RunCrateStatus::Pending,
     )
     .await?;
-    let record = read_job_record(storage, job_id, None)
+    let record = read_job_record(&server.context, job_id, None)
         .await?
         .ok_or("the run is stored")?;
     let context = || JobContext {
@@ -429,6 +433,7 @@ async fn crate_redrive_links() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        handlers: Default::default(),
     };
     let JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) =
         write_run_crate(&context(), job_id).await
@@ -436,15 +441,20 @@ async fn crate_redrive_links() -> TestResult<()> {
         return Err("the crate is written".into());
     };
     let document_id = Ulid::from_string(&resource)?;
-    let link = read_run_link(storage, job_id)
+    let link = read_run_link(&server.context, job_id)
         .await?
         .ok_or("the run is linked")?;
     assert_eq!(link.run_crate, Some(document_id));
     assert_eq!((link.group_id, link.created_by), (group_id, realm.user_id));
 
     // The node prunes on its own schedule; a run inside its retention survives a pass.
-    prune_job_batch(server.context.as_ref()).await?;
-    put_crate_status(storage, job_id, &RunCrateStatus::Minted { document_id }).await?;
+    prune_job_batch(server.context.as_ref(), &[]).await?;
+    put_crate_status(
+        &server.context,
+        job_id,
+        &RunCrateStatus::Minted { document_id },
+    )
+    .await?;
     storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: RUN_LINK_KEYSPACE.to_string(),
@@ -457,10 +467,10 @@ async fn crate_redrive_links() -> TestResult<()> {
         JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource: ref again }) if *again == resource
     ));
     assert_eq!(
-        read_crate_status(storage, job_id).await?,
+        read_crate_status(&server.context, job_id).await?,
         Some(RunCrateStatus::Written { resource })
     );
-    let link = read_run_link(storage, job_id)
+    let link = read_run_link(&server.context, job_id)
         .await?
         .ok_or("the run is linked again")?;
     assert_eq!(link.run_crate, Some(document_id));

@@ -4,23 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, config_oidc_path};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use url::Url;
@@ -35,6 +34,7 @@ use aruna_core::placement::target_placement_ref;
 
 const MAX_ID_LEN: usize = 64;
 
+use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderChange {
     /// Replaces the entry with this id in place, or appends a new one.
@@ -51,36 +51,12 @@ pub struct SetProviderConfig {
     pub change: ProviderChange,
 }
 
+/// Checks the caller's config permission, then writes the change in a write transaction that
+/// reruns after a lost conflict, since a background config write can win its commit.
 #[derive(Debug, PartialEq)]
 pub struct SetProviderOperation {
-    config: SetProviderConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: SetProviderState,
-    output: Option<Result<RealmConfigDocument, SetProviderError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetProviderState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    Finish,
-    Error,
+    config: Arc<SetProviderConfig>,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -103,8 +79,6 @@ pub enum SetProviderError {
     UnknownProvider,
     #[error("the last OIDC provider cannot be removed")]
     LastProvider,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -142,14 +116,112 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+impl From<IoError> for SetProviderError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetProvider".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl SetProviderOperation {
     pub fn new(config: SetProviderConfig) -> Self {
         Self {
+            config: Arc::new(config),
+            authorized: false,
+        }
+    }
+
+    fn change(&self) -> IoCall {
+        let config = Arc::clone(&self.config);
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || ProviderWrite::new(Arc::clone(&config));
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetProviderOperation {
+    type Output = RealmConfigDocument;
+    type Error = SetProviderError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SetProviderError> {
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return Err(SetProviderError::Unauthorized);
+        }
+        let valid = match &self.config.change {
+            ProviderChange::Upsert(provider) => validate_provider(provider),
+            ProviderChange::Remove(id) => validate_id(id),
+        };
+        if let Err(reason) = valid {
+            return Err(SetProviderError::InvalidProvider { reason });
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetProviderError> {
+        if self.authorized {
+            return result
+                .child::<RealmConfigDocument, SetProviderError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetProviderError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(error = %error, "Realm OIDC provider authorization check failed");
+                Err(SetProviderError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// What the config write transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+}
+
+/// Reads the realm config and its admin state, then stores the change and its queued admin
+/// events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct ProviderWrite {
+    config: Arc<SetProviderConfig>,
+    stage: Stage,
+    document: Option<RealmConfigDocument>,
+    deletes: Vec<(KeySpace, Key)>,
+}
+
+impl ProviderWrite {
+    fn new(config: Arc<SetProviderConfig>) -> Self {
+        Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: SetProviderState::Init,
-            output: None,
+            stage: Stage::Read,
+            document: None,
+            deletes: Vec::new(),
         }
     }
 
@@ -172,34 +244,11 @@ impl SetProviderOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetProviderState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetProviderError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(SetProviderError::MissingTransaction);
-        };
+    ) -> Result<Next<RealmConfigDocument>, SetProviderError> {
         let Some(document_value) = document_value else {
             return Err(SetProviderError::ConfigMissing);
         };
@@ -270,215 +319,64 @@ impl SetProviderOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = SetProviderState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document.clone());
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetProviderError::MissingTransaction);
-        };
-        self.state = SetProviderState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    /// Opens a transaction that reads, validates and applies the change from the start.
-    fn start_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = SetProviderState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: SetProviderError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetProviderState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetProviderError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<RealmConfigDocument>, SetProviderError> {
+        let output = self.document.take().ok_or(SetProviderError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for SetProviderOperation {
+impl Operation for ProviderWrite {
     type Output = RealmConfigDocument;
     type Error = SetProviderError;
 
-    fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetProviderError::Unauthorized);
-        }
-        let valid = match &self.config.change {
-            ProviderChange::Upsert(provider) => validate_provider(provider),
-            ProviderChange::Remove(id) => validate_id(id),
-        };
-        if let Err(reason) = valid {
-            return self.fail(SetProviderError::InvalidProvider { reason });
-        }
-        self.state = SetProviderState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            SetProviderState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => self.start_transaction(),
-                        Ok(false) => self.fail(SetProviderError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Realm OIDC provider authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(SetProviderError::StorageError(error))
-                                }
-                                _ => self.fail(SetProviderError::Unauthorized),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", other.label()),
-            },
-            SetProviderState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            SetProviderState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    match self
-                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            SetProviderState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => {
-                let document = document.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(SetProviderError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = SetProviderState::DeleteAdminConflicts { document };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
-            }
-            SetProviderState::DeleteAdminConflicts { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
-            }
-            SetProviderState::CommitTransaction { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                        self.txn_id = None;
-                        self.state = SetProviderState::ScheduleSyncDrain { document };
-                        smallvec![schedule_drain_effect()]
-                    }
-                    Event::Storage(StorageEvent::Error {
-                        error: StorageError::TransactionConflict,
-                    }) if self.attempts < COMMIT_ATTEMPTS => {
-                        self.txn_id = None;
-                        self.start_transaction()
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => {
-                        self.txn_id = None;
-                        self.fail(error.into())
-                    }
-                    other => self.unexpected_event("transaction commit result", other.label()),
-                }
-            }
-            SetProviderState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetProviderState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetProviderState::Finish;
-                    smallvec![]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            SetProviderState::Finish | SetProviderState::Error | SetProviderState::Init => {
-                smallvec![]
-            }
-        }
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SetProviderState::Finish | SetProviderState::Error
-        )
+    fn first(&mut self) -> Result<Next<Self::Output>, SetProviderError> {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(SetProviderError::NotFinished);
-        }
-        self.output.unwrap_or(Err(SetProviderError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetProviderError> {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = values::<2>(result)?;
+                self.emit_document_write(document, reducer)
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
 }
@@ -507,8 +405,6 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use aruna_core::task::TaskKey;
-    use std::time::Duration;
     use ulid::Ulid;
 
     fn actor() -> Actor {
@@ -530,8 +426,12 @@ mod tests {
     }
 
     fn operation(change: ProviderChange) -> SetProviderOperation {
+        SetProviderOperation::new(config_for(change))
+    }
+
+    fn config_for(change: ProviderChange) -> SetProviderConfig {
         let actor = actor();
-        SetProviderOperation::new(SetProviderConfig {
+        SetProviderConfig {
             auth_context: AuthContext {
                 user_id: actor.user_id,
                 realm_id: actor.realm_id,
@@ -540,38 +440,26 @@ mod tests {
             },
             actor,
             change,
-        })
+        }
     }
 
-    /// Steps an operation to its document write against a management node config;
-    /// `None` when it aborts there instead.
+    /// Runs the write transaction of `change` against a management node config to its
+    /// document write; the error when it fails there instead.
     fn written(
-        operation: &mut SetProviderOperation,
+        change: ProviderChange,
         providers: Vec<OidcProviderConfig>,
-    ) -> Option<RealmConfigDocument> {
+    ) -> Result<RealmConfigDocument, SetProviderError> {
         let actor = actor();
         let mut config = RealmConfigDocument::new(actor.realm_id, providers, 3);
         config.ensure_node(actor.node_id, RealmNodeKind::Management);
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([2u8; 16]),
-        }));
-        let value: Value = config.to_bytes(&actor).unwrap().into();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(b"config".as_slice()), Some(value)),
-                (Key::from(b"state".as_slice()), None),
-            ],
-        }));
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] => {
-                Some(RealmConfigDocument::from_bytes(&writes[0].2).unwrap())
+        let mut write = ProviderWrite::new(Arc::new(config_for(change)));
+        write.first().unwrap();
+        let read = IoResult::Values(vec![Some(config.to_bytes(&actor).unwrap().into()), None]);
+        match write.next(read)? {
+            Next::Call(IoCall::Write(writes)) => {
+                Ok(RealmConfigDocument::from_bytes(&writes[0].2).unwrap())
             }
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })] => None,
-            other => panic!("unexpected effects: {other:?}"),
+            _ => panic!("expected the config write"),
         }
     }
 
@@ -584,37 +472,23 @@ mod tests {
     }
 
     #[test]
-    fn start_checks_permission() {
-        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
-        let effects = operation.start();
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let emitted = format!("{effects:?}");
-        assert!(emitted.contains(&policy_admin_path(actor().realm_id)));
-        assert!(emitted.contains("WRITE"));
-    }
-
-    #[test]
-    fn retry_rereads_config() {
-        // A commit lost to a background config write reads again and keeps that write.
-        let actor = actor();
-        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-        first.ensure_node(actor.node_id, RealmNodeKind::Management);
-        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
-        let written =
-            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
-        assert_eq!(ids(&written), vec!["ls"]);
-    }
-
-    #[test]
-    fn denied_is_terminal() {
-        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(SetProviderError::Unauthorized));
+    fn allowed_runs_write() {
+        // The change runs as a write child only after the permission check allowed it.
+        for (allowed, runs) in [(true, true), (false, false)] {
+            let mut operation =
+                operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+            assert!(matches!(
+                operation.first(),
+                Ok(Next::Call(IoCall::Child(_)))
+            ));
+            let checked = IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)));
+            let turn = operation.next(checked);
+            match runs {
+                true => assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_))))),
+                false => assert_eq!(turn, Err(SetProviderError::Unauthorized)),
+            }
+        }
+        crate::realm::commit_retry::retries_conflicts::<ProviderWrite>();
     }
 
     #[test]
@@ -627,9 +501,8 @@ mod tests {
         plain_http.discovery_url = "https://ls.example/discovery".to_string();
         for invalid in [plain_http, blank_audience, bad_id] {
             let mut operation = operation(ProviderChange::Upsert(invalid));
-            assert!(operation.start().is_empty());
             assert!(matches!(
-                operation.finalize(),
+                operation.first(),
                 Err(SetProviderError::InvalidProvider { .. })
             ));
         }
@@ -640,60 +513,46 @@ mod tests {
     fn upsert_keeps_order() {
         let main = provider("main", "https://keycloak.example");
         let ls = provider("ls", "https://ls.example");
-        let mut appended = operation(ProviderChange::Upsert(ls.clone()));
-        let document = written(&mut appended, vec![main.clone()]).unwrap();
+        let document = written(ProviderChange::Upsert(ls.clone()), vec![main.clone()]).unwrap();
         assert_eq!(ids(&document), ["main", "ls"]);
 
         let replaced = provider("main", "https://replaced.example");
-        let mut replace = operation(ProviderChange::Upsert(replaced.clone()));
-        let document = written(&mut replace, vec![main, ls.clone()]).unwrap();
+        let change = ProviderChange::Upsert(replaced.clone());
+        let document = written(change, vec![main, ls.clone()]).unwrap();
         assert_eq!(document.oidc_providers, vec![replaced, ls]);
     }
 
     #[test]
     fn upsert_completes() {
+        // The written config is the output, and it comes only with the drain wake after the commit.
+        let actor = actor();
         let main = provider("main", "https://keycloak.example");
-        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
-        written(&mut operation, vec![main]).unwrap();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([2u8; 16]),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
-                key: TaskKey::DrainSyncOutbox,
-                ..
-            })]
-        ));
-        assert!(!operation.is_complete());
-        operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: Duration::ZERO,
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(ids(&operation.finalize().unwrap()), ["main", "ls"]);
+        let mut config = RealmConfigDocument::new(actor.realm_id, vec![main], 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let change = ProviderChange::Upsert(provider("ls", "https://ls.example"));
+        let mut write = ProviderWrite::new(Arc::new(config_for(change)));
+        let (written, output) = crate::realm::commit_retry::write_once(&mut write, &actor, &config);
+        assert_eq!(ids(&output), ["main", "ls"]);
+        assert_eq!(output, written);
     }
 
     #[test]
     fn remove_guards_last() {
         let main = provider("main", "https://keycloak.example");
         let ls = provider("ls", "https://ls.example");
-        let mut remove = operation(ProviderChange::Remove("ls".to_string()));
-        let document = written(&mut remove, vec![main.clone(), ls]).unwrap();
+        let remove = ProviderChange::Remove("ls".to_string());
+        let document = written(remove, vec![main.clone(), ls]).unwrap();
         assert_eq!(ids(&document), ["main"]);
 
-        let mut last = operation(ProviderChange::Remove("main".to_string()));
-        assert_eq!(written(&mut last, vec![main.clone()]), None);
-        assert_eq!(last.finalize(), Err(SetProviderError::LastProvider));
-        let mut unknown = operation(ProviderChange::Remove("ls".to_string()));
-        assert_eq!(written(&mut unknown, vec![main]), None);
-        assert_eq!(unknown.finalize(), Err(SetProviderError::UnknownProvider));
+        let last = ProviderChange::Remove("main".to_string());
+        assert_eq!(
+            written(last, vec![main.clone()]),
+            Err(SetProviderError::LastProvider)
+        );
+        let unknown = ProviderChange::Remove("ls".to_string());
+        assert_eq!(
+            written(unknown, vec![main]),
+            Err(SetProviderError::UnknownProvider)
+        );
     }
 }

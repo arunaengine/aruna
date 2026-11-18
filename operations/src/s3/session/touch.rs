@@ -6,7 +6,7 @@
 use super::S3SessionError;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::s3_session::S3Session;
 use std::time::SystemTime;
 
@@ -87,8 +87,8 @@ impl Operation for TouchS3Operation {
         Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -115,7 +115,10 @@ mod pure_tests {
         let mut operation = TouchS3Operation::new(config());
         let read = vec![(S3_SESSION_KEYSPACE.to_string(), operation.key())];
         assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let missing = operation.next(IoResult::Values(vec![None]));
         assert_eq!(missing, Err(S3SessionError::NotFound));
     }

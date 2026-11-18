@@ -200,15 +200,11 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         None,
     );
     record.captured_inputs = captured_inputs;
-    insert_job(&ctx.storage_handle, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(
-        &ctx.storage_handle,
-        job_id,
-        node_id,
-        unix_timestamp_millis(),
-    )
-    .await
-    .unwrap() else {
+    insert_job(&ctx, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx, job_id, node_id, unix_timestamp_millis())
+        .await
+        .unwrap()
+    else {
         panic!("claim failed");
     };
     (job_id, claimed)
@@ -280,10 +276,7 @@ async fn wait_state(
     let mut progress = None;
     let mut deadline = Instant::now() + idle;
     loop {
-        let record = read_job_record(&ctx.storage_handle, job_id, None)
-            .await
-            .ok()
-            .flatten();
+        let record = read_job_record(&ctx, job_id, None).await.ok().flatten();
         if let Some(record) = &record
             && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
         {
@@ -327,7 +320,7 @@ async fn wait_run_crate(
 ) -> Option<RunCrateStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Some(status)) = read_crate_status(&ctx.storage_handle, job_id).await
+        if let Ok(Some(status)) = read_crate_status(&ctx, job_id).await
             && !matches!(
                 status,
                 RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
@@ -590,7 +583,7 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
     )
     .await;
     aruna_operations::jobs::store::attempt::set_cancel_requested(
-        &fixture.compute_ctx.storage_handle,
+        &fixture.compute_ctx,
         job_id,
         unix_timestamp_millis(),
     )
@@ -653,7 +646,7 @@ async fn execution_restart_adopts() -> TestResult<()> {
 
     // Reconciliation receives only jobs with leases expired by the sweep.
     // Expire the crashed holder's lease to reproduce that admission condition.
-    mutate_job(&fixture.compute_ctx.storage_handle, job_id, |record| {
+    mutate_job(&fixture.compute_ctx, job_id, |record| {
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_ms = 1;
         }
@@ -663,14 +656,14 @@ async fn execution_restart_adopts() -> TestResult<()> {
     .expect("expire crashed lease");
 
     // The reconciler adopts the still-running container.
-    let lost = read_job_record(&fixture.compute_ctx.storage_handle, job_id, None)
+    let lost = read_job_record(&fixture.compute_ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
     let runtime = JobsRuntime::new();
     let reconciler = ComputeReconciler::new(fixture.compute_ctx.clone(), Arc::downgrade(&runtime));
     reconciler
-        .reconcile_lost_attempt(&fixture.compute_ctx.storage_handle, lost)
+        .reconcile_lost_attempt(&fixture.compute_ctx, lost)
         .await;
 
     // Still exactly one container: no double-run.

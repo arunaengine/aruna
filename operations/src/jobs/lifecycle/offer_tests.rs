@@ -31,13 +31,13 @@ fn receipt(family: &Family) -> ReceiptFrame {
 }
 
 fn answer(result: Result<MetadataTransportMessage, PeerRequestError>) -> IoResult {
-    IoResult::Event(Event::Net(NetEvent::MetadataAnswer(Box::new(
+    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
         MetadataAnswer {
             peer: node(4),
             elapsed: Duration::from_secs(1),
             result: result.map(|message| encode_message(&message).expect("reply encodes")),
         },
-    ))))
+    )))))
 }
 
 fn offer(family: &Family) -> OfferLaunchOperation {
@@ -54,13 +54,13 @@ fn accepts_receipt() {
     .expect("frame encodes");
     assert_eq!(
         offer.first(),
-        Ok(Next::Call(IoCall::Effect(Effect::Net(
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
             NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
                 peer: node(4),
                 frame,
                 timeout: Duration::from_secs(30),
             }))
-        ))))
+        )))))
     );
     let receipt = receipt(&family);
     let expected = JobRecordFrame::new(receipt.clone().into_inner()).expect("receipt record");

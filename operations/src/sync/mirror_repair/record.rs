@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, Value};
@@ -19,11 +19,9 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 /// What the operation does with the record it reads.
 #[derive(Debug, PartialEq)]
 enum Change {
-    /// Writes a new record of this intent, due from the runner's clock.
+    /// Writes a new record of this intent, due from the runner's clock, unless a staged delete
+    /// supersedes a reconcile; a claimed rollback of the same relationship stays claimed.
     Stage(SyncRelationship, SyncMirrorIntent),
-    /// Writes the record, unless a staged delete supersedes a reconcile; a claimed rollback of
-    /// the same relationship stays claimed.
-    Store(SyncMirrorRecord),
     /// Deletes a record of the expected intent; a reconcile must still name `relationship`.
     Clear {
         relationship: SyncRelationship,
@@ -66,10 +64,6 @@ impl MirrorRecordOperation {
                 expected,
             },
         )
-    }
-
-    pub(super) fn store(record: SyncMirrorRecord) -> Self {
-        Self::with(repair_key(&record.relationship), Change::Store(record))
     }
 
     pub(super) fn clear_scanned(scanned: SyncMirrorRecord) -> Self {
@@ -115,7 +109,6 @@ impl MirrorRecordOperation {
             Change::Stage(relationship, intent) => {
                 SyncMirrorRecord::new(relationship.clone(), *intent, self.now_ms)
             }
-            Change::Store(record) => record.clone(),
             Change::Clear {
                 relationship,
                 expected,
@@ -188,8 +181,8 @@ impl Operation for MirrorRecordOperation {
         self.decide(value)
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -245,7 +238,10 @@ mod tests {
             relationship(),
             SyncMirrorIntent::Delete,
         ));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let staged = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Delete, NOW);
         assert_eq!(operation.next(values(None)), Ok(write(&staged)));
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
@@ -253,9 +249,10 @@ mod tests {
 
     #[test]
     fn delete_supersedes_reconcile() {
-        let mut operation = reading(MirrorRecordOperation::store(record(
+        let mut operation = reading(MirrorRecordOperation::stage(
+            relationship(),
             SyncMirrorIntent::Reconcile,
-        )));
+        ));
         let staged = record(SyncMirrorIntent::Delete);
         assert_eq!(operation.next(values(Some(&staged))), Ok(Next::Done(())));
     }
@@ -266,11 +263,13 @@ mod tests {
             rollback: true,
             ..record(SyncMirrorIntent::Delete)
         };
-        let next = record(SyncMirrorIntent::Delete);
-        let mut operation = reading(MirrorRecordOperation::store(next.clone()));
+        let mut operation = reading(MirrorRecordOperation::stage(
+            relationship(),
+            SyncMirrorIntent::Delete,
+        ));
         let expected = SyncMirrorRecord {
             rollback: true,
-            ..next
+            ..SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Delete, NOW)
         };
         assert_eq!(operation.next(values(Some(&claimed))), Ok(write(&expected)));
     }

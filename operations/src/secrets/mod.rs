@@ -6,6 +6,7 @@ pub mod node;
 pub mod owner;
 pub mod realm;
 
+use aruna_core::calls::IoCall;
 use aruna_core::errors::ConversionError;
 use aruna_core::secrets::widens_use;
 use aruna_core::secrets::{
@@ -23,6 +24,16 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::notifications::routing::{RoutingContext, route_resource_event};
+
+/// The wakes after a committed admin document change: the outbox drain, then the notice drain
+/// when it wrote notices. A missed timer leaves the rows to the next drain.
+fn drains(notices: bool) -> Vec<IoCall> {
+    let notice = notices.then(crate::notifications::outbox_record::schedule_drain_effect);
+    let outbox = crate::sync::outbox_record::schedule_drain_effect();
+    (std::iter::once(outbox).chain(notice))
+        .map(IoCall::from)
+        .collect()
+}
 
 /// One change a manager asks for. `expected` is an `If-Match` revision token.
 #[derive(Clone, Debug, PartialEq, Eq)]

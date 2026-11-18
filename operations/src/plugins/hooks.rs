@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{PluginRun, hook_key, hook_time_key};
 use ulid::Ulid;
 
@@ -91,8 +91,8 @@ impl Operation for AdmitHook {
     type Output = bool;
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<bool>, RunError> {

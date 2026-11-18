@@ -17,7 +17,6 @@ use aruna_core::structs::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
-use aruna_core::types::Value;
 use aruna_net::DocumentSyncService;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::sync::sync_quarantine::{
@@ -234,7 +233,7 @@ async fn capacity_blocks_releases() {
         .await
         .unwrap();
     assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
-    drive(AcknowledgeQuarantineOperation::new(oldest), &ctx)
+    drive(AcknowledgeQuarantineOperation::new(oldest.clone()), &ctx)
         .await
         .unwrap()
         .expect("row is acknowledged");

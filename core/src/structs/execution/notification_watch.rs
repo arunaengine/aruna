@@ -623,6 +623,11 @@ impl WatchInterestTable {
             .insert(node_id, entries);
     }
 
+    /// Takes one realm's node map out of the table; empty when the realm holds no interest.
+    pub fn take_realm(&mut self, realm_id: RealmId) -> HashMap<NodeId, Vec<WatchInterestEntry>> {
+        self.realms.remove(&realm_id).unwrap_or_default()
+    }
+
     /// Replaces the entire node map for a realm, dropping empty digests and the
     /// realm entry itself when nothing remains.
     pub fn set_realm(

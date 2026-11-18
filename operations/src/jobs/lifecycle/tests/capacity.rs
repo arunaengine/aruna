@@ -18,12 +18,13 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::lifecycle::launch_checks::pin_matches;
 use crate::jobs::lifecycle::reservation::{
     MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits,
 };
 use crate::jobs::lifecycle::stage::read_targets;
-use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
+use crate::jobs::lifecycle::target::{already_running, existing_receipt};
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::replication::protocol::BaoReadTarget;
 use crate::storage_read::iter_prefix_page;
@@ -234,7 +235,7 @@ async fn persists_receipt_first() {
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(
-        crate::jobs::store::state::read_job_record(&ctx.storage_handle, spec.job_id, None)
+        crate::jobs::store::state::read_job_record(&ctx, spec.job_id, None)
             .await
             .expect("physical row read")
             .is_some()

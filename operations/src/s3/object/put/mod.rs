@@ -1,43 +1,45 @@
-//! Runs the S3 PutObject state machine: quota and policy gates, blob write, head and version.
+//! Runs the S3 PutObject operation: quota and policy gates, blob write, head and version.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, release_row_effect,
-    write_head_effect, write_location_effect, write_version_effect,
-};
-use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
+use crate::blob::records::{HeadAliasContext, release_rows};
+use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_authority};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
-use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
 use crate::s3::purge_fence::{
-    PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+    PurgeFenceError, check_fence_row, check_published, fence_key, publication_rows,
 };
 use crate::s3::row_fence::{FenceError, RowFence};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
-use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
+use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite, WriteCleanup};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::managed_copy::{
-    CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
-    split_serve_reads, validate_registration,
+    CopyRegistration, CopyRequest, ManagedCopyError, register_entry, split_serve_reads,
+    validate_registration,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -45,6 +47,7 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
@@ -58,18 +61,18 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_core::structs::storage::replication_queue::build_live_obligation;
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
+};
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use bytes::Bytes;
-use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::plugin_runs::SourceEvent;
-use aruna_core::plugin_runs::journaled;
 use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
@@ -95,21 +98,20 @@ pub enum PutObjectState {
     /// Reads a distributed bucket's record: only the key's coordinator writes, at its epoch.
     ReadRecord,
     CheckPurgeWrite,
-    /// Reads the bucket's encryption settings, then its active key, to capture the seal plan.
+    /// Reads the bucket's encryption settings before any byte moves.
     ReadSealSettings,
     ReadSealKey,
     WriteBlob,
-    CleanupFailedWrite,
-    QueueCleanupRow,
+    /// Publishes the written bytes in the version transaction, run as a child.
+    Publish,
+    /// Writes the reconcile row of the written blob in the version transaction.
     WriteCleanupRow,
-    StartTransaction,
     CheckPurgeFence,
     CheckBucket,
-    /// Rereads the encryption settings in the version transaction against the captured plan.
+    /// Reads the bucket's encryption settings in the version transaction.
     CheckSealFence,
     FenceBackend,
     CheckHashLookup,
-    CreateBlobLocation,
     ReadObjectLookup,
     ReadLivenessVersion,
     WriteBlobHead,
@@ -119,47 +121,40 @@ pub enum PutObjectState {
     RegisterManagedCopy,
     WriteReplicationObligation,
     EnforceQuota,
-    QuotaRejectAbort,
     UpdateUsage,
-    /// Reads the row fence's guards or writes its receipts in the version transaction.
+    /// Checks the caller's guard rows and writes its receipts in the version transaction.
     RowFence,
-    CommitTransaction,
-    ReleaseReservation,
-    RegisterBlobDht,
-    CleanupDuplicate,
-    Finish,
+    /// The write failed; only the cleanup in `abort` remains.
     Error,
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
     /// Reads which key the rule recorded at the path of a same-name write.
     ReadPlainOwner,
-    /// Looks at the path of a same-name write before it is written.
+    /// Looks at the path of a same-name write before the bytes go there.
     StatPlain,
     WritePlainRecords,
-    /// Reads the import rule that the version's import rows belong to.
+    /// Reads the import rule in the version transaction.
     ReadImportRule,
-    /// Records what a write to an import folder will be before its bytes move.
+    /// Records what a plain write will be before its bytes reach the path.
     WriteIntent,
-    /// Syncs that intent to disk before the bytes move.
+    /// Syncs that record to disk before the write.
     SyncIntent,
-    /// Reads the version a history write registers, inside the version transaction.
+    /// Reads the version an import may have registered already.
     ReadHistory,
-    /// Deletes the write intents the committed version makes obsolete.
+    /// Deletes the intent records the committed version made obsolete.
     RetireIntents,
-    /// Deletes the intent of a write the provider refused before any byte moved.
+    /// Deletes the record of a write the provider refused before any byte moved.
     DropIntent,
     /// Syncs that delete to disk.
     SyncDroppedIntent,
     /// Records the hash of the written bytes in the write intent.
     WriteEvidence,
-    /// Drops the transaction of a write an import already registered.
-    AbortRegistered,
-    /// Reads the delete trail inside the version transaction.
+    /// Reads the delete trail of the key in the version transaction.
     ReadTrail,
-    /// Reads the group's import rules inside the version transaction.
+    /// Reads the group's import rules in the version transaction.
     ReadRules,
-    /// Reads which rules read a linked write's path, inside the version transaction.
+    /// Reads which rules read the written path, inside the version transaction.
     ReadReaders,
     /// Reads the current version and its file, which a re-upload of the same bytes reads too.
     ReadDedupHead,
@@ -237,6 +232,15 @@ pub enum PutObjectError {
     UsageRebuilding,
 }
 
+/// A refused call fails as its storage error; a lost conflict as the transaction conflict.
+impl From<IoError> for PutObjectError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn = Result<Next<PutObjectResult>, PutObjectError>;
+
 #[derive(Debug, PartialEq)]
 pub struct PutObjectInput {
     pub bucket: String,
@@ -268,6 +272,32 @@ pub struct PutObjectConfig {
     pub routing: RoutingSnapshot,
 }
 
+impl PutObjectConfig {
+    /// The settings without the body, which only the write that streams it needs.
+    fn without_body(&self) -> Self {
+        let request = &self.request;
+        Self {
+            user_id: self.user_id,
+            group_id: self.group_id,
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            request: PutObjectInput {
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                content_length: request.content_length,
+                body: None,
+            },
+            expected_checksums: self.expected_checksums.clone(),
+            checksum_type: self.checksum_type.clone(),
+            exists: self.exists,
+            version_source: self.version_source.clone(),
+            preassigned_version_id: self.preassigned_version_id,
+            quota_ceiling: self.quota_ceiling,
+            routing: self.routing.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PutObjectResult {
     pub location: BackendLocation,
@@ -276,16 +306,21 @@ pub struct PutObjectResult {
     pub replayed: bool,
 }
 
+/// Runs outside any transaction: the bytes are written first, then the version transaction
+/// runs as a second instance of this operation with `publishing` set, rebuilt after a lost
+/// conflict.
 #[derive(Debug, PartialEq)]
 pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
-    txn_id: Option<Ulid>,
+    /// This instance is the version transaction.
+    publishing: bool,
     conflicts: u8,
     version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
-    rollback_location: Option<BackendLocation>,
+    /// The written blob after a publish whose commit outcome is unknown.
+    reconcile_location: Option<BackendLocation>,
     cleanup: WriteCleanup<PutObjectError>,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
@@ -300,7 +335,8 @@ pub struct PutObjectOperation {
     create_only: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
-    output: Option<Result<BackendLocation, PutObjectError>>,
+    /// The location the version publishes.
+    output: Option<BackendLocation>,
     expected_bucket: Option<BucketInfo>,
     metadata: HashMap<String, String>,
     rocrate_limits: RoCrateLimits,
@@ -316,7 +352,6 @@ pub struct PutObjectOperation {
     /// Destination details of this node. Absent means no governed byte may be
     /// materialized here at all.
     gate_context: Option<GateContext>,
-    gate: Option<PolicyGateOperation>,
     /// What the gate decided on, re-read inside the version transaction.
     gated_bucket: Option<GatedBucket>,
     /// Refs of an existing preassigned version, checked against its registration
@@ -342,11 +377,9 @@ pub struct PutObjectOperation {
     /// Registers the version as history: the head and its generation stay as they are.
     keep_head: bool,
     /// The plain write that waits for its intent record.
-    pending_write: Option<Effects>,
+    pending_write: Option<IoCall>,
     /// The intent record of the plain write in flight.
-    written_intent: Vec<aruna_core::types::Key>,
-    /// The intent or hash write in flight, in one transaction with a read of its rule.
-    fence: Option<fenced::FencedWrite>,
+    written_intent: Vec<Key>,
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
@@ -356,6 +389,8 @@ pub struct PutObjectOperation {
     dedup_checked: bool,
     /// Set when the preassigned version already existed and the put only handed it back.
     replayed: bool,
+    /// An import registered the version with the same bytes, so nothing is written.
+    registered: bool,
     row_fence: Option<RowFence>,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     pub(super) set_hint: Option<SetHint>,
@@ -374,12 +409,12 @@ impl PutObjectOperation {
         PutObjectOperation {
             state: PutObjectState::Init,
             config,
-            txn_id: None,
+            publishing: false,
             conflicts: 0,
             version_id,
             written_location: None,
             cleanup_location: None,
-            rollback_location: None,
+            reconcile_location: None,
             cleanup: WriteCleanup::default(),
             existing_pointer: None,
             new_blob: false,
@@ -400,7 +435,6 @@ impl PutObjectOperation {
             inherited_policies: Vec::new(),
             version_origin: None,
             gate_context: None,
-            gate: None,
             gated_bucket: None,
             replay_policies: Vec::new(),
             replay_location: None,
@@ -418,13 +452,13 @@ impl PutObjectOperation {
             keep_head: false,
             pending_write: None,
             written_intent: Vec::new(),
-            fence: None,
             trail_scan: None,
             rule_scan: None,
             readers: sharing::ReaderScan::default(),
             dedup: None,
             dedup_checked: false,
             replayed: false,
+            registered: false,
             row_fence: None,
             set_hint: None,
             binding: None,
@@ -539,110 +573,18 @@ impl PutObjectOperation {
         self
     }
 
-    fn begin(&mut self) -> Effects {
-        let Some(version_id) = self.config.preassigned_version_id else {
-            return self.handle_init();
-        };
-        let key = match VersionKey::new(
-            self.config.request.bucket.clone(),
-            self.config.request.key.clone(),
-            version_id,
-        )
-        .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(error) => return self.emit_error(error.into()),
-        };
-        self.state = PutObjectState::ReadPreassignedVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })]
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
     }
 
-    fn handle_preassigned_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let Some(value) = value else {
-            return self.handle_init();
-        };
-        let version = match BlobVersion::from_bytes(value.as_ref()) {
-            Ok(version) => version,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let Some(location_key) = version.location_key() else {
-            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
-        };
-        self.replay_policies = version.placement_policies.clone();
-        self.state = PutObjectState::ReadPreassignedLocation;
-        smallvec![blob_location_read(&location_key, None)]
+    fn call(&mut self, state: PutObjectState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn handle_preassigned_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) = event
-        else {
-            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
-        };
-        let location = match BackendLocation::from_bytes(value.as_ref()) {
-            Ok(location) => location,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        if self.replay_policies.is_empty() {
-            return self.finish_replay(location);
-        }
-        // A governed replay may only hand back a copy this node registered.
-        let Some(version_id) = self.version_id else {
-            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
-        };
-        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
-        // The replay hands back bytes, so it answers the same question a serve
-        // does: is this copy registered *and* may this node serve at all.
-        let effect = match serve_reads(&key, None) {
-            Ok(effect) => effect,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        self.replay_location = Some(location);
-        self.state = PutObjectState::ReadPreassignedCopy;
-        smallvec![effect]
-    }
-
-    fn handle_preassigned_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let (value, subject) = match split_serve_reads(values) {
-            Ok(split) => split,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let (Some(version_id), Some(location)) = (self.version_id, self.replay_location.take())
-        else {
-            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
-        };
-        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
-        match validate_registration(
-            value.as_deref(),
-            &CopyRequest {
-                key: &key,
-                node_id: Some(self.config.node_id),
-                blake3: None,
-                refs: &self.replay_policies,
-                subject_generation: Some(subject.subject.generation),
-            },
-        ) {
-            Ok(_) => self.finish_replay(location),
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn finish_replay(&mut self, location: BackendLocation) -> Effects {
-        self.output = Some(Ok(location));
-        self.replayed = true;
-        self.state = PutObjectState::Finish;
-        smallvec![]
+    fn effect(&mut self, state: PutObjectState, effect: Effect) -> Turn {
+        self.call(state, effect.into())
     }
 
     fn version_key(&self, version_id: Ulid) -> VersionKey {
@@ -653,275 +595,267 @@ impl PutObjectOperation {
         )
     }
 
-    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
-        self.rocrate_limits = limits;
-        self
+    fn begin(&mut self) -> Turn {
+        let Some(version_id) = self.config.preassigned_version_id else {
+            return self.handle_init();
+        };
+        let key = self.version_key(version_id).to_bytes()?;
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, key);
+        self.call(PutObjectState::ReadPreassignedVersion, read)
+    }
+
+    fn handle_preassigned_version(&mut self, value: Option<Value>) -> Turn {
+        let Some(value) = value else {
+            return self.handle_init();
+        };
+        let version = BlobVersion::from_bytes(value.as_ref())?;
+        let location_key = version.location_key();
+        let location_key = location_key.ok_or(PutObjectError::InvalidPreassignedVersion)?;
+        self.replay_policies = version.placement_policies.clone();
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes());
+        self.call(PutObjectState::ReadPreassignedLocation, read)
+    }
+
+    fn handle_preassigned_location(&mut self, value: Option<Value>) -> Turn {
+        let value = value.ok_or(PutObjectError::InvalidPreassignedVersion)?;
+        let location = BackendLocation::from_bytes(value.as_ref())?;
+        if self.replay_policies.is_empty() {
+            return self.finish_replay(location);
+        }
+        // A governed replay may only hand back a copy this node registered.
+        let version_id = self.version_id;
+        let version_id = version_id.ok_or(PutObjectError::InvalidPreassignedVersion)?;
+        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
+        // The replay hands back bytes, so it answers the same question a serve
+        // does: is this copy registered *and* may this node serve at all.
+        let reads = vec![
+            (
+                MANAGED_COPY_KEYSPACE.to_string(),
+                key.to_bytes().map_err(ManagedCopyError::from)?.into(),
+            ),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+        ];
+        self.replay_location = Some(location);
+        self.call(PutObjectState::ReadPreassignedCopy, IoCall::Read(reads))
+    }
+
+    fn handle_preassigned_copy(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let (value, subject) = split_serve_reads(abe::keyed(&values))?;
+        let (Some(version_id), Some(location)) = (self.version_id, self.replay_location.take())
+        else {
+            return Err(PutObjectError::InvalidPreassignedVersion);
+        };
+        let key = ManagedCopyKey::new(self.version_key(version_id), location.backend.clone());
+        validate_registration(
+            value.as_deref(),
+            &CopyRequest {
+                key: &key,
+                node_id: Some(self.config.node_id),
+                blake3: None,
+                refs: &self.replay_policies,
+                subject_generation: Some(subject.subject.generation),
+            },
+        )?;
+        self.finish_replay(location)
+    }
+
+    fn finish_replay(&mut self, location: BackendLocation) -> Turn {
+        self.replayed = true;
+        let version_id = self.version_id.ok_or(PutObjectError::PutObjectFailed)?;
+        Ok(Next::Done(PutObjectResult {
+            location,
+            version_id,
+            replayed: true,
+        }))
     }
 
     /// The destination default is read before any byte moves, so the gate that
     /// admits this write sees the refs the version would actually carry.
-    fn handle_init(&mut self) -> Effects {
-        self.state = PutObjectState::ReadGateBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.config.request.bucket.as_bytes().into(),
-            txn_id: None,
-        })]
+    fn handle_init(&mut self) -> Turn {
+        let read = read_row(
+            S3_BUCKET_KEYSPACE,
+            self.config.request.bucket.as_bytes().to_vec(),
+        );
+        self.call(PutObjectState::ReadGateBucket, read)
     }
 
-    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let bucket = match value
-            .as_ref()
+    fn handle_gate_bucket(&mut self, value: Option<Value>) -> Turn {
+        let bucket = (value.as_ref())
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(bucket) => bucket,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let refs = match union_refs(
+            .transpose()?;
+        let refs = union_refs(
             &GatedBucket::observe(bucket.as_ref()).policies,
             &self.inherited_policies,
-        ) {
-            Ok(refs) => refs,
-            Err(error) => return self.emit_error(error.into()),
-        };
+        )?;
         self.gated_bucket = Some(
             GatedBucket::observe(bucket.as_ref())
                 .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
-        self.binding = bucket
-            .as_ref()
-            .and_then(|bucket| bucket.distribution.clone());
+        self.binding = (bucket.as_ref()).and_then(|bucket| bucket.distribution.clone());
         self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         // A planned id is minted before the write; inside a set it must already carry the hint.
         if let (Some(hint), Some(id)) = (self.set_hint, self.config.preassigned_version_id)
             && SetHint::of_version(id) != hint
         {
-            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+            return Err(PutObjectError::InvalidPreassignedVersion);
         }
-        let group_id = bucket
-            .as_ref()
-            .map_or(self.config.group_id, |bucket| bucket.group_id);
-        match write_gate(self.gate_context.as_ref(), &refs, Some(group_id)) {
-            Ok(None) => self.check_write_fence(),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
-                self.state = PutObjectState::PolicyGate;
-                match complete {
-                    true => self.finish_gate(),
-                    false => effects,
-                }
-            }
-            Err(error) => self.emit_error(error.into()),
+        let group_id = (bucket.as_ref()).map_or(self.config.group_id, |bucket| bucket.group_id);
+        match write_gate(self.gate_context.as_ref(), &refs, Some(group_id))? {
+            None => self.check_write_fence(),
+            Some(gate) => self.call(PutObjectState::PolicyGate, IoCall::child(gate)),
         }
     }
 
-    fn handle_policy_gate(&mut self, event: Event) -> Effects {
-        let Some(gate) = self.gate.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let effects = gate.step(event);
-        match gate.is_complete() {
-            true => self.finish_gate(),
-            false => effects,
-        }
+    fn gate_passed(&mut self, result: IoResult) -> Turn {
+        let outcome = result.child::<PolicyGateOutcome, ReadPolicyError>()?;
+        let outcome = outcome.map_err(PolicyGateError::from)?;
+        gate_decision(outcome)?;
+        self.check_write_fence()
     }
 
-    fn finish_gate(&mut self) -> Effects {
-        let Some(gate) = self.gate.take() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let outcome = match gate.finalize() {
-            Ok(outcome) => outcome,
-            Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
-        };
-        match gate_decision(outcome) {
-            Ok(()) => self.check_write_fence(),
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn check_write_fence(&mut self) -> Effects {
+    fn check_write_fence(&mut self) -> Turn {
         if let Some(binding) = self.binding.as_ref() {
-            self.state = PutObjectState::ReadRecord;
-            return smallvec![record_read(binding)];
+            let reads = IoCall::Read(authority_reads(binding.set_id));
+            return self.call(PutObjectState::ReadRecord, reads);
         }
         self.read_write_fence()
     }
 
-    fn record_checked(&mut self, event: Event) -> Effects {
-        let Some(binding) = self.binding.as_ref() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        match record_authority(binding, &self.config.request.key, event) {
-            Ok(authority) => {
-                self.version_epoch = authority.epoch;
-                self.authority = Some(authority);
-                self.read_write_fence()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn record_checked(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let binding = self.binding.as_ref();
+        let binding = binding.ok_or(PutObjectError::InvalidOperationState)?;
+        let answer = Event::Storage(StorageEvent::BatchReadResult {
+            values: abe::keyed(&values),
+        });
+        let authority = record_authority(binding, &self.config.request.key, answer)?;
+        self.version_epoch = authority.epoch;
+        self.authority = Some(authority);
+        self.read_write_fence()
     }
 
-    fn read_write_fence(&mut self) -> Effects {
-        self.state = PutObjectState::CheckPurgeWrite;
-        smallvec![write_fence_read(&self.config.request.bucket, None)]
+    fn read_write_fence(&mut self) -> Turn {
+        let read = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.config.request.bucket));
+        self.call(PutObjectState::CheckPurgeWrite, read)
     }
 
-    fn write_fence_checked(&mut self, event: Event) -> Effects {
-        match check_write_fence(event, &self.config.request.bucket, &self.config.request.key) {
-            Ok(()) => self.read_seal_settings(),
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn write_fence_checked(&mut self, value: Option<Value>) -> Turn {
+        let (bucket, key) = (&self.config.request.bucket, &self.config.request.key);
+        check_fence_row(value.as_deref(), bucket, key)?;
+        self.read_seal_settings()
     }
 
-    fn read_seal_settings(&mut self) -> Effects {
-        self.state = PutObjectState::ReadSealSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.config.request.bucket.as_bytes().into(),
-            txn_id: None,
-        })]
+    fn read_seal_settings(&mut self) -> Turn {
+        let read = read_row(
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.config.request.bucket.as_bytes().to_vec(),
+        );
+        self.call(PutObjectState::ReadSealSettings, read)
     }
 
     /// A plain bucket writes at once; an encrypting one first reads its active key record.
-    fn seal_settings_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let settings = match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => settings,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn seal_settings_read(&mut self, value: Option<Value>) -> Turn {
+        let settings = BucketEncryption::from_row(value.as_deref())?;
         let Some(key) = settings.active_key() else {
             return self.write_blob();
         };
         self.seal_settings = Some(settings);
-        self.state = PutObjectState::ReadSealKey;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            key: key.key().into(),
-            txn_id: None,
-        })]
+        let read = read_row(BUCKET_KEY_KEYSPACE, key.key());
+        self.call(PutObjectState::ReadSealKey, read)
     }
 
-    fn seal_key_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let Some(settings) = self.seal_settings.take() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
+    fn seal_key_read(&mut self, value: Option<Value>) -> Turn {
+        let settings = self.seal_settings.take();
+        let settings = settings.ok_or(PutObjectError::InvalidOperationState)?;
         let record = match value.map(|value| BucketKeyRecord::from_bytes(value.as_ref())) {
-            Some(Ok(record)) => record,
-            Some(Err(error)) => return self.emit_error(error.into()),
-            None => return self.emit_error(seal_error(BucketKeyError::Unsupported)),
+            Some(record) => record?,
+            None => return Err(seal_error(BucketKeyError::Unsupported)),
         };
-        match SealPlan::capture(&settings, &record) {
-            Ok(plan) => {
-                self.seal_plan = plan;
-                if self.seal_plan.is_none()
-                    || self.adopt.is_some()
-                    || !self.envelope_enabled
-                    || self.origin != CopyOrigin::Write
-                    || self.config.preassigned_version_id.is_some()
-                {
-                    self.write_blob()
-                } else {
-                    self.read_abe(false)
-                }
-            }
-            Err(error) => self.emit_error(seal_error(error)),
+        self.seal_plan = SealPlan::capture(&settings, &record).map_err(seal_error)?;
+        if self.seal_plan.is_none()
+            || self.adopt.is_some()
+            || !self.envelope_enabled
+            || self.origin != CopyOrigin::Write
+            || self.config.preassigned_version_id.is_some()
+        {
+            self.write_blob()
+        } else {
+            self.read_abe(false)
         }
     }
 
-    fn write_blob(&mut self) -> Effects {
+    fn write_blob(&mut self) -> Turn {
         // Resolution runs before any bytes move; a failure is terminal.
-        let resolved = match resolve_backend(
+        let resolved = resolve_backend(
             &self.config.routing,
             &self.config.request.bucket,
             &self.config.request.key,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => return self.emit_error(error.into()),
-        };
+        )?;
         let resolved = resolved.with_encryption(self.seal_plan);
-        if let Some(location) = self.config_adopt() {
+        if let Some(location) = self.adopt.take() {
             // Separate encrypted writes never share an archive.
             if self.seal_plan.is_some() {
-                return self.emit_error(PutObjectError::WriteFailed(
+                return Err(PutObjectError::WriteFailed(
                     "an encrypting bucket does not adopt another blob".to_string(),
                 ));
             }
             // Imported bytes stay on the backend they were found on.
             if location.backend != resolved.backend && !location.is_external() {
-                return self.emit_error(PutObjectError::WriteFailed(
+                return Err(PutObjectError::WriteFailed(
                     "the adopted blob sits on another backend".to_string(),
                 ));
             }
             if location.format.encoding().setting() != EncodingClass::from(resolved.compression) {
-                return self.emit_error(PutObjectError::WriteFailed(
+                return Err(PutObjectError::WriteFailed(
                     "the adopted blob uses another encoding".to_string(),
                 ));
             }
             self.adopted = true;
             self.written_location = Some(location);
-            self.state = PutObjectState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
+            return self.start_publish();
         }
         if let Some(target) = self.plain_target(&resolved) {
             return self.start_plain(target, resolved);
         }
         // A mapped bucket stores every key 1:1 or not at all.
         if self.config.routing.mapped(&self.config.request.bucket) {
-            return self.emit_error(PutObjectError::Unmapped);
+            return Err(PutObjectError::Unmapped);
         }
-        self.state = PutObjectState::WriteBlob;
-        if let Some(blob) = self.config.request.body.take() {
-            if let Some(plan) = self.envelope_plan.clone() {
-                return smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
-                    aruna_core::structs::storage::abe::AbeEffect::Write {
-                        plan,
-                        resolved,
-                        bucket: self.config.request.bucket.clone(),
-                        key: self.config.request.key.clone(),
-                        created_by: self.config.user_id,
-                        blob,
-                        size: self.config.request.content_length,
-                    }
-                )))];
-            }
-            smallvec![Effect::Blob(BlobEffect::Write {
+        let blob = self.config.request.body.take();
+        let blob = blob.ok_or(PutObjectError::MissingBody)?;
+        let write = match self.envelope_plan.clone() {
+            Some(plan) => BlobEffect::Abe(Box::new(
+                aruna_core::structs::storage::abe::AbeEffect::Write {
+                    plan,
+                    resolved,
+                    bucket: self.config.request.bucket.clone(),
+                    key: self.config.request.key.clone(),
+                    created_by: self.config.user_id,
+                    blob,
+                    size: self.config.request.content_length,
+                },
+            )),
+            None => BlobEffect::Write {
                 bucket: self.config.request.bucket.clone(),
                 key: self.config.request.key.clone(),
                 resolved,
                 created_by: self.config.user_id,
                 blob,
                 size: self.config.request.content_length,
-            })]
-        } else {
-            self.emit_error(PutObjectError::MissingBody)
-        }
+            },
+        };
+        self.effect(PutObjectState::WriteBlob, Effect::Blob(write))
     }
 
-    fn config_adopt(&mut self) -> Option<BackendLocation> {
-        self.adopt.take()
-    }
-
-    fn handle_write_finished(&mut self, event: Event) -> Effects {
+    fn handle_write_finished(&mut self, event: Event) -> Turn {
         let location = match event {
             Event::Blob(BlobEvent::Abe(event)) => {
                 let aruna_core::structs::storage::abe::AbeEvent::Written { location, envelope } =
                     *event
                 else {
-                    return self.emit_error(PutObjectError::InvalidOperationState);
+                    return Err(PutObjectError::InvalidOperationState);
                 };
                 self.envelope = Some(envelope);
                 location
@@ -941,1018 +875,122 @@ impl PutObjectOperation {
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
-                return self.cleanup_failed_write(PutObjectError::WriteFailed(message));
+                return Err(PutObjectError::WriteFailed(message));
             }
             Event::Blob(BlobEvent::Error(error @ BlobError::WriteCleanup { .. })) => {
                 if let BlobError::WriteCleanup { location, .. } = &error {
                     self.written_location = Some(location.clone());
                 }
-                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
+                return Err(PutObjectError::BlobWriteFailed(error));
             }
             Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.drop_intent(),
             Event::Blob(BlobEvent::Error(error)) => {
-                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
+                return Err(PutObjectError::BlobWriteFailed(error));
             }
-            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+            _ => return Err(PutObjectError::InvalidOperationState),
         };
         self.written_location = Some(location.clone());
 
         // Check if the body was fully written
-        if self
-            .config
-            .request
-            .content_length
+        if (self.config.request.content_length)
             .is_some_and(|expected| location.blob_size != expected)
         {
-            return self.cleanup_failed_write(PutObjectError::IncompleteBody);
+            return Err(PutObjectError::IncompleteBody);
         }
 
         for expected in &self.config.expected_checksums {
             let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
-                return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
+                return Err(PutObjectError::MissingExpectedChecksum(
                     expected.algorithm.s3_name(),
                 ));
             };
-
             if actual != &expected.digest {
-                return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
+                return Err(PutObjectError::ChecksumMismatch(
                     expected.algorithm.s3_name(),
                 ));
             }
         }
-        if let Some(effects) = self.write_evidence() {
-            return effects;
+        if let Some(turn) = self.write_evidence() {
+            return turn;
         }
-        self.start_transaction()
+        self.start_publish()
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.state = PutObjectState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
-            self.txn_id = Some(txn_id);
-            self.state = PutObjectState::CheckPurgeFence;
-            let authority = self.authority.as_ref();
-            smallvec![publication_read(
-                &self.config.request.bucket,
-                authority,
-                self.txn_id
-            )]
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn fence_checked(&mut self, event: Event) -> Effects {
-        let request = &self.config.request;
-        if let Err(error) = check_publication(
-            event,
-            &request.bucket,
-            &request.key,
-            self.authority.as_ref(),
-        ) {
-            return self.cleanup_failed_write(error.into());
-        }
-        // Read unconditionally: the version snapshots the default this
-        // transaction observes, not one read before the bytes streamed.
-        self.state = PutObjectState::CheckBucket;
-        smallvec![drift_reads(&self.config.request.bucket, self.txn_id)]
-    }
-
-    fn start_fence(&mut self) -> Effects {
-        let Some(location) = self.get_written_location() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        match fence_backend(&location.backend, self.txn_id) {
-            Some(effect) => {
-                self.state = PutObjectState::FenceBackend;
-                smallvec![effect]
-            }
-            None => self.start_hash_lookup(),
-        }
-    }
-
-    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
-        match check_fence(event) {
-            Ok(()) => self.start_hash_lookup(),
-            Err(error) => self.cleanup_failed_write(error.into()),
-        }
-    }
-
-    fn handle_bucket_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let (current, subject) = match split_drift_reads(values) {
-            Ok(split) => split,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        if self.expected_bucket.is_some()
-            && (current.as_ref().map(BucketInfo::identity)
-                != self.expected_bucket.as_ref().map(BucketInfo::identity)
-                || current
-                    .as_ref()
-                    .is_none_or(|bucket| bucket.group_id != self.config.group_id))
-        {
-            return self.emit_error(StorageError::TransactionConflict.into());
-        }
-        // The refs the version commits must be the refs the gate admitted: a
-        // default changed while the bytes streamed was never evaluated.
-        let observed = GatedBucket::observe(current.as_ref());
-        if let Some(gated) = self.gated_bucket.as_ref() {
-            if !gated.matches(&observed) {
-                return self.emit_error(PolicyGateError::Drift.into());
-            }
-            if let Err(error) = gated.check_subject(subject.as_ref()) {
-                return self.emit_error(error.into());
-            }
-        }
-        // A copy encoded under an older setting is never published: the bucket's
-        // migration may already have passed this key.
-        let written = self
-            .get_written_location()
-            .map(|location| location.format.encoding().setting());
-        if self.seal_plan.is_none()
-            && current
-                .as_ref()
-                .zip(written)
-                .is_some_and(|(bucket, written)| EncodingClass::from(bucket.compression) != written)
-        {
-            return self.emit_error(StorageError::TransactionConflict.into());
-        }
-        self.bucket_policies = observed.policies;
-        self.state = PutObjectState::CheckSealFence;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.config.request.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    /// A copy sealed under an older plan, or plain bytes for a bucket that now encrypts, is
-    /// never published.
-    fn seal_fence_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let settings = match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => settings,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let written = self
-            .get_written_location()
-            .map(|location| location.format.bucket_key());
-        let current = match self.seal_plan {
-            Some(plan) if written != Some(Some(plan.key)) => Err(BucketKeyError::Unsupported),
-            Some(plan) => plan.still_current(&settings),
-            None if settings.is_encrypted() => Err(BucketKeyError::StaleGeneration {
-                requested: 0,
-                current: settings.key_generation,
-            }),
-            None => Ok(()),
-        };
-        match current {
-            Ok(()) if self.envelope.is_some() => self.read_abe(true),
-            Ok(()) => self.start_fence(),
-            Err(error) => self.emit_error(seal_error(error)),
-        }
-    }
-
-    /// Looks up only the copy on the backend this write resolved to, so
-    /// identical content on another backend never overrides the placement.
-    fn start_hash_lookup(&mut self) -> Effects {
-        if let Some(effects) = self.read_current() {
-            return effects;
-        }
-        self.state = PutObjectState::CheckHashLookup;
-        let Some(written_location) = self.get_written_location() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let Some(blake3_hash) = written_location.get_blake3() else {
-            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-        };
-        let key = match BlobLocationKey::from_blake3(
-            blake3_hash,
-            written_location.format.encoding(),
-            written_location.backend.clone(),
-        ) {
-            Ok(key) => key,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        smallvec![blob_location_read(&key, self.txn_id)]
-    }
-
-    fn hash_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-
-        let Some(written_location) = self.get_written_location().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-
-        match value {
-            Some(value) => {
-                let existing_location = match BackendLocation::from_bytes(value.as_ref()) {
-                    Ok(location) => location,
-                    Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-                };
-
-                if !self.adopted && existing_location != written_location {
-                    self.cleanup_location = Some(written_location);
-                }
-                self.output = Some(Ok(existing_location));
-                self.create_blob_location()
-            }
-            None => {
-                self.new_blob = true;
-                self.output = Some(Ok(written_location.clone()));
-                self.create_blob_location()
-            }
-        }
-    }
-
-    fn create_blob_location(&mut self) -> Effects {
-        self.state = PutObjectState::CreateBlobLocation;
-        let Some(location) = self.get_output().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-        };
-
-        let effect = match write_location_effect(
-            match blake3_hash.try_into() {
-                Ok(hash) => hash,
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err.into())),
-            },
-            location,
-            self.txn_id,
-        ) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-        };
-        smallvec![effect]
-    }
-
-    fn alias_context(&self) -> HeadAliasContext {
-        HeadAliasContext::new(
-            self.config.realm_id,
-            self.config.group_id,
-            self.config.node_id,
-            self.config.request.bucket.clone(),
-            self.config.request.key.clone(),
-        )
-    }
-
-    fn create_object_lookup(&mut self) -> Effects {
-        let Some(_output) = self.get_output().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-
-        self.state = PutObjectState::ReadObjectLookup;
-        let key = match BlobHeadKey::new(
-            self.config.request.bucket.clone(),
-            self.config.request.key.clone(),
-        )
-        .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-        };
-
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn object_lookup_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-
-        let existing = match value
-            .as_ref()
-            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(existing) => existing,
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-        };
-        if let Some(expected) = self.expected_head
-            && existing.as_ref().map(|pointer| pointer.version_id) != expected
-        {
-            return self.emit_error(PutObjectError::HeadChanged);
-        }
-        self.existing_pointer = existing;
-        let existing_pointer = self.existing_pointer.clone();
-        if let Some(pointer) = existing_pointer.as_ref() {
-            let key = match VersionKey::new(
-                self.config.request.bucket.clone(),
-                self.config.request.key.clone(),
-                pointer.version_id,
-            )
-            .to_bytes()
-            {
-                Ok(key) => key.into(),
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-            };
-            self.state = PutObjectState::ReadLivenessVersion;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key,
-                txn_id: self.txn_id,
-            })];
-        }
-        self.write_current_lookup(existing_pointer.as_ref())
-    }
-
-    fn liveness_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-
-        let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
-        self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
-        let request = &self.config.request;
-        // A history write leaves the head charged as it is.
-        self.released_bytes = head
-            .filter(|_| !self.keep_head)
-            .and_then(|version| version.offered_size(&request.bucket, &request.key))
-            .unwrap_or(0);
-        if self.create_only && self.was_live {
-            return self.emit_error(PutObjectError::ObjectExists);
-        }
-
-        let existing_pointer = self.existing_pointer.clone();
-        self.write_current_lookup(existing_pointer.as_ref())
-    }
-
-    fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
+    /// Hands the state the version transaction needs to a fresh child; the parent keeps its
+    /// own copy, so a lost conflict runs the transaction again from the same state.
+    fn publish_child(&mut self) -> Self {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
             .get_or_insert_with(|| mint_version(set_hint));
-        // An import may register a listed write's version before the write commits it.
-        if self.keep_head || self.listed_write() {
-            return self.read_history(version_id);
-        }
-        self.write_head(existing, version_id)
+        let mut child = Self::new(self.config.without_body());
+        child.publishing = true;
+        child.state = PutObjectState::CheckPurgeFence;
+        child.version_id = Some(version_id);
+        child.written_location = self.written_location.clone();
+        child.adopted = self.adopted;
+        child.create_only = self.create_only;
+        child.expected_bucket = self.expected_bucket.clone();
+        child.metadata = self.metadata.clone();
+        child.rocrate_limits = self.rocrate_limits.clone();
+        child.restrictions = self.restrictions.clone();
+        child.inherited_policies = self.inherited_policies.clone();
+        child.version_origin = self.version_origin.clone();
+        child.gated_bucket = self.gated_bucket.clone();
+        child.origin = self.origin;
+        child.seal_plan = self.seal_plan;
+        child.envelope = self.envelope.clone();
+        child.plain = self.plain.clone();
+        child.expected_head = self.expected_head;
+        child.import_rows = self.import_rows.clone();
+        child.keep_head = self.keep_head;
+        child.written_intent = self.written_intent.clone();
+        child.trail_scan = self.trail_scan.clone();
+        child.rule_scan = self.rule_scan.clone();
+        child.row_fence = self.row_fence.clone();
+        child.set_hint = self.set_hint;
+        child.binding = self.binding.clone();
+        child.authority = self.authority.clone();
+        child.version_epoch = self.version_epoch;
+        child
     }
 
-    pub(super) fn write_head(
-        &mut self,
-        existing: Option<&CurrentVersionPointer>,
-        version_id: Ulid,
-    ) -> Effects {
-        let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => stamp_head(pointer, self.binding.as_ref(), self.version_epoch),
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+    fn start_publish(&mut self) -> Turn {
+        let child = self.publish_child();
+        self.call(PutObjectState::Publish, IoCall::child(child))
+    }
+
+    /// A lost conflict publishes again with the bytes already written; a refused publish
+    /// rolls them back; one whose commit outcome is unknown leaves them to reconciliation.
+    fn published(&mut self, result: IoResult) -> Turn {
+        let error = match result.child::<PutObjectResult, PutObjectError>()? {
+            Ok(result) => return Ok(Next::Done(result)),
+            Err(error) => error,
         };
-        self.head_pointer = Some(pointer.clone());
-        let effect = match write_head_effect(&self.alias_context(), pointer, self.txn_id) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        self.state = PutObjectState::Error;
+        let PutObjectError::StorageError(storage) = &error else {
+            return Err(error);
         };
-
-        self.state = PutObjectState::WriteBlobHead;
-        smallvec![effect]
-    }
-
-    /// A concurrent registration of the same version makes this transaction conflict.
-    fn read_history(&mut self, version_id: Ulid) -> Effects {
-        let key = match self.version_key(version_id).to_bytes() {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-        };
-        self.state = PutObjectState::ReadHistory;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn history_read(&mut self, event: Event) -> Effects {
-        let value = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
-            _ => return self.emit_error(PutObjectError::InvalidOperationState),
-        };
-        let Some(value) = value else {
-            if self.keep_head {
-                return self.write_path_index();
-            }
-            let Some(txn_id) = self.txn_id else {
-                return self.emit_error(PutObjectError::NoTransactionFound);
-            };
-            if self.trail_scan.as_ref().is_none_or(|scan| scan.writer) {
-                return self.writer_trail(txn_id);
-            }
-            let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
-            let Some(version_id) = version_id else {
-                return self.emit_error(PutObjectError::PutObjectFailed);
-            };
-            return self.write_head(existing.as_ref(), version_id);
-        };
-        // A listed write an import already registered with the same bytes is done: it is not
-        // charged or moved again. Other content under its version id is a conflict.
-        let stored = BlobVersion::from_bytes(value.as_ref()).ok();
-        let hash = stored.as_ref().and_then(|version| version.blob_hash());
-        let written = self.get_output().and_then(|location| location.get_blake3());
-        if self.keep_head || hash.is_none() || hash.map(|hash| &hash[..]) != written {
-            return self.emit_error(PutObjectError::VersionExists);
+        if *storage == StorageError::TransactionConflict && self.conflicts < CONFLICT_RETRIES {
+            self.conflicts += 1;
+            return self.start_publish();
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        self.state = PutObjectState::AbortRegistered;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        if !storage.proves_no_commit() {
+            self.keep_written_blob(storage);
+        }
+        Err(error)
     }
 
-    /// The registered version stays as the import committed it.
-    fn registered_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
-                self.txn_id = None;
-                self.after_commit()
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn location_created(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.create_object_lookup()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn head_written(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.write_path_index()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn write_path_index(&mut self) -> Effects {
-        let Some(location) = self.get_output().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-        };
-        let effect = match add_index_effect(
-            &self.alias_context(),
-            match blake3_hash.try_into() {
-                Ok(hash) => hash,
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err.into())),
-            },
-            match self.version_id {
-                Some(version_id) => version_id,
-                None => return self.emit_error(PutObjectError::PutObjectFailed),
-            },
-            self.txn_id,
-        ) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-        };
-        self.state = PutObjectState::WritePathIndex;
-        smallvec![effect]
-    }
-
-    fn path_index_created(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            let Some(version_id) = self.version_id else {
-                return self.emit_error(PutObjectError::PutObjectFailed);
-            };
-            let Some(output) = self.get_output().cloned() else {
-                return self.emit_error(PutObjectError::MissingOutput);
-            };
-            let Some(blake3_hash) = output.get_blake3() else {
-                return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-            };
-            let version_created_at = UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms());
-            // A deduplicated location keeps its first writer; the version keeps its own.
-            let created_by = self
-                .get_written_location()
-                .map_or(output.created_by, |written| written.created_by);
-            let version = BlobVersion::materialized(
-                match blake3_hash.try_into() {
-                    Ok(hash) => hash,
-                    Err(err) => {
-                        return self.emit_error(PutObjectError::ConversionError(err.into()));
-                    }
-                },
-                output.backend.clone(),
-                output.format.encoding(),
-                version_created_at,
-                created_by,
-                self.config.version_source.clone(),
-            )
-            .with_metadata(self.metadata.clone())
-            .with_origin(Some(self.version_origin.clone().unwrap_or(
-                match self.config.version_source {
-                    Some(_) => VersionOrigin::Source { job_id: None },
-                    None => VersionOrigin::Upload {
-                        node_id: self.config.node_id,
-                        device: None,
-                        client: None,
-                    },
-                },
-            )));
-            let version = match version.with_policies(self.effective_policies()) {
-                Ok(version) => version,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            let version_key = VersionKey::new(
-                self.config.request.bucket.clone(),
-                self.config.request.key.clone(),
-                version_id,
-            );
-            let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
-            let version = stamp_version(
-                version,
-                self.binding.as_ref(),
-                generation,
-                self.version_epoch,
-            );
-            self.stored_policies = version.placement_policies.clone();
-            self.version_epoch = version.original_epoch;
-            let effect = match write_version_effect(&version_key, &version, self.txn_id) {
-                Ok(effect) => effect,
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-            };
-            let release = match release_row_effect(&version_key, &version, self.txn_id) {
-                Ok(release) => release,
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-            };
-            self.state = PutObjectState::CreateVersionRecord;
-            let config = &self.config;
-            let uploaded = SourceEvent::data_uploaded(
-                (config.realm_id, config.group_id, config.node_id),
-                (&config.request.bucket, &config.request.key),
-                version_id,
-                unix_timestamp_millis(),
-            );
-            let effect = match (effect, release) {
-                // A tagged release crate commits its release row with the version.
-                (
-                    Effect::Storage(StorageEffect::Write {
-                        key_space,
-                        key,
-                        value,
-                        txn_id,
-                    }),
-                    Some(Effect::Storage(StorageEffect::BatchWrite { writes: rows, .. })),
-                ) => Effect::Storage(StorageEffect::BatchWrite {
-                    writes: [vec![(key_space, key, value)], rows].concat(),
-                    txn_id,
-                }),
-                (effect, _) => effect,
-            };
-            match journaled(effect, &uploaded) {
-                Ok(effect) => smallvec![effect],
-                Err(err) => self.emit_error(PutObjectError::ConversionError(err)),
-            }
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn version_created(&mut self, event: Event) -> Effects {
-        if let Event::Storage(
-            StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
-        ) = event
-        {
-            self.store_envelope()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    /// A Pithos archive records its owning version in the version transaction, so cleanup
-    /// never frees an archive a committed version uses.
-    fn write_copy_owner(&mut self) -> Effects {
-        let (Some(version_id), Some(location)) = (self.version_id, self.get_output()) else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        if location.format.bucket_key().is_none() {
-            return self.register_managed_copy();
-        }
-        let version = VersionKey::new(
-            self.config.request.bucket.clone(),
-            self.config.request.key.clone(),
-            version_id,
-        );
-        let owner = CopyOwner::new(ArchiveKey::of(location), version);
-        match owner_write_effect(&owner, self.txn_id) {
-            Ok(effect) => {
-                self.state = PutObjectState::WriteCopyOwner;
-                smallvec![effect]
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn copy_owner_written(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.register_managed_copy()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    /// Joins the version transaction, so the copy becomes serveable exactly when
-    /// the logical version does and never before.
-    fn register_managed_copy(&mut self) -> Effects {
-        let Some(version_id) = self.version_id else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
-        let Some(location) = self.get_output().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let effect = match register_effect(
-            CopyRegistration {
-                version: VersionKey::new(
-                    self.config.request.bucket.clone(),
-                    self.config.request.key.clone(),
-                    version_id,
-                ),
-                node_id: self.config.node_id,
-                location: &location,
-                policies: &self.stored_policies,
-                origin: self.origin,
-                subject_generation: self.stored_subject(),
-                registered_at_ms: version_id.timestamp_ms(),
-            },
-            self.txn_id,
-        ) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = PutObjectState::RegisterManagedCopy;
-        smallvec![effect]
-    }
-
-    fn handle_copy_registered(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            if self.keep_head {
-                return self.charge_usage();
-            }
-            self.write_obligation()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn write_obligation(&mut self) -> Effects {
-        let Some(version_id) = self.version_id else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
-        let effect = match build_live_obligation(
-            self.config.node_id,
-            AuthContext {
-                user_id: self.config.user_id,
-                realm_id: self.config.realm_id,
-                path_restrictions: self.restrictions.clone(),
-                session: None,
-            },
-            self.config.request.bucket.clone(),
-            self.config.request.key.clone(),
-            version_id,
-            false,
-            self.txn_id,
-        ) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = PutObjectState::WriteReplicationObligation;
-        smallvec![effect]
-    }
-
-    fn obligation_written(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.charge_usage()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn charge_usage(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let Some(location) = self.get_output().cloned() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let size = i128::from(location.blob_size);
-        let group_delta = UsageDelta {
-            objects: if self.was_live || self.keep_head {
-                0
-            } else {
-                1
-            },
-            logical_bytes: size + i128::from(self.envelope_bytes),
-            referenced_bytes: -i128::from(self.released_bytes),
-            ..Default::default()
-        };
-        let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
-            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-        };
-        let added = self.version_id.map(|version_id| AddedVersion {
-            version_id,
-            epoch: self.version_epoch,
-            generation: self.head_pointer.as_ref().map_or(0, |head| head.generation),
-            entry: VersionEntry {
-                marker: false,
-                size: location.blob_size,
-                referenced: false,
-                identity: location
-                    .get_blake3()
-                    .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
-                pending: false,
-                searchable: searchable(&self.metadata),
-            },
-        });
-        let head = self.head_pointer.is_some();
-        let key = &self.config.request.key;
-        let inventory =
-            added.and_then(|added| version_written(self.binding.as_ref(), key, added, head));
-        self.usage_update = Some(
-            UsageCounterUpdate::with_stored(self.config.group_id, group_delta, stored)
-                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion)
-                .with_inventory(inventory),
-        );
-
-        // Enforce the hard quota before counters commit; only a
-        // positive logical delta can breach it, so deletes pass.
-        let charged = location.blob_size.saturating_add(self.envelope_bytes);
-        if let Some(ceiling) = self.config.quota_ceiling
-            && charged > 0
-        {
-            let mut gate = QuotaGate::new_for_realm(
-                ceiling,
-                charged,
-                self.config.group_id,
-                self.config.node_id,
-                self.config.realm_id,
-            );
-            self.state = PutObjectState::EnforceQuota;
-            let effects = gate.start(txn_id);
-            self.quota_gate = Some(gate);
-            effects
-        } else {
-            self.start_usage_update(txn_id)
-        }
-    }
-
-    fn start_usage_update(&mut self, txn_id: Ulid) -> Effects {
-        self.state = PutObjectState::UpdateUsage;
-        match self.usage_update.as_mut() {
-            Some(update) => update.start(txn_id),
-            None => self.emit_error(PutObjectError::PutObjectFailed),
-        }
-    }
-
-    fn handle_enforce_quota(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let Some(gate) = self.quota_gate.as_mut() else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
-        match gate.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => {
-                if gate.is_rebuilding() {
-                    self.cleanup.set_error(PutObjectError::UsageRebuilding);
-                    self.reject_over_quota()
-                } else if gate.is_exceeded() {
-                    self.cleanup.set_error(PutObjectError::QuotaExceeded {
-                        limit: gate.ceiling(),
-                        usage: gate.projected_usage(),
-                    });
-                    self.reject_over_quota()
-                } else {
-                    self.start_usage_update(txn_id)
-                }
-            }
-            Err(err) => {
-                self.cleanup.set_error(err.into());
-                self.reject_over_quota()
-            }
-        }
-    }
-
-    /// Unwinds the pending write after quota/accounting failure: aborts the open
-    /// transaction, then deletes the orphaned blob, before surfacing the error.
-    fn reject_over_quota(&mut self) -> Effects {
-        self.state = PutObjectState::QuotaRejectAbort;
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => self.cleanup_orphan_blob(),
-        }
-    }
-
-    fn abort_quota_reject(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => self.cleanup_orphan_blob(),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn cleanup_orphan_blob(&mut self) -> Effects {
-        self.rollback_written_blob()
-    }
-
-    /// Takes the location: once its delete is queued the rollback in `abort`
-    /// must not queue a second one. A copy stays behind so a delete that fails
-    /// can still be handed to the durable cleanup queue.
-    fn rollback_written_blob(&mut self) -> Effects {
-        self.state = PutObjectState::CleanupFailedWrite;
-        match self.written_location.take() {
-            // An adopted blob belongs to another version and stays.
-            Some(_) if self.adopted => self.emit_pending_error(),
-            Some(location) => {
-                self.rollback_location = Some(location.clone());
-                smallvec![Effect::Blob(BlobEffect::Delete { location })]
-            }
-            None => self.emit_pending_error(),
-        }
-    }
-
-    fn handle_usage_update(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let Some(update) = self.usage_update.as_mut() else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.write_cleanup_row(txn_id),
-            Err(err) => {
-                self.cleanup.set_error(err.into());
-                self.reject_over_quota()
-            }
-        }
-    }
-
-    fn write_cleanup_row(&mut self, txn_id: Ulid) -> Effects {
-        let next = match (self.row_fence.as_mut(), self.version_id) {
-            (Some(fence), Some(version_id)) => fence.next(txn_id, version_id),
-            (Some(_), None) => return self.emit_error(PutObjectError::InvalidOperationState),
-            (None, _) => None,
-        };
-        if let Some(effect) = next {
-            self.state = PutObjectState::RowFence;
-            return smallvec![effect];
-        }
-        if let Some(effects) = self.plain_records(txn_id) {
-            return effects;
-        }
-        if self.adopted {
-            self.state = PutObjectState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        let Some(location) = self.written_location.clone() else {
-            return self.emit_error(PutObjectError::MissingOutput);
-        };
-        let key = location.ulid.to_bytes().to_vec().into();
-        let work = match self.reconcile_work(location) {
-            Ok(work) => work,
-            Err(error) => return self.emit_error(error),
-        };
-        let value = match work.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        self.state = PutObjectState::WriteCleanupRow;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key,
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn fence_answered(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        match self.row_fence.as_mut().map(|fence| fence.answer(event)) {
-            Some(Ok(())) => self.write_cleanup_row(txn_id),
-            Some(Err(FenceError::Taken)) => self.emit_error(PutObjectError::FenceTaken),
-            Some(Err(FenceError::Storage(error))) => self.emit_error(error.into()),
-            Some(Err(FenceError::Unexpected)) | None => {
-                self.emit_error(PutObjectError::InvalidOperationState)
-            }
-        }
-    }
-
-    fn handle_cleanup_row(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.emit_error(PutObjectError::NoTransactionFound);
-                };
-                self.state = PutObjectState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.after_commit()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.txn_id = None;
-                if matches!(error, StorageError::TransactionConflict)
-                    && self.conflicts < CONFLICT_RETRIES
-                {
-                    return self.restart_after_conflict();
-                }
-                if error.proves_no_commit() {
-                    return self.cleanup_failed_write(PutObjectError::StorageError(error));
-                }
-                self.keep_written_blob(error)
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    /// The committed records own the blob now, so the rollback must not still hold it.
-    fn after_commit(&mut self) -> Effects {
-        let release_id = self.written_location.take().map(|location| location.ulid);
-        if let Some(id) = release_id {
-            self.cleanup.set_release(id);
-            self.state = PutObjectState::ReleaseReservation;
-            smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
-        } else {
-            self.register_blob()
-        }
-    }
-
-    /// A refused commit discarded its writes, so only the metadata segment
-    /// reopens: the blob is already on the backend and the version id is kept,
-    /// so the retry stays the same write instead of re-reading the body.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.txn_id = None;
-        self.existing_pointer = None;
-        self.was_live = false;
-        self.released_bytes = 0;
-        self.new_blob = false;
-        self.cleanup_location = None;
-        self.usage_update = None;
-        self.quota_gate = None;
-        self.output = None;
-        self.rule_exists = None;
-        if let Some(scan) = self.trail_scan.as_mut() {
-            scan.restart();
-        }
-        if let Some(scan) = self.rule_scan.as_mut() {
-            scan.restart();
-        }
-        self.readers = sharing::ReaderScan::default();
-        (self.dedup, self.dedup_checked) = (None, false);
-        if let Some(fence) = self.row_fence.as_mut() {
-            fence.restart();
-        }
-        self.state = PutObjectState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    /// A commit whose outcome is unknown may already own these bytes, so they go
-    /// to the reconciliation queue rather than being deleted or dropped: the
-    /// committed blob location row is what decides their fate.
-    fn keep_written_blob(&mut self, error: StorageError) -> Effects {
+    /// A commit whose outcome is unknown may already own these bytes, so they go to the
+    /// reconciliation queue rather than being deleted: the committed blob location row is
+    /// what decides their fate.
+    fn keep_written_blob(&mut self, error: &StorageError) {
         let Some(location) = self.written_location.take() else {
-            return self.emit_error(error.into());
+            return;
         };
         if self.adopted {
-            return self.emit_error(error.into());
+            return;
         }
-        let release_id = location.ulid;
         warn!(
             event = "put_object.commit_outcome_unknown",
             backend = %location.backend,
@@ -1960,13 +998,8 @@ impl PutObjectOperation {
             error = %error,
             "Queuing the written blob for reconciliation"
         );
-        self.cleanup.set_error(error.into());
-        self.cleanup.set_release(release_id);
-        let work = match self.reconcile_work(location) {
-            Ok(work) => work,
-            Err(_) => return self.release_or_error(),
-        };
-        self.queue_cleanup_work(work)
+        self.cleanup.set_release(location.ulid);
+        self.reconcile_location = Some(location);
     }
 
     fn reconcile_work(&self, location: BackendLocation) -> Result<BlobCleanupWork, PutObjectError> {
@@ -1987,182 +1020,29 @@ impl PutObjectOperation {
         })
     }
 
-    fn register_blob(&mut self) -> Effects {
-        let Some(location) = self.get_output().cloned() else {
-            return self.continue_after_registration();
+    /// A cleanup row written outside any transaction.
+    fn cleanup_row(work: &BlobCleanupWork) -> Option<IoCall> {
+        let key = match work {
+            BlobCleanupWork::ReconcileWrite { location, .. } => {
+                location.ulid.to_bytes().to_vec().into()
+            }
+            _ => Ulid::generate().to_bytes().to_vec().into(),
         };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.continue_after_registration();
-        };
-        // Distributed buckets are found through their content indexes, not the DHT.
-        if self.binding.is_some() {
-            return self.continue_after_registration();
-        }
-        self.state = PutObjectState::RegisterBlobDht;
-        match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
-            Ok(effect) => smallvec![effect],
-            Err(_) => self.continue_after_registration(),
-        }
-    }
-
-    fn blob_registered(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
-            | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
-            | Event::Net(NetEvent::Error(_)) => self.continue_after_registration(),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn continue_after_registration(&mut self) -> Effects {
-        if let Some(location) = self.cleanup_location.take() {
-            self.state = PutObjectState::CleanupDuplicate;
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.state = PutObjectState::Finish;
-            match self.dedup.is_some() {
-                true => smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()],
-                false => smallvec![schedule_snapshot_publish()],
+        match work.to_bytes() {
+            Ok(value) => Some(IoCall::Write(vec![(
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                key,
+                value.into(),
+            )])),
+            Err(error) => {
+                warn!(%error, "A put cleanup row could not be encoded");
+                None
             }
         }
-    }
-
-    fn handle_duplicate_cleanup(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.state = PutObjectState::Finish;
-                smallvec![schedule_snapshot_publish()]
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn emit_finish(&mut self) -> Effects {
-        self.state = PutObjectState::Finish;
-        smallvec![]
-    }
-
-    fn cleanup_failed_write(&mut self, error: PutObjectError) -> Effects {
-        self.cleanup.set_error(error);
-        self.rollback_written_blob()
-    }
-
-    fn write_cleanup_failed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) => {
-                self.rollback_location = None;
-                self.emit_pending_error()
-            }
-            // The bytes are still on the backend, and this operation is over;
-            // only a queued delete can still reach them.
-            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn queue_rollback_delete(&mut self) -> Effects {
-        let Some(location) = self.rollback_location.take() else {
-            return self.emit_pending_error();
-        };
-        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
-    }
-
-    /// Hands one row to the durable cleanup queue outside any transaction. The
-    /// row keeps the location until storage accepts it, so a refused write can
-    /// still be retried rather than losing the only record of the bytes.
-    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let Some(effect) = self.cleanup.queue(work) else {
-            return self.release_or_error();
-        };
-        self.state = PutObjectState::QueueCleanupRow;
-        smallvec![effect]
-    }
-
-    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        match self.cleanup.handle_queued(event) {
-            CleanupStep::Retry(effect) => smallvec![effect],
-            CleanupStep::Accepted => self.release_or_error(),
-            CleanupStep::Exhausted | CleanupStep::Closed => self.finish_or_error(),
-            CleanupStep::Invalid => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn release_or_error(&mut self) -> Effects {
-        let Some(effect) = self.cleanup.release_effect() else {
-            return self.finish_or_error();
-        };
-        self.state = PutObjectState::ReleaseReservation;
-        smallvec![effect]
-    }
-
-    /// Only a request that already carries an error fails here: a durable
-    /// commit whose reservation release was deferred still succeeds.
-    fn finish_or_error(&mut self) -> Effects {
-        if self.cleanup.error_pending() {
-            return self.emit_pending_error();
-        }
-        self.continue_after_registration()
-    }
-
-    /// The commit is durable, so a refused release must not fail the request.
-    /// The reconciliation row clears the reservation and registers the blob;
-    /// a duplicate copy is deleted by the cleanup the commit already planned.
-    fn defer_release(&mut self) -> Effects {
-        let Some(id) = self.cleanup.take_release() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        warn!(
-            event = "put_object.release_deferred",
-            release_id = %id,
-            "Queuing the blob reservation for reconciliation"
-        );
-        let Some(work) = self
-            .get_output()
-            .filter(|location| location.ulid == id)
-            .cloned()
-            .and_then(|location| self.reconcile_work(location).ok())
-        else {
-            return self.continue_after_registration();
-        };
-        self.queue_cleanup_work(work)
-    }
-
-    fn handle_release(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            if !self.cleanup.error_pending() {
-                return self.defer_release();
-            }
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        if self.cleanup.release_id() != Some(id) {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        }
-        self.cleanup.clear_release();
-        if self.cleanup.error_pending() {
-            self.emit_pending_error()
-        } else {
-            self.register_blob()
-        }
-    }
-
-    fn emit_pending_error(&mut self) -> Effects {
-        let Some(error) = self.cleanup.take_error() else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
-        self.emit_error(error)
-    }
-
-    /// The terminal state is complete, so the driver never calls `abort` for us;
-    /// rolling back here is what keeps an open transaction from outliving the
-    /// operation. `abort` takes what it releases, so it cannot run twice.
-    fn emit_error(&mut self, error: PutObjectError) -> Effects {
-        self.state = PutObjectState::Error;
-        self.output = Some(Err(error));
-        self.abort()
     }
 
     fn get_output(&self) -> Option<&BackendLocation> {
-        self.output.as_ref()?.as_ref().ok()
+        self.output.as_ref()
     }
 
     fn get_written_location(&self) -> Option<&BackendLocation> {
@@ -2170,919 +1050,174 @@ impl PutObjectOperation {
     }
 }
 
-impl EffectOperation for PutObjectOperation {
+impl Operation for PutObjectOperation {
     type Output = PutObjectResult;
     type Error = PutObjectError;
 
-    fn start(&mut self) -> Effects {
-        if self.state != PutObjectState::Init {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        } else {
-            self.begin()
+    fn first(&mut self) -> Turn {
+        match self.publishing {
+            true => self.read_publication(),
+            false => self.begin(),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Turn {
         match &self.state {
-            PutObjectState::Init => self.begin(),
-            PutObjectState::ReadPreassignedVersion => self.handle_preassigned_version(event),
-            PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
-            PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
-            PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
-            PutObjectState::PolicyGate => self.handle_policy_gate(event),
-            PutObjectState::ReadRecord => self.record_checked(event),
-            PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
-            PutObjectState::ReadSealSettings => self.seal_settings_read(event),
-            PutObjectState::ReadSealKey => self.seal_key_read(event),
-            PutObjectState::ReadAbe => self.abe_read(event, false),
-            PutObjectState::FenceAbe => self.abe_read(event, true),
-            PutObjectState::WriteEnvelope => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.write_copy_owner(),
-                _ => self.emit_error(PutObjectError::InvalidOperationState),
-            },
-            PutObjectState::WriteBlob => self.handle_write_finished(event),
-            PutObjectState::ReadPlainOwner => self.plain_owner(event),
-            PutObjectState::StatPlain => self.plain_stat(event),
-            PutObjectState::WritePlainRecords | PutObjectState::RetireIntents => {
-                self.plain_written(event)
+            PutObjectState::Init => self.first(),
+            PutObjectState::ReadPreassignedVersion => {
+                self.handle_preassigned_version(result.value()?)
             }
-            PutObjectState::ReadImportRule => self.import_rule_read(event),
-            PutObjectState::WriteIntent | PutObjectState::SyncIntent => self.intent_written(event),
-            PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
-                self.intent_dropped(event)
+            PutObjectState::ReadPreassignedLocation => {
+                self.handle_preassigned_location(result.value()?)
             }
-            PutObjectState::ReadTrail => self.trail_read(event),
-            PutObjectState::ReadRules => self.rules_read(event),
-            PutObjectState::ReadReaders => self.readers_read(event),
-            PutObjectState::WriteEvidence => self.evidence_written(event),
-            PutObjectState::AbortRegistered => self.registered_aborted(event),
-            PutObjectState::ReadHistory => self.history_read(event),
-            PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
-            PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
-            PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
-            PutObjectState::StartTransaction => self.handle_transaction_started(event),
-            PutObjectState::CheckPurgeFence => self.fence_checked(event),
-            PutObjectState::CheckBucket => self.handle_bucket_checked(event),
-            PutObjectState::CheckSealFence => self.seal_fence_checked(event),
-            PutObjectState::FenceBackend => self.handle_backend_fenced(event),
-            PutObjectState::CheckHashLookup => self.hash_checked(event),
+            PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(result.values()?),
+            PutObjectState::ReadGateBucket => self.handle_gate_bucket(result.value()?),
+            PutObjectState::PolicyGate => self.gate_passed(result),
+            PutObjectState::ReadRecord => self.record_checked(result.values()?),
+            PutObjectState::CheckPurgeWrite => self.write_fence_checked(result.value()?),
+            PutObjectState::ReadSealSettings => self.seal_settings_read(result.value()?),
+            PutObjectState::ReadSealKey => self.seal_key_read(result.value()?),
+            PutObjectState::ReadAbe => self.abe_read(result.values()?, false),
+            PutObjectState::FenceAbe => self.abe_read(result.values()?, true),
+            PutObjectState::WriteEnvelope => {
+                result.done()?;
+                self.write_copy_owner()
+            }
+            PutObjectState::WriteBlob => self.handle_write_finished(result.event()?),
+            PutObjectState::Publish => self.published(result),
+            PutObjectState::ReadPlainOwner => self.plain_owner(result.value()?),
+            PutObjectState::StatPlain => self.plain_stat(result.event()?),
+            PutObjectState::WritePlainRecords => {
+                result.done()?;
+                self.plain_written()
+            }
+            PutObjectState::RetireIntents => {
+                result.done()?;
+                self.finish_publish()
+            }
+            PutObjectState::ReadImportRule => self.import_rule_read(result.values()?),
+            PutObjectState::WriteIntent => self.intent_written(result),
+            PutObjectState::SyncIntent => self.intent_synced(result),
+            PutObjectState::DropIntent => {
+                result.done()?;
+                self.call(PutObjectState::SyncDroppedIntent, IoCall::Sync)
+            }
+            PutObjectState::SyncDroppedIntent => {
+                result.done()?;
+                self.written_intent.clear();
+                Err(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+            }
+            PutObjectState::ReadTrail => self.trail_read(result),
+            PutObjectState::ReadRules => self.rules_read(result.page()?),
+            PutObjectState::ReadReaders => self.readers_read(result.page()?),
+            PutObjectState::WriteEvidence => self.evidence_written(result),
+            PutObjectState::ReadHistory => self.history_read(result.value()?),
+            PutObjectState::WriteCleanupRow => {
+                result.done()?;
+                self.finish_publish()
+            }
+            PutObjectState::CheckPurgeFence => self.publication_checked(result.values()?),
+            PutObjectState::CheckBucket => self.handle_bucket_checked(result.values()?),
+            PutObjectState::CheckSealFence => self.seal_fence_checked(result.value()?),
+            PutObjectState::FenceBackend => self.handle_backend_fenced(result.value()?),
+            PutObjectState::CheckHashLookup => self.hash_checked(result.value()?),
             PutObjectState::ReadDedupHead
             | PutObjectState::ReadDedupVersion
             | PutObjectState::ReadDedupLocation
             | PutObjectState::ReadDedupProvider
-            | PutObjectState::ReadDedupClaim => self.dedup_read(event),
-            PutObjectState::CreateBlobLocation => self.location_created(event),
-            PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
-            PutObjectState::ReadLivenessVersion => self.liveness_read(event),
-            PutObjectState::WriteBlobHead => self.head_written(event),
-            PutObjectState::WritePathIndex => self.path_index_created(event),
-            PutObjectState::CreateVersionRecord => self.version_created(event),
-            PutObjectState::WriteCopyOwner => self.copy_owner_written(event),
-            PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
-            PutObjectState::WriteReplicationObligation => self.obligation_written(event),
-            PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
-            PutObjectState::QuotaRejectAbort => self.abort_quota_reject(event),
-            PutObjectState::UpdateUsage => self.handle_usage_update(event),
-            PutObjectState::RowFence => self.fence_answered(event),
-            PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
-            PutObjectState::ReleaseReservation => self.handle_release(event),
-            PutObjectState::RegisterBlobDht => self.blob_registered(event),
-            PutObjectState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
-            PutObjectState::Finish => self.emit_finish(),
-            PutObjectState::Error => self.abort(),
+            | PutObjectState::ReadDedupClaim => self.dedup_read(result.value()?),
+            PutObjectState::ReadObjectLookup => self.object_lookup_read(result.value()?),
+            PutObjectState::ReadLivenessVersion => self.liveness_read(result.value()?),
+            PutObjectState::WriteBlobHead => {
+                result.done()?;
+                self.write_path_index()
+            }
+            PutObjectState::WritePathIndex => {
+                result.done()?;
+                self.write_version()
+            }
+            PutObjectState::CreateVersionRecord => {
+                result.done()?;
+                self.store_envelope()
+            }
+            PutObjectState::WriteCopyOwner => {
+                result.done()?;
+                self.register_managed_copy()
+            }
+            PutObjectState::RegisterManagedCopy => {
+                result.done()?;
+                match self.keep_head {
+                    true => self.charge_usage(),
+                    false => self.write_obligation(),
+                }
+            }
+            PutObjectState::WriteReplicationObligation => {
+                result.done()?;
+                self.charge_usage()
+            }
+            PutObjectState::EnforceQuota => self.handle_enforce_quota(result),
+            PutObjectState::UpdateUsage => self.handle_usage_update(result),
+            PutObjectState::RowFence => self.fence_answered(result),
+            PutObjectState::Error => Err(PutObjectError::InvalidOperationState),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PutObjectState::Finish | PutObjectState::Error)
+    fn transaction(&self) -> TransactionMode {
+        match self.publishing {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
+        }
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let location = match self.output {
-            Some(Ok(location)) => location,
-            Some(Err(error)) => return Err(error),
-            None => return Err(PutObjectError::PutObjectFailed),
-        };
-        self.version_id
-            .map(|version_id| PutObjectResult {
-                location,
-                version_id,
-                replayed: self.replayed,
-            })
-            .ok_or(PutObjectError::PutObjectFailed)
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut actions: Effects = smallvec![];
+    /// Rolls the written bytes back, or leaves them to reconciliation after a publish whose
+    /// commit outcome is unknown, and releases their reservation; the runner makes these
+    /// calls in order before the run ends. The version transaction leaves all of it to its
+    /// parent.
+    fn abort(&mut self) -> Vec<IoCall> {
+        if self.publishing {
+            return Vec::new();
+        }
+        // The publish was cut off: its commit may have applied.
+        if self.state == PutObjectState::Publish
+            && !self.adopted
+            && let Some(location) = self.written_location.take()
+        {
+            self.reconcile_location = Some(location);
+        }
+        let mut calls = Vec::new();
+        if let Some(location) = self.reconcile_location.take() {
+            let work = self.reconcile_work(location);
+            calls.extend(work.ok().as_ref().and_then(Self::cleanup_row));
+        }
         if let Some(location) = self.written_location.take()
             && !self.adopted
         {
-            actions.push(Effect::Blob(BlobEffect::Delete { location }));
+            calls.push(IoCall::child(RollbackWrite::new(location)));
         }
-        if let Some(txn_id) = self.txn_id.take() {
-            actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        if let Some(id) = self.cleanup.take_release() {
+            calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
         }
-        actions.extend(
-            self.fence
-                .as_mut()
-                .and_then(fenced::FencedWrite::abort_open),
-        );
-        actions
-    }
-}
-
-#[cfg(test)]
-mod pure_tests {
-    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-    use crate::groups::backends::BackendFenceError;
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::stream::BackendStream;
-    use aruna_core::structs::identity::auth::PathRestriction;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-    use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
-    use aruna_core::structs::storage::routing::{
-        BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
-        StorageRoutingRule,
-    };
-    use aruna_core::types::TxnId;
-    use std::collections::{BTreeSet, HashMap};
-    use ulid::Ulid;
-
-    /// Answers the pre-write bucket read with an absent bucket, which is the
-    /// ungoverned path every routing test exercises, then clears the fence.
-    fn begin(operation: &mut PutObjectOperation) -> aruna_core::types::Effects {
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        operation.step(fence_clear());
-        operation.step(plain_bucket())
-    }
-
-    /// Answers an encryption settings read for a bucket without settings.
-    fn plain_bucket() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
-        })
-    }
-
-    fn fence_clear() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: crate::s3::purge_fence::fence_key("bucket"),
-            value: None,
-        })
-    }
-
-    fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
-            group_id: snapshot.group_id,
-            realm_id,
-            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
-            request: PutObjectInput {
-                bucket: "bucket".to_string(),
-                key: "archive/one".to_string(),
-                content_length: Some(3),
-                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
-                    &b"abc"[..],
-                ))),
-            },
-            expected_checksums: Vec::new(),
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling: None,
-            routing: snapshot,
-        }
-    }
-
-    fn snapshot() -> RoutingSnapshot {
-        RoutingSnapshot::new(
-            Ulid::from_parts(2, 2),
-            BackendCatalog::new("default")
-                .with_backend("default", None)
-                .with_backend("tape", Some("archive".to_string())),
-        )
-    }
-
-    #[test]
-    fn stamps_resolved_backend() {
-        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
-            key_prefix: "archive/".to_string(),
-            exact: false,
-            target: RoutingTarget::Class("archive".to_string()),
-        }]);
-
-        let effects = begin(&mut PutObjectOperation::new(config(snapshot)));
-
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
-            panic!("expected one blob write, got {effects:?}")
-        };
-        assert_eq!(resolved.backend, BackendRef::Node("tape".to_string()));
-        assert_eq!(resolved.storage_class.as_deref(), Some("archive"));
-    }
-
-    #[test]
-    fn obligation_keeps_restrictions() {
-        // The durable repair record is what a lost enqueue replays, so a scoped
-        // credential must stay scoped on it.
-        let restrictions = vec![PathRestriction {
-            pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
-            permission: aruna_core::structs::identity::auth::Permission::WRITE,
-        }];
-        let mut operation = PutObjectOperation::new(config(snapshot()))
-            .with_restrictions(Some(restrictions.clone()));
-        operation.version_id = Some(Ulid::from_parts(3, 3));
-
-        let effects = operation.write_obligation();
-
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one obligation write, got {effects:?}")
-        };
-        let record =
-            aruna_core::structs::storage::replication_queue::LiveObligationRecord::from_bytes(
-                value.as_ref(),
-            )
-            .expect("obligation decodes");
-        assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
-    }
-
-    #[test]
-    fn missing_class_stamps() {
-        // A class this node does not offer reroutes the write, never fails it.
-        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
-            key_prefix: String::new(),
-            exact: false,
-            target: RoutingTarget::Class("glacier".to_string()),
-        }]);
-
-        let effects = begin(&mut PutObjectOperation::new(config(snapshot)));
-
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
-            panic!("expected one blob write, got {effects:?}")
-        };
-        assert_eq!(resolved.backend, BackendRef::Node("default".to_string()));
-        assert_eq!(resolved.storage_class, None);
-    }
-
-    #[test]
-    fn unknown_backend_aborts() {
-        // A named backend is binding: nothing may be written when it is gone.
-        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
-            key_prefix: String::new(),
-            exact: false,
-            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
-        }]);
-
-        let mut operation = PutObjectOperation::new(config(snapshot));
-        let effects = begin(&mut operation);
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::RoutingFailed(RoutingError::UnknownBackend(
-                _
-            )))
-        ));
-    }
-
-    #[test]
-    fn refuses_disabled_backend() {
-        // A disabled backend refuses writes, so this write must not commit a
-        // location on it.
-        let backend_id = Ulid::from_bytes([5u8; 16]);
-        let snapshot = snapshot()
-            .with_group_inputs(GroupRoutingInputs {
-                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
-                backend_ids: BTreeSet::from([backend_id]),
-                ..Default::default()
-            })
-            .with_bucket_rules(Vec::new());
-        let mut operation = PutObjectOperation::new(config(snapshot));
-        begin(&mut operation);
-        operation.step(Event::Blob(BlobEvent::WriteFinished {
-            location: written(backend_id),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(3),
-        }));
-        operation.step(fence_clear());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (b"bucket".to_vec().into(), None),
-                (b"subject".to_vec().into(), None),
-            ],
-        }));
-        operation.step(plain_bucket());
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
-        }));
-
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::Delete { .. })]
-            ),
-            "expected the written blob to be rolled back, got {effects:?}"
-        );
-
-        let effects = operation.step(Event::Blob(BlobEvent::DeleteFinished));
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ),
-            "expected the transaction to abort, got {effects:?}"
-        );
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::BackendFenceError(
-                BackendFenceError::Unavailable
-            ))
-        ));
-    }
-
-    #[test]
-    fn queues_failed_rollback() {
-        // A rollback delete the backend refuses must become a durable cleanup
-        // row, otherwise the written bytes are orphaned with nothing naming them.
-        let backend_id = Ulid::from_bytes([5u8; 16]);
-        let snapshot = snapshot()
-            .with_group_inputs(GroupRoutingInputs {
-                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
-                backend_ids: BTreeSet::from([backend_id]),
-                ..Default::default()
-            })
-            .with_bucket_rules(Vec::new());
-        let mut operation = PutObjectOperation::new(config(snapshot));
-        begin(&mut operation);
-        operation.step(Event::Blob(BlobEvent::WriteFinished {
-            location: written(backend_id),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(3),
-        }));
-        operation.step(fence_clear());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (b"bucket".to_vec().into(), None),
-                (b"subject".to_vec().into(), None),
-            ],
-        }));
-        operation.step(plain_bucket());
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
-        }));
-
-        let effects = operation.step(Event::Blob(BlobEvent::Error(
-            aruna_core::errors::BlobError::UnknownBackend("gone".to_string()),
-        )));
-
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, txn_id, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected one cleanup row write, got {effects:?}")
-        };
-        assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
-        // Outside the transaction: that transaction is about to be aborted.
-        assert_eq!(*txn_id, None);
-
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"k".to_vec().into(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-    }
-
-    fn written(backend_id: Ulid) -> BackendLocation {
-        BackendLocation {
-            backend: BackendRef::Group(backend_id),
-            storage_class: None,
-            root: "root".to_string(),
-            storage_bucket: "bucket".to_string(),
-            backend_path: "bucket/object".to_string(),
-            ulid: Ulid::from_bytes([6u8; 16]),
-            format: StoredFormat::default(),
-            created_by: aruna_core::UserId::default(),
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            staging: false,
-            partial: false,
-            blob_size: 3,
-            hashes: HashMap::new(),
-        }
-    }
-
-    fn disabled(backend_id: Ulid) -> GroupStorage {
-        GroupStorage {
-            backend_id,
-            group_id: Ulid::from_bytes([7u8; 16]),
-            name: "tenant".to_string(),
-            kind: GroupBackendKind::S3,
-            public_config: HashMap::new(),
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            updated_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
-            disabled: true,
-            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod test;
-
-/// F1 acceptance: no byte-materialization effect and no registration may be
-/// emitted before the destination passed the shared placement gate.
-#[cfg(test)]
-mod decision_tests {
-    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-    use crate::placement::policy::{GateContext, PolicyCacheEntry, PolicyGateError};
-    use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::stream::BackendStream;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::policy::{
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
-    };
-    use aruna_core::structs::storage::blob::BucketInfo;
-    use aruna_core::structs::storage::format::Compression;
-    use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_core::structs::storage::routing::RoutingSnapshot;
-    use aruna_core::types::{Effects, Value};
-    use byteview::ByteView;
-    use std::collections::{BTreeMap, HashMap};
-    use std::time::UNIX_EPOCH;
-    use ulid::Ulid;
-
-    const BODY: &[u8] = b"payload";
-
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn realm() -> RealmId {
-        RealmId::from_bytes([3u8; 32])
-    }
-
-    /// A rule that admits exactly one location.
-    fn policy(location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([1u8; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
-    }
-
-    /// The same rule under one group's ownership.
-    fn owned_policy(location: &str, owner: Ulid) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([1u8; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid")
-        .owned_by(owner)
-        .expect("owner is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
-    }
-
-    fn gate(location: &str) -> GateContext {
-        GateContext {
-            realm_id: realm(),
-            subject: PlacementSubject {
-                node_id: node(9),
-                generation: 1,
-                location: location.to_string(),
-                labels: BTreeMap::new(),
-                executor_kind: None,
-                local_to_controller: true,
-            },
-            now_ms: 1_000,
-            admitting: true,
-        }
-    }
-
-    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
-        let info = BucketInfo {
-            group_id: Ulid::from_bytes([2u8; 16]),
-            created_at: UNIX_EPOCH,
-            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: refs,
-            placement_policy_generation: generation,
-            compression: Compression::Off,
-            distribution: None,
-        };
-        ByteView::from(info.to_bytes().expect("bucket encodes"))
-    }
-
-    fn read(value: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value,
-        })
-    }
-
-    /// Answers a purge fence read with no fence held.
-    fn fence_clear() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: crate::s3::purge_fence::fence_key("bucket"),
-            value: None,
-        })
-    }
-
-    fn operation(location: &str) -> PutObjectOperation {
-        let group_id = Ulid::from_bytes([2u8; 16]);
-        PutObjectOperation::new(PutObjectConfig {
-            user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
-            group_id,
-            realm_id: realm(),
-            node_id: node(9),
-            request: PutObjectInput {
-                bucket: "bucket".to_string(),
-                key: "governed.txt".to_string(),
-                content_length: Some(BODY.len() as u64),
-                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
-            },
-            expected_checksums: vec![],
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling: None,
-            routing: RoutingSnapshot::single(group_id),
-        })
-        .with_gate(gate(location))
-    }
-
-    fn materializes(effects: &Effects) -> bool {
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Write { .. })))
-    }
-
-    #[test]
-    fn denies_before_write() {
-        // The rule admits another location, so nothing may be written at all.
-        let rule = policy("us-east");
-        let mut operation = operation("eu-west");
-        assert!(!materializes(&operation.start()));
-        let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        assert!(!materializes(&effects));
-        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-        let cached = PolicyCacheEntry::verified(&document, 10)
-            .to_bytes()
-            .expect("entry encodes");
-        operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::policy::authority(realm()));
-
-        assert!(!materializes(&effects));
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
-        ));
-    }
-
-    #[test]
-    fn unresolved_blocks_write() {
-        // A rule that cannot be obtained blocks; it is never read as a grant.
-        let rule = policy("eu-west");
-        let mut operation = operation("eu-west");
-        operation.start();
-        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        let hint = PolicyCacheEntry::unavailable(1_000)
-            .to_bytes()
-            .expect("entry encodes");
-        let effects = operation.step(read(Some(ByteView::from(hint))));
-
-        assert!(!materializes(&effects));
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(
-                PolicyGateError::Unavailable { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn missing_subject_blocks() {
-        // A node that advertises no subject may hold nothing governed.
-        let mut config = operation("eu-west");
-        config.gate_context = None;
-        config.start();
-        let effects = config.step(read(Some(bucket(
-            vec![PlacementPolicyRef {
-                policy_id: Ulid::from_bytes([1u8; 16]),
-                digest: [4u8; 32],
-            }],
-            1,
-        ))));
-
-        assert!(!materializes(&effects));
-        assert!(matches!(
-            config.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::NoSubject))
-        ));
-    }
-
-    #[test]
-    fn planned_needs_hint() {
-        // A planned id in a distributed bucket must already carry the set hint.
-        use aruna_core::structs::storage::distribution::hint::with_hint;
-        use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
-        let set_id = Ulid::from_bytes([5u8; 16]);
-        let planned = |id: Ulid| {
-            let mut operation = operation("eu-west");
-            operation.config.preassigned_version_id = Some(id);
-            operation.start();
-            operation.step(read(None));
-            let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
-            info.distribution = Some(DistributionBinding {
-                set_id,
-                member_id: Ulid::from_bytes([6u8; 16]),
-                incarnation: 1,
-                revision: Default::default(),
-            });
-            operation.step(read(Some(ByteView::from(info.to_bytes().unwrap()))));
-            operation
-        };
-        let hint = SetHint::of_set(set_id);
-        let plain = Ulid::from_parts(1, 0);
-        assert_ne!(SetHint::of_version(plain), hint);
-        assert!(matches!(
-            planned(plain).finalize(),
-            Err(PutObjectError::InvalidPreassignedVersion)
-        ));
-        assert!(!planned(with_hint(plain, hint)).is_complete());
-    }
-
-    #[test]
-    fn ungoverned_skips_gate() {
-        // An ungoverned write reaches the blob effect with no policy round trip.
-        let mut operation = operation("eu-west");
-        operation.start();
-        operation.step(read(Some(bucket(Vec::new(), 0))));
-        operation.step(fence_clear());
-        let effects = operation.step(read(None));
-        assert!(materializes(&effects));
-    }
-
-    #[test]
-    fn drift_aborts_commit() {
-        // A default changed while the bytes streamed was never evaluated, so
-        // the version must not commit the refs it would now inherit.
-        let mut operation = operation("eu-west");
-        operation.start();
-        operation.step(read(Some(bucket(Vec::new(), 0))));
-        operation.step(fence_clear());
-        operation.step(read(None));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
-            location: location(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([7u8; 16]),
-        }));
-        operation.step(fence_clear());
-        let effects = operation.step(drift_read(
-            Some(bucket(vec![policy("us-east").policy_ref()], 1)),
-            None,
-        ));
-
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Storage(StorageEffect::AbortTransaction { .. })
-        )));
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
-        ));
-    }
-
-    /// The exposing transaction re-reads the bucket and the local subject in
-    /// one batch; both must still be what the gate decided on.
-    fn drift_read(bucket: Option<Value>, subject: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (ByteView::from(Vec::new()), bucket),
-                (ByteView::from(Vec::new()), subject),
-            ],
-        })
-    }
-
-    fn subject_row(generation: u64, blocked: bool) -> Value {
-        let mut record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
-            crate::tests::policy::subject(node(9), "eu-west"),
-        )
-        .expect("subject is valid");
-        record.subject.generation = generation;
-        record.serving_blocked = blocked;
-        record.policy_draining = blocked;
-        ByteView::from(record.to_bytes().expect("record encodes"))
-    }
-
-    #[test]
-    fn subject_advance_aborts() {
-        // The subject that admitted the write moved on while the bytes
-        // streamed, so the copy would commit refs nothing evaluated.
-        let rule = policy("eu-west");
-        let mut operation = operation("eu-west");
-        operation.start();
-        operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-        let cached = PolicyCacheEntry::verified(&document, 10)
-            .to_bytes()
-            .expect("entry encodes");
-        operation.step(read(Some(ByteView::from(cached))));
-        operation.step(crate::tests::policy::authority(realm()));
-        operation.step(fence_clear());
-        operation.step(read(None));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
-            location: location(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([7u8; 16]),
-        }));
-        operation.step(fence_clear());
-
-        let effects = operation.step(drift_read(
-            Some(bucket(vec![rule.policy_ref()], 1)),
-            Some(subject_row(2, false)),
-        ));
-
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Storage(StorageEffect::AbortTransaction { .. })
-        )));
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::Drift))
-        ));
-    }
-
-    /// The realm view and the policy row a cache miss reads next.
-    fn opened(policy_row: Option<Value>) -> Event {
-        let mut config =
-            aruna_core::structs::identity::realm::RealmConfigDocument::new(realm(), Vec::new(), 2);
-        config.seed_default_placement();
-        for seed in 1..=4u8 {
-            config.ensure_node(
-                node(seed),
-                aruna_core::structs::identity::realm::RealmNodeKind::Server,
-            );
-        }
-        let (config_value, auth_value) =
-            crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));
-        let key = ByteView::from(Vec::new());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (key.clone(), policy_row),
-                (key.clone(), Some(config_value)),
-                (key, Some(auth_value)),
-            ],
-        })
-    }
-
-    #[test]
-    fn digest_mismatch_blocks() {
-        // The obtained document holds another definition under the same id, so
-        // the write refuses instead of falling back to allow.
-        let requested = policy("eu-west");
-        let mut operation = operation("eu-west");
-        operation.start();
-        operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
-        operation.step(read(None));
-        let substituted = crate::tests::policy::signed_document(realm(), &policy("us-east"), 9);
-        let effects = operation.step(opened(Some(ByteView::from(
-            substituted.to_bytes().expect("document encodes"),
-        ))));
-
-        assert!(!materializes(&effects));
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::Invalid))
-        ));
-    }
-
-    #[test]
-    fn inherited_ref_gates() {
-        // Staging, imports and job outputs carry their source's refs into an
-        // otherwise ungoverned destination; a sender may never drop one.
-        let rule = policy("us-east");
-        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
-        operation.start();
-        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
-        assert!(!materializes(&effects));
-
-        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-        let cached = PolicyCacheEntry::verified(&document, 10)
-            .to_bytes()
-            .expect("entry encodes");
-        operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::policy::authority(realm()));
-
-        assert!(!materializes(&effects));
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(PolicyGateError::Denied { .. }))
-        ));
-    }
-
-    #[test]
-    fn refuses_foreign_owner() {
-        // A copy inherits a rule another group owns into this group's bucket;
-        // the subject satisfies it, so only the ownership refuses the write.
-        let rule = owned_policy("eu-west", Ulid::from_bytes([8u8; 16]));
-        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
-        operation.start();
-        let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
-        assert!(!materializes(&effects));
-
-        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-        let cached = PolicyCacheEntry::verified(&document, 10)
-            .to_bytes()
-            .expect("entry encodes");
-        operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::policy::group_authority(
-            realm(),
-            Ulid::from_bytes([8u8; 16]),
-        ));
-
-        assert!(!materializes(&effects));
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutObjectError::PolicyGate(
-                PolicyGateError::ForeignPolicy { .. }
-            ))
-        ));
-    }
-
-    fn location() -> aruna_core::structs::storage::blob::BackendLocation {
-        aruna_core::structs::storage::blob::BackendLocation {
-            backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
-            storage_class: None,
-            root: "/data".to_string(),
-            storage_bucket: "aruna".to_string(),
-            backend_path: "objects/one".to_string(),
-            ulid: Ulid::from_bytes([5u8; 16]),
-            format: StoredFormat::default(),
-            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
-            created_at: UNIX_EPOCH,
-            staging: false,
-            partial: false,
-            blob_size: BODY.len() as u64,
-            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
-        }
+        calls
     }
 }
 
 mod dedup;
 pub(crate) mod fenced;
 mod plain;
+#[path = "publish.rs"]
+mod publish;
 mod sharing;
 mod trail;
 pub(crate) use sharing::{ReaderScan, RuleScan};
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
-    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_read, owns_path, same_name_path,
-    version_row,
+    PlainRecord, intent_keys, intent_rows, owner_call, path_owned, same_name_path, version_row,
 };
 
 #[path = "abe.rs"]
 pub(crate) mod abe;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod test;

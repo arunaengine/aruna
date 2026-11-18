@@ -16,7 +16,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_core::structs::storage::distribution::on_use::CacheEntry;
+use aruna_core::structs::storage::distribution::on_use::{Attachment, CacheEntry};
 use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::types::Key;
 use std::time::SystemTime;

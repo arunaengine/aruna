@@ -7,7 +7,9 @@ use super::*;
 #[tokio::test]
 async fn watch_origins_converge() {
     // Independent origins must not lose a replica to arrival-order admission.
-    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventKind, WatchEventMask, WatchSubscription,
+    };
 
     let (_left_dir, left) = test_storage();
     let (_right_dir, right) = test_storage();

@@ -15,23 +15,30 @@ use super::records::RecordStoreError;
 use super::records::verify::FamilyView;
 
 pub mod admit;
+pub mod admit_here;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
 mod fetch;
+mod forward;
 pub mod held;
 pub mod ids;
 pub mod ingress;
+pub(crate) mod launch_checks;
 pub mod offer;
 pub mod outbox;
+mod output_policies;
 pub mod plan;
+pub mod publish;
 pub mod report;
 pub mod reservation;
 pub mod routing;
 pub mod stage;
+mod submission_rules;
 pub mod target;
 pub mod updates;
 pub mod witness;
+pub mod witness_arm;
 
 /// Why one lifecycle round did not complete. An availability failure is never
 /// reported as a refusal of the request itself.

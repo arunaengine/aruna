@@ -286,7 +286,7 @@ fn outbox_counts_gaps() {
         (SourceKind::DataUploaded, GapReason::Pruned),
         (1, 3),
     );
-    let read_call(reads) = outbox.gap_ask() else {
+    let IoCall::Read(reads) = outbox.gap_ask() else {
         panic!("gap rows are read once each");
     };
     assert_eq!(reads.len(), 3);
@@ -294,7 +294,7 @@ fn outbox_counts_gaps() {
     let mut kept = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
     kept.add(1);
     let values: Vec<_> = (reads.iter())
-        .map(|(_, key)| (*key == full).then(|| encode(&kept).unwrap()))
+        .map(|(_, key)| (**key == *full).then(|| encode(&kept).unwrap()))
         .collect();
     let rows = outbox.rows(values).unwrap();
     assert_eq!(rows.len(), 4);

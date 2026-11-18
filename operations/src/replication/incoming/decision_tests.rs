@@ -4,7 +4,6 @@
 
 use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
-use crate::placement::policy::PolicyCacheEntry;
 use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
 use aruna_core::structs::placement::policy::{
     PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
@@ -71,17 +70,18 @@ fn denies_incoming_replica() {
     // would invite bytes is refused instead.
     let rule = policy("us-east");
     let mut operation = governed(&rule).with_gate(gate("eu-west"));
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let mut effects = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let Some(Effect::SubOperation(mut gate)) = effects.pop() else {
+        panic!("expected the gate child")
+    };
 
-    let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-    let cached = PolicyCacheEntry::verified(&document, 10)
-        .to_bytes()
-        .expect("entry encodes");
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: Some(cached.into()),
-    }));
-    operation.step(crate::tests::policy::authority(realm()));
+    gate.start();
+    assert!(
+        gate.step(crate::tests::policy::resolved_policy(&rule))
+            .is_empty()
+    );
+    assert!(gate.is_complete());
+    operation.step(gate.finalize());
 
     assert!(rejected(&operation));
 }
