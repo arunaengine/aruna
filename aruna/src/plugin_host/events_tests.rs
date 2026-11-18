@@ -24,7 +24,6 @@ use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
-use aruna_operations::driver::node_routing;
 use aruna_operations::plugins::calls::decide_batch;
 use aruna_operations::plugins::calls::match_journal;
 use aruna_operations::plugins::calls::plan_replays;
@@ -40,12 +39,11 @@ use aruna_operations::plugins::runs::list_runs;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::created;
+use aruna_operations::plugins::test_support::drain_blob_batch;
 use aruna_operations::plugins::test_support::echoed_sync;
 use aruna_operations::plugins::test_support::install_artifact;
 use aruna_operations::plugins::test_support::installed;
 use aruna_operations::plugins::test_support::scoped;
-use aruna_operations::replication::drain::ProcessBatchOperation;
-use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::sync::sync_relationship::StoreRelationshipOperation;
 use aruna_operations::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
@@ -182,9 +180,7 @@ async fn sync_job_runs() {
     let queue = QueueBlobOperation::new_relationship(input, None, relationship.id);
     drive(queue, &fixture.ctx).await.unwrap();
 
-    let ctx = &fixture.ctx;
-    let drain = ProcessBatchOperation::new(MetadataPages, node_routing(ctx), ctx.node_and_realm());
-    let drained = drive(drain, ctx).await.unwrap();
+    let drained = drain_blob_batch(&fixture.ctx).await;
     assert_eq!(drained.succeeded, 1);
     for _ in 0..2 {
         let worker = worker(&fixture);

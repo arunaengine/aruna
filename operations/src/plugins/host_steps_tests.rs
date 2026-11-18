@@ -439,3 +439,44 @@ fn native_marks_change() {
     assert!(failure.changed);
     assert_eq!(failure.error.kind, ErrorKind::Conflict);
 }
+
+fn ready_change() -> ReadyChange {
+    ReadyChange {
+        record: Box::new(record()),
+        granted: access(),
+        document_id: Ulid::from_parts(4, 4),
+        expected: record().last_event_id,
+        entity: None,
+    }
+}
+
+fn apply() -> ApplyChange {
+    let mutation = UpdateDocumentMutation::RemoveDataEntity {
+        id: "file".to_string(),
+    };
+    let scope = scope();
+    let mut apply = ApplyChange::new((&scope, None), ready_change(), mutation, intent());
+    assert!(is_child(&apply.first()));
+    apply
+}
+
+#[test]
+fn apply_records_revision() {
+    let mut change = apply();
+    let routed = child_result(Ok::<_, MetadataWriteError>(record()));
+    assert!(is_child(&change.next(routed)));
+    let kept = child_result(Ok::<_, CallFailure>("reply".to_string()));
+    assert_eq!(change.next(kept), Ok(Next::Done("reply".to_string())));
+}
+
+#[test]
+fn apply_records_failure() {
+    let mut change = apply();
+    let refused = child_result(Err::<MetadataRegistryRecord, _>(
+        MetadataWriteError::Forbidden,
+    ));
+    assert!(is_child(&change.next(refused)));
+    let failed = CallFailure::from(refusal());
+    let kept = child_result(Err::<String, _>(failed.clone()));
+    assert_eq!(change.next(kept), Err(failed));
+}

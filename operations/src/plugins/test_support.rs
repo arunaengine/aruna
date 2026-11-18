@@ -859,3 +859,13 @@ pub async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> {
     }
     found
 }
+
+/// Runs one replication batch to its end.
+pub async fn drain_blob_batch(ctx: &DriverContext) -> crate::replication::drain::BlobDrainResult {
+    let drain = crate::replication::drain::ProcessBatchOperation::new(
+        crate::replication::page::deliver::MetadataPages,
+        crate::driver::node_routing(ctx),
+        ctx.node_and_realm(),
+    );
+    crate::driver::drive(drain, ctx).await.unwrap()
+}
