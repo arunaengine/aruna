@@ -597,7 +597,7 @@ mod call_tests {
     }
 
     #[test]
-    fn delete_runs_in_order() {
+    fn delete_runs_ordered() {
         // One transaction reads the row, the config and the mapping, writes, then deletes;
         // the prune queue, graph prune and sync drain follow the commit.
         let actor = actor();
