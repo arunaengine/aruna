@@ -638,3 +638,221 @@ impl Operation for AuditEndpointsOperation {
         self.read_next()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, REALM, node, user};
+    use aruna_core::calls::IoError;
+
+    fn job() -> JobId {
+        JobId::from_bytes([3; 16])
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn projected(family: &Family, truncated: bool) -> ProjectedFamily {
+        ProjectedFamily {
+            family: family.family(),
+            revision: 0,
+            projection: None,
+            truncated,
+            cached: false,
+        }
+    }
+
+    fn view(family: &Family, truncated: bool) -> IoResult {
+        let read = Some((projected(family, truncated), family.spec()));
+        child(Ok::<_, JobRouteError>(read))
+    }
+
+    fn absent() -> IoResult {
+        child(Ok::<Option<FamilyView>, JobRouteError>(None))
+    }
+
+    fn auth(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: REALM,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn stranger() -> UserId {
+        UserId::local(ulid::Ulid::from_parts(9, 9), REALM)
+    }
+
+    // An unknown alias names no family; a lost transaction reads as busy.
+    #[test]
+    fn projection_outcomes() {
+        let answer = |error| {
+            let mut read = FamilyProjectionOperation::new(job(), 1);
+            assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+            read.next(child(Err::<ProjectedFamily, _>(error)))
+        };
+        assert_eq!(answer(RecordStoreError::UnknownAlias), Ok(Next::Done(None)));
+        let conflict =
+            RecordStoreError::Storage(aruna_core::errors::StorageError::TransactionConflict);
+        assert_eq!(answer(conflict), Err(unavailable(BUSY)));
+    }
+
+    // A family reduced to nothing has no spec to look up.
+    #[test]
+    fn projection_needs_content() {
+        let family = Family::new([1; 32]);
+        let mut read = FamilyProjectionOperation::new(job(), 1);
+        read.first().expect("the projection starts");
+        let done = read.next(child(Ok::<_, RecordStoreError>(projected(&family, false))));
+        assert_eq!(done, Err(no_projection()));
+    }
+
+    // Status stays self-scoped, and a truncated projection answers nothing.
+    #[test]
+    fn status_rules() {
+        let family = Family::new([1; 32]);
+        let answer = |user_id, truncated| {
+            let mut read = FamilyStatusOperation::new(&auth(user_id), job(), 1);
+            read.first().expect("the projection starts");
+            read.next(view(&family, truncated))
+        };
+        let owner = family.spec().created_by;
+        assert_eq!(answer(stranger(), false), Err(JobRouteError::NotFound));
+        assert!(matches!(
+            answer(owner, true),
+            Err(JobRouteError::Unavailable(_))
+        ));
+        assert_eq!(answer(owner, false), Ok(Next::Done(None)));
+    }
+
+    // Without a family the session is looked up as this owner's local job.
+    #[test]
+    fn session_falls_back() {
+        let mut read = SessionJobOperation::new(user(), job(), 1);
+        read.first().expect("the projection starts");
+        assert!(matches!(
+            read.next(absent()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let missing = read.next(child(Ok::<Option<JobRecord>, IoError>(None)));
+        assert_eq!(missing, Err(JobRouteError::NotFound));
+    }
+
+    // A session of another submitter is absent.
+    #[test]
+    fn session_stays_private() {
+        let family = Family::new([1; 32]);
+        let mut read = SessionJobOperation::new(stranger(), job(), 1);
+        read.first().expect("the projection starts");
+        assert_eq!(
+            read.next(view(&family, false)),
+            Err(JobRouteError::NotFound)
+        );
+    }
+
+    // No family means no responder, and a truncated one cannot choose.
+    #[test]
+    fn responder_rules() {
+        let family = Family::new([1; 32]);
+        let mut none = FamilyResponderOperation::new(job(), 1);
+        none.first().expect("the projection starts");
+        assert_eq!(none.next(absent()), Ok(Next::Done(None)));
+        let mut partial = FamilyResponderOperation::new(job(), 1);
+        partial.first().expect("the projection starts");
+        assert!(matches!(
+            partial.next(view(&family, true)),
+            Err(JobRouteError::Unavailable(_))
+        ));
+    }
+
+    // A report is read only by the submitter, whose paged inputs are filled next.
+    #[test]
+    fn report_flow() {
+        let family = Family::new([1; 32]);
+        let local = Some((node(1), REALM));
+        let mut foreign = FamilyReportOperation::new(&auth(stranger()), job(), local, 1);
+        foreign.first().expect("the projection starts");
+        assert_eq!(
+            foreign.next(view(&family, false)),
+            Err(JobRouteError::NotFound)
+        );
+        let owner = auth(family.spec().created_by);
+        let mut report = FamilyReportOperation::new(&owner, job(), local, 1);
+        report.first().expect("the projection starts");
+        assert!(matches!(
+            report.next(view(&family, false)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let spec = child(Ok::<_, PageReadError>(family.spec()));
+        assert_eq!(report.next(spec), Ok(Next::Done(None)));
+    }
+
+    // A deleted run answers as absent once its details are read.
+    #[test]
+    fn deleted_run_absent() {
+        let family = Family::new([1; 32]);
+        let owner = auth(family.spec().created_by);
+        let mut report = FamilyReportOperation::new(&owner, job(), None, 1);
+        report.step =
+            ReportStep::Details(Box::new(projected(&family, false)), Box::new(family.spec()));
+        let details = ReportDetails {
+            deleted: true,
+            ..ReportDetails::default()
+        };
+        let answer = report.next(child(Ok::<_, JobRouteError>(details)));
+        assert_eq!(answer, Err(JobRouteError::NotFound));
+    }
+
+    fn paging() -> AuditPaging {
+        AuditPaging {
+            cursor: None,
+            limit: Default::default(),
+        }
+    }
+
+    // The log is paged for the submitter and a failed page is an internal error.
+    #[test]
+    fn log_flow() {
+        let family = Family::new([1; 32]);
+        let owner = auth(family.spec().created_by);
+        let range = (AuditRange::Family, paging());
+        let mut log = FamilyLogOperation::new(&owner, job(), range, 1);
+        log.first().expect("the projection starts");
+        assert!(matches!(
+            log.next(view(&family, false)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<AuditPage, _>(RecordStoreError::UnknownAlias);
+        assert!(matches!(
+            log.next(child(failed)),
+            Err(JobRouteError::Internal(_))
+        ));
+    }
+
+    // Known endpoints are kept, and records without outputs read nothing.
+    #[test]
+    fn endpoints_keep_known() {
+        let known = BTreeMap::from([(node(1), "https://s3".to_string())]);
+        let mut read = AuditEndpointsOperation::new(&[], known.clone());
+        assert_eq!(read.first(), Ok(Next::Done(known)));
+    }
+
+    // An advertisement that cannot be read leaves that node without an endpoint.
+    #[test]
+    fn unread_endpoint_skipped() {
+        let mut read = AuditEndpointsOperation {
+            nodes: Vec::new(),
+            asked: Some(node(2)),
+            endpoints: BTreeMap::new(),
+        };
+        let failed = NodeInfoError::Decode("unreadable".to_string());
+        let answer = child(Err::<BTreeMap<NodeId, NodeInfoDocument>, _>(failed));
+        assert_eq!(read.next(answer), Ok(Next::Done(BTreeMap::new())));
+    }
+}
