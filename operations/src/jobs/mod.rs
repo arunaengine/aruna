@@ -15,6 +15,7 @@ pub mod export;
 pub mod harvest;
 pub mod import;
 mod import_listing;
+pub mod key_locks;
 pub mod key_wake;
 pub mod lifecycle;
 pub mod metadata_class;
