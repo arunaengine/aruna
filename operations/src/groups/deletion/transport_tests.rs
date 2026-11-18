@@ -11,6 +11,8 @@ use aruna_core::structs::identity::group_delete::{
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
+use ulid::Ulid;
+
 use super::tests::{Fixture, read};
 use crate::inbound::initialize_incoming_fixture;
 use crate::metadata::MetadataHandle;
@@ -72,9 +74,18 @@ async fn peers_delete_together() {
         &second_context
     };
     for _ in 0..2 {
-        super::delete_group(context, auth.clone(), None, group_id)
-            .await
-            .unwrap();
+        crate::driver::drive(
+            super::DeleteGroupOperation::new(
+                context.node_and_realm(),
+                auth.clone(),
+                None,
+                group_id,
+                Ulid::generate(),
+            ),
+            context,
+        )
+        .await
+        .unwrap();
     }
     for context in [&first_context, &second_context] {
         assert!(
@@ -110,9 +121,12 @@ async fn check_reports_nodes() {
     let second_context = Arc::new(second.context);
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
-    let replies = super::check_group(&first_context, auth, group_id)
-        .await
-        .unwrap();
+    let replies = crate::driver::drive(
+        super::CheckGroupOperation::new(first_context.node_and_realm(), auth, group_id),
+        &first_context,
+    )
+    .await
+    .unwrap();
     let reply = |seed| {
         replies
             .iter()

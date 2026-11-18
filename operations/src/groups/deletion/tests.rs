@@ -569,14 +569,12 @@ async fn retained_backend_removed() {
 
 async fn seen(fixture: &Fixture, auth: &AuthContext, group_id: Ulid) -> Vec<String> {
     let names = ["a", "b)x"].map(String::from).to_vec();
-    super::coordinator::visible(
+    drive(
+        super::access::VisibleOperation::new(auth, group_id, fixture.actor.node_id, names),
         &fixture.context,
-        auth,
-        group_id,
-        fixture.actor.node_id,
-        names,
     )
     .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -661,14 +659,12 @@ async fn renders_refusals() {
     };
     // The local refusal and a peer refusal both pass through the coordinator filter.
     for node in [node(1), node(2)] {
-        let error = super::coordinator::blocked(
+        let error = drive(
+            super::access::BlockedOperation::new(&fixture.auth, group_id, node, reply.clone()),
             &fixture.context,
-            &fixture.auth,
-            group_id,
-            node,
-            reply.clone(),
         )
-        .await;
+        .await
+        .unwrap();
         let GroupDeletionError::NotEmpty { kinds, .. } = error else {
             panic!("expected a refusal, got {error:?}");
         };
@@ -685,9 +681,12 @@ async fn renders_refusals() {
         more: false,
         hidden: 0,
     };
-    let error =
-        super::coordinator::blocked(&fixture.context, &fixture.auth, group_id, node(1), readable)
-            .await;
+    let error = drive(
+        super::access::BlockedOperation::new(&fixture.auth, group_id, node(1), readable),
+        &fixture.context,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         error.to_string(),
         format!("group is not empty: node {}: S3 buckets (shown)", node(1))

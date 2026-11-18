@@ -35,16 +35,19 @@ use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
+use crate::driver::drive;
 use crate::forward::authorize::ForwardAuthError;
-use crate::forward::authorize::authorize_forwarded_pid;
-use crate::forward::authorize::authorize_write;
+use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::forward_auth_error;
-use crate::forward::replay::document_deleted_here;
-use crate::forward::replay::existing_record;
-use crate::forward::routing::forward_to_holders;
+use crate::forward::authorize::write_check;
+use crate::forward::replay::DeletedHereOperation;
+use crate::forward::routing::ForwardHoldersOperation;
+use crate::forward::transport::MetadataWriteError;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
 use crate::forward::transport::write_error;
+use crate::realm::load_config::config_unavailable;
 
 /// The one node that owns a document's PID state: rank-0 holder of the placement
 /// derived from the structured id, never the registry row (a delete removes it
@@ -103,8 +106,10 @@ pub(super) async fn pid_authority(
     realm_id: RealmId,
     document_id: Ulid,
 ) -> Result<(RealmConfigDocument, NodeId), MetadataApiError> {
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let authority = pid_authority_node(&config, realm_id, document_id)
         .ok_or(MetadataApiError::ServiceUnavailable)?;
@@ -301,12 +306,15 @@ pub async fn add_identifiers_routed(
     auth: AuthContext,
 ) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
     let add = async || {
-        let record = existing_record(context, document_id)
+        let record = load_document_record(context.as_ref(), document_id)
             .await
-            .map_err(MetadataApiError::Internal)?
+            .map_err(|error| {
+                MetadataApiError::Internal(format!("metadata registry read failed: {error:?}"))
+            })?
             .ok_or(MetadataApiError::NotFound)?;
-        authorize_write(context, auth.clone(), record.permission_path)
+        drive(write_check(&auth, &record.permission_path), context)
             .await
+            .map_err(ForwardAuthError::from)
             .map_err(|error| match error {
                 ForwardAuthError::Unauthorized => MetadataApiError::Unauthorized,
                 ForwardAuthError::Forbidden => MetadataApiError::Forbidden,
@@ -441,8 +449,10 @@ pub async fn resolve_pid_routed(
     if context.net_handle.is_none() {
         return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     if outside_realm(&config, realm_id, document_id) {
         return Ok(PersistentIdResolution::Missing);
@@ -504,7 +514,10 @@ pub(super) async fn local_pid_resolution(
     // An active mapping without a registry row is a permanent 410 only once this node has
     // evidence the document was created here and is gone.
     let Some(record) = record else {
-        return if document_deleted_here(context, document_id).await? {
+        return if drive(DeletedHereOperation::new(document_id), context)
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?
+        {
             Ok(PersistentIdResolution::Gone { pid: mapping.pid })
         } else {
             Err(MetadataApiError::ServiceUnavailable)
@@ -530,19 +543,23 @@ pub(super) async fn forward_pid(
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let response = forward_to_holders(
+    let response = drive(
+        ForwardHoldersOperation::new(
+            context.node_and_realm().map(|(node_id, _)| node_id),
+            &[authority],
+            &MetadataTransportMessage::ForwardPersistentId {
+                auth_token,
+                config_digest,
+                document_id,
+                request,
+            },
+            None,
+            false,
+        ),
         context,
-        &[authority],
-        MetadataTransportMessage::ForwardPersistentId {
-            auth_token,
-            config_digest,
-            document_id,
-            request,
-        },
-        None,
-        false,
     )
     .await
+    .map_err(MetadataWriteError::from)
     .map_err(write_error)?;
     match response {
         MetadataTransportMessage::ForwardedPersistentId {
@@ -581,7 +598,11 @@ pub(crate) async fn apply_forwarded_pid(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if config.digest().ok() != Some(config_digest) {
@@ -612,7 +633,12 @@ pub(crate) async fn apply_forwarded_pid(
     // Transitions carry the caller's authority: forwarding is a routing hop, so
     // the holder re-runs the WRITE check the origin's handler ran.
     let internal = matches!(&auth_token, Some(AuthToken::Internal(_)));
-    let auth = match authorize_forwarded_pid(context, peer, realm_id, auth_token).await {
+    let auth = match drive(
+        ForwardedCallerOperation::for_token(peer, realm_id, auth_token),
+        context,
+    )
+    .await
+    {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };
@@ -627,10 +653,9 @@ pub(crate) async fn apply_forwarded_pid(
     if minting_subject.is_some_and(|minted_by| minted_by != auth.user_id) {
         return forward_auth_error(ForwardAuthError::Forbidden);
     }
-    let record = match existing_record(context, document_id).await {
-        Ok(Some(record)) => Some(record),
-        Ok(None) => None,
-        Err(error) => return reject(error),
+    let record = match load_document_record(context.as_ref(), document_id).await {
+        Ok(record) => record,
+        Err(error) => return reject(format!("metadata registry read failed: {error:?}")),
     };
     match (&request, record.as_ref()) {
         (PersistentIdRequest::Fail { .. }, _) if !internal => {
@@ -638,19 +663,20 @@ pub(crate) async fn apply_forwarded_pid(
         }
         (PersistentIdRequest::Mint { .. } | PersistentIdRequest::Fail { .. }, _) if internal => {}
         (PersistentIdRequest::Withdraw { .. }, Some(_)) => {
-            if let Err(error) = authorize_write(
+            if let Err(error) = drive(
+                write_check(&auth, &format!("/{realm_id}/admin/pids/{document_id}")),
                 context,
-                auth.clone(),
-                format!("/{realm_id}/admin/pids/{document_id}"),
             )
             .await
+            .map_err(ForwardAuthError::from)
             {
                 return forward_auth_error(error);
             }
         }
         (_, Some(record)) => {
-            if let Err(error) =
-                authorize_write(context, auth.clone(), record.permission_path.clone()).await
+            if let Err(error) = drive(write_check(&auth, &record.permission_path.clone()), context)
+                .await
+                .map_err(ForwardAuthError::from)
             {
                 return forward_auth_error(error);
             }

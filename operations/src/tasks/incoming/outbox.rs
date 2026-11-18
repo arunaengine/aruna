@@ -359,7 +359,11 @@ impl OperationsTaskHandler {
         if batch.records.iter().any(|(_, record)| matches!(&record.event,
             DocumentOutboxEvent::AdminOperation { event, .. }
                 if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
-            && let Err(error) = crate::groups::deletion::sync_decision(self.context.as_ref()).await
+            && let Err(error) = crate::driver::drive(
+                crate::groups::deletion::SyncDecisionOperation,
+                self.context.as_ref(),
+            )
+            .await
         {
             warn!(error = %error, "Group deletion decision is not durable; retaining outbox");
             invocation.read_failed = true;

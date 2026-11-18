@@ -24,6 +24,8 @@ pub enum HoldScope {
     PluginInstall(ulid::Ulid),
     /// This node's writes to one metadata document, so its actor's dots stay in order.
     DocumentWrite(ulid::Ulid),
+    /// Drawing placement handles and provisioning bindings on this node.
+    PlacementHandles,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

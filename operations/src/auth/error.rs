@@ -14,7 +14,7 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use jsonwebtoken::dangerous::insecure_decode;
 use thiserror::Error;
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum PolicyEnforcementError {
     #[error("request denied by policy `{name}`: {reason}")]
     Denied { name: String, reason: String },
@@ -89,6 +89,13 @@ pub enum ArunaBearerError {
     JwtError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+/// Two errors match when they say the same; several sources have no equality of their own.
+impl PartialEq for ArunaBearerError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
 }
 
 /// The non-secret identity of a token the request already validated, for work that runs as its

@@ -42,7 +42,7 @@ use super::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::PermissionRules;
-use crate::auth::request_authorization::permission_rules;
+use crate::auth::request_authorization::rules_operation;
 use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::distribution::guard::{
     GuardError, authority_reads, authority_rows, write_target, write_targets,
@@ -1109,7 +1109,7 @@ pub(super) async fn access_rules(
     spec: &StagingJobSpec,
 ) -> Result<PermissionRules, String> {
     let root = source_permission_path(spec, "");
-    permission_rules(&ctx.driver, &spec.auth_context, &root)
+    drive(rules_operation(&spec.auth_context, &root), &ctx.driver)
         .await
         .map_err(|error| error.to_string())
 }

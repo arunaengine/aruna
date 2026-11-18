@@ -31,7 +31,6 @@ use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
 use crate::device::scan_rows::ScanRowsOperation;
 use crate::driver::{DriverContext, drive};
-use crate::placement::process_placements::load_realm_config;
 
 use super::folders::FolderError;
 use super::pull::forward_pull;
@@ -40,6 +39,8 @@ use super::repository::{
     base_key, folder_key, requeued, same_version,
 };
 use super::rows::{abort_txn, commit_txn, read_value, start_txn, write_rows};
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const UPLOAD_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -58,8 +59,10 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
     // A realm that limits a device's concurrent requests gets no more uploads at once.
-    let in_flight = load_realm_config(context, realm_id)
+    let in_flight = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .and_then(|config| config.quota.device_concurrent_pulls)
         .map_or(UPLOADS_IN_FLIGHT, |limit| {
             UPLOADS_IN_FLIGHT.min(limit as usize)

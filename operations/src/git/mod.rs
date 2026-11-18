@@ -23,9 +23,10 @@ pub mod versions;
 use crate::driver::drive;
 use self::changes::PropertyConflict;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use aruna_blob::git::GitStore;
@@ -89,13 +90,15 @@ pub async fn document(
         .await
         .map_err(|_| GitError::Unavailable)?
         .ok_or(GitError::NotFound)?;
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            record.realm_id,
+            auth,
+            &record.permission_path,
+            &permission,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        record.realm_id,
-        auth,
-        &record.permission_path,
-        &permission,
-        PolicyRequestExtras::rest(),
     )
     .await?;
     let lifecycle = parse_lifecycle_read(

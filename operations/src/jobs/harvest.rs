@@ -31,7 +31,9 @@ use ulid::Ulid;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::forward::authorize::{CreateScope, authorize_create};
+use crate::driver::drive;
+use crate::forward::authorize::AuthorizeCreateOperation;
+use crate::forward::authorize::CreateScope;
 use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
@@ -573,15 +575,20 @@ async fn authorize_write(
     document_id: Ulid,
 ) -> Result<String, HarvestFailure> {
     let path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let checked = authorize_create(
-        &ctx.driver,
-        realm_id,
-        &owner_auth(source.created_by, realm_id),
-        PolicyRequestExtras::default(),
-        source.group_id,
-        &path,
-        document_id,
-        CreateScope::Group,
+    let checked = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            AuthorizeCreateOperation::new(
+                realm_id,
+                &owner_auth(source.created_by, realm_id),
+                PolicyRequestExtras::default(),
+                source.group_id,
+                &path,
+                document_id,
+                CreateScope::Group,
+            ),
+            &ctx.driver,
+        ),
     )
     .await;
     match checked {

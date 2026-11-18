@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::metadata::{MetadataError, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
@@ -24,22 +23,19 @@ use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
-use async_trait::async_trait;
-use jsonwebtoken::DecodingKey;
-use tracing::warn;
 use ulid::Ulid;
 
-use self::peer_auth::load_auth_state;
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
 use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
-    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
-    realm_user_cutoff,
+    DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
@@ -242,102 +238,26 @@ impl AuthValidationState {
             issuer_keys: Arc::new(IssuerKeyCache::new()),
         }
     }
-}
 
-#[async_trait]
-impl ArunaValidationState for AuthValidationState {
-    async fn is_token_revoked(
-        &self,
-        realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        // Without realm state this node holds no revocation authority at all;
-        // once it has any, the token's own issuing realm answers.
-        match self.realm_id {
-            Some(_) => realm_token_revoked(&self.storage_handle, *realm_id, token_hash).await,
-            None => Ok(false),
-        }
+    /// Verifies `token`. Without realm state this node holds no revocation authority at all;
+    /// once it has any, the token's own issuing realm answers, unless `blind` skips revocation.
+    async fn decode(&self, token: &str, blind: bool) -> Result<TokenClaims, ArunaBearerError> {
+        let revocation = match (blind, self.realm_id) {
+            (false, Some(_)) => RevocationCheck::Realm,
+            _ => RevocationCheck::Skipped,
+        };
+        let checks = TokenChecks {
+            trust: IssuerTrust::Stored,
+            revocation,
+            linked_realm: self.realm_id,
+            keys: Some(self.issuer_keys.clone()),
+        };
+        let context = DriverContext::for_storage(self.storage_handle.clone());
+        drive(DecodeTokenOperation::new(token, checks), &context).await
     }
 
-    async fn user_cutoff(
-        &self,
-        realm_id: &RealmId,
-        user_id: &UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        match self.realm_id {
-            Some(_) => realm_user_cutoff(&self.storage_handle, *realm_id, user_id).await,
-            None => Ok(None),
-        }
-    }
-
-    async fn linked_owner(
-        &self,
-        realm_id: &RealmId,
-        via: &UserId,
-    ) -> Result<Option<UserId>, ArunaBearerError> {
-        match self.realm_id {
-            Some(local) if local == *realm_id => {
-                realm_linked_owner(&self.storage_handle, via).await
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, REALMS_LIST_KEY).await {
-            Ok(trusted) => trusted.contains(realm_id),
-            Err(error) => {
-                warn!(error = %error, "Failed to read metadata trusted realms state");
-                false
-            }
-        }
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        self.issuer_keys.get_or_insert(issuer_pubkey).await
-    }
-}
-
-struct RevocationBlindValidation<'a>(&'a AuthValidationState);
-
-#[async_trait]
-impl ArunaValidationState for RevocationBlindValidation<'_> {
-    async fn is_token_revoked(
-        &self,
-        _realm_id: &RealmId,
-        _token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        Ok(false)
-    }
-
-    async fn user_cutoff(
-        &self,
-        _realm_id: &RealmId,
-        _user_id: &UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.0.is_trusted_realm(realm_id).await
-    }
-
-    async fn linked_owner(
-        &self,
-        realm_id: &RealmId,
-        via: &UserId,
-    ) -> Result<Option<UserId>, ArunaBearerError> {
-        self.0.linked_owner(realm_id, via).await
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        self.0.issuer_decoding_key(issuer_pubkey).await
+    async fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
+        claims_auth(self.decode(token, false).await?)
     }
 }
 

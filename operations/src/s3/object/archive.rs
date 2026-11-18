@@ -22,7 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
@@ -611,7 +611,12 @@ async fn authorization<R>(
 ) -> Result<(), EntryStatus> {
     let extras = PolicyRequestExtras::rest();
     let read = &Permission::READ;
-    match authorize(scope.context, scope.realm_id, auth, path, read, extras).await {
+    match drive(
+        AuthorizeOperation::new(scope.realm_id, auth, path, read, extras),
+        scope.context,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
             Err(EntryStatus::Denied)

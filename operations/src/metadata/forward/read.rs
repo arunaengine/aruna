@@ -45,6 +45,7 @@ use super::routed_export::{
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::is_sync_eligible;
 use futures_util::StreamExt;
 
@@ -111,8 +112,10 @@ pub async fn get_metadata_routed(
         )
         .await;
     }
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     // A device answers from its pinned replica, so a selected document stays readable while the
@@ -322,8 +325,10 @@ pub async fn route_profile_status(
         }
         .map_err(|_| MetadataApiError::ServiceUnavailable);
     }
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let config_digest = config
         .digest()
@@ -510,8 +515,10 @@ pub(crate) async fn apply_forwarded_profile(
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(config_digest) {
         return Err(MetadataReadError::Unavailable);
@@ -552,8 +559,10 @@ pub(crate) async fn apply_forwarded_export(
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(config_digest) {
         return Err(MetadataReadError::Unavailable);
@@ -601,8 +610,10 @@ pub(crate) async fn apply_document_query(
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(config_digest)
         || !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id)

@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
@@ -124,13 +124,9 @@ pub async fn authorize_target(
         &arn.key,
     );
     let extras = PolicyRequestExtras::operation(operation);
-    match Box::pin(authorize(
+    match Box::pin(drive(
+        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::READ,
-        extras,
     ))
     .await
     {

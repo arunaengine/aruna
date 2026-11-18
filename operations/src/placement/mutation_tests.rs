@@ -25,12 +25,15 @@ async fn concurrent_mutations_land() {
         let context = context.clone();
         let actor = actor.clone();
         tasks.push(tokio::spawn(async move {
-            drive_placement_mutation(
-                MutatePlacementConfig {
-                    actor,
-                    mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
-                },
-                None,
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig {
+                        actor,
+                        mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+                    },
+                    None,
+                    None,
+                ),
                 &context,
             )
             .await
@@ -45,4 +48,58 @@ async fn concurrent_mutations_land() {
     for strategy_id in ids {
         assert!(config.strategy(&strategy_id).is_some());
     }
+}
+
+fn mutation_config(mutation: RealmPlacementMutation) -> MutatePlacementConfig {
+    MutatePlacementConfig {
+        actor: actor(RealmId::from_bytes([21; 32])),
+        mutation,
+    }
+}
+
+fn outcome(result: Result<RealmConfigDocument, MutatePlacementError>) -> IoResult {
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+}
+
+fn conflict() -> IoResult {
+    outcome(Err(MutatePlacementError::StorageError(
+        StorageError::TransactionConflict,
+    )))
+}
+
+fn upsert() -> RealmPlacementMutation {
+    RealmPlacementMutation::UpsertStrategy(strategy(Ulid::from_bytes([1; 16])))
+}
+
+#[test]
+fn conflicts_then_fail() {
+    let mut operation = PlacementMutationOperation::new(mutation_config(upsert()), None, None);
+    operation.first().unwrap();
+    for _ in 0..CONFLICT_ATTEMPTS {
+        assert!(matches!(
+            operation.next(conflict()),
+            Ok(Next::Call(IoCall::Delay(_)))
+        ));
+        assert!(matches!(
+            operation.next(IoResult::Woke),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+    }
+    assert_eq!(
+        operation.next(conflict()),
+        Err(MutatePlacementError::StorageError(
+            StorageError::TransactionConflict
+        ))
+    );
+}
+
+#[test]
+fn plain_mutation_finishes() {
+    let config = RealmConfigDocument::new(RealmId::from_bytes([21; 32]), Vec::new(), 2);
+    let mut operation = PlacementMutationOperation::new(mutation_config(upsert()), None, None);
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(outcome(Ok(config.clone()))),
+        Ok(Next::Done(config))
+    );
 }

@@ -26,6 +26,7 @@ use super::link_store::{change_link, ensure_lineage, read_link};
 use super::links::{
     ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation,
 };
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::state::read_job_record;
@@ -274,7 +275,11 @@ pub async fn start_push(
 /// Whether the link's owner still holds the dataset; an unknown placement counts as held.
 pub async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
     let realm_id = context.serving_realm(link.created_by.realm_id);
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return true;
     };
     resolve_metadata_id(&config, realm_id, None, link.document_id).map_or(true, |placement| {

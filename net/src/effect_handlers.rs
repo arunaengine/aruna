@@ -31,6 +31,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
+use aruna_core::events::ShardNetEvent;
 
 /// A snapshot younger than this answers without any DHT work.
 const PRESENCE_FRESH: Duration = Duration::from_secs(10);
@@ -240,6 +241,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::PolicySign(claim) => {
             NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
         }
+        NetEffect::SignDeletePlan(plan) => {
+            NetEvent::DeletePlanSigned(crate::signing::sign_delete_plan(&ctx.secret_key, &plan))
+        }
         NetEffect::VaultSign(records) => {
             NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
         }
@@ -274,6 +278,20 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             ))),
         })),
         // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::Shard(_) => NetEvent::Shard(Box::new(ShardNetEvent::NoNetwork)),
+        NetEffect::EnsureTopics { .. } | NetEffect::AllowTopicPeers { .. } => {
+            NetEvent::TopicPeers(Err(aruna_core::events::TopicPeerError::Failed(
+                "topic peers must be set by the operations runner".to_string(),
+            )))
+        }
+        NetEffect::AuthorizeWritePeer { .. } => {
+            NetEvent::WritePeerChecked(Err(aruna_core::events::WritePeerRefusal::Unavailable(
+                "peer checks must be dispatched by the operations runner".to_string(),
+            )))
+        }
+        NetEffect::RevocationClaims(_) => NetEvent::RevocationClaims(Err(
+            "token checks must be dispatched by the operations runner".to_string(),
+        )),
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
         )),
@@ -613,6 +631,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::JobControl(_) => "job_control",
         NetEffect::AuditPage(_) => "audit_page",
         NetEffect::PolicySign(_) => "policy_sign",
+        NetEffect::SignDeletePlan(_) => "sign_delete_plan",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
@@ -623,6 +642,11 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::GrantSign(_) => "grant_sign",
+        NetEffect::Shard(_) => "shard",
+        NetEffect::EnsureTopics { .. } => "ensure_topics",
+        NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
+        NetEffect::AuthorizeWritePeer { .. } => "authorize_write_peer",
+        NetEffect::RevocationClaims(_) => "revocation_claims",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",

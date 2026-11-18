@@ -32,11 +32,12 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::realm::load_config::load_realm_config;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
 use aruna_core::node_state::InstallInfoOperation;
@@ -269,7 +270,10 @@ async fn fetch_plan(context: &Arc<DriverContext>) -> Option<FetchPlan> {
     let net_handle = context.net_handle.as_ref()?;
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let config = load_realm_config(context, realm_id).await?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()?;
     let owner = node_kind(&config, node_id).and_then(|kind| kind.owner())?;
     let mut peers = realm_peers(&config, node_id);
     // A different node answers first every time, so one lagging peer never owns

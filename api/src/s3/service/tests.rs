@@ -42,7 +42,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::auth::request_authorization::authorize;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::s3::object::get::ObjectInfo;
@@ -2365,25 +2365,29 @@ async fn object_path_decides() {
     };
 
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("imaging/scan-a"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("imaging/scan-a"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_ok()
     );
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("sequencing/reads"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("sequencing/reads"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_err()

@@ -18,9 +18,11 @@ use tracing::warn;
 use super::super::store::put_job_entry;
 use super::super::store::state::read_job_record;
 use super::workspace::mint_workspace_credential;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::ids::session_of;
+use crate::realm::load_config::config_unavailable;
 
 /// Registers the interactive session of a session job. `None` is an ordinary
 /// run, or a node with no compute plane.
@@ -83,8 +85,10 @@ async fn realm_session_idle(context: &DriverContext) -> u64 {
     let Some(net) = context.net_handle.as_ref() else {
         return IDLE_AFTER_MS;
     };
-    crate::realm::load_config::load_realm_config(context, *net.realm_id())
+    drive(GetConfigOperation::new(*net.realm_id()), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .map(|config| config.compute.session_idle_ms)
         .filter(|value| *value > 0)
         .unwrap_or(IDLE_AFTER_MS)

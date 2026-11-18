@@ -40,6 +40,7 @@ use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
@@ -736,8 +737,9 @@ pub async fn delete_preview(
     let context = state.get_ctx();
     // Only keys the caller may read are counted, listed or named by a cursor.
     let scope_of = (auth.realm_id, info.group_id, state.get_node_id());
-    let access = aruna_operations::auth::request_authorization::BucketAccess::load(
-        &context, &auth, scope_of, &bucket,
+    let access = drive(
+        BucketAccessOperation::new(&auth, scope_of, &bucket),
+        &context,
     )
     .await
     .map_err(|_| ServerError::Forbidden)?;
@@ -931,14 +933,10 @@ pub async fn control_purge(
     use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(
-        &context,
-        job_id,
-        None,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?
-    .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1000,14 +998,10 @@ async fn purge_job(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(
-        &context,
-        job_id,
-        None,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?
-    .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let paused = aruna_operations::blob::pause::PausedOperation::new(job_id.as_ulid());
     let paused = drive(paused, &context)
         .await
@@ -1050,10 +1044,11 @@ pub async fn get_purge(
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
-    let record = aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .ok_or(ServerError::NotFound)?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?
+            .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1068,9 +1063,10 @@ async fn purge_ended(
     state: &ServerState,
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
-    let record = aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
 }
 

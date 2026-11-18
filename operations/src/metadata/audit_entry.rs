@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::driver::{drive, drive_until};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::load_config::load_realm_config;
 use aruna_core::audit::AuditPageRequest;
 use aruna_core::audit::AuditPageResponse;
 use aruna_core::audit::validate_request;
@@ -21,11 +19,14 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use std::sync::Arc;
 
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::metadata::audit::{
     AUDIT_INBOUND_ADMISSION, AUDIT_OUTBOUND_ADMISSION, AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE,
     AuditAggregate, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
     decode_cursor,
 };
+use crate::realm::load_config::config_unavailable;
 
 /// Gathers the group's audit trail from every eligible realm node and merges the
 /// pages. `local_node` reads its own keyspace directly; the remaining nodes are
@@ -54,9 +55,14 @@ pub async fn list_audit(
     let mut digest_ready = false;
     let mut include_local = false;
     let mut user_origin = false;
-    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
-        .await
-        .map_err(|_| ListAuditError::Unavailable)?;
+    let config = tokio::time::timeout_at(deadline, async {
+        drive(GetConfigOperation::new(realm_id), context)
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
+    })
+    .await
+    .map_err(|_| ListAuditError::Unavailable)?;
     match config {
         None => partial = true,
         Some(config) => {
@@ -174,10 +180,15 @@ async fn local_audit_result(
         return Err(MetadataReadError::Unavailable);
     }
     validate_request(&request).map_err(|_| MetadataReadError::Unavailable)?;
-    let config = tokio::time::timeout_at(deadline, load_realm_config(context.as_ref(), realm_id))
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        .ok_or(MetadataReadError::Unavailable)?;
+    let config = tokio::time::timeout_at(deadline, async {
+        drive(GetConfigOperation::new(realm_id), context.as_ref())
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
+    })
+    .await
+    .map_err(|_| MetadataReadError::Unavailable)?
+    .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(request.config_digest) {
         return Err(MetadataReadError::Unavailable);
     }
@@ -231,13 +242,15 @@ pub(super) async fn authorize_admin(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), MetadataReadError> {
-    match authorize(
+    match drive(
+        AuthorizeOperation::new(
+            auth_context.realm_id,
+            &auth_context,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
         context.as_ref(),
-        auth_context.realm_id,
-        &auth_context,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
     )
     .await
     {

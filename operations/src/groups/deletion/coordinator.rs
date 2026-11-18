@@ -3,40 +3,31 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
+use aruna_core::metadata::AuthToken;
 use aruna_core::onboarding::OnboardingTicket;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeleteCertificate, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof,
     GroupDeleteRecord, GroupDeletionError,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, admin_documents::AdminDocumentEvent};
 use ulid::Ulid;
 
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{ForwardAuthError, authorize_write};
-use crate::forward::fetch::FanoutOperation;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::peer_trust::is_sync_eligible;
-use aruna_core::metadata::AuthToken;
-
-use super::check::CheckOperation;
+use super::access::{AuthorizeDeleteOperation, BlockedOperation, LoadGroupOperation, LoadedGroup};
 use super::commit::CommitOperation;
 use super::onboarding::InstallOperation;
+use super::peer::{NodeReplies, NodeReply, RequestNodeOperation, RequestNodesOperation};
 use super::prepare::PrepareOperation;
-use super::resources::render;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 
 pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupDeletionError> {
     config
@@ -51,632 +42,632 @@ pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupD
         .ok_or_else(|| GroupDeletionError::Unavailable("realm has no group coordinator".into()))
 }
 
-async fn load_group(
-    context: &DriverContext,
-    group_id: GroupId,
-) -> Result<(Option<Group>, Option<GroupDeleteRecord>), GroupDeletionError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads: vec![
-                (GROUP_KEYSPACE.to_string(), group_id.to_bytes().into()),
-                (
-                    GROUP_DELETE_KEYSPACE.to_string(),
-                    group_id.to_bytes().into(),
-                ),
-            ],
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            let [(_, group), (_, record)] = values.as_slice() else {
-                return Err(GroupDeletionError::Unavailable("invalid group read".into()));
-            };
-            Ok((
-                group.as_deref().map(Group::from_bytes).transpose()?,
-                record
-                    .as_deref()
-                    .map(GroupDeleteRecord::from_bytes)
-                    .transpose()?,
-            ))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(GroupDeletionError::Unavailable("invalid group read".into())),
+pub(super) fn member_nodes(
+    config: &RealmConfigDocument,
+) -> Result<BTreeSet<NodeId>, GroupDeletionError> {
+    (config.nodes.iter())
+        .map(|node| node.node_id.parse::<NodeId>())
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))
+}
+
+pub(super) fn network_missing() -> GroupDeletionError {
+    GroupDeletionError::Unavailable("network handle is missing".into())
+}
+
+pub(super) fn clock_time(now_ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(now_ms)
+}
+
+pub(super) fn config_call(realm_id: RealmId) -> IoCall {
+    IoCall::child(GetConfigOperation::new(realm_id))
+}
+
+pub(super) fn read_config(result: IoResult) -> Result<RealmConfigDocument, GroupDeletionError> {
+    result
+        .child::<RealmConfigDocument, GetConfigError>()?
+        .map_err(|_| GroupDeletionError::Unavailable("realm configuration is missing".into()))
+}
+
+/// The outcome of a child that returns nothing.
+pub(super) fn finished(result: IoResult) -> Result<(), GroupDeletionError> {
+    result.child::<(), GroupDeletionError>()?
+}
+
+pub(super) fn prepare_call(
+    plan: &GroupDeletePlan,
+    phase: GroupDeletePhase,
+    node_id: NodeId,
+    now_ms: u64,
+) -> IoCall {
+    let time = clock_time(now_ms);
+    IoCall::child(PrepareOperation::new(plan.clone(), phase, node_id, time))
+}
+
+fn is_member(config: &RealmConfigDocument, node: NodeId) -> bool {
+    let node = node.to_string();
+    config.nodes.iter().any(|member| member.node_id == node)
+}
+
+/// Makes the deletion decision durable before anything acts on it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SyncDecisionOperation;
+
+impl Operation for SyncDecisionOperation {
+    type Output = ();
+    type Error = GroupDeletionError;
+
+    fn first(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        Ok(Next::Call(IoCall::Sync))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
+        done(result)?;
+        Ok(Next::Done(()))
     }
 }
 
-pub(super) async fn authorize(
-    context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    group_id: GroupId,
-    record: Option<&GroupDeleteRecord>,
-    exists: bool,
-) -> Result<(), GroupDeletionError> {
-    if auth.user_id.is_nil() || auth.path_restrictions.is_some() {
-        return Err(GroupDeletionError::Unauthorized);
-    }
-    if record.is_some_and(|record| {
-        record.phase == GroupDeletePhase::Deleted
-            && record.plan.realm_id == auth.realm_id
-            && (record.plan.owner == auth.user_id
-                || record.plan.requested_by == auth.user_id
-                || record.deleted_by == Some(auth.user_id))
-    }) {
-        return Ok(());
-    }
-    let mut paths = vec![format!("/{}/admin/groups", auth.realm_id)];
-    if exists {
-        paths.push(format!("/{}/g/{group_id}/admin", auth.realm_id));
-    }
-    for path in paths {
-        match authorize_write(context, auth.clone(), path).await {
-            Ok(()) => return Ok(()),
-            Err(ForwardAuthError::Unavailable(reason)) => {
-                return Err(GroupDeletionError::Unavailable(reason));
-            }
-            Err(ForwardAuthError::Forbidden | ForwardAuthError::Unauthorized) => {}
-        }
-    }
-    Err(GroupDeletionError::Unauthorized)
+#[derive(Debug, PartialEq)]
+enum DeleteStage {
+    Config,
+    Load,
+    Authorize,
+    Forward,
+    Publish,
+    Prepare,
+    Requests,
+    Blocked,
+    Recheck,
+    Commit,
+    /// The plan is being cancelled; this error answers the caller afterwards.
+    Cancel(GroupDeletionError),
+    /// As `Cancel`, for a refusal that still has to be worded for the caller.
+    CancelBlocked(NodeId, GroupDeletionError),
+    Refuse,
 }
 
-/// Keeps the bucket names the caller may read, as the S3 bucket listing does.
-/// Any authorization error drops the name.
-pub(super) async fn visible(
-    context: &DriverContext,
-    auth: &AuthContext,
-    group_id: GroupId,
-    node: NodeId,
-    names: Vec<String>,
-) -> Vec<String> {
-    let mut kept = Vec::new();
-    for name in names {
-        let path = bucket_permission_path(auth.realm_id, group_id, node, &name);
-        let read = crate::auth::request_authorization::authorize(
-            context,
-            auth.realm_id,
-            auth,
-            &path,
-            &Permission::READ,
-            PolicyRequestExtras::rest(),
-        )
-        .await;
-        if read.is_ok() {
-            kept.push(name);
-        }
-    }
-    kept
-}
+type DeleteTurn = Result<Next<()>, GroupDeletionError>;
 
-pub(super) async fn blocked(
-    context: &DriverContext,
-    auth: &AuthContext,
-    group_id: GroupId,
-    node: NodeId,
-    error: GroupDeletionError,
-) -> GroupDeletionError {
-    let GroupDeletionError::NotEmpty {
-        kinds,
-        buckets,
-        more,
-        hidden,
-    } = error
-    else {
-        return error;
-    };
-    let count = buckets.len();
-    let names = visible(context, auth, group_id, node, buckets).await;
-    let hidden = hidden + (count - names.len()) as u64;
-    GroupDeletionError::NotEmpty {
-        kinds: vec![format!(
-            "node {node}: {}",
-            render(&kinds, &names, hidden, more)
-        )],
-        buckets: Vec::new(),
-        more: false,
-        hidden: 0,
-    }
-}
-
-pub async fn delete_group(
-    context: &Arc<DriverContext>,
+/// Deletes an empty group: all nodes confirm the plan, then the coordinator commits it.
+#[derive(Debug, PartialEq)]
+pub struct DeleteGroupOperation {
+    local: Option<(NodeId, RealmId)>,
     auth: AuthContext,
     token: Option<AuthToken>,
     group_id: GroupId,
-) -> Result<(), GroupDeletionError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    if auth.realm_id != *net.realm_id() {
-        return Err(GroupDeletionError::Unauthorized);
-    }
-    let config = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .ok()
-        .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
-    let (group, record) = load_group(context, group_id).await?;
-    authorize(context, &auth, group_id, record.as_ref(), group.is_some()).await?;
-    let target = match record
-        .as_ref()
-        .filter(|record| record.phase != GroupDeletePhase::Cancelled)
-    {
-        Some(record) => record.plan.coordinator,
-        None => coordinator(&config)?,
-    };
-    if target != net.node_id() {
-        request_node(
-            context,
-            target,
+    request_id: Ulid,
+    now_ms: u64,
+    stage: DeleteStage,
+    config: Option<RealmConfigDocument>,
+    group: Option<Group>,
+    record: Option<GroupDeleteRecord>,
+    plan: Option<GroupDeletePlan>,
+    /// Reversed, so the next reply pops off the end.
+    replies: NodeReplies,
+    proofs: Vec<GroupDeleteProof>,
+    failure: Option<GroupDeletionError>,
+}
+
+impl DeleteGroupOperation {
+    /// `request_id` names the plan when this call starts a new one.
+    pub fn new(
+        local: Option<(NodeId, RealmId)>,
+        auth: AuthContext,
+        token: Option<AuthToken>,
+        group_id: GroupId,
+        request_id: Ulid,
+    ) -> Self {
+        Self {
+            local,
+            auth,
             token,
-            GroupDeleteAction::Start { group_id },
-        )
-        .await?;
-        return Ok(());
-    }
-    if let Some(record) = record
-        .as_ref()
-        .filter(|record| record.phase == GroupDeletePhase::Deleted)
-    {
-        let event = record.event.as_deref().ok_or_else(|| {
-            GroupDeletionError::Unavailable("committed deletion event is missing".into())
-        })?;
-        return publish_decision(context, &record.plan, event).await;
-    }
-    let group = group.ok_or(GroupDeletionError::NotFound)?;
-    if group.realm_id != auth.realm_id || group.group_id != group_id {
-        return Err(GroupDeletionError::Unauthorized);
-    }
-    let nodes = config
-        .nodes
-        .iter()
-        .map(|node| node.node_id.parse::<NodeId>())
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
-    let plan = record
-        .as_ref()
-        .filter(|record| record.phase != GroupDeletePhase::Cancelled)
-        .map(|record| record.plan.clone())
-        .unwrap_or_else(|| GroupDeletePlan {
-            request_id: Ulid::generate(),
             group_id,
-            realm_id: auth.realm_id,
-            owner: group.owner,
-            requested_by: auth.user_id,
-            coordinator: net.node_id(),
-            nodes,
-        });
-    if record
-        .as_ref()
-        .is_some_and(|record| record.phase == GroupDeletePhase::Aborting)
-        || !plan.matches_config(&config)
-        || plan.requested_by != auth.user_id
-    {
-        cancel_plan(context, &plan).await?;
-        return Err(GroupDeletionError::Conflict(
-            "previous attempt cancelled; retry deletion".into(),
-        ));
-    }
-    if let Err(error) = drive(
-        PrepareOperation::new(
-            plan.clone(),
-            GroupDeletePhase::Preparing,
-            net.node_id(),
-            SystemTime::now(),
-        ),
-        context.as_ref(),
-    )
-    .await
-    {
-        cancel_plan(context, &plan).await?;
-        return Err(blocked(context.as_ref(), &auth, group_id, net.node_id(), error).await);
-    }
-    let nodes = plan.nodes.iter().copied().collect::<Vec<_>>();
-    let prepare = || GroupDeleteAction::Prepare {
-        plan: Box::new(plan.clone()),
-    };
-    let replies = request_nodes(context, &nodes, prepare).await;
-    let mut proofs = Vec::new();
-    let mut failure = None;
-    for (node, reply) in replies {
-        match reply {
-            Ok(Some(proof)) if proof.node_id == node => proofs.push(proof),
-            Ok(_) => {
-                failure = Some(GroupDeletionError::Unavailable(format!(
-                    "node {node} did not confirm emptiness"
-                )))
-            }
-            Err(error) => {
-                failure = Some(blocked(context.as_ref(), &auth, group_id, node, error).await)
-            }
+            request_id,
+            now_ms: 0,
+            stage: DeleteStage::Config,
+            config: None,
+            group: None,
+            record: None,
+            plan: None,
+            replies: Vec::new(),
+            proofs: Vec::new(),
+            failure: None,
         }
     }
-    if let Some(error) = failure {
-        cancel_plan(context, &plan).await?;
-        return Err(error);
+
+    fn node_id(&self) -> Result<NodeId, GroupDeletionError> {
+        Ok(self.local.ok_or_else(network_missing)?.0)
     }
-    if let Err(error) = authorize(context, &auth, group_id, None, true).await {
-        cancel_plan(context, &plan).await?;
-        return Err(error);
+
+    fn current_plan(&self) -> Result<&GroupDeletePlan, GroupDeletionError> {
+        (self.plan.as_ref()).ok_or_else(|| GroupDeletionError::Unavailable("no plan".into()))
     }
-    let actor = Actor {
-        node_id: net.node_id(),
-        user_id: auth.user_id,
-        realm_id: auth.realm_id,
-    };
-    let certificate = GroupDeleteCertificate {
-        plan: plan.clone(),
-        proofs,
-    };
-    if !certificate.verify() {
-        cancel_plan(context, &plan).await?;
-        return Err(GroupDeletionError::Unavailable(
-            "a node supplied an invalid confirmation".into(),
-        ));
+
+    fn cancel(&mut self, stage: DeleteStage) -> DeleteTurn {
+        let plan = self.current_plan()?.clone();
+        self.stage = stage;
+        let cancel = CancelPlanOperation::new(self.local, plan);
+        Ok(Next::Call(IoCall::child(cancel)))
     }
-    let committed = drive(
-        CommitOperation::new(certificate, actor, Some(auth), None),
-        context.as_ref(),
-    )
-    .await;
-    let event = match committed {
-        Ok(event) => event,
-        Err(
-            error @ (GroupDeletionError::Unauthorized
-            | GroupDeletionError::NotFound
-            | GroupDeletionError::Invalid(_)
-            | GroupDeletionError::Conflict(_)),
-        ) => {
-            cancel_plan(context, &plan).await?;
+
+    fn publish(&mut self, plan: GroupDeletePlan, event: AdminDocumentEvent) -> DeleteTurn {
+        self.stage = DeleteStage::Publish;
+        let publish = PublishDecisionOperation::new(self.local, plan, event);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+
+    fn route(&mut self) -> DeleteTurn {
+        let node_id = self.node_id()?;
+        let config = self.config.take().ok_or_else(network_missing)?;
+        let record = self.record.take();
+        let active = (record.as_ref()).filter(|record| record.phase != GroupDeletePhase::Cancelled);
+        let target = match active {
+            Some(record) => record.plan.coordinator,
+            None => coordinator(&config)?,
+        };
+        if target != node_id {
+            self.stage = DeleteStage::Forward;
+            let start = GroupDeleteAction::Start {
+                group_id: self.group_id,
+            };
+            let token = self.token.take();
+            let forward = RequestNodeOperation::new(self.local, target, token, start);
+            return Ok(Next::Call(IoCall::child(forward)));
+        }
+        if let Some(record) = (record.as_ref()).filter(|r| r.phase == GroupDeletePhase::Deleted) {
+            let event = record.event.as_deref().ok_or_else(|| {
+                GroupDeletionError::Unavailable("committed deletion event is missing".into())
+            })?;
+            return self.publish(record.plan.clone(), event.clone());
+        }
+        let group = self.group.take().ok_or(GroupDeletionError::NotFound)?;
+        if group.realm_id != self.auth.realm_id || group.group_id != self.group_id {
+            return Err(GroupDeletionError::Unauthorized);
+        }
+        let nodes = member_nodes(&config)?;
+        let plan = active
+            .map(|record| record.plan.clone())
+            .unwrap_or_else(|| GroupDeletePlan {
+                request_id: self.request_id,
+                group_id: self.group_id,
+                realm_id: self.auth.realm_id,
+                owner: group.owner,
+                requested_by: self.auth.user_id,
+                coordinator: node_id,
+                nodes,
+            });
+        let aborting = record.is_some_and(|record| record.phase == GroupDeletePhase::Aborting);
+        let stale = !plan.matches_config(&config) || plan.requested_by != self.auth.user_id;
+        self.plan = Some(plan);
+        if aborting || stale {
+            let retry =
+                GroupDeletionError::Conflict("previous attempt cancelled; retry deletion".into());
+            return self.cancel(DeleteStage::Cancel(retry));
+        }
+        self.stage = DeleteStage::Prepare;
+        let phase = GroupDeletePhase::Preparing;
+        let call = prepare_call(self.current_plan()?, phase, node_id, self.now_ms);
+        Ok(Next::Call(call))
+    }
+
+    fn request_all(&mut self) -> DeleteTurn {
+        let plan = self.current_plan()?.clone();
+        let nodes = plan.nodes.iter().copied().collect();
+        let prepare = GroupDeleteAction::Prepare {
+            plan: Box::new(plan),
+        };
+        self.stage = DeleteStage::Requests;
+        let ask = RequestNodesOperation::new(self.local, nodes, prepare);
+        Ok(Next::Call(IoCall::child(ask)))
+    }
+
+    fn blocked_call(&self, node: NodeId, error: GroupDeletionError) -> IoCall {
+        let blocked = BlockedOperation::new(&self.auth, self.group_id, node, error);
+        IoCall::child(blocked)
+    }
+
+    fn take_reply(&mut self, node: NodeId, reply: NodeReply) -> Option<GroupDeletionError> {
+        match reply {
+            Ok(Some(proof)) if proof.node_id == node => self.proofs.push(proof),
+            Ok(_) => {
+                self.failure = Some(GroupDeletionError::Unavailable(format!(
+                    "node {node} did not confirm emptiness"
+                )));
+            }
+            Err(error) => return Some(error),
+        }
+        None
+    }
+
+    /// Reads the replies in turn; the last failure is the one the caller sees.
+    fn walk_replies(&mut self) -> DeleteTurn {
+        while let Some((node, reply)) = self.replies.pop() {
+            if let Some(error) = self.take_reply(node, reply) {
+                self.stage = DeleteStage::Blocked;
+                return Ok(Next::Call(self.blocked_call(node, error)));
+            }
+        }
+        if let Some(error) = self.failure.take() {
+            return self.cancel(DeleteStage::Cancel(error));
+        }
+        self.stage = DeleteStage::Recheck;
+        let check = AuthorizeDeleteOperation::new(&self.auth, self.group_id, None, true);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn commit(&mut self) -> DeleteTurn {
+        let node_id = self.node_id()?;
+        let certificate = GroupDeleteCertificate {
+            plan: self.current_plan()?.clone(),
+            proofs: std::mem::take(&mut self.proofs),
+        };
+        if !certificate.verify() {
+            let invalid =
+                GroupDeletionError::Unavailable("a node supplied an invalid confirmation".into());
+            return self.cancel(DeleteStage::Cancel(invalid));
+        }
+        let actor = Actor {
+            node_id,
+            user_id: self.auth.user_id,
+            realm_id: self.auth.realm_id,
+        };
+        self.stage = DeleteStage::Commit;
+        let auth = Some(self.auth.clone());
+        let commit = CommitOperation::new(certificate, actor, auth, None);
+        Ok(Next::Call(IoCall::child(commit)))
+    }
+}
+
+impl Operation for DeleteGroupOperation {
+    type Output = ();
+    type Error = GroupDeletionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> DeleteTurn {
+        let (_, realm_id) = self.local.ok_or_else(network_missing)?;
+        if self.auth.realm_id != realm_id {
+            return Err(GroupDeletionError::Unauthorized);
+        }
+        Ok(Next::Call(config_call(realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DeleteTurn {
+        match std::mem::replace(&mut self.stage, DeleteStage::Refuse) {
+            DeleteStage::Config => {
+                self.config = Some(read_config(result)?);
+                self.stage = DeleteStage::Load;
+                let load = LoadGroupOperation::new(self.group_id);
+                Ok(Next::Call(IoCall::child(load)))
+            }
+            DeleteStage::Load => {
+                let (group, record) = result.child::<LoadedGroup, GroupDeletionError>()??;
+                self.stage = DeleteStage::Authorize;
+                let check = AuthorizeDeleteOperation::new(
+                    &self.auth,
+                    self.group_id,
+                    record.as_ref(),
+                    group.is_some(),
+                );
+                self.group = group;
+                self.record = record;
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            DeleteStage::Authorize => {
+                finished(result)?;
+                self.route()
+            }
+            DeleteStage::Forward => {
+                result.child::<Option<GroupDeleteProof>, GroupDeletionError>()??;
+                Ok(Next::Done(()))
+            }
+            DeleteStage::Publish => {
+                finished(result)?;
+                Ok(Next::Done(()))
+            }
+            DeleteStage::Prepare => match finished(result) {
+                Ok(()) => self.request_all(),
+                Err(error) => {
+                    let node_id = self.node_id()?;
+                    self.cancel(DeleteStage::CancelBlocked(node_id, error))
+                }
+            },
+            DeleteStage::Requests => {
+                let mut replies = result.child::<NodeReplies, GroupDeletionError>()??;
+                replies.reverse();
+                self.replies = replies;
+                self.walk_replies()
+            }
+            DeleteStage::Blocked => {
+                let worded = result.child::<GroupDeletionError, GroupDeletionError>()??;
+                self.failure = Some(worded);
+                self.walk_replies()
+            }
+            DeleteStage::Recheck => match finished(result) {
+                Ok(()) => self.commit(),
+                Err(error) => self.cancel(DeleteStage::Cancel(error)),
+            },
+            DeleteStage::Commit => {
+                match result.child::<AdminDocumentEvent, GroupDeletionError>()? {
+                    Ok(event) => {
+                        let plan = self.current_plan()?.clone();
+                        self.publish(plan, event)
+                    }
+                    Err(
+                        error @ (GroupDeletionError::Unauthorized
+                        | GroupDeletionError::NotFound
+                        | GroupDeletionError::Invalid(_)
+                        | GroupDeletionError::Conflict(_)),
+                    ) => self.cancel(DeleteStage::Cancel(error)),
+                    Err(error) => Err(error),
+                }
+            }
+            DeleteStage::Cancel(error) => {
+                finished(result)?;
+                Err(error)
+            }
+            DeleteStage::CancelBlocked(node, error) => {
+                finished(result)?;
+                self.stage = DeleteStage::Refuse;
+                Ok(Next::Call(self.blocked_call(node, error)))
+            }
+            DeleteStage::Refuse => Err(result.child::<GroupDeletionError, GroupDeletionError>()??),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CancelStage {
+    Abort,
+    Config,
+    Notify,
+    Cancelled,
+}
+
+/// Aborts a plan here, tells the other members, and records it as cancelled.
+#[derive(Debug, PartialEq)]
+struct CancelPlanOperation {
+    local: Option<(NodeId, RealmId)>,
+    plan: GroupDeletePlan,
+    now_ms: u64,
+    stage: CancelStage,
+    /// Reversed, so the next member pops off the end.
+    members: Vec<NodeId>,
+    failure: Option<GroupDeletionError>,
+}
+
+impl CancelPlanOperation {
+    fn new(local: Option<(NodeId, RealmId)>, plan: GroupDeletePlan) -> Self {
+        Self {
+            local,
+            plan,
+            now_ms: 0,
+            stage: CancelStage::Abort,
+            members: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn node_id(&self) -> Result<NodeId, GroupDeletionError> {
+        Ok(self.local.ok_or_else(network_missing)?.0)
+    }
+
+    fn notify_next(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        if let Some(node) = self.members.pop() {
+            self.stage = CancelStage::Notify;
+            let abort = GroupDeleteAction::Abort {
+                plan: Box::new(self.plan.clone()),
+            };
+            let notify = RequestNodeOperation::new(self.local, node, None, abort);
+            return Ok(Next::Call(IoCall::child(notify)));
+        }
+        if let Some(error) = self.failure.take() {
             return Err(error);
         }
-        Err(error) => return Err(error),
-    };
-    publish_decision(context, &plan, &event).await
+        self.stage = CancelStage::Cancelled;
+        let phase = GroupDeletePhase::Cancelled;
+        let call = prepare_call(&self.plan, phase, self.node_id()?, self.now_ms);
+        Ok(Next::Call(call))
+    }
 }
 
-async fn cancel_plan(
-    context: &Arc<DriverContext>,
-    plan: &GroupDeletePlan,
-) -> Result<(), GroupDeletionError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    drive(
-        PrepareOperation::new(
-            plan.clone(),
-            GroupDeletePhase::Aborting,
-            net.node_id(),
-            SystemTime::now(),
-        ),
-        context.as_ref(),
-    )
-    .await?;
-    let config = drive(GetConfigOperation::new(plan.realm_id), context)
-        .await
-        .ok()
-        .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
-    let mut failure = None;
-    for node in &plan.nodes {
-        if *node != net.node_id()
-            && config
-                .nodes
-                .iter()
-                .any(|member| member.node_id == node.to_string())
-            && let Err(error) = request_node(
-                context,
-                *node,
-                None,
-                GroupDeleteAction::Abort {
-                    plan: Box::new(plan.clone()),
-                },
-            )
-            .await
-        {
-            failure = Some(error);
+impl Operation for CancelPlanOperation {
+    type Output = ();
+    type Error = GroupDeletionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        let phase = GroupDeletePhase::Aborting;
+        let call = prepare_call(&self.plan, phase, self.node_id()?, self.now_ms);
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
+        match self.stage {
+            CancelStage::Abort => {
+                finished(result)?;
+                self.stage = CancelStage::Config;
+                Ok(Next::Call(config_call(self.plan.realm_id)))
+            }
+            CancelStage::Config => {
+                let config = read_config(result)?;
+                let node_id = self.node_id()?;
+                self.members = (self.plan.nodes.iter().rev().copied())
+                    .filter(|node| *node != node_id && is_member(&config, *node))
+                    .collect();
+                self.notify_next()
+            }
+            CancelStage::Notify => {
+                let reply = result.child::<Option<GroupDeleteProof>, GroupDeletionError>()?;
+                if let Err(error) = reply {
+                    self.failure = Some(error);
+                }
+                self.notify_next()
+            }
+            CancelStage::Cancelled => {
+                finished(result)?;
+                Ok(Next::Done(()))
+            }
         }
     }
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    drive(
-        PrepareOperation::new(
-            plan.clone(),
-            GroupDeletePhase::Cancelled,
-            net.node_id(),
-            SystemTime::now(),
-        ),
-        context.as_ref(),
-    )
-    .await
 }
 
-async fn publish_decision(
-    context: &Arc<DriverContext>,
-    plan: &GroupDeletePlan,
-    event: &AdminDocumentEvent,
-) -> Result<(), GroupDeletionError> {
-    sync_decision(context.as_ref()).await?;
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    let config = drive(GetConfigOperation::new(plan.realm_id), context)
-        .await
-        .ok()
-        .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
-    for node in &plan.nodes {
-        if *node != net.node_id()
-            && config
-                .nodes
-                .iter()
-                .any(|member| member.node_id == node.to_string())
-        {
-            request_node(
-                context,
-                *node,
-                None,
-                GroupDeleteAction::Commit {
-                    event: Box::new(event.clone()),
-                },
-            )
-            .await?;
-        }
-    }
-    Ok(())
+#[derive(Debug, PartialEq)]
+enum PublishStage {
+    Sync,
+    Config,
+    Notify,
 }
 
-pub(crate) async fn sync_decision(context: &DriverContext) -> Result<(), GroupDeletionError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::SyncAll)
-        .await
-    {
-        Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(GroupDeletionError::Unavailable(
-            "deletion decision was not persisted".into(),
-        )),
-    }
+/// Makes the decision durable, then hands it to every other member.
+#[derive(Debug, PartialEq)]
+struct PublishDecisionOperation {
+    local: Option<(NodeId, RealmId)>,
+    plan: GroupDeletePlan,
+    event: AdminDocumentEvent,
+    stage: PublishStage,
+    /// Reversed, so the next member pops off the end.
+    members: Vec<NodeId>,
 }
 
-/// Each answer bounds itself in the transport; this only stops a request that never ends.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
-/// Peers asked at once by one fan-out, as before the effect group.
-const FANOUT_LIMIT: usize = 4;
-
-/// Sends `action` to every node: this node runs it itself, all others are asked at once.
-async fn request_nodes(
-    context: &Arc<DriverContext>,
-    nodes: &[NodeId],
-    action: impl Fn() -> GroupDeleteAction,
-) -> Vec<(NodeId, Result<Option<GroupDeleteProof>, GroupDeletionError>)> {
-    let local = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut replies = Vec::new();
-    if let Some(local) = local.filter(|local| nodes.contains(local)) {
-        replies.push((
+impl PublishDecisionOperation {
+    fn new(
+        local: Option<(NodeId, RealmId)>,
+        plan: GroupDeletePlan,
+        event: AdminDocumentEvent,
+    ) -> Self {
+        Self {
             local,
-            super::peer::apply_control(context, local, action()).await,
-        ));
-    }
-    let requests = (nodes.iter().copied())
-        .filter(|node| Some(*node) != local)
-        .map(|node| {
-            let message = MetadataTransportMessage::GroupDeletion {
-                auth_token: None,
-                action: action(),
-            };
-            (node, message)
-        })
-        .collect();
-    let fanout = FanoutOperation::new(requests, FANOUT_LIMIT, REQUEST_TIMEOUT);
-    let answers = match drive(fanout, context.as_ref()).await {
-        Ok(answers) => answers,
-        Err(error) => {
-            let unavailable = |node| {
-                (
-                    node,
-                    Err(GroupDeletionError::Unavailable(error.to_string())),
-                )
-            };
-            let remote = nodes.iter().copied().filter(|node| Some(*node) != local);
-            replies.extend(remote.map(unavailable));
-            return replies;
+            plan,
+            event,
+            stage: PublishStage::Sync,
+            members: Vec::new(),
         }
-    };
-    replies.extend(
-        answers
-            .into_iter()
-            .map(|(node, answer)| (node, deletion_reply(node, answer))),
-    );
-    replies
-}
+    }
 
-fn deletion_reply(
-    node: NodeId,
-    answer: Result<MetadataTransportMessage, String>,
-) -> Result<Option<GroupDeleteProof>, GroupDeletionError> {
-    match answer {
-        Ok(MetadataTransportMessage::GroupDeletionResult { result }) => result,
-        Ok(_) => Err(GroupDeletionError::Unavailable(format!(
-            "node {node} refused the deletion request"
-        ))),
-        Err(error) => Err(GroupDeletionError::Unavailable(format!(
-            "node {node}: {error}"
-        ))),
+    fn notify_next(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        let Some(node) = self.members.pop() else {
+            return Ok(Next::Done(()));
+        };
+        self.stage = PublishStage::Notify;
+        let commit = GroupDeleteAction::Commit {
+            event: Box::new(self.event.clone()),
+        };
+        let notify = RequestNodeOperation::new(self.local, node, None, commit);
+        Ok(Next::Call(IoCall::child(notify)))
     }
 }
 
-async fn request_node(
-    context: &Arc<DriverContext>,
-    node: NodeId,
-    token: Option<AuthToken>,
-    action: GroupDeleteAction,
-) -> Result<Option<GroupDeleteProof>, GroupDeletionError> {
-    if context
-        .net_handle
-        .as_ref()
-        .is_some_and(|net| net.node_id() == node)
-    {
-        return super::peer::apply_control(context, node, action).await;
+impl Operation for PublishDecisionOperation {
+    type Output = ();
+    type Error = GroupDeletionError;
+
+    fn first(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        Ok(Next::Call(IoCall::Sync))
     }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| GroupDeletionError::Unavailable("metadata transport is missing".into()))?;
-    match metadata
-        .request_forwarded_write(
-            node,
-            MetadataTransportMessage::GroupDeletion {
-                auth_token: token,
-                action,
-            },
-        )
-        .await
-    {
-        Ok(MetadataTransportMessage::GroupDeletionResult { result }) => result,
-        Ok(_) => Err(GroupDeletionError::Unavailable(format!(
-            "node {node} refused the deletion request"
-        ))),
-        Err(error) => Err(GroupDeletionError::Unavailable(format!(
-            "node {node}: {error}"
-        ))),
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
+        match self.stage {
+            PublishStage::Sync => {
+                done(result)?;
+                self.local.ok_or_else(network_missing)?;
+                self.stage = PublishStage::Config;
+                Ok(Next::Call(config_call(self.plan.realm_id)))
+            }
+            PublishStage::Config => {
+                let config = read_config(result)?;
+                let (node_id, _) = self.local.ok_or_else(network_missing)?;
+                self.members = (self.plan.nodes.iter().rev().copied())
+                    .filter(|node| *node != node_id && is_member(&config, *node))
+                    .collect();
+                self.notify_next()
+            }
+            PublishStage::Notify => {
+                result.child::<Option<GroupDeleteProof>, GroupDeletionError>()??;
+                self.notify_next()
+            }
+        }
     }
 }
 
-pub async fn install_onboarding(
-    context: &DriverContext,
+/// Installs the deletion records an onboarding ticket carries, durably.
+#[derive(Debug, PartialEq)]
+pub struct InstallOnboardingOperation {
+    /// Reversed, so the next record pops off the end.
+    records: Result<Vec<GroupDeleteRecord>, GroupDeletionError>,
+    syncing: bool,
+}
+
+impl InstallOnboardingOperation {
+    pub fn new(ticket: &OnboardingTicket, realm_id: RealmId, node_id: NodeId, now: u64) -> Self {
+        Self {
+            records: ticket_records(ticket, realm_id, node_id, now),
+            syncing: false,
+        }
+    }
+
+    fn install_next(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        let records = self.records.as_mut().map_err(|error| error.clone())?;
+        match records.pop() {
+            Some(record) => Ok(Next::Call(IoCall::child(InstallOperation::new(record)))),
+            None => {
+                self.syncing = true;
+                Ok(Next::Call(IoCall::Sync))
+            }
+        }
+    }
+}
+
+fn ticket_records(
     ticket: &OnboardingTicket,
     realm_id: RealmId,
     node_id: NodeId,
     now: u64,
-) -> Result<(), GroupDeletionError> {
+) -> Result<Vec<GroupDeleteRecord>, GroupDeletionError> {
     if ticket.payload.realm_id != realm_id.to_string() {
         return Err(GroupDeletionError::Invalid(
             "onboarding realm mismatch".into(),
         ));
     }
+    let target = DocumentTarget::RealmAuthorization { realm_id };
     ticket
-        .verify(
-            node_id,
-            &DocumentTarget::RealmAuthorization { realm_id },
-            now,
-        )
+        .verify(node_id, &target, now)
         .map_err(|error| GroupDeletionError::Invalid(error.to_string()))?;
-    for record in &ticket.payload.group_deletions {
-        if record.plan.realm_id != realm_id {
-            return Err(GroupDeletionError::Invalid(
-                "deletion realm mismatch".into(),
-            ));
-        }
-        drive(InstallOperation::new(record.clone()), context).await?;
-    }
-    sync_decision(context).await
-}
-
-/// Scans this node and keeps only the bucket names the caller may read; `hidden` counts the
-/// others. `more` stays the scan's own flag: more blocking buckets than it named.
-pub(super) async fn scan(
-    context: &DriverContext,
-    auth: &AuthContext,
-    group_id: GroupId,
-    node: NodeId,
-) -> Result<(), GroupDeletionError> {
-    match drive(CheckOperation::new(group_id, SystemTime::now()), context).await {
-        Err(GroupDeletionError::NotEmpty {
-            kinds,
-            buckets,
-            more,
-            hidden,
-        }) => {
-            let count = buckets.len();
-            let names = visible(context, auth, group_id, node, buckets).await;
-            Err(GroupDeletionError::NotEmpty {
-                kinds,
-                more,
-                hidden: hidden + (count - names.len()) as u64,
-                buckets: names,
-            })
-        }
-        result => result,
-    }
-}
-
-/// Answers an infrastructure peer's check. Like Prepare, a node that holds the group
-/// authorizes the caller again, and a device without the group row still scans.
-pub(super) async fn check_node(
-    context: &Arc<DriverContext>,
-    config: &RealmConfigDocument,
-    auth: &AuthContext,
-    group_id: GroupId,
-    node: NodeId,
-) -> Result<(), GroupDeletionError> {
-    let (group, record) = load_group(context, group_id).await?;
-    if group.is_some() {
-        authorize(context, auth, group_id, record.as_ref(), true).await?;
-    } else if is_sync_eligible(config, node) {
-        return Err(GroupDeletionError::Unavailable(
-            "group has not synchronized to this node".into(),
-        ));
-    }
-    scan(context, auth, group_id, node).await
-}
-
-/// Asks every realm node what blocks the deletion. A node error is kept in its entry.
-pub async fn check_group(
-    context: &Arc<DriverContext>,
-    auth: AuthContext,
-    group_id: GroupId,
-) -> Result<Vec<(NodeId, Result<(), GroupDeletionError>)>, GroupDeletionError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    if auth.realm_id != *net.realm_id() {
-        return Err(GroupDeletionError::Unauthorized);
-    }
-    let config = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .ok()
-        .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
-    let (group, record) = load_group(context, group_id).await?;
-    authorize(context, &auth, group_id, record.as_ref(), group.is_some()).await?;
-    if group.is_none() {
-        return Err(GroupDeletionError::NotFound);
-    }
-    let local = net.node_id();
-    // Peers answer a check only from infrastructure nodes, as they do for Prepare.
-    if !is_sync_eligible(&config, local) {
-        return Err(GroupDeletionError::Unavailable(
-            "run the deletion check on a server node".into(),
-        ));
-    }
-    let nodes = config
-        .nodes
+    let records = &ticket.payload.group_deletions;
+    if records
         .iter()
-        .map(|node| node.node_id.parse::<NodeId>())
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
-    let mut replies = Vec::new();
-    if nodes.contains(&local) {
-        replies.push((local, scan(context, &auth, group_id, local).await));
+        .any(|record| record.plan.realm_id != realm_id)
+    {
+        return Err(GroupDeletionError::Invalid(
+            "deletion realm mismatch".into(),
+        ));
     }
-    let remote = nodes
-        .into_iter()
-        .filter(|node| *node != local)
-        .collect::<Vec<_>>();
-    let check = || GroupDeleteAction::Check {
-        group_id,
-        caller: Box::new(auth.clone()),
-    };
-    let answers = request_nodes(context, &remote, check).await;
-    replies.extend(
-        answers
-            .into_iter()
-            .map(|(node, reply)| (node, reply.map(|_| ()))),
-    );
-    replies.sort_by_key(|(node, _)| *node);
-    Ok(replies)
+    Ok(records.iter().rev().cloned().collect())
 }
+
+impl Operation for InstallOnboardingOperation {
+    type Output = ();
+    type Error = GroupDeletionError;
+
+    fn first(&mut self) -> Result<Next<()>, GroupDeletionError> {
+        self.install_next()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
+        if self.syncing {
+            done(result)?;
+            return Ok(Next::Done(()));
+        }
+        finished(result)?;
+        self.install_next()
+    }
+}
+
+#[cfg(test)]
+#[path = "coordinator_tests.rs"]
+mod tests;

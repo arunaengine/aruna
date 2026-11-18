@@ -23,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyLoadOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::DriverContext;
 use crate::driver::drive;
@@ -249,11 +251,13 @@ async fn load_evaluators(
     context: &DriverContext,
     records: &[MetadataRegistryRecord],
 ) -> Result<Evaluators, VisibilityError> {
-    PolicyEvaluator::load_bulk(
+    drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
         context,
-        records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id)),
     )
     .await
     .map_err(|_| VisibilityError::Unavailable)
@@ -289,7 +293,9 @@ async fn build_evaluators(
     scopes.dedup();
     let mut evaluators = Evaluators::new();
     for (realm_id, group_id) in scopes {
-        if let Ok(evaluator) = PolicyEvaluator::load(context, realm_id, Some(group_id)).await {
+        if let Ok(evaluator) =
+            drive(PolicyLoadOperation::new(realm_id, Some(group_id)), context).await
+        {
             evaluators.insert((realm_id, group_id), evaluator);
         }
     }

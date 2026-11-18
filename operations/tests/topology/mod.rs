@@ -60,8 +60,8 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::testing::{project_logged_events, replay_event_log};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::placement::expand_placement::expand_realm_placement;
-use aruna_operations::placement::mutation::drive_placement_mutation;
+use aruna_operations::placement::expand_placement::ExpandPlacementOperation;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -599,9 +599,15 @@ impl Topology {
         // driver re-drives a conflicted mutation itself.
         self.config = hang_cap(
             "placement mutation",
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                None,
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig { actor, mutation },
+                    None,
+                    node.context
+                        .as_ref()
+                        .node_and_realm()
+                        .map(|(node_id, _)| node_id),
+                ),
                 node.context.as_ref(),
             ),
         )
@@ -921,7 +927,10 @@ impl Topology {
         let actor = self.actor(self.node(0));
         let started = hang_cap(
             "onboarding expansion",
-            expand_realm_placement(self.nodes[0].context.as_ref(), &actor),
+            drive(
+                ExpandPlacementOperation::new(&actor),
+                self.nodes[0].context.as_ref(),
+            ),
         )
         .await?;
         self.await_config("expansion transitions replicate", |config| {
@@ -1155,19 +1164,26 @@ async fn install_realm_config(
     for strategy_id in strategy_ids {
         hang_cap(
             "initialize activations",
-            drive_placement_mutation(
-                MutatePlacementConfig {
-                    actor: Actor {
-                        node_id: nodes[0].node_id(),
-                        user_id,
-                        realm_id,
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig {
+                        actor: Actor {
+                            node_id: nodes[0].node_id(),
+                            user_id,
+                            realm_id,
+                        },
+                        mutation: RealmPlacementMutation::InitializeActivations {
+                            strategy_id,
+                            candidate_map_epoch: 1,
+                        },
                     },
-                    mutation: RealmPlacementMutation::InitializeActivations {
-                        strategy_id,
-                        candidate_map_epoch: 1,
-                    },
-                },
-                None,
+                    None,
+                    nodes[0]
+                        .context
+                        .as_ref()
+                        .node_and_realm()
+                        .map(|(node_id, _)| node_id),
+                ),
                 nodes[0].context.as_ref(),
             ),
         )
@@ -1203,11 +1219,7 @@ async fn install_realm_config(
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                )
+                async move { aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()) }
             }))
             .await;
             let pending = outcomes
@@ -1301,11 +1313,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                ),
+                async { aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()) },
                 span,
             )
             .await;
@@ -1660,12 +1668,7 @@ pub async fn install_replica_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {
@@ -1692,12 +1695,7 @@ pub async fn install_default_config(
         store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(config)
 }

@@ -30,11 +30,12 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::nonce::SpendNonceOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
@@ -296,8 +297,10 @@ async fn prepare_granted(
     let granted = signed
         .verify(*net.realm_id(), net.node_id(), now)
         .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| {
             NativeReferenceReject::Unavailable("realm config unavailable".to_string())
         })?;
@@ -355,8 +358,10 @@ async fn prepare_delegated(
     let delegation = signed
         .verify(*net.realm_id(), net.node_id(), now)
         .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| {
             NativeReferenceReject::Unavailable("realm config unavailable".to_string())
         })?;
@@ -446,17 +451,19 @@ async fn read_exact(
         &request.bucket,
         &request.key,
     );
-    if let Err(error) = authorize(
+    if let Err(error) = drive(
+        AuthorizeOperation::new(
+            auth_context.realm_id,
+            auth_context,
+            &path,
+            &Permission::READ,
+            PolicyRequestExtras::operation(if request.head {
+                HEAD_OPERATION
+            } else {
+                READ_OPERATION
+            }),
+        ),
         context,
-        auth_context.realm_id,
-        auth_context,
-        &path,
-        &Permission::READ,
-        PolicyRequestExtras::operation(if request.head {
-            HEAD_OPERATION
-        } else {
-            READ_OPERATION
-        }),
     )
     .await
     {

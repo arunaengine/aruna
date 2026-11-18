@@ -64,7 +64,7 @@ use crate::device::sync::{
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::groups::backends::drain::remove_drained_backends;
+use crate::forward::realm::RelayAdminOperation;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
@@ -139,7 +139,9 @@ use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::notifications::watch::table::RebuildTableOperation;
-use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
+use crate::placement::process_placements::PlacementReconcileOutcome;
+use crate::placement::process_placements::PlacementReconcileStatus;
+use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
@@ -165,8 +167,10 @@ use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
+mod drained;
 mod outbox;
 mod registration;
+pub(crate) use drained::remove_drained_backends;
 mod restore;
 
 pub use outbox::drive_sync_drain;
@@ -557,13 +561,16 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::forward::entry::relay_admin_event(
+        match drive(
+            RelayAdminOperation::new(
+                self.context.node_and_realm().map(|(node_id, _)| node_id),
+                &holders,
+                record.target.clone(),
+                event.clone(),
+                record.placement,
+                origin_signature,
+            ),
             &self.context,
-            &holders,
-            record.target.clone(),
-            event.clone(),
-            record.placement,
-            origin_signature,
         )
         .await
         {
@@ -848,7 +855,12 @@ impl OperationsTaskHandler {
                 if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
-                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                let outcome = drive(
+                    ReconcilePlacementsOperation::new(realm_id, node_id, true),
+                    &self.context,
+                )
+                .await
+                .unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
                     PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {

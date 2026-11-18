@@ -36,6 +36,8 @@ use crate::jobs::lifecycle::family_reads::FamilyStatusOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::write_peer::WritePeerOperation;
 
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 
 impl From<&OwnedArtifact> for WireArtifact {
@@ -610,8 +612,10 @@ async fn holds_family(
         .net_handle
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let config = crate::realm::load_config::load_realm_config(context, *net.realm_id())
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     let view = crate::jobs::records::verify::FamilyView::resolve(&config, *net.realm_id(), family)
         .ok_or_else(|| {

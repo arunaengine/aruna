@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use tracing::warn;
 
 use crate::driver::DriverContext;
+use aruna_core::events::TopicPeerError;
 
 /// Why signing fails on a node without a net handle, which holds the node key.
 const UNAVAILABLE: &str = "net transport unavailable";
@@ -133,9 +134,31 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
     Ok(Event::Net(NetEvent::Recorded))
 }
 
+/// Runs the topic peer effects through the handle; hands any other effect back.
+async fn set_topic_peers(effect: NetEffect, context: &DriverContext) -> Result<Event, NetEffect> {
+    let (topics, peers, create) = match effect {
+        NetEffect::EnsureTopics { topics, peers } => (topics, peers, true),
+        NetEffect::AllowTopicPeers { topics, peers } => (topics, peers, false),
+        other => return Err(other),
+    };
+    let result = match &context.net_handle {
+        None => Err(TopicPeerError::NoNetwork),
+        Some(net) => match create {
+            true => net.ensure_sync_topics(&topics, peers).await,
+            false => net.allow_topic_peers(&topics, peers).await,
+        }
+        .map_err(|error| TopicPeerError::Failed(error.to_string())),
+    };
+    Ok(Event::Net(NetEvent::TopicPeers(result)))
+}
+
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     let effect = match record_watch(effect, context.net_handle.as_ref()) {
         Ok(recorded) => return recorded,
+        Err(effect) => effect,
+    };
+    let effect = match set_topic_peers(effect, context).await {
+        Ok(answered) => return answered,
         Err(effect) => effect,
     };
     if let NetEffect::DocumentSync(DocumentEffect::ReloadRealmPeers) = effect {
@@ -159,6 +182,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
                 VaultSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
+            NetEffect::SignDeletePlan(_) => {
+                Event::Net(NetEvent::DeletePlanSigned(Err(UNAVAILABLE.to_string())))
+            }
             NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
                 SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),

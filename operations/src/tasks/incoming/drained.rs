@@ -1,4 +1,5 @@
 //! Removes disabled tenant backends that hold nothing any more, once the reclaim sweep emptied them.
+//! The blob handle's claim must outlive the removal, so this stays with the task input.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,13 +7,15 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use tracing::{info, warn};
 
-use super::remove::{DisabledScanOperation, HoldingScanOperation, RemoveBackendOperation};
 use crate::driver::{DriverContext, drive};
+use crate::groups::backends::remove::{
+    DisabledScanOperation, HoldingScanOperation, RemoveBackendOperation,
+};
 
 /// Deletes the record and credentials of every disabled tenant backend that no
 /// longer holds anything. Runs after the reclaim sweep, which is what empties
 /// them; a backend on `retain` keeps its rows and so is never removed.
-pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, String> {
+pub(crate) async fn remove_drained_backends(context: &DriverContext) -> Result<usize, String> {
     let disabled = drive(DisabledScanOperation::default(), context)
         .await
         .map_err(|error| error.to_string())?;
@@ -74,7 +77,3 @@ fn idle_backends(context: &DriverContext, disabled: Vec<GroupStorage>) -> Vec<(G
         })
         .collect()
 }
-
-#[cfg(test)]
-#[path = "drain_tests.rs"]
-mod tests;

@@ -44,14 +44,12 @@ use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use super::submit_local::{MintJobOperation, QueueJobOperation, SubmitLocalOperation};
 use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
-use crate::realm::load_config::load_realm_config;
 use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
@@ -62,6 +60,9 @@ use super::lifecycle::family_reads::{
 use super::lifecycle::ids::session_of;
 use super::route::{JobRouteOperation, JobRouteOutcome, RoutedJobStatus};
 
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
@@ -687,8 +688,10 @@ pub async fn resolve_job_owner(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     config.job_owner(job_id).map_err(|error| match error {
         JobOwnerError::NotJobControl => JobRouteError::NotFound,
@@ -779,7 +782,12 @@ async fn linked_push_job(
     ];
     for (path, permission) in checks {
         let extras = PolicyRequestExtras::rest();
-        match authorize(context, auth.realm_id, auth, &path, &permission, extras).await {
+        match drive(
+            AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras),
+            context,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
             Err(AuthorizeError::CheckFailed(error)) => return Err(error),
@@ -810,13 +818,15 @@ async fn joined_pid_job(
     else {
         return Ok(None);
     };
-    match authorize(
+    match drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &document.permission_path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &document.permission_path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
     )
     .await
     {

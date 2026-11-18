@@ -35,8 +35,8 @@ use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{GroupCountOperation, count_realm_documents};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
-use aruna_operations::placement::mutation::drive_placement_mutation;
-use aruna_operations::placement::provision::provision_metadata_binding;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
+use aruna_operations::placement::provision::ProvisionBindingOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -1673,9 +1673,12 @@ pub async fn mutate_realm_placement(
                 Permission::WRITE,
             )
             .await?;
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                Some(auth),
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig { actor, mutation },
+                    Some(auth),
+                    context.node_and_realm().map(|(node_id, _)| node_id),
+                ),
                 &context,
             )
             .await
@@ -1690,9 +1693,12 @@ pub async fn mutate_realm_placement(
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
-            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
-                .await
-                .map_err(map_handle_error)?;
+            drive(
+                ProvisionBindingOperation::new(actor.clone(), scope, strategy_id),
+                context.as_ref(),
+            )
+            .await
+            .map_err(map_handle_error)?;
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {

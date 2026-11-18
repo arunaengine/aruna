@@ -30,7 +30,7 @@ use aruna_core::structs::execution::table::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::ReadRoute;
-use aruna_operations::auth::request_authorization::permission_rules;
+use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
@@ -1201,7 +1201,7 @@ pub async fn list_references(
     );
     ensure_permission(&state, &auth, bucket_path.clone(), Permission::READ).await?;
     // Denies and path restrictions below the bucket hide single keys from the page.
-    let rules = permission_rules(&state.get_ctx(), &auth, &bucket_path)
+    let rules = drive(rules_operation(&auth, &bucket_path), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
 

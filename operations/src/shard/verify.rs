@@ -3,33 +3,29 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentNetEvent;
-use aruna_core::document::shard_topic_id;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::document::{ShardManifest, shard_topic_id};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, ShardNetEffect};
+use aruna_core::events::{Event, GroupEvent, GroupResult, ShardNetEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::rows::{PrefixPages, done, encoded_row, read_row, value};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_net::NetHandle;
-use byteview::ByteView;
-use futures_util::{StreamExt, stream};
+use aruna_net::shard_manifest::manifest_entry_digest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::shard::assemble_shard_manifest;
-use crate::shard::client::fetch_shard_manifest;
-use crate::shard::manifest::manifest_entry_digest;
-use crate::shard::restore::apply_restored_reconcile;
-use crate::sync::reconcile::SyncTopicsOperation;
+use super::{
+    AssembleManifestOperation, ManifestError, client::FetchManifestOperation, shard_answer,
+    shard_call,
+};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::sync::shard_placement::{placement_key, placement_prefix};
-use aruna_core::placement::resolve_shard_holders;
 
 /// Page size for scanning persisted shard verification markers.
 const SHARD_PAGE_SIZE: usize = 256;
@@ -61,160 +57,289 @@ pub struct ShardVerificationSummary {
     pub unverified: usize,
 }
 
-/// Reconciles every newly held shard against the first reachable co-holder in
-/// rank order, comparing digest and entries, then retrying once via
-/// anti-entropy. Verified markers skip, so it is idempotent across restarts.
-pub async fn verify_held_shards(
-    context: &Arc<DriverContext>,
-    node_id: NodeId,
-    realm_id: RealmId,
-) -> ShardVerificationSummary {
-    let mut summary = ShardVerificationSummary::default();
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
-        return summary;
-    };
-    let Some(net_handle) = context.net_handle.clone() else {
-        return summary;
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShardVerdict {
+    Known,
+    Verified,
+    Open,
+}
 
-    let held_shards: Vec<_> = config
-        .strategies
-        .iter()
+fn verification_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
+    placement_key(realm_id, placement)
+}
+
+/// The shards this node holds with their co-holders in rank order, so the first
+/// reachable co-holder is the highest-ranked one.
+fn held_shards(config: &RealmConfigDocument, node_id: NodeId) -> Vec<(PlacementRef, Vec<NodeId>)> {
+    (config.strategies.iter())
         .flat_map(|strategy| {
-            (0..strategy.shard_count).filter_map(|shard| {
+            (0..strategy.shard_count).filter_map(move |shard| {
                 let placement = PlacementRef {
                     strategy_id: strategy.strategy_id,
                     shard,
                 };
-                let holders = resolve_shard_holders(&config, &placement);
+                let holders = resolve_shard_holders(config, &placement);
                 holders.contains(&node_id).then(|| {
-                    // Rank order is preserved by `resolve_shard_holders`; keep it so the
-                    // first reachable co-holder is the highest-ranked one.
-                    let co_holders: Vec<NodeId> = holders
-                        .into_iter()
-                        .filter(|candidate| *candidate != node_id)
-                        .collect();
-                    (placement, co_holders)
+                    let others = holders.into_iter().filter(|peer| *peer != node_id);
+                    (placement, others.collect())
                 })
             })
         })
-        .collect();
-
-    let net_handle = &net_handle;
-    let pending = stream::iter(held_shards.into_iter().enumerate().map(
-        |(shard_index, (placement, co_holders))| async move {
-            let mut shard_summary = ShardVerificationSummary {
-                held: 1,
-                ..ShardVerificationSummary::default()
-            };
-            if is_shard_verified(context, realm_id, &placement).await {
-                shard_summary.already_verified = 1;
-            } else if verify_one_shard(
-                context,
-                net_handle,
-                node_id,
-                realm_id,
-                placement,
-                &co_holders,
-            )
-            .await
-            {
-                shard_summary.newly_verified = 1;
-            } else {
-                shard_summary.unverified = 1;
-            }
-
-            (shard_index, shard_summary)
-        },
-    ))
-    .buffer_unordered(VERIFICATION_CONCURRENCY_LIMIT);
-    futures_util::pin_mut!(pending);
-
-    let mut shard_summaries = Vec::new();
-    while let Some(shard_summary) = pending.next().await {
-        shard_summaries.push(shard_summary);
-    }
-    shard_summaries.sort_unstable_by_key(|(shard_index, _)| *shard_index);
-    for (_, shard_summary) in shard_summaries {
-        summary.held += shard_summary.held;
-        summary.already_verified += shard_summary.already_verified;
-        summary.newly_verified += shard_summary.newly_verified;
-        summary.unverified += shard_summary.unverified;
-    }
-    summary
+        .collect()
 }
 
-async fn verify_one_shard(
-    context: &Arc<DriverContext>,
-    net_handle: &NetHandle,
+/// Reconciles every newly held shard against the first reachable co-holder in
+/// rank order, comparing digest and entries, then retrying via anti-entropy.
+/// Verified markers skip, so it is idempotent across restarts.
+#[derive(Debug, PartialEq)]
+pub struct VerifyHeldOperation {
     node_id: NodeId,
     realm_id: RealmId,
-    placement: PlacementRef,
-    co_holders: &[NodeId],
-) -> bool {
-    let topic = shard_topic_id(realm_id, &placement);
+    verifying: bool,
+}
 
-    // A sole holder converges only after its genesis exists.
-    // A genesis-less topic has an empty fingerprint, so the digest alone is insufficient.
-    if co_holders.is_empty() {
-        if !net_handle.sync_topic_exists(topic).unwrap_or(false) {
-            debug!(
-                strategy = %placement.strategy_id,
-                shard = placement.shard,
-                "Sole-holder shard has no local genesis yet; deferring verification"
-            );
-            return false;
+impl VerifyHeldOperation {
+    pub fn new(node_id: NodeId, realm_id: RealmId) -> Self {
+        Self {
+            node_id,
+            realm_id,
+            verifying: false,
         }
-        let digest = match assemble_shard_manifest(context, realm_id, placement).await {
-            Ok(manifest) => manifest.digest,
-            Err(error) => {
-                warn!(error = %error, "Failed to assemble sole-holder shard manifest for verification");
-                return false;
-            }
-        };
-        mark_verified(context, realm_id, placement, None, digest).await;
-        info!(
-            strategy = %placement.strategy_id,
-            shard = placement.shard,
-            "Verified sole-holder shard",
-        );
-        return true;
     }
 
-    match converge_shard_digest(
-        context, net_handle, node_id, realm_id, placement, co_holders,
-    )
-    .await
-    {
-        Some((co_holder, digest)) => {
-            mark_verified(context, realm_id, placement, Some(co_holder), digest).await;
-            info!(
-                strategy = %placement.strategy_id,
-                shard = placement.shard,
+    fn verify_all(&mut self, config: &RealmConfigDocument) -> Next<ShardVerificationSummary> {
+        let shards = held_shards(config, self.node_id);
+        if shards.is_empty() {
+            return Next::Done(ShardVerificationSummary::default());
+        }
+        self.verifying = true;
+        let members = (shards.into_iter())
+            .map(|(placement, co_holders)| {
+                let verify = VerifyShardOperation::new(self.realm_id, placement, co_holders);
+                Effect::SubOperation(boxed_suboperation(verify, |result| {
+                    Event::Child(ChildOutcome::new(result))
+                }))
+            })
+            .collect();
+        Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: VERIFICATION_CONCURRENCY_LIMIT,
+            form: GroupForm::All { deadline: None },
+        }))
+    }
+}
+
+impl Operation for VerifyHeldOperation {
+    type Output = ShardVerificationSummary;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<ShardVerificationSummary>, IoError> {
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ShardVerificationSummary>, IoError> {
+        if !self.verifying {
+            return Ok(
+                match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => self.verify_all(&config),
+                    Err(_) => Next::Done(ShardVerificationSummary::default()),
+                },
+            );
+        }
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            return Err(IoError::Unexpected {
+                expected: "the verification group",
+                got: result.label(),
+            });
+        };
+        let mut summary = ShardVerificationSummary::default();
+        for member in results {
+            summary.held += 1;
+            let verdict = match member {
+                GroupResult::Done(event) => match *event {
+                    Event::Child(outcome) => IoResult::Child(outcome)
+                        .child::<ShardVerdict, IoError>()?
+                        .unwrap_or(ShardVerdict::Open),
+                    _ => ShardVerdict::Open,
+                },
+                _ => ShardVerdict::Open,
+            };
+            match verdict {
+                ShardVerdict::Known => summary.already_verified += 1,
+                ShardVerdict::Verified => summary.newly_verified += 1,
+                ShardVerdict::Open => summary.unverified += 1,
+            }
+        }
+        Ok(Next::Done(summary))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum VerifyStage {
+    Known,
+    SoleExists,
+    SoleManifest,
+    Converge,
+    Mark,
+}
+
+type VerifyTurn = Result<Next<ShardVerdict>, IoError>;
+
+/// Verifies one shard unless a marker says it already was.
+#[derive(Debug, PartialEq)]
+struct VerifyShardOperation {
+    realm_id: RealmId,
+    placement: PlacementRef,
+    co_holders: Vec<NodeId>,
+    now_ms: u64,
+    stage: VerifyStage,
+    against: Option<NodeId>,
+}
+
+impl VerifyShardOperation {
+    fn new(realm_id: RealmId, placement: PlacementRef, co_holders: Vec<NodeId>) -> Self {
+        Self {
+            realm_id,
+            placement,
+            co_holders,
+            now_ms: 0,
+            stage: VerifyStage::Known,
+            against: None,
+        }
+    }
+
+    fn topic(&self) -> irokle::TopicId {
+        shard_topic_id(self.realm_id, &self.placement)
+    }
+
+    fn mark(&mut self, digest: [u8; 32]) -> VerifyTurn {
+        let record = ShardVerificationRecord {
+            placement: self.placement,
+            verified_against: self.against,
+            digest,
+            verified_at_ms: self.now_ms,
+        };
+        self.stage = VerifyStage::Mark;
+        let mark = MarkVerifiedOperation {
+            key: verification_key(self.realm_id, &self.placement),
+            record,
+        };
+        Ok(Next::Call(IoCall::child(mark)))
+    }
+
+    fn verdict(&self) -> ShardVerdict {
+        match self.against {
+            Some(co_holder) => info!(
+                strategy = %self.placement.strategy_id,
+                shard = self.placement.shard,
                 co_holder = %co_holder,
                 "Verified shard against co-holder",
-            );
-            true
+            ),
+            None => info!(
+                strategy = %self.placement.strategy_id,
+                shard = self.placement.shard,
+                "Verified sole-holder shard",
+            ),
         }
-        None => false,
+        ShardVerdict::Verified
     }
 }
 
-/// Reconciles the local shard copy against the first reachable co-holder,
-/// returning it with the digest both sides agree on. The matched digest is the
-/// checkpoint root a completion proof commits to; `None` when none converged.
-pub async fn converge_shard_digest(
-    context: &Arc<DriverContext>,
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    realm_id: RealmId,
-    placement: PlacementRef,
-    co_holders: &[NodeId],
-) -> Option<(NodeId, [u8; 32])> {
-    converge_with_barrier(
-        context, net_handle, node_id, realm_id, placement, co_holders, None,
-    )
-    .await
+impl Operation for VerifyShardOperation {
+    type Output = ShardVerdict;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> VerifyTurn {
+        let key = verification_key(self.realm_id, &self.placement);
+        Ok(Next::Call(read_row(SHARD_VERIFICATION_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> VerifyTurn {
+        match self.stage {
+            VerifyStage::Known => {
+                if value(result)?.is_some() {
+                    return Ok(Next::Done(ShardVerdict::Known));
+                }
+                // A sole holder converges only after its genesis exists: a genesis-less
+                // topic has an empty fingerprint, so the digest alone is insufficient.
+                if self.co_holders.is_empty() {
+                    self.stage = VerifyStage::SoleExists;
+                    let topics = vec![self.topic()];
+                    return Ok(Next::Call(shard_call(ShardNetEffect::Existing(topics))));
+                }
+                self.stage = VerifyStage::Converge;
+                let converge =
+                    ConvergeOperation::new(self.realm_id, self.placement, &self.co_holders, None);
+                Ok(Next::Call(IoCall::child(converge)))
+            }
+            VerifyStage::SoleExists => match shard_answer(result)? {
+                ShardNetEvent::Existing(topics) if topics.contains(&self.topic()) => {
+                    self.stage = VerifyStage::SoleManifest;
+                    let assemble = AssembleManifestOperation::new(self.realm_id, self.placement);
+                    Ok(Next::Call(IoCall::child(assemble)))
+                }
+                _ => {
+                    debug!(
+                        strategy = %self.placement.strategy_id,
+                        shard = self.placement.shard,
+                        "Sole-holder shard has no local genesis yet; deferring verification"
+                    );
+                    Ok(Next::Done(ShardVerdict::Open))
+                }
+            },
+            VerifyStage::SoleManifest => match result.child::<ShardManifest, ManifestError>()? {
+                Ok(manifest) => self.mark(manifest.digest),
+                Err(error) => {
+                    warn!(error = %error, "Failed to assemble sole-holder shard manifest for verification");
+                    Ok(Next::Done(ShardVerdict::Open))
+                }
+            },
+            VerifyStage::Converge => {
+                match result.child::<Option<(NodeId, [u8; 32])>, IoError>()?? {
+                    Some((co_holder, digest)) => {
+                        self.against = Some(co_holder);
+                        self.mark(digest)
+                    }
+                    None => Ok(Next::Done(ShardVerdict::Open)),
+                }
+            }
+            VerifyStage::Mark => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    warn!(error = %error, "Failed to persist shard verification marker");
+                }
+                Ok(Next::Done(self.verdict()))
+            }
+        }
+    }
+}
+
+/// Writes one verification marker.
+#[derive(Debug, PartialEq)]
+struct MarkVerifiedOperation {
+    key: Key,
+    record: ShardVerificationRecord,
+}
+
+impl Operation for MarkVerifiedOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let key = self.key.clone();
+        let row = encoded_row(SHARD_VERIFICATION_KEYSPACE, key, &self.record)?;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        done(result)?;
+        Ok(Next::Done(()))
+    }
 }
 
 /// Whether the local cursor covers the required barrier join. Vacuous without
@@ -226,198 +351,249 @@ fn dominates_required(cursor: &[u8], required: Option<&irokle::ActorClock>) -> b
     postcard::from_bytes::<irokle::ActorClock>(cursor).is_ok_and(|local| local.dominates(required))
 }
 
-/// [`converge_shard_digest`] with an additionally required frontier: the local
-/// cursor must dominate the join of every old-holder barrier before the digest
-/// counts, so a target cannot prove while missing an unreachable holder's writes.
-pub async fn converge_with_barrier(
-    context: &Arc<DriverContext>,
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    realm_id: RealmId,
-    placement: PlacementRef,
-    co_holders: &[NodeId],
-    required: Option<&irokle::ActorClock>,
-) -> Option<(NodeId, [u8; 32])> {
-    let topic = shard_topic_id(realm_id, &placement);
-    for co_holder in co_holders {
-        let mut remote =
-            match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    debug!(
-                        co_holder = %co_holder,
-                        error = %error,
-                        "Shard manifest fetch failed; trying next co-holder"
-                    );
-                    continue;
-                }
-            };
-
-        // Reconcile against this source with a bounded number of anti-entropy
-        // passes; on non-convergence continue to the next source.
-        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
-            let local = match assemble_shard_manifest(context, realm_id, placement).await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    warn!(error = %error, "Failed to assemble local shard manifest for verification");
-                    return None;
-                }
-            };
-            // Genesis-less holders share the empty fingerprint.
-            // Require a local genesis before comparing manifests.
-            if net_handle.sync_topic_exists(topic).unwrap_or(false)
-                && manifests_converged(&local, &remote)
-                && dominates_required(&local.cursor, required)
-            {
-                return Some((*co_holder, local.digest));
-            }
-            // Topic or entry digests differ: pull the co-holder's events and re-compare.
-            let sync =
-                SyncTopicsOperation::new(*net_handle.realm_id(), vec![topic], vec![*co_holder]);
-            let event = DocumentNetEvent::reconciled(drive(sync, context).await);
-            apply_restored_reconcile(context, node_id, event).await;
-            remote = match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    debug!(co_holder = %co_holder, error = %error, "Re-fetch of shard manifest failed");
-                    break;
-                }
-            };
-        }
-    }
-    None
-}
-
-fn manifests_converged(
-    local: &aruna_core::document::ShardManifest,
-    remote: &aruna_core::document::ShardManifest,
-) -> bool {
+fn manifests_converged(local: &ShardManifest, remote: &ShardManifest) -> bool {
     local.digest == remote.digest
         && manifest_entry_digest(&local.entries) == manifest_entry_digest(&remote.entries)
 }
 
+#[derive(Debug, PartialEq)]
+enum ConvergeStage {
+    Fetch,
+    Local,
+    Exists(Box<ShardManifest>),
+    Pull,
+    Refetch,
+}
+
+type ConvergeOutput = Option<(NodeId, [u8; 32])>;
+type ConvergeTurn = Result<Next<ConvergeOutput>, IoError>;
+
+/// Reconciles the local shard copy against the first reachable co-holder, returning it with
+/// the digest a completion proof commits to, or `None`. With `required`, the local cursor must
+/// also dominate that frontier, so a target cannot prove while missing a holder's writes.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ConvergeOperation {
+    realm_id: RealmId,
+    placement: PlacementRef,
+    /// Reversed, so the next co-holder pops off the end.
+    co_holders: Vec<NodeId>,
+    required: Option<irokle::ActorClock>,
+    holder: Option<NodeId>,
+    remote: Option<ShardManifest>,
+    attempts: usize,
+    stage: ConvergeStage,
+}
+
+impl ConvergeOperation {
+    pub(crate) fn new(
+        realm_id: RealmId,
+        placement: PlacementRef,
+        co_holders: &[NodeId],
+        required: Option<irokle::ActorClock>,
+    ) -> Self {
+        Self {
+            realm_id,
+            placement,
+            co_holders: co_holders.iter().rev().copied().collect(),
+            required,
+            holder: None,
+            remote: None,
+            attempts: 0,
+            stage: ConvergeStage::Fetch,
+        }
+    }
+
+    fn topic(&self) -> irokle::TopicId {
+        shard_topic_id(self.realm_id, &self.placement)
+    }
+
+    fn fetch(&self, peer: NodeId) -> IoCall {
+        IoCall::child(FetchManifestOperation::new(
+            peer,
+            self.realm_id,
+            self.placement,
+        ))
+    }
+
+    fn next_holder(&mut self) -> ConvergeTurn {
+        let Some(peer) = self.co_holders.pop() else {
+            return Ok(Next::Done(None));
+        };
+        self.holder = Some(peer);
+        self.attempts = 0;
+        self.stage = ConvergeStage::Fetch;
+        Ok(Next::Call(self.fetch(peer)))
+    }
+
+    fn assemble(&mut self, remote: ShardManifest) -> ConvergeTurn {
+        self.remote = Some(remote);
+        self.stage = ConvergeStage::Local;
+        let assemble = AssembleManifestOperation::new(self.realm_id, self.placement);
+        Ok(Next::Call(IoCall::child(assemble)))
+    }
+
+    fn holder(&self) -> Result<NodeId, IoError> {
+        self.holder.ok_or(IoError::Unexpected {
+            expected: "a co-holder",
+            got: "none",
+        })
+    }
+}
+
+impl Operation for ConvergeOperation {
+    type Output = ConvergeOutput;
+    type Error = IoError;
+
+    fn first(&mut self) -> ConvergeTurn {
+        self.next_holder()
+    }
+
+    fn next(&mut self, result: IoResult) -> ConvergeTurn {
+        let holder = self.holder()?;
+        match std::mem::replace(&mut self.stage, ConvergeStage::Pull) {
+            ConvergeStage::Fetch => match result.child::<ShardManifest, ManifestError>()? {
+                Ok(remote) => self.assemble(remote),
+                Err(error) => {
+                    debug!(
+                        co_holder = %holder,
+                        error = %error,
+                        "Shard manifest fetch failed; trying next co-holder"
+                    );
+                    self.next_holder()
+                }
+            },
+            ConvergeStage::Local => match result.child::<ShardManifest, ManifestError>()? {
+                Ok(local) => {
+                    self.stage = ConvergeStage::Exists(Box::new(local));
+                    let topics = vec![self.topic()];
+                    Ok(Next::Call(shard_call(ShardNetEffect::Existing(topics))))
+                }
+                Err(error) => {
+                    warn!(error = %error, "Failed to assemble local shard manifest for verification");
+                    Ok(Next::Done(None))
+                }
+            },
+            // Genesis-less holders share the empty fingerprint, so a local genesis
+            // must exist before manifests are compared.
+            ConvergeStage::Exists(local) => {
+                let exists = matches!(
+                    shard_answer(result)?,
+                    ShardNetEvent::Existing(topics) if topics.contains(&self.topic())
+                );
+                let converged = (self.remote.as_ref())
+                    .is_some_and(|remote| manifests_converged(&local, remote));
+                if exists && converged && dominates_required(&local.cursor, self.required.as_ref())
+                {
+                    return Ok(Next::Done(Some((holder, local.digest))));
+                }
+                // Topic or entry digests differ: pull the co-holder's events and re-compare.
+                self.stage = ConvergeStage::Pull;
+                Ok(Next::Call(shard_call(ShardNetEffect::Pull {
+                    topics: vec![self.topic()],
+                    peers: vec![holder],
+                })))
+            }
+            ConvergeStage::Pull => {
+                shard_answer(result)?;
+                self.stage = ConvergeStage::Refetch;
+                Ok(Next::Call(self.fetch(holder)))
+            }
+            ConvergeStage::Refetch => match result.child::<ShardManifest, ManifestError>()? {
+                Ok(remote) => {
+                    self.attempts += 1;
+                    if self.attempts < VERIFICATION_MAX_ATTEMPTS {
+                        self.assemble(remote)
+                    } else {
+                        self.next_holder()
+                    }
+                }
+                Err(error) => {
+                    debug!(co_holder = %holder, error = %error, "Re-fetch of shard manifest failed");
+                    self.next_holder()
+                }
+            },
+        }
+    }
+}
+
 /// Deletes a shard's verification marker (e.g. when the local node leaves the
 /// shard's holder set), so a later re-entry re-verifies from scratch.
-pub async fn delete_shard_verification(
-    context: &DriverContext,
-    realm_id: RealmId,
-    placement: &PlacementRef,
-) {
-    if let Event::Storage(StorageEvent::Error { error }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
-            key: verification_key(realm_id, placement),
-            txn_id: None,
-        })
-        .await
-    {
-        warn!(error = %error, "Failed to delete shard verification marker");
-    }
+pub(crate) fn forget_verification(realm_id: RealmId, placement: &PlacementRef) -> IoCall {
+    IoCall::Delete(vec![(
+        SHARD_VERIFICATION_KEYSPACE.to_string(),
+        verification_key(realm_id, placement),
+    )])
 }
 
 /// Topic ids of every shard the local node has durably verified in `realm_id`.
 /// Reconciliation installs a former-holder history cutoff only for these: an
 /// unverified shard's clock is not a trustworthy cutover boundary until proven.
-pub async fn load_verified_topics(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct VerifiedTopicsOperation {
     realm_id: RealmId,
-) -> BTreeSet<::irokle::TopicId> {
-    let mut topics = BTreeSet::new();
-    let mut start_after: Option<Key> = None;
-    loop {
-        let (values, next) = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
-                prefix: Some(placement_prefix(realm_id)),
-                start: start_after.take().map(IterStart::After),
-                limit: SHARD_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(%realm_id, error = %error, "Failed to scan verified shards");
-                return topics;
-            }
-            other => {
-                warn!(%realm_id, event = ?other, "Unexpected verified shard scan result");
-                return topics;
-            }
-        };
-        for (_, value) in &values {
-            if let Ok(record) = postcard::from_bytes::<ShardVerificationRecord>(value) {
-                topics.insert(shard_topic_id(realm_id, &record.placement));
-            }
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
+    pages: PrefixPages,
+    topics: BTreeSet<irokle::TopicId>,
+}
+
+impl VerifiedTopicsOperation {
+    pub fn new(realm_id: RealmId) -> Self {
+        let prefix = placement_prefix(realm_id);
+        Self {
+            realm_id,
+            pages: PrefixPages::new(SHARD_VERIFICATION_KEYSPACE, prefix, SHARD_PAGE_SIZE),
+            topics: BTreeSet::new(),
         }
     }
-    topics
+}
+
+impl Operation for VerifiedTopicsOperation {
+    type Output = BTreeSet<irokle::TopicId>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<BTreeSet<irokle::TopicId>>, IoError> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<BTreeSet<irokle::TopicId>>, IoError> {
+        for (_, row) in self.pages.take(result)? {
+            if let Ok(record) = postcard::from_bytes::<ShardVerificationRecord>(&row) {
+                let topic = shard_topic_id(self.realm_id, &record.placement);
+                self.topics.insert(topic);
+            }
+        }
+        Ok(match self.pages.done() {
+            true => Next::Done(std::mem::take(&mut self.topics)),
+            false => Next::Call(self.pages.call()),
+        })
+    }
 }
 
 /// Whether the local node has a persisted verification marker for a shard.
-pub async fn is_shard_verified(
-    context: &DriverContext,
-    realm_id: RealmId,
-    placement: &PlacementRef,
-) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
-                key: verification_key(realm_id, placement),
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
-    )
+#[derive(Debug, PartialEq)]
+pub struct ShardVerifiedOperation {
+    key: Key,
 }
 
-async fn mark_verified(
-    context: &DriverContext,
-    realm_id: RealmId,
-    placement: PlacementRef,
-    verified_against: Option<NodeId>,
-    digest: [u8; 32],
-) {
-    let record = ShardVerificationRecord {
-        placement,
-        verified_against,
-        digest,
-        verified_at_ms: unix_timestamp_millis(),
-    };
-    let value = match postcard::to_allocvec(&record) {
-        Ok(value) => value,
-        Err(error) => {
-            warn!(error = %error, "Failed to encode shard verification record");
-            return;
+impl ShardVerifiedOperation {
+    pub fn new(realm_id: RealmId, placement: &PlacementRef) -> Self {
+        Self {
+            key: verification_key(realm_id, placement),
         }
-    };
-    if let Event::Storage(StorageEvent::Error { error }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
-            key: verification_key(realm_id, &placement),
-            value: ByteView::from(value),
-            txn_id: None,
-        })
-        .await
-    {
-        warn!(error = %error, "Failed to persist shard verification marker");
     }
 }
 
-fn verification_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
-    placement_key(realm_id, placement)
+impl Operation for ShardVerifiedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let key = self.key.clone();
+        Ok(Next::Call(read_row(SHARD_VERIFICATION_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        Ok(Next::Done(value(result)?.is_some()))
+    }
 }
 
 #[cfg(test)]

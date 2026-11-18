@@ -333,11 +333,9 @@ mod tests {
             .await
             .expect("an open fence admits the write");
         // The departing holder reported the bucket drained at this write's generation.
-        crate::placement::process_transitions::close(
-            &context.storage_handle,
-            &realm_id,
-            &placement,
-            1,
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
+            &crate::driver::DriverContext::for_storage(context.storage_handle.clone()),
         )
         .await
         .expect("close");

@@ -950,12 +950,12 @@ impl Handle for TaskHandle {
                 let event = match task_effect {
                     TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after).await,
                     TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after).await,
+                    TaskEffect::ScheduleIdleTimer { key, after } => {
+                        self.schedule_idle_timer(key, after).await
+                    }
                     TaskEffect::CancelTimer { key } => self.cancel_timer(key).await,
                     TaskEffect::AbortRunningHandlers { key } => {
                         self.abort_running_handlers(key).await
-                    }
-                    TaskEffect::ScheduleIdleTimer { key, after } => {
-                        self.schedule_idle_timer(key, after).await
                     }
                 };
                 Event::Task(event)

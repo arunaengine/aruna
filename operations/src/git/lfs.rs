@@ -5,10 +5,11 @@
 use super::objects::{self, Blob};
 use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records, repository};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -65,13 +66,15 @@ async fn permit(
         &object.bucket,
         &object.key,
     );
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &permission,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &permission,
-        PolicyRequestExtras::rest(),
     )
     .await?;
     Ok(())

@@ -7,7 +7,7 @@ use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::version_holders;
@@ -139,13 +139,15 @@ async fn resolve(
             &exact.bucket,
             &exact.key,
         );
-        authorize(
+        drive(
+            AuthorizeOperation::new(
+                exact.realm_id,
+                auth,
+                &path,
+                &Permission::READ,
+                PolicyRequestExtras::rest(),
+            ),
             context,
-            exact.realm_id,
-            auth,
-            &path,
-            &Permission::READ,
-            PolicyRequestExtras::rest(),
         )
         .await
         .map_err(|_| GitError::NotFound)?;

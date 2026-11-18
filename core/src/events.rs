@@ -510,10 +510,71 @@ pub enum NetEvent {
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
     DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
+    Shard(Box<ShardNetEvent>),
+    /// Whether sync topics took the requested peers.
+    TopicPeers(Result<(), TopicPeerError>),
+    /// This node's signature over a group deletion plan.
+    DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
+    /// The caller a forwarded credential names, or why the peer may not act for it.
+    WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
+    /// The verified claims of a token named for revocation, or why it is invalid.
+    RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
     /// This node and the holders its watch interest matches; none without a net handle.
     WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
+}
+
+/// What peers said about topics this node lacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenesisProbe {
+    /// Topics at least one reached peer holds.
+    pub known_co_holder: std::collections::BTreeSet<irokle::TopicId>,
+    /// Topics a reached peer may hold; creating them could fork the topic.
+    pub unconfirmed: std::collections::BTreeSet<irokle::TopicId>,
+    pub unreachable: Vec<NodeId>,
+}
+
+/// The answer to a [`crate::effects::ShardNetEffect`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardNetEvent {
+    /// This node has no net transport.
+    NoNetwork,
+    Existing(std::collections::BTreeSet<irokle::TopicId>),
+    /// How many topics could not be reopened.
+    Reopened {
+        failed: usize,
+    },
+    Closed(Result<bool, String>),
+    Outcome(Result<(), String>),
+    Probed(GenesisProbe),
+    /// Whether what the pull brought was applied.
+    Pulled {
+        applied: bool,
+    },
+    Flag(bool),
+    Facts {
+        holder: NodeId,
+        digest: [u8; 32],
+        cursor: Vec<u8>,
+    },
+    Root(Result<[u8; 32], String>),
+    Proof(crate::structs::placement::transition::CompletionProof),
+    Manifest(Result<Box<crate::document::ShardManifest>, String>),
+}
+
+/// Why sync topics did not take the requested peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicPeerError {
+    NoNetwork,
+    Failed(String),
+}
+
+/// Why a forwarded credential was not accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePeerRefusal {
+    Unauthorized,
+    Unavailable(String),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -953,6 +1014,11 @@ impl Event {
                     DatasetSummary,
                     WritePeerAuth,
                     GrantSign,
+                    Shard,
+                    TopicPeers,
+                    DeletePlanSigned,
+                    WritePeerChecked,
+                    RevocationClaims,
                     Notification,
                     InboxWoken,
                     Heartbeat,

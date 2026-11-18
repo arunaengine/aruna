@@ -32,9 +32,12 @@ use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
 };
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::forward::realm::ApplyRelayOperation;
+use crate::forward::token::ApplyRevokeOperation;
+use crate::forward::transport::reject;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::search_local_buckets;
@@ -166,13 +169,15 @@ impl MetadataHandle {
             net_handle.node_id(),
             local_bucket,
         );
-        match authorize(
+        match drive(
+            AuthorizeOperation::new(
+                *net_handle.realm_id(),
+                &auth,
+                &path,
+                &Permission::WRITE,
+                extras,
+            ),
             context.as_ref(),
-            *net_handle.realm_id(),
-            &auth,
-            &path,
-            &Permission::WRITE,
-            extras,
         )
         .await
         {
@@ -248,13 +253,15 @@ async fn delete_mirror(
                     net_handle.node_id(),
                     local_bucket,
                 );
-                match authorize(
+                match drive(
+                    AuthorizeOperation::new(
+                        *net_handle.realm_id(),
+                        auth,
+                        &path,
+                        &Permission::WRITE,
+                        extras,
+                    ),
                     context.as_ref(),
-                    *net_handle.realm_id(),
-                    auth,
-                    &path,
-                    &Permission::WRITE,
-                    extras,
                 )
                 .await
                 {
@@ -908,7 +915,12 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_token_revoke(context, peer, forward).await
+                    drive(
+                        ApplyRevokeOperation::new(context.node_and_realm(), peer, forward),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| reject(format!("token revocation failed: {error}")))
                 })
                 .await
             }
@@ -938,23 +950,38 @@ impl MetadataHandle {
                 MetadataTransportMessage::ForwardedPlacementPolicy { result }
             }
             forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
-                Box::pin(async {
-                    crate::users::vault_route::apply_forwarded_vault(context, peer, forward).await
-                })
-                .await
+                let apply = crate::users::vault_route::ApplyVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Forwarded vault change failed");
+                        MetadataTransportMessage::ForwardedWriteUnavailable
+                    })
             }
             MetadataTransportMessage::FetchVaultRecords { user_id, query } => {
-                Box::pin(async {
-                    crate::users::vault_route::serve_vault_fetch(context, peer, user_id, query)
-                        .await
-                })
-                .await
+                let serve = crate::users::vault_route::ServeVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    user_id,
+                    query,
+                );
+                MetadataTransportMessage::FetchedVaultRecords {
+                    result: Box::pin(crate::driver::drive(serve, context.as_ref())).await,
+                }
             }
             forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
-                Box::pin(async {
-                    crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
-                })
-                .await
+                let apply = crate::placement::policy::ApplyPolicyOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| reject(error.to_string()))
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
                 Box::pin(async {
@@ -1020,21 +1047,38 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_admin_relay(context, peer, forward).await
+                    drive(
+                        ApplyRelayOperation::new(context.node_and_realm(), peer, forward),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Failed to persist a relayed admin event");
+                        MetadataTransportMessage::ForwardedWriteUnavailable
+                    })
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
-                Box::pin(async {
-                    crate::groups::forward::apply_group_create(context, peer, forward).await
-                })
-                .await
+                let apply = crate::groups::forward::ApplyGroupOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| reject(format!("group create failed: {error}")))
             }
             request @ MetadataTransportMessage::GroupDeletion { .. } => {
-                Box::pin(crate::groups::deletion::apply_request(
-                    context, peer, request,
-                ))
-                .await
+                let apply = crate::groups::deletion::ApplyRequestOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    request,
+                    ulid::Ulid::generate(),
+                );
+                MetadataTransportMessage::GroupDeletionResult {
+                    result: Box::pin(crate::driver::drive(apply, context.as_ref())).await,
+                }
             }
             _ => unreachable!("request family routed incorrectly"),
         }

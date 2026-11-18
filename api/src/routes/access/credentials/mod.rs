@@ -925,10 +925,12 @@ pub(crate) async fn authorize_credential_issuance(
         // A member whose roles reach only part of the group data may still take
         // a credential: authorization uses the derived roots, while probing the
         // bare directory would ask a `/**` grant to match the directory itself.
-        let roots = aruna_operations::auth::request_authorization::reachable_roots(
+        let rules = aruna_operations::driver::drive(
+            aruna_operations::auth::request_authorization::rules_operation(
+                &effective_auth,
+                &group_root,
+            ),
             &state.get_ctx(),
-            &effective_auth,
-            &group_root,
         )
         .await
         .map_err(|error| match error {
@@ -939,6 +941,11 @@ pub(crate) async fn authorize_credential_issuance(
             | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
             _ => ServerError::InternalError(error.into()),
         })?;
+        let roots = aruna_operations::auth::request_authorization::reachable_roots(
+            &rules,
+            &effective_auth,
+            &group_root,
+        );
         if roots.is_empty() {
             return Err(ServerError::Forbidden);
         }

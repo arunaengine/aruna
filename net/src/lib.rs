@@ -20,6 +20,7 @@ mod eviction;
 mod heartbeat;
 pub mod job_control;
 pub mod notification;
+pub mod shard_manifest;
 mod signing;
 pub mod streams;
 mod tasks;
@@ -1072,6 +1073,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
+        Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
@@ -1082,6 +1084,11 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
         Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
+        Effect::Net(NetEffect::Shard(_)) => "shard",
+        Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
+        Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
+        Effect::Net(NetEffect::AuthorizeWritePeer { .. }) => "authorize_write_peer",
+        Effect::Net(NetEffect::RevocationClaims(_)) => "revocation_claims",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",

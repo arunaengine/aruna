@@ -405,16 +405,16 @@ async fn fill(
             compute_handle: None,
             outbound_handle: None,
         };
-        aruna_operations::groups::deletion::install_onboarding(
-            &context,
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let install = aruna_operations::groups::deletion::InstallOnboardingOperation::new(
             &ticket,
             config.realm_id,
             config.node_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        )
-        .await?;
+            now,
+        );
+        aruna_operations::driver::drive(install, &context).await?;
         stopped(stop)?;
     }
     let net_handle = NetHandle::new(

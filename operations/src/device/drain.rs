@@ -29,7 +29,6 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::write::apply_batch_routed;
 use crate::metadata::update_document::UpdateDocumentError;
-use crate::placement::process_placements::load_realm_config;
 
 use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
 
@@ -41,6 +40,8 @@ use super::publish_queue::{
 use super::replica_store::{read_replica, store_replica};
 use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -67,7 +68,11 @@ pub async fn drain_publish_queue(context: &Arc<DriverContext>) -> DrainOutcome {
     };
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return DrainOutcome::Deferred;
     };
 

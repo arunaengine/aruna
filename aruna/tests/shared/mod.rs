@@ -877,12 +877,19 @@ async fn spawn_seed_at(
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
     // The single-node seed owns rank zero and creates shard geneses before writes.
-    aruna_operations::placement::process_placements::process_shard_placements(
+    aruna_operations::driver::drive(
+        aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
+            realm_id,
+            net.node_id(),
+            true,
+        ),
         &context,
-        realm_id,
-        net.node_id(),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure(
+        )
+    });
     if !reopen {
         drive(
             ClaimInitialOperation::new(ClaimInitialInput {
@@ -1040,12 +1047,19 @@ async fn spawn_joiner_mode(
         config.realm_id,
     )
     .await;
-    aruna_operations::placement::process_placements::reconcile_shard_topics(
+    aruna_operations::driver::drive(
+        aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
+            config.realm_id,
+            config.node_id,
+            false,
+        ),
         &joiner_context,
-        config.realm_id,
-        config.node_id,
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure(
+        )
+    });
     announce_realm_presence(joiner_context.as_ref(), &config.realm_id, config.node_id).await?;
 
     let (base_url, state, server_task) = spawn_rest_server(

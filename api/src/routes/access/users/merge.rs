@@ -15,7 +15,6 @@ use aruna_core::link::fresh_local;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, oidc_subject_key};
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::driver::drive;
 use aruna_operations::users::merge::handoff::{HandoffConfig, HandoffOperation};
 use aruna_operations::users::merge::{MergeError, MergeUsersConfig, MergeUsersOperation};
@@ -198,7 +197,7 @@ async fn merge_account(
     let survivor_token = bearer.as_ref().map(|bearer| bearer.as_str().to_string());
     let survivor_login = bearer_auth_time(&state, bearer).await?;
     // A cut-off token still names its account, so a repeat of a finished merge is recognized.
-    let (claims, live) = match decode_bearer_token(state.as_ref(), &request.token).await {
+    let (claims, live) = match state.decode_token(&request.token).await {
         Ok(claims) => (claims, true),
         Err(_) => match claims_for_revocation(&state, &request.token).await {
             Ok(claims) => (claims, false),

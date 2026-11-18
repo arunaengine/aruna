@@ -25,11 +25,11 @@ use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 use super::{IncomingVersionOperation, IncomingVersionResult};
-use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
@@ -533,13 +533,15 @@ async fn allow_policy(
     permission: &Permission,
     operation: &str,
 ) -> Result<bool, String> {
-    match authorize(
+    match drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            path,
+            permission,
+            PolicyRequestExtras::operation(operation),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        path,
-        permission,
-        PolicyRequestExtras::operation(operation),
     )
     .await
     {
@@ -690,20 +692,25 @@ async fn bao_policy(
                 unique.entry(key).or_insert(candidate);
             }
             let candidates = unique.into_values().collect::<Vec<_>>();
-            let evaluators = PolicyEvaluator::load_bulk(
+            let evaluators = drive(
+                PolicyBulkOperation::new(
+                    candidates
+                        .iter()
+                        .map(|candidate| (candidate.realm_id, candidate.group_id)),
+                ),
                 context,
-                candidates
-                    .iter()
-                    .map(|candidate| (candidate.realm_id, candidate.group_id)),
             )
             .await
             .map_err(|error| error.to_string())?;
-            let permissions = GroupPermissionRules::collect(
+            let permissions = drive(
+                GroupRulesOperation::new(
+                    Some(&request.auth_context),
+                    candidates.iter().map(|candidate| candidate.group_id),
+                ),
                 context,
-                Some(&request.auth_context),
-                candidates.iter().map(|candidate| candidate.group_id),
             )
-            .await;
+            .await
+            .unwrap_or_default();
             let mut allowed = Vec::with_capacity(candidates.len());
             let mut had_denial = false;
             for candidate in candidates {

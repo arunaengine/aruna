@@ -6,12 +6,17 @@ use crate::error::CliError;
 use aruna::config::load;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::calls::Next;
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-use aruna_operations::auth::bearer_token::{ArunaValidationState, decode_bearer_token};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::auth::bearer_token::{
+    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks,
+};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -26,7 +31,6 @@ use aruna_operations::realm::claim_admin::{
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
 use rand::Rng;
 use reqwest::Client;
@@ -454,26 +458,23 @@ impl DoctorValidationState {
     }
 }
 
-#[async_trait]
-impl ArunaValidationState for DoctorValidationState {
-    async fn is_token_revoked(
-        &self,
-        _realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        Ok(self.revoked_token_hashes.contains(token_hash))
-    }
-
-    async fn user_cutoff(
-        &self,
-        _realm_id: &RealmId,
-        _user_id: &aruna_core::UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.trusted_realms.contains(realm_id)
+impl DoctorValidationState {
+    /// Verifies `token` against the loaded realm state. The checks need no further reads.
+    fn decode(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = TokenChecks {
+            trust: IssuerTrust::Listed(self.trusted_realms.iter().copied().collect()),
+            revocation: RevocationCheck::Listed(
+                self.revoked_token_hashes.iter().cloned().collect(),
+            ),
+            linked_realm: None,
+            keys: None,
+        };
+        let mut decode = DecodeTokenOperation::new(token, checks);
+        decode.stamp(unix_timestamp_millis());
+        match decode.first()? {
+            Next::Done(claims) => Ok(claims),
+            _ => Err(ArunaBearerError::RevocationUnavailable),
+        }
     }
 }
 
@@ -501,7 +502,7 @@ async fn build_token_view(
     validation_state: &DoctorValidationState,
 ) -> Result<TokenView, CliError> {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-    let valid = match decode_bearer_token(validation_state, token).await {
+    let valid = match validation_state.decode(token) {
         Ok(_) => Valid::True,
         Err(err) => Valid::False {
             reason: err.to_string(),

@@ -11,6 +11,7 @@ use super::{
 use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
@@ -729,8 +730,9 @@ async fn authorize_document(
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
-    aruna_operations::auth::request_authorization::authorize_document(
-        &context, realm_id, auth, document, extras,
+    drive(
+        AuthorizeDocumentOperation::new(realm_id, auth, document, extras),
+        &context,
     )
     .await
     .map_err(crate::auth::map_authorize_error)

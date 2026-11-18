@@ -12,16 +12,16 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-use serde::de::DeserializeOwned;
 
-use super::{MetadataHandle, RevocationBlindValidation, WritePeerError};
-use crate::auth::bearer_token::{
-    ArunaValidationState, decode_bearer_token, realm_user_cutoff, validate_bearer_token,
-};
+use super::{AuthValidationState, MetadataHandle, WritePeerError};
+use crate::auth::bearer_token::UserCutoffOperation;
 use crate::auth::error::ArunaBearerError;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::contact::PeerContacts;
 use crate::metadata::protocol::MetadataReadError;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
 
@@ -105,7 +105,10 @@ impl MetadataHandle {
             self.note_peer_contact(peer);
             return Ok(auth);
         };
-        let auth = validate_bearer_token(&self.inner.auth_validation, token.as_str())
+        let auth = self
+            .inner
+            .auth_validation
+            .validate(token.as_str())
             .await
             .map_err(|_| WritePeerError::Unauthorized)?;
         let local_realm_id = self
@@ -163,11 +166,7 @@ impl MetadataHandle {
         &self,
         token: &str,
     ) -> Result<TokenClaims, ArunaBearerError> {
-        decode_bearer_token(
-            &RevocationBlindValidation(&self.inner.auth_validation),
-            token,
-        )
-        .await
+        self.inner.auth_validation.decode(token, true).await
     }
 }
 
@@ -186,9 +185,12 @@ pub(super) async fn replay_authority(
     else {
         return Ok(auth_token);
     };
-    let cutoff = realm_user_cutoff(storage_handle, auth.realm_id, &auth.user_id)
-        .await
-        .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;
+    let cutoff = drive(
+        UserCutoffOperation::new(auth.realm_id, &auth.user_id),
+        &DriverContext::for_storage(storage_handle.clone()),
+    )
+    .await
+    .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;
     let issued = issued_at.min(authored_at_ms / 1000);
     match cutoff.is_some_and(|cutoff| issued < cutoff) {
         true => Err(WritePeerError::Unauthorized),
@@ -196,13 +198,10 @@ pub(super) async fn replay_authority(
     }
 }
 
-pub(super) async fn remote_auth_context<S>(
-    state: &S,
+pub(super) async fn remote_auth_context(
+    state: &AuthValidationState,
     auth_token: Option<AuthToken>,
-) -> Result<Option<AuthContext>, MetadataError>
-where
-    S: ArunaValidationState + ?Sized,
-{
+) -> Result<Option<AuthContext>, MetadataError> {
     let Some(auth_token) = auth_token else {
         return Ok(None);
     };
@@ -211,26 +210,25 @@ where
             "internal metadata auth requires the remote peer gate".to_string(),
         ));
     };
-    validate_bearer_token(state, token.as_str())
+    state
+        .validate(token.as_str())
         .await
         .map(Some)
         .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
 }
 
-pub(super) async fn bucket_search_auth<S>(
-    state: &S,
+pub(super) async fn bucket_search_auth(
+    state: &AuthValidationState,
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError>
-where
-    S: ArunaValidationState + ?Sized,
-{
+) -> Result<AuthContext, MetadataReadError> {
     let Some(AuthToken::Bearer(token)) = auth_token else {
         return Err(MetadataReadError::Unauthorized);
     };
-    let auth = validate_bearer_token(state, token.as_str())
+    let auth = state
+        .validate(token.as_str())
         .await
         .map_err(|_| MetadataReadError::Unauthorized)?;
     let Some(local_realm_id) = local_realm_id else {
@@ -246,16 +244,13 @@ where
 }
 
 /// A bucket search without a bearer reads as Everyone, and only from a configured member.
-pub(super) async fn search_reader_auth<S>(
-    state: &S,
+pub(super) async fn search_reader_auth(
+    state: &AuthValidationState,
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError>
-where
-    S: ArunaValidationState + ?Sized,
-{
+) -> Result<AuthContext, MetadataReadError> {
     if auth_token.is_some() {
         return bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await;
     }
@@ -268,16 +263,13 @@ where
 
 /// A release membership request: a bearer this node validates itself, from a realm
 /// infrastructure node only, never a device.
-pub(super) async fn release_auth<S>(
-    state: &S,
+pub(super) async fn release_auth(
+    state: &AuthValidationState,
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError>
-where
-    S: ArunaValidationState + ?Sized,
-{
+) -> Result<AuthContext, MetadataReadError> {
     let auth = bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await?;
     ensure_peer_configured(
         storage_handle,
@@ -290,17 +282,14 @@ where
     Ok(auth)
 }
 
-pub(super) async fn authorize_peer<S>(
-    state: &S,
+pub(super) async fn authorize_peer(
+    state: &AuthValidationState,
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<AuthToken>,
     allow_internal: bool,
-) -> Result<Option<AuthContext>, MetadataError>
-where
-    S: ArunaValidationState + ?Sized,
-{
+) -> Result<Option<AuthContext>, MetadataError> {
     let internal_auth = matches!(&auth_token, Some(AuthToken::Internal(_)));
     let auth_context = match auth_token {
         Some(AuthToken::Internal(auth)) if allow_internal => {
@@ -397,42 +386,15 @@ async fn ensure_peer_configured(
     }
 }
 
-pub(super) async fn load_auth_state<T>(
-    storage_handle: &StorageHandle,
-    key: &[u8],
-) -> Result<T, MetadataError>
-where
-    T: DeserializeOwned + Default,
-{
-    match storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => {
-            postcard::from_bytes(&bytes).map_err(|error| MetadataError::Backend(error.to_string()))
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
-        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata auth state read result: {}",
-            other.label()
-        ))),
-    }
-}
-
 pub(super) async fn config_digest_matches(
     context: &DriverContext,
     realm_id: RealmId,
     expected: &[u8; 32],
 ) -> bool {
-    crate::realm::load_config::load_realm_config(context, realm_id)
+    drive(GetConfigOperation::new(realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .and_then(|config| config.digest().ok())
         .as_ref()
         == Some(expected)

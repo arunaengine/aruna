@@ -7,158 +7,72 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::document::DocumentNetEvent;
-use aruna_core::document::shard_topic_id;
-use aruna_core::effects::StorageEffect;
+use aruna_core::backoff::conflict_backoff;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::{DocumentOutboxRecord, ShardManifest, shard_topic_id};
+use aruna_core::document_apply::ApplyError;
+use aruna_core::effects::ShardNetEffect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::placement::transition::{
-    PlacementTransition, ProofClaim, TransitionStatus,
-};
-use aruna_storage::StorageHandle;
-use byteview::ByteView;
-use tracing::{debug, warn};
-
-use crate::driver::{DriverContext, drive};
-use crate::placement::mutation::drive_placement_mutation;
-use crate::realm::mutate_placement::{
-    CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
-    RealmPlacementMutation, is_management,
-};
-use crate::shard::verify::converge_with_barrier;
-use crate::shard::{assemble_shard_manifest, frontier_root};
-use crate::sync::document_outbox::OutboxPagePlan;
-use crate::sync::reconcile::SyncTopicsOperation;
+use aruna_core::events::ShardNetEvent;
+use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use aruna_core::row_plan::PlanOperation;
+use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::placement::transition::{
+    PlacementTransition, ProofClaim, TransitionLimits, TransitionStatus,
+};
+use aruna_core::types::Key;
+use tracing::{debug, warn};
 
-/// Runs every transition step the local node owns. Returns whether a step is
-/// still outstanding, so the caller re-arms the placement retry.
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::placement::mutation::PlacementMutationOperation;
+use crate::realm::mutate_placement::{
+    CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
+    RealmPlacementMutation, is_management,
+};
+use crate::shard::verify::ConvergeOperation;
+use crate::shard::{AssembleManifestOperation, ManifestError, shard_answer, shard_call};
+use crate::sync::document_outbox::OutboxTimerOperation;
+use crate::sync::outbox_record::outbox_stream_prefixes;
+
 /// Fence close attempts before a persistent transaction conflict is reported.
 const CLOSE_ATTEMPTS: usize = 4;
+const OUTBOX_PAGE_SIZE: usize = 256;
 
-pub async fn process_placement_transitions(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    config: &RealmConfigDocument,
-) -> bool {
-    if config.placement_transitions.is_empty() {
-        let activations =
-            ensure_strategy_activations(context, realm_id, local_node_id, config).await;
-        let expansions = ensure_expansions(context, realm_id, local_node_id, config).await;
-        return activations || expansions;
+fn realm_actor(realm_id: RealmId, node_id: NodeId) -> Actor {
+    Actor {
+        node_id,
+        user_id: UserId::nil(realm_id),
+        realm_id,
     }
-    let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
-    pending |= ensure_expansions(context, realm_id, local_node_id, config).await;
-    let mut departed = false;
-    // Batch all steps to avoid one conflict-prone realm-config transaction per bucket and node.
-    let mut steps: Vec<RealmPlacementMutation> = Vec::new();
-    for transition in &config.placement_transitions {
-        if transition_stale(config, transition) {
-            // A plan whose incomplete buckets all have stale predecessors can
-            // never apply; abort it so the strategy's in-flight slot frees.
-            if is_management(config, local_node_id) {
-                steps.push(RealmPlacementMutation::AbortTransition(
-                    transition.plan.transition_id,
-                ));
+}
+
+/// One placement mutation of this node's own.
+fn submit_call(realm_id: RealmId, local: NodeId, mutation: RealmPlacementMutation) -> IoCall {
+    let config = MutatePlacementConfig {
+        actor: realm_actor(realm_id, local),
+        mutation,
+    };
+    IoCall::child(PlacementMutationOperation::new(config, None, None))
+}
+
+/// Whether a submitted mutation needs another pass.
+fn submit_failed(result: IoResult) -> Result<bool, IoError> {
+    Ok(
+        match result.child::<RealmConfigDocument, MutatePlacementError>()? {
+            Ok(_) => false,
+            Err(error) => {
+                warn!(error = %error, "Placement transition step did not apply");
+                true
             }
-            continue;
-        }
-        // One window function decides execution and membership alike: only
-        // admitted buckets run, and only their targets join topics.
-        let admitted: Vec<u32> = transition
-            .plan
-            .admitted_buckets(&transition.completed)
-            .map(|bucket| bucket.bucket)
-            .collect();
-        for bucket in &transition.plan.buckets {
-            if let Some(completion) = transition.completion(bucket.bucket) {
-                let departing = bucket.old_holders.contains(&local_node_id)
-                    && !bucket.target_holders.contains(&local_node_id);
-                departed |= departing;
-                // Past the bucket's grace, a departing holder owes a drain
-                // report before its retention may end (F7).
-                let grace_passed = aruna_core::time::unix_timestamp_millis()
-                    >= completion
-                        .completed_at_ms
-                        .saturating_add(transition.plan.limits.grace_ms);
-                if departing
-                    && grace_passed
-                    && !transition.drain_reported(bucket.bucket, local_node_id)
-                {
-                    let placement = PlacementRef {
-                        strategy_id: transition.plan.strategy_id,
-                        shard: bucket.bucket,
-                    };
-                    match drain_step(context, realm_id, transition, &placement, local_node_id).await
-                    {
-                        StepPlan::Ready(mutation) => steps.push(mutation),
-                        StepPlan::Stalled(mutation) => {
-                            steps.push(mutation);
-                            pending = true;
-                        }
-                        StepPlan::Pending => pending = true,
-                        StepPlan::Done => {}
-                    }
-                }
-                continue;
-            }
-            // An observed abort stops this node from submitting anything
-            // further: the un-cut buckets simply never complete.
-            if !matches!(transition.status, TransitionStatus::Active) {
-                continue;
-            }
-            if !admitted.contains(&bucket.bucket) {
-                pending = true;
-                continue;
-            }
-            let placement = PlacementRef {
-                strategy_id: transition.plan.strategy_id,
-                shard: bucket.bucket,
-            };
-            if bucket.old_holders.contains(&local_node_id) {
-                match barrier_step(context, realm_id, local_node_id, transition, &placement).await {
-                    StepPlan::Ready(mutation) => steps.push(mutation),
-                    StepPlan::Stalled(mutation) => {
-                        steps.push(mutation);
-                        pending = true;
-                    }
-                    StepPlan::Pending => pending = true,
-                    StepPlan::Done => {}
-                }
-            }
-            if bucket.target_holders.contains(&local_node_id) {
-                match completion_step(context, realm_id, local_node_id, transition, &placement)
-                    .await
-                {
-                    StepPlan::Ready(mutation) => steps.push(mutation),
-                    StepPlan::Stalled(mutation) => {
-                        // A stall is diagnostics: reduce it once and keep the
-                        // retry armed for a later convergence.
-                        steps.push(mutation);
-                        pending = true;
-                    }
-                    StepPlan::Pending => pending = true,
-                    StepPlan::Done => {}
-                }
-            }
-        }
-    }
-    if !steps.is_empty() {
-        pending |= submit_steps(context, realm_id, local_node_id, steps).await;
-    }
-    // Flush before grace ends so writes accepted before cutover reach the topic (DECISIONS K3).
-    if departed {
-        crate::tasks::incoming::drive_sync_drain(context.clone()).await;
-    }
-    pending
+        },
+    )
 }
 
 /// An active plan none of whose incomplete buckets can ever apply: every one
@@ -184,48 +98,333 @@ fn transition_stale(config: &RealmConfigDocument, transition: &PlacementTransiti
     incomplete > 0 && stale == incomplete
 }
 
-/// Closes the bucket's write fence, then reports it drained once no journalled
-/// eviction and no closed-generation record remains. The durable close comes
-/// first: an empty scan alone proves nothing about a pre-cutover writer.
-async fn drain_step(
-    context: &Arc<DriverContext>,
+/// One bucket step this node owes: a mutation ready to batch, work still
+/// blocked on a precondition, a stall report worth reducing while the retry
+/// stays armed, or nothing left to do.
+#[derive(Debug, PartialEq)]
+enum StepPlan {
+    Ready(RealmPlacementMutation),
+    Stalled(RealmPlacementMutation),
+    Pending,
+    Done,
+}
+
+/// A bucket step that needs I/O, in the order the pass runs them.
+#[derive(Debug, PartialEq)]
+enum BucketWork {
+    Drain(usize, PlacementRef),
+    Barrier(usize, PlacementRef),
+    Completion(usize, PlacementRef),
+}
+
+#[derive(Debug, PartialEq)]
+enum PassStage {
+    Activations,
+    Expansions,
+    Work,
+    Submit,
+    Kick,
+}
+
+type PassTurn = Result<Next<bool>, IoError>;
+
+/// Runs every transition step the local node owns. Answers whether a step is
+/// still outstanding, so the caller re-arms the placement retry.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ProcessTransitionsOperation {
     realm_id: RealmId,
-    transition: &PlacementTransition,
-    placement: &PlacementRef,
-    local_node_id: NodeId,
-) -> StepPlan {
-    let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
-        return StepPlan::Done;
-    };
-    let closed = bucket.predecessor_epoch;
-    if let Err(error) = close(&context.storage_handle, &realm_id, placement, closed).await {
-        debug!(error = %error, "Transition drain could not close the write fence");
-        return StepPlan::Pending;
+    local: NodeId,
+    config: Arc<RealmConfigDocument>,
+    now_ms: u64,
+    stage: PassStage,
+    pending: bool,
+    departed: bool,
+    /// Batched, to avoid one conflict-prone realm-config transaction per bucket and node.
+    steps: Vec<RealmPlacementMutation>,
+    /// Reversed, so the next step pops off the end.
+    work: Vec<BucketWork>,
+}
+
+impl ProcessTransitionsOperation {
+    pub(crate) fn new(realm_id: RealmId, local: NodeId, config: Arc<RealmConfigDocument>) -> Self {
+        Self {
+            realm_id,
+            local,
+            config,
+            now_ms: 0,
+            stage: PassStage::Activations,
+            pending: false,
+            departed: false,
+            steps: Vec::new(),
+            work: Vec::new(),
+        }
     }
-    if let Some(net_handle) = context.net_handle.as_ref() {
-        match net_handle.close_sync_topic(shard_topic_id(realm_id, placement)) {
-            Ok(true) => return StepPlan::Pending,
-            Ok(false) => {}
-            Err(error) => {
-                debug!(error = %error, "Transition drain could not close the shard topic");
-                return StepPlan::Pending;
+
+    fn plan_work(&mut self) {
+        let (config, local) = (self.config.clone(), self.local);
+        let mut work = Vec::new();
+        for (index, transition) in config.placement_transitions.iter().enumerate() {
+            if transition_stale(&config, transition) {
+                // A plan whose incomplete buckets all have stale predecessors can
+                // never apply; abort it so the strategy's in-flight slot frees.
+                if is_management(&config, local) {
+                    let id = transition.plan.transition_id;
+                    self.steps.push(RealmPlacementMutation::AbortTransition(id));
+                }
+                continue;
+            }
+            // One window function decides execution and membership alike: only
+            // admitted buckets run, and only their targets join topics.
+            let admitted: Vec<u32> = (transition.plan.admitted_buckets(&transition.completed))
+                .map(|bucket| bucket.bucket)
+                .collect();
+            for bucket in &transition.plan.buckets {
+                let placement = PlacementRef {
+                    strategy_id: transition.plan.strategy_id,
+                    shard: bucket.bucket,
+                };
+                if let Some(completion) = transition.completion(bucket.bucket) {
+                    let departing = bucket.old_holders.contains(&local)
+                        && !bucket.target_holders.contains(&local);
+                    self.departed |= departing;
+                    // Past the bucket's grace, a departing holder owes a drain
+                    // report before its retention may end.
+                    let grace = transition.plan.limits.grace_ms;
+                    if departing
+                        && self.now_ms >= completion.completed_at_ms.saturating_add(grace)
+                        && !transition.drain_reported(bucket.bucket, local)
+                    {
+                        work.push(BucketWork::Drain(index, placement));
+                    }
+                    continue;
+                }
+                // An observed abort stops this node from submitting anything
+                // further: the un-cut buckets simply never complete.
+                if !matches!(transition.status, TransitionStatus::Active) {
+                    continue;
+                }
+                if !admitted.contains(&bucket.bucket) {
+                    self.pending = true;
+                    continue;
+                }
+                if bucket.old_holders.contains(&local) {
+                    work.push(BucketWork::Barrier(index, placement));
+                }
+                if bucket.target_holders.contains(&local) {
+                    work.push(BucketWork::Completion(index, placement));
+                }
+            }
+        }
+        work.reverse();
+        self.work = work;
+    }
+
+    fn transition(&self, index: usize) -> Result<PlacementTransition, IoError> {
+        (self.config.placement_transitions.get(index).cloned()).ok_or(IoError::Unexpected {
+            expected: "a placement transition",
+            got: "none",
+        })
+    }
+
+    fn next_work(&mut self) -> PassTurn {
+        self.stage = PassStage::Work;
+        let (realm_id, local) = (self.realm_id, self.local);
+        match self.work.pop() {
+            Some(BucketWork::Drain(index, placement)) => {
+                let transition = self.transition(index)?;
+                let step = DrainStepOperation::new(realm_id, &transition, &placement, local);
+                Ok(Next::Call(IoCall::child(step)))
+            }
+            Some(BucketWork::Barrier(index, placement)) => {
+                let transition = self.transition(index)?;
+                let step = BarrierStepOperation::new(realm_id, local, &transition, &placement);
+                Ok(Next::Call(IoCall::child(step)))
+            }
+            Some(BucketWork::Completion(index, placement)) => {
+                let transition = self.transition(index)?;
+                let step = CompletionStepOperation::new(realm_id, local, &transition, &placement);
+                Ok(Next::Call(IoCall::child(step)))
+            }
+            None => self.submit(),
+        }
+    }
+
+    fn submit(&mut self) -> PassTurn {
+        if self.steps.is_empty() {
+            return self.kick();
+        }
+        self.stage = PassStage::Submit;
+        let steps = std::mem::take(&mut self.steps);
+        let submit = SubmitStepsOperation::new(realm_actor(self.realm_id, self.local), steps);
+        Ok(Next::Call(IoCall::child(submit)))
+    }
+
+    /// Flushes before grace ends so writes accepted before cutover reach the topic.
+    fn kick(&mut self) -> PassTurn {
+        if !self.departed {
+            return Ok(Next::Done(self.pending));
+        }
+        self.stage = PassStage::Kick;
+        Ok(Next::Call(IoCall::child(OutboxTimerOperation::new())))
+    }
+}
+
+impl Operation for ProcessTransitionsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PassTurn {
+        let run = ActivationsOperation::new(self.realm_id, self.local, self.config.clone());
+        Ok(Next::Call(IoCall::child(run)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PassTurn {
+        match self.stage {
+            PassStage::Activations => {
+                self.pending = result.child::<bool, IoError>()??;
+                self.stage = PassStage::Expansions;
+                let run = ExpansionsOperation::new(self.realm_id, self.local, self.config.clone());
+                Ok(Next::Call(IoCall::child(run)))
+            }
+            PassStage::Expansions => {
+                self.pending |= result.child::<bool, IoError>()??;
+                if self.config.placement_transitions.is_empty() {
+                    return Ok(Next::Done(self.pending));
+                }
+                self.plan_work();
+                self.next_work()
+            }
+            PassStage::Work => {
+                match result.child::<StepPlan, IoError>()?? {
+                    StepPlan::Ready(mutation) => self.steps.push(mutation),
+                    // A stall is diagnostics: reduce it once and keep the retry armed.
+                    StepPlan::Stalled(mutation) => {
+                        self.steps.push(mutation);
+                        self.pending = true;
+                    }
+                    StepPlan::Pending => self.pending = true,
+                    StepPlan::Done => {}
+                }
+                self.next_work()
+            }
+            PassStage::Submit => {
+                self.pending |= result.child::<bool, IoError>()??;
+                self.kick()
+            }
+            PassStage::Kick => {
+                if let Err(error) = result.child::<(), ApplyError>()? {
+                    warn!(%error, "Failed to scan document sync outbox");
+                }
+                Ok(Next::Done(self.pending))
             }
         }
     }
-    if let Some(blocker) = drain_blocker(context, placement, closed).await {
-        debug!(
-            ?blocker,
-            strategy_id = %placement.strategy_id,
-            bucket = placement.shard,
-            "Transition drain cannot report the bucket yet"
-        );
-        return StepPlan::Pending;
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainStage {
+    Close,
+    Topic,
+    Blocker,
+}
+
+/// Closes the bucket's write fence, then reports it drained once no journalled
+/// eviction and no closed-generation record remains. The durable close comes
+/// first: an empty scan alone proves nothing about a pre-cutover writer.
+#[derive(Debug, PartialEq)]
+struct DrainStepOperation {
+    realm_id: RealmId,
+    transition_id: ulid::Ulid,
+    placement: PlacementRef,
+    local: NodeId,
+    closed: Option<u64>,
+    stage: DrainStage,
+}
+
+impl DrainStepOperation {
+    fn new(
+        realm_id: RealmId,
+        transition: &PlacementTransition,
+        placement: &PlacementRef,
+        local: NodeId,
+    ) -> Self {
+        let bucket = transition.plan.bucket_plan(placement.shard);
+        Self {
+            realm_id,
+            transition_id: transition.plan.transition_id,
+            placement: *placement,
+            local,
+            closed: bucket.map(|bucket| bucket.predecessor_epoch),
+            stage: DrainStage::Close,
+        }
     }
-    StepPlan::Ready(RealmPlacementMutation::ReportDrained {
-        transition_id: transition.plan.transition_id,
-        bucket: placement.shard,
-        reported_by: local_node_id,
-    })
+}
+
+impl Operation for DrainStepOperation {
+    type Output = StepPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<StepPlan>, IoError> {
+        let Some(closed) = self.closed else {
+            return Ok(Next::Done(StepPlan::Done));
+        };
+        let close = CloseFenceOperation::new(self.realm_id, self.placement, closed);
+        Ok(Next::Call(IoCall::child(close)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StepPlan>, IoError> {
+        match self.stage {
+            DrainStage::Close => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    debug!(error = %error, "Transition drain could not close the write fence");
+                    return Ok(Next::Done(StepPlan::Pending));
+                }
+                self.stage = DrainStage::Topic;
+                let topic = shard_topic_id(self.realm_id, &self.placement);
+                Ok(Next::Call(shard_call(ShardNetEffect::Close(topic))))
+            }
+            DrainStage::Topic => {
+                match shard_answer(result)? {
+                    ShardNetEvent::Closed(Ok(true)) => return Ok(Next::Done(StepPlan::Pending)),
+                    ShardNetEvent::Closed(Err(error)) => {
+                        debug!(error = %error, "Transition drain could not close the shard topic");
+                        return Ok(Next::Done(StepPlan::Pending));
+                    }
+                    _ => {}
+                }
+                self.stage = DrainStage::Blocker;
+                let closed = self.closed.unwrap_or_default();
+                let blocker = DrainBlockerOperation::new(&self.placement, closed);
+                Ok(Next::Call(IoCall::child(blocker)))
+            }
+            DrainStage::Blocker => {
+                let blocker = match result.child::<Option<DrainBlocker>, IoError>()? {
+                    Ok(None) => {
+                        return Ok(Next::Done(StepPlan::Ready(
+                            RealmPlacementMutation::ReportDrained {
+                                transition_id: self.transition_id,
+                                bucket: self.placement.shard,
+                                reported_by: self.local,
+                            },
+                        )));
+                    }
+                    Ok(Some(blocker)) => format!("{blocker:?}"),
+                    Err(error) => error.to_string(),
+                };
+                debug!(
+                    %blocker,
+                    strategy_id = %self.placement.strategy_id,
+                    bucket = self.placement.shard,
+                    "Transition drain cannot report the bucket yet"
+                );
+                Ok(Next::Done(StepPlan::Pending))
+            }
+        }
+    }
 }
 
 /// Why a bucket is not drained yet. Named so the order of the checks is
@@ -235,456 +434,704 @@ async fn drain_step(
 enum DrainBlocker {
     Eviction,
     OutboxRow,
-    ScanFailed,
 }
 
 /// The first reason `placement` cannot be reported drained through `closed`.
 /// The eviction journal comes first: a scan that already passed a stream proves
 /// nothing about rows the eviction hand-off commits afterwards.
-async fn drain_blocker(
-    context: &Arc<DriverContext>,
-    placement: &PlacementRef,
+#[derive(Debug, PartialEq)]
+struct DrainBlockerOperation {
+    placement: PlacementRef,
     closed: u64,
-) -> Option<DrainBlocker> {
-    // No net handle means no eviction source, so nothing can be journalled.
-    if context
-        .net_handle
-        .as_ref()
-        .is_some_and(|net_handle| net_handle.eviction_pending(placement))
-    {
-        return Some(DrainBlocker::Eviction);
-    }
-    for prefix in crate::sync::outbox_record::outbox_stream_prefixes() {
-        let mut start_after: Option<Vec<u8>> = None;
-        loop {
-            let read = OutboxPagePlan {
-                prefix: prefix.to_vec(),
-                start_after: start_after.take(),
-                limit: 256,
-            };
-            let batch = match drive(PlanOperation::new(read), context).await {
-                Ok(batch) => batch,
-                Err(error) => {
-                    debug!(error = %error, "Transition drain scan failed");
-                    return Some(DrainBlocker::ScanFailed);
-                }
-            };
-            // An unfenced row carries generation zero and always counts.
-            if batch
-                .records
-                .iter()
-                .any(|(_, record)| record.placement == *placement && record.generation <= closed)
-            {
-                return Some(DrainBlocker::OutboxRow);
-            }
-            if !batch.has_more {
-                break;
-            }
-            start_after = batch.next_start_after;
-        }
-    }
-    None
+    /// Reversed, so the next stream pops off the end.
+    prefixes: Vec<&'static [u8]>,
+    pages: Option<PrefixPages>,
 }
 
-/// One bucket step this node owes: a mutation ready to batch, work still
-/// blocked on a precondition, a stall report worth reducing while the retry
-/// stays armed, or nothing left to do.
-enum StepPlan {
-    Ready(RealmPlacementMutation),
-    Stalled(RealmPlacementMutation),
-    Pending,
-    Done,
+impl DrainBlockerOperation {
+    fn new(placement: &PlacementRef, closed: u64) -> Self {
+        let mut prefixes = outbox_stream_prefixes().to_vec();
+        prefixes.reverse();
+        Self {
+            placement: *placement,
+            closed,
+            prefixes,
+            pages: None,
+        }
+    }
+
+    fn next_stream(&mut self) -> Result<Next<Option<DrainBlocker>>, IoError> {
+        let Some(prefix) = self.prefixes.pop() else {
+            return Ok(Next::Done(None));
+        };
+        let pages = PrefixPages::new(SYNC_OUTBOX_KEYSPACE, prefix.to_vec(), OUTBOX_PAGE_SIZE);
+        let call = pages.call();
+        self.pages = Some(pages);
+        Ok(Next::Call(call))
+    }
+}
+
+impl Operation for DrainBlockerOperation {
+    type Output = Option<DrainBlocker>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<DrainBlocker>>, IoError> {
+        Ok(Next::Call(shard_call(ShardNetEffect::EvictionPending(
+            self.placement,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<DrainBlocker>>, IoError> {
+        let Some(pages) = self.pages.as_mut() else {
+            // No net handle means no eviction source, so nothing can be journalled.
+            if matches!(shard_answer(result)?, ShardNetEvent::Flag(true)) {
+                return Ok(Next::Done(Some(DrainBlocker::Eviction)));
+            }
+            return self.next_stream();
+        };
+        // An unfenced row carries generation zero and always counts.
+        let blocked = pages.take(result)?.iter().any(|(_, row)| {
+            postcard::from_bytes::<DocumentOutboxRecord>(row).is_ok_and(|record| {
+                record.placement == self.placement && record.generation <= self.closed
+            })
+        });
+        if blocked {
+            return Ok(Next::Done(Some(DrainBlocker::OutboxRow)));
+        }
+        if pages.done() {
+            return self.next_stream();
+        }
+        Ok(Next::Call(pages.call()))
+    }
 }
 
 /// Freezes this old holder's frontier for the bucket, once.
-async fn barrier_step(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+struct BarrierStepOperation {
     realm_id: RealmId,
-    local_node_id: NodeId,
-    transition: &PlacementTransition,
-    placement: &PlacementRef,
-) -> StepPlan {
-    if transition
-        .barriers
-        .iter()
-        .any(|barrier| barrier.bucket == placement.shard && barrier.reported_by == local_node_id)
-    {
-        return StepPlan::Done;
-    }
-    let frontier = match assemble_shard_manifest(context, realm_id, *placement).await {
-        Ok(manifest) => manifest.cursor,
-        Err(error) => {
-            debug!(error = %error, "Cannot assemble a transition barrier frontier yet");
-            return StepPlan::Pending;
-        }
-    };
-    StepPlan::Ready(RealmPlacementMutation::ReportBarrier {
-        transition_id: transition.plan.transition_id,
-        bucket: placement.shard,
-        reported_by: local_node_id,
-        frontier,
-    })
+    local: NodeId,
+    transition_id: ulid::Ulid,
+    placement: PlacementRef,
+    reported: bool,
 }
 
-/// Joins, pulls, verifies, and proves the bucket from the target side.
-async fn completion_step(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    transition: &PlacementTransition,
-    placement: &PlacementRef,
-) -> StepPlan {
-    if transition.proofs_for(placement.shard).any(|proof| {
-        proof.holder == local_node_id && transition.proof_valid(placement.shard, proof)
-    }) {
-        return StepPlan::Done;
-    }
-    let Some(bucket) = transition.plan.bucket_plan(placement.shard) else {
-        return StepPlan::Done;
-    };
-    // Until every old holder has fenced there is no reference frontier, so a
-    // proof would attest to a moving target.
-    if !transition.barrier_established(placement.shard, &bucket.old_holders) {
-        return StepPlan::Pending;
-    }
-    let Some(net_handle) = context.net_handle.clone() else {
-        return StepPlan::Pending;
-    };
-    let sources: Vec<NodeId> = bucket
-        .old_holders
-        .iter()
-        .copied()
-        .filter(|holder| *holder != local_node_id)
-        .collect();
-
-    let topic = shard_topic_id(realm_id, placement);
-    if !sources.is_empty() && !net_handle.sync_topic_exists(topic).unwrap_or(false) {
-        // Join-only: this adopts an existing genesis and can never mint one.
-        let sync = SyncTopicsOperation::new(*net_handle.realm_id(), vec![topic], sources.clone());
-        let event = DocumentNetEvent::reconciled(drive(sync, context).await);
-        crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
-    }
-
-    let mut required = irokle::ActorClock::default();
-    for barrier in transition
-        .barriers
-        .iter()
-        .filter(|barrier| barrier.bucket == placement.shard)
-        .filter(|barrier| bucket.old_holders.contains(&barrier.reported_by))
-    {
-        let Ok(frontier) = postcard::from_bytes::<irokle::ActorClock>(&barrier.frontier) else {
-            debug!(
-                reported_by = %barrier.reported_by,
-                "Undecodable barrier frontier; leaving the bucket pending"
-            );
-            return StepPlan::Pending;
-        };
-        required.merge(&frontier);
-    }
-
-    let checkpoint_root = if sources.is_empty() {
-        // A source-less bucket still binds its fenced frontier and topic genesis,
-        // not its moving live fingerprint.
-        match frontier_root(&net_handle, topic, &required) {
-            Ok(root) => root,
-            Err(error) => {
-                debug!(error = %error, "Cannot assemble a source-less transition checkpoint");
-                return StepPlan::Pending;
-            }
-        }
-    } else {
-        // Proofs dominate all reported fenced frontiers, including unreachable pull sources.
-        match converge_with_barrier(
-            context,
-            &net_handle,
-            local_node_id,
+impl BarrierStepOperation {
+    fn new(
+        realm_id: RealmId,
+        local: NodeId,
+        transition: &PlacementTransition,
+        placement: &PlacementRef,
+    ) -> Self {
+        let reported = transition
+            .barriers
+            .iter()
+            .any(|barrier| barrier.bucket == placement.shard && barrier.reported_by == local);
+        Self {
             realm_id,
-            *placement,
-            &sources,
-            Some(&required),
-        )
-        .await
-        {
-            Some((_, _)) => match frontier_root(&net_handle, topic, &required) {
-                Ok(root) => root,
+            local,
+            transition_id: transition.plan.transition_id,
+            placement: *placement,
+            reported,
+        }
+    }
+}
+
+impl Operation for BarrierStepOperation {
+    type Output = StepPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<StepPlan>, IoError> {
+        if self.reported {
+            return Ok(Next::Done(StepPlan::Done));
+        }
+        let assemble = AssembleManifestOperation::new(self.realm_id, self.placement);
+        Ok(Next::Call(IoCall::child(assemble)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<StepPlan>, IoError> {
+        Ok(Next::Done(
+            match result.child::<ShardManifest, ManifestError>()? {
+                Ok(manifest) => StepPlan::Ready(RealmPlacementMutation::ReportBarrier {
+                    transition_id: self.transition_id,
+                    bucket: self.placement.shard,
+                    reported_by: self.local,
+                    frontier: manifest.cursor,
+                }),
                 Err(error) => {
-                    debug!(error = %error, "Cannot hash the transition checkpoint frontier");
-                    return StepPlan::Pending;
+                    debug!(error = %error, "Cannot assemble a transition barrier frontier yet");
+                    StepPlan::Pending
                 }
             },
-            None => {
-                debug!(
-                    strategy = %placement.strategy_id,
-                    shard = placement.shard,
-                    "No old holder served a verifiable shard copy yet"
-                );
-                // Surface the bounded failure exactly once per reporter; the
-                // reduced record keeps the report idempotent across retries.
-                if !transition.stalls.iter().any(|stall| {
-                    stall.bucket == placement.shard && stall.reported_by == local_node_id
-                }) {
-                    return StepPlan::Stalled(RealmPlacementMutation::ReportStall {
-                        transition_id: transition.plan.transition_id,
-                        bucket: placement.shard,
-                        reported_by: local_node_id,
-                        reason: "no old holder served a verifiable copy".to_string(),
-                    });
-                }
-                return StepPlan::Pending;
-            }
-        }
-    };
-
-    let Some(activation) = config_activation(context, realm_id, placement).await else {
-        return StepPlan::Pending;
-    };
-    // Never sign a tuple the reducer will ignore: the stored activation must
-    // still be the epoch this plan moves from.
-    if activation != bucket.predecessor_epoch {
-        return StepPlan::Pending;
+        ))
     }
-    let claim = ProofClaim {
-        realm_id,
-        transition_id: transition.plan.transition_id,
-        strategy_id: transition.plan.strategy_id,
-        bucket: placement.shard,
-        old_activation_epoch: activation,
-        target_map_epoch: transition.plan.target_map_epoch,
-        barrier_digest: transition.barrier_digest(placement.shard),
-        checkpoint_root,
-        holder: local_node_id,
-    };
-    let proof = claim.signed_with(|message| net_handle.sign(message));
-    StepPlan::Ready(RealmPlacementMutation::SubmitCompletion {
-        transition_id: transition.plan.transition_id,
-        strategy_id: transition.plan.strategy_id,
-        proof,
-    })
 }
 
-/// Commits one pass's gathered steps in a single transaction.
-async fn submit_steps(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+enum CompletionStage {
+    Exists,
+    Pull,
+    Converge,
+    Root,
+    Activation([u8; 32]),
+    Sign,
+}
+
+type CompletionTurn = Result<Next<StepPlan>, IoError>;
+
+/// Joins, pulls, verifies, and proves the bucket from the target side.
+#[derive(Debug, PartialEq)]
+struct CompletionStepOperation {
     realm_id: RealmId,
-    local_node_id: NodeId,
-    steps: Vec<RealmPlacementMutation>,
-) -> bool {
-    let actor = Actor {
-        node_id: local_node_id,
-        user_id: UserId::nil(realm_id),
-        realm_id,
-    };
-    let mut attempts = 0;
-    loop {
-        match drive(
-            MutatePlacementOperation::batch(actor.clone(), steps.clone()),
-            context,
-        )
-        .await
+    local: NodeId,
+    transition: PlacementTransition,
+    placement: PlacementRef,
+    sources: Vec<NodeId>,
+    required: irokle::ActorClock,
+    stage: CompletionStage,
+}
+
+impl CompletionStepOperation {
+    fn new(
+        realm_id: RealmId,
+        local: NodeId,
+        transition: &PlacementTransition,
+        placement: &PlacementRef,
+    ) -> Self {
+        Self {
+            realm_id,
+            local,
+            transition: transition.clone(),
+            placement: *placement,
+            sources: Vec::new(),
+            required: irokle::ActorClock::default(),
+            stage: CompletionStage::Exists,
+        }
+    }
+
+    fn topic(&self) -> irokle::TopicId {
+        shard_topic_id(self.realm_id, &self.placement)
+    }
+
+    fn root_call(&mut self) -> CompletionTurn {
+        self.stage = CompletionStage::Root;
+        Ok(Next::Call(shard_call(ShardNetEffect::FrontierRoot {
+            topic: self.topic(),
+            frontier: self.required.clone(),
+        })))
+    }
+
+    /// Joins the barriers of the old holders; an undecodable one leaves the bucket pending.
+    fn join_barriers(&mut self) -> Result<bool, IoError> {
+        let shard = self.placement.shard;
+        let Some(bucket) = self.transition.plan.bucket_plan(shard) else {
+            return Ok(false);
+        };
+        let barriers = (self.transition.barriers.iter())
+            .filter(|barrier| barrier.bucket == shard)
+            .filter(|barrier| bucket.old_holders.contains(&barrier.reported_by));
+        for barrier in barriers {
+            let Ok(frontier) = postcard::from_bytes::<irokle::ActorClock>(&barrier.frontier) else {
+                debug!(
+                    reported_by = %barrier.reported_by,
+                    "Undecodable barrier frontier; leaving the bucket pending"
+                );
+                return Ok(false);
+            };
+            self.required.merge(&frontier);
+        }
+        Ok(true)
+    }
+
+    fn verify(&mut self) -> CompletionTurn {
+        if !self.join_barriers()? {
+            return Ok(Next::Done(StepPlan::Pending));
+        }
+        // A source-less bucket still binds its fenced frontier and topic genesis,
+        // not its moving live fingerprint.
+        if self.sources.is_empty() {
+            return self.root_call();
+        }
+        // Proofs dominate all reported fenced frontiers, including unreachable pull sources.
+        self.stage = CompletionStage::Converge;
+        let converge = ConvergeOperation::new(
+            self.realm_id,
+            self.placement,
+            &self.sources,
+            Some(self.required.clone()),
+        );
+        Ok(Next::Call(IoCall::child(converge)))
+    }
+
+    /// Surfaces the bounded failure once per reporter; the reduced record keeps the
+    /// report idempotent across retries.
+    fn stalled(&self) -> StepPlan {
+        let shard = self.placement.shard;
+        debug!(
+            strategy = %self.placement.strategy_id,
+            shard,
+            "No old holder served a verifiable shard copy yet"
+        );
+        let reported = (self.transition.stalls.iter())
+            .any(|stall| stall.bucket == shard && stall.reported_by == self.local);
+        if reported {
+            return StepPlan::Pending;
+        }
+        StepPlan::Stalled(RealmPlacementMutation::ReportStall {
+            transition_id: self.transition.plan.transition_id,
+            bucket: shard,
+            reported_by: self.local,
+            reason: "no old holder served a verifiable copy".to_string(),
+        })
+    }
+
+    fn sign(&mut self, root: [u8; 32], config: &RealmConfigDocument) -> CompletionTurn {
+        let shard = self.placement.shard;
+        let transition = &self.transition;
+        let activation = config
+            .activation(&self.placement.strategy_id, shard)
+            .map(|activation| activation.activation_epoch);
+        let predecessor =
+            (transition.plan.bucket_plan(shard)).map(|bucket| bucket.predecessor_epoch);
+        // Never sign a tuple the reducer will ignore: the stored activation must
+        // still be the epoch this plan moves from.
+        let (Some(activation), true) = (activation, activation == predecessor) else {
+            return Ok(Next::Done(StepPlan::Pending));
+        };
+        let claim = ProofClaim {
+            realm_id: self.realm_id,
+            transition_id: transition.plan.transition_id,
+            strategy_id: transition.plan.strategy_id,
+            bucket: shard,
+            old_activation_epoch: activation,
+            target_map_epoch: transition.plan.target_map_epoch,
+            barrier_digest: transition.barrier_digest(shard),
+            checkpoint_root: root,
+            holder: self.local,
+        };
+        self.stage = CompletionStage::Sign;
+        Ok(Next::Call(shard_call(ShardNetEffect::SignProof(claim))))
+    }
+}
+
+impl Operation for CompletionStepOperation {
+    type Output = StepPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> CompletionTurn {
+        let (shard, local) = (self.placement.shard, self.local);
+        let proved = self
+            .transition
+            .proofs_for(shard)
+            .any(|proof| proof.holder == local && self.transition.proof_valid(shard, proof));
+        let Some(bucket) = self.transition.plan.bucket_plan(shard).filter(|_| !proved) else {
+            return Ok(Next::Done(StepPlan::Done));
+        };
+        // Until every old holder has fenced there is no reference frontier, so a
+        // proof would attest to a moving target.
+        if !self
+            .transition
+            .barrier_established(shard, &bucket.old_holders)
         {
-            Ok(_) => return false,
+            return Ok(Next::Done(StepPlan::Pending));
+        }
+        self.sources = (bucket.old_holders.iter().copied())
+            .filter(|holder| *holder != local)
+            .collect();
+        if self.sources.is_empty() {
+            return self.verify();
+        }
+        Ok(Next::Call(shard_call(ShardNetEffect::Existing(vec![
+            self.topic(),
+        ]))))
+    }
+
+    fn next(&mut self, result: IoResult) -> CompletionTurn {
+        match std::mem::replace(&mut self.stage, CompletionStage::Sign) {
+            CompletionStage::Exists => match shard_answer(result)? {
+                ShardNetEvent::Existing(topics) if !topics.contains(&self.topic()) => {
+                    // Join-only: this adopts an existing genesis and can never mint one.
+                    self.stage = CompletionStage::Pull;
+                    Ok(Next::Call(shard_call(ShardNetEffect::Pull {
+                        topics: vec![self.topic()],
+                        peers: self.sources.clone(),
+                    })))
+                }
+                ShardNetEvent::Existing(_) => self.verify(),
+                _ => Ok(Next::Done(StepPlan::Pending)),
+            },
+            CompletionStage::Pull => {
+                shard_answer(result)?;
+                self.verify()
+            }
+            CompletionStage::Converge => {
+                match result.child::<Option<(NodeId, [u8; 32])>, IoError>()?? {
+                    Some(_) => self.root_call(),
+                    None => Ok(Next::Done(self.stalled())),
+                }
+            }
+            CompletionStage::Root => match shard_answer(result)? {
+                ShardNetEvent::Root(Ok(root)) => {
+                    self.stage = CompletionStage::Activation(root);
+                    let read = GetConfigOperation::new(self.realm_id);
+                    Ok(Next::Call(IoCall::child(read)))
+                }
+                ShardNetEvent::Root(Err(error)) => {
+                    debug!(error = %error, "Cannot hash the transition checkpoint frontier");
+                    Ok(Next::Done(StepPlan::Pending))
+                }
+                _ => Ok(Next::Done(StepPlan::Pending)),
+            },
+            // The activation is read back, so the proof commits to the epoch the
+            // reducer will compare it against.
+            CompletionStage::Activation(root) => {
+                match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => self.sign(root, &config),
+                    Err(error) => {
+                        warn!(error = %error, "realm config unavailable");
+                        Ok(Next::Done(StepPlan::Pending))
+                    }
+                }
+            }
+            CompletionStage::Sign => Ok(Next::Done(match shard_answer(result)? {
+                ShardNetEvent::Proof(proof) => {
+                    StepPlan::Ready(RealmPlacementMutation::SubmitCompletion {
+                        transition_id: self.transition.plan.transition_id,
+                        strategy_id: self.transition.plan.strategy_id,
+                        proof,
+                    })
+                }
+                _ => StepPlan::Pending,
+            })),
+        }
+    }
+}
+
+/// Commits one pass's gathered steps in a single transaction; answers whether they failed.
+#[derive(Debug, PartialEq)]
+struct SubmitStepsOperation {
+    actor: Actor,
+    steps: Vec<RealmPlacementMutation>,
+    attempts: usize,
+    waiting: bool,
+}
+
+impl SubmitStepsOperation {
+    fn new(actor: Actor, steps: Vec<RealmPlacementMutation>) -> Self {
+        Self {
+            actor,
+            steps,
+            attempts: 0,
+            waiting: false,
+        }
+    }
+
+    fn submit(&mut self) -> Next<bool> {
+        self.waiting = false;
+        let batch = MutatePlacementOperation::batch(self.actor.clone(), self.steps.clone());
+        Next::Call(IoCall::child(batch))
+    }
+}
+
+impl Operation for SubmitStepsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(self.submit())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.waiting {
+            return Ok(self.submit());
+        }
+        match result.child::<RealmConfigDocument, MutatePlacementError>()? {
+            Ok(_) => Ok(Next::Done(false)),
             Err(MutatePlacementError::StorageError(StorageError::TransactionConflict))
-                if attempts < CONFLICT_ATTEMPTS =>
+                if self.attempts < CONFLICT_ATTEMPTS =>
             {
-                tokio::time::sleep(aruna_core::backoff::conflict_backoff(
-                    attempts,
-                    local_node_id.as_bytes(),
-                ))
-                .await;
-                attempts += 1;
+                let wait = conflict_backoff(self.attempts, self.actor.node_id.as_bytes());
+                self.attempts += 1;
+                self.waiting = true;
+                Ok(Next::Call(IoCall::Delay(wait)))
             }
             Err(error) => {
                 warn!(error = %error, "Placement transition steps did not apply");
-                return true;
+                Ok(Next::Done(true))
             }
         }
     }
 }
 
 /// Starts the successor expansion for a strategy whose activations trail the
-/// newest map once its active transition is terminal (F10). Only a management
-/// node issues the plan; everyone else reports pending so their timer keeps watching.
-async fn ensure_expansions(
-    context: &Arc<DriverContext>,
+/// newest map once its active transition is terminal. Only a management node
+/// issues the plan; everyone else reports nothing and their timer keeps watching.
+#[derive(Debug, PartialEq)]
+struct ExpansionsOperation {
     realm_id: RealmId,
-    local_node_id: NodeId,
-    config: &RealmConfigDocument,
-) -> bool {
-    let Some(epoch) = config.newest_map_epoch() else {
-        return false;
-    };
-    let Some(map) = config.candidate_map(epoch) else {
-        return false;
-    };
-    // Management nodes race and the predecessor gate coalesces the winner; a
-    // non-management issuer would only ever be rejected by its peers.
-    if !is_management(config, local_node_id) {
-        return false;
-    }
-    let mut pending = false;
-    for strategy in &config.strategies {
-        if config.placement_transitions.iter().any(|transition| {
-            transition.plan.strategy_id == strategy.strategy_id && !transition.is_terminal()
-        }) {
-            continue;
-        }
-        // Onboarding owns the first expansion; requiring its record prevents duplicate issuance.
-        if !config
-            .placement_transitions
-            .iter()
-            .any(|transition| transition.plan.strategy_id == strategy.strategy_id)
-        {
-            continue;
-        }
-        let Ok(buckets) = expansion_buckets(config, strategy.strategy_id, epoch) else {
-            continue;
-        };
-        if buckets.is_empty() {
-            continue;
-        }
-        pending = true;
-        let placement = PlacementRef {
-            strategy_id: strategy.strategy_id,
-            shard: 0,
-        };
-        // A map that cannot resolve this strategy's holders cannot plan it; a
-        // newer publication resolves that, so just stay pending.
-        if holders_in_map(config, strategy, &placement, map).is_none() {
-            continue;
-        }
-        let transition_id = ulid::Ulid::generate();
-        match plan_transition(
+    local: NodeId,
+    config: Arc<RealmConfigDocument>,
+    now_ms: u64,
+    pending: bool,
+    /// Reversed, so the next start pops off the end.
+    starts: Vec<RealmPlacementMutation>,
+}
+
+impl ExpansionsOperation {
+    fn new(realm_id: RealmId, local: NodeId, config: Arc<RealmConfigDocument>) -> Self {
+        Self {
+            realm_id,
+            local,
             config,
-            TransitionRequest {
-                transition_id,
-                strategy_id: strategy.strategy_id,
+            now_ms: 0,
+            pending: false,
+            starts: Vec::new(),
+        }
+    }
+
+    fn plan_starts(&mut self) {
+        let (config, local) = (self.config.clone(), self.local);
+        let Some(epoch) = config.newest_map_epoch() else {
+            return;
+        };
+        let Some(map) = config.candidate_map(epoch) else {
+            return;
+        };
+        // Management nodes race and the predecessor gate coalesces the winner; a
+        // non-management issuer would only ever be rejected by its peers.
+        if !is_management(&config, local) {
+            return;
+        }
+        let transitions = &config.placement_transitions;
+        for strategy in &config.strategies {
+            let strategy_id = strategy.strategy_id;
+            let mut own = transitions
+                .iter()
+                .filter(|t| t.plan.strategy_id == strategy_id);
+            // Onboarding owns the first expansion; requiring its record prevents
+            // duplicate issuance.
+            if own.clone().next().is_none() || own.any(|t| !t.is_terminal()) {
+                continue;
+            }
+            let Ok(buckets) = expansion_buckets(&config, strategy_id, epoch) else {
+                continue;
+            };
+            if buckets.is_empty() {
+                continue;
+            }
+            self.pending = true;
+            let placement = PlacementRef {
+                strategy_id,
+                shard: 0,
+            };
+            // A map that cannot resolve this strategy's holders cannot plan it; a
+            // newer publication resolves that, so just stay pending.
+            if holders_in_map(&config, strategy, &placement, map).is_none() {
+                continue;
+            }
+            let request = TransitionRequest {
+                transition_id: ulid::Ulid::generate(),
+                strategy_id,
                 buckets,
                 target_map_epoch: epoch,
                 // Expansion moves nothing off a holder; every bucket may run.
-                limits: aruna_core::structs::placement::transition::TransitionLimits {
+                limits: TransitionLimits {
                     max_incomplete_buckets: u32::MAX,
                     ..Default::default()
                 },
-                created_by: local_node_id,
-                created_at_ms: aruna_core::time::unix_timestamp_millis(),
-            },
-        ) {
-            Ok(plan) => {
-                pending |= submit_mutation(
-                    context,
-                    realm_id,
-                    local_node_id,
-                    RealmPlacementMutation::StartTransition(plan),
-                )
-                .await;
-            }
-            Err(error) => {
-                debug!(error = %error, "Successor expansion could not plan yet");
+                created_by: local,
+                created_at_ms: self.now_ms,
+            };
+            match plan_transition(&config, request) {
+                Ok(plan) => self
+                    .starts
+                    .push(RealmPlacementMutation::StartTransition(plan)),
+                Err(error) => debug!(error = %error, "Successor expansion could not plan yet"),
             }
         }
+        self.starts.reverse();
     }
-    pending
+
+    fn next_start(&mut self) -> Next<bool> {
+        match self.starts.pop() {
+            Some(start) => Next::Call(submit_call(self.realm_id, self.local, start)),
+            None => Next::Done(self.pending),
+        }
+    }
+}
+
+impl Operation for ExpansionsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        self.plan_starts();
+        Ok(self.next_start())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        self.pending |= submit_failed(result)?;
+        Ok(self.next_start())
+    }
+}
+
+/// The activations `config` can issue, whether work stays open, and whether some
+/// strategy is missing from the newest map, which only a successor map can freeze.
+fn plan_activations(
+    config: &RealmConfigDocument,
+    local: NodeId,
+) -> (Vec<RealmPlacementMutation>, bool, bool) {
+    let mut planned = (Vec::new(), false, false);
+    let Some((epoch, map)) =
+        (config.newest_map_epoch()).and_then(|epoch| Some((epoch, config.candidate_map(epoch)?)))
+    else {
+        return planned;
+    };
+    // The activation record is an immutable value, so concurrent management
+    // issuers coalesce; a non-management issuer never lands at all.
+    if !is_management(config, local) {
+        return planned;
+    }
+    for strategy in &config.strategies {
+        let strategy_id = strategy.strategy_id;
+        if config.activation(&strategy_id, 0).is_some() {
+            continue;
+        }
+        let placement = PlacementRef {
+            strategy_id,
+            shard: 0,
+        };
+        // A map without this strategy's selector cannot activate it; the
+        // successor map is what freezes it.
+        if holders_in_map(config, strategy, &placement, map).is_none() {
+            planned.1 = true;
+            planned.2 |= map.selector(&strategy_id).is_none();
+            continue;
+        }
+        planned
+            .0
+            .push(RealmPlacementMutation::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch: epoch,
+            });
+    }
+    planned.0.reverse();
+    planned
+}
+
+#[derive(Debug, PartialEq)]
+enum ActivationStage {
+    Activate,
+    Publish,
+    Reread,
+    Settle,
 }
 
 /// Activates the newest map for a strategy that has none, publishing the
 /// successor map first when that map predates the strategy. Only a management
 /// node issues either; concurrent duplicates coalesce as immutable values.
-async fn ensure_strategy_activations(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+struct ActivationsOperation {
     realm_id: RealmId,
-    local_node_id: NodeId,
-    config: &RealmConfigDocument,
-) -> bool {
-    let (mut pending, unfrozen) =
-        activate_newest_map(context, realm_id, local_node_id, config).await;
-    if !unfrozen {
-        return pending;
-    }
-    pending = true;
-    let epoch = config.newest_map_epoch().unwrap_or_default();
-    if !publish_successor_map(context, realm_id, local_node_id, config, epoch).await {
-        return pending;
-    }
-    // Resolve activations in this pass because the committed successor map is already durable.
-    if let Some(published) =
-        crate::placement::process_placements::load_realm_config(context, realm_id).await
-    {
-        activate_newest_map(context, realm_id, local_node_id, &published).await;
-    }
-    pending
+    local: NodeId,
+    config: Arc<RealmConfigDocument>,
+    stage: ActivationStage,
+    pending: bool,
+    unfrozen: bool,
+    /// Reversed, so the next activation pops off the end.
+    activations: Vec<RealmPlacementMutation>,
 }
 
-/// Initializes activations against `config`'s newest map. Returns whether work
-/// is still outstanding and whether some strategy is missing from that map,
-/// which only a successor map can freeze.
-async fn activate_newest_map(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    config: &RealmConfigDocument,
-) -> (bool, bool) {
-    let Some(epoch) = config.newest_map_epoch() else {
-        return (false, false);
-    };
-    let Some(map) = config.candidate_map(epoch) else {
-        return (false, false);
-    };
-    // The activation record is an immutable value, so concurrent management
-    // issuers coalesce; a non-management issuer never lands at all.
-    if !is_management(config, local_node_id) {
-        return (false, false);
-    }
-    let mut pending = false;
-    let mut unfrozen = false;
-    for strategy in &config.strategies {
-        if config.activation(&strategy.strategy_id, 0).is_some() {
-            continue;
-        }
-        let placement = PlacementRef {
-            strategy_id: strategy.strategy_id,
-            shard: 0,
-        };
-        // A map without this strategy's selector cannot activate it; the
-        // successor map published by the caller is what freezes it.
-        if holders_in_map(config, strategy, &placement, map).is_none() {
-            pending = true;
-            unfrozen |= map.selector(&strategy.strategy_id).is_none();
-            continue;
-        }
-        pending |= submit_mutation(
-            context,
+impl ActivationsOperation {
+    fn new(realm_id: RealmId, local: NodeId, config: Arc<RealmConfigDocument>) -> Self {
+        Self {
             realm_id,
-            local_node_id,
-            RealmPlacementMutation::InitializeActivations {
-                strategy_id: strategy.strategy_id,
-                candidate_map_epoch: epoch,
-            },
-        )
-        .await;
+            local,
+            config,
+            stage: ActivationStage::Activate,
+            pending: false,
+            unfrozen: false,
+            activations: Vec::new(),
+        }
     }
-    (pending, unfrozen)
+
+    fn next_activation(&mut self) -> Result<Next<bool>, IoError> {
+        if let Some(activation) = self.activations.pop() {
+            let submit = submit_call(self.realm_id, self.local, activation);
+            return Ok(Next::Call(submit));
+        }
+        if self.stage == ActivationStage::Settle || !self.unfrozen {
+            return Ok(Next::Done(self.pending));
+        }
+        self.publish()
+    }
+
+    /// Freezes a strategy the newest map predates into its successor. The epoch is
+    /// derived byte-identically, so a second issuer's copy coalesces rather than
+    /// conflicting; admission rejects an occupied epoch.
+    fn publish(&mut self) -> Result<Next<bool>, IoError> {
+        self.pending = true;
+        let publisher = self.local.to_string();
+        if map_publisher(&self.config) != Some(publisher.as_str()) {
+            return Ok(Next::Done(true));
+        }
+        let epoch = self.config.newest_map_epoch().unwrap_or_default();
+        self.stage = ActivationStage::Publish;
+        let map = self.config.freeze_map(epoch + 1);
+        let publish = RealmPlacementMutation::PublishCandidateMap(map);
+        Ok(Next::Call(submit_call(self.realm_id, self.local, publish)))
+    }
 }
 
-/// Freezes a strategy the newest map predates into its successor. The epoch is
-/// derived byte-identically, so a second issuer's copy coalesces rather than
-/// conflicting; admission rejects an occupied epoch.
-async fn publish_successor_map(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    config: &RealmConfigDocument,
-    epoch: u64,
-) -> bool {
-    if map_publisher(config) != Some(local_node_id.to_string().as_str()) {
-        return false;
+impl Operation for ActivationsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let (activations, pending, unfrozen) = plan_activations(&self.config, self.local);
+        self.activations = activations;
+        self.pending = pending;
+        self.unfrozen = unfrozen;
+        self.next_activation()
     }
-    !submit_mutation(
-        context,
-        realm_id,
-        local_node_id,
-        RealmPlacementMutation::PublishCandidateMap(config.freeze_map(epoch + 1)),
-    )
-    .await
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        match self.stage {
+            ActivationStage::Activate => {
+                self.pending |= submit_failed(result)?;
+                self.next_activation()
+            }
+            ActivationStage::Publish => {
+                if submit_failed(result)? {
+                    return Ok(Next::Done(true));
+                }
+                // Activations resolve in this pass: the successor map is already durable.
+                self.stage = ActivationStage::Reread;
+                let read = GetConfigOperation::new(self.realm_id);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            ActivationStage::Reread => {
+                match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => {
+                        self.activations = plan_activations(&config, self.local).0;
+                        self.stage = ActivationStage::Settle;
+                        self.next_activation()
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "realm config unavailable");
+                        Ok(Next::Done(true))
+                    }
+                }
+            }
+            ActivationStage::Settle => {
+                submit_failed(result)?;
+                self.next_activation()
+            }
+        }
+    }
 }
 
 /// The realm's candidate-map issuer: the lowest-id Management node. Publishing
@@ -704,142 +1151,99 @@ fn map_publisher(config: &RealmConfigDocument) -> Option<&str> {
         .min()
 }
 
-/// The bucket's current activation epoch, read back from storage so the proof
-/// commits to the epoch the reducer will compare it against.
-async fn config_activation(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    placement: &PlacementRef,
-) -> Option<u64> {
-    let config = crate::placement::process_placements::load_realm_config(context, realm_id).await?;
-    config
-        .activation(&placement.strategy_id, placement.shard)
-        .map(|activation| activation.activation_epoch)
+/// One close attempt in its own write transaction.
+#[derive(Debug, PartialEq)]
+struct FenceAttemptOperation {
+    key_space: String,
+    key: Key,
+    placement: PlacementRef,
+    generation: u64,
+    writing: bool,
 }
 
-/// Drives one placement mutation and reports whether it needs another pass.
-async fn submit_mutation(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    mutation: RealmPlacementMutation,
-) -> bool {
-    let config = MutatePlacementConfig {
-        actor: Actor {
-            node_id: local_node_id,
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        },
-        mutation,
-    };
-    match drive_placement_mutation(config, None, context).await {
-        Ok(_) => false,
-        Err(error) => {
-            warn!(error = %error, "Placement transition step did not apply");
-            true
+impl Operation for FenceAttemptOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(read_row(&self.key_space, self.key.clone())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.writing {
+            done(result)?;
+            return Ok(Next::Done(()));
         }
+        let current = stored_generation(value(result)?.as_ref());
+        if current.is_some_and(|current| current >= self.generation) {
+            return Ok(Next::Done(()));
+        }
+        if current.is_none() {
+            // Unparseable bytes admit nothing, so leaving them would brick the
+            // bucket for good while this close reported success.
+            warn!(placement = ?self.placement, "Rewriting an unparseable placement write fence");
+        }
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![(
+            self.key_space.clone(),
+            self.key.clone(),
+            self.generation.to_be_bytes().to_vec().into(),
+        )])))
     }
 }
 
 /// Durably closes `placement` through `generation`, so no later transaction is
 /// admitted and every uncommitted one conflicts. Monotone and idempotent; an
 /// unparseable stored value is overwritten rather than bricking the bucket.
-pub async fn close(
-    storage: &StorageHandle,
-    realm_id: &RealmId,
-    placement: &PlacementRef,
+#[derive(Debug, PartialEq)]
+pub struct CloseFenceOperation {
+    realm_id: RealmId,
+    placement: PlacementRef,
     generation: u64,
-) -> Result<(), String> {
-    let (key_space, key) = fence_read(realm_id, placement);
-    for _ in 0..CLOSE_ATTEMPTS {
-        let txn_id = match storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => {
-                return Err(format!(
-                    "unexpected fence transaction result: {}",
-                    other.label()
-                ));
-            }
-        };
-        let current = match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.clone(),
-                key: key.clone(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                stored_generation(value.as_ref())
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error.to_string());
-            }
-            other => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(format!("unexpected fence read result: {}", other.label()));
-            }
-        };
-        if current.is_some_and(|current| current >= generation) {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(());
-        }
-        if current.is_none() {
-            // Unparseable bytes admit nothing, so leaving them would brick the
-            // bucket for good while this close reported success.
-            warn!(?placement, "Rewriting an unparseable placement write fence");
-        }
-        match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.clone(),
-                key: key.clone(),
-                value: ByteView::from(generation.to_be_bytes().to_vec()),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error.to_string());
-            }
-            other => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(format!("unexpected fence write result: {}", other.label()));
-            }
-        }
-        match storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
-                return Ok(());
-            }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => continue,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence commit result: {}", other.label())),
+    attempts: usize,
+}
+
+impl CloseFenceOperation {
+    pub fn new(realm_id: RealmId, placement: PlacementRef, generation: u64) -> Self {
+        Self {
+            realm_id,
+            placement,
+            generation,
+            attempts: 0,
         }
     }
-    Err(StorageError::TransactionConflict.to_string())
+
+    fn attempt(&mut self) -> Next<()> {
+        self.attempts += 1;
+        let (key_space, key) = fence_read(&self.realm_id, &self.placement);
+        Next::Call(IoCall::child(FenceAttemptOperation {
+            key_space,
+            key,
+            placement: self.placement,
+            generation: self.generation,
+            writing: false,
+        }))
+    }
+}
+
+impl Operation for CloseFenceOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(self.attempt())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match result.child::<(), IoError>()? {
+            Err(IoError::Conflict) if self.attempts < CLOSE_ATTEMPTS => Ok(self.attempt()),
+            outcome => outcome.map(Next::Done),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -862,6 +1266,9 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::realm::load_config::config_unavailable;
+    use byteview::ByteView;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1006,8 +1413,10 @@ mod tests {
     }
 
     async fn load_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigDocument {
-        crate::placement::process_placements::load_realm_config(context, realm_id)
+        drive(GetConfigOperation::new(realm_id), context)
             .await
+            .inspect_err(config_unavailable)
+            .ok()
             .expect("the realm config is stored")
     }
 
@@ -1035,7 +1444,14 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.to_string() == issuer)
             .expect("the issuer is a configured node");
-        assert!(process_placement_transitions(&context, realm_id, publisher, &document).await);
+        assert!(
+            drive(
+                ProcessTransitionsOperation::new(realm_id, publisher, Arc::new(document.clone())),
+                &context
+            )
+            .await
+            .unwrap()
+        );
 
         // One successor map, carrying the missing frozen selector, plus every
         // activation it unblocks.
@@ -1059,7 +1475,12 @@ mod tests {
         }
 
         // Repeating the pass publishes no further epoch.
-        process_placement_transitions(&context, realm_id, publisher, &published).await;
+        drive(
+            ProcessTransitionsOperation::new(realm_id, publisher, Arc::new(published.clone())),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             load_config(&context, realm_id).await.newest_map_epoch(),
             Some(2)
@@ -1111,7 +1532,14 @@ mod tests {
                 candidate.to_string() == map_publisher(&document).expect("a management issuer")
             })
             .expect("the issuer is a configured node");
-        assert!(!ensure_expansions(&context, realm_id, issuer, &document).await);
+        assert!(
+            !drive(
+                ExpansionsOperation::new(realm_id, issuer, Arc::new(document.clone())),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(
             load_config(&context, realm_id)
                 .await
@@ -1135,7 +1563,14 @@ mod tests {
         activation.transition_id = None;
         store_config(&context, &document).await;
 
-        assert!(ensure_expansions(&context, realm_id, issuer, &document).await);
+        assert!(
+            drive(
+                ExpansionsOperation::new(realm_id, issuer, Arc::new(document.clone())),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         let started = load_config(&context, realm_id).await;
         let successors: Vec<_> = started
             .placement_transitions
@@ -1153,7 +1588,14 @@ mod tests {
         assert!(bucket.target_holders.contains(&node(2)));
         assert!(bucket.target_holders.contains(&node(3)));
 
-        assert!(!ensure_expansions(&context, realm_id, issuer, &started).await);
+        assert!(
+            !drive(
+                ExpansionsOperation::new(realm_id, issuer, Arc::new(started.clone())),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(
             load_config(&context, realm_id)
                 .await
@@ -1181,7 +1623,14 @@ mod tests {
             .find(|candidate| candidate.to_string() != issuer)
             .expect("two management nodes");
 
-        assert!(process_placement_transitions(&context, realm_id, other, &document).await);
+        assert!(
+            drive(
+                ProcessTransitionsOperation::new(realm_id, other, Arc::new(document.clone())),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(
             load_config(&context, realm_id).await.newest_map_epoch(),
             Some(1)
@@ -1289,7 +1738,12 @@ mod tests {
         let predecessor = write_outbox_row(&context, placement, 1, 21).await;
         write_outbox_row(&context, placement, 2, 22).await;
 
-        let blocked = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        let blocked = drive(
+            DrainStepOperation::new(realm_id, transition, &placement, node(1)),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(blocked, StepPlan::Pending),
             "an undrained predecessor row blocks the report"
@@ -1302,7 +1756,12 @@ mod tests {
         drive(aruna_core::row_plan::PlanOperation::new(delete), &context)
             .await
             .expect("the row is deleted");
-        let reported = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        let reported = drive(
+            DrainStepOperation::new(realm_id, transition, &placement, node(1)),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(
                 reported,
@@ -1328,7 +1787,9 @@ mod tests {
             .expect("the eviction is journalled");
 
         assert_eq!(
-            drain_blocker(&context, &placement, 1).await,
+            drive(DrainBlockerOperation::new(&placement, 1), &context)
+                .await
+                .unwrap(),
             Some(DrainBlocker::Eviction),
             "the journal must be consulted before the outbox scan"
         );
@@ -1353,7 +1814,12 @@ mod tests {
             .expect("the eviction is journalled");
 
         assert!(net_handle.eviction_pending(&elsewhere));
-        let reported = drain_step(&context, realm_id, transition, &placement, node(1)).await;
+        let reported = drive(
+            DrainStepOperation::new(realm_id, transition, &placement, node(1)),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(
                 reported,
@@ -1483,9 +1949,12 @@ mod tests {
         };
         assert!(fence::admits(value.as_ref(), 1));
 
-        close(&storage, &realm_id, &placement, 1)
-            .await
-            .expect("the departing holder closes the fence");
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
+            &crate::driver::DriverContext::for_storage(storage.clone()),
+        )
+        .await
+        .expect("the departing holder closes the fence");
 
         let write = storage
             .send_storage_effect(StorageEffect::Write {
@@ -1536,17 +2005,48 @@ mod tests {
             }
         };
 
-        close(&storage, &realm_id, &placement, 3).await.unwrap();
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 3),
+            &crate::driver::DriverContext::for_storage(storage.clone()),
+        )
+        .await
+        .unwrap();
         assert_eq!(stored().await, 3);
         // A stale re-close never reopens the bucket.
-        close(&storage, &realm_id, &placement, 2).await.unwrap();
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 2),
+            &crate::driver::DriverContext::for_storage(storage.clone()),
+        )
+        .await
+        .unwrap();
         assert_eq!(stored().await, 3);
-        close(&storage, &realm_id, &placement, 4).await.unwrap();
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
+            &crate::driver::DriverContext::for_storage(storage.clone()),
+        )
+        .await
+        .unwrap();
         assert_eq!(stored().await, 4);
 
         let (lower, higher) = tokio::join!(
-            close(&storage, &realm_id, &placement, 5),
-            close(&storage, &realm_id, &placement, 6),
+            async {
+                crate::driver::drive(
+                    crate::placement::process_transitions::CloseFenceOperation::new(
+                        realm_id, placement, 5,
+                    ),
+                    &crate::driver::DriverContext::for_storage(storage.clone()),
+                )
+                .await
+            },
+            async {
+                crate::driver::drive(
+                    crate::placement::process_transitions::CloseFenceOperation::new(
+                        realm_id, placement, 6,
+                    ),
+                    &crate::driver::DriverContext::for_storage(storage.clone()),
+                )
+                .await
+            },
         );
         lower.unwrap();
         higher.unwrap();
@@ -1576,7 +2076,12 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        close(&storage, &realm_id, &placement, 4).await.unwrap();
+        crate::driver::drive(
+            crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
+            &crate::driver::DriverContext::for_storage(storage.clone()),
+        )
+        .await
+        .unwrap();
 
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
             .send_storage_effect(StorageEffect::Read {
