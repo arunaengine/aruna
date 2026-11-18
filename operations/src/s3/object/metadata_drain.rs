@@ -452,302 +452,196 @@ impl Default for DrainRefreshOperation {
     }
 }
 
-pub(super) async fn refresh_with_context(
-    context: &DriverContext,
-    refresh: ReferenceRefresh,
-) -> Result<(), String> {
-    let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id)
-        .to_bytes()
-        .map_err(|err| err.to_string())?;
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => {
-            return Err(format!(
-                "unexpected start transaction event: {}",
-                other.label()
-            ));
-        }
-    };
-
-    let mut minted = false;
-    let refreshed_value = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: version_key.clone().into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(err) => {
-                    abort_reference_refresh(context, txn_id).await;
-                    return Err(err.to_string());
-                }
-            };
-            let predecessor = version.clone();
-            let BlobVersion {
-                created_at,
-                created_by,
-                state,
-                metadata,
-                published_by,
-                placement_policies,
-                original_epoch,
-                generation,
-                identity,
-                origin,
-                hop,
-            } = version;
-            let BlobVersionState::Reference {
-                source,
-                cached_metadata,
-                last_refresh,
-                advance_count,
-            } = state
-            else {
-                abort_reference_refresh(context, txn_id).await;
-                return Ok(());
-            };
-            // Only a confirmed observation counts as a refresh; fields under the version id never
-            // change, so a confirmed change becomes a successor and an unknown one is dropped.
-            let Some(observation) = refresh.metadata.clone() else {
-                abort_reference_refresh(context, txn_id).await;
-                return Err("the refresh carries no observation".to_string());
-            };
-            let comparison = cached_metadata.compare(&observation);
-            // A version whose recorded digests bind its bytes gets no successor without them.
-            let bound = !cached_metadata.enforced_checksums().is_empty();
-            if refresh.refreshed_at > last_refresh
-                && comparison == ObservationMatch::Changed
-                && !bound
-            {
-                let mint = MintSuccessorOperation::new(
-                    txn_id,
-                    refresh.clone(),
-                    observation.clone(),
-                    predecessor,
-                );
-                match drive(mint, context).await {
-                    Ok(written) => minted = written,
-                    // The key's range moved to another coordinator, which refreshes it there.
-                    Err(MintError::Distribution(error)) if error.moved_away() => {
-                        abort_reference_refresh(context, txn_id).await;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        abort_reference_refresh(context, txn_id).await;
-                        return Err(error.to_string());
-                    }
-                }
-            }
-            if refresh.refreshed_at <= last_refresh || comparison != ObservationMatch::Same {
-                None
-            } else {
-                Some(
-                    match (BlobVersion {
-                        published_by,
-                        placement_policies,
-                        original_epoch,
-                        generation,
-                        identity,
-                        origin,
-                        hop,
-                        ..BlobVersion::reference(
-                            source,
-                            cached_metadata,
-                            created_at,
-                            created_by,
-                            refresh.refreshed_at,
-                        )
-                        .with_metadata(metadata)
-                        .with_advance_count(advance_count)
-                    })
-                    .to_bytes()
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            abort_reference_refresh(context, txn_id).await;
-                            return Err(err.to_string());
-                        }
-                    },
-                )
-            }
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_reference_refresh(context, txn_id).await;
-            return Ok(());
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_reference_refresh(context, txn_id).await;
-            return Err(error.to_string());
-        }
-        other => {
-            abort_reference_refresh(context, txn_id).await;
-            return Err(format!("unexpected version read event: {}", other.label()));
-        }
-    };
-
-    if let Some(refreshed_value) = refreshed_value {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: version_key.into(),
-                value: refreshed_value.into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                abort_reference_refresh(context, txn_id).await;
-                return Err(error.to_string());
-            }
-            other => {
-                abort_reference_refresh(context, txn_id).await;
-                return Err(format!("unexpected version write event: {}", other.label()));
-            }
+impl DrainRefreshOperation {
+    pub fn new() -> Self {
+        Self {
+            state: DrainState::ReadDue,
+            started: Instant::now(),
+            now_ms: 0,
+            rows: VecDeque::new(),
+            more_rows: false,
+            jobs: VecDeque::new(),
+            current: None,
+            job_count: 0,
+            oldest_lag_ms: 0,
+            scan_ms: 0,
+            succeeded: 0,
+            failed: 0,
+            has_more_due: false,
+            next_due_ms: None,
         }
     }
 
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            if minted {
-                // The dirty markers and the obligation committed above are the durable work.
-                for effect in [schedule_snapshot_publish(), schedule_blob_drain()] {
-                    if let Effect::Task(effect) = effect {
-                        schedule_task(context, effect).await;
-                    }
-                }
-            }
-            Ok(())
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_reference_refresh(context, txn_id).await;
-            Err(error.to_string())
-        }
-        other => {
-            abort_reference_refresh(context, txn_id).await;
-            Err(format!("unexpected commit event: {}", other.label()))
-        }
+    fn call(&mut self, state: DrainState, call: IoCall) -> DrainTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
-}
 
-/// Observes the source first when the refresh carries no observation; a failed observation
-/// fails the job, which the queue retries later.
-async fn observe_and_refresh(
-    context: &DriverContext,
-    mut refresh: ReferenceRefresh,
-) -> Result<(), String> {
-    if refresh.metadata.is_none() {
-        let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
-        let observed = match drive(ObserveSourceOperation::new(version_key), context).await {
-            Ok(observed) => observed,
-            // Work for a version that is gone or no longer resolvable is finished, not retried.
-            Err(error) if error.is_obsolete() => return Ok(()),
-            Err(error) => return Err(error.to_string()),
+    /// Takes the next due row: a job to read, a broken row to drop, or the end of the scan.
+    fn walk_rows(&mut self) -> DrainTurn {
+        let Some(row) = self.rows.pop_front() else {
+            self.has_more_due = self.more_rows;
+            return self.start_jobs();
         };
-        refresh.metadata = Some(observed);
-        refresh.refreshed_at = SystemTime::now().max(refresh.refreshed_at);
+        let Some((due_at_ms, key)) = split_due(&row) else {
+            let delete = vec![(REFRESH_DUE_KEYSPACE.to_string(), row)];
+            return self.call(DrainState::DeleteStale, IoCall::Delete(delete));
+        };
+        if due_at_ms > self.now_ms {
+            self.next_due_ms = Some(due_at_ms);
+            return self.start_jobs();
+        }
+        if self.jobs.len() >= REFRESH_BATCH_SIZE {
+            self.has_more_due = true;
+            return self.start_jobs();
+        }
+        let read = read_row(REFRESH_JOB_KEYSPACE, key.to_vec());
+        self.call(DrainState::ReadJob(row), read)
     }
-    refresh_with_context(context, refresh).await
-}
 
-async fn schedule_task(context: &DriverContext, effect: TaskEffect) {
-    if persist_task_effect(&context.storage_handle, &effect)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    if let Some(task_handle) = &context.task_handle {
-        let _ = task_handle.send_effect(Effect::Task(effect)).await;
-    }
-}
-
-async fn abort_reference_refresh(context: &DriverContext, txn_id: Ulid) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-}
-
-pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    match next_timer(storage).await {
-        Ok(None) => {}
-        Ok(Some(after)) => {
-            let event = task_handle
-                .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainRefreshQueue,
-                    after,
-                }))
-                .await;
-            if let Event::Task(TaskEvent::Error { message, .. }) = event {
-                warn!(message = %message, "Failed to restore reference metadata refresh timer");
+    fn job_read(&mut self, row: Key, value: Option<Value>) -> DrainTurn {
+        let Some((due_at_ms, key)) = split_due(&row) else {
+            return self.walk_rows();
+        };
+        let key = key.to_vec();
+        let mut stale = vec![(REFRESH_DUE_KEYSPACE.to_string(), row.clone())];
+        match value.map(|value| postcard::from_bytes::<ReferenceRefreshRecord>(&value)) {
+            Some(Ok(job)) if job.due_at_ms == due_at_ms => {
+                self.jobs.push_back((key, job));
+                return self.walk_rows();
+            }
+            Some(Ok(_)) | None => {}
+            Some(Err(error)) => {
+                warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
+                stale.push((REFRESH_JOB_KEYSPACE.to_string(), ByteView::from(key)));
             }
         }
-        Err(error) => warn!(error = ?error, "Failed to scan reference metadata refresh jobs"),
+        self.call(DrainState::DeleteStale, IoCall::Delete(stale))
+    }
+
+    fn start_jobs(&mut self) -> DrainTurn {
+        self.scan_ms = duration_ms(self.started.elapsed());
+        self.job_count = self.jobs.len();
+        self.oldest_lag_ms = (self.jobs.iter())
+            .map(|(_, job)| self.now_ms.saturating_sub(job.due_at_ms))
+            .max()
+            .unwrap_or(0);
+        self.next_job()
+    }
+
+    fn next_job(&mut self) -> DrainTurn {
+        let Some((key, job)) = self.jobs.pop_front() else {
+            return Ok(Next::Done(self.summary()));
+        };
+        let refresh = RefreshReferenceOperation::new(job.refresh.clone());
+        self.current = Some((key, job));
+        self.call(DrainState::RunJob, IoCall::child(refresh))
+    }
+
+    fn job_ran(&mut self, outcome: Result<(), RefreshRunError>) -> DrainTurn {
+        let (key, job) = self.current.take().ok_or(IoError::Unfinished)?;
+        let Err(error) = outcome else {
+            let settle = SettleJob::new(key, job, None);
+            let state = DrainState::Settle { failed: false };
+            return self.call(state, IoCall::child(settle));
+        };
+        let attempts = job.attempts.saturating_add(1);
+        let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
+        let next = ReferenceRefreshRecord {
+            refresh: job.refresh.clone(),
+            due_at_ms,
+            attempts,
+            last_error: Some(error.to_string()),
+        };
+        self.next_due_ms = min_due_at(self.next_due_ms, due_at_ms);
+        let settle = SettleJob::new(key, job, Some(next));
+        let state = DrainState::Settle { failed: true };
+        self.call(state, IoCall::child(settle))
+    }
+
+    fn summary(&self) -> ReferenceDrainResult {
+        if self.job_count > 0 {
+            info!(
+                event = "pipeline.reference_metadata_refresh.summary",
+                jobs = self.job_count,
+                succeeded = self.succeeded,
+                failed = self.failed,
+                scan_ms = self.scan_ms,
+                total_ms = duration_ms(self.started.elapsed()),
+                oldest_lag_ms = self.oldest_lag_ms,
+                has_more_due = self.has_more_due,
+                "Reference metadata refresh batch summary"
+            );
+        }
+        let next_due_after = (self.next_due_ms.filter(|_| !self.has_more_due))
+            .map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms));
+        ReferenceDrainResult {
+            processed: self.job_count,
+            succeeded: self.succeeded,
+            failed: self.failed,
+            has_more_due: self.has_more_due,
+            next_due_after,
+        }
+    }
+}
+
+impl Operation for DrainRefreshOperation {
+    type Output = ReferenceDrainResult;
+    type Error = ReferenceRefreshError;
+
+    fn first(&mut self) -> DrainTurn {
+        self.started = Instant::now();
+        self.now_ms = unix_timestamp_millis();
+        Ok(Next::Call(due_page(REFRESH_SCAN_PAGE)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DrainTurn {
+        match std::mem::replace(&mut self.state, DrainState::DeleteStale) {
+            DrainState::ReadDue => {
+                let (rows, next) = result.page()?;
+                self.rows = rows.into_iter().map(|(row, _)| row).collect();
+                self.more_rows = next.is_some();
+                self.walk_rows()
+            }
+            DrainState::ReadJob(row) => self.job_read(row, result.value()?),
+            DrainState::DeleteStale => {
+                result.done()?;
+                self.walk_rows()
+            }
+            DrainState::RunJob => self.job_ran(result.child::<(), RefreshRunError>()?),
+            DrainState::Settle { failed } => {
+                result.child::<(), ReferenceRefreshError>()??;
+                match failed {
+                    true => self.failed = self.failed.saturating_add(1),
+                    false => self.succeeded = self.succeeded.saturating_add(1),
+                }
+                self.next_job()
+            }
+        }
     }
 }
 
 #[cfg(test)]
-pub(super) async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
-    Ok(!first_due(storage, 1).await?.0.is_empty())
-}
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use std::collections::HashMap;
+    use ulid::Ulid;
 
-async fn next_timer(storage: &StorageHandle) -> Result<Option<Duration>, ReferenceRefreshError> {
-    let (rows, _) = first_due(storage, 1).await?;
-    Ok(rows
-        .first()
-        .and_then(|(row, _)| split_due(row))
-        .map(|(due_at_ms, _)| due_after(unix_timestamp_millis(), due_at_ms)))
-}
-
-pub async fn process_batch(
-    context: &DriverContext,
-) -> Result<ReferenceDrainResult, ReferenceRefreshError> {
-    let batch_started = Instant::now();
-    let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(&context.storage_handle, now_ms, REFRESH_BATCH_SIZE).await?;
-    let mut next_due_ms = scan.next_due_ms;
-    let has_more_due = scan.has_more_due;
-    let scan_elapsed = batch_started.elapsed();
-    let job_count = scan.jobs.len();
-    let oldest_lag_ms = scan
-        .jobs
-        .iter()
-        .map(|(_, job)| now_ms.saturating_sub(job.due_at_ms))
-        .max()
-        .unwrap_or(0);
-
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    for (job_key, job) in scan.jobs {
-        match observe_and_refresh(context, job.refresh.clone()).await {
-            Ok(()) => {
-                settle_job(&context.storage_handle, &job_key, &job, None).await?;
-                succeeded = succeeded.saturating_add(1);
-            }
-            Err(error) => {
-                let retry_due_at =
-                    reschedule_job(&context.storage_handle, &job_key, &job, error).await?;
-                next_due_ms = min_due_at(next_due_ms, retry_due_at);
-                failed = failed.saturating_add(1);
-            }
+    fn observation(content_length: u64) -> SourceMetadata {
+        SourceMetadata {
+            content_length,
+            content_type: None,
+            etag: Some(format!("etag-{content_length}")),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
         }
     }
 
