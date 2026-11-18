@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -11,15 +12,17 @@ use aruna_core::structs::storage::distribution::accounting::{
 };
 use aruna_core::structs::storage::distribution::inventory::{HeadEntry, VersionEntry};
 use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::TxnId;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::inventory::{
-    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
+    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, StagedCall,
+    open_ranges,
 };
+use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
 
 pub(crate) fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
@@ -82,19 +85,115 @@ pub(crate) async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyR
     ));
 }
 
+/// Runs one call of an embedded update in `txn_id`; an outside read runs without it.
+async fn run_staged(
+    handle: &StorageHandle,
+    txn_id: TxnId,
+    call: StagedCall,
+) -> Result<IoResult, IoError> {
+    let (call, txn) = match call {
+        StagedCall::InTransaction(call) => (call, Some(txn_id)),
+        StagedCall::Outside(call) => (call, None),
+    };
+    let mut raw = false;
+    let effect = match call {
+        IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id: txn },
+        IoCall::Page {
+            space,
+            prefix,
+            after,
+            limit,
+        } => StorageEffect::Iter {
+            key_space: space,
+            prefix: Some(prefix),
+            start: after.map(IterStart::After),
+            limit,
+            txn_id: txn,
+        },
+        IoCall::Write(writes) => StorageEffect::BatchWrite {
+            writes,
+            txn_id: txn,
+        },
+        IoCall::Delete(deletes) => StorageEffect::BatchDelete {
+            deletes,
+            txn_id: txn,
+        },
+        IoCall::AddCounters { space, deltas } => StorageEffect::AddCounters {
+            key_space: space,
+            deltas,
+            txn_id,
+        },
+        IoCall::AddUsage {
+            space,
+            deltas,
+            buckets,
+        } => StorageEffect::AddUsage {
+            key_space: space,
+            deltas,
+            buckets,
+            txn_id,
+        },
+        IoCall::Effect(effect) => {
+            let Effect::Storage(mut storage) = *effect else {
+                panic!("only storage effects are expected: {effect:?}");
+            };
+            if let Some(slot) = storage.txn_slot() {
+                *slot = txn;
+            }
+            raw = true;
+            storage
+        }
+        other => panic!("an update makes no such call: {other:?}"),
+    };
+    let event = handle.send_storage_effect(effect).await;
+    if let Event::Storage(StorageEvent::Error { error }) = event {
+        return Err(IoError::Storage(error));
+    }
+    if raw {
+        return Ok(IoResult::Event(Box::new(event)));
+    }
+    Ok(match event {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => IoResult::Page {
+            rows: values,
+            next: next_start_after,
+        },
+        Event::Storage(
+            StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
+        ) => IoResult::Done,
+        other => panic!("unexpected storage event: {other:?}"),
+    })
+}
+
 /// Runs `update` to the end inside the open transaction `txn_id`.
 pub(crate) async fn stage(
     handle: &StorageHandle,
     txn_id: TxnId,
     update: &mut InventoryUpdate,
 ) -> Result<(), InventoryError> {
-    let mut effects: Effects = update.start(txn_id);
-    while let Some(effect) = effects.pop() {
-        let event = send(handle, effect).await;
-        match update.step(event, txn_id)? {
-            Some(next) => effects = next,
-            None => return Ok(()),
-        }
+    let mut next = update.start_calls();
+    while let Some(call) = next {
+        let answer = run_staged(handle, txn_id, call).await?;
+        next = update.step_calls(answer)?;
+    }
+    Ok(())
+}
+
+/// Runs a counter update to the end inside the open transaction `txn_id`.
+pub(crate) async fn stage_usage(
+    handle: &StorageHandle,
+    txn_id: TxnId,
+    update: &mut UsageCounterUpdate,
+) -> Result<(), UsageUpdateError> {
+    let mut next = Some(update.start_calls());
+    while let Some(call) = next {
+        let answer = run_staged(handle, txn_id, call).await?;
+        next = update.step_calls(answer)?;
     }
     Ok(())
 }
@@ -165,6 +264,11 @@ pub(crate) async fn account(
 
 /// A write of a new current version `seed` of `size` bytes at generation 1.
 pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
+    InventoryUpdate::new(write_change(set_id, key, seed, size))
+}
+
+/// The change [`write`] applies.
+pub(crate) fn write_change(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryChange {
     let version_id = Ulid::from_bytes([seed; 16]);
     let entry = VersionEntry {
         marker: false,
@@ -187,7 +291,7 @@ pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUp
         generation: 1,
         version: entry,
     });
-    InventoryUpdate::new(change)
+    change
 }
 
 /// Removes a key's head and the versions `seeds`.
