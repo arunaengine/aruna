@@ -11,13 +11,18 @@ use crate::distribution::test_record::{record, searched, store_record};
 use crate::distribution::test_store::{
     apply, context, get, install, open, purge, range, send, write,
 };
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_index::{KeyChange, KeyQuery, MetaTerms};
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, SEARCH_FEED_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_VERSIONS_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
+};
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::inventory::HeadEntry;
 use aruna_core::structs::storage::distribution::inventory::head_position;
+use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_storage::StorageHandle;
+use aruna_storage::key_index::RangeIndexes;
 use tempfile::TempDir;
 
 /// The set of [`searched`], which keeps a search index.

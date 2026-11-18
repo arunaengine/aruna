@@ -36,6 +36,9 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::charged_ranges::{
+    HeldRange, HeldRanges, HeldRangesOperation, UsageError, sum_held,
+};
 use crate::metadata::call_results::page_rows;
 
 /// The open end of a range in its range index key.
@@ -1339,12 +1342,135 @@ impl Operation for FeedPassOperation {
     }
 }
 
+/// What the pending call of a progress read answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgressStep {
+    Held,
+    States,
+    Count,
+}
+
+/// The search index progress of every range of a bucket this node holds, while its set keeps a
+/// search index; a range whose index is not opened yet has none indexed.
+#[derive(Debug, PartialEq)]
+pub(super) struct RangeProgressOperation {
+    bucket: String,
+    step: ProgressStep,
+    set_id: Ulid,
+    pending: VecDeque<(HeldRange, Option<IndexState>)>,
+    current: Option<(HeldRange, Option<IndexState>)>,
+    held: Vec<HeldRange>,
+    progress: BTreeMap<Ulid, IndexProgress>,
+}
+
+impl RangeProgressOperation {
+    pub(super) fn new(bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            step: ProgressStep::Held,
+            set_id: Ulid::nil(),
+            pending: VecDeque::new(),
+            current: None,
+            held: Vec::new(),
+            progress: BTreeMap::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        range: &HeldRange,
+        state: Option<&IndexState>,
+        indexed: u64,
+    ) -> Result<(), FeedError> {
+        let counters = sum_held([range]).map_err(|error| FeedError::Storage(error.to_string()))?;
+        let entry = IndexProgress {
+            ready: matches!(state, Some(IndexState::Ready { .. })),
+            indexed,
+            keys: u64::try_from(counters.objects).unwrap_or_default(),
+        };
+        self.progress.insert(range.range_id, entry);
+        Ok(())
+    }
+
+    /// Counts the next range with an index; one without has none indexed.
+    fn next_range(&mut self) -> Result<Next<BTreeMap<Ulid, IndexProgress>>, FeedError> {
+        while let Some((range, state)) = self.pending.pop_front() {
+            let Some(generation) = state.as_ref().map(IndexState::generation) else {
+                self.add(&range, None, 0)?;
+                continue;
+            };
+            let count = index(IndexEffect::Count {
+                set_id: self.set_id,
+                range_id: range.range_id,
+                generation,
+            });
+            self.current = Some((range, state));
+            self.step = ProgressStep::Count;
+            return Ok(Next::Call(count));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.progress)))
+    }
+}
+
+impl Operation for RangeProgressOperation {
+    type Output = BTreeMap<Ulid, IndexProgress>;
+    type Error = FeedError;
+
+    fn first(&mut self) -> Result<Next<BTreeMap<Ulid, IndexProgress>>, FeedError> {
+        let held = HeldRangesOperation::new(&self.bucket);
+        Ok(Next::Call(IoCall::child(held)))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<BTreeMap<Ulid, IndexProgress>>, FeedError> {
+        match self.step {
+            ProgressStep::Held => {
+                let held = result.child::<Option<HeldRanges>, UsageError>()?;
+                let held = held.map_err(|error| FeedError::Storage(error.to_string()))?;
+                let Some((binding, snapshot, held)) = held else {
+                    return Ok(Next::Done(BTreeMap::new()));
+                };
+                if !snapshot.config.settings.search_index {
+                    return Ok(Next::Done(BTreeMap::new()));
+                }
+                self.set_id = binding.set_id;
+                let keys = held.iter().map(|range| state_key(binding.set_id, range.range_id));
+                let read = batch_read(SEARCH_INDEX_KEYSPACE, keys.collect::<Vec<_>>());
+                self.held = held;
+                self.step = ProgressStep::States;
+                Ok(Next::Call(read))
+            }
+            ProgressStep::States => {
+                let held = std::mem::take(&mut self.held);
+                for (range, state) in held.into_iter().zip(result.values()?) {
+                    let state = state
+                        .map(|value| IndexState::from_bytes(&value))
+                        .transpose()?;
+                    self.pending.push_back((range, state));
+                }
+                self.next_range()
+            }
+            ProgressStep::Count => {
+                let (range, state) = self.current.take().ok_or(FeedError::NotFinished)?;
+                let IndexEvent::Counted(count) = index_event(result)? else {
+                    return Err(FeedError::NotFinished);
+                };
+                self.add(&range, state.as_ref(), count)?;
+                self.next_range()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::test_record::{record, searched};
+    use crate::distribution::test_record::{binding, record, searched};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
+    use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 
     fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Key, Value)> {
         (values.into_iter())
@@ -1639,5 +1765,89 @@ mod tests {
         let mut pass = FeedPassOperation::new(FeedLimits::default(), FeedCursors::default());
         pass.first().unwrap();
         assert!(pass.next(IoResult::Done).is_err());
+    }
+
+    fn held(seed: u8, objects: i128) -> HeldRange {
+        HeldRange {
+            range_id: Ulid::from_bytes([seed; 16]),
+            complete: true,
+            coordinated: true,
+            rows: vec![(
+                vec![seed],
+                RangeCounters {
+                    objects,
+                    ..RangeCounters::default()
+                },
+            )],
+        }
+    }
+
+    /// A progress read of two held ranges, waiting for their state rows.
+    fn progress_read() -> (RangeProgressOperation, Ulid) {
+        let (snapshot, _) = searched();
+        let set_id = snapshot.set_id();
+        let bound = (binding(&snapshot, 1, 5), snapshot, vec![held(1, 7), held(2, 8)]);
+        let mut read = RangeProgressOperation::new("spire");
+        assert!(is_child(read.first()));
+        let keys = [1, 2].map(|seed| state_key(set_id, Ulid::from_bytes([seed; 16])));
+        let found = read.next(child(Ok::<_, UsageError>(Some(bound))));
+        assert_eq!(found, Ok(Next::Call(batch_read(SEARCH_INDEX_KEYSPACE, keys))));
+        (read, set_id)
+    }
+
+    // A range with an index counts its generation; one without has none indexed.
+    #[test]
+    fn counts_range_progress() {
+        let (mut read, set_id) = progress_read();
+        let state = IndexState::Ready { generation: 3 };
+        let count = index(IndexEffect::Count {
+            set_id,
+            range_id: Ulid::from_bytes([2; 16]),
+            generation: 3,
+        });
+        let states = read.next(self::read(vec![None, Some(state.to_bytes().unwrap())]));
+        assert_eq!(states, Ok(Next::Call(count)));
+        let Ok(Next::Done(progress)) = read.next(indexed(IndexEvent::Counted(5))) else {
+            panic!("expected the progress");
+        };
+        let unopened = IndexProgress {
+            ready: false,
+            indexed: 0,
+            keys: 7,
+        };
+        let ready = IndexProgress {
+            ready: true,
+            indexed: 5,
+            keys: 8,
+        };
+        assert_eq!(progress[&Ulid::from_bytes([1; 16])], unopened);
+        assert_eq!(progress[&Ulid::from_bytes([2; 16])], ready);
+    }
+
+    // A failed count fails the read, so no partial progress is shown.
+    #[test]
+    fn count_failure_fails() {
+        let (mut read, _) = progress_read();
+        let state = IndexState::Ready { generation: 3 };
+        let states = self::read(vec![Some(state.to_bytes().unwrap()), None]);
+        read.next(states).unwrap();
+        let failed = IndexError::Failed("disk".to_string());
+        let answer = read.next(indexed(IndexEvent::Error(failed.clone())));
+        assert_eq!(answer, Err(FeedError::Index(failed)));
+    }
+
+    // No held ranges, or a set without a search index, have no progress to report.
+    #[test]
+    fn progress_needs_search() {
+        let finished = |held: Option<HeldRanges>| {
+            let mut read = RangeProgressOperation::new("spire");
+            read.first().unwrap();
+            read.next(child(Ok::<_, UsageError>(held)))
+        };
+        let none = Ok(Next::Done(BTreeMap::new()));
+        assert_eq!(finished(None), none);
+        let (snapshot, _) = record(true);
+        let plain = (binding(&snapshot, 1, 5), snapshot, vec![held(1, 7)]);
+        assert_eq!(finished(Some(plain)), none);
     }
 }
