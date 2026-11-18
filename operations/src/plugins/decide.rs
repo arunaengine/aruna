@@ -65,7 +65,7 @@ pub enum Verdict {
 }
 
 /// Key of an event's dedup record: install, trigger kind, then the source id.
-pub fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<u8> {
+pub(crate) fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<u8> {
     let mut key = install_id.to_bytes().to_vec();
     key.push(kind as u8);
     key.extend_from_slice(source.as_bytes());
@@ -73,7 +73,7 @@ pub fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<u8> {
 }
 
 /// The outcome an earlier decision recorded for the event.
-pub fn seen_outcome(row: &ForwardRow) -> SeenOutcome {
+pub(crate) fn seen_outcome(row: &ForwardRow) -> SeenOutcome {
     let seen = seen_key(row.install_id, row.event.kind, &row.event.source);
     SeenOutcome(seen)
 }
@@ -101,7 +101,7 @@ impl Operation for SeenOutcome {
 
 /// Counts an event that came too late in its own gap row.
 #[derive(Debug, PartialEq)]
-pub struct LateEvent(pub GapCount);
+pub(crate) struct LateEvent(pub GapCount);
 
 impl Operation for LateEvent {
     type Output = ();
@@ -125,7 +125,7 @@ impl Operation for LateEvent {
 
 /// Records the event's outcome under `verdict` in one transaction: a queued run, a held queue
 /// slot, or a denial. A full queue and an unavailable check are busy and write nothing.
-pub fn decide_event(
+pub(crate) fn decide_event(
     verdict: Verdict,
     row: &ForwardRow,
     now_ms: u64,
@@ -334,7 +334,11 @@ impl Operation for PruneSeen {
 }
 
 /// The event's dedup record with its outcome.
-pub fn seen_row(row: &ForwardRow, outcome: &Outcome, now_ms: u64) -> Result<Row, StoreError> {
+pub(crate) fn seen_row(
+    row: &ForwardRow,
+    outcome: &Outcome,
+    now_ms: u64,
+) -> Result<Row, StoreError> {
     let key = seen_key(row.install_id, row.event.kind, &row.event.source);
     let record = SeenRow {
         outcome: outcome.clone(),
@@ -401,7 +405,7 @@ impl Hold {
 }
 
 /// Keeps each report from `sender` that is newer than the one kept; answers the sequence kept.
-pub fn keep_reports(sender: NodeId, reports: Vec<(Ulid, GapRow)>) -> KeepReports {
+pub(crate) fn keep_reports(sender: NodeId, reports: Vec<(Ulid, GapRow)>) -> KeepReports {
     KeepReports {
         sender,
         reports,
@@ -573,7 +577,7 @@ enum JudgePhase {
 /// Whether the local install record and its prerequisite writes are here, then steps 0 to 4 for
 /// the event's path as a new run of the install would pass them.
 #[derive(Debug, PartialEq)]
-pub struct Judge {
+pub(crate) struct Judge {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     row: ForwardRow,
@@ -582,7 +586,7 @@ pub struct Judge {
 }
 
 impl Judge {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<RealmConfigDocument>,
         local: NodeId,
         row: ForwardRow,
@@ -668,7 +672,7 @@ enum RowPhase {
 
 /// One event's outcome. Busy writes nothing, so the sender keeps the row and sends it again.
 #[derive(Debug, PartialEq)]
-pub struct DecideRow {
+pub(crate) struct DecideRow {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     row: ForwardRow,
@@ -731,7 +735,7 @@ impl Operation for DecideRow {
 
 /// Decides each event of a batch from `sender` and keeps its newest gap reports.
 #[derive(Debug, PartialEq)]
-pub struct DecideBatch {
+pub(crate) struct DecideBatch {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     sender: NodeId,
@@ -743,7 +747,7 @@ pub struct DecideBatch {
 }
 
 impl DecideBatch {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<RealmConfigDocument>,
         (local, sender): (NodeId, NodeId),
         batch: EventBatch,
@@ -799,7 +803,7 @@ impl Operation for DecideBatch {
 
 /// The receiver side of a forward from an infrastructure peer.
 #[derive(Debug, PartialEq)]
-pub struct ServeEvents {
+pub(crate) struct ServeEvents {
     node: ServingNode,
     peer: NodeId,
     now_ms: u64,
@@ -807,7 +811,7 @@ pub struct ServeEvents {
 }
 
 impl ServeEvents {
-    pub fn new(node: ServingNode, peer: NodeId, batch: EventBatch, now_ms: u64) -> Self {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, batch: EventBatch, now_ms: u64) -> Self {
         Self {
             node,
             peer,

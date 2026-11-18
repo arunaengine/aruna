@@ -31,7 +31,7 @@ use super::rows::{
 };
 use crate::realm::mutate_placement::node_kind;
 
-pub const COVERAGE_ROW: u8 = b'c';
+pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
 
 type Coverage = BTreeMap<TriggerKind, BTreeSet<String>>;
@@ -58,13 +58,13 @@ pub struct ReplayRow {
     pub until: Vec<u8>,
 }
 
-pub fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
+pub(crate) fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
     [&[kind][..], &install_id.to_bytes()].concat()
 }
 
 /// The coverage this node held before, the boundary the grown part starts at, and the node
 /// whose clock it uses; `None` when nothing grew since the coverage row.
-pub fn growth(
+pub(crate) fn growth(
     install: &PluginInstall,
     row: Option<&CoverageRow>,
     coverage: &Coverage,
@@ -90,7 +90,7 @@ pub fn growth(
 }
 
 /// The coverage row and the replay row of an install.
-pub fn replay_rows(install_id: Ulid) -> ReplayRows {
+pub(crate) fn replay_rows(install_id: Ulid) -> ReplayRows {
     ReplayRows(install_id)
 }
 
@@ -226,14 +226,14 @@ impl Operation for StartReplay {
 }
 
 /// Every replay key, for [`replay_page`].
-pub fn replay_scan() -> Scan {
+pub(crate) fn replay_scan() -> Scan {
     Scan::new(PLUGIN_REPLAYS_KEYSPACE, vec![REPLAY_ROW])
 }
 
 /// One page of `page` rows of the replay at `key` in one transaction: forward rows for the newly
 /// covered events it reads, then the replay row continued, or the coverage row written once the
 /// replay reaches `until`. Answers the rows read and whether the replay ended.
-pub fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> ReplayPage {
+pub(crate) fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> ReplayPage {
     ReplayPage {
         key,
         now_ms,
@@ -400,7 +400,7 @@ impl Operation for ReplayPage {
 
 /// What one install's coverage needs now.
 #[derive(Debug, PartialEq)]
-pub enum ReplayPlan {
+pub(crate) enum ReplayPlan {
     Nothing,
     /// A replay of the grown part starts; the node's clock is `by`'s unless it is this one.
     Start {
@@ -415,14 +415,14 @@ pub enum ReplayPlan {
 /// Decides from the coverage row whether the install's coverage grew here; a record that moved on
 /// without growth only updates the row.
 #[derive(Debug, PartialEq)]
-pub struct PlanReplay {
+pub(crate) struct PlanReplay {
     install: PluginInstall,
     target: Option<Target>,
     writing: bool,
 }
 
 impl PlanReplay {
-    pub fn new(install: PluginInstall, target: Target) -> Self {
+    pub(crate) fn new(install: PluginInstall, target: Target) -> Self {
         Self {
             install,
             target: Some(target),

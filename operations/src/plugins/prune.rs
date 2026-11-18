@@ -26,7 +26,7 @@ const AUDIT_CURSOR: &[u8] = b"c";
 
 /// One page of at most `page` use audit rows past their retention, deleted with its cursor in
 /// one transaction; answers how many records went and whether older rows may follow.
-pub fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
+pub(crate) fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
     PruneUses {
         cutoff: now_ms.saturating_sub(USE_AUDIT_RETENTION),
         page,

@@ -66,7 +66,7 @@ pub struct RunScope {
 
 /// Steps 0 to 2: this node runs the install, the account is the active account the record
 /// names, and the record is active with the run's artifact.
-pub fn check_run<'a>(
+pub(crate) fn check_run<'a>(
     scope: &RunScope,
     config: &'a RealmConfigDocument,
     account: Option<&User>,
@@ -76,7 +76,7 @@ pub fn check_run<'a>(
 }
 
 /// Steps 0 to 2 for install `install_id` pinned at `digest`, run by `local`.
-pub fn check_install<'a>(
+pub(crate) fn check_install<'a>(
     place: (&'a RealmConfigDocument, RealmId, NodeId),
     binding: (Ulid, &str),
     account: Option<&User>,
@@ -93,7 +93,7 @@ pub fn check_install<'a>(
 
 /// The install whatever its state: this node runs it, its account is active and marked with
 /// it, and it still pins `digest`.
-pub fn check_identity<'a>(
+pub(crate) fn check_identity<'a>(
     (config, realm_id, local): (&'a RealmConfigDocument, RealmId, NodeId),
     (install_id, digest): (Ulid, &str),
     account: Option<&User>,
@@ -174,7 +174,7 @@ fn restricted(
 /// Step 4: each of `accesses` on `target`, as the account restricted to `patterns`, against
 /// roles, denies and policies with the operation `plugin.<permission>`.
 #[derive(Debug, PartialEq)]
-pub struct Authorize {
+pub(crate) struct Authorize {
     account: PluginInstall,
     permission: Permission,
     target: String,
@@ -186,7 +186,7 @@ pub struct Authorize {
 
 impl Authorize {
     /// The accesses `permission` needs on `target`.
-    pub fn call(
+    pub(crate) fn call(
         install: &PluginInstall,
         permission: Permission,
         target: &str,
@@ -198,7 +198,7 @@ impl Authorize {
 
     /// One access on `target` under the operation `plugin.<permission>`, such as READ on the
     /// source of a copy, whose target needs WRITE.
-    pub fn access(
+    pub(crate) fn access(
         install: &PluginInstall,
         (permission, access): (Permission, Access),
         target: &str,
@@ -341,14 +341,14 @@ enum CheckPhase {
 /// Steps 0 to 4 for one call; `target` is the permission and resource a guarded call names.
 /// State and log calls name none and pass steps 0 to 2 only.
 #[derive(Debug, PartialEq)]
-pub struct CheckCall {
+pub(crate) struct CheckCall {
     scope: RunScope,
     target: Option<(Permission, String)>,
     phase: CheckPhase,
 }
 
 impl CheckCall {
-    pub fn new(scope: &RunScope, target: Option<(Permission, &str)>) -> Self {
+    pub(crate) fn new(scope: &RunScope, target: Option<(Permission, &str)>) -> Self {
         Self {
             scope: scope.clone(),
             target: target.map(|(permission, resource)| (permission, resource.to_string())),
@@ -412,7 +412,7 @@ impl Operation for CheckCall {
 }
 
 /// A realm config that cannot be read, as a call sees it.
-pub fn config_unavailable(error: GetConfigError) -> CallError {
+pub(crate) fn config_unavailable(error: GetConfigError) -> CallError {
     CallError(unavailable(format!("realm config: {error:?}")))
 }
 

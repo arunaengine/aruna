@@ -185,7 +185,7 @@ impl InstallCaller {
     }
 
     /// Removes the rules of a removing or abandoned install from its group secrets.
-    pub fn retire(&self, install: &PluginInstall) -> IoCall {
+    pub(crate) fn retire(&self, install: &PluginInstall) -> IoCall {
         IoCall::child(RetireRules::new(&self.actor, install, self.now_ms))
     }
 }
@@ -196,16 +196,16 @@ pub fn written(result: IoResult) -> Result<(), InstallError> {
     Ok(())
 }
 
-pub fn config_call(realm_id: RealmId) -> IoCall {
+pub(crate) fn config_call(realm_id: RealmId) -> IoCall {
     IoCall::child(GetConfigOperation::new(realm_id))
 }
 
-pub fn config_answer(result: IoResult) -> Result<RealmConfigDocument, InstallError> {
+pub(crate) fn config_answer(result: IoResult) -> Result<RealmConfigDocument, InstallError> {
     Ok(result.child::<RealmConfigDocument, GetConfigError>()??)
 }
 
 /// Asks whether the caller is an admin of the group.
-pub fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
+pub(crate) fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
     IoCall::child(ServiceCheckOperation::new(ServiceCheckConfig {
         auth_context: auth.clone(),
         group_id,
@@ -214,7 +214,7 @@ pub fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
 }
 
 /// Refuses a caller who is not an admin of the group.
-pub fn admin_answer(result: IoResult) -> Result<(), InstallError> {
+pub(crate) fn admin_answer(result: IoResult) -> Result<(), InstallError> {
     (result.child::<Option<User>, ServiceCheckError>()?)
         .map(drop)
         .map_err(|_| InstallError::Unauthorized)
@@ -490,7 +490,7 @@ enum SettlePhase {
 /// blocked while something required is not granted, else paused or active. A failure undoes
 /// the account and role, but only while the record is still the revision this call wrote.
 #[derive(Debug, PartialEq)]
-pub struct SettleInstall {
+pub(crate) struct SettleInstall {
     caller: InstallCaller,
     record: PluginInstall,
     audit: Option<AdminAuditAction>,
@@ -498,7 +498,7 @@ pub struct SettleInstall {
 }
 
 impl SettleInstall {
-    pub fn new(
+    pub(crate) fn new(
         caller: InstallCaller,
         record: PluginInstall,
         audit: Option<AdminAuditAction>,
@@ -694,7 +694,7 @@ struct HeldPattern {
 /// operation `plugin.<permission>`, against roles, denies below a subtree, restrictions and
 /// policies. Any policy reading the path refuses every subtree, even one guarded off for plugins.
 #[derive(Debug, PartialEq)]
-pub struct CheckHolder {
+pub(crate) struct CheckHolder {
     auth: AuthContext,
     scope: InstallScope,
     patterns: VecDeque<(Permission, String)>,
@@ -705,7 +705,7 @@ pub struct CheckHolder {
 }
 
 impl CheckHolder {
-    pub fn new(
+    pub(crate) fn new(
         auth: &AuthContext,
         (scope, grants): (&InstallScope, &Grants),
         config: &RealmConfigDocument,
@@ -864,7 +864,7 @@ pub(crate) fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -
     }
 }
 
-pub fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
+pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
     InstallScope {
         realm_id,
         group_id: install.group_id,

@@ -44,7 +44,7 @@ pub mod replay;
 pub mod rows;
 pub mod rules;
 pub mod runs;
-pub mod secret_use;
+pub(crate) mod secret_use;
 pub mod settings;
 pub mod state;
 pub mod submit;

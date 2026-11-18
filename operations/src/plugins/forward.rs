@@ -45,7 +45,7 @@ use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
 /// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
-pub const REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// The longest wait before a receiver is tried again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
@@ -72,19 +72,19 @@ impl Backoff {
 }
 
 /// One request's batch and the outbox key of each event in it by install and source id.
-pub type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
+pub(crate) type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
 
 /// One receiver's requests, each with the encoded row bytes it holds.
 #[derive(Debug, Default, PartialEq)]
-pub struct Requests {
+pub(crate) struct Requests {
     bound: usize,
-    pub open: Vec<(Pending, usize)>,
+    pub(crate) open: Vec<(Pending, usize)>,
 }
 
 impl Requests {
     /// The request with room for `size` more bytes; a new one when the last is full. A row
     /// larger than the bound gets a request of its own.
-    pub fn room(&mut self, size: usize) -> &mut Pending {
+    pub(crate) fn room(&mut self, size: usize) -> &mut Pending {
         let fits =
             (self.open.last()).is_some_and(|(_, used)| *used == 0 || used + size <= self.bound);
         if !fits {
@@ -98,7 +98,7 @@ impl Requests {
 }
 
 /// The requests to `node`, each holding at most `bound` encoded row bytes.
-pub fn receiver_requests(
+pub(crate) fn receiver_requests(
     batches: &mut BTreeMap<NodeId, Requests>,
     node: NodeId,
     bound: usize,
@@ -109,7 +109,7 @@ pub fn receiver_requests(
 }
 
 /// The next install after `after` with forward rows on this node.
-pub fn next_install(after: Option<Ulid>) -> NextInstall {
+pub(crate) fn next_install(after: Option<Ulid>) -> NextInstall {
     // A forward key is the install id, then 24 bytes of journal time and event id.
     let start = after.map(|id| [&id.to_bytes()[..], &[0xff; 24]].concat());
     NextInstall(start)
@@ -139,7 +139,7 @@ impl Operation for NextInstall {
 }
 
 /// Deletes every row below `prefix`, a page at a time.
-pub fn drop_rows(space: &'static str, prefix: Vec<u8>) -> DropRows {
+pub(crate) fn drop_rows(space: &'static str, prefix: Vec<u8>) -> DropRows {
     DropRows {
         space,
         prefix,
@@ -185,7 +185,7 @@ impl Operation for DropRows {
 
 /// Counts the install's first rows past their send expiry as gaps and deletes them in one
 /// transaction; answers the other rows.
-pub fn expire_rows(install_id: Ulid, now_ms: u64) -> ExpireRows {
+pub(crate) fn expire_rows(install_id: Ulid, now_ms: u64) -> ExpireRows {
     ExpireRows {
         install_id,
         now_ms,
@@ -265,7 +265,7 @@ impl Operation for ExpireRows {
 
 /// What this node holds about a dataset event: the document's status, the event's own record
 /// and whether the document is deleted.
-pub fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> DatasetFacts {
+pub(crate) fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> DatasetFacts {
     DatasetFacts {
         document,
         event_id,
@@ -435,7 +435,7 @@ enum ReadablePhase {
 /// Whether a dataset event is not readable here yet: its own change is not materialized and the
 /// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
 #[derive(Debug, PartialEq)]
-pub struct Unreadable {
+pub(crate) struct Unreadable {
     kind: SourceKind,
     ids: Option<(Ulid, Ulid)>,
     /// Whether this node has a metadata store that can be asked about a change.
@@ -444,7 +444,7 @@ pub struct Unreadable {
 }
 
 impl Unreadable {
-    pub fn new(row: &ForwardRow, metadata: bool) -> Self {
+    pub(crate) fn new(row: &ForwardRow, metadata: bool) -> Self {
         let event = &row.event;
         let ids = (event.resource.parse().ok()).zip(event.revision.parse().ok());
         Self {
@@ -534,7 +534,7 @@ enum CollectPhase {
 /// their send expiry become gaps, rows and unacknowledged gaps of `open` receivers join a request
 /// unless their dataset is not readable here yet.
 #[derive(Debug, PartialEq)]
-pub struct CollectOutbox {
+pub(crate) struct CollectOutbox {
     config: Arc<RealmConfigDocument>,
     open: BTreeSet<NodeId>,
     now_ms: u64,
@@ -546,7 +546,7 @@ pub struct CollectOutbox {
 }
 
 impl CollectOutbox {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<RealmConfigDocument>,
         open: BTreeSet<NodeId>,
         (now_ms, bound): (u64, usize),
@@ -710,13 +710,13 @@ impl Operation for CollectOutbox {
 
 /// Hands a batch of events to its receiver over the metadata transport.
 #[derive(Debug, PartialEq)]
-pub struct SendEvents {
+pub(crate) struct SendEvents {
     node: NodeId,
     batch: EventBatch,
 }
 
 impl SendEvents {
-    pub fn new(node: NodeId, batch: EventBatch) -> Self {
+    pub(crate) fn new(node: NodeId, batch: EventBatch) -> Self {
         Self { node, batch }
     }
 }

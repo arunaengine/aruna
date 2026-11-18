@@ -284,7 +284,7 @@ impl Operation for DropCompletion {
 
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and
 /// how it ended.
-pub fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
+pub(crate) fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
     let path = match row.kind {
         WorkKind::Copy | WorkKind::Download => row.target.clone(),
         WorkKind::Upload => row.source.clone(),

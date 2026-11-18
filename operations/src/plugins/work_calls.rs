@@ -159,7 +159,7 @@ impl Operation for AdmitWork {
 /// The current patterns a transfer may use: the row's connection is still granted and authorized
 /// as at submission, then the transfer's own grant on its object.
 #[derive(Debug, PartialEq)]
-pub struct TransferGrants {
+pub(crate) struct TransferGrants {
     install: PluginInstall,
     connection: Option<String>,
     permission: Permission,
@@ -170,11 +170,11 @@ pub struct TransferGrants {
 }
 
 impl TransferGrants {
-    pub fn download(install: &PluginInstall, row: &WorkRow, target: &str) -> Self {
+    pub(crate) fn download(install: &PluginInstall, row: &WorkRow, target: &str) -> Self {
         Self::new(install, row, Permission::TransfersDownload, None, target)
     }
 
-    pub fn upload(install: &PluginInstall, row: &WorkRow, source: &str) -> Self {
+    pub(crate) fn upload(install: &PluginInstall, row: &WorkRow, source: &str) -> Self {
         let read = Some(Access::READ);
         Self::new(install, row, Permission::TransfersUpload, read, source)
     }
