@@ -331,12 +331,14 @@ fn refused_finalize_rolls_back() {
     let turn = operation.next(finalize_answer(Err(BackendFenceError::Unavailable.into())));
     assert_eq!(turn.err(), Some(BackendFenceError::Unavailable.into()));
 
+    // The record reopens and a rollback child deletes the composed object.
     let calls = operation.abort();
-    assert!(matches!(calls.first(), Some(IoCall::Child(_))));
-    assert_eq!(
-        cleanup_works(&calls),
-        [BlobCleanupWork::DeleteBlob { location: composed }]
-    );
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Child(_), IoCall::Child(_)]
+    ));
+    assert!(cleanup_works(&calls).is_empty());
+    assert!(operation.composed_location.is_none());
     // A second abort finds nothing left to do.
     assert!(operation.abort().is_empty());
 
@@ -348,10 +350,12 @@ fn refused_finalize_rolls_back() {
         .next(finalize_answer(Err(conflict.into())))
         .unwrap_err();
     let calls = operation.abort();
-    assert_eq!(
-        cleanup_works(&calls),
-        [BlobCleanupWork::DeleteBlob { location: composed }]
-    );
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Child(_), IoCall::Child(_)]
+    ));
+    assert_eq!(operation.composed_location, None);
+    drop(composed);
 }
 
 #[test]
@@ -996,11 +1000,12 @@ fn quota_aborts_finalize() {
         })
     );
     let calls = operation.abort();
-    assert!(matches!(calls.first(), Some(IoCall::Child(_))));
-    assert_eq!(
-        cleanup_works(&calls),
-        [BlobCleanupWork::DeleteBlob { location }]
-    );
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Child(_), IoCall::Child(_)]
+    ));
+    assert!(cleanup_works(&calls).is_empty());
+    drop(location);
 }
 
 fn marked_answer(result: Result<Marked, CompleteUploadError>) -> IoResult {

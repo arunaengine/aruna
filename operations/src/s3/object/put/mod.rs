@@ -20,7 +20,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
-use crate::s3::write_cleanup::WriteCleanup;
+use crate::s3::write_cleanup::{RollbackWrite, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -1192,8 +1192,7 @@ impl Operation for PutObjectOperation {
         if let Some(location) = self.written_location.take()
             && !self.adopted
         {
-            let work = BlobCleanupWork::DeleteBlob { location };
-            calls.extend(Self::cleanup_row(&work));
+            calls.push(IoCall::child(RollbackWrite::new(location)));
         }
         if let Some(id) = self.cleanup.take_release() {
             calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());

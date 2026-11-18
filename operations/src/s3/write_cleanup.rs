@@ -3,11 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::PendingCleanup;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ABE_PENDING_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
-use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::{
+    ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork};
 use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey};
 use aruna_core::types::Key;
 use ulid::Ulid;
@@ -128,4 +132,110 @@ pub(crate) fn record_rows(
         upload_id.to_bytes().to_vec().into(),
     ));
     Ok(deletes)
+}
+
+/// Deletes written bytes no version owns; a refused delete leaves them to the durable cleanup
+/// queue, so they are never lost to both.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RollbackWrite {
+    location: BackendLocation,
+    queued: bool,
+}
+
+impl RollbackWrite {
+    pub(crate) fn new(location: BackendLocation) -> Self {
+        Self {
+            location,
+            queued: false,
+        }
+    }
+}
+
+impl Operation for RollbackWrite {
+    type Output = ();
+    type Error = StorageError;
+
+    fn first(&mut self) -> Result<Next<()>, StorageError> {
+        let location = self.location.clone();
+        Ok(Next::Call(
+            Effect::Blob(BlobEffect::Delete { location }).into(),
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, StorageError> {
+        if self.queued {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let Event::Blob(BlobEvent::Error(_)) = result.event()? else {
+            return Ok(Next::Done(()));
+        };
+        let location = self.location.clone();
+        let work = BlobCleanupWork::DeleteBlob { location };
+        let key = Ulid::generate().to_bytes().to_vec().into();
+        let value = work.to_bytes();
+        let value = value.map_err(|error| IoError::Codec(error.to_string()))?;
+        let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
+        self.queued = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
+
+    fn location() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "path".to_string(),
+            ulid: Ulid::from_parts(1, 1),
+            format: StoredFormat::default(),
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: Default::default(),
+        }
+    }
+
+    fn answer(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    #[test]
+    fn rollback_queues_refused() {
+        // A deleted blob needs nothing more.
+        let mut rollback = RollbackWrite::new(location());
+        let delete = Effect::Blob(BlobEffect::Delete {
+            location: location(),
+        });
+        assert_eq!(rollback.first(), Ok(Next::Call(delete.into())));
+        let turn = rollback.next(answer(BlobEvent::DeleteFinished));
+        assert_eq!(turn, Ok(Next::Done(())));
+
+        // A refused delete leaves the blob to the cleanup queue.
+        let mut rollback = RollbackWrite::new(location());
+        rollback.first().unwrap();
+        let refused = BlobEvent::Error(aruna_core::errors::BlobError::DeleteError(
+            "unreachable".to_string(),
+        ));
+        let Ok(Next::Call(IoCall::Write(rows))) = rollback.next(answer(refused)) else {
+            panic!("expected the cleanup row")
+        };
+        assert_eq!(rows[0].0, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(
+            BlobCleanupWork::from_bytes(rows[0].2.as_ref()).unwrap(),
+            BlobCleanupWork::DeleteBlob {
+                location: location()
+            }
+        );
+        assert_eq!(rollback.next(IoResult::Done), Ok(Next::Done(())));
+    }
 }

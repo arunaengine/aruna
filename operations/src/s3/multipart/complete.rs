@@ -23,7 +23,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish, upload_count,
 };
-use crate::s3::write_cleanup::{WriteCleanup, record_rows};
+use crate::s3::write_cleanup::{RollbackWrite, WriteCleanup, record_rows};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -313,6 +313,8 @@ pub struct CompleteUploadOperation {
     reconcile_location: Option<BackendLocation>,
     /// A pre-finalize write has no committed owner, even when its hash is absent.
     delete_location: Option<BackendLocation>,
+    /// The composed object a refused finalize deletes.
+    rollback: Option<BackendLocation>,
     cleanup: WriteCleanup<CompleteUploadError>,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -402,6 +404,7 @@ impl CompleteUploadOperation {
             composed_location: None,
             reconcile_location: None,
             delete_location: None,
+            rollback: None,
             cleanup: WriteCleanup::default(),
             final_location: None,
             composite_hashes: HashMap::new(),
@@ -542,7 +545,7 @@ impl CompleteUploadOperation {
     }
 
     /// The rows that roll the composed object back. An in-place object is the only copy of its
-    /// parts, so a retry completes from it; any other goes to the durable delete queue.
+    /// parts, so a retry completes from it; any other is deleted by a rollback child.
     fn rollback_works(&mut self) -> Vec<BlobCleanupWork> {
         let mut works = Vec::new();
         if let Some(location) = self.reconcile_location.take() {
@@ -559,7 +562,7 @@ impl CompleteUploadOperation {
                     owner: WriteOwner::Upload { upload_id },
                 });
             }
-            Some(location) => works.push(BlobCleanupWork::DeleteBlob { location }),
+            Some(location) => self.rollback = Some(location),
             None => {}
         }
         works
@@ -1226,7 +1229,11 @@ impl Operation for CompleteUploadOperation {
             };
             calls.push(IoCall::child(reopen));
         }
-        for work in self.rollback_works() {
+        let works = self.rollback_works();
+        if let Some(location) = self.rollback.take() {
+            calls.push(IoCall::child(RollbackWrite::new(location)));
+        }
+        for work in works {
             match work.to_bytes() {
                 Ok(value) => {
                     let key = cleanup_key(&work);
