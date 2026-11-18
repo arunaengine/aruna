@@ -3,28 +3,25 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::abe::KeyError;
-use crate::blob::migration::queue::quota_origin;
-use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
-use crate::driver::{DriverContext, drive};
+use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersionOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, RekeyOutcome, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
-use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::blob::{BucketInfo, VersionKey};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord, SealPlan};
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionTarget,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Version rows one page scans for the prefix.
@@ -48,133 +45,123 @@ fn epoch_of(row: Option<&Value>) -> Option<u64> {
 /// Realm quota and origin that new envelope charges must fit.
 type Quota = Option<(QuotaConfig, RealmId, NodeId)>;
 
-/// Re-keys one page under `prefix` and returns the progress and whether the pass is done.
-pub async fn rekey_page(
-    context: &DriverContext,
-    bucket: &str,
-    prefix: &str,
-    page: usize,
-) -> Result<(RekeyProgress, bool), KeyError> {
-    let quota = quota_origin(context).await.map_err(|_| KeyError::Storage)?;
-    let operation = RekeyOperation::new(bucket, prefix, page, quota, SystemTime::now());
-    drive(operation, context).await
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Step {
-    Settings,
-    Rows,
-    Claim,
-    ClaimRead,
-    ClaimWrite,
-    ClaimCommit,
-    Start,
-    Hold,
-    Scan,
-    Run,
-    Check,
-    Save,
-    Commit,
-    Done,
-}
-
-/// Re-keys up to `page` versions under `prefix` after the saved cursor through the rotation
-/// unit, then saves the cursor. Outputs the progress and whether the pass is done.
-#[derive(Debug, PartialEq)]
-pub struct RekeyOperation {
+/// What one page re-keys.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PageScope {
     bucket: String,
     prefix: String,
     page: usize,
     quota: Quota,
     now: SystemTime,
-    step: Step,
-    id: Key,
-    settings: Option<(BucketEncryption, BucketInfo)>,
-    /// The progress row this page started from.
-    seen: Option<Value>,
-    unit: Option<EncryptionTransition>,
-    progress: Option<RekeyProgress>,
-    rows: Vec<Key>,
-    handled: usize,
-    next: bool,
-    moved: usize,
-    stopped: Option<KeyError>,
-    done: bool,
-    txn: Option<TxnId>,
-    output: Option<Result<(RekeyProgress, bool), KeyError>>,
 }
 
-impl RekeyOperation {
-    pub fn new(bucket: &str, prefix: &str, page: usize, quota: Quota, now: SystemTime) -> Self {
+impl PageScope {
+    pub(crate) fn new(
+        bucket: &str,
+        prefix: &str,
+        page: usize,
+        quota: Quota,
+        now: SystemTime,
+    ) -> Self {
         Self {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             page: page.max(1),
             quota,
             now,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    Config,
+    Settings,
+    Rows,
+    Claim,
+    Page,
+}
+
+type RekeyTurn = Result<Next<(RekeyProgress, bool)>, KeyError>;
+
+/// Re-keys up to `page` versions under `prefix` after the saved cursor through the rotation
+/// unit, then saves the cursor. Outputs the progress and whether the pass is done.
+#[derive(Debug, PartialEq)]
+pub struct RekeyOperation {
+    scope: PageScope,
+    /// Whose realm quota new envelopes are charged against, when the node has a realm.
+    origin: Option<(RealmId, NodeId)>,
+    step: Step,
+    id: Key,
+    settings: Option<(BucketEncryption, BucketInfo)>,
+    unit: Option<EncryptionTransition>,
+    fresh: Option<RekeyProgress>,
+    /// The progress the claim stored, which stands when the page loses a conflict.
+    stored: Option<RekeyProgress>,
+}
+
+impl RekeyOperation {
+    pub fn new(
+        bucket: &str,
+        prefix: &str,
+        page: usize,
+        origin: Option<(RealmId, NodeId)>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            scope: PageScope::new(bucket, prefix, page, None, now),
+            origin,
             step: Step::Settings,
             id: Key::from(Vec::new()),
             settings: None,
-            seen: None,
             unit: None,
-            progress: None,
-            rows: Vec::new(),
-            handled: 0,
-            next: false,
-            moved: 0,
-            stopped: None,
-            done: false,
-            txn: None,
-            output: None,
+            fresh: None,
+            stored: None,
         }
     }
 
-    fn finish(&mut self, result: Result<(RekeyProgress, bool), KeyError>) -> Effects {
-        self.step = Step::Done;
-        self.output = Some(result);
-        self.abort()
+    fn call(&mut self, step: Step, call: IoCall) -> RekeyTurn {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
-    /// Ends with the error that stopped the page, else with the progress.
-    fn end(&mut self) -> Effects {
-        let result = match (self.stopped.take(), self.progress.clone()) {
-            (Some(error), _) => Err(error),
-            (None, Some(progress)) => Ok((progress, self.done)),
-            (None, None) => Err(KeyError::Storage),
-        };
-        self.finish(result)
+    fn read_settings(&mut self) -> RekeyTurn {
+        let name: Key = self.scope.bucket.as_bytes().to_vec().into();
+        let reads = vec![
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
+            (S3_BUCKET_KEYSPACE.to_string(), name),
+        ];
+        self.call(Step::Settings, IoCall::Read(reads))
     }
 
-    fn settings_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let Ok([(_, settings), (_, info)]) = <[_; 2]>::try_from(values) else {
-            return self.finish(Err(KeyError::Storage));
+    /// A realm without a config document has no quota.
+    fn config_read(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> RekeyTurn {
+        self.scope.quota = match (config, self.origin) {
+            (Ok(config), Some((realm, node))) => Some((config.quota, realm, node)),
+            (Err(GetConfigError::DocumentNotFound), _) => None,
+            _ => return Err(KeyError::Storage),
         };
+        self.read_settings()
+    }
+
+    fn settings_read(&mut self, [settings, info]: [Option<Value>; 2]) -> RekeyTurn {
         let settings = BucketEncryption::from_row(settings.as_deref());
         let info = info.as_deref().map(BucketInfo::from_bytes);
         let (Ok(settings), Some(Ok(info))) = (settings, info) else {
-            return self.finish(Err(KeyError::Missing));
+            return Err(KeyError::Missing);
         };
-        let Some(key) = settings.active_key() else {
-            return self.finish(Err(KeyError::Missing));
-        };
+        let key = settings.active_key().ok_or(KeyError::Missing)?;
         self.id = key.bucket_id.to_bytes().to_vec().into();
         self.settings = Some((settings, info));
-        self.step = Step::Rows;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
-                (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
-            ],
-            txn_id: None,
-        })]
+        let reads = vec![
+            (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
+            (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
+        ];
+        self.call(Step::Rows, IoCall::Read(reads))
     }
 
-    fn rows_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (Some((settings, info)), Ok([(_, record), (_, epoch)])) =
-            (self.settings.take(), <[_; 2]>::try_from(values))
-        else {
-            return self.finish(Err(KeyError::Storage));
-        };
+    fn rows_read(&mut self, [record, epoch]: [Option<Value>; 2]) -> RekeyTurn {
+        let (settings, info) = self.settings.take().ok_or(KeyError::Storage)?;
         let record = record.as_deref().map(BucketKeyRecord::from_bytes);
         let plan = match record {
             Some(Ok(record)) => SealPlan::capture(&settings, &record).ok().flatten(),
@@ -183,68 +170,171 @@ impl RekeyOperation {
         let (Some(key), Some(plan), Some(epoch)) =
             (settings.active_key(), plan, epoch_of(epoch.as_ref()))
         else {
-            return self.finish(Err(KeyError::Missing));
+            return Err(KeyError::Missing);
         };
-        self.progress = Some(RekeyProgress {
-            prefix: self.prefix.clone(),
+        let fresh = RekeyProgress {
+            prefix: self.scope.prefix.clone(),
             epoch,
             cursor: Vec::new(),
             rekeyed: 0,
-        });
+        };
         let target = TransitionTarget {
             compression: info.compression,
             plan: Some(plan),
         };
-        let now = self.now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now = self
+            .scope
+            .now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let (kind, generation) = (TransitionKind::Rotate, settings.storage_generation);
         let now = now.as_millis() as u64;
-        let unit = EncryptionTransition::new(kind, Some(key), target, generation, now);
-        self.unit = Some(unit);
-        self.step = Step::Claim;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.unit = Some(EncryptionTransition::new(
+            kind,
+            Some(key),
+            target,
+            generation,
+            now,
+        ));
+        self.fresh = Some(fresh.clone());
+        let claim = ClaimRekey {
+            id: self.id.clone(),
+            prefix: self.scope.prefix.clone(),
+            fresh,
+            claimed: None,
+        };
+        self.call(Step::Claim, IoCall::child(claim))
     }
 
-    /// Stores the pass before any rewrite, so a call for another prefix finds it and stops.
-    fn claim_read(&mut self, value: Option<Value>) -> Effects {
-        let (Some(txn_id), Some(fresh)) = (self.txn, self.progress.take()) else {
-            return self.finish(Err(KeyError::Storage));
-        };
-        let progress = match value.as_deref().map(postcard::from_bytes::<RekeyProgress>) {
-            None => fresh,
-            Some(Ok(saved)) if saved.prefix != self.prefix => {
-                return self.finish(Err(KeyError::Busy));
+    fn claimed(&mut self, claim: Result<(RekeyProgress, Value), KeyError>) -> RekeyTurn {
+        let (progress, seen) = claim.map_err(|error| match error {
+            KeyError::Conflict => KeyError::Storage,
+            other => other,
+        })?;
+        let unit = self.unit.take().ok_or(KeyError::Storage)?;
+        self.stored = Some(progress.clone());
+        let scope = self.scope.clone();
+        let page = RekeyPage::new(scope, unit, self.id.clone(), progress, seen);
+        self.call(Step::Page, IoCall::child(page))
+    }
+
+    /// Ends with the error that stopped the page, else with the progress.
+    fn page_ended(&mut self, ended: Result<PageEnd, KeyError>) -> RekeyTurn {
+        match ended {
+            Ok(PageEnd {
+                stopped: Some(error),
+                ..
+            }) => Err(error),
+            Ok(PageEnd { progress, done, .. }) => Ok(Next::Done((progress, done))),
+            // A copy, raise or removal wrote a read row during the page; the next call resumes.
+            Err(KeyError::Conflict) => {
+                let progress = self.stored.take().ok_or(KeyError::Storage)?;
+                Ok(Next::Done((progress, false)))
             }
-            Some(Ok(saved)) if saved.epoch != fresh.epoch => fresh,
-            Some(Ok(saved)) => saved,
-            Some(Err(_)) => return self.finish(Err(AbeError::Context.into())),
-        };
-        let Ok(row) = postcard::to_allocvec(&progress) else {
-            return self.finish(Err(KeyError::Storage));
-        };
-        self.seen = Some(row.clone().into());
-        self.progress = Some(progress);
-        self.step = Step::ClaimWrite;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into())],
-            txn_id: Some(txn_id),
-        })]
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Operation for RekeyOperation {
+    type Output = (RekeyProgress, bool);
+    type Error = KeyError;
+
+    fn first(&mut self) -> RekeyTurn {
+        match self.origin {
+            Some((realm, _)) => {
+                self.call(Step::Config, IoCall::child(GetConfigOperation::new(realm)))
+            }
+            None => self.read_settings(),
+        }
     }
 
-    fn scan(&mut self) -> Effects {
-        let (Ok(versions), Some(progress)) = (
-            VersionKey::bucket_prefix(&self.bucket),
-            self.progress.as_ref(),
-        ) else {
-            return self.finish(Err(KeyError::Storage));
+    fn next(&mut self, result: IoResult) -> RekeyTurn {
+        match self.step {
+            Step::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                self.config_read(config)
+            }
+            Step::Settings => self.settings_read(values::<2>(result)?),
+            Step::Rows => self.rows_read(values::<2>(result)?),
+            Step::Claim => self.claimed(result.child::<(RekeyProgress, Value), KeyError>()?),
+            Step::Page => self.page_ended(result.child::<PageEnd, KeyError>()?),
+        }
+    }
+}
+
+/// Stores the pass before any rewrite, so a call for another prefix finds it and stops. Outputs
+/// the pass and its stored row.
+#[derive(Debug, PartialEq)]
+struct ClaimRekey {
+    id: Key,
+    prefix: String,
+    fresh: RekeyProgress,
+    claimed: Option<(RekeyProgress, Value)>,
+}
+
+type ClaimTurn = Result<Next<(RekeyProgress, Value)>, KeyError>;
+
+impl ClaimRekey {
+    fn claim(&mut self, value: Option<Value>) -> ClaimTurn {
+        let saved = value.as_deref().map(postcard::from_bytes::<RekeyProgress>);
+        let progress = match saved {
+            None => self.fresh.clone(),
+            Some(Ok(saved)) if saved.prefix != self.prefix => return Err(KeyError::Busy),
+            Some(Ok(saved)) if saved.epoch != self.fresh.epoch => self.fresh.clone(),
+            Some(Ok(saved)) => saved,
+            Some(Err(_)) => return Err(AbeError::Context.into()),
         };
-        let after = (!progress.cursor.is_empty()).then(|| progress.cursor.clone().into());
-        self.step = Step::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(versions.into()),
-            start: after.map(IterStart::After),
+        let row: Value = postcard::to_allocvec(&progress)
+            .map_err(|_| KeyError::Storage)?
+            .into();
+        self.claimed = Some((progress, row.clone()));
+        let write = (ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row);
+        Ok(Next::Call(IoCall::Write(vec![write])))
+    }
+}
+
+impl Operation for ClaimRekey {
+    type Output = (RekeyProgress, Value);
+    type Error = KeyError;
+
+    fn first(&mut self) -> ClaimTurn {
+        let read = read_row(ABE_REKEY_KEYSPACE, self.id.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> ClaimTurn {
+        match self.claimed.take() {
+            Some(claimed) => {
+                result.done()?;
+                Ok(Next::Done(claimed))
+            }
+            None => self.claim(result.value()?),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// One scan of the bucket's version rows. It stays outside the page's transaction, whose
+/// conflicts must come only from the pass rows it read.
+#[derive(Debug, PartialEq)]
+struct VersionScan {
+    prefix: Key,
+    after: Option<Key>,
+}
+
+impl Operation for VersionScan {
+    type Output = (Vec<Key>, bool);
+    type Error = KeyError;
+
+    fn first(&mut self) -> Result<Next<(Vec<Key>, bool)>, KeyError> {
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: self.prefix.clone(),
+            after: self.after.clone(),
             limit: SCAN,
             txn_id: None,
         })]

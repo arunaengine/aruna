@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::abe::KeyError;
 use crate::abe::envelope::EnvelopeOperation;
+use crate::driver::drive;
 use crate::s3::abe_copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
-use crate::s3::abe_rekey::RekeyOperation;
+use crate::s3::abe_rekey::{PageEnd, PageScope, RekeyPage};
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
@@ -18,6 +20,10 @@ use aruna_core::structs::storage::abe::{
 };
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, EncryptionMode, public_key_of,
+};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::transition::{
+    EncryptionTransition, TransitionKind, TransitionTarget,
 };
 
 struct Sealed {
@@ -351,42 +357,106 @@ async fn copy_restarts_rekey() {
     assert_eq!(kept, source);
 }
 
+/// Writes one row in its own transaction, as a concurrent copy does.
+#[derive(Debug, PartialEq)]
+struct RaceWrite(Vec<(String, Key, Value)>);
+
+impl Operation for RaceWrite {
+    type Output = ();
+    type Error = KeyError;
+
+    fn first(&mut self) -> Result<Next<()>, KeyError> {
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.0))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, KeyError> {
+        result.done()?;
+        Ok(Next::Done(()))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// A re-key page whose progress row changes right after the page read it.
+#[derive(Debug, PartialEq)]
+struct RacedPage {
+    page: RekeyPage,
+    race: Option<RaceWrite>,
+    held: Option<IoCall>,
+}
+
+impl Operation for RacedPage {
+    type Output = PageEnd;
+    type Error = KeyError;
+
+    fn first(&mut self) -> Result<Next<PageEnd>, KeyError> {
+        self.page.first()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PageEnd>, KeyError> {
+        if let Some(call) = self.held.take() {
+            result.child::<(), KeyError>()??;
+            return Ok(Next::Call(call));
+        }
+        match (self.page.next(result)?, self.race.take()) {
+            (Next::Call(call), Some(race)) => {
+                self.held = Some(call);
+                Ok(Next::Call(IoCall::child(race)))
+            }
+            (turn, _) => Ok(turn),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 #[tokio::test]
 async fn copy_resets_page() {
-    // A copy into foo/ after the first page scanned stops that page from finishing the pass.
+    // A copy into foo/ resets the progress row, so the page that read it cannot finish the pass.
     let (_temp, context) = context();
     let storage = &context.storage_handle;
-    let (sealed, source_id, _) = sealed(storage).await;
+    let (sealed, _, _) = sealed(storage).await;
     let key = sealed.location.format.bucket_key().unwrap();
-    let record = BucketKeyRecord::new(key, Ulid::generate(), sealed.public, 0);
-    put(
-        storage,
-        BUCKET_KEY_KEYSPACE,
-        key.key(),
-        record.to_bytes().unwrap(),
-    )
-    .await;
-    let mut operation = RekeyOperation::new("bucket", "foo/", 4, None, SystemTime::UNIX_EPOCH);
-    let mut effects: Vec<Effect> = operation.start().into_iter().collect();
-    while !operation.is_complete() {
-        let Effect::Storage(effect) = effects.remove(0) else {
-            panic!("unexpected effect");
-        };
-        let scan = matches!(effect, StorageEffect::Iter { .. });
-        let event = storage.send_storage_effect(effect).await;
-        if scan {
-            let copy = copy_input(&sealed, (SOURCE, source_id), "foo/a");
-            let operation = SealedCopyOperation::new(copy);
-            run(operation, storage, Some(&sealed), Race::Off)
-                .await
-                .unwrap();
-        }
-        effects.extend(operation.step(event));
-    }
-    let (_, done) = operation.finalize().unwrap();
-    assert!(!done);
     let id = key.bucket_id.to_bytes().to_vec();
-    assert!(get(storage, ABE_REKEY_KEYSPACE, id).await.is_some());
+    let progress = RekeyProgress {
+        prefix: "foo/".into(),
+        epoch: 1,
+        cursor: Vec::new(),
+        rekeyed: 0,
+    };
+    let row = postcard::to_allocvec(&progress).unwrap();
+    put(storage, ABE_REKEY_KEYSPACE, id.clone(), row.clone()).await;
+    let target = TransitionTarget {
+        compression: Compression::Off,
+        plan: None,
+    };
+    let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 0, 0);
+    let scope = PageScope::new("bucket", "foo/", 4, None, SystemTime::UNIX_EPOCH);
+    let page = RekeyPage::new(scope, unit, id.clone().into(), progress, row.into());
+    let reset = RekeyProgress {
+        prefix: "foo/".into(),
+        epoch: 1,
+        cursor: Vec::new(),
+        rekeyed: 7,
+    };
+    let reset = postcard::to_allocvec(&reset).unwrap();
+    let written = (
+        ABE_REKEY_KEYSPACE.to_string(),
+        Key::from(id.clone()),
+        Value::from(reset.clone()),
+    );
+    let raced = RacedPage {
+        page,
+        race: Some(RaceWrite(vec![written])),
+        held: None,
+    };
+    assert_eq!(drive(raced, &context).await, Err(KeyError::Conflict));
+    let kept = get(storage, ABE_REKEY_KEYSPACE, id).await.unwrap();
+    assert_eq!(kept.as_ref(), &reset[..]);
 }
 
 #[tokio::test]

@@ -153,10 +153,6 @@ pub enum SubOperationEvent {
     },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
-    /// One version of a re-key page ended.
-    VersionRekeyed {
-        outcome: RekeyOutcome,
-    },
     /// A kept bucket key audit record was stored and its retry timer row removed.
     AuditStored {
         result: Result<(), String>,
@@ -177,18 +173,6 @@ pub enum SubOperationEvent {
     NotificationsFailed {
         reason: String,
     },
-}
-
-/// How the re-key of one version ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RekeyOutcome {
-    Moved,
-    Skipped,
-    /// The bucket key is locked on this node.
-    Locked,
-    Failed,
-    /// The version needs a later page; this page stops before it.
-    Unfinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -976,7 +960,6 @@ impl Event {
                     VaultHeld,
                     KeyRequestsOpened,
                     KeyRequestsFailed,
-                    VersionRekeyed,
                     AuditStored,
                     KeysLooked,
                     CopySealed,

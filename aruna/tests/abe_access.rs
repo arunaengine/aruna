@@ -23,9 +23,9 @@ use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abe_copies::complete_copies;
-use aruna_operations::s3::abe_rekey::rekey_page;
+use aruna_operations::s3::abe_rekey::{RekeyOperation, RekeyProgress};
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -57,6 +57,22 @@ fn query_url(route: &str, query: &[(&str, &str)]) -> TestResult<reqwest::Url> {
     let mut url = reqwest::Url::parse(route)?;
     url.query_pairs_mut().extend_pairs(query.iter().copied());
     Ok(url)
+}
+
+/// Re-keys one page as the route does.
+async fn rekey_page(
+    context: &DriverContext,
+    bucket: &str,
+    prefix: &str,
+    page: usize,
+) -> Result<(RekeyProgress, bool), KeyError> {
+    let origin = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let now = std::time::SystemTime::now();
+    drive(
+        RekeyOperation::new(bucket, prefix, page, origin, now),
+        context,
+    )
+    .await
 }
 
 #[test]
