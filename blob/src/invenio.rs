@@ -2,59 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use aruna_core::errors::StagingSourceError;
 use aruna_core::repository::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
+use aruna_core::repository::remote::{InvenioAccess, InvenioError};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use bytes::Bytes;
 use reqwest::{Method, Response, Url};
 use serde_json::Value;
-use thiserror::Error;
 
-use crate::blob::BlobHandle;
 use crate::egress::EgressGuard;
 
 const REDIRECT_HOPS: usize = 5;
 const JSON_ACCEPT: &str = "application/vnd.inveniordm.v1+json, application/json;q=0.9";
 
-#[derive(Debug, Error)]
-pub enum InvenioError {
-    #[error("invalid repository URL or cross-origin link")]
-    InvalidUrl,
-    #[error("repository request refused by egress policy")]
-    Egress,
-    #[error("repository transport failed")]
-    Transport,
-    #[error("repository returned HTTP {0}")]
-    Status(u16),
-    #[error("repository response exceeds the metadata limit")]
-    Limit,
-    #[error("repository returned invalid JSON")]
-    Json,
-    #[error("repository redirected too often")]
-    Redirects,
-    #[error("repository tokens require HTTPS outside loopback")]
-    InsecureToken,
-}
-
 pub struct InvenioClient<'a> {
     egress: &'a EgressGuard,
-    endpoint: Url,
-    token: Option<String>,
-    metadata_limit: u64,
+    access: InvenioAccess,
 }
 
 impl<'a> InvenioClient<'a> {
-    pub fn new(
-        blob: &'a BlobHandle,
-        endpoint: &str,
-        token: Option<String>,
-        metadata_limit: u64,
-    ) -> Result<Self, InvenioError> {
-        Self::with_guard(blob.egress(), endpoint, token, metadata_limit)
+    pub(crate) fn new(egress: &'a EgressGuard, access: InvenioAccess) -> Self {
+        Self { egress, access }
     }
 
     pub(crate) fn with_guard(
@@ -63,56 +34,16 @@ impl<'a> InvenioClient<'a> {
         token: Option<String>,
         metadata_limit: u64,
     ) -> Result<Self, InvenioError> {
-        let mut endpoint = Url::parse(endpoint).map_err(|_| InvenioError::InvalidUrl)?;
-        if !matches!(endpoint.scheme(), "https" | "http")
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(InvenioError::InvalidUrl);
-        }
-        if token.is_some() && !secure_transport(&endpoint) {
-            return Err(InvenioError::InsecureToken);
-        }
-        let path = format!("{}/", endpoint.path().trim_end_matches('/'));
-        endpoint.set_path(&path);
-        Ok(Self {
-            egress,
-            endpoint,
-            token,
-            metadata_limit,
-        })
-    }
-
-    pub fn endpoint(&self) -> &str {
-        self.endpoint.as_str()
+        let access = InvenioAccess::new(endpoint, token, metadata_limit)?;
+        Ok(Self::new(egress, access))
     }
 
     pub fn url(&self, segments: &[&str]) -> Result<Url, InvenioError> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| InvenioError::InvalidUrl)?
-            .pop_if_empty()
-            .extend(segments);
-        Ok(url)
+        self.access.url(segments)
     }
 
     pub fn link(&self, link: &str) -> Result<Url, InvenioError> {
-        let url = self
-            .endpoint
-            .join(link)
-            .map_err(|_| InvenioError::InvalidUrl)?;
-        if url.origin() != self.endpoint.origin()
-            || !url.path().starts_with(self.endpoint.path())
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(InvenioError::InvalidUrl);
-        }
-        Ok(url)
+        self.access.link(link)
     }
 
     // File bodies rely on the egress idle timeout; only metadata calls set a total deadline.
@@ -122,7 +53,7 @@ impl<'a> InvenioClient<'a> {
             .egress
             .repository_request(method, url)
             .map_err(|_| InvenioError::Egress)?;
-        if let Some(token) = &self.token {
+        if let Some(token) = self.access.token() {
             request = request.bearer_auth(token);
         }
         Ok(request)
@@ -171,7 +102,7 @@ impl<'a> InvenioClient<'a> {
         check_status(&response)?;
         if response
             .content_length()
-            .is_some_and(|size| size > self.metadata_limit)
+            .is_some_and(|size| size > self.access.metadata_limit())
         {
             return Err(InvenioError::Limit);
         }
@@ -181,7 +112,8 @@ impl<'a> InvenioClient<'a> {
             .await
             .map_err(|_| InvenioError::Transport)?
         {
-            if chunk.len() as u64 > self.metadata_limit.saturating_sub(body.len() as u64) {
+            let left = self.access.metadata_limit().saturating_sub(body.len() as u64);
+            if chunk.len() as u64 > left {
                 return Err(InvenioError::Limit);
             }
             body.extend_from_slice(&chunk);
@@ -238,7 +170,7 @@ impl<'a> InvenioClient<'a> {
         let mut url = self.link(url.as_str())?;
         let mut authorized = true;
         for _ in 0..=REDIRECT_HOPS {
-            authorized &= url.origin() == self.endpoint.origin();
+            authorized &= url.origin() == self.access.endpoint_url().origin();
             let mut request = self
                 .egress
                 .repository_request(method.clone(), url.clone())
@@ -251,7 +183,7 @@ impl<'a> InvenioClient<'a> {
                 let last = range.end.saturating_sub(1);
                 request = request.header("Range", format!("bytes={}-{last}", range.start));
             }
-            if let Some(token) = self.token.as_ref().filter(|_| authorized) {
+            if let Some(token) = self.access.token().filter(|_| authorized) {
                 request = request.bearer_auth(token);
             }
             let response = request.send().await.map_err(|_| InvenioError::Transport)?;
@@ -413,17 +345,6 @@ fn reference_error(error: InvenioError) -> StagingSourceError {
         InvenioError::Status(401 | 403) => StagingSourceError::AccessDenied,
         error => StagingSourceError::ReadError(error.to_string()),
     }
-}
-
-fn secure_transport(url: &Url) -> bool {
-    let host = url.host_str().unwrap_or_default();
-    url.scheme() == "https"
-        || host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 fn is_redirect(response: &Response) -> bool {

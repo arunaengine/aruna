@@ -22,7 +22,7 @@ fn refuses_plain_token() {
         ("http://localhost.example.org/api/", false),
     ] {
         assert_eq!(
-            secure_transport(&Url::parse(endpoint).unwrap()),
+            InvenioAccess::new(endpoint, Some("token".into()), 16).is_ok(),
             secure,
             "{endpoint}"
         );
