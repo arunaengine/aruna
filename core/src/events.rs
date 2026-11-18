@@ -504,6 +504,10 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// The version a granted read reached, or why it did not.
+    GrantedRead(
+        Result<Box<crate::native_reference::GrantedBody>, crate::errors::StagingSourceError>,
+    ),
     /// The signed read grant, or `None` when this node cannot sign it.
     GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
@@ -942,6 +946,7 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    GrantedRead,
                     DatasetSummary,
                     WritePeerAuth,
                     GrantSign,

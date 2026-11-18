@@ -15,8 +15,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
 use aruna_core::structs::storage::read_grant::{
-    self, GrantScope, GrantedRequest, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION,
-    SignedGrant, SignedRequest,
+    self, GrantScope, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION, SignedRequest,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
@@ -52,68 +51,6 @@ struct PreparedReference {
     metadata: SourceMetadata,
     group_id: Option<aruna_core::types::GroupId>,
     body: Option<BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>>,
-}
-
-/// Seconds a granted request this node signs stays valid.
-const GRANTED_SECS: u64 = 15;
-
-/// One exact version read from `holder` for the caller `grant` names. The holder checks the
-/// grant it issued, this node's signature and the caller's permissions, then serves the range.
-pub(crate) async fn granted_read(
-    context: &DriverContext,
-    holder: NodeId,
-    grant: &SignedGrant,
-    range: Option<std::ops::Range<u64>>,
-    head: bool,
-) -> Result<(SourceMetadata, BiStream), StagingSourceError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or(StagingSourceError::HandleMissing)?;
-    let GrantScope::Version(arn) = &grant.grant.scope else {
-        return Err(StagingSourceError::AccessDenied);
-    };
-    let range = NativeRange::checked(range)?;
-    let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
-    let scope = &grant.grant.scope;
-    let digest = read_grant::request_digest(
-        operation,
-        scope,
-        range.map(|range| (range.start, range.end)),
-    )
-    .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    let request = GrantedRequest {
-        realm_id: *net.realm_id(),
-        issuer: net.node_id(),
-        target: holder,
-        operation: operation.to_string(),
-        request_digest: digest,
-        nonce: rand::random(),
-        issued_at: aruna_core::time::unix_timestamp_millis() / 1000,
-        valid_secs: GRANTED_SECS,
-        grant: grant.clone(),
-    };
-    let bytes = request
-        .signing_bytes()
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    let signed = SignedRequest {
-        signature: net.sign(&bytes),
-        request,
-    };
-    let request = NativeReferenceRequest {
-        authority: NativeAuthority::Granted(Box::new(signed)),
-        bucket: arn.bucket.clone(),
-        key: arn.key.clone(),
-        version_id: arn.version,
-        head,
-        range,
-    };
-    let (response, stream) = send_request(net, holder, request).await?;
-    match response {
-        NativeReferenceResponse::Content(metadata)
-        | NativeReferenceResponse::Described { metadata, .. } => Ok((metadata, stream)),
-        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
-    }
 }
 
 /// One exact version read from `holder` for a caller this node verified itself, bound by a
