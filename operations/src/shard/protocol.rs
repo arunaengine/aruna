@@ -8,10 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_net::streams::BiStream;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::shard::manifest::manifest_entry_digest;
 
@@ -169,12 +166,12 @@ pub(crate) fn plan_manifest_pages(
     })
 }
 
-pub(crate) async fn write_manifest_pages(
-    stream: &mut BiStream,
-    manifest: &ShardManifest,
-    plan: &ManifestPagePlan,
-) -> Result<(), String> {
-    for (index, range) in plan.ranges.iter().enumerate() {
+/// The encoded response frames of a planned manifest, one page each.
+pub(crate) fn page_frames<'a>(
+    manifest: &'a ShardManifest,
+    plan: &'a ManifestPagePlan,
+) -> impl Iterator<Item = Result<Vec<u8>, String>> + 'a {
+    plan.ranges.iter().enumerate().map(|(index, range)| {
         let page_index = u32::try_from(index)
             .map_err(|_| "shard manifest requires too many pages".to_string())?;
         let response = borrowed_page_response(
@@ -185,9 +182,17 @@ pub(crate) async fn write_manifest_pages(
             index + 1 == plan.ranges.len(),
             &manifest.entries[range.clone()],
         );
-        write_frame(stream, &response, MAX_RESPONSE_SIZE).await?;
+        encode_frame(&response, MAX_RESPONSE_SIZE)
+    })
+}
+
+/// Encodes one frame body, refusing one above `max_size`.
+pub(crate) fn encode_frame<T: Serialize>(message: &T, max_size: usize) -> Result<Vec<u8>, String> {
+    let bytes = postcard::to_allocvec(message).map_err(|error| error.to_string())?;
+    if bytes.len() > max_size {
+        return Err("shard message exceeds maximum size".to_string());
     }
-    Ok(())
+    Ok(bytes)
 }
 
 fn borrowed_page_response<'a>(
@@ -380,74 +385,6 @@ impl ManifestAssembler {
             updated_at_ms: metadata.updated_at_ms,
         }))
     }
-}
-
-pub async fn write_shard_request(
-    stream: &mut BiStream,
-    message: &ShardTransportMessage,
-) -> Result<(), String> {
-    write_frame(stream, message, MAX_REQUEST_SIZE).await
-}
-
-pub async fn read_shard_request(stream: &mut BiStream) -> Result<ShardTransportMessage, String> {
-    read_frame(stream, MAX_REQUEST_SIZE).await
-}
-
-pub async fn write_shard_response(
-    stream: &mut BiStream,
-    message: &ShardTransportResponse,
-) -> Result<(), String> {
-    write_frame(stream, message, MAX_RESPONSE_SIZE).await
-}
-
-pub async fn read_shard_response(stream: &mut BiStream) -> Result<ShardTransportResponse, String> {
-    read_frame(stream, MAX_RESPONSE_SIZE).await
-}
-
-async fn write_frame<T: Serialize>(
-    stream: &mut BiStream,
-    message: &T,
-    max_size: usize,
-) -> Result<(), String> {
-    let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
-    if bytes.len() > max_size {
-        return Err("shard message exceeds maximum size".to_string());
-    }
-    stream
-        .0
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|err| err.to_string())?;
-    stream
-        .0
-        .write_all(&bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-    stream.0.flush().await.map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-async fn read_frame<T: DeserializeOwned>(
-    stream: &mut BiStream,
-    max_size: usize,
-) -> Result<T, String> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .1
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|err| err.to_string())?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_size {
-        return Err("shard frame exceeds maximum size".to_string());
-    }
-    let mut bytes = vec![0u8; len];
-    stream
-        .1
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -732,7 +669,7 @@ mod tests {
             .expect("capture remains open");
 
         let error =
-            tokio::time::timeout(Duration::from_millis(250), read_shard_request(&mut inbound))
+            tokio::time::timeout(Duration::from_millis(250), crate::effect_adapters::shard::read_request(&mut inbound))
                 .await
                 .expect("oversized header must be rejected without reading its body")
                 .expect_err("oversized request must be rejected");
