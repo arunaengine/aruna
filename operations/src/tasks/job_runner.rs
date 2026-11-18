@@ -533,6 +533,11 @@ impl JobHost for ExecutionHost {
     }
 }
 
+/// The host of an execution run with this cancel signal.
+pub(crate) fn execution_host(cancel: CancellationToken) -> Arc<dyn JobHost> {
+    Arc::new(ExecutionHost { cancel })
+}
+
 /// What this node gives every execution run.
 pub fn run_wiring(context: &DriverContext) -> RunWiring {
     RunWiring {
@@ -561,8 +566,7 @@ where
         stop.clone(),
     ));
     tokio::pin!(heartbeat);
-    let host = Arc::new(ExecutionHost { cancel });
-    let work = with_job_host(host, drive(operation, context));
+    let work = with_job_host(execution_host(cancel), drive(operation, context));
     let work = Box::pin(work);
     tokio::select! {
         result = work => {
@@ -638,7 +642,7 @@ pub async fn run_execution_job(
 }
 
 /// Supervises an adopted attempt.
-async fn resume_attempt(
+pub(crate) async fn resume_attempt(
     context: Arc<DriverContext>,
     scope: Arc<AttemptScope>,
     record: Arc<JobRecord>,

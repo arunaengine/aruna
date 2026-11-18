@@ -70,13 +70,139 @@ use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
 /// validation, and credential expiry must all agree on this value.
 pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The backend a run was placed on and the execution its receipt names.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedBackend {
+    pub facts: BackendFacts,
+    pub receipted: Option<Ulid>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ResolveStep {
+    Select,
+    Held(Box<BackendFacts>),
+    Subject(Box<BackendFacts>),
+    Fenced,
+}
+
+type ResolveNext = Result<Next<ResolvedBackend>, JobError>;
+
+/// Resolves the backend for a run, or an error when none is eligible. A receipted execution is
+/// fenced to the receipt's execution site, so subject drift refuses the start; a local job
+/// without a receipt keeps the unfenced selection.
+#[derive(Debug, PartialEq)]
+pub struct ResolveBackendOperation {
+    constraint: Option<ExecutorKind>,
+    job_id: JobId,
+    receipted: Option<Ulid>,
+    stored: (u64, [u8; 32]),
+    current_generation: u64,
+    step: ResolveStep,
+}
+
+impl ResolveBackendOperation {
+    pub fn new(spec: &ExecutionSpec, job_id: JobId) -> Self {
+        Self {
+            constraint: (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire),
+            job_id,
+            receipted: None,
+            stored: (0, [0; 32]),
+            current_generation: 0,
+            step: ResolveStep::Select,
+        }
+    }
+
+    fn resolved(&self, facts: BackendFacts) -> ResolveNext {
+        Ok(Next::Done(ResolvedBackend {
+            facts,
+            receipted: self.receipted,
+        }))
+    }
+}
+
+impl Operation for ResolveBackendOperation {
+    type Output = ResolvedBackend;
+    type Error = JobError;
+
+    fn first(&mut self) -> ResolveNext {
+        let constraint = self.constraint.clone();
+        Ok(Next::Call(compute_call(ComputeEffect::Select {
+            constraint,
+        })))
+    }
+
+    fn next(&mut self, result: IoResult) -> ResolveNext {
+        match std::mem::replace(&mut self.step, ResolveStep::Fenced) {
+            // A node without compute is a local gap, never a verdict on the job.
+            ResolveStep::Select => match compute_answer(result)? {
+                ComputeAnswer::Selected(Some(facts)) => {
+                    self.step = ResolveStep::Held(Box::new(facts));
+                    let held = HeldReservations::of_job(self.job_id);
+                    Ok(Next::Call(IoCall::child(held)))
+                }
+                ComputeAnswer::Selected(None) => {
+                    Err(JobError::permanent("no eligible executor for job"))
+                }
+                _ => Err(JobError::retryable("no compute backend configured")),
+            },
+            ResolveStep::Held(facts) => {
+                let held = result
+                    .child::<Vec<JobReservationRecord>, LifecycleError>()?
+                    .map_err(|error| JobError::retryable(error.to_string()))?;
+                let Some(reservation) = held.into_iter().next() else {
+                    return self.resolved(*facts);
+                };
+                self.receipted = Some(reservation.execution_id);
+                if reservation.subject_generation == 0 {
+                    return self.resolved(*facts);
+                }
+                self.stored = (reservation.subject_generation, reservation.subject_digest);
+                self.step = ResolveStep::Subject(facts);
+                Ok(Next::Call(IoCall::child(LocalSubjectOperation::new())))
+            }
+            ResolveStep::Subject(facts) => {
+                let subject = result.child::<Option<NodeSubjectRecord>, SubjectScanError>()?;
+                let Some(subject) = subject.ok().flatten().map(|record| record.subject) else {
+                    return Err(JobError::retryable(
+                        "receipted execution cannot start without a local placement subject",
+                    ));
+                };
+                self.current_generation = subject.generation;
+                let (generation, digest) = self.stored;
+                Ok(Next::Call(compute_call(ComputeEffect::Fenced {
+                    kind: facts.kind,
+                    subject: Box::new(subject),
+                    generation,
+                    digest,
+                })))
+            }
+            ResolveStep::Fenced => match compute_answer(result)? {
+                ComputeAnswer::Fenced(Ok(facts)) => self.resolved(facts),
+                ComputeAnswer::Fenced(Err(BackendError::Fenced)) => {
+                    let (stored, current) = (self.stored.0, self.current_generation);
+                    warn!(
+                        job_id = %self.job_id,
+                        stored_generation = stored,
+                        current_generation = current,
+                        "Receipted execution refused: the execution site drifted from its receipt"
+                    );
+                    Err(JobError::retryable(format!(
+                        "execution site drifted from its receipt: stored subject generation {stored}, current {current}"
+                    )))
+                }
+                ComputeAnswer::Fenced(Err(error)) => Err(JobError::permanent(format!(
+                    "no eligible executor for job: {error}"
+                ))),
+                _ => Err(JobError::retryable("no compute backend configured")),
+            },
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum RunStep {
     FreshCancel,
-    Select,
-    Held(Box<BackendFacts>),
-    Subject(Box<(BackendFacts, u64, [u8; 32])>),
-    Fenced,
+    Resolve,
     Preparing,
     Published,
     Parked,
@@ -113,8 +239,6 @@ pub struct ExecutionRunOperation {
     facts: Option<BackendFacts>,
     receipted: Option<Ulid>,
     scope: Option<Arc<AttemptScope>>,
-    /// The stored and current subject generations of a site check.
-    drifted_from: Option<(u64, u64)>,
     now_ms: u64,
     step: RunStep,
 }
@@ -140,7 +264,6 @@ impl ExecutionRunOperation {
             facts: None,
             receipted: None,
             scope: None,
-            drifted_from: None,
             now_ms: 0,
             step: RunStep::Last,
         }
@@ -217,30 +340,6 @@ impl ExecutionRunOperation {
     fn supervise(&mut self) -> RunNext {
         let supervise = SuperviseOperation::new(self.scope()?);
         self.call(RunStep::Last, IoCall::child(supervise))
-    }
-
-    /// Reads the receipt of this job: a receipted execution is fenced to its execution site,
-    /// and subject drift refuses the start. A local job keeps the unfenced selection.
-    fn selected_backend(&mut self, facts: BackendFacts) -> RunNext {
-        let held = HeldReservations::of_job(self.job_id());
-        self.call(RunStep::Held(Box::new(facts)), IoCall::child(held))
-    }
-
-    fn receipt_read(&mut self, facts: BackendFacts, held: Vec<JobReservationRecord>) -> RunNext {
-        let Some(reservation) = held.into_iter().next() else {
-            return self.backend_ready(facts);
-        };
-        self.receipted = Some(reservation.execution_id);
-        if reservation.subject_generation == 0 {
-            return self.backend_ready(facts);
-        }
-        let site = (
-            facts,
-            reservation.subject_generation,
-            reservation.subject_digest,
-        );
-        let read = LocalSubjectOperation::new();
-        self.call(RunStep::Subject(Box::new(site)), IoCall::child(read))
     }
 
     fn backend_ready(&mut self, facts: BackendFacts) -> RunNext {
@@ -429,74 +528,22 @@ impl Operation for ExecutionRunOperation {
             let end = EndRunOperation::new(self.job_id(), self.claim()?, ending, settle);
             return self.call(RunStep::Last, IoCall::child(end));
         }
-        let constraint = (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire);
-        let call = compute_call(ComputeEffect::Select { constraint });
-        self.call(RunStep::Select, call)
+        let resolve = ResolveBackendOperation::new(&spec, self.job_id());
+        self.call(RunStep::Resolve, IoCall::child(resolve))
     }
 
     fn next(&mut self, result: IoResult) -> RunNext {
         let job_id = self.job_id();
         match std::mem::replace(&mut self.step, RunStep::Last) {
             RunStep::FreshCancel => self.cancelled(result, "Fresh cancellation write failed"),
-            // A node without compute is a local gap, never a verdict on the job.
-            RunStep::Select => match compute_answer(result)? {
-                ComputeAnswer::Selected(Some(facts)) => self.selected_backend(facts),
-                ComputeAnswer::Selected(None) => {
-                    let error = JobError::permanent("no eligible executor for job");
-                    self.pre_submit(error, false)
+            // A fenced refusal is retryable: the site may come back or another target may
+            // take the job.
+            RunStep::Resolve => match result.child::<ResolvedBackend, JobError>()? {
+                Ok(resolved) => {
+                    self.receipted = resolved.receipted;
+                    self.backend_ready(resolved.facts)
                 }
-                _ => {
-                    let error = JobError::retryable("no compute backend configured");
-                    self.pre_submit(error, false)
-                }
-            },
-            RunStep::Held(facts) => {
-                match result.child::<Vec<JobReservationRecord>, LifecycleError>()? {
-                    Ok(held) => self.receipt_read(*facts, held),
-                    Err(error) => self.pre_submit(JobError::retryable(error.to_string()), false),
-                }
-            }
-            RunStep::Subject(site) => {
-                let (facts, generation, digest) = *site;
-                let subject = result.child::<Option<NodeSubjectRecord>, SubjectScanError>()?;
-                let Some(subject) = subject.ok().flatten().map(|record| record.subject) else {
-                    let error =
-                        "receipted execution cannot start without a local placement subject";
-                    return self.pre_submit(JobError::retryable(error), false);
-                };
-                let current = subject.generation;
-                self.drifted_from = Some((generation, current));
-                let call = compute_call(ComputeEffect::Fenced {
-                    kind: facts.kind,
-                    subject: Box::new(subject),
-                    generation,
-                    digest,
-                });
-                self.call(RunStep::Fenced, call)
-            }
-            RunStep::Fenced => match compute_answer(result)? {
-                ComputeAnswer::Fenced(Ok(facts)) => self.backend_ready(facts),
-                ComputeAnswer::Fenced(Err(BackendError::Fenced)) => {
-                    let (stored, current) = self.drifted_from.unwrap_or_default();
-                    warn!(
-                        job_id = %job_id,
-                        stored_generation = stored,
-                        current_generation = current,
-                        "Receipted execution refused: the execution site drifted from its receipt"
-                    );
-                    let message = format!(
-                        "execution site drifted from its receipt: stored subject generation {stored}, current {current}"
-                    );
-                    self.pre_submit(JobError::retryable(message), false)
-                }
-                ComputeAnswer::Fenced(Err(error)) => {
-                    let message = format!("no eligible executor for job: {error}");
-                    self.pre_submit(JobError::permanent(message), false)
-                }
-                _ => {
-                    let error = JobError::retryable("no compute backend configured");
-                    self.pre_submit(error, false)
-                }
+                Err(error) => self.pre_submit(error, false),
             },
             RunStep::Preparing => {
                 if result.child::<JobRecord, JobMutationError>()?.is_err() {

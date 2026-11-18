@@ -13,7 +13,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
+    CapturedInput, ExecutionSpec, InputSelection, InputSource, JobError, JobId, JobRecord,
 };
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -36,6 +36,7 @@ use crate::connectors::root_record::{parse_root, read_root};
 use crate::jobs::lifecycle::stage::{StageError, StageInputOperation, StagedInput};
 use crate::jobs::read_access::{SourceReadError, SourceReadOperation};
 use crate::jobs::store::job_calls::change_job;
+use crate::jobs::store::store_call::StoreCall;
 use crate::jobs::store::{JobMutation, JobMutationError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
@@ -411,6 +412,29 @@ pub(super) fn serving_pin(source: &VersionSourceBinding, root: Option<&SourceRoo
     SourcePin::served(&full.as_ref().unwrap_or(source).descriptor)
 }
 
+/// Stores which source served each input of the claim's preparation.
+pub(super) fn keep_served(
+    job_id: JobId,
+    token: Ulid,
+    served: BTreeMap<String, SourcePin>,
+) -> StoreCall<JobRecord> {
+    change_job(job_id, move |record| {
+        if record.claim.as_ref().map(|claim| claim.claim_token) != Some(token) {
+            return Err(JobMutationError::TokenMismatch);
+        }
+        let mut changed = false;
+        for input in &mut record.captured_inputs {
+            let pin = served.get(&input.destination_key).cloned();
+            changed |= input.served_by != pin;
+            input.served_by = pin;
+        }
+        Ok(match changed {
+            true => JobMutation::Persist,
+            false => JobMutation::Skip,
+        })
+    })
+}
+
 #[derive(Debug, PartialEq)]
 enum LoadStep {
     Source(SourceObject, String),
@@ -562,21 +586,7 @@ impl LoadInputsOperation {
             return Ok(Next::Done(std::mem::take(&mut self.files)));
         };
         let served = std::mem::take(&mut self.served);
-        let keep = change_job(self.record.job_id, move |record| {
-            if record.claim.as_ref().map(|claim| claim.claim_token) != Some(token) {
-                return Err(JobMutationError::TokenMismatch);
-            }
-            let mut changed = false;
-            for input in &mut record.captured_inputs {
-                let pin = served.get(&input.destination_key).cloned();
-                changed |= input.served_by != pin;
-                input.served_by = pin;
-            }
-            Ok(match changed {
-                true => JobMutation::Persist,
-                false => JobMutation::Skip,
-            })
-        });
+        let keep = keep_served(self.record.job_id, token, served);
         self.step = LoadStep::Served;
         Ok(Next::Call(IoCall::child(keep)))
     }

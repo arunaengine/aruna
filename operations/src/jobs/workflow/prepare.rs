@@ -14,7 +14,6 @@ use aruna_core::compute::{
     StagingMode, TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
 };
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, WorkspaceMode};
 
@@ -25,7 +24,6 @@ use super::credential::{
 };
 use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, view_entries};
 use super::inputs::LoadInputsOperation;
-use crate::driver::DriverContext;
 use crate::jobs::lifecycle::ids::session_of;
 
 pub(super) const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -45,20 +43,6 @@ pub struct PreparedTask {
 /// The bucket a run works inside, empty when it owns none.
 pub(super) fn job_bucket(record: &JobRecord) -> String {
     record.workspace_bucket.clone().unwrap_or_default()
-}
-
-/// The operation that mints the run's credential for its workspace bucket.
-pub fn workspace_mint(
-    context: &DriverContext,
-    spec: &ExecutionSpec,
-    record: &JobRecord,
-    node_id: NodeId,
-    scope: (&str, Option<&str>),
-) -> MintCredentialOperation {
-    let realm_id = context.serving_realm(record.created_by.realm_id);
-    let run = RunIdentity::new(spec, record, realm_id, node_id);
-    let key = (context.net_handle.as_ref()).map(|net| net.credential_encryption_key());
-    MintCredentialOperation::workspace((spec, record), run, scope, (key, SystemTime::now()))
 }
 
 /// The names the mount driver reads the run credential under.
@@ -84,10 +68,9 @@ enum PrepareStep {
 
 type PrepareNext = Result<Next<PreparedTask>, JobError>;
 
-/// Builds the inputs and credentials of one attempt, for its first submit and for every
-/// recovery, so a resubmit carries the very credential the first submit minted. Mounted inputs
-/// are read through the run's input view at their exact versions; every other input is read
-/// straight from its source. Nothing is copied, so an adopted attempt restages the same way.
+/// Builds the inputs and credentials of one attempt, for its first submit and every recovery,
+/// so a resubmit carries the credential the first one minted. Mounted inputs are read through
+/// the run's input view; nothing is copied, so an adopted attempt restages the same way.
 #[derive(Debug, PartialEq)]
 pub struct PrepareAttemptOperation {
     run: RunIdentity,

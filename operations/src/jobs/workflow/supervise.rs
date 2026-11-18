@@ -16,6 +16,7 @@ use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use tracing::warn;
+use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use super::attempt::{AttemptScope, stops_call};
@@ -32,7 +33,6 @@ use crate::jobs::store::row_calls::read_job_record;
 #[derive(Debug, PartialEq)]
 enum SuperviseStep {
     Anchor,
-    AnchorWrite(u64),
     Facts(u64),
     Plan(u64),
     Open(u64),
@@ -192,37 +192,17 @@ impl Operation for SuperviseOperation {
     }
 
     fn first(&mut self) -> SuperviseNext {
-        let read = read_job_record(self.scope.job_id);
-        self.call(SuperviseStep::Anchor, IoCall::child(read))
+        let scope = &self.scope;
+        let anchor = WalltimeAnchorOperation::new(scope.job_id, scope.token);
+        self.call(SuperviseStep::Anchor, IoCall::child(anchor))
     }
 
     fn next(&mut self, result: IoResult) -> SuperviseNext {
         let scope = self.scope.clone();
         match std::mem::replace(&mut self.step, SuperviseStep::Close) {
             SuperviseStep::Anchor => {
-                let record = result.child::<Option<JobRecord>, JobMutationError>()?;
-                match record
-                    .ok()
-                    .flatten()
-                    .and_then(|record| record.started_at_ms)
-                {
-                    Some(started_at_ms) => self.anchored(started_at_ms),
-                    None => {
-                        let anchor = self.now_ms;
-                        let write = record_attempt_started(scope.job_id, scope.token, anchor);
-                        self.call(SuperviseStep::AnchorWrite(anchor), IoCall::child(write))
-                    }
-                }
-            }
-            SuperviseStep::AnchorWrite(anchor) => {
-                let started = match result.child::<JobRecord, JobMutationError>()? {
-                    Ok(record) => record.started_at_ms.unwrap_or(anchor),
-                    Err(error) => {
-                        warn!(job_id = %scope.job_id, error = %error, "Walltime anchor write failed");
-                        anchor
-                    }
-                };
-                self.anchored(started)
+                let anchored = result.child::<u64, IoError>()?;
+                self.anchored(anchored.unwrap_or(self.now_ms))
             }
             SuperviseStep::Facts(started_at_ms) => {
                 let mounts = match compute_answer(result)? {
@@ -289,6 +269,62 @@ impl Operation for SuperviseOperation {
                 Ok(Next::Done(()))
             }
         }
+    }
+}
+
+/// Finds when an attempt's walltime started. The cap needs an anchor even without backend start
+/// evidence, and the first pass persists the one it derives, so a restarted supervisor cannot
+/// hand the attempt a fresh window.
+#[derive(Debug, PartialEq)]
+pub struct WalltimeAnchorOperation {
+    job_id: JobId,
+    token: Ulid,
+    anchor: Option<u64>,
+    now_ms: u64,
+}
+
+impl WalltimeAnchorOperation {
+    pub fn new(job_id: JobId, token: Ulid) -> Self {
+        Self {
+            job_id,
+            token,
+            anchor: None,
+            now_ms: 0,
+        }
+    }
+}
+
+impl Operation for WalltimeAnchorOperation {
+    type Output = u64;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<u64>, IoError> {
+        Ok(Next::Call(IoCall::child(read_job_record(self.job_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, IoError> {
+        let Some(anchor) = self.anchor else {
+            let record = result.child::<Option<JobRecord>, JobMutationError>()?;
+            if let Some(started) = record.ok().flatten().and_then(|job| job.started_at_ms) {
+                return Ok(Next::Done(started));
+            }
+            self.anchor = Some(self.now_ms);
+            let write = record_attempt_started(self.job_id, self.token, self.now_ms);
+            return Ok(Next::Call(IoCall::child(write)));
+        };
+        Ok(Next::Done(
+            match result.child::<JobRecord, JobMutationError>()? {
+                Ok(record) => record.started_at_ms.unwrap_or(anchor),
+                Err(error) => {
+                    warn!(job_id = %self.job_id, error = %error, "Walltime anchor write failed");
+                    anchor
+                }
+            },
+        ))
     }
 }
 

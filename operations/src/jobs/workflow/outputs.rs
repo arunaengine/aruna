@@ -502,6 +502,32 @@ impl Operation for PutOutputOperation {
     }
 }
 
+/// The first input the job holds no captured form of.
+pub(super) fn uncaptured_input<'a>(spec: &'a ExecutionSpec, record: &JobRecord) -> Option<&'a str> {
+    (spec.inputs.iter())
+        .find(|input| {
+            !(record.captured_inputs.iter())
+                .any(|captured| captured.destination_key == input.dest_key)
+        })
+        .map(|input| input.dest_key.as_str())
+}
+
+/// Union of the refs the captured inputs carry, so an output is never less constrained than what
+/// produced it, also on a node that holds no copy of an input.
+pub(super) fn input_refs(
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+) -> Result<Vec<PlacementPolicyRef>, JobError> {
+    let refs: Vec<PlacementPolicyRef> = (record.captured_inputs.iter())
+        .filter(|captured| {
+            (spec.inputs.iter()).any(|input| input.dest_key == captured.destination_key)
+        })
+        .flat_map(|captured| captured.policies.iter().copied())
+        .collect();
+    PlacementPolicyRef::canonical_set(&refs)
+        .map_err(|error| JobError::permanent(format!("input policy refs invalid: {error}")))
+}
+
 #[derive(Debug, PartialEq)]
 enum CaptureStep {
     Resolve(OutputSelection),
@@ -622,16 +648,11 @@ impl CaptureOutputsOperation {
         self.policies()
     }
 
-    /// Union of the refs every input carries, so an output is never less constrained than what
-    /// produced it. A device captures no inputs and may never read governed content, so its
-    /// inputs carry none; a realm node must not guess them.
+    /// A device captures no inputs and may never read governed content, so its inputs carry no
+    /// refs; a realm node must not guess them.
     fn policies(&mut self) -> CaptureNext {
         let scope = self.scope.clone();
-        let missing = (scope.spec.inputs.iter()).find(|input| {
-            !(scope.record.captured_inputs.iter())
-                .any(|captured| captured.destination_key == input.dest_key)
-        });
-        if missing.is_some() {
+        if uncaptured_input(&scope.spec, &scope.record).is_some() {
             let role = LocalUserOperation::new(scope.run.realm_id);
             return self.call(CaptureStep::Role, IoCall::child(role));
         }
@@ -639,15 +660,7 @@ impl CaptureOutputsOperation {
     }
 
     fn inherit(&mut self) -> CaptureNext {
-        let refs: Vec<PlacementPolicyRef> = (self.scope.record.captured_inputs.iter())
-            .filter(|captured| {
-                (self.scope.spec.inputs.iter())
-                    .any(|input| input.dest_key == captured.destination_key)
-            })
-            .flat_map(|captured| captured.policies.iter().copied())
-            .collect();
-        self.inherited = PlacementPolicyRef::canonical_set(&refs)
-            .map_err(|error| JobError::permanent(format!("input policy refs invalid: {error}")))?;
+        self.inherited = input_refs(&self.scope.spec, &self.scope.record)?;
         self.next_output()
     }
 
@@ -736,12 +749,8 @@ impl Operation for CaptureOutputsOperation {
             }
             CaptureStep::Role => {
                 if !result.child::<bool, IoError>()?.unwrap_or(false) {
-                    let scope = &self.scope;
-                    let missing = (scope.spec.inputs.iter()).find(|input| {
-                        !(scope.record.captured_inputs.iter())
-                            .any(|captured| captured.destination_key == input.dest_key)
-                    });
-                    let key = missing.map_or("", |input| input.dest_key.as_str());
+                    let missing = uncaptured_input(&self.scope.spec, &self.scope.record);
+                    let key = missing.unwrap_or_default();
                     return Err(JobError::permanent(format!(
                         "input `{key}` has no captured inputs to inherit refs from"
                     )));
