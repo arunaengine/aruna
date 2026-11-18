@@ -932,8 +932,11 @@ impl OperationsTaskHandler {
                 let start = (self.wake_cursor.lock())
                     .expect("wake cursor mutex poisoned")
                     .clone();
-                let delivery =
-                    crate::jobs::remote_key::deliver_owed_wakes(&self.context, start).await;
+                let serving = self.context.node_and_realm();
+                let deliver = crate::jobs::remote_key::DeliverWakesOperation::new(start, serving);
+                let delivery = drive(deliver, self.context.as_ref())
+                    .await
+                    .unwrap_or_else(|_| crate::jobs::remote_key::Delivery::unread());
                 *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
                     delivery.next.clone();
                 if delivery.owed {
