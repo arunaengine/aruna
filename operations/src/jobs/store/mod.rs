@@ -78,8 +78,6 @@ pub mod row_calls;
 pub mod run_delete;
 pub mod store_call;
 
-use mutation::{MutateJobOperation, NoGuard};
-
 use mutation_error::JobMutationError;
 
 #[derive(Debug, Serialize, Deserialize)]
