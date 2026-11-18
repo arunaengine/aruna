@@ -631,21 +631,113 @@ mod tests {
         }
     }
 
-/// Whether `key` names the current version of its object.
-pub async fn is_current(context: &DriverContext, key: &VersionKey) -> Result<bool, String> {
-    let head = BlobHeadKey::new(key.bucket.clone(), key.key.clone());
-    let read = StorageEffect::Read {
-        key_space: BLOB_HEAD_KEYSPACE.to_string(),
-        key: head.to_bytes().map_err(|error| error.to_string())?.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-            Some(value) => CurrentVersionPointer::from_bytes(value.as_ref())
-                .map(|pointer| pointer.version_id == key.version_id)
-                .map_err(|error| error.to_string()),
-            None => Ok(false),
-        },
-        other => Err(format!("could not read a head: {}", other.label())),
+    fn cleaner(limit: usize, scan: usize) -> CleanBrokenOperation {
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let template = DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: String::new(),
+            version_id: None,
+            group_id: Ulid::from_bytes([5; 16]),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[6; 32]).public(),
+            deleted_by: user_id,
+        };
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        CleanBrokenOperation::new(&template, &auth, None, (limit, scan))
+    }
+
+    #[test]
+    fn empty_queue_ends() {
+        let mut checks = ProcessChecksOperation::new();
+        assert!(matches!(
+            checks.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        assert_eq!(checks.next(empty_page()), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn finished_check_skipped() {
+        let mut checks = ProcessChecksOperation::new();
+        checks.first().unwrap();
+        let row = (Key::from(b"bucket".to_vec()), Value::from(Vec::new()));
+        let page = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        assert!(matches!(checks.next(page), Ok(Next::Call(IoCall::Read(_)))));
+        let mut record = StorageCheck::new(1);
+        record.finished_at_ms = Some(2);
+        let value = Value::from(record.to_bytes().unwrap());
+        let answer = IoResult::Values(vec![Some(value)]);
+        assert_eq!(checks.next(answer), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn last_page_finishes() {
+        let mut page = CheckPageOperation::new("bucket".to_string(), StorageCheck::new(1));
+        page.stamp(9);
+        page.first().unwrap();
+        let turn = page.next(empty_page());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(page.record.finished_at_ms, Some(9));
+        let stored: Result<(), MigrationError> = Ok(());
+        let answer = IoResult::Child(ChildOutcome::new(stored));
+        assert_eq!(page.next(answer), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn replaced_check_kept() {
+        let mut store = StoreCheckOperation::new("bucket", StorageCheck::new(1));
+        store.first().unwrap();
+        let newer = Value::from(StorageCheck::new(2).to_bytes().unwrap());
+        let answer = IoResult::Values(vec![Some(newer)]);
+        assert_eq!(store.next(answer), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn finished_check_leaves() {
+        let mut record = StorageCheck::new(1);
+        record.finished_at_ms = Some(2);
+        let stored = Value::from(record.to_bytes().unwrap());
+        let mut store = StoreCheckOperation::new("bucket", record);
+        store.first().unwrap();
+        let turn = store.next(IoResult::Values(vec![Some(stored)]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let turn = store.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(store.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn spent_scan_exhausted() {
+        let done = cleaner(10, 0).first();
+        let expected = Cleaned {
+            exhausted: true,
+            ..Cleaned::default()
+        };
+        assert_eq!(done, Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn empty_page_cleans_nothing() {
+        let mut clean = cleaner(10, 5);
+        assert!(matches!(clean.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        assert_eq!(clean.next(empty_page()), Ok(Next::Done(Cleaned::default())));
+    }
+
+    #[test]
+    fn missing_head_not_current() {
+        let key = VersionKey::new("bucket", "key", Ulid::from_bytes([7; 16]));
+        let mut current = IsCurrentOperation::new(&key);
+        assert!(matches!(current.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = IoResult::Values(vec![None]);
+        assert_eq!(current.next(answer), Ok(Next::Done(false)));
     }
 }
