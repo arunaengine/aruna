@@ -970,6 +970,196 @@ pub(crate) mod test {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 
+    async fn copy_object(
+        context: &DriverContext,
+        input: CopyObjectInput,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        drive(
+            CopyObjectOperation::new(input, node_routing(context)),
+            context,
+        )
+        .await
+    }
+
+    async fn copy_object_at(
+        context: &DriverContext,
+        input: CopyObjectInput,
+        version_id: Ulid,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        let copy = CopyObjectOperation::new(input, node_routing(context)).at_version(version_id);
+        drive(copy, context).await
+    }
+
+    async fn copy_object_tracked(
+        context: &DriverContext,
+        input: CopyObjectInput,
+        pulled: Option<Arc<AtomicU64>>,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        let copy = CopyObjectOperation::new(input, node_routing(context));
+        match pulled {
+            Some(pulled) => drive(copy.with_progress(pulled), context).await,
+            None => drive(copy, context).await,
+        }
+    }
+
+    fn step_input(conditions: CopySourceConditions) -> CopyObjectInput {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        CopyObjectInput {
+            source_bucket: "source".to_string(),
+            source_key: "a".to_string(),
+            source_version_id: None,
+            source_group_id: Ulid::from_bytes([3; 16]),
+            source_auth_context: auth_context(user_id),
+            dest_bucket: "dest".to_string(),
+            dest_key: "b".to_string(),
+            user_id,
+            group_id: Ulid::from_bytes([3; 16]),
+            realm_id,
+            node_id: test_node_id(),
+            quota_ceiling: None,
+            conditions,
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Materialize,
+            job_id: None,
+        }
+    }
+
+    fn step_head() -> HeadObjectResult {
+        HeadObjectResult {
+            location: None,
+            metadata: HashMap::new(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type:
+                aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        }
+    }
+
+    fn step_copy(conditions: CopySourceConditions) -> CopyObjectOperation {
+        CopyObjectOperation::new(step_input(conditions), NodeRouting::default())
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: std::fmt::Debug + PartialEq + Send + 'static,
+        E: std::fmt::Debug + PartialEq + Send + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
+    }
+
+    #[test]
+    fn failed_condition_stops() {
+        let mut copy = step_copy(CopySourceConditions {
+            if_match: Some("other".to_string()),
+            ..Default::default()
+        });
+        assert!(matches!(copy.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let fenced = copy.next(child::<(), PurgeFenceError>(Ok(())));
+        assert!(matches!(fenced, Ok(Next::Call(IoCall::Child(_)))));
+        let answer = copy.next(child::<_, HeadObjectError>(Ok(step_head())));
+        assert_eq!(answer, Err(CopyObjectError::PreconditionFailed));
+    }
+
+    #[test]
+    fn missing_source_fails() {
+        let mut copy = step_copy(CopySourceConditions::default());
+        copy.first().unwrap();
+        copy.next(child::<(), PurgeFenceError>(Ok(()))).unwrap();
+        let missing = child::<HeadObjectResult, _>(Err(HeadObjectError::NoSuchKey));
+        let answer = copy.next(missing);
+        assert_eq!(answer, Err(CopyObjectError::Get(GetObjectError::NoSuchKey)));
+    }
+
+    #[test]
+    fn committed_version_answers() {
+        let version = Ulid::from_bytes([4; 16]);
+        let mut copy = step_copy(CopySourceConditions::default()).at_version(version);
+        copy.first().unwrap();
+        let answer = copy.next(child::<_, HeadObjectError>(Ok(step_head())));
+        let Ok(Next::Done(done)) = answer else {
+            panic!("a committed version answers the copy");
+        };
+        assert_eq!(done.version_id, version);
+        assert_eq!(done.source_version_id, None);
+    }
+
+    #[test]
+    fn absent_version_copies() {
+        let version = Ulid::from_bytes([4; 16]);
+        let mut copy = step_copy(CopySourceConditions::default()).at_version(version);
+        copy.first().unwrap();
+        let missing = child::<HeadObjectResult, _>(Err(HeadObjectError::NoSuchVersion));
+        assert!(matches!(
+            copy.next(missing),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(copy.step, CopyStep::Fence);
+    }
+
+    #[test]
+    fn unbound_reference_fails() {
+        let input = step_input(CopySourceConditions::default());
+        let stamp = CopyStamp {
+            version: None,
+            fresh: Ulid::from_bytes([5; 16]),
+            now_ms: 1,
+        };
+        let mut keep = KeepReferenceOperation::new(input, step_head(), None, stamp);
+        assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let answer = keep.next(child::<(), CopyObjectError>(Ok(())));
+        assert_eq!(
+            answer,
+            Err(CopyObjectError::Get(GetObjectError::GetObjectFailed))
+        );
+    }
+
+    #[test]
+    fn plain_source_admitted() {
+        let mut admit = AdmitSourceOperation {
+            bucket: "source".to_string(),
+            admitting: false,
+        };
+        assert!(matches!(admit.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = admit.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn locked_source_refused() {
+        let settings = BucketEncryption {
+            mode: aruna_core::structs::storage::encryption::EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([6; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let mut admit = AdmitSourceOperation {
+            bucket: "source".to_string(),
+            admitting: false,
+        };
+        admit.first().unwrap();
+        let row = settings.to_bytes().unwrap();
+        let read = admit.next(IoResult::Values(vec![Some(row.into())]));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Effect(_)))));
+        let error = aruna_core::structs::storage::encryption::BucketKeyError::InvalidToken;
+        let event = Event::Blob(BlobEvent::Error(BlobError::BucketKey(error)));
+        let answer = admit.next(IoResult::Event(Box::new(event)));
+        assert!(matches!(
+            answer,
+            Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                ConversionError::BucketKey(_)
+            )))
+        ));
+    }
+
     fn auth_context(user_id: UserId) -> AuthContext {
         AuthContext {
             user_id,
@@ -1381,12 +1571,8 @@ pub(crate) mod test {
             job_id: None,
         };
         let version = Ulid::generate();
-        let first = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
-        let again = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
+        let first = copy_object_at(&context, input(), version).await.unwrap();
+        let again = copy_object_at(&context, input(), version).await.unwrap();
         assert_eq!((first.version_id, again.version_id), (version, version));
         let head = HeadObjectInput {
             bucket: "bucket".to_string(),
@@ -1433,7 +1619,7 @@ pub(crate) mod test {
             job_id: None,
         };
         let version = Ulid::generate();
-        let first = copy_object_at(&context, input(), version, None).await;
+        let first = copy_object_at(&context, input(), version).await;
         assert_eq!(first.unwrap().size, 5);
         let delete = DeleteObjectInput {
             bucket: "bucket".to_string(),
@@ -1447,11 +1633,9 @@ pub(crate) mod test {
         drive(DeleteObjectOperation::new(delete), &context)
             .await
             .unwrap();
-        let fresh = copy_object_at(&context, input(), Ulid::generate(), None).await;
+        let fresh = copy_object_at(&context, input(), Ulid::generate()).await;
         assert!(fresh.is_err(), "a new copy of the deleted source must fail");
-        let again = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
+        let again = copy_object_at(&context, input(), version).await.unwrap();
         assert_eq!((again.version_id, again.size), (version, 5));
     }
 
@@ -1765,7 +1949,8 @@ pub(crate) mod test {
             },
             limits: RoCrateLimits::default(),
         });
-        let refused = copy_object_token(&context, request("plain"), token).await;
+        let copy = CopyObjectOperation::new(request("plain"), node_routing(&context));
+        let refused = drive(copy.with_token(token), &context).await;
         assert!(matches!(
             refused,
             Err(CopyObjectError::Get(GetObjectError::ConversionError(
