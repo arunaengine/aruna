@@ -333,3 +333,127 @@ mod tests {
     fn reading() -> ManagedReadOperation {
         let mut operation = ManagedReadOperation::new(node(), request());
         assert!(is_child(&operation.first()));
+        assert!(is_child(&operation.next(child(Ok::<_, IoError>(false)))));
+        let turn = operation.next(child(Ok::<_, GateContextError>(Some(gate()))));
+        assert!(is_child(&turn));
+        assert_eq!(operation.request.destination, Some(gate().subject));
+        operation
+    }
+
+    #[test]
+    fn plain_read_answers() {
+        let mut operation = reading();
+        let turn = operation.next(child(Ok::<_, BaoReadError>(output())));
+        assert_eq!(turn, Ok(Next::Done(output())));
+    }
+
+    #[test]
+    fn taught_refs_retry() {
+        let mut operation = reading();
+        assert!(is_child(&operation.next(required(vec![policy(1)]))));
+        assert!(is_child(&operation.next(allowed())));
+        assert_eq!(operation.request.known_refs, vec![policy(1)]);
+        let turn = operation.next(child(Ok::<_, BaoReadError>(output())));
+        assert_eq!(turn, Ok(Next::Done(output())));
+    }
+
+    #[test]
+    fn repeated_refs_stop() {
+        let mut operation = reading();
+        operation.next(required(vec![policy(1)])).unwrap();
+        operation.next(allowed()).unwrap();
+        assert_eq!(
+            operation.next(required(vec![policy(1)])),
+            Err(BaoReadError::PolicyRequired {
+                refs: vec![policy(1)]
+            })
+        );
+    }
+
+    #[test]
+    fn new_refs_exhaust() {
+        // The second answer may name other refs; they are checked, but no third read follows.
+        let mut operation = reading();
+        operation.next(required(vec![policy(1)])).unwrap();
+        operation.next(allowed()).unwrap();
+        operation.next(required(vec![policy(2)])).unwrap();
+        assert_eq!(
+            operation.next(allowed()),
+            Err(BaoReadError::PolicyRequired {
+                refs: vec![policy(2)]
+            })
+        );
+    }
+
+    #[test]
+    fn empty_refs_stop() {
+        let mut operation = reading();
+        assert_eq!(
+            operation.next(required(Vec::new())),
+            Err(BaoReadError::PolicyRequired { refs: Vec::new() })
+        );
+    }
+
+    #[test]
+    fn unreadable_gate_refuses() {
+        let mut operation = ManagedReadOperation::new(node(), request());
+        operation.first().unwrap();
+        // A role that cannot be read falls through to the server path.
+        let role = operation.next(child(Err::<bool, _>(IoError::Conflict)));
+        assert!(is_child(&role));
+        let gate = Err::<Option<GateContext>, _>(GateContextError::from(IoError::Conflict));
+        assert_eq!(
+            operation.next(child(gate)),
+            Err(BaoReadError::NoDestination)
+        );
+    }
+
+    #[test]
+    fn device_read_final() {
+        let mut operation = ManagedReadOperation::new(node(), request());
+        operation.request.destination = Some(gate().subject);
+        operation.first().unwrap();
+        assert!(is_child(&operation.next(child(Ok::<_, IoError>(true)))));
+        assert_eq!(operation.request.destination, None);
+        assert_eq!(
+            operation.next(required(vec![policy(1)])),
+            Err(BaoReadError::GovernedUnavailable)
+        );
+    }
+
+    fn net(event: NetEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Net(event)))
+    }
+
+    #[test]
+    fn no_net_no_user() {
+        let mut operation = LocalUserOperation::new(realm());
+        let asked: IoCall = Effect::Net(NetEffect::LocalNode).into();
+        assert_eq!(operation.first(), Ok(Next::Call(asked)));
+        let turn = operation.next(net(NetEvent::LocalNode(None)));
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn unlisted_node_no_user() {
+        let mut operation = LocalUserOperation::new(realm());
+        operation.first().unwrap();
+        let read = operation.next(net(NetEvent::LocalNode(Some(node()))));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
+        let document = RealmConfigDocument::new(realm(), Vec::new(), 1);
+        let value = document.to_bytes().unwrap().into();
+        let turn = operation.next(IoResult::Values(vec![Some(value)]));
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn missing_config_no_user() {
+        let mut operation = LocalUserOperation::new(realm());
+        operation.first().unwrap();
+        operation
+            .next(net(NetEvent::LocalNode(Some(node()))))
+            .unwrap();
+        let turn = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+}
