@@ -20,6 +20,7 @@ use aruna_core::outbound::{ConnectionError, OutboundEffect, OutboundError, Outbo
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
+use aruna_core::task::TaskEvent;
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -169,6 +170,18 @@ async fn dispatch_unboxed(
                 crate::driver::drive_suboperation(sub_operation, context, depth + 1, deadline).await
             }
         }
+        Effect::Background(child) => {
+            let slot = crate::distribution::pull::fill_slot();
+            let started = slot.is_some();
+            if let Some(slot) = slot {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    dispatch_effect(Effect::SubOperation(child), &context, 0).await;
+                });
+            }
+            Event::Task(TaskEvent::BackgroundStarted { started })
+        }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
         Effect::Index(index_effect) => Event::Index(match context.storage_handle.range_indexes() {
             Some(indexes) => indexes.execute(*index_effect).await,
@@ -236,6 +249,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(_) => "net",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
+        Effect::Background(_) => "background",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",

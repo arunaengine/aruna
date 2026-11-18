@@ -864,7 +864,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::LocalFile(_) => Ok(Family::LocalFile),
         Effect::Net(_) => Ok(Family::Net),
         Effect::Metadata(_) => Ok(Family::Metadata),
-        Effect::Task(_) => Ok(Family::Task),
+        Effect::Task(_) | Effect::Background(_) => Ok(Family::Task),
         Effect::Index(_) => Ok(Family::Index),
         Effect::Session(_) => Ok(Family::Session),
         Effect::Outbound(_) => Ok(Family::Outbound),

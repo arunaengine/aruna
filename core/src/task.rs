@@ -143,6 +143,10 @@ pub enum TaskEvent {
         key: TaskKey,
         count: usize,
     },
+    /// Answers `Effect::Background`: whether a free slot let the child start.
+    BackgroundStarted {
+        started: bool,
+    },
     Error {
         key: Option<TaskKey>,
         message: String,

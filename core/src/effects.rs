@@ -52,6 +52,9 @@ pub enum Effect {
     Net(NetEffect),
     Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
+    /// Starts a child beside the caller while a background slot is free; answered at once by
+    /// `TaskEvent::BackgroundStarted`. The child's result goes nowhere.
+    Background(Box<dyn SubOperation>),
     Task(TaskEffect),
     Search(),
     Stream(),

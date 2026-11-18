@@ -1091,6 +1091,7 @@ impl Event {
                 TaskEvent {
                     TimerScheduled,
                     TimerCancelled,
+                    BackgroundStarted,
                     RunningHandlersAborted,
                     Error,
                 }
