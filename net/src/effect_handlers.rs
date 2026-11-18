@@ -15,6 +15,7 @@ use aruna_core::events::{
     PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
@@ -249,9 +250,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
             elapsed: Duration::ZERO,
-            result: Err(PeerRequestError::Failed(
+            result: Err(PeerRequestError::Failed(MetadataError::Backend(
                 "metadata request must be dispatched by the operations runner".to_string(),
-            )),
+            ))),
         })),
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Notification(_) => NetEvent::Notification(Err(

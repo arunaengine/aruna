@@ -525,7 +525,7 @@ pub struct MetadataAnswer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
     /// The request failed before an answer arrived.
-    Failed(String),
+    Failed(crate::metadata::MetadataError),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }
