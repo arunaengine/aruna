@@ -22,10 +22,11 @@ use super::peer_auth::{
     bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
 };
 use super::query::query_local_graphs;
+use crate::metadata::message_kind::transport_message_kind;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, transport_message_kind, write_body_at, write_message_at, write_stream_body,
+    read_budget, write_body_at, write_message_at, write_stream_body,
     write_transport_message,
 };
 use super::{

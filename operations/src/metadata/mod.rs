@@ -28,6 +28,7 @@ mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
 pub mod materialization_queue;
+pub(crate) mod message_kind;
 pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
@@ -111,7 +112,8 @@ pub use handle::{
     list_cached_records, query_authorized_local, search_authorized_local, send_metadata_effect,
     warm_caches,
 };
-pub(crate) use handle::{export_summary_jsonld, search_local_filtered, transport_message_kind};
+pub(crate) use handle::{export_summary_jsonld, search_local_filtered};
+pub(crate) use message_kind::transport_message_kind;
 pub use protocol::{
     MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,

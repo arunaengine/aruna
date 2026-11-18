@@ -628,7 +628,7 @@ pub(crate) async fn apply_forwarded_write(
         }
         other => reject(format!(
             "unexpected forwarded metadata message: {}",
-            crate::metadata::handle::transport_message_kind(&other)
+            crate::metadata::message_kind::transport_message_kind(&other)
         )),
     }
 }

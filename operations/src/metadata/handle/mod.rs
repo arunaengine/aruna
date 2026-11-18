@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use aruna_core::structs::storage::format::Compression;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -44,7 +45,6 @@ pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::query::query_authorized_local;
 pub use self::search::search_authorized_local;
 pub(crate) use self::search::search_local_filtered;
-pub(crate) use self::transport::transport_message_kind;
 mod ingress;
 mod lifecycle;
 mod peer_auth;
@@ -152,12 +152,6 @@ const RANGE_INDEX_DIR: &str = "range-indexes";
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MetadataRequestDelivery {
-    DefinitelyNotSent,
-    PossiblySent,
 }
 
 #[derive(Debug)]

@@ -14,7 +14,7 @@ use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::retry_disposition;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::handle::MetadataRequestDelivery;
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;

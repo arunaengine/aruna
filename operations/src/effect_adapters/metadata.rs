@@ -25,7 +25,8 @@ use crate::metadata::forward::read::{summary_answer, summary_export};
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed_write::RouteDeleteOperation;
 use crate::metadata::forward::write::route_metadata_update;
-use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
+use crate::metadata::handle::WritePeerError;
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
