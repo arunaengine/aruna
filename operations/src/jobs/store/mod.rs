@@ -14,15 +14,40 @@ use aruna_core::keyspaces::{
     LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, JobClaim, JobError, JobErrorKind, JobExecutionClass, JobId,
-    JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
-    JobState, JobTransitionError, LaunchRecord, RunCrateStatus, attempt_control_key,
-    cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id, job_entry_key,
-    job_entry_prefix, job_owner_cursor, job_prune_key, job_record_key, job_wait_key,
-    owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key,
-    run_crate_key, validate_transition, workspace_credential_id,
-};
+use aruna_core::structs::execution::job::AttemptControl;
+use aruna_core::structs::execution::job::AttemptIntent;
+use aruna_core::structs::execution::job::JobClaim;
+use aruna_core::structs::execution::job::JobError;
+use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::JobExecutionClass;
+use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::JobProgress;
+use aruna_core::structs::execution::job::JobRecord;
+use aruna_core::structs::execution::job::JobRecordEnvelope;
+use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::JobState;
+use aruna_core::structs::execution::job::LaunchRecord;
+use aruna_core::structs::execution::job::RunCrateStatus;
+use aruna_core::structs::execution::job::attempt_control_key;
+use aruna_core::structs::execution::job::cleanup_dedup_key;
+use aruna_core::structs::execution::job::cleanup_job_id;
+use aruna_core::structs::execution::job::crate_dedup_key;
+use aruna_core::structs::execution::job::crate_job_id;
+use aruna_core::structs::execution::job::job_entry_key;
+use aruna_core::structs::execution::job::job_entry_prefix;
+use aruna_core::structs::execution::job::job_owner_cursor;
+use aruna_core::structs::execution::job::job_prune_key;
+use aruna_core::structs::execution::job::job_record_key;
+use aruna_core::structs::execution::job::job_wait_key;
+use aruna_core::structs::execution::job::owner_index_key;
+use aruna_core::structs::execution::job::owner_index_prefix;
+use aruna_core::structs::execution::job::parse_dedup_value;
+use aruna_core::structs::execution::job::parse_entry_key;
+use aruna_core::structs::execution::job::parse_owner_key;
+use aruna_core::structs::execution::job::run_crate_key;
+use aruna_core::structs::execution::job::validate_transition;
+use aruna_core::structs::execution::job::workspace_credential_id;
 use aruna_core::structs::execution::job::{
     ClaimGuard, JobDeletes, JobWrites, dedup_index_key, index_deltas, job_insert_entries,
     prune_delete_entries,
@@ -33,7 +58,6 @@ use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -50,6 +74,7 @@ pub mod key_wait;
 pub mod list_jobs;
 pub mod mark_start;
 pub mod mutation;
+pub mod mutation_error;
 pub mod park_wake;
 pub mod query;
 pub mod remote_wait;
@@ -61,50 +86,12 @@ pub mod store_call;
 use crate::driver::drive;
 use mutation::{MutateJobOperation, NoGuard};
 
+pub use mutation_error::JobMutationError;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {
     owner: UserId,
     expires_at_ms: u64,
-}
-
-#[derive(Debug, PartialEq, Error)]
-pub enum JobMutationError {
-    #[error("job not found")]
-    NotFound,
-    #[error("job claim token mismatch")]
-    TokenMismatch,
-    #[error("attempt intent conflicts with the committed lineage")]
-    IntentConflict,
-    #[error("attempt epoch exhausted")]
-    EpochExhausted,
-    #[error("controller generation exhausted")]
-    GenerationExhausted,
-    #[error("attempt control record is missing")]
-    MissingControl,
-    #[error("job report is frozen")]
-    ReportFrozen,
-    #[error("attempt control epoch mismatch")]
-    EpochMismatch,
-    #[error("execution output record digest conflicts with the stored digest")]
-    OutputRecordConflict,
-    #[error(transparent)]
-    IllegalTransition(#[from] JobTransitionError),
-    #[error("execution outputs are not proven durable: {0}")]
-    OutputsUnproven(#[from] JobRecordError),
-    #[error("{0}")]
-    Storage(String),
-    /// The write transaction lost to a concurrent one; a fresh run may succeed.
-    #[error("job storage transaction conflicted")]
-    Conflict,
-}
-
-impl From<aruna_core::calls::IoError> for JobMutationError {
-    fn from(error: aruna_core::calls::IoError) -> Self {
-        match error {
-            aruna_core::calls::IoError::Conflict => Self::Conflict,
-            error => Self::Storage(error.to_string()),
-        }
-    }
 }
 
 /// Outcome of a mutation closure: whether the caller wants the record persisted.
