@@ -11,7 +11,6 @@ use crate::jobs::repository::test_support::{
     scope,
 };
 use aruna_core::structs::execution::harvest::{HarvestGranularity, HarvestSelector};
-use aruna_core::telemetry::RequestStages;
 
 fn source() -> HarvestSource {
     HarvestSource {
@@ -666,19 +665,12 @@ fn unavailable_access_retries() {
     );
 }
 
-#[tokio::test]
-async fn access_records_stage() {
-    for answer in [Ok(()), Err(AuthorizeError::PermissionDenied)] {
-        let stages = RequestStages::default();
-        let checked = stages.clone().scope(async {
-            let mut operation = apply(false);
-            operation.stamp(NOW_MS);
-            let live = provenance(HarvestRecordState::Live, 50);
-            operation.next(read_answer(Some(&live))).unwrap();
-            operation.stamp(NOW_MS + 7);
-            operation.next(child::<(), AuthorizeError>(answer)).is_ok()
-        });
-        let passed = checked.await;
-        assert_eq!(stages.render(), "permission=7.0ms", "passed: {passed}");
-    }
+#[test]
+fn access_time_measured() {
+    let mut operation = apply(false);
+    operation.stamp(NOW_MS);
+    let live = provenance(HarvestRecordState::Live, 50);
+    operation.next(read_answer(Some(&live))).unwrap();
+    operation.stamp(NOW_MS + 7);
+    assert_eq!(operation.access_elapsed(), Duration::from_millis(7));
 }

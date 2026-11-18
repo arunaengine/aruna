@@ -3,15 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::jobs::repository::test_support::{
     NOW_MS, child, job_id, link, link_bytes, local_scope, realm, registry_record, scope,
 };
-use aruna_core::effects::StorageEffect;
+use crate::jobs::store::mutation::{Rows, run_in_memory};
 use aruna_core::events::StorageEvent;
 use aruna_core::repository::{LinkFailure, LinkPush};
-use aruna_core::rows::read_row;
-use aruna_storage::FjallStorage;
 
 fn entry(due_at_ms: u64) -> LinkQueueEntry {
     LinkQueueEntry {
@@ -531,49 +528,10 @@ fn empty_queue_idle() {
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
 }
 
-async fn stored(context: &crate::driver::DriverContext, link_id: Ulid) -> Option<LinkQueueEntry> {
-    drive(StoredEntry(link_id), context).await.unwrap()
-}
-
-/// Reads one queue row back for the storage test below.
-#[derive(Debug, PartialEq)]
-struct StoredEntry(Ulid);
-
-impl Operation for StoredEntry {
-    type Output = Option<LinkQueueEntry>;
-    type Error = LinkError;
-
-    fn first(&mut self) -> Turn<Self::Output> {
-        Ok(Next::Call(read_row(LINK_QUEUE_KEYSPACE, id_key(self.0))))
-    }
-
-    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
-        let value = aruna_core::rows::value(result)?;
-        Ok(Next::Done(
-            value.map(|bytes| postcard::from_bytes(&bytes).unwrap()),
-        ))
-    }
-}
-
-async fn write_row(context: &crate::driver::DriverContext, row: (String, Key, Value)) {
-    let effect = StorageEffect::Write {
-        key_space: row.0,
-        key: row.1,
-        value: row.2,
-        txn_id: None,
-    };
-    let answer = context.storage_handle.send_storage_effect(effect).await;
-    assert!(matches!(
-        answer,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
-}
-
-#[tokio::test]
-async fn retry_keeps_newer() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = crate::testing::test_context(storage.clone());
+// A retry moves an unchanged check; a change queued while the check ran keeps its earlier due
+// time, and a check removed meanwhile, for example by a started push, stays removed.
+#[test]
+fn retry_keeps_newer() {
     let (link_id, document_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
     let entry = |due_at_ms, first_at_ms| LinkQueueEntry {
         document_id,
@@ -581,29 +539,26 @@ async fn retry_keeps_newer() {
         first_at_ms,
         settle_only: false,
     };
-    let settle =
-        |queued: &Value, retry_at| SettleCheckOperation::new(link_id, queued.clone(), retry_at);
-    let queued = queue_row(link_id, &entry(100, 90)).unwrap();
-    write_row(&context, queued.clone()).await;
-
-    drive(settle(&queued.2, Some(500)), &context).await.unwrap();
-    assert_eq!(stored(&context, link_id).await, Some(entry(500, 90)));
-
-    // A change queued while the check ran keeps its earlier due time.
-    let newer = queue_row(link_id, &entry(200, 150)).unwrap();
-    write_row(&context, newer).await;
-    drive(settle(&queued.2, Some(500)), &context).await.unwrap();
-    assert_eq!(stored(&context, link_id).await, Some(entry(200, 150)));
-    drive(settle(&queued.2, None), &context).await.unwrap();
-    assert_eq!(stored(&context, link_id).await, Some(entry(200, 150)));
-
-    // A check removed meanwhile, for example by a started push, stays removed.
-    let delete = StorageEffect::Delete {
-        key_space: LINK_QUEUE_KEYSPACE.to_string(),
-        key: id_key(link_id),
-        txn_id: None,
+    let (space, key, queued) = queue_row(link_id, &entry(100, 90)).unwrap();
+    let row = (space, key.to_vec());
+    let settle = |retry_at| SettleCheckOperation::new(link_id, queued.clone(), retry_at);
+    let stored = |rows: &Rows| {
+        rows.get(&row)
+            .map(|bytes| postcard::from_bytes::<LinkQueueEntry>(bytes).unwrap())
     };
-    context.storage_handle.send_storage_effect(delete).await;
-    drive(settle(&queued.2, Some(500)), &context).await.unwrap();
-    assert_eq!(stored(&context, link_id).await, None);
+    let mut rows = Rows::from([(row.clone(), queued.to_vec())]);
+
+    assert_eq!(run_in_memory(settle(Some(500)), &mut rows), Ok(()));
+    assert_eq!(stored(&rows), Some(entry(500, 90)));
+
+    let (_, _, newer) = queue_row(link_id, &entry(200, 150)).unwrap();
+    rows.insert(row.clone(), newer.to_vec());
+    assert_eq!(run_in_memory(settle(Some(500)), &mut rows), Ok(()));
+    assert_eq!(stored(&rows), Some(entry(200, 150)));
+    assert_eq!(run_in_memory(settle(None), &mut rows), Ok(()));
+    assert_eq!(stored(&rows), Some(entry(200, 150)));
+
+    rows.remove(&row);
+    assert_eq!(run_in_memory(settle(Some(500)), &mut rows), Ok(()));
+    assert_eq!(stored(&rows), None);
 }

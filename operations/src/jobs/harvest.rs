@@ -640,10 +640,14 @@ impl ApplyRecordOperation {
         )))
     }
 
+    /// How long the running [`Self::access`] check has taken on the runner's clock.
+    fn access_elapsed(&self) -> Duration {
+        Duration::from_millis(self.now_ms.saturating_sub(self.access_started_ms))
+    }
+
     /// The end of an [`Self::access`] check; a refusal names the record's path.
     fn access_result(&self, result: IoResult) -> Result<(), HarvestFailure> {
-        let elapsed = self.now_ms.saturating_sub(self.access_started_ms);
-        record_stage("permission", Duration::from_millis(elapsed));
+        record_stage("permission", self.access_elapsed());
         match result.child::<(), AuthorizeError>()? {
             Ok(()) => Ok(()),
             Err(
