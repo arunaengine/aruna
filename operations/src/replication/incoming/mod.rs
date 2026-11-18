@@ -3,57 +3,56 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
-    release_row_effect, write_location_effect, write_version_effect,
-};
+use crate::blob::records::{HeadAliasContext, release_rows};
 use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
-use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, drift_reads,
-    gate_decision, split_drift_reads, union_refs, write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
+    split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
-use crate::s3::bucket::key::rows::settings_read;
-use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
+use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
-use aruna_core::calls::ChildOutcome;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    SYNC_RECEIPT_KEYSPACE,
 };
-use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_entry};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope, envelope_charge,
 };
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
-    VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer,
+    ResolvedBackend, VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
@@ -67,6 +66,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::origin::{OriginVersion, SyncHop};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -75,7 +75,7 @@ use aruna_core::structs::storage::replication::{
 };
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
-use aruna_core::structs::storage::replication_queue::live_obligation_effect;
+use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
@@ -83,17 +83,14 @@ use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
-use std::collections::VecDeque;
+use aruna_core::types::{GroupId, Key, Value};
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-/// One state machine per inbound stream: every accepted event advances exactly
-/// one state, `step` names its handler after the phase, and any failure after
-/// the reply rejects, aborts the transaction, and deletes unowned bytes.
+/// One operation per inbound stream: every answer advances exactly one state, `next` names its
+/// handler after the phase, and any failure after the reply rejects and deletes unowned bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum IncomingVersionState {
     Init,
@@ -107,9 +104,8 @@ enum IncomingVersionState {
     ReadExistingClaim,
     ReadReplacedBlob,
     ReadQuotaConfig,
-    StartQuotaCheck,
+    /// Waits for the child that sums the group's usage in one read snapshot.
     EnforceQuota,
-    FinishQuotaCheck,
     ReadExistingBlob,
     /// Reads the admitted ABE parameters and epoch of an encrypting destination.
     ReadAbe,
@@ -118,7 +114,8 @@ enum IncomingVersionState {
     SendNegotiation,
     AwaitApproval,
     ReceiveBlob,
-    StartTransaction,
+    /// Waits for the child that applies the version in one write transaction.
+    Apply,
     CheckPurgeFence,
     CheckDrift,
     /// Reads the record of the destination's set to admit a publication.
@@ -145,20 +142,48 @@ enum IncomingVersionState {
     CheckCommitQuota,
     UpdateUsage,
     WriteCleanupRow,
-    CommitTransaction,
     ReleaseReservation,
     ScheduleUsage,
     ScheduleLiveDrain,
     /// Hashes a pending replica at once when its key is already unlocked here.
     SchedulePromotion,
-    SendApplyRejected,
-    AbortTransaction,
-    CleanupReceivedBlob,
     RegisterBlobDht,
     SendApplyComplete,
     CloseConnection,
-    Finish,
-    Error,
+}
+
+type Turn = Result<Next<IncomingVersionResult>, IncomingVersionError>;
+
+impl From<IoError> for IncomingVersionError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+/// Sums a group's usage against its ceiling in one read snapshot; outputs whether it is exceeded.
+#[derive(Debug, PartialEq)]
+struct QuotaProbe {
+    gate: QuotaGate,
+}
+
+impl Operation for QuotaProbe {
+    type Output = bool;
+    type Error = QuotaGateError;
+
+    fn first(&mut self) -> Result<Next<bool>, QuotaGateError> {
+        Ok(Next::Call(self.gate.start_calls()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, QuotaGateError> {
+        Ok(match self.gate.step_calls(result)? {
+            Some(call) => Next::Call(call),
+            None => Next::Done(self.gate.is_exceeded()),
+        })
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -237,8 +262,6 @@ pub enum IncomingVersionError {
     ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
     MultipartMetadataOverflow,
-    #[error("operation did not finish")]
-    NotFinished,
     #[error("Unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
@@ -291,15 +314,12 @@ impl EnqueueClock {
 
 /// The bytes accepted from the sender, with the reservation cleanup this node
 /// still owes while the apply transaction is unresolved.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ReceivedBlob {
     location: BackendLocation,
     /// Set until the apply commits; every abort before that must delete the
     /// copy, every failure after it must preserve the copy the commit owns.
     cleanup_on_abort: bool,
-    /// The reconciliation row written inside the apply transaction for the
-    /// case where the commit outcome is never learned, prepared once.
-    reconciliation: Option<ReconciliationWork>,
 }
 
 impl ReceivedBlob {
@@ -307,7 +327,6 @@ impl ReceivedBlob {
         Self {
             location,
             cleanup_on_abort: true,
-            reconciliation: None,
         }
     }
 
@@ -317,7 +336,6 @@ impl ReceivedBlob {
         Self {
             location,
             cleanup_on_abort: false,
-            reconciliation: None,
         }
     }
 
@@ -330,14 +348,6 @@ impl ReceivedBlob {
         self.cleanup_on_abort = false;
         Some(self.location.clone())
     }
-}
-
-/// The cleanup keyspace row that reconciles a received write whose commit
-/// outcome was never learned.
-#[derive(Debug, PartialEq)]
-struct ReconciliationWork {
-    key: Vec<u8>,
-    value: Vec<u8>,
 }
 
 /// The current-head transition the apply decided on. The hash rides with the
@@ -363,7 +373,8 @@ pub struct IncomingVersionOperation {
     /// it is enqueued, so a long apply still gets its full grace window instead
     /// of inheriting an operation-start time that may already be stale.
     clock: EnqueueClock,
-    txn_id: Option<Ulid>,
+    /// This instance is the apply: one write transaction over the rows of the version.
+    applying: bool,
     destination_group_id: Option<GroupId>,
     /// The destination bucket's own rules, so this receiver routes its replica
     /// with the tenant's rules and its own class table.
@@ -399,13 +410,18 @@ pub struct IncomingVersionOperation {
     defer_quota: bool,
     replaced_reference_bytes: u64,
     /// Envelope rows of the replaced version, deleted with its metadata.
-    replaced_envelope: Vec<(String, aruna_core::types::Key)>,
+    replaced_envelope: Vec<(String, Key)>,
+    /// The rows the last replaced-envelope read asked for, in order.
+    replaced_reads: Vec<(String, Key)>,
     pending_head: Option<PendingHeadTransition>,
-    head_transition_effects: VecDeque<Effect>,
-    pending_version_effects: VecDeque<Effect>,
     release_id: Option<Ulid>,
     apply_committed: bool,
-    output: Option<Result<IncomingVersionResult, IncomingVersionError>>,
+    /// The apply may have committed: the received copy is kept and goes to reconciliation.
+    outcome_unknown: bool,
+    /// Why the run failed, in the words the sender classifies.
+    failure: Option<String>,
+    /// The result a run that ends without applying reports once its stream is closed.
+    output: Option<IncomingVersionResult>,
     rocrate_limits: RoCrateLimits,
     routing: NodeRouting,
     /// Set when the destination backend is over its cap, which only refuses a
@@ -448,7 +464,7 @@ impl IncomingVersionOperation {
             local_realm_id,
             manifest,
             clock: EnqueueClock(SystemTime::now),
-            txn_id: None,
+            applying: false,
             destination_group_id: None,
             destination_rules: Vec::new(),
             destination_compression: Compression::Off,
@@ -470,15 +486,16 @@ impl IncomingVersionOperation {
             defer_quota: false,
             replaced_reference_bytes: 0,
             replaced_envelope: Vec::new(),
+            replaced_reads: Vec::new(),
             pending_head: None,
             destination_binding: None,
             installed_head: None,
             written_identity: None,
             written_pending: false,
-            head_transition_effects: VecDeque::new(),
-            pending_version_effects: VecDeque::new(),
             release_id: None,
             apply_committed: false,
+            outcome_unknown: false,
+            failure: None,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             routing: NodeRouting::default(),
@@ -541,11 +558,8 @@ impl IncomingVersionOperation {
     }
 }
 
-impl EffectOperation for IncomingVersionOperation {
-    type Output = IncomingVersionResult;
-    type Error = IncomingVersionError;
-
-    fn start(&mut self) -> Effects {
+impl IncomingVersionOperation {
+    fn negotiate(&mut self) -> Turn {
         if let Err(error) = self.manifest.validate() {
             return self.reject_negotiation(error.into());
         }
@@ -591,130 +605,181 @@ impl EffectOperation for IncomingVersionOperation {
         self.read_destination_bucket()
     }
 
-    /// One accepted event per state, dispatched to the handler named
-    /// after the accepted result. The phase order is documented on
-    /// [`IncomingVersionState`].
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            // Negotiation: decide and send the reply.
-            IncomingVersionState::Init => self.start(),
-            IncomingVersionState::ReadDestinationBucket => self.accept_destination_bucket(event),
-            IncomingVersionState::ReadDestinationKey => self.accept_destination_key(event),
-            IncomingVersionState::ReadExistingClaim => self.accept_existing_claim(event),
-            IncomingVersionState::CreateDestinationBucket => self.accept_bucket_created(event),
-            IncomingVersionState::LoadDestinationRouting => self.accept_routing_loaded(event),
-            IncomingVersionState::ReadExistingVersion => self.accept_existing_version(event),
-            IncomingVersionState::ReadReplacedBlob => self.accept_replaced_blob(event),
-            IncomingVersionState::ReadQuotaConfig => self.accept_quota_config(event),
-            IncomingVersionState::StartQuotaCheck => self.accept_quota_transaction(event),
-            IncomingVersionState::EnforceQuota => self.accept_quota_step(event),
-            IncomingVersionState::FinishQuotaCheck => self.accept_quota_abort(event),
-            IncomingVersionState::ReadExistingBlob => self.accept_existing_blob(event),
-            IncomingVersionState::ReadAbe => self.accept_abe(event),
-            IncomingVersionState::CreateEnvelope => self.accept_envelope(event),
-            IncomingVersionState::PolicyGate => self.accept_policy_gate(event),
-            IncomingVersionState::SendNegotiation => self.accept_reply_sent(event),
-            IncomingVersionState::AwaitApproval => self.accept_source_approval(event),
-            // Receiving: accept the bytes and open the apply.
-            IncomingVersionState::ReceiveBlob => self.accept_blob_finish(event),
-            IncomingVersionState::StartTransaction => self.accept_transaction_start(event),
-            IncomingVersionState::CheckPurgeFence => self.accept_purge_fence(event),
-            IncomingVersionState::CheckDrift => self.accept_drift_check(event),
-            IncomingVersionState::ReadPublicationRecord => self.accept_publication_record(event),
-            IncomingVersionState::RecheckPublication => self.accept_publication_recheck(event),
-            // Apply/commit: expose the version and settle ownership.
-            IncomingVersionState::VerifyReplaced => self.accept_replaced_version(event),
-            IncomingVersionState::ReadReplacedEnvelope => self.accept_replaced_envelope(event),
-            IncomingVersionState::ReadReplacedRows => self.accept_replaced_rows(event),
-            IncomingVersionState::ReadReplacedMetadata => self.accept_metadata_iterated(event),
-            IncomingVersionState::DeleteReplacedMetadata => self.accept_metadata_deleted(event),
-            IncomingVersionState::WriteReclaimCandidate => self.accept_reclaim_candidate(event),
-            IncomingVersionState::FenceBackend => self.accept_backend_fence(event),
-            IncomingVersionState::VerifyExistingBlob => self.accept_verified_blob(event),
-            IncomingVersionState::WriteBlobLocation => self.accept_blob_location(event),
-            IncomingVersionState::ReadObjectLookup => self.accept_object_lookup(event),
-            IncomingVersionState::ReadNamedHead => self.accept_named_head(event),
-            IncomingVersionState::ReadCurrentVersion => self.accept_current_version(event),
-            IncomingVersionState::ApplyHeadTransition => self.accept_head_progress(event),
-            IncomingVersionState::WriteBlobVersion => self.accept_blob_version(event),
-            IncomingVersionState::WriteMultipartMetadata => self.accept_multipart_write(event),
-            IncomingVersionState::WriteLiveObligation => self.accept_live_obligation(event),
-            IncomingVersionState::CheckCommitQuota => self.accept_commit_quota(event),
-            IncomingVersionState::UpdateUsage => self.accept_usage_update(event),
-            IncomingVersionState::WriteCleanupRow => self.accept_cleanup_row(event),
-            IncomingVersionState::CommitTransaction => self.accept_transaction_commit(event),
-            IncomingVersionState::ReleaseReservation => self.accept_reservation_release(event),
-            IncomingVersionState::ScheduleUsage => self.accept_usage_schedule(event),
-            IncomingVersionState::ScheduleLiveDrain => self.accept_live_drain(event),
-            IncomingVersionState::SchedulePromotion => self.accept_promotion_scheduled(event),
-            IncomingVersionState::RegisterBlobDht => self.accept_blob_registration(event),
-            IncomingVersionState::SendApplyComplete => self.accept_completion_sent(event),
-            // Cleanup: reject, abort, delete and close.
-            IncomingVersionState::SendApplyRejected => self.accept_apply_rejection(event),
-            IncomingVersionState::AbortTransaction => self.accept_transaction_abort(event),
-            IncomingVersionState::CleanupReceivedBlob => self.accept_blob_cleanup(event),
-            IncomingVersionState::CloseConnection => self.accept_connection_close(event),
-            IncomingVersionState::Finish => smallvec![],
-            IncomingVersionState::Error => smallvec![],
+    /// Whether the sender still waits for the outcome of an apply it was invited to.
+    fn owes_rejection(&self) -> bool {
+        !self.apply_committed
+            && matches!(
+                self.negotiation_result,
+                Some(
+                    ReplicationNegotiationResult::NeedVersionOnly
+                        | ReplicationNegotiationResult::NeedBlobVersion
+                        | ReplicationNegotiationResult::NeedSealedBlob(_)
+                        | ReplicationNegotiationResult::NeedAbeBlob(..)
+                )
+            )
+    }
+
+    /// An apply whose commit outcome is unknown may own the received copy: it is kept, and the
+    /// reconciliation row decides its fate from the committed rows.
+    fn keep_received(&mut self) {
+        if let Some(received) = self.received_blob.as_mut() {
+            received.cleanup_on_abort = false;
+            self.outcome_unknown = true;
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            IncomingVersionState::Finish | IncomingVersionState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        // Only a terminal state carries an outcome; a premature finalize is an
-        // explicit error rather than a successful default.
-        if !matches!(
-            self.state,
-            IncomingVersionState::Finish | IncomingVersionState::Error
-        ) {
-            return Err(IncomingVersionError::NotFinished);
-        }
-        let default = self.result(self.apply_committed);
-        match (self.state, self.output) {
-            (_, Some(Ok(output))) => Ok(output),
-            (_, Some(Err(error))) => Err(error),
-            (IncomingVersionState::Finish, None) => Ok(default),
-            (IncomingVersionState::Error, None) => Err(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            )),
-            _ => unreachable!("nonterminal states are rejected before the outcome is read"),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut effects = smallvec![];
-
-        let cleanup_location = match &self.state {
-            // An unknown commit outcome must preserve the copy: the commit may
-            // have landed, so the reservation is released instead of deleted.
-            IncomingVersionState::CommitTransaction => {
-                if let Some(received) = self.received_blob.as_mut() {
-                    received.cleanup_on_abort = false;
-                }
+    fn reconcile_call(&self) -> Option<IoCall> {
+        match self.cleanup_row() {
+            Ok(row) => row.map(|row| IoCall::Write(vec![row])),
+            Err(error) => {
+                warn!(%error, "A received copy could not be queued for reconciliation");
                 None
             }
-            _ => self
-                .received_blob
-                .as_mut()
-                .and_then(ReceivedBlob::take_cleanup),
-        };
-        if let Some(location) = cleanup_location {
-            effects.push(Effect::Blob(BlobEffect::Delete { location }));
         }
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects.push(Effect::Blob(BlobEffect::CloseConnection {
-            stream_id: self.stream_id,
-        }));
+    }
+}
 
-        effects
+impl Operation for IncomingVersionOperation {
+    type Output = IncomingVersionResult;
+    type Error = IncomingVersionError;
+
+    fn first(&mut self) -> Turn {
+        match self.applying {
+            true => self.check_purge_fence(),
+            false => self.negotiate(),
+        }
+    }
+
+    /// One answer per state, dispatched to the handler named after the accepted result. The
+    /// phase order is documented on [`IncomingVersionState`].
+    fn next(&mut self, result: IoResult) -> Turn {
+        use IncomingVersionState as State;
+        match self.state {
+            // Negotiation: decide and send the reply.
+            State::Init => self.negotiate(),
+            State::ReadDestinationBucket => self.accept_destination_bucket(result.values()?),
+            State::ReadDestinationKey => self.accept_destination_key(result.value()?),
+            State::ReadExistingClaim => self.accept_existing_claim(result.value()?),
+            State::CreateDestinationBucket => self.accept_bucket_created(result.event()?),
+            State::LoadDestinationRouting => self.accept_routing_loaded(result.event()?),
+            State::ReadExistingVersion => self.accept_existing_version(result.value()?),
+            State::ReadReplacedBlob => self.accept_replaced_blob(result.value()?),
+            State::ReadQuotaConfig => self.accept_quota_config(result.value()?),
+            State::EnforceQuota => self.accept_quota_probe(result.child::<bool, QuotaGateError>()?),
+            State::ReadExistingBlob => self.accept_existing_blob(result.value()?),
+            State::ReadAbe => self.accept_abe(result.values()?),
+            State::CreateEnvelope => self.accept_envelope(result.event()?),
+            State::PolicyGate => {
+                self.accept_policy_gate(result.child::<PolicyGateOutcome, ReadPolicyError>()?)
+            }
+            State::SendNegotiation => self.accept_reply_sent(result.event()?),
+            State::AwaitApproval => self.accept_source_approval(result.event()?),
+            // Receiving: accept the bytes and run the apply.
+            State::ReceiveBlob => self.accept_blob_finish(result.event()?),
+            State::Apply => {
+                let applied = result.child::<IncomingVersionResult, IncomingVersionError>()?;
+                self.accept_applied(applied)
+            }
+            State::ReadPublicationRecord => self.accept_publication_record(result.event()?),
+            // Apply: expose the version; the runner commits with the outcome.
+            State::CheckPurgeFence => self.accept_purge_fence(result.value()?),
+            State::CheckDrift => self.accept_drift_check(result.values()?),
+            State::RecheckPublication => self.accept_publication_recheck(result.event()?),
+            State::VerifyReplaced => self.accept_replaced_version(result.value()?),
+            State::ReadReplacedEnvelope => self.accept_replaced_envelope(result.values()?),
+            State::ReadReplacedRows => self.accept_replaced_rows(result.values()?),
+            State::ReadReplacedMetadata => self.accept_metadata_iterated(result.page()?),
+            State::DeleteReplacedMetadata => {
+                result.done()?;
+                self.accept_metadata_deleted()
+            }
+            State::WriteReclaimCandidate => {
+                result.done()?;
+                self.replaced_version = None;
+                self.write_hash_lookup()
+            }
+            State::FenceBackend => self.accept_backend_fence(result.value()?),
+            State::VerifyExistingBlob => self.accept_verified_blob(result.value()?),
+            State::WriteBlobLocation => {
+                result.done()?;
+                self.write_object_lookup()
+            }
+            State::ReadObjectLookup => self.accept_object_lookup(result.value()?),
+            State::ReadNamedHead => self.accept_named_head(result.value()?),
+            State::ReadCurrentVersion => self.accept_current_version(result.value()?),
+            State::ApplyHeadTransition => {
+                result.done()?;
+                self.write_version()
+            }
+            State::WriteBlobVersion => {
+                result.done()?;
+                self.write_multipart_metadata()
+            }
+            State::WriteMultipartMetadata => {
+                result.done()?;
+                self.write_live_obligation()
+            }
+            State::WriteLiveObligation => {
+                result.done()?;
+                self.start_commit_quota()
+            }
+            State::CheckCommitQuota => self.accept_commit_quota(result),
+            State::UpdateUsage => self.accept_usage_update(result),
+            State::WriteCleanupRow => {
+                result.done()?;
+                self.finish_apply()
+            }
+            // After the commit: settle ownership and tell the sender.
+            State::ReleaseReservation => self.accept_reservation_release(result.event()?),
+            State::ScheduleUsage => self.accept_usage_schedule(result.event()?),
+            State::ScheduleLiveDrain => self.accept_live_drain(result.event()?),
+            State::SchedulePromotion => self.accept_promotion_scheduled(result.event()?),
+            State::RegisterBlobDht => self.accept_blob_registration(result.event()?),
+            State::SendApplyComplete => self.accept_completion_sent(result.event()?),
+            State::CloseConnection => self.accept_connection_close(result.event()?),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        match self.applying {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
+        }
+    }
+
+    /// A failed run tells a waiting sender, deletes bytes no commit owns and closes the stream.
+    /// While the apply may have committed the copy stays and goes to reconciliation.
+    fn abort(&mut self) -> Vec<IoCall> {
+        if self.applying {
+            return Vec::new();
+        }
+        if self.state == IncomingVersionState::Apply {
+            self.keep_received();
+        }
+        let stream_id = self.stream_id;
+        let mut calls = Vec::new();
+        if self.outcome_unknown {
+            calls.extend(self.reconcile_call());
+            if let Some(received) = self.received_blob.as_ref() {
+                let id = received.location.ulid;
+                calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+            }
+        }
+        if self.owes_rejection() {
+            let reason = self.failure.take();
+            let reason = reason.unwrap_or_else(|| "version replication apply failed".to_string());
+            if let Ok(payload) = VersionReplicationMessage::VersionApplyRejected(reason).to_bytes()
+            {
+                let send = BlobEffect::SendMessage { stream_id, payload };
+                calls.push(Effect::Blob(send).into());
+            }
+        }
+        let cleanup = self.received_blob.as_mut();
+        if let Some(location) = cleanup.and_then(ReceivedBlob::take_cleanup) {
+            calls.push(Effect::Blob(BlobEffect::Delete { location }).into());
+        }
+        calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
+        calls
     }
 }
 
@@ -730,9 +795,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::ReadExistingVersion => "ReadExistingVersion",
             IncomingVersionState::ReadReplacedBlob => "ReadReplacedBlob",
             IncomingVersionState::ReadQuotaConfig => "ReadQuotaConfig",
-            IncomingVersionState::StartQuotaCheck => "StartQuotaCheck",
             IncomingVersionState::EnforceQuota => "EnforceQuota",
-            IncomingVersionState::FinishQuotaCheck => "FinishQuotaCheck",
             IncomingVersionState::ReadExistingBlob => "ReadExistingBlob",
             IncomingVersionState::ReadAbe => "ReadAbe",
             IncomingVersionState::CreateEnvelope => "CreateEnvelope",
@@ -740,7 +803,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::SendNegotiation => "SendNegotiation",
             IncomingVersionState::AwaitApproval => "AwaitApproval",
             IncomingVersionState::ReceiveBlob => "ReceiveBlob",
-            IncomingVersionState::StartTransaction => "StartTransaction",
+            IncomingVersionState::Apply => "Apply",
             IncomingVersionState::CheckPurgeFence => "CheckPurgeFence",
             IncomingVersionState::CheckDrift => "CheckDrift",
             IncomingVersionState::ReadPublicationRecord => "ReadPublicationRecord",
@@ -764,23 +827,17 @@ impl IncomingVersionOperation {
             IncomingVersionState::CheckCommitQuota => "CheckCommitQuota",
             IncomingVersionState::UpdateUsage => "UpdateUsage",
             IncomingVersionState::WriteCleanupRow => "WriteCleanupRow",
-            IncomingVersionState::CommitTransaction => "CommitTransaction",
             IncomingVersionState::ReleaseReservation => "ReleaseReservation",
             IncomingVersionState::ScheduleUsage => "ScheduleUsage",
             IncomingVersionState::ScheduleLiveDrain => "ScheduleLiveDrain",
             IncomingVersionState::SchedulePromotion => "SchedulePromotion",
-            IncomingVersionState::SendApplyRejected => "SendApplyRejected",
-            IncomingVersionState::AbortTransaction => "AbortTransaction",
-            IncomingVersionState::CleanupReceivedBlob => "CleanupReceivedBlob",
             IncomingVersionState::RegisterBlobDht => "RegisterBlobInDht",
             IncomingVersionState::SendApplyComplete => "SendApplyComplete",
             IncomingVersionState::CloseConnection => "CloseConnection",
-            IncomingVersionState::Finish => "Finish",
-            IncomingVersionState::Error => "Error",
         }
     }
 
-    fn reject_negotiation(&mut self, err: IncomingVersionError) -> Effects {
+    fn reject_negotiation(&mut self, err: IncomingVersionError) -> Turn {
         debug!(
             bucket = %self.manifest.bucket,
             key = %self.manifest.key,
@@ -790,7 +847,7 @@ impl IncomingVersionOperation {
             "Rejecting incoming version replication negotiation"
         );
         let reason = err.to_string();
-        self.output = Some(Ok(self.result(false)));
+        self.output = Some(self.result(false));
         self.send_negotiation(ReplicationNegotiationResult::Rejected(reason))
     }
 
@@ -801,7 +858,7 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn fail(&mut self, err: IncomingVersionError) -> Effects {
+    fn fail(&mut self, err: IncomingVersionError) -> Turn {
         debug!(
             bucket = %self.manifest.bucket,
             key = %self.manifest.key,
@@ -811,30 +868,37 @@ impl IncomingVersionOperation {
             error = %err,
             "Incoming version replication failed"
         );
-        let should_reject = matches!(
-            self.negotiation_result,
-            Some(
-                ReplicationNegotiationResult::NeedVersionOnly
-                    | ReplicationNegotiationResult::NeedBlobVersion
-                    | ReplicationNegotiationResult::NeedSealedBlob(_)
-                    | ReplicationNegotiationResult::NeedAbeBlob(..)
-            )
-        ) && !self.apply_committed
-            && !matches!(
-                self.state,
-                IncomingVersionState::SendApplyRejected
-                    | IncomingVersionState::AbortTransaction
-                    | IncomingVersionState::CleanupReceivedBlob
-                    | IncomingVersionState::CloseConnection
-                    | IncomingVersionState::Error
-            );
-        self.output = Some(Err(err));
-        if should_reject {
-            self.send_apply_rejected()
-        } else {
-            self.state = IncomingVersionState::Error;
-            self.abort()
-        }
+        self.failure = Some(err.to_string());
+        Err(err)
+    }
+
+    fn invalid(&mut self, expected: &'static str, received: &'static str) -> Turn {
+        self.fail(IncomingVersionError::InvalidStateEvent {
+            state: self.state_name(),
+            expected,
+            received,
+        })
+    }
+
+    fn call(&mut self, state: IncomingVersionState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn read(&mut self, state: IncomingVersionState, space: &str, key: impl Into<Key>) -> Turn {
+        self.call(state, read_row(space, key))
+    }
+
+    fn reads(&mut self, state: IncomingVersionState, reads: Vec<(String, Key)>) -> Turn {
+        self.call(state, IoCall::Read(reads))
+    }
+
+    fn write(&mut self, state: IncomingVersionState, rows: Vec<(String, Key, Value)>) -> Turn {
+        self.call(state, IoCall::Write(rows))
+    }
+
+    fn blob(&mut self, state: IncomingVersionState, effect: BlobEffect) -> Turn {
+        self.call(state, Effect::Blob(effect).into())
     }
 
     fn version_key_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1067,7 +1131,8 @@ impl IncomingVersionOperation {
             .ok_or(IncomingVersionError::MissingBlobInfo)
     }
 
-    fn prepare_head_transition(&mut self) -> Effects {
+    /// The head row of the transition, with the hash index of a current materialized version.
+    fn prepare_head_transition(&mut self) -> Turn {
         let context = match self.alias_context() {
             Ok(context) => context,
             Err(err) => return self.fail(err),
@@ -1077,29 +1142,50 @@ impl IncomingVersionOperation {
             None => (None, None),
         };
         self.installed_head = pointer.clone();
-        let effects = match build_transition_effects(&context, pointer, current_hash, self.txn_id) {
-            Ok(effects) => effects,
+        let head_key = match context.head_key().to_bytes() {
+            Ok(key) => Key::from(key),
             Err(err) => return self.fail(err.into()),
         };
-
-        self.head_transition_effects = effects.into_iter().collect();
-        self.state = IncomingVersionState::ApplyHeadTransition;
-        self.emit_head_transition()
+        let Some(pointer) = pointer else {
+            let delete = vec![(BLOB_HEAD_KEYSPACE.to_string(), head_key)];
+            return self.call(
+                IncomingVersionState::ApplyHeadTransition,
+                IoCall::Delete(delete),
+            );
+        };
+        let head = match pointer.to_bytes() {
+            Ok(value) => value,
+            Err(err) => return self.fail(err.into()),
+        };
+        let mut rows = vec![(BLOB_HEAD_KEYSPACE.to_string(), head_key, head.into())];
+        if let Some(hash) = current_hash {
+            match self.index_row(&context, hash) {
+                Ok(row) => rows.push(row),
+                Err(err) => return self.fail(err),
+            }
+        }
+        self.write(IncomingVersionState::ApplyHeadTransition, rows)
     }
 
-    fn emit_head_transition(&mut self) -> Effects {
-        if let Some(effect) = self.head_transition_effects.pop_front() {
-            return smallvec![effect];
-        }
-
-        self.write_version()
+    fn index_row(
+        &self,
+        context: &HeadAliasContext,
+        hash: [u8; 32],
+    ) -> Result<(String, Key, Value), IncomingVersionError> {
+        let key = context.path_index_key(hash, self.manifest.version_id);
+        let key = key.to_bytes()?.into();
+        Ok((PATHS_INDEX_KEYSPACE.to_string(), key, Vec::new().into()))
     }
 
     /// Reads the bucket with its encryption settings, so an encrypting bucket captures its seal
     /// plan before any byte arrives.
-    fn read_destination_bucket(&mut self) -> Effects {
-        self.state = IncomingVersionState::ReadDestinationBucket;
-        smallvec![settings_read(&self.manifest.bucket, None)]
+    fn read_destination_bucket(&mut self) -> Turn {
+        let key: Key = self.manifest.bucket.as_bytes().to_vec().into();
+        let reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+        ];
+        self.reads(IncomingVersionState::ReadDestinationBucket, reads)
     }
 
     fn destination_bucket_info(&self) -> BucketInfo {
@@ -1116,34 +1202,40 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn create_destination_bucket(&mut self) -> Effects {
+    fn create_destination_bucket(&mut self) -> Turn {
         self.create_attempted = true;
-        self.state = IncomingVersionState::CreateDestinationBucket;
-        smallvec![Effect::SubOperation(boxed_suboperation(
+        let child = boxed_suboperation(
             CreateBucketOperation::new(
                 self.manifest.bucket.clone(),
-                self.destination_bucket_info()
+                self.destination_bucket_info(),
             ),
-            |result| Event::SubOperation(SubOperationEvent::BucketCreated {
-                result: match result {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(err.to_string()),
-                },
-            }),
-        ))]
+            |result| {
+                Event::SubOperation(SubOperationEvent::BucketCreated {
+                    result: match result {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(err.to_string()),
+                    },
+                })
+            },
+        );
+        self.call(
+            IncomingVersionState::CreateDestinationBucket,
+            IoCall::Child(child),
+        )
     }
 
     /// The receiver's own group default and registered backend ids, loaded once
     /// the destination group is known so that the existing-copy probe and the
     /// transfer resolve the destination from identical inputs.
-    fn load_destination_routing(&mut self) -> Effects {
-        self.state = IncomingVersionState::LoadDestinationRouting;
-        smallvec![load_group_inputs(
-            self.destination_group_id.unwrap_or(self.manifest.group_id)
-        )]
+    fn load_destination_routing(&mut self) -> Turn {
+        let group_id = self.destination_group_id.unwrap_or(self.manifest.group_id);
+        self.call(
+            IncomingVersionState::LoadDestinationRouting,
+            load_group_inputs(group_id).into(),
+        )
     }
 
-    fn check_permissions(&mut self, group_id: Ulid) -> Effects {
+    fn check_permissions(&mut self, group_id: Ulid) -> Turn {
         if self.manifest.distribution.is_some() {
             return self.read_publication_record(false);
         }
@@ -1163,41 +1255,38 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn read_existing_version(&mut self) -> Effects {
-        self.state = IncomingVersionState::ReadExistingVersion;
+    fn read_existing_version(&mut self) -> Turn {
         let key = match self.version_key_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        self.read(
+            IncomingVersionState::ReadExistingVersion,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+        )
     }
 
-    fn read_replaced_blob(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = IncomingVersionState::ReadReplacedBlob;
-        smallvec![blob_location_read(&key, None)]
+    fn read_replaced_blob(&mut self, key: BlobLocationKey) -> Turn {
+        self.read(
+            IncomingVersionState::ReadReplacedBlob,
+            BLOB_LOCATIONS_KEYSPACE,
+            key.to_bytes(),
+        )
     }
 
-    fn read_quota_config(&mut self) -> Effects {
-        self.state = IncomingVersionState::ReadQuotaConfig;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: DocumentTarget::RealmConfig {
-                realm_id: self.local_realm_id,
-            }
-            .storage_keyspace()
-            .to_string(),
-            key: DocumentTarget::RealmConfig {
-                realm_id: self.local_realm_id,
-            }
-            .storage_key(),
-            txn_id: None,
-        })]
+    fn read_quota_config(&mut self) -> Turn {
+        let target = DocumentTarget::RealmConfig {
+            realm_id: self.local_realm_id,
+        };
+        self.read(
+            IncomingVersionState::ReadQuotaConfig,
+            target.storage_keyspace(),
+            target.storage_key(),
+        )
     }
 
-    fn start_quota_check(&mut self, ceiling: u64) -> Effects {
+    fn start_quota_check(&mut self, ceiling: u64) -> Turn {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionError::DestinationNotFound);
         };
@@ -1207,32 +1296,22 @@ impl IncomingVersionOperation {
         }
         .saturating_sub(self.replaced_logical_bytes);
         self.quota_ceiling = Some(ceiling);
-        self.quota_gate = Some(QuotaGate::new_for_realm(
+        let gate = QuotaGate::new_for_realm(
             ceiling,
             logical_bytes,
             group_id,
             self.local_node_id,
             self.local_realm_id,
-        ));
-        self.state = IncomingVersionState::StartQuotaCheck;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true,
-        })]
-    }
-
-    fn finish_quota_check(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
-        self.state = IncomingVersionState::FinishQuotaCheck;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        self.call(
+            IncomingVersionState::EnforceQuota,
+            IoCall::child(QuotaProbe { gate }),
+        )
     }
 
     /// Asks only about the backend this node would route the blob to: a copy on
     /// any other backend cannot satisfy the destination placement.
-    fn read_existing_blob(&mut self) -> Effects {
+    fn read_existing_blob(&mut self) -> Turn {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionError::MissingBlobInfo);
         };
@@ -1258,27 +1337,22 @@ impl IncomingVersionOperation {
         if self.seal_plan.is_some() {
             return self.request_blob_version();
         }
-        self.state = IncomingVersionState::ReadExistingBlob;
-        smallvec![blob_location_read(
-            // Only a copy in this node's own encoding for the bucket can be reused.
-            &BlobLocationKey::new(hash, self.destination_compression.into(), backend),
-            None
-        )]
+        // Only a copy in this node's own encoding for the bucket can be reused.
+        let key = BlobLocationKey::new(hash, self.destination_compression.into(), backend);
+        self.read(
+            IncomingVersionState::ReadExistingBlob,
+            BLOB_LOCATIONS_KEYSPACE,
+            key.to_bytes(),
+        )
     }
 
     /// The only negotiation result that stores bytes, so the destination's cap
     /// is answered here rather than at the probe that keys the deduplication.
-    fn request_blob_version(&mut self) -> Effects {
+    fn request_blob_version(&mut self) -> Turn {
         match self.destination_full.take() {
             Some(error) => self.reject_negotiation(IncomingVersionError::RoutingFailed(error)),
             None => match self.seal_plan {
-                Some(plan) => {
-                    self.state = IncomingVersionState::ReadAbe;
-                    smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: abe_reads(plan.key),
-                        txn_id: None,
-                    })]
-                }
+                Some(plan) => self.reads(IncomingVersionState::ReadAbe, abe_reads(plan.key)),
                 None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion),
             },
         }
@@ -1286,58 +1360,42 @@ impl IncomingVersionOperation {
 
     /// Admitted ABE parameters give the replica its own object key and envelope before the
     /// transfer; a generation without them keeps bucket-only grants.
-    fn accept_abe(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_abe(&mut self, values: Vec<Option<Value>>) -> Turn {
         let Some(plan) = self.seal_plan else {
             return self.fail(IncomingVersionError::StalePlan);
         };
-        if values
-            .first()
-            .is_some_and(|(_, parameters)| parameters.is_none())
-        {
+        if values.first().is_some_and(Option::is_none) {
             return self.send_negotiation(ReplicationNegotiationResult::NeedSealedBlob(plan));
         }
-        let (parameters, epoch) = match parse_abe(&values, plan.key) {
+        let (parameters, epoch) = match parse_abe(&keyed(&values), plan.key) {
             Ok(parsed) => parsed,
             Err(error) => return self.reject_negotiation(BlobError::from(error).into()),
         };
-        self.state = IncomingVersionState::CreateEnvelope;
-        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
-            AbeEffect::Envelope(EnvelopePlan {
-                parameters,
-                epoch,
-                write_id: Ulid::generate(),
-                object_key: self.manifest.key.clone(),
-                bucket_public: plan.public_key,
-            })
-        )))]
+        let envelope = AbeEffect::Envelope(EnvelopePlan {
+            parameters,
+            epoch,
+            write_id: Ulid::generate(),
+            object_key: self.manifest.key.clone(),
+            bucket_public: plan.public_key,
+        });
+        self.blob(
+            IncomingVersionState::CreateEnvelope,
+            BlobEffect::Abe(Box::new(envelope)),
+        )
     }
 
-    fn accept_envelope(&mut self, event: Event) -> Effects {
+    fn accept_envelope(&mut self, event: Event) -> Turn {
         let envelope = match event {
             Event::Blob(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Envelope(envelope) => envelope,
                 event => {
-                    return self.fail(IncomingVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "AbeEvent::Envelope",
-                        received: (Event::Blob(BlobEvent::Abe(Box::new(event)))).label(),
-                    });
+                    let received = Event::Blob(BlobEvent::Abe(Box::new(event))).label();
+                    return self.invalid("AbeEvent::Envelope", received);
                 }
             },
             Event::Blob(BlobEvent::Error(error)) => return self.reject_negotiation(error.into()),
             event => {
-                return self.fail(IncomingVersionError::InvalidStateEvent {
-                    state: self.state_name(),
-                    expected: "Event::Blob(BlobEvent::Abe)",
-                    received: event.label(),
-                });
+                return self.invalid("Event::Blob(BlobEvent::Abe)", event.label());
             }
         };
         let Some(plan) = self.seal_plan else {
@@ -1361,7 +1419,7 @@ impl IncomingVersionOperation {
 
     /// Nothing is admitted before the destination is evaluated: the reply that
     /// invites bytes is itself behind the gate.
-    fn send_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
+    fn send_negotiation(&mut self, result: ReplicationNegotiationResult) -> Turn {
         // A rejection invites no bytes, so it is not gated. Gating it would
         // re-enter the gate from its own denial and never terminate.
         if matches!(
@@ -1394,32 +1452,19 @@ impl IncomingVersionOperation {
             Ok(None) => self.reply_negotiation(result),
             Ok(Some(gate)) => {
                 self.pending_negotiation = Some(result);
-                self.state = IncomingVersionState::PolicyGate;
-                let child =
-                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
-                smallvec![Effect::SubOperation(child)]
+                self.call(IncomingVersionState::PolicyGate, IoCall::child(gate))
             }
             Err(error) => self.reject_negotiation(error.into()),
         }
     }
 
-    fn accept_policy_gate(&mut self, event: Event) -> Effects {
-        let Event::Child(outcome) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "the placement gate outcome",
-                received: event.label(),
-            });
-        };
+    fn accept_policy_gate(&mut self, outcome: Result<PolicyGateOutcome, ReadPolicyError>) -> Turn {
         let Some(result) = self.pending_negotiation.take() else {
             return self.fail(IncomingVersionError::GateNotPending);
         };
-        let outcome = match outcome.take::<PolicyGateOutcome, ReadPolicyError>() {
-            Some(Ok(outcome)) => outcome,
-            Some(Err(error)) => {
-                return self.reject_negotiation(PolicyGateError::from(error).into());
-            }
-            None => return self.fail(PolicyGateError::InvalidEvent.into()),
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return self.reject_negotiation(PolicyGateError::from(error).into()),
         };
         match gate_decision(outcome) {
             Ok(()) => self.reply_negotiation(result),
@@ -1427,50 +1472,125 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn reply_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
+    fn reply_negotiation(&mut self, result: ReplicationNegotiationResult) -> Turn {
         self.negotiation_result = Some(result.clone());
-        self.state = IncomingVersionState::SendNegotiation;
         let payload = match VersionReplicationMessage::VersionNegotiationResponse(result).to_bytes()
         {
             Ok(payload) => payload,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
-            stream_id: self.stream_id,
-            payload,
-        })]
+        let stream_id = self.stream_id;
+        self.blob(
+            IncomingVersionState::SendNegotiation,
+            BlobEffect::SendMessage { stream_id, payload },
+        )
     }
 
-    fn receive_blob(&mut self) -> Effects {
+    fn receive_blob(&mut self) -> Turn {
         // The receiver routes with its own snapshot; the sender's stamped
         // backend crossed the wire but is ignored.
         let resolved = match self.resolve_destination() {
             Ok(resolved) => resolved.with_encryption(self.seal_plan),
             Err(error) => return self.fail(error),
         };
-        self.state = IncomingVersionState::ReceiveBlob;
-        smallvec![Effect::Blob(BlobEffect::HandleReplication {
+        let receive = BlobEffect::HandleReplication {
             replication_id: None,
             stream_id: self.stream_id,
             resolved,
             keep_alive: true,
             object: self.envelope.as_ref().map(|e| e.context.public_key),
-        })]
+        };
+        self.blob(IncomingVersionState::ReceiveBlob, receive)
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.state = IncomingVersionState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    /// The apply runs as a child, in one write transaction of its own.
+    fn start_apply(&mut self) -> Turn {
+        let child = IoCall::child(self.apply_child());
+        self.call(IncomingVersionState::Apply, child)
     }
 
-    fn check_purge_fence(&mut self) -> Effects {
-        self.state = IncomingVersionState::CheckPurgeFence;
-        smallvec![write_fence_read(&self.manifest.bucket, self.txn_id)]
+    fn apply_child(&self) -> Self {
+        Self {
+            applying: true,
+            publisher_node_id: self.publisher_node_id,
+            clock: self.clock,
+            destination_group_id: self.destination_group_id,
+            destination_compression: self.destination_compression,
+            destination_bound: self.destination_bound,
+            destination_binding: self.destination_binding.clone(),
+            quota_ceiling: self.quota_ceiling,
+            existing_blob_location: self.existing_blob_location.clone(),
+            replaced_version: self.replaced_version.clone(),
+            existing_marker: self.existing_marker,
+            advance_version_exists: self.advance_version_exists,
+            received_blob: self.received_blob.clone(),
+            replaced_logical_bytes: self.replaced_logical_bytes,
+            replaced_reference_bytes: self.replaced_reference_bytes,
+            rocrate_limits: self.rocrate_limits.clone(),
+            gated_refs: self.gated_refs.clone(),
+            gated_bucket: self.gated_bucket.clone(),
+            seal_plan: self.seal_plan,
+            envelope: self.envelope.clone(),
+            ..Self::new(
+                self.stream_id,
+                self.local_node_id,
+                self.local_realm_id,
+                self.manifest.clone(),
+            )
+        }
     }
 
-    fn read_replaced_metadata(&mut self) -> Effects {
+    /// The apply committed, or failed; an error that does not prove the commit never landed
+    /// leaves the received copy to reconciliation.
+    fn accept_applied(
+        &mut self,
+        applied: Result<IncomingVersionResult, IncomingVersionError>,
+    ) -> Turn {
+        if let Err(error) = applied {
+            if let IncomingVersionError::StorageError(storage) = &error
+                && !storage.proves_no_commit()
+            {
+                self.keep_received();
+            }
+            return self.fail(error);
+        }
+        if let Some(received) = self.received_blob.as_mut() {
+            received.cleanup_on_abort = false;
+        }
+        self.apply_committed = true;
+        debug!(
+            bucket = %self.manifest.bucket,
+            key = %self.manifest.key,
+            version_id = %self.manifest.version_id,
+            stream_id = %self.stream_id,
+            kind = ?self.manifest.kind,
+            "Committed incoming replication transaction"
+        );
+        match self.received_blob.as_ref().map(|it| it.location.ulid) {
+            Some(id) => {
+                self.release_id = Some(id);
+                self.blob(
+                    IncomingVersionState::ReleaseReservation,
+                    BlobEffect::ReleaseReservation { id },
+                )
+            }
+            None => self.call(
+                IncomingVersionState::ScheduleUsage,
+                schedule_snapshot_publish().into(),
+            ),
+        }
+    }
+
+    fn check_purge_fence(&mut self) -> Turn {
+        let key = fence_key(&self.manifest.bucket);
+        self.read(
+            IncomingVersionState::CheckPurgeFence,
+            PURGE_FENCE_KEYSPACE,
+            key,
+        )
+    }
+
+    fn read_replaced_metadata(&mut self) -> Turn {
         if self.replaced_version.is_none() {
             return self.write_hash_lookup();
         }
@@ -1478,31 +1598,33 @@ impl IncomingVersionOperation {
             Ok(prefix) => prefix.into(),
             Err(error) => return self.fail(error.into()),
         };
-        self.state = IncomingVersionState::ReadReplacedMetadata;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start: None,
+        let scan = IoCall::Page {
+            space: OBJECT_METADATA_KEYSPACE.to_string(),
+            prefix,
+            after: None,
             limit: 10_000,
-            txn_id: self.txn_id,
-        })]
+        };
+        self.call(IncomingVersionState::ReadReplacedMetadata, scan)
     }
 
     /// Re-reads the details the negotiation gate decided on, inside the very
     /// transaction that exposes the replica.
-    fn check_drift(&mut self) -> Effects {
-        self.state = IncomingVersionState::CheckDrift;
-        let mut effect = drift_reads(&self.manifest.bucket, self.txn_id);
-        // Encryption enabled since the negotiation must still refuse the replica.
-        if let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = &mut effect {
-            let key = self.manifest.bucket.as_bytes().to_vec().into();
-            reads.push((BUCKET_ENCRYPTION_KEYSPACE.to_string(), key));
-            // The envelope is published only under the parameters and epoch read here.
-            if let (Some(plan), Some(_)) = (self.seal_plan, &self.envelope) {
-                reads.extend(abe_reads(plan.key));
-            }
+    fn check_drift(&mut self) -> Turn {
+        let bucket: Key = self.manifest.bucket.as_bytes().to_vec().into();
+        let mut reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+            // Encryption enabled since the negotiation must still refuse the replica.
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
+        ];
+        // The envelope is published only under the parameters and epoch read here.
+        if let (Some(plan), Some(_)) = (self.seal_plan, &self.envelope) {
+            reads.extend(abe_reads(plan.key));
         }
-        smallvec![effect]
+        self.reads(IncomingVersionState::CheckDrift, reads)
     }
 
     /// Why this replica lands here, from what this node itself observed: an
@@ -1529,23 +1651,19 @@ impl IncomingVersionOperation {
             .unwrap_or_default()
     }
 
-    fn verify_replaced(&mut self) -> Effects {
+    fn verify_replaced(&mut self) -> Turn {
         let key = match self.version_key_bytes() {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = IncomingVersionState::VerifyReplaced;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        self.read(
+            IncomingVersionState::VerifyReplaced,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+        )
     }
 
-    fn delete_replaced_metadata(
-        &mut self,
-        values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
-    ) -> Effects {
+    fn delete_replaced_metadata(&mut self, values: Vec<(Key, Value)>) -> Turn {
         let mut deletes = Vec::with_capacity(values.len() + 2);
         let summary_key = match MultipartObjectKey::summary(self.manifest.version_id).to_bytes() {
             Ok(key) => key.into(),
@@ -1576,11 +1694,10 @@ impl IncomingVersionOperation {
             };
             deletes.push((PATHS_INDEX_KEYSPACE.to_string(), key));
         }
-        self.state = IncomingVersionState::DeleteReplacedMetadata;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: self.txn_id,
-        })]
+        self.call(
+            IncomingVersionState::DeleteReplacedMetadata,
+            IoCall::Delete(deletes),
+        )
     }
 
     /// The copy the replaced version named, once the replacement stops naming
@@ -1597,7 +1714,7 @@ impl IncomingVersionOperation {
         })
     }
 
-    fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
+    fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Turn {
         let candidate = ReclaimCandidate {
             enqueued_at: self.clock.now(),
         };
@@ -1605,13 +1722,12 @@ impl IncomingVersionOperation {
             Ok(value) => value,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = IncomingVersionState::WriteReclaimCandidate;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
-            key: key.to_bytes().into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        let row = (
+            BLOB_RECLAIM_KEYSPACE.to_string(),
+            key.to_bytes().into(),
+            value.into(),
+        );
+        self.write(IncomingVersionState::WriteReclaimCandidate, vec![row])
     }
 
     fn effective_materialized_location(&self) -> Result<BackendLocation, IncomingVersionError> {
@@ -1684,8 +1800,7 @@ impl IncomingVersionOperation {
     fn archive_rows(
         &self,
         location: &BackendLocation,
-    ) -> Result<Vec<(String, aruna_core::types::Key, aruna_core::types::Value)>, IncomingVersionError>
-    {
+    ) -> Result<Vec<(String, Key, Value)>, IncomingVersionError> {
         let archive = ArchiveKey::of(location);
         let version = VersionKey::new(
             &self.manifest.bucket,
@@ -1733,7 +1848,7 @@ impl IncomingVersionOperation {
         Ok(rows)
     }
 
-    fn write_hash_lookup(&mut self) -> Effects {
+    fn write_hash_lookup(&mut self) -> Turn {
         if self.is_reference_item() {
             return self.write_object_lookup();
         }
@@ -1750,13 +1865,16 @@ impl IncomingVersionOperation {
         self.begin_blob_location()
     }
 
-    fn begin_blob_location(&mut self) -> Effects {
+    fn begin_blob_location(&mut self) -> Turn {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup();
         };
-        if let Some(effect) = fence_backend(&location.backend, self.txn_id) {
-            self.state = IncomingVersionState::FenceBackend;
-            return smallvec![effect];
+        if let BackendRef::Group(backend_id) = location.backend {
+            return self.read(
+                IncomingVersionState::FenceBackend,
+                STORAGE_BACKEND_KEYSPACE,
+                backend_key(backend_id),
+            );
         }
         self.verify_existing_blob()
     }
@@ -1764,7 +1882,7 @@ impl IncomingVersionOperation {
     /// A negotiation that adopted an existing copy read it outside the
     /// transaction. Re-reading it inside makes the commit fail rather than
     /// leave the version naming bytes another writer has since removed.
-    fn verify_existing_blob(&mut self) -> Effects {
+    fn verify_existing_blob(&mut self) -> Turn {
         if self.received_blob.is_some() {
             return self.write_blob_location();
         }
@@ -1778,14 +1896,15 @@ impl IncomingVersionOperation {
             Ok(hash) => hash,
             Err(err) => return self.fail(ConversionError::from(err).into()),
         };
-        self.state = IncomingVersionState::VerifyExistingBlob;
-        smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, location.format.encoding(), location.backend),
-            self.txn_id
-        )]
+        let key = BlobLocationKey::new(hash, location.format.encoding(), location.backend);
+        self.read(
+            IncomingVersionState::VerifyExistingBlob,
+            BLOB_LOCATIONS_KEYSPACE,
+            key.to_bytes(),
+        )
     }
 
-    fn write_blob_location(&mut self) -> Effects {
+    fn write_blob_location(&mut self) -> Turn {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup();
         };
@@ -1794,32 +1913,29 @@ impl IncomingVersionOperation {
                 Ok(writes) => writes,
                 Err(error) => return self.fail(error),
             };
-            self.state = IncomingVersionState::WriteBlobLocation;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: self.txn_id,
-            })];
+            return self.write(IncomingVersionState::WriteBlobLocation, writes);
         }
         let Some(blake3_hash) = location.get_blake3() else {
             return self.write_object_lookup();
         };
-
-        self.state = IncomingVersionState::WriteBlobLocation;
-        let effect = match write_location_effect(
-            match blake3_hash.try_into() {
-                Ok(hash) => hash,
-                Err(err) => return self.fail(ConversionError::from(err).into()),
-            },
-            location,
-            self.txn_id,
-        ) {
-            Ok(effect) => effect,
+        let hash: [u8; 32] = match blake3_hash.try_into() {
+            Ok(hash) => hash,
+            Err(err) => return self.fail(ConversionError::from(err).into()),
+        };
+        let key = BlobLocationKey::new(hash, location.format.encoding(), location.backend.clone());
+        let value = match location.to_bytes() {
+            Ok(value) => value,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![effect]
+        let row = (
+            BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key.to_bytes().into(),
+            value.into(),
+        );
+        self.write(IncomingVersionState::WriteBlobLocation, vec![row])
     }
 
-    fn write_object_lookup(&mut self) -> Effects {
+    fn write_object_lookup(&mut self) -> Turn {
         if !self.manifest.current_version {
             // The head may still name the replaced row, whose liveness then changes.
             let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
@@ -1837,33 +1953,26 @@ impl IncomingVersionOperation {
         self.read_head(IncomingVersionState::ReadObjectLookup)
     }
 
-    fn read_head(&mut self, state: IncomingVersionState) -> Effects {
-        self.state = state;
+    fn read_head(&mut self, state: IncomingVersionState) -> Turn {
         let key = match BlobHeadKey::new(&self.manifest.bucket, &self.manifest.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        self.read(state, BLOB_HEAD_KEYSPACE, key)
     }
 
-    fn read_current(&mut self, version_id: Ulid) -> Effects {
-        self.state = IncomingVersionState::ReadCurrentVersion;
+    fn read_current(&mut self, version_id: Ulid) -> Turn {
         let key = match VersionKey::new(&self.manifest.bucket, &self.manifest.key, version_id)
             .to_bytes()
         {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        self.read(
+            IncomingVersionState::ReadCurrentVersion,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+        )
     }
 
     /// The liveness change of a replaced row the head names while the head stays: a version
@@ -1879,14 +1988,7 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_named_head(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_named_head(&mut self, value: Option<Value>) -> Turn {
         let head = value.as_deref().map(CurrentVersionPointer::from_bytes);
         match head.transpose() {
             Ok(head) => {
@@ -1897,13 +1999,13 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn apply_liveness(&mut self, previous_live: bool) -> Effects {
+    fn apply_liveness(&mut self, previous_live: bool) -> Turn {
         let next_live = self.manifest.kind == ReplicationItemKind::Materialized;
         self.object_delta = i128::from(u8::from(next_live)) - i128::from(u8::from(previous_live));
         self.prepare_head_transition()
     }
 
-    fn write_compared_object(&mut self, existing: Option<&[u8]>) -> Effects {
+    fn write_compared_object(&mut self, existing: Option<&[u8]>) -> Turn {
         let Some(incoming_generation) = self.manifest.current_version_generation else {
             return self.write_version();
         };
@@ -1973,7 +2075,7 @@ impl IncomingVersionOperation {
 
     /// Continues exactly where `write_compared_object` left off; the
     /// stored pointers carry the decision, so no continuation state is needed.
-    fn resume_head_transition(&mut self) -> Effects {
+    fn resume_head_transition(&mut self) -> Turn {
         if self.pending_head.is_none() {
             return self.write_version();
         }
@@ -1983,7 +2085,7 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn write_version(&mut self) -> Effects {
+    fn write_version(&mut self) -> Turn {
         self.write_blob_version()
     }
 
@@ -2006,86 +2108,75 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn write_blob_version(&mut self) -> Effects {
-        self.state = IncomingVersionState::WriteBlobVersion;
+    fn write_blob_version(&mut self) -> Turn {
+        match self.version_rows() {
+            Ok(rows) => self.write(IncomingVersionState::WriteBlobVersion, rows),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn copy_registration<'a>(
+        &'a self,
+        version: VersionKey,
+        location: &'a BackendLocation,
+    ) -> CopyRegistration<'a> {
+        CopyRegistration {
+            version,
+            node_id: self.local_node_id,
+            location,
+            policies: &self.gated_refs,
+            origin: self.copy_origin(),
+            subject_generation: self.stored_subject(),
+            registered_at_ms: self.manifest.version_id.timestamp_ms(),
+        }
+    }
+
+    /// The version and every row that commits with it, written in one call.
+    fn version_rows(&mut self) -> Result<Vec<(String, Key, Value)>, IncomingVersionError> {
         let version_key = VersionKey::new(
             &self.manifest.bucket,
             &self.manifest.key,
             self.manifest.version_id,
         );
+        let mut extra = Vec::new();
         let (version, materialized_hash) = match self.manifest.kind {
+            ReplicationItemKind::Materialized if self.is_reference_item() => {
+                let version = self.reference_version()?;
+                (version.with_policies(self.gated_refs.clone())?, None)
+            }
+            ReplicationItemKind::Materialized if self.pending_replica() => {
+                let location = self.effective_materialized_location()?;
+                let pending = BlobVersion::pending(
+                    ArchiveKey::of(&location),
+                    self.manifest.created_at,
+                    self.manifest.created_by,
+                    self.manifest.source.clone(),
+                )
+                .with_metadata(self.manifest.metadata.clone())
+                .with_publisher(self.publisher_node_id)
+                .with_policies(self.gated_refs.clone())?;
+                // No hash alias and no DHT entry until promotion verified the claimed hash.
+                let copy = self.copy_registration(version_key.clone(), &location);
+                extra.push(register_entry(copy)?);
+                (pending, None)
+            }
             ReplicationItemKind::Materialized => {
-                if self.is_reference_item() {
-                    let version = match self
-                        .reference_version()
-                        .and_then(|version| Ok(version.with_policies(self.gated_refs.clone())?))
-                    {
-                        Ok(version) => version,
-                        Err(error) => return self.fail(error),
-                    };
-                    (version, None)
-                } else if self.pending_replica() {
-                    let Ok(location) = self.effective_materialized_location() else {
-                        return self.fail(IncomingVersionError::MissingBlobLocation);
-                    };
-                    let pending = match BlobVersion::pending(
-                        ArchiveKey::of(&location),
-                        self.manifest.created_at,
-                        self.manifest.created_by,
-                        self.manifest.source.clone(),
-                    )
-                    .with_metadata(self.manifest.metadata.clone())
-                    .with_publisher(self.publisher_node_id)
-                    .with_policies(self.gated_refs.clone())
-                    {
-                        Ok(pending) => pending,
-                        Err(err) => return self.fail(err.into()),
-                    };
-                    // No hash alias and no DHT entry until promotion verified the claimed hash.
-                    match register_effect(
-                        CopyRegistration {
-                            version: version_key.clone(),
-                            node_id: self.local_node_id,
-                            location: &location,
-                            policies: &self.gated_refs,
-                            origin: self.copy_origin(),
-                            subject_generation: self.stored_subject(),
-                            registered_at_ms: self.manifest.version_id.timestamp_ms(),
-                        },
-                        self.txn_id,
-                    ) {
-                        Ok(register) => self.pending_version_effects.push_back(register),
-                        Err(err) => return self.fail(err.into()),
-                    }
-                    (pending, None)
-                } else {
-                    let Ok(location) = self.effective_materialized_location() else {
-                        return self.fail(IncomingVersionError::MissingBlobLocation);
-                    };
-                    let Some(blake3_hash) = location.get_blake3() else {
-                        return self.fail(IncomingVersionError::MissingBlobLocation);
-                    };
-                    let hash: [u8; 32] = match blake3_hash.try_into() {
-                        Ok(hash) => hash,
-                        Err(err) => return self.fail(ConversionError::from(err).into()),
-                    };
-                    let materialized = match BlobVersion::materialized(
-                        hash,
-                        location.backend.clone(),
-                        location.format.encoding(),
-                        self.manifest.created_at,
-                        self.manifest.created_by,
-                        self.manifest.source.clone(),
-                    )
-                    .with_metadata(self.manifest.metadata.clone())
-                    .with_publisher(self.publisher_node_id)
-                    .with_policies(self.gated_refs.clone())
-                    {
-                        Ok(materialized) => materialized,
-                        Err(err) => return self.fail(err.into()),
-                    };
-                    (materialized, Some(hash))
-                }
+                let location = self.effective_materialized_location()?;
+                let blake3_hash = location.get_blake3();
+                let blake3_hash = blake3_hash.ok_or(IncomingVersionError::MissingBlobLocation)?;
+                let hash: [u8; 32] = blake3_hash.try_into().map_err(ConversionError::from)?;
+                let materialized = BlobVersion::materialized(
+                    hash,
+                    location.backend.clone(),
+                    location.format.encoding(),
+                    self.manifest.created_at,
+                    self.manifest.created_by,
+                    self.manifest.source.clone(),
+                )
+                .with_metadata(self.manifest.metadata.clone())
+                .with_publisher(self.publisher_node_id)
+                .with_policies(self.gated_refs.clone())?;
+                (materialized, Some(hash))
             }
             ReplicationItemKind::DeleteMarker => (
                 BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by)
@@ -2098,84 +2189,36 @@ impl IncomingVersionOperation {
         self.written_identity = logical_identity(&version);
         self.written_pending = matches!(version.state, BlobVersionState::PendingContent { .. });
         // A member stores the binding compact too, with the root record it names.
-        let (version, root) = match compact_version(version) {
-            Ok(compacted) => compacted,
-            Err(err) => return self.fail(err.into()),
-        };
+        let (version, root) = compact_version(version)?;
+        let mut rows = vec![(
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            version_key.to_bytes()?.into(),
+            version.to_bytes()?.into(),
+        )];
+        rows.append(&mut extra);
         if let Some(root) = root {
-            match root_write(&root) {
-                Ok((key_space, key, value)) => {
-                    let write = StorageEffect::Write {
-                        key_space,
-                        key,
-                        value,
-                        txn_id: self.txn_id,
-                    };
-                    self.pending_version_effects
-                        .push_back(Effect::Storage(write));
-                }
-                Err(err) => return self.fail(err.into()),
-            }
+            rows.push(root_write(&root)?);
         }
-        let effect = match write_version_effect(&version_key, &version, self.txn_id) {
-            Ok(effect) => effect,
-            Err(err) => return self.fail(err.into()),
-        };
         // A member keeps the receipt of a pulled version, so a later coordinator answers replays.
-        if let Some(receipt) = self.pull_receipt() {
-            self.pending_version_effects.push_back(receipt);
-        }
+        rows.extend(self.pull_receipt());
         // Only a same-set publication keeps release tags; its row commits with the version.
-        match release_row_effect(&version_key, &version, self.txn_id) {
-            Ok(Some(row)) => self.pending_version_effects.push_back(row),
-            Ok(None) => {}
-            Err(err) => return self.fail(err.into()),
-        }
+        rows.extend(release_rows(&version_key, &version)?);
         // The envelope, its mappings and usage are published with the version they name.
         if let (Some(envelope), Some(received)) = (&self.envelope, &self.received_blob) {
-            let rows = (
-                &self.manifest.metadata,
-                self.rocrate_limits.metadata_bytes,
-                self.txn_id,
-            );
-            match envelope_write(envelope, &version_key, &received.location, rows) {
-                Ok((write, charge)) => {
-                    self.envelope_bytes = charge;
-                    self.pending_version_effects.push_back(write);
-                }
-                Err(error) => return self.fail(BlobError::from(error).into()),
-            }
+            let metadata = (&self.manifest.metadata, self.rocrate_limits.metadata_bytes);
+            let located = located_rows(envelope, &version_key, &received.location, metadata);
+            let (written, charge) = located.map_err(BlobError::from)?;
+            self.envelope_bytes = charge;
+            rows.extend(written);
         }
         if let Some(hash) = materialized_hash {
-            let context = match self.alias_context() {
-                Ok(context) => context,
-                Err(err) => return self.fail(err),
-            };
-            match add_index_effect(&context, hash, self.manifest.version_id, self.txn_id) {
-                Ok(index_effect) => self.pending_version_effects.push_back(index_effect),
-                Err(err) => return self.fail(err.into()),
-            }
+            let context = self.alias_context()?;
+            rows.push(self.index_row(&context, hash)?);
             // The replica becomes serveable exactly when its version commits.
             // A reference item materializes nothing and registers nothing.
-            let location = match self.effective_materialized_location() {
-                Ok(location) => location,
-                Err(err) => return self.fail(err),
-            };
-            match register_effect(
-                CopyRegistration {
-                    version: version_key,
-                    node_id: self.local_node_id,
-                    location: &location,
-                    policies: &self.gated_refs,
-                    origin: self.copy_origin(),
-                    subject_generation: self.stored_subject(),
-                    registered_at_ms: self.manifest.version_id.timestamp_ms(),
-                },
-                self.txn_id,
-            ) {
-                Ok(register) => self.pending_version_effects.push_back(register),
-                Err(err) => return self.fail(err.into()),
-            }
+            let location = self.effective_materialized_location()?;
+            let copy = self.copy_registration(version_key, &location);
+            rows.push(register_entry(copy)?);
         }
         // A version new to this node is journaled last in its transaction. A delete marker is
         // not an upload, and a rewrite of a version already here keeps its first anchor.
@@ -2189,27 +2232,16 @@ impl IncomingVersionOperation {
                 self.manifest.version_id,
                 unix_timestamp_millis(),
             );
-            match journal_entries(&uploaded) {
-                Ok(writes) => {
-                    let batch = StorageEffect::BatchWrite {
-                        writes,
-                        txn_id: self.txn_id,
-                    };
-                    self.pending_version_effects
-                        .push_back(Effect::Storage(batch));
-                }
-                Err(err) => return self.fail(err.into()),
-            }
+            rows.extend(journal_entries(&uploaded)?);
         }
-        smallvec![effect]
+        Ok(rows)
     }
 
-    fn write_multipart_metadata(&mut self) -> Effects {
+    fn write_multipart_metadata(&mut self) -> Turn {
         let Some(multipart) = self.manifest.multipart.as_ref() else {
             return self.write_live_obligation();
         };
 
-        self.state = IncomingVersionState::WriteMultipartMetadata;
         let mut writes = Vec::with_capacity(multipart.parts.len() + 1);
 
         let summary_key = match MultipartObjectKey::summary(self.manifest.version_id).to_bytes() {
@@ -2244,13 +2276,10 @@ impl IncomingVersionOperation {
             ));
         }
 
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        self.write(IncomingVersionState::WriteMultipartMetadata, writes)
     }
 
-    fn write_live_obligation(&mut self) -> Effects {
+    fn write_live_obligation(&mut self) -> Turn {
         let auth_context = match self.manifest.reference_advance.as_ref() {
             Some(_) => self.manifest.auth_context.clone(),
             None => {
@@ -2260,7 +2289,6 @@ impl IncomingVersionOperation {
                 auth_context
             }
         };
-        self.state = IncomingVersionState::WriteLiveObligation;
         let mut record = LiveObligationRecord::new(
             self.local_node_id,
             auth_context,
@@ -2274,23 +2302,17 @@ impl IncomingVersionOperation {
         if let Some(advance) = self.manifest.reference_advance {
             record = record.with_reference_advance(advance);
         }
-        match live_obligation_effect(record, self.txn_id) {
-            Ok(effect) => smallvec![effect],
+        match live_obligation_entry(&record) {
+            Ok(row) => self.write(IncomingVersionState::WriteLiveObligation, vec![row]),
             Err(error) => self.fail(error.into()),
         }
     }
 
-    fn cleanup_key(location: &BackendLocation) -> Vec<u8> {
-        location.ulid.to_bytes().to_vec()
-    }
-
-    fn prepare_cleanup(&mut self) -> Result<(), IncomingVersionError> {
-        let Some(received) = self.received_blob.as_mut() else {
-            return Ok(());
+    /// The row that reconciles the received write when its commit outcome is never learned.
+    fn cleanup_row(&self) -> Result<Option<(String, Key, Value)>, IncomingVersionError> {
+        let Some(received) = self.received_blob.as_ref() else {
+            return Ok(None);
         };
-        if received.reconciliation.is_some() {
-            return Ok(());
-        }
         let location = &received.location;
         let blake3 = location
             .get_blake3()
@@ -2310,44 +2332,30 @@ impl IncomingVersionOperation {
             location: location.clone(),
             owner,
         };
-        let key = Self::cleanup_key(location);
-        let value = work.to_bytes()?;
-        received.reconciliation = Some(ReconciliationWork { key, value });
-        Ok(())
+        Ok(Some((
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            location.ulid.to_bytes().to_vec().into(),
+            work.to_bytes()?.into(),
+        )))
     }
 
-    fn cleanup_effect(&self, txn_id: Ulid) -> Option<Effect> {
-        let reconciliation = self.received_blob.as_ref()?.reconciliation.as_ref()?;
-        Some(Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: reconciliation.key.clone().into(),
-            value: reconciliation.value.clone().into(),
-            txn_id: Some(txn_id),
-        }))
-    }
-
-    fn commit_or_cleanup(&mut self) -> Effects {
+    fn commit_or_cleanup(&mut self) -> Turn {
         if self.manifest.kind != ReplicationItemKind::Materialized
             || self.is_reference_item()
             || self.received_blob.is_none()
         {
-            return self.commit_transaction();
+            return self.finish_apply();
         }
-        if let Err(error) = self.prepare_cleanup() {
-            return self.fail(error);
+        match self.cleanup_row() {
+            Ok(Some(row)) => self.write(IncomingVersionState::WriteCleanupRow, vec![row]),
+            Ok(None) => self.fail(ReplicationError::ReplicationFailed.into()),
+            Err(error) => self.fail(error),
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
-        let Some(effect) = self.cleanup_effect(txn_id) else {
-            return self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            ));
-        };
-        self.state = IncomingVersionState::WriteCleanupRow;
-        smallvec![effect]
+    }
+
+    /// The apply's outcome; the runner commits its transaction with it.
+    fn finish_apply(&mut self) -> Turn {
+        Ok(Next::Done(self.result(true)))
     }
 
     fn usage_delta(&self) -> Result<UsageDelta, IncomingVersionError> {
@@ -2370,17 +2378,16 @@ impl IncomingVersionOperation {
     }
 
     /// The receipt row of a device pull the received version of a distributed bucket records.
-    fn pull_receipt(&self) -> Option<Effect> {
+    fn pull_receipt(&self) -> Option<(String, Key, Value)> {
         self.destination_binding.as_ref()?;
         let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
         let target = (self.manifest.bucket.as_str(), self.manifest.key.as_str());
         let key = tagged_receipt(target, &self.manifest.metadata, marker)?;
-        Some(Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
-            key: key.into(),
-            value: self.manifest.version_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        }))
+        Some((
+            SYNC_RECEIPT_KEYSPACE.to_string(),
+            key.into(),
+            self.manifest.version_id.to_bytes().to_vec().into(),
+        ))
     }
 
     /// The received version and, when this apply installs it, the head of a distributed bucket.
@@ -2418,7 +2425,7 @@ impl IncomingVersionOperation {
         Some(change)
     }
 
-    fn start_commit_quota(&mut self) -> Effects {
+    fn start_commit_quota(&mut self) -> Turn {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionError::DestinationNotFound);
         };
@@ -2464,11 +2471,6 @@ impl IncomingVersionOperation {
                 .in_bucket(&self.manifest.bucket, row)
                 .with_inventory(inventory),
         );
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
         let quota_bytes = (blob.size.saturating_add(self.envelope_bytes))
             .saturating_sub(self.replaced_logical_bytes);
         if let Some(ceiling) = self.quota_ceiling
@@ -2481,103 +2483,40 @@ impl IncomingVersionOperation {
                 self.local_node_id,
                 self.local_realm_id,
             );
-            self.state = IncomingVersionState::CheckCommitQuota;
-            let effects = gate.start(txn_id);
+            let call = gate.start_calls();
             self.quota_gate = Some(gate);
-            effects
+            self.call(IncomingVersionState::CheckCommitQuota, call)
         } else {
             self.start_usage_update()
         }
     }
 
-    fn start_usage_update(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
-        self.state = IncomingVersionState::UpdateUsage;
+    fn start_usage_update(&mut self) -> Turn {
         match self.usage_update.as_mut() {
-            Some(update) => update.start(txn_id),
-            None => self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            )),
+            Some(update) => {
+                let call = update.start_calls().into_call();
+                self.call(IncomingVersionState::UpdateUsage, call)
+            }
+            None => self.fail(ReplicationError::ReplicationFailed.into()),
         }
     }
 
-    fn commit_transaction(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
-        self.state = IncomingVersionState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_commit_failure(&mut self, error: StorageError) -> Effects {
-        if error.proves_no_commit() {
-            return self.fail(error.into());
-        }
-
-        self.txn_id = None;
-        if let Some(received) = self.received_blob.as_mut() {
-            received.cleanup_on_abort = false;
-        }
-        self.output = Some(Err(error.into()));
-        self.release_or_reject()
-    }
-
-    fn release_or_reject(&mut self) -> Effects {
-        let Some(id) = self
-            .received_blob
-            .as_ref()
-            .map(|received| received.location.ulid)
-        else {
-            return self.send_apply_rejected();
-        };
-        self.release_id = Some(id);
-        self.state = IncomingVersionState::ReleaseReservation;
-        smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
-    }
-
-    fn accept_reservation_release(&mut self, event: Event) -> Effects {
+    fn accept_reservation_release(&mut self, event: Event) -> Turn {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ReservationReleased)",
-                received: event.label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::ReservationReleased)", event.label());
         };
         if self.release_id != Some(id) {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "matching reservation id",
-                received: (Event::Blob(BlobEvent::ReservationReleased { id })).label(),
-            });
+            let received = Event::Blob(BlobEvent::ReservationReleased { id }).label();
+            return self.invalid("matching reservation id", received);
         }
         self.release_id = None;
-        if self.apply_committed {
-            self.state = IncomingVersionState::ScheduleUsage;
-            smallvec![schedule_snapshot_publish()]
-        } else {
-            self.send_apply_rejected()
-        }
+        self.call(
+            IncomingVersionState::ScheduleUsage,
+            schedule_snapshot_publish().into(),
+        )
     }
 
-    fn accept_cleanup_row(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_transaction(),
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::{WriteResult|Error})",
-                received: other.label(),
-            }),
-        }
-    }
-
-    fn register_blob_dht(&mut self) -> Effects {
+    fn register_blob_dht(&mut self) -> Turn {
         // Distributed buckets are found through their content indexes, not the DHT.
         if self.is_reference_item() || self.destination_bound {
             return self.send_apply_complete();
@@ -2589,16 +2528,15 @@ impl IncomingVersionOperation {
             return self.send_apply_complete();
         };
 
-        self.state = IncomingVersionState::RegisterBlobDht;
         let effect =
             match dht_registration_effect(blake3_hash, self.local_realm_id, &self.rocrate_limits) {
                 Ok(effect) => effect,
                 Err(_) => return self.send_apply_complete(),
             };
-        smallvec![effect]
+        self.call(IncomingVersionState::RegisterBlobDht, effect.into())
     }
 
-    fn finish_live_drain(&mut self) -> Effects {
+    fn finish_live_drain(&mut self) -> Turn {
         match self.manifest.kind {
             ReplicationItemKind::Materialized if self.pending_replica() => {
                 self.schedule_promotion()
@@ -2609,88 +2547,48 @@ impl IncomingVersionOperation {
     }
 
     /// A pending replica registers nothing here; its promotion does once the key is usable.
-    fn schedule_promotion(&mut self) -> Effects {
+    fn schedule_promotion(&mut self) -> Turn {
         let Some(key) = self.seal_plan.map(|plan| plan.key) else {
             return self.send_apply_complete();
         };
-        self.state = IncomingVersionState::SchedulePromotion;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+        let wake = TaskEffect::ShortenTimer {
             key: TaskKey::PromotePending {
                 bucket_id: key.bucket_id,
                 generation: key.generation,
             },
             after: std::time::Duration::ZERO,
-        })]
+        };
+        self.call(
+            IncomingVersionState::SchedulePromotion,
+            Effect::Task(wake).into(),
+        )
     }
 
-    fn accept_promotion_scheduled(&mut self, event: Event) -> Effects {
+    fn accept_promotion_scheduled(&mut self, event: Event) -> Turn {
         if !matches!(event, Event::Task(_)) {
             warn!(event = ?event, "Incoming replication committed but promotion scheduling returned an unexpected event");
         }
         self.send_apply_complete()
     }
 
-    fn send_apply_complete(&mut self) -> Effects {
-        self.state = IncomingVersionState::SendApplyComplete;
+    fn send_apply_complete(&mut self) -> Turn {
         let payload = match VersionReplicationMessage::VersionApplyComplete.to_bytes() {
             Ok(payload) => payload,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
-            stream_id: self.stream_id,
-            payload,
-        })]
+        let stream_id = self.stream_id;
+        self.blob(
+            IncomingVersionState::SendApplyComplete,
+            BlobEffect::SendMessage { stream_id, payload },
+        )
     }
 
-    fn send_apply_rejected(&mut self) -> Effects {
-        self.state = IncomingVersionState::SendApplyRejected;
-        let reason = self
-            .output
-            .as_ref()
-            .and_then(|result| result.as_ref().err())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "version replication apply failed".to_string());
-        let payload = match VersionReplicationMessage::VersionApplyRejected(reason).to_bytes() {
-            Ok(payload) => payload,
-            Err(_) => {
-                self.state = IncomingVersionState::Error;
-                return self.abort();
-            }
-        };
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
-            stream_id: self.stream_id,
-            payload,
-        })]
-    }
-
-    fn abort_or_close(&mut self) -> Effects {
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = IncomingVersionState::AbortTransaction;
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        } else {
-            self.cleanup_or_close()
-        }
-    }
-
-    fn cleanup_or_close(&mut self) -> Effects {
-        if let Some(location) = self
-            .received_blob
-            .as_mut()
-            .and_then(ReceivedBlob::take_cleanup)
-        {
-            self.state = IncomingVersionState::CleanupReceivedBlob;
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.state = IncomingVersionState::Error;
-            self.close_connection()
-        }
-    }
-
-    fn close_connection(&mut self) -> Effects {
-        self.state = IncomingVersionState::CloseConnection;
-        smallvec![Effect::Blob(BlobEffect::CloseConnection {
-            stream_id: self.stream_id,
-        })]
+    fn close_connection(&mut self) -> Turn {
+        let stream_id = self.stream_id;
+        self.blob(
+            IncomingVersionState::CloseConnection,
+            BlobEffect::CloseConnection { stream_id },
+        )
     }
 }
 
@@ -2698,15 +2596,8 @@ impl IncomingVersionOperation {
 // Destination resolution, the quota probe and the placement gate that
 // together decide the reply sent to the sender.
 impl IncomingVersionOperation {
-    fn accept_destination_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event.label(),
-            });
-        };
-        let [(_, value), (_, settings)] = match <[_; 2]>::try_from(values) {
+    fn accept_destination_bucket(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [value, settings] = match <[_; 2]>::try_from(values) {
             Ok(values) => values,
             Err(_) => return self.fail(PolicyGateError::InvalidEvent.into()),
         };
@@ -2770,23 +2661,15 @@ impl IncomingVersionOperation {
             return self.load_destination_routing();
         };
         self.destination_settings = Some(settings);
-        self.state = IncomingVersionState::ReadDestinationKey;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            key: key.key().into(),
-            txn_id: None,
-        })]
+        self.read(
+            IncomingVersionState::ReadDestinationKey,
+            BUCKET_KEY_KEYSPACE,
+            key.key(),
+        )
     }
 
     /// Captures how this encrypting destination seals: its active key and stored format.
-    fn accept_destination_key(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_destination_key(&mut self, value: Option<Value>) -> Turn {
         let Some(settings) = self.destination_settings.take() else {
             return self.fail(IncomingVersionError::DestinationNotFound);
         };
@@ -2804,13 +2687,12 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_bucket_created(&mut self, event: Event) -> Effects {
+    fn accept_bucket_created(&mut self, event: Event) -> Turn {
         let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::SubOperation(SubOperationEvent::BucketCreated)",
-                received: event.label(),
-            });
+            return self.invalid(
+                "Event::SubOperation(SubOperationEvent::BucketCreated)",
+                event.label(),
+            );
         };
         if let Err(reason) = result {
             debug!(
@@ -2823,13 +2705,12 @@ impl IncomingVersionOperation {
         self.read_destination_bucket()
     }
 
-    fn accept_routing_loaded(&mut self, event: Event) -> Effects {
+    fn accept_routing_loaded(&mut self, event: Event) -> Turn {
         let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
-                received: event.label(),
-            });
+            return self.invalid(
+                "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                event.label(),
+            );
         };
         match result {
             Ok(inputs) => self.destination_inputs = inputs,
@@ -2840,15 +2721,7 @@ impl IncomingVersionOperation {
         self.check_permissions(self.destination_group_id.unwrap_or(self.manifest.group_id))
     }
 
-    fn accept_existing_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
-
+    fn accept_existing_version(&mut self, value: Option<Value>) -> Turn {
         debug!(
             bucket = %self.manifest.bucket,
             key = %self.manifest.key,
@@ -2934,12 +2807,11 @@ impl IncomingVersionOperation {
                 BlobVersionState::PendingContent { archive, .. }
                     if self.manifest.blob.is_some() && !self.is_reference_item() =>
                 {
-                    self.state = IncomingVersionState::ReadExistingClaim;
-                    return smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: PENDING_CLAIM_KEYSPACE.to_string(),
-                        key: archive.to_bytes().into(),
-                        txn_id: None,
-                    })];
+                    return self.read(
+                        IncomingVersionState::ReadExistingClaim,
+                        PENDING_CLAIM_KEYSPACE,
+                        archive.to_bytes(),
+                    );
                 }
                 BlobVersionState::PendingContent { .. } => {
                     return self.reject_negotiation(IncomingVersionError::EncryptedVersion);
@@ -2955,14 +2827,7 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_existing_claim(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_existing_claim(&mut self, value: Option<Value>) -> Turn {
         let claimed = self.manifest.blob.as_ref().map(|blob| blob.hash.to_vec());
         if value.is_some_and(|value| Some(value.to_vec()) == claimed) {
             return self.send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
@@ -2970,14 +2835,7 @@ impl IncomingVersionOperation {
         self.reject_negotiation(IncomingVersionError::EncryptedVersion)
     }
 
-    fn accept_replaced_blob(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_replaced_blob(&mut self, value: Option<Value>) -> Turn {
         self.replaced_logical_bytes = match value
             .as_ref()
             .map(|value| BackendLocation::from_bytes(value.as_ref()))
@@ -2994,14 +2852,7 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_quota_config(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_quota_config(&mut self, value: Option<Value>) -> Turn {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionError::DestinationNotFound);
         };
@@ -3033,70 +2884,21 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_quota_transaction(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event.label(),
-            });
-        };
-        self.txn_id = Some(txn_id);
-        let Some(gate) = self.quota_gate.as_mut() else {
-            return self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            ));
-        };
-        self.state = IncomingVersionState::EnforceQuota;
-        gate.start(txn_id)
-    }
-
-    fn accept_quota_step(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
-        let Some(gate) = self.quota_gate.as_mut() else {
-            return self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            ));
-        };
-        match gate.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.finish_quota_check(),
-            Err(err) => self.fail(err.into()),
+    fn accept_quota_probe(&mut self, exceeded: Result<bool, QuotaGateError>) -> Turn {
+        match exceeded {
+            Ok(true) => {
+                self.output = Some(self.result(false));
+                self.send_negotiation(ReplicationNegotiationResult::Rejected("quota".to_string()))
+            }
+            Ok(false) if self.is_reference_item() => {
+                self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+            }
+            Ok(false) => self.read_existing_blob(),
+            Err(error) => self.fail(error.into()),
         }
     }
 
-    fn accept_quota_abort(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: event.label(),
-            });
-        };
-        self.txn_id = None;
-        if self.quota_gate.as_ref().is_some_and(QuotaGate::is_exceeded) {
-            self.output = Some(Ok(self.result(false)));
-            self.send_negotiation(ReplicationNegotiationResult::Rejected("quota".to_string()))
-        } else if self.is_reference_item() {
-            self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
-        } else {
-            self.read_existing_blob()
-        }
-    }
-
-    fn accept_existing_blob(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
-
+    fn accept_existing_blob(&mut self, value: Option<Value>) -> Turn {
         if let Some(value) = value {
             match BackendLocation::from_bytes(value.as_ref()) {
                 Ok(location) => {
@@ -3144,13 +2946,9 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_reply_sent(&mut self, event: Event) -> Effects {
+    fn accept_reply_sent(&mut self, event: Event) -> Turn {
         let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event.label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
         };
 
         match self.negotiation_result.clone() {
@@ -3166,12 +2964,13 @@ impl IncomingVersionOperation {
                     "Negotiation sent; awaiting version apply"
                 );
                 if self.manifest.blob.is_some() {
-                    self.state = IncomingVersionState::AwaitApproval;
-                    smallvec![Effect::Blob(BlobEffect::ReadMessage {
-                        stream_id: self.stream_id,
-                    })]
+                    let stream_id = self.stream_id;
+                    self.blob(
+                        IncomingVersionState::AwaitApproval,
+                        BlobEffect::ReadMessage { stream_id },
+                    )
                 } else {
-                    self.start_transaction()
+                    self.start_apply()
                 }
             }
             Some(
@@ -3197,33 +2996,24 @@ impl IncomingVersionOperation {
 }
 
 // Phase: receiving
-// Accepting the transferred blob and opening the apply transaction with
-// its purge-fence and destination-drift checks.
+// Accepting the transferred blob, then the apply's purge-fence and destination-drift checks.
 impl IncomingVersionOperation {
-    fn accept_source_approval(&mut self, event: Event) -> Effects {
+    fn accept_source_approval(&mut self, event: Event) -> Turn {
         let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "VersionApplyApproved",
-                received: event.label(),
-            });
+            return self.invalid("VersionApplyApproved", event.label());
         };
         match VersionReplicationMessage::from_bytes(&payload) {
-            Ok(VersionReplicationMessage::VersionApplyApproved) => self.start_transaction(),
-            Ok(_) => self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "VersionApplyApproved",
-                received: (Event::Blob(BlobEvent::MessageReceived {
-                    stream_id: self.stream_id,
-                    payload,
-                }))
-                .label(),
-            }),
+            Ok(VersionReplicationMessage::VersionApplyApproved) => self.start_apply(),
+            Ok(_) => {
+                let stream_id = self.stream_id;
+                let received = Event::Blob(BlobEvent::MessageReceived { stream_id, payload });
+                self.invalid("VersionApplyApproved", received.label())
+            }
             Err(error) => self.fail(error.into()),
         }
     }
 
-    fn accept_blob_finish(&mut self, event: Event) -> Effects {
+    fn accept_blob_finish(&mut self, event: Event) -> Turn {
         let location = match event {
             Event::Blob(BlobEvent::ReplicationFinished { location }) => location,
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
@@ -3233,11 +3023,10 @@ impl IncomingVersionOperation {
                 ));
             }
             other => {
-                return self.fail(IncomingVersionError::InvalidStateEvent {
-                    state: self.state_name(),
-                    expected: "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
-                    received: other.label(),
-                });
+                return self.invalid(
+                    "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
+                    other.label(),
+                );
             }
         };
         if let Err(err) = self.validate_received(&location) {
@@ -3254,53 +3043,27 @@ impl IncomingVersionOperation {
             "Received and validated replicated blob"
         );
         self.received_blob = Some(ReceivedBlob::reserved(location));
-        self.start_transaction()
+        self.start_apply()
     }
 
-    fn accept_transaction_start(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event.label(),
-            });
-        };
-        self.txn_id = Some(txn_id);
-        debug!(
-            bucket = %self.manifest.bucket,
-            key = %self.manifest.key,
-            version_id = %self.manifest.version_id,
-            stream_id = %self.stream_id,
-            txn_id = %txn_id,
-            "Started incoming replication transaction"
-        );
-        self.check_purge_fence()
-    }
-
-    fn accept_purge_fence(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.manifest.bucket, &self.manifest.key) {
+    fn accept_purge_fence(&mut self, value: Option<Value>) -> Turn {
+        let checked = check_fence_row(value.as_deref(), &self.manifest.bucket, &self.manifest.key);
+        if let Err(error) = checked {
             return self.fail(error.into());
         }
         self.check_drift()
     }
 
-    fn accept_drift_check(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_drift_check(&mut self, mut values: Vec<Option<Value>>) -> Turn {
         if let (Some(plan), Some(envelope)) = (self.seal_plan, &self.envelope) {
             let abe = values.split_off(values.len().saturating_sub(2));
-            let anchored = parse_abe(&abe, plan.key)
+            let anchored = parse_abe(&keyed(&abe), plan.key)
                 .and_then(|(parameters, epoch)| envelope.anchored(&parameters, epoch));
             if anchored.is_err() {
                 return self.fail(IncomingVersionError::StalePlan);
             }
         }
-        let Some((_, settings)) = values.pop().filter(|_| values.len() == 2) else {
+        let Some(settings) = values.pop().filter(|_| values.len() == 2) else {
             return self.fail(PolicyGateError::InvalidEvent.into());
         };
         let settings = match BucketEncryption::from_row(settings.as_deref()) {
@@ -3318,7 +3081,7 @@ impl IncomingVersionOperation {
         if stale {
             return self.fail(IncomingVersionError::StalePlan);
         }
-        let (bucket, subject) = match split_drift_reads(values) {
+        let (bucket, subject) = match split_drift_reads(keyed(&values)) {
             Ok(split) => split,
             Err(error) => return self.fail(error.into()),
         };
@@ -3364,14 +3127,7 @@ impl IncomingVersionOperation {
 // Exposing the replica: replacement cleanup, head transition, the version
 // and its side records, then usage accounting and the commit.
 impl IncomingVersionOperation {
-    fn accept_replaced_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_replaced_version(&mut self, value: Option<Value>) -> Turn {
         let current = match value
             .as_ref()
             .map(|value| BlobVersion::from_bytes(value.as_ref()))
@@ -3395,31 +3151,23 @@ impl IncomingVersionOperation {
     }
 
     /// Like a delete, a replacement removes the replaced envelope or pending copy and its charge.
-    fn read_replaced_envelope(&mut self) -> Effects {
+    fn read_replaced_envelope(&mut self) -> Turn {
         let key = match self.version_key_bytes() {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
         let bucket = self.manifest.bucket.as_bytes().to_vec();
-        self.state = IncomingVersionState::ReadReplacedEnvelope;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (ABE_VERSION_KEYSPACE.to_string(), key.into()),
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
-            ],
-            txn_id: self.txn_id,
-        })]
+        let reads = vec![
+            (ABE_VERSION_KEYSPACE.to_string(), key.into()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+        ];
+        self.replaced_reads = reads.clone();
+        self.reads(IncomingVersionState::ReadReplacedEnvelope, reads)
     }
 
-    fn accept_replaced_envelope(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event.label(),
-            });
-        };
-        let [(key, id), (_, settings)] = values.as_slice() else {
+    fn accept_replaced_envelope(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let asked = std::mem::take(&mut self.replaced_reads);
+        let ([id, settings], [(_, key), _]) = (values.as_slice(), asked.as_slice()) else {
             return self.fail(PolicyGateError::InvalidEvent.into());
         };
         let reads = match id {
@@ -3449,30 +3197,21 @@ impl IncomingVersionOperation {
                 }
             }
         };
-        self.state = IncomingVersionState::ReadReplacedRows;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.replaced_reads = reads.clone();
+        self.reads(IncomingVersionState::ReadReplacedRows, reads)
     }
 
-    fn accept_replaced_rows(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event.label(),
-            });
-        };
-        let charge = match values.as_slice() {
-            [(row, pending)] => {
+    fn accept_replaced_rows(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let asked = std::mem::take(&mut self.replaced_reads);
+        let charge = match (values.as_slice(), asked.as_slice()) {
+            ([pending], [(_, row)]) => {
                 let Some(pending) = pending else {
                     return self.read_replaced_metadata();
                 };
                 self.replaced_envelope = vec![(ABE_COPY_KEYSPACE.to_string(), row.clone())];
                 pending.len() as u64
             }
-            [(id, envelope), (_, archive)] => {
+            ([envelope, archive], [(_, id), _]) => {
                 self.replaced_envelope.extend([
                     (ABE_ENVELOPE_KEYSPACE.to_string(), id.clone()),
                     (ABE_ARCHIVE_KEYSPACE.to_string(), id.clone()),
@@ -3488,32 +3227,17 @@ impl IncomingVersionOperation {
         self.read_replaced_metadata()
     }
 
-    fn accept_metadata_iterated(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_metadata_iterated(
+        &mut self,
+        (values, next_start_after): (Vec<(Key, Value)>, Option<Key>),
+    ) -> Turn {
         if next_start_after.is_some() {
             return self.fail(IncomingVersionError::MultipartMetadataOverflow);
         }
         self.delete_replaced_metadata(values)
     }
 
-    fn accept_metadata_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_metadata_deleted(&mut self) -> Turn {
         match self.replaced_reclaim_key() {
             Some(key) => self.write_replaced_candidate(key),
             None => {
@@ -3523,33 +3247,17 @@ impl IncomingVersionOperation {
         }
     }
 
-    fn accept_reclaim_candidate(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event.label(),
-            });
-        };
-        self.replaced_version = None;
-        self.write_hash_lookup()
-    }
-
-    fn accept_backend_fence(&mut self, event: Event) -> Effects {
-        match check_fence(event) {
-            Ok(()) => self.verify_existing_blob(),
-            Err(error) => self.fail(error.into()),
+    fn accept_backend_fence(&mut self, value: Option<Value>) -> Turn {
+        let record = (value.as_deref()).map(GroupStorage::from_bytes).transpose();
+        let record = record.map_err(RecordReadError::Conversion);
+        match record {
+            Ok(Some(record)) if !record.disabled => self.verify_existing_blob(),
+            Ok(_) => self.fail(BackendFenceError::Unavailable.into()),
+            Err(error) => self.fail(BackendFenceError::Read(error).into()),
         }
     }
 
-    fn accept_verified_blob(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_verified_blob(&mut self, value: Option<Value>) -> Turn {
         let stored = match value
             .map(|value| BackendLocation::from_bytes(value.as_ref()))
             .transpose()
@@ -3563,28 +3271,7 @@ impl IncomingVersionOperation {
         self.write_blob_location()
     }
 
-    fn accept_blob_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(
-            StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
-        ) = event
-        else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::{WriteResult|BatchWriteResult})",
-                received: event.label(),
-            });
-        };
-        self.write_object_lookup()
-    }
-
-    fn accept_object_lookup(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_object_lookup(&mut self, value: Option<Value>) -> Turn {
         let existing_pointer = value
             .as_ref()
             .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
@@ -3608,14 +3295,7 @@ impl IncomingVersionOperation {
         self.write_compared_object(value.as_deref())
     }
 
-    fn accept_current_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event.label(),
-            });
-        };
+    fn accept_current_version(&mut self, value: Option<Value>) -> Turn {
         let Some(value) = value else {
             return self.fail(if self.manifest.reference_advance.is_some() {
                 IncomingVersionError::InvalidReferenceAdvance
@@ -3645,185 +3325,64 @@ impl IncomingVersionOperation {
         self.apply_liveness(!version.is_deleted())
     }
 
-    fn accept_head_progress(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. })
-            | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_head_transition(),
-            _ => self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::{WriteResult|DeleteResult})",
-                received: event.label(),
-            }),
-        }
-    }
-
-    fn accept_blob_version(&mut self, event: Event) -> Effects {
-        let (Event::Storage(StorageEvent::WriteResult { .. })
-        | Event::Storage(StorageEvent::BatchWriteResult { .. })) = event
-        else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event.label(),
-            });
-        };
-        if let Some(effect) = self.pending_version_effects.pop_front() {
-            return smallvec![effect];
-        }
-        self.write_multipart_metadata()
-    }
-
-    fn accept_multipart_write(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event.label(),
-            });
-        };
-        debug!(
-            bucket = %self.manifest.bucket,
-            key = %self.manifest.key,
-            version_id = %self.manifest.version_id,
-            stream_id = %self.stream_id,
-            multipart_parts = self.manifest.multipart.as_ref().map(|m| m.parts.len()).unwrap_or(0),
-            "Wrote multipart replication metadata"
-        );
-        self.write_live_obligation()
-    }
-
-    fn accept_live_obligation(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event.label(),
-            });
-        };
-        self.start_commit_quota()
-    }
-
-    fn accept_commit_quota(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
+    fn accept_commit_quota(&mut self, result: IoResult) -> Turn {
         let Some(gate) = self.quota_gate.as_mut() else {
-            return self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            ));
+            return self.fail(ReplicationError::ReplicationFailed.into());
         };
-        match gate.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
+        match gate.step_calls(result) {
+            Ok(Some(call)) => Ok(Next::Call(call)),
             Ok(None) if gate.is_exceeded() => self.fail(IncomingVersionError::QuotaExceeded),
             Ok(None) => self.start_usage_update(),
             Err(error) => self.fail(error.into()),
         }
     }
 
-    fn accept_usage_update(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(IncomingVersionError::StorageError(
-                StorageError::TransactionNotFound,
-            ));
-        };
+    fn accept_usage_update(&mut self, result: IoResult) -> Turn {
         let Some(update) = self.usage_update.as_mut() else {
-            return self.fail(IncomingVersionError::ReplicationError(
-                ReplicationError::ReplicationFailed,
-            ));
+            return self.fail(ReplicationError::ReplicationFailed.into());
         };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
+        match update.step_calls(result) {
+            Ok(Some(call)) => Ok(Next::Call(call.into_call())),
             Ok(None) => self.commit_or_cleanup(),
             Err(error) => self.fail(error.into()),
         }
     }
 
-    fn accept_transaction_commit(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                if let Some(received) = self.received_blob.as_mut() {
-                    received.cleanup_on_abort = false;
-                }
-                self.apply_committed = true;
-                debug!(
-                    bucket = %self.manifest.bucket,
-                    key = %self.manifest.key,
-                    version_id = %self.manifest.version_id,
-                    stream_id = %self.stream_id,
-                    kind = ?self.manifest.kind,
-                    "Committed incoming replication transaction"
-                );
-                if let Some(id) = self
-                    .received_blob
-                    .as_ref()
-                    .map(|received| received.location.ulid)
-                {
-                    self.release_id = Some(id);
-                    self.state = IncomingVersionState::ReleaseReservation;
-                    smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
-                } else {
-                    self.state = IncomingVersionState::ScheduleUsage;
-                    smallvec![schedule_snapshot_publish()]
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.handle_commit_failure(error),
-            other => self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::{TransactionCommitted|Error})",
-                received: other.label(),
-            }),
+    fn accept_usage_schedule(&mut self, event: Event) -> Turn {
+        if !matches!(
+            event,
+            Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. })
+        ) {
+            warn!(event = ?event, "Incoming replication committed but usage scheduling returned an unexpected event");
         }
+        self.call(
+            IncomingVersionState::ScheduleLiveDrain,
+            schedule_blob_drain().into(),
+        )
     }
 
-    fn accept_usage_schedule(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = IncomingVersionState::ScheduleLiveDrain;
-                smallvec![schedule_blob_drain()]
-            }
-            other => {
-                warn!(event = ?other, "Incoming replication committed but usage scheduling returned an unexpected event");
-                self.state = IncomingVersionState::ScheduleLiveDrain;
-                smallvec![schedule_blob_drain()]
-            }
+    fn accept_live_drain(&mut self, event: Event) -> Turn {
+        if !matches!(
+            event,
+            Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. })
+        ) {
+            warn!(event = ?event, "Incoming replication committed but drain scheduling returned an unexpected event");
         }
+        self.finish_live_drain()
     }
 
-    fn accept_live_drain(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.finish_live_drain(),
-            other => {
-                warn!(event = ?other, "Incoming replication committed but drain scheduling returned an unexpected event");
-                self.finish_live_drain()
-            }
-        }
-    }
-
-    fn accept_blob_registration(&mut self, event: Event) -> Effects {
+    fn accept_blob_registration(&mut self, event: Event) -> Turn {
         match event {
             Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
             | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
             | Event::Net(NetEvent::Error(_)) => self.send_apply_complete(),
-            _ => self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Net(NetEvent::Dht(DhtEvent::*))",
-                received: event.label(),
-            }),
+            _ => self.invalid("Event::Net(NetEvent::Dht(DhtEvent::*))", event.label()),
         }
     }
 
-    fn accept_completion_sent(&mut self, event: Event) -> Effects {
+    fn accept_completion_sent(&mut self, event: Event) -> Turn {
         let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event.label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
         };
         debug!(
             bucket = %self.manifest.bucket,
@@ -3836,69 +3395,23 @@ impl IncomingVersionOperation {
     }
 }
 
-// Phase: cleanup
-// Rejecting, aborting, deleting unowned bytes and closing the stream.
+// Phase: close
 impl IncomingVersionOperation {
-    fn accept_apply_rejection(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event.label(),
-            });
-        };
-        self.abort_or_close()
-    }
-
-    fn accept_transaction_abort(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: event.label(),
-            });
-        };
-        self.cleanup_or_close()
-    }
-
-    fn accept_blob_cleanup(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.state = IncomingVersionState::Error;
-                self.close_connection()
-            }
-            _ => {
-                self.state = IncomingVersionState::Error;
-                self.close_connection()
-            }
-        }
-    }
-
-    fn accept_connection_close(&mut self, event: Event) -> Effects {
+    fn accept_connection_close(&mut self, event: Event) -> Turn {
         let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-            return self.fail(IncomingVersionError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ConnectionClosed)",
-                received: event.label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", event.label());
         };
-        if self.output.as_ref().is_some_and(Result::is_err) {
-            self.state = IncomingVersionState::Error;
-        } else {
-            self.state = IncomingVersionState::Finish;
-        }
-        if self.output.is_none() {
-            self.output = Some(Ok(self.result(self.apply_committed)));
-        }
         debug!(
             bucket = %self.manifest.bucket,
             key = %self.manifest.key,
             version_id = %self.manifest.version_id,
             stream_id = %self.stream_id,
-            state = %self.state_name(),
             "Closed incoming replication connection"
         );
-        smallvec![]
+        let output = self.output.take();
+        Ok(Next::Done(
+            output.unwrap_or_else(|| self.result(self.apply_committed)),
+        ))
     }
 }
 
