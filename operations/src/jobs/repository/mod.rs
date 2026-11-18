@@ -85,7 +85,7 @@ impl JobScope {
             job_id: ctx.job_id,
             owner_node: ctx.owner_node_id,
             claim_token: ctx.claim_token,
-            stop: JobStop::new(ctx.cancel.clone(), ctx.shutdown.clone()),
+            stop: aruna_blob::remote::job_stop(ctx.cancel.clone(), ctx.shutdown.clone()),
             progress: ctx.progress.clone(),
         }
     }

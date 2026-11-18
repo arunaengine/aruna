@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::ops::Range;
+use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use serde_json::Value;
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use url::Url;
 
@@ -32,39 +33,39 @@ pub enum StopReason {
     Interrupted,
 }
 
-/// The stop signals of one job, carried by the backend calls that end when the job stops.
-#[derive(Clone, Debug)]
-pub struct JobStop {
-    cancel: CancellationToken,
-    shutdown: CancellationToken,
+/// Where a job's stop comes from; the job's runtime provides it.
+pub trait StopSignal: Send + Sync {
+    /// Why the job must stop now, a cancel before a shutdown.
+    fn reason(&self) -> Option<StopReason>;
+    /// Completes once the job must stop.
+    fn stopped(&self) -> BoxFuture<'_, StopReason>;
 }
+
+/// The stop signal of one job, carried by the backend calls that end when the job stops.
+#[derive(Clone)]
+pub struct JobStop(Arc<dyn StopSignal>);
 
 impl JobStop {
-    pub fn new(cancel: CancellationToken, shutdown: CancellationToken) -> Self {
-        Self { cancel, shutdown }
+    pub fn new(signal: impl StopSignal + 'static) -> Self {
+        Self(Arc::new(signal))
     }
 
-    /// Why the job must stop now, a cancel before a shutdown.
     pub fn reason(&self) -> Option<StopReason> {
-        if self.cancel.is_cancelled() {
-            return Some(StopReason::Cancelled);
-        }
-        self.shutdown
-            .is_cancelled()
-            .then_some(StopReason::Interrupted)
+        self.0.reason()
     }
 
-    /// Completes once the job must stop.
-    pub async fn stopped(&self) -> StopReason {
-        tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => StopReason::Cancelled,
-            () = self.shutdown.cancelled() => StopReason::Interrupted,
-        }
+    pub fn stopped(&self) -> BoxFuture<'_, StopReason> {
+        self.0.stopped()
     }
 }
 
-/// Two stops are equal while they say the same; the tokens themselves have no identity.
+impl std::fmt::Debug for JobStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("JobStop").field(&self.reason()).finish()
+    }
+}
+
+/// Two stops are equal while they say the same; the signals themselves have no identity.
 impl PartialEq for JobStop {
     fn eq(&self, other: &Self) -> bool {
         self.reason() == other.reason()

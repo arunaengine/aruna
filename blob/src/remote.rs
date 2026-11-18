@@ -15,7 +15,7 @@ use aruna_core::repository::ImportMode;
 use aruna_core::repository::invenio::{file_path, record_id};
 use aruna_core::repository::remote::{
     ArchiveSpool, FileDigests, InvenioAccess, InvenioMethod, JobStop, RemoteAnswer, RemoteCall,
-    RemoteFailure, RemoteRequest,
+    RemoteFailure, RemoteRequest, StopReason, StopSignal,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::Hasher;
@@ -31,6 +31,7 @@ use futures::io::AsyncWriteExt;
 use reqwest::{Method, Url};
 use serde_json::{Value, json};
 use tokio::io::DuplexStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::blob::BlobHandle;
 use crate::invenio::InvenioClient;
@@ -43,6 +44,38 @@ const OAI_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 const ARCHIVE_DELETE_BUDGET: Duration = Duration::from_secs(30);
 
 type Answer = Result<RemoteAnswer, RemoteFailure>;
+
+/// A job's cancel and shutdown tokens as its stop signal.
+struct TokenStop {
+    cancel: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl StopSignal for TokenStop {
+    fn reason(&self) -> Option<StopReason> {
+        if self.cancel.is_cancelled() {
+            return Some(StopReason::Cancelled);
+        }
+        self.shutdown
+            .is_cancelled()
+            .then_some(StopReason::Interrupted)
+    }
+
+    fn stopped(&self) -> BoxFuture<'_, StopReason> {
+        Box::pin(async {
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => StopReason::Cancelled,
+                () = self.shutdown.cancelled() => StopReason::Interrupted,
+            }
+        })
+    }
+}
+
+/// The stop signal of a job with these tokens.
+pub fn job_stop(cancel: CancellationToken, shutdown: CancellationToken) -> JobStop {
+    JobStop::new(TokenStop { cancel, shutdown })
+}
 
 /// Runs `work`, unless the job must stop first; a stop ends it at once.
 async fn until_stop<T>(
@@ -431,16 +464,10 @@ fn checked_size(size: u64, added: u64, limit: u64) -> Result<u64, RemoteFailure>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::repository::remote::StopReason;
-    use tokio_util::sync::CancellationToken;
 
     fn stop() -> (JobStop, CancellationToken, CancellationToken) {
         let (cancel, shutdown) = (CancellationToken::new(), CancellationToken::new());
-        (
-            JobStop::new(cancel.clone(), shutdown.clone()),
-            cancel,
-            shutdown,
-        )
+        (job_stop(cancel.clone(), shutdown.clone()), cancel, shutdown)
     }
 
     #[tokio::test]
