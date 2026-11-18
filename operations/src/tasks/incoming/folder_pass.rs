@@ -11,7 +11,7 @@ use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
-use crate::device::drain::DrainOutcome;
+use crate::device::drain::{DrainOutcome, publish_pending};
 use crate::device::sync::folders::{finish_binding, finish_unbind, list_folders};
 use crate::device::sync::reconcile::ReconcilePlan;
 use crate::device::sync::{ReconcileFolderError, folder_gate, folder_pass, sync_timers};
@@ -93,5 +93,20 @@ pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &Tas
             .await
     {
         warn!(%message, "Failed to restore the synced-folder upload timer");
+    }
+}
+
+/// Re-arms the publish drain when the queue still holds entries.
+pub(super) async fn restore_publish_timer(context: &DriverContext, task_handle: &TaskHandle) {
+    match drive(publish_pending(), context).await {
+        Ok(false) => {}
+        Ok(true) => {
+            let key = TaskKey::DrainDeviceIntake;
+            let armed = task_handle.schedule_idle_timer(key, Duration::ZERO).await;
+            if let TaskEvent::Error { message, .. } = armed {
+                warn!(%message, "Failed to restore the device publish timer");
+            }
+        }
+        Err(error) => warn!(%error, "Failed to scan the device publish queue"),
     }
 }

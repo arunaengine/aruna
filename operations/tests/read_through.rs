@@ -8,6 +8,7 @@ use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 
 use std::time::Duration;
 
+use crate::metadata_calls::get_metadata_routed;
 use aruna_core::StructuredId;
 use aruna_operations::device::drain::drain_publish_queue;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
@@ -17,7 +18,6 @@ use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
 };
 use aruna_operations::metadata::create_document::mint_local_document;
-use crate::metadata_calls::get_metadata_routed;
 use aruna_operations::metadata::forward::write::route_metadata_update;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
@@ -258,7 +258,12 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
 
     let holder = realm.holder(&placement);
     let replaced = || async {
-        drain_publish_queue(&device.context).await;
+        drive(
+            drain_publish_queue(device.context.node_and_realm()),
+            &device.context,
+        )
+        .await
+        .expect("the drain runs");
         let _ = replay_event_log(holder.context.as_ref()).await;
         let _ = process_materialization_batch(holder.context.as_ref()).await;
         aruna_operations::metadata::export_rocrate_jsonld(

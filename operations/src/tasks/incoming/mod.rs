@@ -54,9 +54,7 @@ use crate::blob::holders::RefreshHoldersOperation;
 use crate::blob::reclaim_sweep::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
-use crate::device::drain::{
-    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, restore_publish_timer,
-};
+use crate::device::drain::{DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER,
@@ -170,7 +168,7 @@ use crate::tasks::task_persistence::{
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use folder_pass::restore_sync_timers;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 mod drained;
 pub mod folder_pass;
@@ -1130,7 +1128,12 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
+                let drain =
+                    crate::device::drain::drain_publish_queue(self.context.node_and_realm());
+                let after = match drive(drain, &self.context)
+                    .await
+                    .unwrap_or(DrainOutcome::Deferred)
+                {
                     DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

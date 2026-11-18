@@ -43,7 +43,7 @@ async fn durable_rearm_loop(
             warn!(%error, "Failed to restore connector reference pruning");
         }
         restore_outbox_timer(&context).await;
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
@@ -273,7 +273,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
