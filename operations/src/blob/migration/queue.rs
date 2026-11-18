@@ -1162,108 +1162,222 @@ impl StoreTransitionOperation {
     fn done(&mut self, stored: bool) -> Turn<StoredTransition> {
         let record = self.record.clone();
         Ok(Next::Done(StoredTransition { stored, record }))
+    }
+
+    fn progress_row(&self) -> Result<(String, Key, Value), MigrationError> {
+        let value = self.record.to_bytes()?.into();
+        Ok((TRANSITION_KEYSPACE.to_string(), self.key.clone(), value))
+    }
+
+    fn current(&mut self, stored: Option<EncryptionTransition>) -> Turn<StoredTransition> {
+        let record = &self.record;
+        let owned = stored.is_some_and(|stored| {
+            stored.started_at_ms == record.started_at_ms && stored.kind == record.kind
+        });
+        if !owned {
+            return self.done(false);
+        }
+        if self.record.state != TransitionState::Finished {
+            return self.write(Vec::new(), None);
+        }
+        let mut scan = SourceScan::new(&self.bucket, &self.record)?;
+        let first = scan.start();
+        self.step = StoreStep::Scan(Box::new(scan));
+        Ok(Next::Call(first))
+    }
+
+    fn scanned(&mut self, scan: &SourceScan) -> Turn<StoredTransition> {
+        let (pending, versions) = (scan.pending, scan.versions);
+        if pending + versions > 0 {
+            let record = &mut self.record;
+            record.finished_at_ms = None;
+            record.cursor = None;
+            record.remaining = pending + versions;
+            record.state = match versions > 0 {
+                true => TransitionState::Running,
+                false => TransitionState::Blocked,
+            };
+            record.blocked_reason = (versions == 0).then(|| PENDING_REASON.to_string());
+            let wait = RECHECK.as_millis() as u64;
+            record.retry_at_ms = Some(self.now_ms.saturating_add(wait));
+        }
+        let unfinished = self.record.finished_at_ms.is_none();
+        if unfinished && self.record.state == TransitionState::Finished {
+            if let Some(source) = retiring(&self.record) {
+                self.step = StoreStep::SourceKey;
+                return Ok(Next::Call(read_row(BUCKET_KEY_KEYSPACE, source.key())));
+            }
+        }
+        self.write(Vec::new(), None)
+    }
+
+    /// No copy needs the source generation any more: it retires and its node copy is removed.
+    fn source_read(&mut self, value: Option<Value>) -> Turn<StoredTransition> {
+        let Some(value) = value else {
+            return self.write(Vec::new(), None);
+        };
+        let Some(source) = self.record.source else {
+            return self.write(Vec::new(), None);
+        };
+        let mut key = BucketKeyRecord::from_bytes(value.as_ref())?;
+        let vault = key.vault_entry.take().or(self.record.source_vault);
+        key.state = KeyState::Retired;
+        let row = (
+            BUCKET_KEY_KEYSPACE.to_string(),
+            source.key().into(),
+            key.to_bytes()?.into(),
+        );
+        let vault = vault.map(|id| VaultEntry::new(VaultPurpose::BucketKey, id));
+        self.write(vec![row], vault)
+    }
+
+    fn write(
+        &mut self,
+        mut rows: Vec<(String, Key, Value)>,
+        vault: Option<VaultEntry>,
+    ) -> Turn<StoredTransition> {
+        rows.insert(0, self.progress_row()?);
+        self.step = StoreStep::Written(vault);
+        Ok(Next::Call(IoCall::Write(rows)))
+    }
+
+    fn written(&mut self, vault: Option<VaultEntry>) -> Turn<StoredTransition> {
+        if self.record.finished_at_ms.is_some() {
+            self.step = StoreStep::Left;
+            let row = (TRANSITION_QUEUE_KEYSPACE.to_string(), self.key.clone());
+            return Ok(Next::Call(IoCall::Delete(vec![row])));
+        }
+        match vault {
+            Some(entry) => {
+                self.step = StoreStep::Vault;
+                let delete = StorageEffect::VaultDelete {
+                    entry,
+                    txn_id: None,
+                };
+                Ok(Next::Call(Effect::Storage(delete).into()))
+            }
+            None => self.done(true),
+        }
+    }
+}
+
+impl Operation for StoreTransitionOperation {
+    type Output = StoredTransition;
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<StoredTransition> {
+        Ok(Next::Call(read_row(TRANSITION_KEYSPACE, self.key.clone())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<StoredTransition> {
+        match std::mem::replace(&mut self.step, StoreStep::Left) {
+            StoreStep::Current => self.current(decode_transition(result.value()?)?),
+            StoreStep::Scan(mut scan) => match scan.step(result)? {
+                Some(call) => {
+                    self.step = StoreStep::Scan(scan);
+                    Ok(Next::Call(call))
+                }
+                None => self.scanned(&scan),
+            },
+            StoreStep::SourceKey => self.source_read(result.value()?),
+            StoreStep::Written(vault) => {
+                result.done()?;
+                self.written(vault)
+            }
+            StoreStep::Left => {
+                result.done()?;
+                self.done(true)
+            }
+            StoreStep::Vault => match result.event()? {
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+                ) => self.done(true),
+                other => Err(MigrationError::Failed(format!(
+                    "could not remove the source key copy: {}",
+                    other.label()
+                ))),
+            },
         }
     }
 }
 
 /// Uploads that captured the retiring source can never complete, so their envelopes go, one
-/// page per atomic batch.
-async fn reclaim_uploads(
-    storage: &StorageHandle,
-    record: &EncryptionTransition,
-) -> Result<u64, String> {
-    let Some(source) = retiring(record) else {
-        return Ok(0);
-    };
-    let (mut after, mut count) = (None, 0);
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            ABE_PENDING_KEYSPACE,
-            None,
-            after,
-            PAGE,
-            None,
-        )
-        .await?;
-        let deletes: Vec<_> = rows
-            .into_iter()
-            .filter(|(_, value)| envelope_key(value) == Some(source))
-            .map(|(upload, _)| (ABE_PENDING_KEYSPACE.to_string(), upload))
-            .collect();
-        count += deletes.len() as u64;
-        if !deletes.is_empty() {
-            let delete = StorageEffect::BatchDelete {
-                deletes,
-                txn_id: None,
-            };
-            match storage.send_storage_effect(delete).await {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-                other => {
-                    return Err(format!(
-                        "could not remove stale upload envelopes: {}",
-                        other.label()
-                    ));
-                }
-            }
+/// page per atomic batch. Outputs how many went.
+#[derive(Debug, PartialEq)]
+struct ReclaimUploadsOperation {
+    source: Option<BucketKeyRef>,
+    pages: PrefixPages,
+    count: u64,
+    deleting: bool,
+}
+
+impl ReclaimUploadsOperation {
+    fn new(record: &EncryptionTransition) -> Self {
+        Self {
+            source: retiring(record),
+            pages: PrefixPages::new(ABE_PENDING_KEYSPACE, empty_prefix(), PAGE),
+            count: 0,
+            deleting: false,
         }
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(count),
+    }
+
+    fn next_page(&mut self) -> Turn<u64> {
+        match self.pages.done() {
+            true => Ok(Next::Done(self.count)),
+            false => Ok(Next::Call(self.pages.call())),
         }
     }
 }
 
-/// No copy needs the source generation any more: it retires and its node copy is removed.
-async fn retire_source(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    record: &EncryptionTransition,
-) -> Result<Vec<StorageEffect>, String> {
-    let Some(source) = record.source else {
-        return Ok(Vec::new());
-    };
-    let current = record.target.plan.map(|plan| plan.key);
-    if current == Some(source) {
-        return Ok(Vec::new());
+impl Operation for ReclaimUploadsOperation {
+    type Output = u64;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<u64> {
+        match self.source {
+            Some(_) => Ok(Next::Call(self.pages.call())),
+            None => Ok(Next::Done(0)),
+        }
     }
-    let read = StorageEffect::Read {
-        key_space: BUCKET_KEY_KEYSPACE.to_string(),
-        key: source.key().into(),
-        txn_id: Some(txn_id),
-    };
-    let mut key = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => BucketKeyRecord::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(Vec::new()),
-        other => return Err(format!("could not read the source key: {}", other.label())),
-    };
-    let vault = key.vault_entry.take().or(record.source_vault);
-    key.state = KeyState::Retired;
-    let mut effects = vec![StorageEffect::Write {
-        key_space: BUCKET_KEY_KEYSPACE.to_string(),
-        key: source.key().into(),
-        value: key.to_bytes().map_err(|e| e.to_string())?.into(),
-        txn_id: Some(txn_id),
-    }];
-    if let Some(id) = vault {
-        effects.push(StorageEffect::VaultDelete {
-            entry: VaultEntry::new(VaultPurpose::BucketKey, id),
-            txn_id: Some(txn_id),
-        });
+
+    fn next(&mut self, result: IoResult) -> Turn<u64> {
+        if std::mem::take(&mut self.deleting) {
+            result.done()?;
+            return self.next_page();
+        }
+        let source = self.source;
+        let deletes: Vec<_> = (self.pages.take(result)?.into_iter())
+            .filter(|(_, value)| envelope_key(value) == source)
+            .map(|(upload, _)| (ABE_PENDING_KEYSPACE.to_string(), upload))
+            .collect();
+        if deletes.is_empty() {
+            return self.next_page();
+        }
+        self.count += deletes.len() as u64;
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
-    Ok(effects)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::SealPlan;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
+    use aruna_storage::StorageHandle;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -1312,6 +1426,198 @@ mod tests {
         let record = EncryptionTransition::new(TransitionKind::Decrypt, Some(source), target, 2, 1);
         assert_eq!(uses_key(&locations, source, &record), 2);
         assert_eq!(uses_key(&locations[1..4], source, &record), 0);
+    }
+
+    async fn settle(
+        context: &DriverContext,
+        bucket: &str,
+        record: EncryptionTransition,
+    ) -> Result<Option<Duration>, MigrationError> {
+        drive(SettleTransitionOperation::new(bucket, record), context).await
+    }
+
+    async fn read_record(
+        storage: &StorageHandle,
+        bucket: &str,
+    ) -> Result<Option<EncryptionTransition>, String> {
+        let read = StorageEffect::Read {
+            key_space: TRANSITION_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                decode_transition(value).map_err(|error| error.to_string())
+            }
+            other => Err(other.label().to_string()),
+        }
+    }
+
+    async fn exists(
+        storage: &StorageHandle,
+        key_space: &str,
+        key: Vec<u8>,
+        txn_id: Option<aruna_core::types::TxnId>,
+    ) -> Result<bool, String> {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            other => Err(other.label().to_string()),
+        }
+    }
+
+    /// Runs a [`SourceScan`] alone, in a snapshot of its own.
+    #[derive(Debug, PartialEq)]
+    struct ScanOperation(SourceScan);
+
+    impl Operation for ScanOperation {
+        type Output = u64;
+        type Error = MigrationError;
+
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::ReadSnapshot
+        }
+
+        fn first(&mut self) -> Turn<u64> {
+            Ok(Next::Call(self.0.start()))
+        }
+
+        fn next(&mut self, result: IoResult) -> Turn<u64> {
+            match self.0.step(result)? {
+                Some(call) => Ok(Next::Call(call)),
+                None => Ok(Next::Done(self.0.pending)),
+            }
+        }
+    }
+
+    fn transition() -> EncryptionTransition {
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        EncryptionTransition::new(TransitionKind::Decrypt, Some(source), target, 2, 1)
+    }
+
+    fn stored_child(record: EncryptionTransition) -> IoResult {
+        let stored = StoredTransition {
+            stored: true,
+            record,
+        };
+        let outcome: Result<StoredTransition, MigrationError> = Ok(stored);
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    #[test]
+    fn empty_queue_ends() {
+        let mut process = ProcessTransitionsOperation::new(None);
+        assert!(matches!(
+            process.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(process.next(page), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn waiting_transition_skipped() {
+        let mut process = ProcessTransitionsOperation::new(None);
+        process.stamp(1_000);
+        process.first().unwrap();
+        let row = (Key::from(b"b".to_vec()), Value::from(Vec::new()));
+        let page = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        assert!(matches!(
+            process.next(page),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let mut record = transition();
+        record.retry_at_ms = Some(3_000);
+        let value = Value::from(record.to_bytes().unwrap());
+        let wait = Duration::from_secs(2);
+        let answer = IoResult::Values(vec![Some(value)]);
+        assert_eq!(process.next(answer), Ok(Next::Done(Some(wait))));
+    }
+
+    #[test]
+    fn empty_pass_settles() {
+        let mut advance = AdvanceTransitionOperation::new("b".to_string(), transition(), None);
+        assert!(matches!(
+            advance.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let turn = advance.next(page);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(advance.record.state, TransitionState::Cleanup);
+    }
+
+    #[test]
+    fn failed_pass_retries() {
+        let mut advance = AdvanceTransitionOperation::new("b".to_string(), transition(), None);
+        advance.stamp(5);
+        advance.first().unwrap();
+        advance.record.failed = 1;
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(matches!(
+            advance.next(page),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(advance.record.retries, 1);
+        let wait = RECHECK.saturating_mul(2);
+        let answer = stored_child(advance.record.clone());
+        assert_eq!(advance.next(answer), Ok(Next::Done(Some(wait))));
+    }
+
+    #[test]
+    fn replaced_record_kept() {
+        let mut store = StoreTransitionOperation::new("b", transition());
+        store.first().unwrap();
+        let answer = IoResult::Values(vec![None]);
+        let Ok(Next::Done(stored)) = store.next(answer) else {
+            panic!("a missing record ends the store");
+        };
+        assert!(!stored.stored);
+    }
+
+    #[test]
+    fn present_copy_kept() {
+        let key = Key::from(vec![0, 1]);
+        let mut forget = ForgetRemovedOperation::new(1, vec![key]);
+        assert!(matches!(
+            forget.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(matches!(forget.next(page), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = IoResult::Values(vec![Some(Value::from(vec![1]))]);
+        assert_eq!(forget.next(answer), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn no_retiring_key_reclaims_none() {
+        let mut record = transition();
+        record.source = None;
+        let mut reclaim = ReclaimUploadsOperation::new(&record);
+        assert_eq!(reclaim.first(), Ok(Next::Done(0)));
     }
 
     fn context(root: &std::path::Path) -> DriverContext {
