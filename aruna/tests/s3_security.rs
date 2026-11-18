@@ -333,7 +333,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
         ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
     };
     use aruna_operations::driver::drive;
-    use aruna_operations::jobs::workflow::prepare::workspace_mint;
+    use aruna_operations::jobs::workflow::credential::{MintCredentialOperation, RunIdentity};
 
     let seed = spawn_complete_seed().await?;
     let result = async {
@@ -381,7 +381,12 @@ async fn workspace_credential_writes() -> TestResult<()> {
         record.workspace_mode = WorkspaceMode::Existing;
         record.workspace_bucket = Some("ws-run".to_string());
         let context = seed.context.as_ref();
-        let mint = workspace_mint(context, &spec, &record, node_id, ("ws-run", None));
+        let realm_id = context.serving_realm(record.created_by.realm_id);
+        let run = RunIdentity::new(&spec, &record, realm_id, node_id);
+        let key = (context.net_handle.as_ref()).map(|net| net.credential_encryption_key());
+        let secret = (key, std::time::SystemTime::now());
+        let job = (&spec, &record);
+        let mint = MintCredentialOperation::workspace(job, run, ("ws-run", None), secret);
         let minted = drive(mint, context)
             .await
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;

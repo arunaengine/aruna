@@ -5,6 +5,7 @@
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::{AttemptRef, TombstoneEvidence};
 use aruna_core::errors::StorageError;
+use aruna_core::events::Event;
 
 use super::*;
 
@@ -47,13 +48,7 @@ fn authorized() -> IoResult {
 }
 
 fn compute_call(request: ComputeRequest) -> Next<()> {
-    Next::Call(IoCall::Effect(Box::new(Effect::Compute(Box::new(
-        ComputeEffect {
-            kind: ExecutorKind::Docker,
-            fence: fence(),
-            request,
-        },
-    )))))
+    Next::Call(attempt_call(&ExecutorKind::Docker, &fence(), request))
 }
 
 fn tombstone_spec() -> ComputeRequest {

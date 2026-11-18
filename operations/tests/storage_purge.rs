@@ -48,7 +48,7 @@ use crate::job_calls::put_purge_checkpoint;
 use crate::job_calls::insert_job;
 use aruna_operations::jobs::store::state::ClaimOutcome;
 use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running};
-use aruna_operations::jobs::workflow::purge::run_storage_purge;
+use aruna_operations::jobs::host::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{

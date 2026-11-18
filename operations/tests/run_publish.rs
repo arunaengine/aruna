@@ -28,7 +28,7 @@ use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReport
 use crate::job_calls::{put_crate_status, read_crate_status, read_run_link};
 use crate::job_calls::insert_job;
 use crate::job_calls::read_job_record;
-use aruna_operations::jobs::workflow::run_crate::write_run_crate;
+use aruna_operations::jobs::workflow::run_crate::{WriteCrateOperation, crate_outcome};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -38,6 +38,11 @@ use topology::{TestNode, TestResult, Topology, read_group_auth, wait_until};
 use ulid::Ulid;
 
 const REMOTE_BUCKET: &str = "lab-data";
+
+async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
+    let write = WriteCrateOperation::new(for_job, ctx.driver.node_and_realm());
+    crate_outcome(drive(write, &ctx.driver).await)
+}
 const LOCAL_BUCKET: &str = "run-out";
 const OUTPUT: &[u8] = b">contig1\nACGT\n";
 /// Only ends a hung exchange; never a performance assertion.

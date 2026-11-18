@@ -43,10 +43,12 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             .await
         }
         JobPayload::WriteRunCrate { for_job } => {
-            Box::pin(crate::jobs::workflow::run_crate::write_run_crate(
-                ctx, *for_job,
-            ))
-            .await
+            let write = crate::jobs::workflow::run_crate::WriteCrateOperation::new(
+                *for_job,
+                ctx.driver.node_and_realm(),
+            );
+            let result = Box::pin(crate::driver::drive(write, &ctx.driver)).await;
+            crate::jobs::workflow::run_crate::crate_outcome(result)
         }
         JobPayload::TerminalCleanup {
             for_job,
@@ -88,16 +90,10 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             Box::pin(run_hosted(ctx, job)).await
         }
         JobPayload::StoragePurge(spec) => {
-            Box::pin(crate::jobs::workflow::purge::run_storage_purge(
-                ctx, spec, false,
-            ))
-            .await
+            Box::pin(super::job_host::run_storage_purge(ctx, spec, false)).await
         }
         JobPayload::StoragePurgeFiles(spec) => {
-            Box::pin(crate::jobs::workflow::purge::run_storage_purge(
-                ctx, spec, true,
-            ))
-            .await
+            Box::pin(super::job_host::run_storage_purge(ctx, spec, true)).await
         }
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => Box::pin(run_backend_import(ctx, spec)).await,

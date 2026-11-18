@@ -12,6 +12,7 @@ use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFa
 use aruna_core::operation::Runnable;
 use aruna_core::structs::execution::job::{JobError, StagingJobSpec};
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
+use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use futures_util::future::BoxFuture;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,7 @@ use crate::effect_adapters::job::{JobHost, with_job_host};
 use crate::jobs::backend_import::{BackendImportOperation, ImportJob};
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
 use crate::jobs::staging::{StagingJobOperation, StagingRun};
+use crate::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use crate::s3::object::read::get_object_routed;
 
@@ -134,6 +136,18 @@ where
         Ok(outcome) => outcome,
         Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
     }
+}
+
+/// Runs a storage purge; with `files` it also releases the linked-storage files of the versions.
+pub async fn run_storage_purge(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    files: bool,
+) -> JobRunOutcome {
+    let wiring = (node_routing(&ctx.driver), ctx.driver.node_and_realm());
+    let ids = (ctx.job_id, ctx.claim_token);
+    let run = PurgeRun::new(ids, spec, files, wiring, ctx.progress.snapshot());
+    run_hosted(ctx, PurgeJobOperation::new(run)).await
 }
 
 pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> JobRunOutcome {

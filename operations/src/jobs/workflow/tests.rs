@@ -2,21 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::finalize::{collect_or_park, exit_message, finalize_attempt, finalize_cancel};
-use super::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec, prepare_workspace};
-use super::recovery::{pre_submit_failure, recover_failed_submit};
-use super::supervise::{supervise_and_finalize, walltime_anchor};
+use super::attempt::{AttemptScope, RunWiring};
+use super::credential::{MintCredentialOperation, RunIdentity, WorkspaceAccessOperation};
+use super::finalize::exit_message;
+use super::inventory::CollectOutputsOperation;
+use super::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec};
+use super::reconcile::ResumeAttemptOperation;
+use super::settle::{ParkAttemptOperation, SettleScope};
+use super::supervise::WalltimeAnchorOperation;
 use super::*;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::effect_adapters::job::with_job_host;
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use crate::jobs::store::attempt::{
-    put_crate_status, read_attempt_control, record_attempt_started, set_cancel_requested,
+use crate::jobs::store::job_calls::ClaimOutcome;
+use crate::jobs::store::test_calls::{
+    begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
+    put_crate_status, read_attempt_control, read_job_record, record_attempt_intent,
+    record_attempt_started, set_cancel_requested, transition_to_preparing, transition_to_ready,
 };
-use crate::jobs::store::query::insert_job;
-use crate::jobs::store::state::{ClaimOutcome, claim_job, handoff_external_attempt};
-use crate::jobs::workflow::prepare::workspace_mint;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::tasks::job_runner::{execution_host, resume_attempt as run_resume, run_execution_job};
+use crate::tasks::job_runner::{run_wiring, under_lease};
+use aruna_compute::ExecutorBackend;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
@@ -32,6 +40,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use std::collections::BTreeMap;
@@ -39,9 +48,231 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::tempdir;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::tests::workflow::{execution_spec, node_id};
+
+/// The context of a call about `backend`: one whose registry holds it.
+fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> DriverContext {
+    let mut context = context.clone();
+    let held = (context.compute_handle.as_ref())
+        .is_some_and(|registry| registry.get(&backend.kind()).is_some());
+    if !held {
+        let registry = ExecutorRegistry::new().with_backend(backend.clone());
+        context.compute_handle = Some(Arc::new(registry));
+    }
+    context
+}
+
+fn wiring(context: &DriverContext) -> RunWiring {
+    RunWiring {
+        serving: context.node_and_realm(),
+        routing: node_routing(context),
+        encryption_key: None,
+    }
+}
+
+fn attempt_scope(
+    context: &DriverContext,
+    (job_id, token): (JobId, ulid::Ulid),
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) -> Arc<AttemptScope> {
+    Arc::new(AttemptScope {
+        job_id,
+        token,
+        kind: backend.kind(),
+        fence: fence.clone(),
+        spec: Arc::new(spec.clone()),
+        bucket: bucket.to_string(),
+        run_as: backend.run_identity(),
+        wiring: match context.net_handle {
+            Some(_) => run_wiring(context),
+            None => wiring(context),
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    result: Result<AttemptStatus, BackendError>,
+    cancel: &CancellationToken,
+) {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let finalize = FinalizeOperation::new(scope, FinalizeGoal::Attempt(result));
+    let run = drive(finalize, &context);
+    with_job_host(execution_host(cancel.clone()), run)
+        .await
+        .unwrap();
+}
+
+async fn finalize_cancel(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let finalize = FinalizeOperation::new(scope, FinalizeGoal::Cancel);
+    drive(finalize, &context).await.unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_failed_submit(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    cancel: &CancellationToken,
+    error: BackendError,
+) -> bool {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let recover = RecoverSubmitOperation::new(scope, error);
+    let run = drive(recover, &context);
+    with_job_host(execution_host(cancel.clone()), run)
+        .await
+        .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_and_finalize(
+    context: Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: Arc<dyn ExecutorBackend>,
+    fence: FenceContext,
+    spec: ExecutionSpec,
+    bucket: String,
+    cancel: CancellationToken,
+) {
+    let scope = attempt_scope(&context, (job_id, token), &backend, &fence, &spec, &bucket);
+    let context = with_backend(&context, &backend);
+    let supervise = SuperviseOperation::new(scope);
+    if under_lease(&context, (job_id, token), cancel, supervise)
+        .await
+        .is_none()
+    {
+        let abandon = supervise::AbandonSessionOperation::new(job_id);
+        drive(abandon, &context).await.unwrap();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_attempt(
+    context: Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: Arc<dyn ExecutorBackend>,
+    fence: FenceContext,
+    phase: AttemptPhase,
+    spec: ExecutionSpec,
+    bucket: String,
+    record: JobRecord,
+    cancel: CancellationToken,
+) {
+    let scope = attempt_scope(&context, (job_id, token), &backend, &fence, &spec, &bucket);
+    let context = Arc::new(with_backend(&context, &backend));
+    run_resume(context, scope, Arc::new(record), phase, cancel).await;
+}
+
+async fn collect_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    control: &aruna_core::structs::execution::job::AttemptControl,
+) -> Option<Vec<aruna_core::structs::execution::job::OutputObject>> {
+    let node = context.net_handle.as_ref().map(|net| net.node_id());
+    let collect = CollectOutputsOperation::new(spec, bucket, control.clone(), node);
+    match drive(collect, context).await {
+        Ok(outputs) => Some(outputs),
+        Err(error) => {
+            let scope = SettleScope {
+                serving: context.node_and_realm(),
+                now_ms: unix_timestamp_millis(),
+            };
+            let park = ParkAttemptOperation::new(job_id, token, error, scope);
+            drive(park, context).await.unwrap();
+            None
+        }
+    }
+}
+
+async fn prepare_workspace(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    bucket: &str,
+) -> Result<(), JobError> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    drive(WorkspaceAccessOperation::existing(run, bucket), context).await
+}
+
+async fn pre_submit_failure(
+    context: &DriverContext,
+    _job_id: JobId,
+    token: ulid::Ulid,
+    record: &JobRecord,
+    error: JobError,
+    logged: bool,
+) {
+    let scope = SettleScope {
+        serving: context.node_and_realm(),
+        now_ms: unix_timestamp_millis(),
+    };
+    let failure = settle::SubmitFailureOperation::new(record, token, error, logged, scope);
+    drive(failure, context).await.unwrap();
+}
+
+async fn walltime_anchor(context: &DriverContext, job_id: JobId, token: ulid::Ulid) -> u64 {
+    let anchor = WalltimeAnchorOperation::new(job_id, token);
+    drive(anchor, context).await.unwrap()
+}
+
+async fn resolve_backend(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    job_id: JobId,
+) -> Result<aruna_core::compute::effect::BackendFacts, JobError> {
+    let resolve = ResolveBackendOperation::new(spec, job_id);
+    drive(resolve, context).await.map(|resolved| resolved.facts)
+}
+
+fn workspace_mint(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    scope: (&str, Option<&str>),
+) -> MintCredentialOperation {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    let key = run_wiring(context).encryption_key;
+    let secret = (key, std::time::SystemTime::now());
+    MintCredentialOperation::workspace((spec, record), run, scope, secret)
+}
 
 fn job_id() -> JobId {
     crate::jobs::submit::mint_job_id(
@@ -731,7 +962,7 @@ async fn cancelled_exhaustion_settles() {
     begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
-    crate::jobs::store::mutate_job(&ctx, job_id, |record| {
+    mutate_job(&ctx, job_id, |record| {
         record.attempts = JOB_MAX_ATTEMPTS - 1;
         Ok(crate::jobs::store::JobMutation::Persist)
     })
@@ -867,13 +1098,14 @@ fn session_spec(idle_after_ms: Option<u64>) -> ExecutionSpec {
 /// A context whose compute plane can register sessions.
 async fn session_context(
     storage: StorageHandle,
+    backend: Arc<dyn ExecutorBackend>,
 ) -> (
     Arc<DriverContext>,
     aruna_net::NetHandle,
     Arc<ExecutorRegistry>,
 ) {
     let (context, net) = net_context(storage).await;
-    let registry = Arc::new(ExecutorRegistry::new());
+    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend));
     let mut context = context;
     Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
     (context, net, registry)
@@ -900,10 +1132,11 @@ async fn session_end_succeeds() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    crate::jobs::store::mutate_job(&context, job_id, |record| {
+    mutate_job(&context, job_id, |record| {
         record.payload = JobPayload::Execution(session_spec(None));
         Ok(crate::jobs::store::JobMutation::Persist)
     })
@@ -912,7 +1145,6 @@ async fn session_end_succeeds() {
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    let backend = StubBackend::new(StubReconcile::Waiting);
 
     let supervisor = tokio::spawn(supervise_and_finalize(
         ctx.clone(),
@@ -965,13 +1197,13 @@ async fn session_idle_succeeds() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, _registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, _registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    let backend = StubBackend::new(StubReconcile::Waiting);
 
     supervise_and_finalize(
         ctx,
@@ -999,13 +1231,13 @@ async fn session_kernel_fails() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    let backend = StubBackend::new(StubReconcile::Waiting);
 
     let supervisor = tokio::spawn(supervise_and_finalize(
         ctx,
@@ -1046,13 +1278,13 @@ async fn superseded_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    let backend = StubBackend::new(StubReconcile::Waiting);
 
     let supervisor = tokio::spawn(supervise_and_finalize(
         ctx,
@@ -1096,13 +1328,13 @@ async fn superseded_keeps_replacement() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    let backend = StubBackend::new(StubReconcile::Waiting);
 
     let supervisor = tokio::spawn(supervise_and_finalize(
         ctx,
@@ -1162,14 +1394,14 @@ async fn cancel_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = crate::testing::test_context(storage.clone());
-    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     set_cancel_requested(&context, job_id, 7).await.unwrap();
-    let backend = StubBackend::new(StubReconcile::NotFound);
 
     supervise_and_finalize(
         ctx,
@@ -1346,7 +1578,7 @@ async fn reconcile_skips_submit() {
     set_cancel_requested(&ctx, job_id, 6).await.unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);
 
-    reconcile::resume_attempt(
+    resume_attempt(
         ctx.clone(),
         job_id,
         token,
@@ -1451,7 +1683,7 @@ async fn recovery_reuses_credential() {
     let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = crate::jobs::store::mutate_job(&context, record.job_id, |record| {
+    let record = mutate_job(&context, record.job_id, |record| {
         record.payload = JobPayload::Execution(spec.clone());
         record.created_by = owner;
         record.captured_inputs = vec![captured.clone()];
@@ -1505,7 +1737,7 @@ async fn workspace_run_credential() {
     let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = crate::jobs::store::mutate_job(&context, record.job_id, |record| {
+    let record = mutate_job(&context, record.job_id, |record| {
         record.payload = JobPayload::Execution(spec.clone());
         record.created_by = owner;
         record.workspace_mode = WorkspaceMode::Existing;
@@ -1561,7 +1793,8 @@ async fn crate_write_idempotent() {
         range_turns: Default::default(),
         handlers: Default::default(),
     };
-    let outcome = super::run_crate::write_run_crate(&ctx, job_id).await;
+    let write = super::run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
+    let outcome = super::run_crate::crate_outcome(drive(write, &ctx.driver).await);
     match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
             assert_eq!(resource, "already-there");

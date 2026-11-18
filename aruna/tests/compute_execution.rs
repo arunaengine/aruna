@@ -29,9 +29,8 @@ use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
 use aruna_operations::jobs::store::{JobMutation, mutate_job};
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
-use aruna_operations::jobs::workflow::run_execution_job;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::tasks::job_runner::{ComputeReconciler, run_execution_job};
 use aws_sdk_s3::primitives::ByteStream;
 use serde_json::{Value, json};
 use shared::{

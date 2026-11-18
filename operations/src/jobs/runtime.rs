@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::executor::{PayloadHandler, ProgressReporter, RangeTurns};
-use super::reconcile::ExternalReconciler;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
+use crate::tasks::job_reconcile::ExternalReconciler;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -455,14 +455,14 @@ mod tests {
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::executor::{JobContext, JobRunOutcome};
     use crate::jobs::runtime_steps::requeue_call;
+    use crate::jobs::store::JobMutation;
     use crate::jobs::store::JobMutationError;
-    use crate::jobs::store::attempt::{AdoptOutcome, adopt_external_attempt, set_cancel_requested};
-    use crate::jobs::store::query::{insert_job, list_job_entries};
-    use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, record_attempt_intent};
-    use crate::jobs::store::state::{
-        RequeueOutcome, cancel_running_job, read_job_record, requeue_job,
+    use crate::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
+    use crate::jobs::store::test_calls::{
+        adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job,
+        list_job_entries, mutate_job, read_job_record, record_attempt_intent, requeue_job,
+        set_cancel_requested,
     };
-    use crate::jobs::store::{JobMutation, mutate_job};
     use crate::tasks::job_runner::{handle_panic, run_job};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -1168,9 +1168,10 @@ mod tests {
         insert_job(&ctx, &record).await.unwrap();
         assert_eq!(runtime.available_slots(), 0);
 
-        let outcome = crate::jobs::job_reads::tests::cancel_owned_job(&ctx, &runtime, owner, job_id)
-            .await
-            .unwrap();
+        let outcome =
+            crate::jobs::job_reads::tests::cancel_owned_job(&ctx, &runtime, owner, job_id)
+                .await
+                .unwrap();
         assert!(matches!(
             outcome,
             crate::jobs::job_cancel::CancelJobOutcome::Requested(_)
