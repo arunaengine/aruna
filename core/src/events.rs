@@ -512,6 +512,10 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// The caller a forwarded token stands for, or why it is not accepted from that peer.
+    WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
+    /// The JSON-LD summary of a dataset, or why it could not be read.
+    DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -523,6 +527,21 @@ pub struct MetadataAnswer {
     pub peer: NodeId,
     pub elapsed: Duration,
     pub result: Result<Vec<u8>, PeerRequestError>,
+}
+
+/// Why a forwarded token gives a peer no caller.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PeerAuthRefusal {
+    #[error("the forwarded token is not accepted")]
+    Unauthorized,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<crate::calls::IoError> for PeerAuthRefusal {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
 }
 
 /// Why a peer request has no answer.
@@ -929,6 +948,8 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    DatasetSummary,
+                    WritePeerAuth,
                     Notification,
                     InboxWoken,
                     Heartbeat,

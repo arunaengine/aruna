@@ -12,11 +12,12 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
-    PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    PeerAuthRefusal, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::dataset_description::DescriptionError;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
 use parking_lot::Mutex;
@@ -245,6 +246,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
+        // Token validation state lives in the metadata handle the runner holds.
+        NetEffect::WritePeerAuth(_) => NetEvent::WritePeerAuth(Err(PeerAuthRefusal::Unavailable(
+            "peer authorization must be dispatched by the operations runner".to_string(),
+        ))),
+        // The routed export reads through the handles the runner holds.
+        NetEffect::DatasetSummary(_) => {
+            NetEvent::DatasetSummary(Err(DescriptionError::Unavailable))
+        }
         // Metadata requests ride the metadata transport the runner holds.
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
@@ -590,6 +599,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
+        NetEffect::DatasetSummary(_) => "dataset_summary",
+        NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",
