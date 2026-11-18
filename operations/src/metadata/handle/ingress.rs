@@ -1001,16 +1001,18 @@ impl MetadataHandle {
                 })
                 .await
             }
-            check @ MetadataTransportMessage::ForwardCheckBucket { .. } => {
-                Box::pin(async {
-                    crate::s3::bucket::forward::check_bucket_write(context, peer, check).await
-                })
-                .await
-            }
-            create @ (MetadataTransportMessage::ForwardCreateBucket { .. }
+            bucket @ (MetadataTransportMessage::ForwardCheckBucket { .. }
+            | MetadataTransportMessage::ForwardCreateBucket { .. }
             | MetadataTransportMessage::ForwardNewBucket { .. }) => {
                 Box::pin(async {
-                    crate::s3::bucket::forward::apply_bucket_create(context, peer, create).await
+                    let local = context.node_and_realm();
+                    let answer =
+                        crate::s3::bucket::forward::BucketForwardOperation::new(local, peer, bucket);
+                    crate::driver::drive(answer, context)
+                        .await
+                        .unwrap_or_else(|error| {
+                            crate::forward::transport::reject(error.to_string())
+                        })
                 })
                 .await
             }
