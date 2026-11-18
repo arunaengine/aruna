@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use aruna_core::events::Event;
 use aruna_core::jobs::{JobEvent, JobStops};
 
-use super::super::tests::{local_candidate, plain_entity, source_scope};
+use super::super::tests::{plain_entity, source_scope, stored_candidate};
 use super::*;
 use crate::jobs::repository::test_support::child;
 
 fn entity() -> ExportEntity {
     let mut entity = plain_entity("a");
-    entity.candidates = vec![local_candidate()];
+    entity.candidates = vec![stored_candidate()];
     entity
 }
 
