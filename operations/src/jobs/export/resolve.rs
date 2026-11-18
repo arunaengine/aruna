@@ -695,3 +695,101 @@ fn rows(result: IoResult) -> Result<Vec<Option<Value>>, ResolveError> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    fn auth() -> AuthContext {
+        AuthContext {
+            user_id: Default::default(),
+            realm_id: RealmId([1u8; 32]),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn exact() -> VersionedObjectArn {
+        VersionedObjectArn {
+            realm_id: RealmId([1u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version: Ulid::from_parts(1, 1),
+        }
+    }
+
+    // An exact version whose bucket is gone is missing without reading anything else.
+    #[test]
+    fn missing_bucket_misses() {
+        let mut resolve = ResolveLocalOperation::new(auth(), LocalSource::Exact(exact()));
+        assert_eq!(resolve.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(resolve.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            resolve.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(ResolveResult::Missing { hash: None }))
+        );
+    }
+
+    // An alias reads its grants and policies together; a realm without its config retries.
+    #[test]
+    fn missing_policies_retry() {
+        let alias = HashIndex {
+            blake3_hash: [3u8; 32],
+            version_id: Ulid::from_parts(1, 1),
+            realm_id: RealmId([1u8; 32]),
+            group_id: Ulid::from_parts(2, 2),
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+        };
+        let mut resolve = ResolveLocalOperation::new(auth(), LocalSource::Alias(alias));
+        let Ok(Next::Call(IoCall::Read(reads))) = resolve.first() else {
+            panic!("the grants and policies are read");
+        };
+        let answer = IoResult::Values(vec![None; reads.len()]);
+        assert!(matches!(
+            resolve.next(answer),
+            Err(ResolveError::Retryable(_))
+        ));
+    }
+
+    // A local open whose bucket is gone is missing before anything else is read.
+    #[test]
+    fn open_missing_bucket() {
+        use aruna_core::structs::storage::blob::BackendRef;
+        let arn = exact();
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "storage".to_string(),
+            backend_path: "b/k".to_string(),
+            ulid: Ulid::from_parts(4, 4),
+            format: Default::default(),
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: Default::default(),
+        };
+        let candidate = LocalCandidate {
+            location,
+            group_id: Ulid::from_parts(2, 2),
+            permission_path: String::new(),
+            node_id: arn.node_id,
+            bucket: arn.bucket,
+            key: arn.key,
+            blake3: [3u8; 32],
+            version_id: arn.version,
+        };
+        let mut open = OpenLocalOperation::new(auth(), false, candidate);
+        assert_eq!(open.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(open.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            open.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(LocalOpen::Missing))
+        );
+    }
+}

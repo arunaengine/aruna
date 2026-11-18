@@ -15,7 +15,7 @@ use aruna_core::structs::placement::compute_config::{
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::quota::group_demand;
+use aruna_operations::node::node_info::group_demand;
 use aruna_operations::node::node_info::set_operator_drain;
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,

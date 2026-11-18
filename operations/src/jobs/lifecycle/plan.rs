@@ -29,11 +29,11 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
-use super::policies::{Resolutions, ResolvePoliciesOperation};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
+use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
@@ -158,12 +158,12 @@ impl BuildPlanOperation {
         }
         self.step = PlanStep::Policies;
         let refs = self.inputs.iter().flat_map(|input| input.policies.clone());
-        let refs = refs
+        let refs: Vec<_> = refs
             .chain(self.round.spec.output_policies.clone())
             .collect();
         let round = &self.round;
-        let resolve =
-            ResolvePoliciesOperation::new(round.spec.realm_id, round.local, round.now_ms, refs);
+        let (realm_id, local, now_ms) = (round.spec.realm_id, round.local, round.now_ms);
+        let resolve = PolicySetResolver::new(realm_id, local, now_ms, ResolveMode::Lenient, &refs);
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
@@ -287,7 +287,7 @@ impl Operation for BuildPlanOperation {
                 self.holders(index + 1)
             }
             PlanStep::Policies => {
-                let resolved = result.child::<Resolutions, IoError>()?;
+                let resolved = result.child::<Resolutions, PolicySetError>()?;
                 self.policies = resolved.unwrap_or_else(|error| {
                     debug!(error = %error, "Placement policies stayed unresolved for planning");
                     BTreeMap::new()
@@ -920,5 +920,50 @@ mod tests {
             })
         );
         assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);
+    }
+
+    /// Answers every call of one round: no member advertises, no copy is registered, no
+    /// policy resolves and no policy row exists.
+    fn quiet_round(operation: &mut BuildPlanOperation) -> (usize, ExecutionPlan) {
+        use aruna_core::calls::ChildOutcome;
+        let mut turn = operation.first();
+        let mut unread = 0;
+        loop {
+            let call = match turn.expect("the round continues") {
+                Next::Call(call) => call,
+                Next::Done(plan) => return (unread, plan),
+                other => panic!("unexpected turn {other:?}"),
+            };
+            let answer = match (&operation.step, call) {
+                (PlanStep::Advertisement(_), IoCall::Child(_)) => {
+                    unread += 1;
+                    let error = NodeInfoError::Decode("unreadable".to_string());
+                    IoResult::Child(ChildOutcome::new(Err::<
+                        BTreeMap<NodeId, NodeInfoDocument>,
+                        _,
+                    >(error)))
+                }
+                (PlanStep::Holders(_), IoCall::Child(_)) => IoResult::Child(ChildOutcome::new(
+                    Ok::<_, GetHoldersError>(Vec::<NodeId>::new()),
+                )),
+                (PlanStep::Policies, IoCall::Child(_)) => {
+                    IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(Resolutions::new())))
+                }
+                (_, IoCall::Read(reads)) => IoResult::Values(vec![None; reads.len()]),
+                (step, call) => panic!("unexpected call {call:?} in {step:?}"),
+            };
+            turn = operation.next(answer);
+        }
+    }
+
+    // A round reads every member's advertisement; one it cannot read leaves the round retryable.
+    #[test]
+    fn unread_round_retries() {
+        let family = Family::new([4u8; 32]);
+        let config = family.config.clone();
+        let mut operation = BuildPlanOperation::new(round(&config, &family.spec(), &[]));
+        let (unread, plan) = quiet_round(&mut operation);
+        assert_eq!(unread, config.sync_eligible_nodes().expect("members").len());
+        assert!(unread > 0 && plan.selected.is_none() && plan.retryable);
     }
 }

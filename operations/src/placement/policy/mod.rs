@@ -43,7 +43,7 @@ pub use read::{
 };
 pub use reconcile::{LocalSubjectOperation, SubjectSyncOperation, SubjectTrigger};
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
-pub use resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+pub use resolve_set::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
 };

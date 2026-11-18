@@ -3,9 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::ChildOutcome;
+use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, Operation, SubOperation};
+use aruna_core::operation::{EffectOperation, Operation, SubOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
@@ -25,7 +27,9 @@ use crate::auth::check_permissions::permission_check;
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
+};
 use crate::s3::policy::successor::{
     MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child,
     mint_outcome,
@@ -86,7 +90,6 @@ pub struct PolicyMutationOperation {
     config: PolicyMutationConfig,
     successor_version_id: Ulid,
     state: MutationState,
-    resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
     mint: Option<Box<dyn SubOperation>>,
     output: Option<Result<SuccessorOutcome, PolicyMutationError>>,
@@ -103,7 +106,6 @@ impl PolicyMutationOperation {
             config,
             successor_version_id,
             state: MutationState::Init,
-            resolver: None,
             resolved: BTreeMap::new(),
             mint: None,
             output: None,
@@ -130,38 +132,36 @@ impl PolicyMutationOperation {
     }
 
     fn resolve_refs(&mut self) -> Effects {
-        let mut resolver = PolicySetResolver::new(
+        let resolver = PolicySetResolver::new(
             self.config.auth_context.realm_id,
             self.config.subject.node_id,
             self.config.now_ms,
             ResolveMode::Strict,
             &self.config.target_refs,
         );
-        let step = resolver.start();
-        self.resolver = Some(resolver);
         self.state = MutationState::Resolve;
-        self.after_resolve(step)
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            resolver,
+            |result| { Event::Child(ChildOutcome::new(result)) }
+        ))]
     }
 
-    fn after_resolve(&mut self, step: ResolveStep) -> Effects {
-        match step {
-            ResolveStep::Pending(effects) => effects,
-            ResolveStep::Done => {
-                if let Some(resolver) = self.resolver.take() {
-                    self.resolved = resolver.into_resolutions();
-                }
+    fn after_resolve(&mut self, result: Result<Resolutions, PolicySetError>) -> Effects {
+        match result {
+            Ok(resolved) => {
+                self.resolved = resolved;
                 match foreign_owner(&self.resolved, self.config.context.group_id) {
                     Some(policy_id) => self.fail(PolicyMutationError::ForeignPolicy { policy_id }),
                     None => self.start_mint(),
                 }
             }
-            ResolveStep::Failed(policy_ref, source) => {
-                self.resolver = None;
+            Err(PolicySetError::Unresolved { policy_ref, source }) => {
                 self.fail(PolicyMutationError::PolicyUnavailable {
                     policy_id: policy_ref.policy_id,
                     source,
                 })
             }
+            Err(PolicySetError::Io(_)) => self.fail(PolicyMutationError::InvalidEvent),
         }
     }
 
@@ -239,11 +239,13 @@ impl EffectOperation for PolicyMutationOperation {
                 }
             }
             MutationState::Resolve => {
-                let Some(resolver) = self.resolver.as_mut() else {
+                let Event::Child(outcome) = event else {
                     return self.fail(PolicyMutationError::InvalidEvent);
                 };
-                let step = resolver.step(event);
-                self.after_resolve(step)
+                match outcome.take::<Resolutions, PolicySetError>() {
+                    Some(result) => self.after_resolve(result),
+                    None => self.fail(PolicyMutationError::InvalidEvent),
+                }
             }
             MutationState::Mint => {
                 let Some(mint) = self.mint.as_mut() else {
@@ -285,14 +287,10 @@ impl EffectOperation for PolicyMutationOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let mut effects: Effects = match self.resolver.as_mut() {
-            Some(resolver) => resolver.abort(),
+        match self.mint.as_mut() {
+            Some(mint) => mint.abort(),
             None => smallvec![],
-        };
-        if let Some(mint) = self.mint.as_mut() {
-            effects.extend(mint.abort());
         }
-        effects
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -321,15 +319,12 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::CurrentVersionPointer;
-    use aruna_core::types::Key;
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
     use crate::blob::records::HeadAliasContext;
-    use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::s3::policy::successor::SuccessorError;
-    use crate::tests::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -399,14 +394,6 @@ mod pure_tests {
         })
     }
 
-    fn cached(policy: &VerifiedPolicy) -> Event {
-        let entry = PolicyCacheEntry::verified(&signed_document(realm_id(), policy, 9), 10);
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(entry.to_bytes().expect("entry encodes").into()),
-        })
-    }
-
     fn group_id() -> Ulid {
         Ulid::from_bytes([2u8; 16])
     }
@@ -449,11 +436,9 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(false));
         operation.step(authorized(true));
-        operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::policy::group_authority(
-            realm_id(),
-            group_id(),
-        ));
+        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
+            &policy,
+        )));
 
         assert!(matches!(
             effects.as_slice(),
@@ -469,8 +454,9 @@ mod pure_tests {
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
         operation.start();
         operation.step(authorized(true));
-        operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::policy::group_authority(realm_id(), foreign));
+        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
+            &policy,
+        )));
 
         assert!(effects.is_empty(), "a foreign rule opens no transaction");
         assert_eq!(
@@ -487,14 +473,8 @@ mod pure_tests {
         let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
         operation.start();
         operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        let key: Key = Vec::new().into();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), None), (key.clone(), None), (key, None)],
-        }));
+        let unresolved = crate::tests::policy::unresolved_set(policy(1).policy_ref());
+        let effects = operation.step(unresolved);
 
         assert!(effects.is_empty(), "no transaction is opened");
         assert!(matches!(
@@ -511,8 +491,9 @@ mod pure_tests {
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
         operation.start();
         operation.step(authorized(true));
-        operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::policy::authority(realm_id()));
+        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
+            &policy,
+        )));
 
         assert!(matches!(
             effects.as_slice(),
@@ -529,8 +510,9 @@ mod pure_tests {
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
         operation.start();
         operation.step(authorized(true));
-        operation.step(cached(&policy));
-        operation.step(crate::tests::policy::authority(realm_id()));
+        operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
+            &policy,
+        )));
         let txn_id = Ulid::from_bytes([5u8; 16]);
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::BatchReadResult {

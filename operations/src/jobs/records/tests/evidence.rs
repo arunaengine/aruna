@@ -3,10 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState,
@@ -385,8 +383,11 @@ fn derives_exact_predecessors() {
 
 #[test]
 fn refuses_partial_scan() {
-    // A failed evidence page must not admit the candidate from the rows that
-    // did load: the run fails, aborts its transaction and writes nothing.
+    // An evidence page that says more rows follow is read on before anything is written, and a
+    // failed page ends the append with nothing written: no candidate is admitted from the
+    // rows that did load.
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
     let family = Family::new([27u8; 32]);
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
@@ -400,59 +401,38 @@ fn refuses_partial_scan() {
         local: None,
         origin: RecordOrigin::Local,
         now_ms: 3_000,
-    })
-    .into_machine();
+    });
     let config = family
         .config
         .to_bytes(&actor(family.holder.public()))
         .expect("config encodes");
-    let txn_id = Ulid::from_bytes([1u8; 16]);
-    let empty = Key::from([0u8].as_slice());
-
-    let mut effects: Vec<Effect> = operation.start().into_iter().collect();
-    effects.extend(operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: empty.clone(),
+    let Ok(Next::Call(IoCall::Effect(_))) = operation.first() else {
+        panic!("the realm config is read first");
+    };
+    let read = Event::Storage(StorageEvent::ReadResult {
+        key: Key::from([0u8].as_slice()),
         value: Some(Value::from(config.as_slice())),
-    })));
-    effects.extend(operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })));
-    effects.extend(
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(empty.clone(), None), (empty.clone(), None)],
-        })),
-    );
-    effects.extend(operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    })));
-    effects.extend(
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(empty, None)],
-        })),
-    );
-    assert!(matches!(
-        effects.last(),
-        Some(Effect::Storage(StorageEffect::Iter { .. }))
-    ));
-
-    effects.extend(operation.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::ReadError("boom".to_string()),
-    })));
-    assert!(operation.is_complete());
-    assert!(matches!(
-        effects.last(),
-        Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-    ));
-    assert!(
-        !effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Storage(StorageEffect::BatchWrite { .. })))
-    );
-    assert_eq!(
-        operation.finalize(),
-        Err(RecordStoreError::Storage(StorageError::ReadError(
-            "boom".to_string()
-        )))
-    );
+    });
+    let mut turn = operation.next(IoResult::Event(Box::new(read)));
+    let more = Key::from([1u8].as_slice());
+    let mut pages = 0;
+    let failed = loop {
+        let result = match turn {
+            Ok(Next::Call(IoCall::Read(reads))) => IoResult::Values(vec![None; reads.len()]),
+            Ok(Next::Call(IoCall::Page { .. })) if pages == 0 => {
+                pages += 1;
+                IoResult::Page {
+                    rows: Vec::new(),
+                    next: Some(more.clone()),
+                }
+            }
+            Ok(Next::Call(IoCall::Page { .. })) => break operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Write(_))) => panic!("a partial scan must not write"),
+            other => panic!("unexpected step {other:?}"),
+        };
+        turn = operation.next(result);
+    };
+    assert!(failed.is_err());
 }
 
 /// Answers every call of `operation` as an empty store would, after the realm config read,

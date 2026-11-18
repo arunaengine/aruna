@@ -3,26 +3,32 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError, StorageEvent};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
-use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim,
 };
-use aruna_core::structs::placement::policy::{PlacementSubject, VerifiedPolicy};
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicyRef, PlacementSubject, PolicyResolution, VerifiedPolicy,
+};
+use aruna_core::types::{Effects, Value};
+use std::collections::BTreeMap;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message};
 use crate::placement::policy::cache::{PolicyCacheEntry, cache_key};
 use crate::placement::policy::tests::{node, realm_authorization};
+use crate::placement::policy::{
+    PolicySetError, PolicySource, ReadPolicyError, Resolutions, ResolvedPolicy,
+};
 
 /// The holders a holder fetch sub-operation asks, in order, and the request it sends them. Every
 /// holder is answered with a failure, so the walk visits all of them.
@@ -72,25 +78,6 @@ pub(crate) fn signed_document(
     PlacementPolicyDocument::new(realm_id, policy, publication)
 }
 
-/// Group authorization granting the policy fixtures' admin user write on
-/// that group's admin path, which a group-owned publication needs.
-pub(crate) fn group_authorization(
-    realm_id: RealmId,
-    group_id: Ulid,
-) -> aruna_core::structs::identity::group::GroupAuthorizationDocument {
-    let role = Role {
-        role_id: Ulid::from_bytes([4u8; 16]),
-        name: "group_admin".to_string(),
-        permissions: HashMap::from([(format!("/{realm_id}/g/{group_id}/**"), Permission::WRITE)]),
-        assigned_users: HashSet::from([admin_user(realm_id)]),
-    };
-    aruna_core::structs::identity::group::GroupAuthorizationDocument {
-        group_id,
-        roles: HashMap::from([(role.role_id, role)]),
-        policies: Vec::new(),
-    }
-}
-
 /// Encoded realm config and authorization, the view a policy read verifies
 /// every publication against.
 pub(crate) fn realm_view(config: &RealmConfigDocument, user: UserId) -> (Value, Value) {
@@ -120,48 +107,35 @@ pub fn subject(node_id: NodeId, location: &str) -> PlacementSubject {
     }
 }
 
-pub fn authority(realm_id: RealmId) -> Event {
-    authority_view(realm_id, None)
+/// A resolver child that resolved every one of `policies`.
+pub(crate) fn resolved_set(policies: &[VerifiedPolicy]) -> Event {
+    let resolved: Resolutions = policies
+        .iter()
+        .map(|policy| {
+            (
+                policy.policy().policy_id,
+                PolicyResolution::Known(policy.clone()),
+            )
+        })
+        .collect();
+    Event::Child(ChildOutcome::new(Ok::<_, PolicySetError>(resolved)))
 }
 
-/// The same realm view plus the owning group's roles, which a group-owned
-/// rule is authenticated against.
-pub fn group_authority(realm_id: RealmId, group_id: GroupId) -> Event {
-    authority_view(realm_id, Some(group_id))
+/// A strict resolver child that could not authenticate `policy_ref`.
+pub(crate) fn unresolved_set(policy_ref: PlacementPolicyRef) -> Event {
+    let source = ReadPolicyError::Unavailable("no holder answered".to_string());
+    let error = PolicySetError::Unresolved { policy_ref, source };
+    Event::Child(ChildOutcome::new(Err::<Resolutions, _>(error)))
 }
 
-fn authority_view(realm_id: RealmId, group_id: Option<GroupId>) -> Event {
-    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
-    config.seed_default_placement();
-    for seed in [1, 9] {
-        config.ensure_node(
-            iroh::SecretKey::from_bytes(&[seed; 32]).public(),
-            RealmNodeKind::Server,
-        );
-    }
-    let (config_value, auth_value) = realm_view(&config, admin_user(realm_id));
-    let key: Key = Vec::new().into();
-    let mut values = vec![
-        (key.clone(), Some(config_value)),
-        (key.clone(), Some(auth_value)),
-    ];
-    if let Some(group_id) = group_id {
-        let document = group_authorization(realm_id, group_id);
-        values.push((
-            key,
-            Some(
-                document
-                    .to_bytes(&aruna_core::structs::identity::auth::Actor {
-                        node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-                        user_id: admin_user(realm_id),
-                        realm_id,
-                    })
-                    .expect("group authorization encodes")
-                    .into(),
-            ),
-        ));
-    }
-    Event::Storage(StorageEvent::BatchReadResult { values })
+/// A resolve child that obtained `policy` from the cache.
+pub(crate) fn resolved_policy(policy: &VerifiedPolicy) -> Event {
+    let resolved = ResolvedPolicy {
+        policy: policy.clone(),
+        source: PolicySource::Cached,
+        stats: Default::default(),
+    };
+    Event::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(resolved)))
 }
 
 pub async fn seed_gate(

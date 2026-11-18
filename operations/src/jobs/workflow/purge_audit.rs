@@ -208,3 +208,47 @@ mod audit_tests {
     }
 }
 
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use crate::jobs::store::mutation::{Rows, run_in_memory};
+
+    fn record() -> BlobAuditRecord {
+        BlobAuditRecord {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            group_id: Ulid::from_parts(1, 1),
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            user_id: Default::default(),
+            kind: BlobAuditKind::Purge(BlobPurgeKind::Bucket),
+            bucket: "b".to_string(),
+            key: String::new(),
+            version_id: None,
+            occurred_at_ms: 1,
+        }
+    }
+
+    fn spaces(rows: &Rows) -> Vec<&str> {
+        rows.keys().map(|(space, _)| space.as_str()).collect()
+    }
+
+    // The trail row is written only while the bucket stands in the purged incarnation.
+    #[test]
+    fn trails_standing_incarnation() {
+        let id = Ulid::from_parts(3, 3);
+        let standing = incarnation(None);
+        let bucket = (S3_BUCKET_KEYSPACE.to_string(), b"b".to_vec());
+        let operation = WriteAuditOperation::new(record(), id, Some(standing)).unwrap();
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        let mut rows = Rows::from([(bucket.clone(), vec![1])]);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(()));
+        let written = spaces(&rows);
+        assert!(
+            written.contains(&DELETE_AUDIT_KEYSPACE) && written.contains(&DELETE_TRAIL_KEYSPACE)
+        );
+
+        let mut gone = Rows::new();
+        let operation = WriteAuditOperation::new(record(), id, Some(standing)).unwrap();
+        assert_eq!(run_in_memory(operation, &mut gone), Ok(()));
+        assert_eq!(spaces(&gone), vec![DELETE_AUDIT_KEYSPACE]);
+    }
+}
