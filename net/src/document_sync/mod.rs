@@ -4,100 +4,34 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ::irokle::Event as _;
-use ::irokle::Storage as _;
-use ::irokle::TopicControl;
 use ::irokle::net::{decode_sync_message, encode_frame, encode_sync_message};
 use ::irokle::oplog::Oplog;
 use ::irokle::sync::SyncMessage;
 use ::irokle::{
-    EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
+    Event as _, EventEnvelope, PeerId, ReplicationPolicy, Storage as _, TopicControl,
+    TopicEviction, TopicGenesis, TopicPayload,
 };
-use aruna_core::DhtKeyId;
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::admin_checks::{
-    AdminOperationFamily, coalescible_config_op, config_mutation_allowed, family_matches_targets,
-    foreign_actor_allowed, has_write_permission, origin_may_publish, revocation_origin_full,
-    service_owner, validate_config_actor, validate_config_target, validate_event_scope,
-    validate_revocation_snapshot, validate_shape,
-};
-use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
-};
-use aruna_core::config_authority::{AdminEventValidation, validate_config_authority};
-use aruna_core::deferred_topics::{
-    DeferredRegistrationOutcome, DocumentSyncDependency, register_deferred_topic,
-    remove_deferred_topic, satisfied_dependencies,
-};
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
-    DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
+    DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
+    DocumentSyncPublish,
 };
-use aruna_core::document_apply::PlacementOutcome;
-use aruna_core::document_apply::create::PendingCreateApply;
-use aruna_core::document_apply::registry::{same_create_event, validate_metadata_event};
+use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
-use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    DOCUMENT_STATE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
-    OWNER_INDEX_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    SYNC_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE,
-};
-use aruna_core::metadata::{
-    GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventRecord,
-    MetadataLifecycleRecord,
-};
-use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, RevocationIndex, config_node_path, decode_reducer_state,
-    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
-    materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_state,
-    overlay_realm_config, reduced_admin_target,
-};
-use aruna_core::storage_entries::{
-    conflict_write_entries, create_acceptance_entry, create_acceptance_key,
-    create_projection_entries, document_lifecycle_entry, document_lifecycle_key,
-    graph_lifecycle_entry, graph_lifecycle_key, graph_prune_entry, reducer_state_entry,
-    reducer_state_key, registry_delete_entries, registry_write_entries, shard_manifest_entry,
-    stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
-    sync_revision_key,
-};
-use aruna_core::structs::execution::notification_watch::interest_dirty_key;
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-};
-use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::binding_directory::BindingError;
-use aruna_core::structs::placement::policy::document::{
-    PlacementPolicyDocument, placement_policy_change, placement_policy_target,
-    verify_policy_authority,
-};
-use aruna_core::structs::placement::record::{DocumentClass, PlacementRef, PlacementScope};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{
-    PersistentIdMapping, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, SyncRejection,
-    build_quarantine_entries, persistent_id_change, persistent_id_key, persistent_id_target,
-    quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
-};
-use aruna_core::sync_checks::{
-    node_info_supersedes, published_by, validate_node_upsert, validate_pid_mapping,
-    validate_policy_document, validate_usage_upsert, validate_watch_interest, watch_change_applies,
-};
+use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
+use aruna_core::reducer::reduced_admin_target;
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::{SyncQuarantineIdentity, SyncRejection};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::types::{GroupId, TxnId, Value};
+use aruna_core::types::Value;
+use aruna_core::{DhtKeyId, NodeId};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
@@ -105,23 +39,21 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
-use ulid::Ulid;
 
 use crate::error::{NetError, Result};
 use crate::streams::{BiStream, PeerKinds};
 
+pub(crate) mod cursor;
 mod eviction;
 mod inbound;
 mod peers;
-mod plan_run;
 mod publish;
 pub(crate) mod reconcile;
 pub(crate) mod storage;
 mod sync;
 mod topics;
 
-use self::reconcile::*;
-use self::storage::*;
+use self::cursor::*;
 
 const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches irokle's 1024-topic wire batches; the worst-case data stream sends
@@ -561,4 +493,4 @@ fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

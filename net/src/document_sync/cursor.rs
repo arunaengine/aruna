@@ -7,12 +7,6 @@ use super::*;
 use crate::streams::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub(crate) fn topic_cursor_key(topic_id: ::irokle::TopicId) -> ByteView {
-    let mut key = b"topic-cursor/".to_vec();
-    key.extend_from_slice(topic_id.as_bytes());
-    ByteView::from(key)
-}
-
 /// Decodes a stored cursor, discarding one written under another genesis, one
 /// whose recorded ops no longer occupy their positions, and one in an
 /// unreadable shape. A discarded cursor restarts replay at actor sequence one.
@@ -134,11 +128,6 @@ pub(in crate::document_sync) fn remove_cursor(
     cursors
         .remove(topic_cursor_key(topic_id))
         .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
-pub(in crate::document_sync) fn deferred_topics_key() -> ByteView {
-    // Retain the original key so previously persisted admin dependencies decode.
-    ByteView::from(b"deferred-admin-topics".to_vec())
 }
 
 pub(in crate::document_sync) async fn read_sync_messages(
