@@ -3,36 +3,38 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::handle::Handle;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent, StatementSignEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
-use aruna_core::structs::storage::distribution::snapshot::RangeFill;
+use aruna_core::structs::storage::distribution::snapshot::{DistributionView, RangeFill};
 use aruna_core::structs::storage::distribution::{
     DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
-use aruna_storage::StorageHandle;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::bootstrap::{
-    BootstrapPage, ClearCursorsOperation, PAGE_ROWS, PageConfig, PageProgress, ReadCursorOperation,
+    BootstrapError, BootstrapPage, ClearCursorsOperation, PAGE_ROWS, PageConfig, PageProgress,
+    ReadCursorOperation,
 };
-use super::members::ReadRecordOperation;
-use super::queue::schedule_blob_drain;
+use super::members::{ReadRecordOperation, RecordError};
+use super::queue::{BlobQueueError, schedule_blob_drain};
+use crate::distribution::forward::PublishRefusal;
 use crate::distribution::lifecycle::SettleMarkerOperation;
+use crate::distribution::purge_steps::PurgeError;
 use crate::distribution::submit::SubmitOperation;
-use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// Sets and pages one drain works on at most.
 const SET_BATCH: usize = 16;
@@ -50,52 +52,21 @@ static SET_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// The range each walk of a set and member continues at, so later ranges get their turn.
 static RANGE_TURNS: Mutex<Option<HashMap<(Ulid, Ulid), usize>>> = Mutex::new(None);
 
-/// Rows of one keyspace under `prefix` after `after`, at most `limit`.
-async fn scan(
-    context: &DriverContext,
-    key_space: &str,
-    (prefix, after): (Option<Vec<u8>>, Option<Vec<u8>>),
-    limit: usize,
-) -> Result<Vec<(Vec<u8>, Value)>, String> {
-    let iter = StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: prefix.map(Key::from),
-        start: after.map(|key| IterStart::After(key.into())),
+type Turn<T> = Result<Next<T>, BlobQueueError>;
+/// What a walk leaves: its outcome and the page budget still unused.
+type Walked = (Outcome, usize);
+
+fn failed(error: impl std::fmt::Display) -> BlobQueueError {
+    BlobQueueError::UnexpectedEvent(error.to_string())
+}
+
+fn catch_up_page(after: Option<Vec<u8>>, limit: usize) -> IoCall {
+    IoCall::Page {
+        space: CATCH_UP_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after: after.map(Into::into),
         limit,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
-            .into_iter()
-            .map(|(key, value)| (key.to_vec(), value))
-            .collect()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {}", other.label())),
     }
-}
-
-async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<(), String> {
-    if deletes.is_empty() {
-        return Ok(());
-    }
-    let effect = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected delete answer {}", other.label())),
-    }
-}
-
-/// One stored cursor, read on its own key.
-async fn read_cursor(
-    context: &DriverContext,
-    key: Vec<u8>,
-) -> Result<Option<BootstrapCursor>, String> {
-    let read = drive(ReadCursorOperation::new(key), context).await;
-    read.map_err(|error| error.to_string())
 }
 
 /// The range index a walk continues at; with `next` it records where the next walk starts.
@@ -113,80 +84,167 @@ fn turn(walk: (Ulid, Ulid), next: Option<usize>) -> usize {
     }
 }
 
-/// Wakes the replication drain when a set waits for its bootstrap.
-pub async fn wake_bootstrap(context: &DriverContext) {
-    if let Some(task) = context.task_handle.as_ref()
-        && bootstrap_waiting(&context.storage_handle).await
-    {
-        task.send_effect(schedule_blob_drain()).await;
-    }
-}
-
 /// Whether any set still waits for its bootstrap here.
-pub async fn bootstrap_waiting(storage: &StorageHandle) -> bool {
-    let iter = StorageEffect::Iter {
-        key_space: CATCH_UP_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: 1,
-        txn_id: None,
-    };
-    matches!(
-        storage.send_storage_effect(iter).await,
-        Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty()
-    )
+#[derive(Debug, PartialEq)]
+pub struct BootstrapWaitingOperation;
+
+impl Operation for BootstrapWaitingOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(catch_up_page(None, 1)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        Ok(Next::Done(!result.page()?.0.is_empty()))
+    }
 }
 
-/// Works on the sets that name catching-up members, within the drain's page budget. Returns
-/// whether some bootstrap still waits, so the drain looks again soon.
-pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Ok(false);
-    };
-    let (realm_id, local) = (*net.realm_id(), net.node_id());
-    let mut budget = PAGE_BUDGET;
-    let mut waiting = false;
-    // Sets after the last batch come next, so waiting sets never starve later ones.
-    let after = SET_CURSOR
-        .lock()
-        .map(|cursor| cursor.clone())
-        .unwrap_or(None);
-    let rows = scan(context, CATCH_UP_KEYSPACE, (None, after), SET_BATCH).await?;
-    let next = (rows.len() == SET_BATCH)
-        .then(|| rows.last().map(|(key, _)| key.clone()))
-        .flatten();
-    if let Ok(mut cursor) = SET_CURSOR.lock() {
-        *cursor = next.clone();
+/// Wakes the replication drain when a set waits for its bootstrap.
+#[derive(Debug, Default, PartialEq)]
+pub struct WakeBootstrapOperation {
+    waking: bool,
+}
+
+impl Operation for WakeBootstrapOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::child(BootstrapWaitingOperation)))
     }
-    // A pass that stopped short of the end looks again soon.
-    waiting |= next.is_some();
-    for (key, seen) in rows {
-        let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
-            delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?;
-            continue;
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.waking {
+            result.event()?;
+            return Ok(Next::Done(()));
+        }
+        if !result.child::<bool, IoError>()?.unwrap_or(false) {
+            return Ok(Next::Done(()));
+        }
+        self.waking = true;
+        Ok(Next::Call(schedule_blob_drain().into()))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainStep {
+    Page,
+    Dropped,
+    Walk(Key, Value, Ulid),
+    Settled,
+}
+
+/// Works on the sets that name catching-up members, within the drain's page budget. Outputs
+/// whether some bootstrap still waits, so the drain looks again soon.
+#[derive(Debug, PartialEq)]
+pub struct ProcessBootstrapOperation {
+    serving: Option<(NodeId, RealmId)>,
+    budget: usize,
+    waiting: bool,
+    rows: VecDeque<(Key, Value)>,
+    step: DrainStep,
+}
+
+impl ProcessBootstrapOperation {
+    pub fn new(serving: Option<(NodeId, RealmId)>) -> Self {
+        Self {
+            serving,
+            budget: PAGE_BUDGET,
+            waiting: false,
+            rows: VecDeque::new(),
+            step: DrainStep::Page,
+        }
+    }
+
+    fn next_set(&mut self) -> Turn<bool> {
+        let Some((key, seen)) = self.rows.pop_front() else {
+            return Ok(Next::Done(self.waiting));
+        };
+        let set_id = <[u8; 16]>::try_from(&key[..]).map(Ulid::from_bytes);
+        let (Ok(set_id), Some((local, realm_id))) = (set_id, self.serving) else {
+            self.step = DrainStep::Dropped;
+            let row = (CATCH_UP_KEYSPACE.to_string(), key);
+            return Ok(Next::Call(IoCall::Delete(vec![row])));
         };
         let walk = SetWalk {
             realm_id,
             local,
             set_id,
         };
-        match walk.run(context, &mut budget).await {
-            Ok(Outcome::Settled) => {
-                let settle =
-                    SettleMarkerOperation::new(CATCH_UP_KEYSPACE, key.to_vec(), seen.to_vec());
-                drive(settle, context)
-                    .await
-                    .map_err(|error| error.to_string())?;
+        let run = SetWalkOperation::new(walk, self.serving, self.budget);
+        self.step = DrainStep::Walk(key, seen, set_id);
+        Ok(Next::Call(IoCall::child(run)))
+    }
+}
+
+impl Operation for ProcessBootstrapOperation {
+    type Output = bool;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<bool> {
+        if self.serving.is_none() {
+            return Ok(Next::Done(false));
+        }
+        // Sets after the last batch come next, so waiting sets never starve later ones.
+        let after = SET_CURSOR
+            .lock()
+            .map(|cursor| cursor.clone())
+            .unwrap_or(None);
+        Ok(Next::Call(catch_up_page(after, SET_BATCH)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, DrainStep::Dropped) {
+            DrainStep::Page => {
+                let (rows, _) = result.page()?;
+                let next = (rows.len() == SET_BATCH)
+                    .then(|| rows.last().map(|(key, _)| key.to_vec()))
+                    .flatten();
+                // A pass that stopped short of the end looks again soon.
+                self.waiting |= next.is_some();
+                if let Ok(mut cursor) = SET_CURSOR.lock() {
+                    *cursor = next;
+                }
+                self.rows = rows.into();
+                self.next_set()
             }
-            Ok(Outcome::Waiting) => waiting = true,
-            Ok(Outcome::Stated) => {}
-            Err(error) => {
-                warn!(%set_id, %error, "Distributed bucket bootstrap failed; retrying");
-                waiting = true;
+            DrainStep::Dropped => {
+                result.done()?;
+                self.next_set()
+            }
+            DrainStep::Walk(key, seen, set_id) => {
+                match result.child::<Walked, BlobQueueError>()? {
+                    Ok((outcome, budget)) => {
+                        self.budget = budget;
+                        match outcome {
+                            Outcome::Settled => {
+                                let settle = SettleMarkerOperation::new(
+                                    CATCH_UP_KEYSPACE,
+                                    key.to_vec(),
+                                    seen.to_vec(),
+                                );
+                                self.step = DrainStep::Settled;
+                                return Ok(Next::Call(IoCall::child(settle)));
+                            }
+                            Outcome::Waiting => self.waiting = true,
+                            Outcome::Stated => {}
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%set_id, %error, "Distributed bucket bootstrap failed; retrying");
+                        self.waiting = true;
+                    }
+                }
+                self.next_set()
+            }
+            DrainStep::Settled => {
+                (result.child::<(), PurgeError>()?).map_err(failed)?;
+                self.next_set()
             }
         }
     }
-    Ok(waiting)
 }
 
 /// What a drain left of one set's bootstraps on this node.
@@ -211,69 +269,103 @@ impl Outcome {
 }
 
 /// One set's bootstraps as seen by this node.
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SetWalk {
     realm_id: RealmId,
     local: NodeId,
     set_id: Ulid,
 }
 
-impl SetWalk {
-    async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<Outcome, String> {
-        let read = drive(ReadRecordOperation::new(self.set_id), context).await;
-        let Some(view) = read.map_err(|error| error.to_string())? else {
-            return Ok(Outcome::Settled);
+/// The record and the member of this node a set's walks run under.
+#[derive(Debug, PartialEq)]
+struct WalkScope {
+    walk: SetWalk,
+    serving: Option<(NodeId, RealmId)>,
+    snapshot: DistributionSnapshot,
+    local: DistributionMember,
+}
+
+#[derive(Debug, PartialEq)]
+enum SetStep {
+    Record,
+    Bucket,
+    Departed,
+    Clear,
+    Part,
+}
+
+/// Runs the walks of one set: the members catching up and the new range copies.
+#[derive(Debug, PartialEq)]
+struct SetWalkOperation {
+    walk: SetWalk,
+    serving: Option<(NodeId, RealmId)>,
+    budget: usize,
+    step: SetStep,
+    scope: Option<Arc<WalkScope>>,
+    targets: VecDeque<DistributionMember>,
+    fills: VecDeque<RangeFill>,
+    outcome: Outcome,
+}
+
+impl SetWalkOperation {
+    fn new(walk: SetWalk, serving: Option<(NodeId, RealmId)>, budget: usize) -> Self {
+        Self {
+            walk,
+            serving,
+            budget,
+            step: SetStep::Record,
+            scope: None,
+            targets: VecDeque::new(),
+            fills: VecDeque::new(),
+            outcome: Outcome::Settled,
+        }
+    }
+
+    /// Deletes the set's cursors in bounded batches; settled once none is left.
+    fn clear(&mut self) -> Turn<Walked> {
+        self.step = SetStep::Clear;
+        let clear = ClearCursorsOperation::new(self.walk.set_id, None, CLEAR_BATCH);
+        Ok(Next::Call(IoCall::child(clear)))
+    }
+
+    fn record_read(&mut self, view: Option<DistributionView>) -> Turn<Walked> {
+        let Some(view) = view else {
+            return Ok(Next::Done((Outcome::Settled, self.budget)));
         };
         let snapshot = view.head.snapshot;
-        let targets = snapshot.catching_up();
-        let local = snapshot
-            .config
-            .members
+        let members = &snapshot.config.members;
+        let Some(local) = members
             .iter()
-            .find(|m| m.node_id == self.local);
-        let Some(local) = local else {
-            return self.clear(context).await;
+            .find(|m| m.node_id == self.walk.local)
+            .cloned()
+        else {
+            return self.clear();
         };
+        let targets: VecDeque<_> = snapshot.catching_up().into_iter().cloned().collect();
         let deleting = snapshot.lifecycle.deletion.is_some();
-        let fills: Vec<&RangeFill> = (snapshot.lifecycle.fills.iter())
+        let fills: VecDeque<_> = (snapshot.lifecycle.fills.iter())
             .filter(|_| !deleting)
             .filter(|fill| {
                 (snapshot.config.ranges.iter()).any(|range| {
                     range.range_id == fill.range_id && range.coordinator == local.member_id
                 })
             })
+            .cloned()
             .collect();
         if targets.is_empty() && fills.is_empty() {
-            return self.clear(context).await;
+            return self.clear();
         }
         // Only the admitted incarnation of this member's bucket publishes.
-        let info = drive(
-            GetBucketOperation::new(snapshot.config.bucket.clone()),
-            context,
-        )
-        .await;
-        let bound = info
-            .ok()
-            .and_then(|info| info.distribution)
-            .is_some_and(|binding| {
-                binding.member_id == local.member_id
-                    && local.incarnation == Some(binding.incarnation)
-            });
-        if !bound {
-            return self.clear(context).await;
-        }
-        let mut walked: Vec<Ulid> = targets.iter().map(|target| target.member_id).collect();
-        walked.extend(fills.iter().map(|fill| fill.member_id));
-        self.clear_departed(context, &walked).await?;
-        let mut outcome = Outcome::Settled;
-        for target in targets {
-            let walked = self.walk(context, &snapshot, local, target, budget).await?;
-            outcome = outcome.and(walked);
-        }
-        for fill in fills {
-            let filled = self.fill(context, &snapshot, local, fill, budget).await?;
-            outcome = outcome.and(filled);
-        }
-        Ok(outcome)
+        let bucket = snapshot.config.bucket.clone();
+        (self.targets, self.fills) = (targets, fills);
+        self.scope = Some(Arc::new(WalkScope {
+            walk: self.walk,
+            serving: self.serving,
+            snapshot,
+            local,
+        }));
+        self.step = SetStep::Bucket;
+        Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))))
     }
 
     /// Walks one range for its new copy; when the walk ended, states the copy filled.
