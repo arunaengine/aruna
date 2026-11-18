@@ -28,7 +28,7 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::offer::{OfferLaunchOperation, OfferOutcome};
-use super::plan::build_plan;
+use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::witness_arm::{
     ArmFamilyOperation, ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange,
     WitnessDeadline, WitnessExplain, deadline_index_key, deadline_key,
@@ -135,6 +135,34 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         }
     }
     remaining
+}
+
+/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
+/// paged inputs of the spec are read in first.
+async fn build_plan(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    spec: &LogicalJobSpec,
+    excluded: &[ExecutionTargetId],
+    now_ms: u64,
+) -> Result<ExecutionPlan, PlanBuildError> {
+    let local = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
+    let spec = crate::jobs::records::pages::with_inputs(context, spec)
+        .await
+        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
+    let round = PlanRound {
+        config: config.clone(),
+        spec,
+        excluded: excluded.to_vec(),
+        now_ms,
+        local,
+        fresh: context.fresh_heartbeats(),
+    };
+    drive(BuildPlanOperation::new(round), context).await
 }
 
 #[cfg(test)]

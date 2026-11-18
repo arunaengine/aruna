@@ -21,9 +21,7 @@ use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
 use aruna_core::structs::placement::record::LabelMatch;
-use aruna_core::structs::storage::blob::{
-    BlobVersion, BlobVersionState, VersionKey, group_permission_path,
-};
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use thiserror::Error;
@@ -36,7 +34,6 @@ use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::driver::{DriverContext, drive};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
@@ -67,34 +64,6 @@ impl From<IoError> for PlanBuildError {
     fn from(error: IoError) -> Self {
         Self::Unavailable(error.to_string())
     }
-}
-
-/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
-/// paged inputs of the spec are read in first.
-pub async fn build_plan(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    spec: &LogicalJobSpec,
-    excluded: &[ExecutionTargetId],
-    now_ms: u64,
-) -> Result<ExecutionPlan, PlanBuildError> {
-    let local = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let spec = crate::jobs::records::pages::with_inputs(context, spec)
-        .await
-        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
-    let round = PlanRound {
-        config: config.clone(),
-        spec,
-        excluded: excluded.to_vec(),
-        now_ms,
-        local,
-        fresh: context.fresh_heartbeats(),
-    };
-    drive(BuildPlanOperation::new(round), context).await
 }
 
 /// What one planning round starts from.
@@ -392,34 +361,6 @@ fn plan_request(
     })
 }
 
-/// Node-info documents of every sync-eligible realm member that has one, and
-/// whether a read failed. An unread advertisement may hold the only legal
-/// target, so the round is a continuation rather than a conclusive refusal.
-pub(super) async fn advertisements(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
-    let mut documents = BTreeMap::new();
-    let Ok(members) = config.sync_eligible_nodes() else {
-        return (documents, true);
-    };
-    let mut unread = false;
-    for node_id in members {
-        let read = drive(ReadInfoOperation::new(vec![node_id]), context).await;
-        match read.map(|mut documents| documents.remove(&node_id)) {
-            Ok(Some(document)) => {
-                documents.insert(node_id, document);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(node = %node_id, error = %error, "Node info advertisement stayed unread");
-                unread = true;
-            }
-        }
-    }
-    (documents, unread)
-}
-
 /// The first required label no advertised executor carries; no round can place such a request.
 pub(super) fn missing_label<'a>(
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
@@ -589,36 +530,6 @@ fn pinned_inputs(
     Ok(inputs)
 }
 
-/// The blake3 of a version this node does not hold locally, read from the
-/// replicated version record.
-pub async fn version_hash(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version: Ulid,
-) -> Option<[u8; 32]> {
-    let version_key = VersionKey::new(bucket, key, version).to_bytes().ok()?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
-            key_space: aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: version_key.into(),
-            txn_id: None,
-        })
-        .await;
-    let aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
-        value: Some(bytes),
-        ..
-    }) = event
-    else {
-        return None;
-    };
-    match postcard::from_bytes::<BlobVersion>(&bytes).ok()?.state {
-        BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),
-        _ => None,
-    }
-}
-
 /// The source endpoint owns the stored bucket/key/version, and every node the DHT lists for
 /// the same content hash holds a registered copy, so running next to one saves the transfer; a
 /// failed lookup leaves the source as the only route.
@@ -670,6 +581,8 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverContext;
+    use crate::jobs::lifecycle::ingress::advertisements;
     use crate::tests::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
