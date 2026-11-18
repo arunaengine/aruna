@@ -15,7 +15,6 @@ use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::distribution::delegation::{
     BodyTrailer, TRAILER_BYTES, body_hasher,
 };
-use aruna_operations::distribution::delegate::sign_body;
 use std::collections::HashMap;
 
 use crate::s3::checksum::validate_trailer_headers;
@@ -60,7 +59,9 @@ pub(super) fn frame_body(
                     digest: *hasher.finalize().as_bytes(),
                     checksum: checksum.as_ref().and_then(|value| value()),
                 };
-                let encoded = sign_body(&context, &nonce, &trailer)
+                let signing = context.net_handle.as_ref();
+                let encoded = signing
+                    .map(|net| net.sign(&trailer.signing_bytes(&nonce)))
                     .and_then(|signature| trailer.encode(&signature).ok());
                 Poll::Ready(Some(match encoded {
                     Some(bytes) => Ok(Bytes::copy_from_slice(&bytes)),

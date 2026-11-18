@@ -1012,8 +1012,6 @@ fn recipient_preserves_authoritative() {
     let mut event = create_event();
     event.node_id = node(1);
     event.record.holder_node_ids = vec![node(3), node(1), node(3)];
-    let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
-
     let expanded = expand_event_holders(event);
 
     assert_eq!(expanded.record.holder_node_ids, vec![node(1), node(3)]);
@@ -1024,8 +1022,6 @@ fn recipient_not_synthesize() {
     let mut event = create_event();
     event.node_id = node(1);
     event.record.holder_node_ids.clear();
-    let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
-
     let expanded = expand_event_holders(event);
 
     assert!(expanded.record.holder_node_ids.is_empty());
@@ -1279,10 +1275,8 @@ fn received_create_projects() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let message = author_message_read(&event);
-    assert_eq!(
-        project.next(child(Ok::<_, StorageReadError>(None))),
-        Ok(Next::Call(message))
-    );
+    let unregistered = Ok::<Option<MetadataRegistryRecord>, StorageReadError>(None);
+    assert_eq!(project.next(child(unregistered)), Ok(Next::Call(message)));
     let lifecycle = read_row(
         DOCUMENT_LIFECYCLE_KEYSPACE,
         document_lifecycle_key(event.record.document_id),

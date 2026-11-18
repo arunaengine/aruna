@@ -340,5 +340,5 @@ impl Operation for ListTransfersOperation {
 }
 
 #[cfg(test)]
-#[path = "folder_reads_tests.rs"]
+#[path = "reads_tests.rs"]
 mod tests;

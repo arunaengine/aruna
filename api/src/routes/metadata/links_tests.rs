@@ -190,6 +190,10 @@ async fn bucket_links_refused() {
     let neither = bucket(&test, &test.auth, BUCKET, bucket_params(None, None, false)).await;
     assert!(matches!(neither, Err(ServerError::BadRequestReason(_))));
     let other = stranger(&test);
+    let links_local = |auth: &AuthContext, request: LinkNodeRequest| {
+        let links = LinksLocalOperation::new(realm_id, Some(auth.clone()), request);
+        aruna_operations::driver::drive(links, context.as_ref())
+    };
     let by_key = bucket(&test, &other, BUCKET, bucket_params(Some("a"), None, false)).await;
     assert!(matches!(by_key, Err(ServerError::Forbidden)));
     let by_prefix = bucket(&test, &other, BUCKET, bucket_params(None, Some(""), false)).await;
@@ -301,7 +305,7 @@ async fn parts_resolve_buckets() {
 #[tokio::test]
 async fn confirms_hidden_dataset() {
     // Only the named dataset a caller may not read is confirmed, by id and without its metadata.
-    use aruna_operations::metadata::api::links::links_local;
+    use aruna_operations::metadata::api::links::local::LinksLocalOperation;
     let test = setup_state().await;
     store_bucket(&test, BUCKET).await;
     let raw = folder(&test, "raw/");
@@ -317,17 +321,17 @@ async fn confirms_hidden_dataset() {
     let realm_id = test.state.get_realm_id();
     let other = stranger(&test);
 
-    let named = links_local(&context, realm_id, Some(&other), request(Some(dataset)))
+    let named = links_local(&other, request(Some(dataset)))
         .await
         .unwrap();
     assert!(named.documents.is_empty());
     assert!(named.hidden && named.confirmed);
     let unrelated = Some(Ulid::from_bytes([61; 16]));
-    let page = links_local(&context, realm_id, Some(&other), request(unrelated))
+    let page = links_local(&other, request(unrelated))
         .await
         .unwrap();
     assert!(page.hidden && !page.confirmed);
-    let reader = links_local(&context, realm_id, Some(&test.auth), request(Some(dataset)))
+    let reader = links_local(&test.auth, request(Some(dataset)))
         .await
         .unwrap();
     assert_eq!(reader.documents.len(), 1);

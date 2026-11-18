@@ -33,7 +33,7 @@ fn main() {
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .and_then(|runtime| runtime.block_on(aruna_operations::git::hook::validate()));
+            .and_then(|runtime| runtime.block_on(aruna_blob::receive_hook::validate()));
         if let Err(error) = &result {
             // Git relays hook stderr to the pushing client as its rejection reason.
             eprintln!("aruna: {error}");

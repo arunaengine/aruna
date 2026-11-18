@@ -22,7 +22,9 @@ use aruna_core::structs::storage::release::{
     CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved};
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved,
+};
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
@@ -507,7 +509,14 @@ async fn release_crate(
             version_id,
         })) if realm_id == state.get_realm_id() => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
-            match resolved(drive_until(resolve_version(context.as_ref(), version_id, deadline), context.as_ref(), deadline).await) {
+            match resolved(
+                drive_until(
+                    resolve_version(context.node_and_realm(), version_id, deadline),
+                    context.as_ref(),
+                    deadline,
+                )
+                .await,
+            ) {
                 GlobalResolution::Found(found) => {
                     // Holders come coordinator first.
                     let holder = match found.local {

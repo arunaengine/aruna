@@ -47,9 +47,11 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::read::get_metadata_routed;
+use crate::metadata::forward::authorized_create::CreateWithIdOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::write::{CreateAuthorizedError, create_with_id, route_metadata_update};
+use crate::metadata::forward::routed_read::RoutedReadOperation;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::write::CreateAuthorizedError;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use crate::plugins::creates::{
@@ -246,16 +248,19 @@ impl RunBroker {
             "plugin {} install {} run {run_id}",
             install.plugin, install.install_id
         );
-        let update = route_metadata_update(
+        let update = crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, self.ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: Some(expected),
+                    commit_message: Some(message),
+                },
+                Some(AuthToken::Internal(auth)),
+            ),
             &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
         );
         let outcome = update
             .await
@@ -298,7 +303,13 @@ impl RunBroker {
             match next_step(claim, lookup) {
                 Step::Dispatch => {
                     let extras = PolicyRequestExtras::operation("plugin.metadata.create");
-                    let created = create_with_id(&self.ctx, actor, (auth, extras), &pinned).await;
+                    let local_node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
+                    let create = CreateWithIdOperation::new(
+                        (actor, local_node),
+                        (auth.clone(), extras),
+                        pinned.clone(),
+                    );
+                    let created = drive(create, &self.ctx).await;
                     let outcome = created.map_err(create_outcome);
                     // A known outcome closes the attempt; a refusal of the arguments lets a
                     // later call correct them. An unknown one keeps them fixed.
@@ -449,7 +460,9 @@ impl RunBroker {
             auth: Some(auth.clone()),
         };
         let token = Some(AuthToken::Internal(auth.clone()));
-        match get_metadata_routed(&self.ctx, self.scope.realm_id, request, token).await {
+        let local_node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
+        let read = RoutedReadOperation::new(local_node, self.scope.realm_id, request, token);
+        match drive(read, &self.ctx).await {
             Ok(record) => Lookup::Found(record.establishing_event_id),
             Err(MetadataApiError::NotFound) => Lookup::Missing,
             Err(_) => Lookup::Unreachable,
@@ -701,16 +714,19 @@ impl Broker for RunBroker {
             install.plugin, install.install_id
         );
         let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld: change };
-        let update = route_metadata_update(
+        let update = crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, self.ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: Some(expected),
+                    commit_message: Some(message),
+                },
+                Some(AuthToken::Internal(auth)),
+            ),
             &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
         );
         let outcome = update
             .await

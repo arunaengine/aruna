@@ -1444,16 +1444,19 @@ async fn removal_keeps_rest() {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
-        route_metadata_update(
+        crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: revision,
+                    commit_message: None,
+                },
+                token,
+            ),
             ctx,
-            actor,
-            Some(&record),
-            document,
-            None,
-            mutation,
-            revision,
-            token,
-            None,
         )
     };
     let revision = Ulid::from_string(&revision_of(&broker, document).await).unwrap();
@@ -1559,16 +1562,19 @@ async fn pending_graph_refused() {
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
         let expected = Some(Ulid::from_string(&pending).unwrap());
-        route_metadata_update(
+        crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: expected,
+                    commit_message: None,
+                },
+                token,
+            ),
             ctx,
-            actor,
-            Some(&record),
-            document,
-            None,
-            mutation,
-            expected,
-            token,
-            None,
         )
     };
     assert!(remove().await.is_err());
@@ -1645,16 +1651,19 @@ async fn unprojected_event_refused() {
             fixture.actor.clone(),
             Some(record.last_event_id),
         );
-        route_metadata_update(
+        crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: expected,
+                    commit_message: None,
+                },
+                token,
+            ),
             ctx,
-            actor,
-            Some(&record),
-            document,
-            None,
-            mutation,
-            expected,
-            token,
-            None,
         )
     };
     let refused = remove().await;

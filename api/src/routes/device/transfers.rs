@@ -90,7 +90,7 @@ async fn list_device_transfers(
         .map(|folder| (folder.folder_id, folder))
         .collect();
 
-    let uploads = read_uploads(&context)
+    let uploads = drive(read_uploads(), &context)
         .await
         .map_err(map_folder_error)?
         .into_iter()

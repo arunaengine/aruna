@@ -8,11 +8,12 @@ use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure};
 use aruna_core::time::unix_timestamp_millis;
 
+use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::persistent_id::forward::{
-    add_identifiers_routed, fail_pid_routed, mint_pid_routed,
-};
+use crate::metadata::persistent_id::forward::{PidNode, PidRouteOperation, outcome_mapping};
+use crate::metadata::protocol::PersistentIdRequest;
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::identity::realm::RealmId;
 
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 
@@ -29,16 +30,18 @@ pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentSpec) -> JobRun
         path_restrictions: None,
         session: None,
     });
-    match mint_pid_routed(
-        &ctx.driver,
-        realm_id,
+    let request = PersistentIdRequest::Mint {
+        minted_by: spec.minted_by,
+        minted_at_ms: unix_timestamp_millis(),
+    };
+    let caller = (Some(auth_token.clone()), None);
+    let mint = PidRouteOperation::new(
+        pid_node(&ctx.driver, realm_id),
         spec.document_id,
-        spec.minted_by,
-        unix_timestamp_millis(),
-        Some(auth_token.clone()),
-    )
-    .await
-    {
+        request,
+        caller,
+    );
+    match drive(mint, &ctx.driver).await.and_then(outcome_mapping) {
         Ok((mapping, newly_minted)) if mapping.is_active() || mapping.is_retired() => {
             JobRunOutcome::Succeeded(JobResultPayload::PersistentId {
                 pid: mapping.pid,
@@ -70,15 +73,14 @@ pub async fn run_register_identifiers(
     ctx: &JobContext,
     spec: &RegisterIdentifiersSpec,
 ) -> JobRunOutcome {
-    let result = add_identifiers_routed(
-        &ctx.driver,
-        spec.auth_context.realm_id,
-        spec.document_id,
-        spec.identifiers.clone(),
-        unix_timestamp_millis(),
-        spec.auth_context.clone(),
-    )
-    .await;
+    let request = PersistentIdRequest::AddIdentifiers {
+        identifiers: spec.identifiers.clone(),
+        occurred_at_ms: unix_timestamp_millis(),
+    };
+    let node = pid_node(&ctx.driver, spec.auth_context.realm_id);
+    let caller = (None, Some(spec.auth_context.clone()));
+    let add = PidRouteOperation::new(node, spec.document_id, request, caller);
+    let result = drive(add, &ctx.driver).await.and_then(outcome_mapping);
     match result {
         Ok((_, changed)) => JobRunOutcome::Succeeded(JobResultPayload::Identifiers { changed }),
         // The authority may not have the mapping yet; after the wait, attempts bound the retries.
@@ -112,16 +114,27 @@ async fn record_failure(
     message: String,
     retryable: bool,
 ) {
-    let _ = fail_pid_routed(
-        &ctx.driver,
-        ctx.driver.serving_realm(spec.minted_by.realm_id),
+    let failure = PersistentIdFailure {
+        message,
+        retryable,
+        recorded_at_ms: unix_timestamp_millis(),
+    };
+    let realm_id = ctx.driver.serving_realm(spec.minted_by.realm_id);
+    let request = PersistentIdRequest::Fail { failure };
+    let caller = (Some(auth_token.clone()), None);
+    let fail = PidRouteOperation::new(
+        pid_node(&ctx.driver, realm_id),
         spec.document_id,
-        PersistentIdFailure {
-            message,
-            retryable,
-            recorded_at_ms: unix_timestamp_millis(),
-        },
-        auth_token.clone(),
+        request,
+        caller,
+    );
+    let _ = drive(fail, &ctx.driver).await;
+}
+
+/// The PID route of `realm_id` from this node.
+fn pid_node(context: &DriverContext, realm_id: RealmId) -> PidNode {
+    (
+        realm_id,
+        context.node_and_realm().map(|(node_id, _)| node_id),
     )
-    .await;
 }

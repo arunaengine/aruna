@@ -18,7 +18,8 @@ use aruna_operations::metadata::api::preflight_types::{
     MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
     ReferenceTarget,
 };
-use aruna_operations::metadata::api::read::references_metadata as run_references_metadata;
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::read_types::MetadataReferencesRequest;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -111,18 +112,14 @@ pub async fn metadata_references(
     Query(params): Query<MetadataReferencesParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataReferencesResponse>)> {
     let ctx = state.get_ctx();
-    let execution = run_references_metadata(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        MetadataReferencesRequest {
+    let execution = drive(ReferencesOperation::new(state.get_realm_id(), MetadataReferencesRequest {
             auth: Some(auth),
             iri: params.iri,
             predicate: params.predicate,
             limit: params.limit,
             resolve: params.resolve,
             after: params.after,
-        },
-    )
+        }), ctx.as_ref())
     .await
     .map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(map_references_response(execution))))

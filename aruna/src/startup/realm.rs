@@ -79,7 +79,7 @@ pub(crate) async fn prepare(
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
         && !drive(
-            fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH),
+            fetch_realm_documents(driver_ctx.node_and_realm(), STARTUP_DOCUMENT_FETCH),
             driver_ctx,
         )
         .await

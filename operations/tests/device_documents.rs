@@ -82,7 +82,7 @@ async fn device_fetches_revocation() -> TestResult<()> {
 
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -134,7 +134,7 @@ async fn device_fetches_owner() -> TestResult<()> {
 
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -162,7 +162,7 @@ async fn device_fetches_groups() -> TestResult<()> {
 
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -202,7 +202,7 @@ async fn device_fetches_groups() -> TestResult<()> {
 
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -272,7 +272,7 @@ async fn device_fetches_nodes() -> TestResult<()> {
     let device = join_device(&realm).await?;
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -337,7 +337,7 @@ async fn device_learns_removal() -> TestResult<()> {
     let device = join_device(&realm).await?;
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -347,7 +347,7 @@ async fn device_learns_removal() -> TestResult<()> {
     set_listed(&realm, &device, false).await?;
     assert!(
         !drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -361,7 +361,7 @@ async fn device_learns_removal() -> TestResult<()> {
     );
     assert!(
         !drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -380,7 +380,7 @@ async fn device_learns_removal() -> TestResult<()> {
     set_listed(&realm, &device, true).await?;
     assert!(
         drive(
-            fetch_realm_documents(&device.context, FETCH_BUDGET),
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
             &device.context
         )
         .await
@@ -404,7 +404,7 @@ async fn offline_learns_removal() -> TestResult<()> {
     for _ in 0..2 {
         assert!(
             !drive(
-                fetch_realm_documents(&device.context, FETCH_BUDGET),
+                fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
                 &device.context
             )
             .await

@@ -6,9 +6,7 @@ use super::list::summary_request;
 use super::*;
 use crate::driver::drive;
 use crate::metadata::api::export::ExportOperation;
-use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::GraphLifecycleRecord;
-use aruna_core::storage_entries::graph_lifecycle_key;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {

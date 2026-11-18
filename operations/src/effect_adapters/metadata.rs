@@ -18,10 +18,11 @@ use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::read::dataset_summary;
+use crate::metadata::forward::read::{summary_answer, summary_export};
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
-use crate::metadata::handle::MetadataRequestDelivery;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::routed_write::RouteDeleteOperation;
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
@@ -45,7 +46,9 @@ pub(super) fn dispatch_summary(
     context: &DriverContext,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + '_>> {
     Box::pin(async move {
-        let answer = dataset_summary(context, request).await;
+        let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+        let export = crate::driver::drive(summary_export(local_node, request), context).await;
+        let answer = summary_answer(export);
         Event::Net(NetEvent::DatasetSummary(answer))
     })
 }
@@ -96,16 +99,19 @@ async fn routed_write(
             document_id,
             jsonld,
         } => {
-            Box::pin(route_metadata_update(
+            Box::pin(crate::driver::drive(
+                RouteUpdateOperation::new(
+                    (actor, context.net_handle.as_ref().map(|net| net.node_id())),
+                    (record.as_deref().cloned(), document_id),
+                    DocumentUpdate {
+                        public: None,
+                        mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+                        expected_revision: None,
+                        commit_message: None,
+                    },
+                    Some(AuthToken::internal(owner)),
+                ),
                 &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                None,
-                UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-                None,
-                Some(AuthToken::internal(owner)),
-                None,
             ))
             .await?;
         }
@@ -116,14 +122,10 @@ async fn routed_write(
             document_id,
         } => {
             let token = Some(AuthToken::internal(owner));
-            Box::pin(route_metadata_delete(
-                &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                token,
-            ))
-            .await?;
+            let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+            let record = record.map(|record| *record);
+            let delete = RouteDeleteOperation::new((actor, local_node), record, document_id, token);
+            Box::pin(crate::driver::drive(delete, &context)).await?;
         }
     }
     Ok(())

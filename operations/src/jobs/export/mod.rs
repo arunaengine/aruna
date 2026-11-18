@@ -694,13 +694,17 @@ async fn export_identity(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
 ) -> Result<aruna_core::repository::ExportIdentity, ExportFailure> {
-    let mapping = crate::metadata::persistent_id::forward::read_pid_routed(
-        &ctx.driver,
-        spec.auth_context.realm_id,
-        spec.document_id,
-    )
-    .await
-    .map_err(|error| ExportFailure::Retryable(format!("reading identifiers failed: {error}")))?;
+    use crate::metadata::persistent_id::forward::{PidRouteOperation, outcome_status};
+    let local_node = ctx.driver.node_and_realm().map(|(node_id, _)| node_id);
+    let node = (spec.auth_context.realm_id, local_node);
+    let request = crate::metadata::protocol::PersistentIdRequest::Status;
+    let status = PidRouteOperation::new(node, spec.document_id, request, (None, None));
+    let mapping = crate::driver::drive(status, &ctx.driver)
+        .await
+        .and_then(outcome_status)
+        .map_err(|error| {
+            ExportFailure::Retryable(format!("reading identifiers failed: {error}"))
+        })?;
     let Some(mapping) = mapping.filter(|mapping| !mapping.is_retired()) else {
         return Ok(Default::default());
     };

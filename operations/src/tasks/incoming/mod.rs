@@ -54,9 +54,7 @@ use crate::blob::holders::RefreshHoldersOperation;
 use crate::blob::reclaim_sweep::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
-use crate::device::drain::{
-    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, restore_publish_timer,
-};
+use crate::device::drain::{DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER,
@@ -170,7 +168,7 @@ use crate::tasks::task_persistence::{
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use folder_pass::restore_sync_timers;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 mod drained;
 pub mod folder_pass;
@@ -754,7 +752,7 @@ impl OperationsTaskHandler {
         }
         let fetched = drive(
             crate::device::realm_documents::fetch_realm_documents(
-                &self.context,
+                self.context.node_and_realm(),
                 REALM_DOCUMENTS_BUDGET,
             ),
             &self.context,
@@ -787,7 +785,7 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        let pass = crate::device::refresh::refresh_replicas(&self.context);
+        let pass = crate::device::refresh::refresh_replicas(self.context.node_and_realm());
         if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
@@ -1040,7 +1038,15 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use crate::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
-                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                let mut after = match crate::driver::drive(
+                    maintain_ranges(
+                        context.node_and_realm(),
+                        &context.fresh_heartbeats(),
+                        context.here().capacity,
+                    ),
+                    context,
+                )
+                .await
                 {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();
@@ -1109,7 +1115,7 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = crate::device::sync::drain_sync_outbox(&self.context);
+                let drain = crate::device::sync::drain_sync_outbox(self.context.node_and_realm());
                 let outcome = drive(drain, &self.context).await;
                 let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
@@ -1122,7 +1128,12 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
+                let drain =
+                    crate::device::drain::drain_publish_queue(self.context.node_and_realm());
+                let after = match drive(drain, &self.context)
+                    .await
+                    .unwrap_or(DrainOutcome::Deferred)
+                {
                     DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

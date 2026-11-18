@@ -76,6 +76,7 @@ impl LfsObject {
     }
 }
 
+#[derive(PartialEq)]
 pub struct GitRequest {
     pub repository: GitRepository,
     pub method: String,
@@ -92,7 +93,7 @@ pub struct GitRequest {
     pub push_key: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitSnapshot {
     pub document_id: Ulid,
     pub event_id: Ulid,
@@ -104,7 +105,7 @@ pub struct GitSnapshot {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedObject {
     pub entity: String,
     pub object: StoredObject,
@@ -112,7 +113,7 @@ pub struct LinkedObject {
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitStatus {
     pub event_id: Ulid,
     pub commit: Option<String>,
@@ -170,6 +171,7 @@ pub enum MergeOutcome {
     Failed(String),
 }
 
+#[derive(PartialEq)]
 pub enum GitEffect {
     Initialize(Ulid),
     /// SHA-256 digests of the packs the local cache already holds.
@@ -284,6 +286,7 @@ pub enum GitEffect {
     },
 }
 
+#[derive(PartialEq)]
 pub enum GitEvent {
     Initialized,
     Imported(std::collections::BTreeSet<String>),
@@ -314,6 +317,120 @@ pub enum GitEvent {
     },
     Layout(Option<crate::repo_layout::Layout>),
     File(Option<Bytes>),
+}
+
+/// Names the request only: its body and token never reach a log.
+impl std::fmt::Debug for GitRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (formatter.debug_struct("GitRequest"))
+            .field("repository", &self.repository)
+            .field("action", &self.action)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Names the effect only: graphs and packs never reach a log.
+impl std::fmt::Debug for GitEffect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Initialize(_) => "Initialize",
+            Self::Imported(_) => "Imported",
+            Self::Import { .. } => "Import",
+            Self::MarkImported { .. } => "MarkImported",
+            Self::Refs(_) => "Refs",
+            Self::Ancestry { .. } => "Ancestry",
+            Self::SetRefs { .. } => "SetRefs",
+            Self::Pack { .. } => "Pack",
+            Self::Generate { .. } => "Generate",
+            Self::Export { .. } => "Export",
+            Self::Resolve { .. } => "Resolve",
+            Self::MergeBase { .. } => "MergeBase",
+            Self::Peel { .. } => "Peel",
+            Self::Commits { .. } => "Commits",
+            Self::Log { .. } => "Log",
+            Self::Diff { .. } => "Diff",
+            Self::Edit { .. } => "Edit",
+            Self::Merge { .. } => "Merge",
+            Self::MergeMetadata { .. } => "MergeMetadata",
+            Self::ReadFile { .. } => "ReadFile",
+            Self::Http(_) => "Http",
+            Self::Layout { .. } => "Layout",
+        })
+    }
+}
+
+/// Names the answer only: packs, files and exports never reach a log.
+impl std::fmt::Debug for GitEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Initialized => "Initialized",
+            Self::Imported(_) => "Imported",
+            Self::Refs(_) => "Refs",
+            Self::Ancestry(_) => "Ancestry",
+            Self::Packed(_) => "Packed",
+            Self::Generated { .. } => "Generated",
+            Self::GenerateFailed(_) => "GenerateFailed",
+            Self::Exported(_) => "Exported",
+            Self::Resolved(_) => "Resolved",
+            Self::Peeled(_) => "Peeled",
+            Self::Log(_) => "Log",
+            Self::Diff(_) => "Diff",
+            Self::Edited(_) => "Edited",
+            Self::Merged(_) => "Merged",
+            Self::MetadataMerged(_) => "MetadataMerged",
+            Self::Response { .. } => "Response",
+            Self::Layout(_) => "Layout",
+            Self::File(_) => "File",
+        })
+    }
+}
+
+/// One call to this node's Git store.
+#[derive(Debug, PartialEq)]
+pub enum GitCall {
+    /// Runs a repository effect for `actor`.
+    Run { effect: GitEffect, actor: UserId },
+    /// Whether the local repository still has its files and settings.
+    Configured(Ulid),
+    /// Whether another run holds the document's repository right now.
+    Busy(Ulid),
+}
+
+/// What the Git store answered.
+#[derive(Debug, PartialEq)]
+pub enum GitAnswer {
+    Ran(GitEvent),
+    Configured(bool),
+    Busy(bool),
+    /// The store is missing or the effect failed.
+    Failed(String),
+}
+
+/// What the receive hook reports about one push, next to the pack of its new objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub refs: Vec<RefUpdate>,
+    /// SHA-256 ids of LFS objects the pushed commits point to.
+    pub lfs: Vec<String>,
+    /// Files the push changes, checked against other users' LFS locks.
+    pub paths: Vec<String>,
+}
+
+/// A length-prefixed JSON request followed by the raw pack.
+pub fn encode_push(request: &PushRequest, pack: &[u8]) -> Option<Vec<u8>> {
+    let json = serde_json::to_vec(request).ok()?;
+    let length = u32::try_from(json.len()).ok()?;
+    Some([&length.to_be_bytes()[..], &json, pack].concat())
+}
+
+/// The request and pack of an [`encode_push`] body.
+pub fn decode_push(body: Bytes) -> Option<(PushRequest, Bytes)> {
+    let length = <[u8; 4]>::try_from(body.get(..4)?).ok()?;
+    let end = usize::try_from(u32::from_be_bytes(length))
+        .ok()?
+        .checked_add(4)?;
+    let request = serde_json::from_slice(body.get(4..end)?).ok()?;
+    Some((request, body.slice(end..)))
 }
 
 /// One replicated Git fact of a metadata document. Every holder rebuilds its local

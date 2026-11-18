@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
@@ -30,7 +31,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs};
-use aruna_core::structs::identity::realm::NodeRealm;
 use super::imports::{ContinueImportsOperation, ImportError, KeptStart};
 use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
 pub use super::rebuild::BeginRebuildsError;
@@ -41,8 +41,8 @@ use super::refill::{RefillConfig, RefillError, RefillOperation, RefillOutcome};
 use super::refresh::{RefreshCursor, RefreshError, RefreshPass, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use super::submit::{StateOperation, Stated};
-use crate::driver::DriverContext;
 use crate::s3::usage::{MarkDirtyError, MarkDirtyOperation};
+use aruna_core::structs::identity::realm::NodeRealm;
 
 /// How long a pass that found nothing to do waits before it looks again.
 const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
@@ -90,12 +90,16 @@ impl MaintainPass {
 
 /// One bounded pass over the range accounts and this node's other range work, resuming where
 /// the last finished pass stopped.
-pub(crate) fn maintain_ranges(context: &DriverContext) -> MaintainRangesOperation {
+pub(crate) fn maintain_ranges(
+    ids: NodeRealm,
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    capacity: Option<u64>,
+) -> MaintainRangesOperation {
     let kept = CURSORS.lock().ok().and_then(|cursors| cursors.clone());
     MaintainRangesOperation::new(
-        context.node_and_realm(),
+        ids,
         kept.unwrap_or_default(),
-        balance_inputs(context),
+        balance_inputs(fresh, capacity),
     )
 }
 

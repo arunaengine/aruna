@@ -51,7 +51,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::write::route_metadata_update;
+use crate::metadata_calls::route_metadata_update;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::realm::set_policies::{
@@ -149,7 +149,12 @@ async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     assert_eq!(
-        drain_publish_queue(&user_node.context).await,
+        drive(
+            drain_publish_queue(user_node.context.node_and_realm()),
+            &user_node.context
+        )
+        .await
+        .expect("the drain runs"),
         DrainOutcome::Recheck
     );
 
@@ -203,14 +208,24 @@ async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pending.len(), 5);
 
     assert_eq!(
-        drain_publish_queue(&user_node.context).await,
+        drive(
+            drain_publish_queue(user_node.context.node_and_realm()),
+            &user_node.context
+        )
+        .await
+        .expect("the drain runs"),
         DrainOutcome::Recheck
     );
 
     // A forward whose outcome was ambiguous is retried after a backoff, so the tail converges
     // over passes.
     wait_for_convergence("a draft behind the first page did not publish", || async {
-        drain_publish_queue(&user_node.context).await;
+        drive(
+            drain_publish_queue(user_node.context.node_and_realm()),
+            &user_node.context,
+        )
+        .await
+        .expect("the drain runs");
         let mut unpublished = 0;
         for draft_id in &pending {
             let drained = drive(

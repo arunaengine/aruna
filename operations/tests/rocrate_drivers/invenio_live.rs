@@ -880,7 +880,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     let mapping =
-        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(2))
+        crate::metadata_calls::read_mapping(&fixture.context, doc_id(2))
             .await?
             .ok_or("pulled dataset has no mapping")?;
     let doi = second.identifier.as_deref().ok_or("v2 has no DOI")?;

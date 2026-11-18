@@ -16,7 +16,7 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub(crate) use super::offer::run::{CheckRootOperation, check_root};
+pub(crate) use super::offer::run::check_root;
 pub use super::offer::run::{
     OfferDirectoryOperation, WithdrawOfferOperation, offer_directory, withdraw_offer,
 };

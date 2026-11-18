@@ -10,7 +10,7 @@ use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
-use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
+use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
@@ -133,6 +133,11 @@ impl DriverContext {
             .map_or(fallback, |net| *net.realm_id())
     }
 
+    /// This node; `None` on a node without a net transport.
+    pub fn node_id(&self) -> Option<aruna_core::NodeId> {
+        self.net_handle.as_ref().map(|net| net.node_id())
+    }
+
     /// This node and the realm it serves; `None` on a node without a net transport.
     pub fn node_and_realm(
         &self,
@@ -169,6 +174,24 @@ impl DriverContext {
         (held.unwrap_or_default().into_iter())
             .map(|held| (held.node_id, held))
             .collect()
+    }
+
+    /// Who this node hears from now, from its heartbeats.
+    pub fn heard(&self) -> Heard {
+        let held = self.held_heartbeats();
+        Heard::of(
+            self.node_id(),
+            held.iter().map(|(node, held)| (*node, held)),
+        )
+    }
+
+    /// This node as distribution operations see it.
+    pub fn here(&self) -> Here {
+        Here {
+            ids: self.node_and_realm(),
+            capacity: node_routing(self).catalog.capacity(),
+            heard: self.heard(),
+        }
     }
 
     /// Fresh heartbeats held for each node; none without a net transport.
@@ -782,6 +805,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
+        | Effect::Git(_)
         | Effect::Search()
         | Effect::Stream() => None,
     }
@@ -1250,6 +1274,9 @@ async fn take_hold(
                 .hold_document(document_id)
                 .await,
         ),
+        HoldScope::GitRepository(document_id) => {
+            Some(context.blob_handle.as_ref()?.git()?.lock(document_id).await)
+        }
         scope => Some(local_hold(scope).lock_owned().await),
     }
 }

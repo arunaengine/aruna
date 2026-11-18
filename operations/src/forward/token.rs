@@ -13,7 +13,7 @@ use crate::forward::authorize::{
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
-use crate::metadata::handle::transport_message_kind;
+use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};

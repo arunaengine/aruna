@@ -41,7 +41,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     let mapping =
-        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(1))
+        crate::metadata_calls::read_mapping(&fixture.context, doc_id(1))
             .await?
             .expect("created document has a mapping");
     let identifiers = mapping
@@ -74,7 +74,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         None,
         aruna_core::structs::secondary_id::IdentifierOrigin::Published,
     )?;
-    let denied = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
+    let denied = crate::metadata_calls::add_identifiers_routed(
         &fixture.context,
         fixture.actor.realm_id,
         doc_id(1),

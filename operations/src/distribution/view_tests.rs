@@ -333,7 +333,7 @@ fn lag_failure_ends() {
     assert!(is_child(
         add.next(child(Ok::<_, StatusError>(Some(view()))))
     ));
-    let failed = Err::<(LagMap, bool), _>(RecordError::NotFinished);
+    let failed = Err::<(LagMap, bool), _>(RecordError::from(IoError::Unfinished));
     assert_eq!(add.next(child(failed)), Ok(Next::Done(status)));
 }
 

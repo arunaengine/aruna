@@ -34,9 +34,10 @@ use aruna_operations::metadata::api::read_types::{
     ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
 use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use aruna_operations::metadata::forward::write::{
-    CreateAuthorizedError, create_metadata_authorized,
+use aruna_operations::metadata::forward::authorized_create::{
+    AuthorizedCreateOperation, DocumentCreate,
 };
+use aruna_operations::metadata::forward::write::CreateAuthorizedError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};
@@ -87,28 +88,30 @@ pub(crate) async fn run_create_metadata(
     message: Option<String>,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
-    create_metadata_authorized(
-        &ctx,
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth,
-        extras,
-        forwarded_auth_token(bearer_token)?,
+    let create = DocumentCreate {
         group_id,
         path,
         public,
         payload,
-        message,
-    )
-    .await
-    .map_err(|error| match error {
-        CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
-        CreateAuthorizedError::Forbidden => ServerError::Forbidden,
-        CreateAuthorizedError::Api(error) => map_api_error(error),
-        CreateAuthorizedError::Create(error) => map_create_error(error),
-        CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
-        CreateAuthorizedError::Write(error) => map_write_error(error),
-    })
+        commit_message: message,
+    };
+    let node = (
+        state.get_realm_id(),
+        state.get_node_id(),
+        ctx.net_handle.is_some(),
+    );
+    let caller = (auth.clone(), extras, forwarded_auth_token(bearer_token)?);
+    let create = AuthorizedCreateOperation::new(node, caller, create);
+    drive(create, ctx.as_ref())
+        .await
+        .map_err(|error| match error {
+            CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
+            CreateAuthorizedError::Forbidden => ServerError::Forbidden,
+            CreateAuthorizedError::Api(error) => map_api_error(error),
+            CreateAuthorizedError::Create(error) => map_create_error(error),
+            CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
+            CreateAuthorizedError::Write(error) => map_write_error(error),
+        })
 }
 
 pub(crate) fn map_references_response(

@@ -89,6 +89,7 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::ExportRoCrate { .. }
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportSummaryAt { .. }
+        | MetadataEffect::DescribeTitle { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::CachedRecords
@@ -107,6 +108,7 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::CheckProfile { .. }
         | MetadataEffect::CachedShapes { .. }
         | MetadataEffect::CacheShapes { .. }
+        | MetadataEffect::FlushGraph
         | MetadataEffect::CacheGeneration
         | MetadataEffect::CacheRecords { .. }
         | MetadataEffect::UncacheRecord { .. }

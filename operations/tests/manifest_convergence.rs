@@ -18,7 +18,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
-use aruna_operations::metadata::persistent_id::read_mapping;
+use crate::metadata_calls::read_mapping;
 use ulid::Ulid;
 
 use crate::convergence;
