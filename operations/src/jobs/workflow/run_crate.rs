@@ -76,7 +76,7 @@ pub enum CrateRun {
 }
 
 /// How the job runtime takes the end of a run-crate job.
-pub(crate) fn crate_outcome(result: Result<CrateRun, JobError>) -> JobRunOutcome {
+pub fn crate_outcome(result: Result<CrateRun, JobError>) -> JobRunOutcome {
     match result {
         Ok(CrateRun::Recorded(resource)) => {
             JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
@@ -115,7 +115,7 @@ enum WriteStep {
 /// durable status and never fails the parent; this job succeeds once the outcome is recorded,
 /// so it is not retried forever on a permanent error.
 #[derive(Debug, PartialEq)]
-pub struct WriteRunCrateOperation {
+pub struct WriteCrateOperation {
     for_job: JobId,
     serving: ServingNode,
     step: WriteStep,
@@ -134,7 +134,7 @@ fn execution_spec(record: &JobRecord) -> Option<&ExecutionSpec> {
     }
 }
 
-impl WriteRunCrateOperation {
+impl WriteCrateOperation {
     pub fn new(for_job: JobId, serving: ServingNode) -> Self {
         Self {
             for_job,
@@ -211,7 +211,7 @@ impl WriteRunCrateOperation {
     }
 }
 
-impl Operation for WriteRunCrateOperation {
+impl Operation for WriteCrateOperation {
     type Output = CrateRun;
     type Error = JobError;
 

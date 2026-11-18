@@ -437,3 +437,102 @@ fn file_scope_narrows() {
     assert_eq!(page.items, vec![version("a")]);
     assert!(!page.is_truncated && page.next_key_marker.is_none());
 }
+
+fn job_run() -> PurgeJobOperation {
+    PurgeJobOperation::new(run_at(prefix_scope(), PurgePhase::FinalList))
+}
+
+fn host_call(effect: JobEffect) -> Next<JobRunOutcome> {
+    Next::Call(job_call(effect))
+}
+
+fn host_answer(event: JobEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Job(event)))
+}
+
+fn stops(cancelled: bool, shutdown: bool) -> IoResult {
+    host_answer(JobEvent::Stops(JobStops {
+        cancelled,
+        shutdown,
+    }))
+}
+
+/// A purge job that holds its fence and was just told to go on.
+fn fenced_job() -> PurgeJobOperation {
+    let mut job = job_run();
+    assert!(matches!(job.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let fenced = job.next(child(Ok::<_, PurgeFenceError>(())));
+    assert_eq!(fenced, Ok(host_call(JobEffect::Stops)));
+    job
+}
+
+// A fence nobody can get fails the job without touching anything.
+#[test]
+fn invalid_fence_fails() {
+    let mut job = job_run();
+    job.first().unwrap();
+    let refused = child(Err::<(), _>(PurgeFenceError::Invalid));
+    let Ok(Next::Done(JobRunOutcome::Failed(error))) = job.next(refused) else {
+        panic!("the job ends failed");
+    };
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+}
+
+// A cancel between turns ends the job and lifts the pause mark.
+#[test]
+fn cancel_lifts_pause() {
+    let mut job = fenced_job();
+    assert!(matches!(
+        job.next(stops(true, false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let lifted = child(Ok::<_, PauseError>(()));
+    assert_eq!(job.next(lifted), Ok(Next::Done(JobRunOutcome::Cancelled)));
+}
+
+// A shutdown leaves the pause mark, because the job runs again.
+#[test]
+fn shutdown_keeps_pause() {
+    let mut job = fenced_job();
+    assert_eq!(
+        job.next(stops(false, true)),
+        Ok(Next::Done(JobRunOutcome::Interrupted))
+    );
+}
+
+// Each turn reports its progress; a paused purge waits and asks again.
+#[test]
+fn paused_turn_waits() {
+    let mut job = fenced_job();
+    assert!(matches!(
+        job.next(stops(false, false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let end = TurnEnd {
+        run: Box::new(run_at(prefix_scope(), PurgePhase::AbortPage)),
+        turn: PurgeTurn::Paused,
+    };
+    let report = job.next(child(Ok::<_, PurgeStop>(end)));
+    assert!(matches!(report, Ok(Next::Call(IoCall::Effect(_)))));
+    assert_eq!(
+        job.next(host_answer(JobEvent::Reported)),
+        Ok(host_call(JobEffect::Pause(PAUSE_POLL)))
+    );
+    let woke = host_answer(JobEvent::Paused { stopped: false });
+    assert_eq!(job.next(woke), Ok(host_call(JobEffect::Stops)));
+}
+
+// A failed turn fails the job, after the pause mark is lifted.
+#[test]
+fn failed_turn_ends() {
+    let mut job = fenced_job();
+    job.next(stops(false, false)).unwrap();
+    let error = JobError::retryable("no");
+    let failed = child(Err::<TurnEnd, _>(PurgeStop::Failed(error.clone())));
+    assert!(matches!(job.next(failed), Ok(Next::Call(IoCall::Child(_)))));
+    let lifted = child(Ok::<_, PauseError>(()));
+    assert_eq!(
+        job.next(lifted),
+        Ok(Next::Done(JobRunOutcome::Failed(error)))
+    );
+}

@@ -46,6 +46,7 @@ use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::host::run_backend_import;
+use aruna_operations::jobs::host::run_storage_purge;
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, transition_to_running,
@@ -58,7 +59,6 @@ use aruna_operations::s3::imports::discovery::{
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
-use aruna_operations::tasks::job_runner::run_storage_purge;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

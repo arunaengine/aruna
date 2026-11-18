@@ -4,6 +4,8 @@
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::pure_tests::execution_record;
 use super::*;
@@ -47,8 +49,8 @@ fn done(resource: &str) -> WriteNext {
     Ok(Next::Done(CrateRun::Recorded(resource.to_string())))
 }
 
-fn write() -> WriteRunCrateOperation {
-    let mut write = WriteRunCrateOperation::new(job(), serving());
+fn write() -> WriteCrateOperation {
+    let mut write = WriteCrateOperation::new(job(), serving());
     assert!(is_child(&write.first()));
     write
 }
@@ -66,7 +68,7 @@ fn config(kind: Option<RealmNodeKind>) -> IoResult {
 }
 
 /// A crate job that read its parent and waits for the realm configuration.
-fn at_config() -> WriteRunCrateOperation {
+fn at_config() -> WriteCrateOperation {
     let mut operation = write();
     assert!(is_child(&operation.next(no_status())));
     let (parent, _) = execution_record();
@@ -140,7 +142,7 @@ fn record_outcome_passes() {
     let mut operation = write();
     operation.next(no_status()).unwrap();
     let (parent, _) = execution_record();
-    let mut no_net = WriteRunCrateOperation::new(job(), None);
+    let mut no_net = WriteCrateOperation::new(job(), None);
     no_net.first().unwrap();
     no_net.next(no_status()).unwrap();
     assert!(is_child(&no_net.next(stored(Some(parent)))));
@@ -150,7 +152,7 @@ fn record_outcome_passes() {
     );
     let failed = JobError::retryable("no");
     let reply = child(Err::<String, _>(failed.clone()));
-    let mut failing = WriteRunCrateOperation::new(job(), None);
+    let mut failing = WriteCrateOperation::new(job(), None);
     failing.first().unwrap();
     failing.next(no_status()).unwrap();
     failing.next(stored(Some(execution_record().0))).unwrap();
@@ -160,6 +162,11 @@ fn record_outcome_passes() {
 fn record(saved_id: Option<Ulid>) -> RecordCrateOperation {
     let (parent, spec) = execution_record();
     RecordCrateOperation::new(job(), &parent, &spec, saved_id, serving())
+}
+
+fn meta_id() -> MetaResourceId {
+    let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
+    MetaResourceId::from_parts(1, handle, BucketId::new(9).unwrap()).unwrap()
 }
 
 fn allowed(allowed: bool) -> IoResult {
@@ -191,15 +198,15 @@ fn record_needs_net() {
 
 // A new id is stored before anything is created with it.
 #[test]
-fn minted_id_stored_first() {
+fn minted_id_kept() {
     let mut operation = record(None);
     assert!(is_child(&operation.first()));
     assert_eq!(operation.step, RecordStep::Mint);
-    let id = MetaResourceId::from_ulid(Ulid::from_bytes([8; 16]));
+    let id = meta_id();
     let minted = child(Ok::<_, CreateDocumentError>(id));
     assert!(is_child(&operation.next(minted)));
     assert_eq!(operation.step, RecordStep::PutMinted);
-    assert_eq!(operation.document_id, Ulid::from_bytes([8; 16]));
+    assert_eq!(operation.document_id, meta_id().as_ulid());
     assert!(is_child(&operation.next(stored(()))));
     assert_eq!(operation.step, RecordStep::Allowed);
 }
@@ -233,7 +240,7 @@ fn check_failure_retries() {
 
 // Only the exact version a holder describes names a device.
 #[test]
-fn device_needs_exact_version() {
+fn device_exact_version() {
     let mut operation = record(None);
     operation.expect_remote = Some(Ulid::from_bytes([9; 16]));
     let denied = child(Err::<LocationSummary, _>(LocationSummaryError::Denied));
@@ -245,6 +252,6 @@ fn device_needs_exact_version() {
 
 // The create is the step everything before it leads to.
 #[test]
-fn checks_lead_to_create() {
+fn checks_reach_create() {
     assert_eq!(at_create().step, RecordStep::Create);
 }

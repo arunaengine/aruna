@@ -44,6 +44,7 @@ use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::host::run_storage_purge;
 use aruna_operations::jobs::store::put_purge_checkpoint;
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
@@ -74,7 +75,6 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_operations::tasks::job_runner::run_storage_purge;
 use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;

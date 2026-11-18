@@ -4,12 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, VecDeque};
+use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::jobs::{JobEffect, JobEvent, JobReport, JobStops};
 use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobError, JobId, JobProgress};
+use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::structs::execution::job::{JobError, JobId, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation, object_permission_path};
@@ -22,6 +26,7 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::types::Key;
 use ulid::Ulid;
 
+use super::super::executor::JobRunOutcome;
 use super::super::store::JobMutationError;
 use super::super::store::job_calls::{RenewOutcome, flush_progress, put_purge_checkpoint};
 use super::super::store::row_calls::read_purge_checkpoint;
@@ -29,11 +34,12 @@ use super::purge_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::pause::{PauseError, PausedOperation};
+use crate::blob::pause::{PauseError, PausePurgeOperation, PausedOperation};
 use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFile, StorageFilesOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
+use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{
     ListUploadsError, ListUploadsInput, ListUploadsOperation, ListUploadsResult,
@@ -50,6 +56,8 @@ use crate::s3::object::versions::{
 use crate::s3::purge_fence::PurgeFenceError;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
+/// How often a paused purge looks whether it was resumed.
+const PAUSE_POLL: Duration = Duration::from_secs(2);
 
 /// Why a purge turn ended the run.
 #[derive(Debug, PartialEq)]
@@ -76,7 +84,7 @@ fn retry(message: impl Into<String>) -> PurgeStop {
 }
 
 /// A fence that cannot be acquired fails the job only when no retry can change that.
-pub(crate) fn fence_error(error: PurgeFenceError) -> JobError {
+fn fence_error(error: PurgeFenceError) -> JobError {
     match error {
         PurgeFenceError::Invalid => JobError::permanent(error.to_string()),
         PurgeFenceError::Suspended
@@ -855,6 +863,10 @@ impl Operation for PurgeTurnOperation {
     type Output = TurnEnd;
     type Error = PurgeStop;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> TurnNext {
         let run = self.run()?;
         match &run.phase {
@@ -1042,6 +1054,156 @@ impl Operation for PurgeTurnOperation {
                     .child::<(), IoError>()?
                     .map_err(|error| retry(format!("purge audit write failed: {error}")))?;
                 self.finished(deleted)
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum JobStep {
+    Fence,
+    Stops,
+    Turn,
+    Reported(PurgeTurn),
+    Paused,
+    Resume(Box<JobRunOutcome>),
+}
+
+/// Runs a whole storage purge for its job: it takes the write fence, then runs turn after turn
+/// and asks the job's host between them whether to stop. With `files` it also plans the release
+/// of the linked-storage files of the versions.
+#[derive(Debug, PartialEq)]
+pub struct PurgeJobOperation {
+    job_id: JobId,
+    scope: StoragePurgeScope,
+    run: Option<PurgeRun>,
+    step: JobStep,
+}
+
+type JobNext = Result<Next<JobRunOutcome>, IoError>;
+
+fn job_call(effect: JobEffect) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Job(effect)))
+}
+
+impl PurgeJobOperation {
+    pub fn new(run: PurgeRun) -> Self {
+        Self {
+            job_id: run.job_id,
+            scope: run.spec.scope.clone(),
+            run: Some(run),
+            step: JobStep::Fence,
+        }
+    }
+
+    fn ask_stops(&mut self) -> Next<JobRunOutcome> {
+        self.step = JobStep::Stops;
+        Next::Call(job_call(JobEffect::Stops))
+    }
+
+    /// The planned files wait in the cleanup queue until the job has ended, so every end but a
+    /// shutdown lifts the pause mark.
+    fn finish(&mut self, outcome: JobRunOutcome) -> Next<JobRunOutcome> {
+        if outcome == JobRunOutcome::Interrupted {
+            return Next::Done(outcome);
+        }
+        self.step = JobStep::Resume(Box::new(outcome));
+        let resume = PausePurgeOperation::new(self.job_id.as_ulid(), false);
+        Next::Call(IoCall::child(resume))
+    }
+
+    fn stops_read(&mut self, stops: JobStops) -> JobNext {
+        if stops.cancelled {
+            return Ok(self.finish(JobRunOutcome::Cancelled));
+        }
+        if stops.shutdown {
+            return Ok(self.finish(JobRunOutcome::Interrupted));
+        }
+        let Some(run) = self.run.take() else {
+            return Err(IoError::Unfinished);
+        };
+        self.step = JobStep::Turn;
+        Ok(Next::Call(IoCall::child(PurgeTurnOperation::new(run, 0))))
+    }
+
+    fn turn_ended(&mut self, end: Result<TurnEnd, PurgeStop>) -> Next<JobRunOutcome> {
+        let end = match end {
+            Ok(end) => end,
+            Err(PurgeStop::Cancelled) => return self.finish(JobRunOutcome::Cancelled),
+            Err(PurgeStop::Failed(error)) => return self.finish(JobRunOutcome::Failed(error)),
+        };
+        let report = JobReport {
+            current: Some(end.run.progress.current),
+            total: end.run.progress.total,
+            ..JobReport::default()
+        };
+        self.run = Some(*end.run);
+        self.step = JobStep::Reported(end.turn);
+        Next::Call(job_call(JobEffect::Report(report)))
+    }
+}
+
+/// The job event that answers a call to the job's host.
+fn job_event(result: IoResult) -> Result<JobEvent, IoError> {
+    match result.event()? {
+        Event::Job(event) => Ok(event),
+        other => Err(IoError::Unexpected {
+            expected: "Event::Job",
+            got: other.label(),
+        }),
+    }
+}
+
+impl Operation for PurgeJobOperation {
+    type Output = JobRunOutcome;
+    type Error = IoError;
+
+    fn first(&mut self) -> JobNext {
+        let (job_id, scope) = (self.job_id, self.scope.clone());
+        let build = move || AcquireFenceOperation::new(job_id, scope.clone());
+        let fence = boxed_retry(build, &job_id.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Ok(Next::Call(IoCall::Child(fence)))
+    }
+
+    fn next(&mut self, result: IoResult) -> JobNext {
+        match std::mem::replace(&mut self.step, JobStep::Stops) {
+            JobStep::Fence => match result.child::<(), PurgeFenceError>()? {
+                Ok(()) => Ok(self.ask_stops()),
+                Err(error) => Ok(Next::Done(JobRunOutcome::Failed(fence_error(error)))),
+            },
+            JobStep::Stops => match job_event(result)? {
+                JobEvent::Stops(stops) => self.stops_read(stops),
+                _ => Err(IoError::Unexpected {
+                    expected: "JobEvent::Stops",
+                    got: "another job event",
+                }),
+            },
+            JobStep::Turn => Ok(self.turn_ended(result.child()?)),
+            JobStep::Reported(turn) => {
+                job_event(result)?;
+                match turn {
+                    PurgeTurn::Continue => Ok(self.ask_stops()),
+                    PurgeTurn::Paused => {
+                        self.step = JobStep::Paused;
+                        Ok(Next::Call(job_call(JobEffect::Pause(PAUSE_POLL))))
+                    }
+                    PurgeTurn::Finished(result) => {
+                        let payload = JobResultPayload::StoragePurge(result);
+                        Ok(self.finish(JobRunOutcome::Succeeded(payload)))
+                    }
+                }
+            }
+            JobStep::Paused => {
+                job_event(result)?;
+                Ok(self.ask_stops())
+            }
+            JobStep::Resume(outcome) => {
+                if let Err(error) = result.child::<(), PauseError>()? {
+                    tracing::warn!(%error, "A purge's pause mark could not be removed");
+                }
+                Ok(Next::Done(*outcome))
             }
         }
     }
