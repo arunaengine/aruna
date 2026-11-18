@@ -459,7 +459,7 @@ async fn acquire_source(
                     )
                 },
                 &ctx.driver,
-                &*upload_id.to_bytes(),
+                &upload_id.to_bytes(),
             )
             .await
             .map_err(|error| match error {
