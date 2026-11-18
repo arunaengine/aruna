@@ -96,6 +96,11 @@ impl RawViewOperation {
         }
     }
 
+    /// Reads only the raw revision of a live document, outside any transaction.
+    pub fn revision(document_id: Ulid) -> Self {
+        Self::new(document_id, None, false)
+    }
+
     fn read(&mut self, step: ViewStep, key_space: &str, key: Key) -> ViewTurn {
         self.step = step;
         Ok(Next::Call(row_call(key_space, key, self.txn_id)))
@@ -196,6 +201,69 @@ impl Operation for RawViewOperation {
     }
 }
 
+/// A live document's displayed revision with how far its projection caught up; `None` once the
+/// document or its graph is deleted or no revision exists.
+#[derive(Debug, PartialEq)]
+pub struct RawDisplayOperation {
+    view: RawViewOperation,
+}
+
+impl RawDisplayOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self {
+            view: RawViewOperation::new(document_id, None, true),
+        }
+    }
+
+    fn view_turn(turn: Next<RawViewOutput>) -> Result<Next<Option<MetadataRawView>>, RawReadError> {
+        match turn {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Wait => Ok(Next::Wait),
+            Next::Done((status, revision)) | Next::Then { output: (status, revision), .. } => {
+                Ok(Next::Done(revision.map(|revision| displayed(status, revision))))
+            }
+        }
+    }
+}
+
+/// The view of `revision`: projected once the status is materialized at exactly its digests.
+fn displayed(
+    status: Option<MaterializationStatusRecord>,
+    revision: MetadataRawRevision,
+) -> MetadataRawView {
+    let projection_state = status
+        .as_ref()
+        .map_or(MaterializationState::Pending, |status| status.state);
+    let projected_event_id = status
+        .filter(|status| {
+            status.state == MaterializationState::Materialized
+                && status.event_id == revision.winning_event_id
+                && status.context_digest == Some(revision.context_digest)
+                && status.dataset_digest == revision.dataset_digest
+        })
+        .map(|status| status.event_id);
+    MetadataRawView {
+        revision,
+        projection_state,
+        projected_event_id,
+    }
+}
+
+impl Operation for RawDisplayOperation {
+    type Output = Option<MetadataRawView>;
+    type Error = RawReadError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, RawReadError> {
+        let turn = self.view.first()?;
+        Self::view_turn(turn)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
+        let turn = self.view.next(result)?;
+        Self::view_turn(turn)
+    }
+}
+
 /// Reads a document's stored raw state outside any transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RawStateOperation {
@@ -233,6 +301,74 @@ mod call_tests {
 
     fn document() -> Ulid {
         event(10).record.document_id
+    }
+
+    fn revision(winning: u8) -> MetadataRawRevision {
+        MetadataRawRevision {
+            jsonld: "{}".to_string(),
+            winning_event_id: Ulid::from_bytes([winning; 16]),
+            context_digest: [1; 32],
+            dataset_digest: Some([2; 32]),
+            merged: None,
+        }
+    }
+
+    fn status(event: u8, state: MaterializationState) -> MaterializationStatusRecord {
+        MaterializationStatusRecord {
+            document_id: document(),
+            event_id: Ulid::from_bytes([event; 16]),
+            graph_iri: String::new(),
+            context_digest: Some([1; 32]),
+            dataset_digest: Some([2; 32]),
+            state,
+            attempts: 0,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn display_reads_status() {
+        let mut display = RawDisplayOperation::new(document());
+        assert_eq!(
+            display.first(),
+            Ok(read_call(
+                MATERIALIZATION_STATUS_KEYSPACE,
+                materialization_status_key(document())
+            ))
+        );
+        // A deleted document has no view.
+        let stored = status(4, MaterializationState::Materialized);
+        let row = Some(postcard::to_allocvec(&stored).unwrap().into());
+        display.next(IoResult::Values(vec![row])).unwrap();
+        let first = event(10);
+        let deleted = MetadataLifecycleRecord::Delete {
+            event: MetadataDeleteRecord {
+                event_id: Ulid::from_parts(1, 20),
+                tombstone: GraphLifecycleRecord::deleted(
+                    first.record.graph_iri.clone(),
+                    first.record.realm_id,
+                    first.record.group_id,
+                    first.record.document_id,
+                    2,
+                ),
+                deleted_after_id: first.event_id,
+            },
+        };
+        assert_eq!(display.next(value(bytes(&deleted))), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn display_marks_projection() {
+        let exact = displayed(Some(status(4, MaterializationState::Materialized)), revision(4));
+        assert_eq!(exact.projection_state, MaterializationState::Materialized);
+        assert_eq!(exact.projected_event_id, Some(Ulid::from_bytes([4; 16])));
+        let behind = displayed(Some(status(3, MaterializationState::Materialized)), revision(4));
+        assert_eq!(behind.projected_event_id, None);
+        let missing = displayed(None, revision(4));
+        assert_eq!(missing.projection_state, MaterializationState::Pending);
+        assert_eq!(missing.projected_event_id, None);
     }
 
     fn read_call<T>(key_space: &str, key: Key) -> Next<T> {

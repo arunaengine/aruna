@@ -806,6 +806,7 @@ impl MetadataEvent {
                 SnapshotInstalled,
                 BatchPlanned,
                 BatchMerged,
+                ProfileChecked,
                 Error,
             }
         )

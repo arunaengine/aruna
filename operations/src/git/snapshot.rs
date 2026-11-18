@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::revision_read::RawDisplayOperation;
 use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
@@ -84,7 +85,7 @@ pub(super) async fn current(
     }
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
-        None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
+        None => drive(RawDisplayOperation::new(document.document_id), context)
             .await
             .map_err(|_| GitError::Unavailable)?
             .map(|view| view.revision),

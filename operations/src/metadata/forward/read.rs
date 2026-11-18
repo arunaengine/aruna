@@ -5,7 +5,7 @@
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::export_metadata_rocrate;
 use crate::metadata::api::export::get_visible_document;
@@ -22,7 +22,7 @@ use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::raw_revision::load_raw_view;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::metadata::revision_read::MetadataRawView;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
@@ -941,7 +941,7 @@ pub async fn export_profile_local(
     if record.last_event_id != expected_revision {
         return Err(MetadataReadError::Unavailable);
     }
-    let raw = load_raw_view(context, profile_id, None)
+    let raw = drive(RawDisplayOperation::new(profile_id), context)
         .await
         .map_err(|_| MetadataReadError::Unavailable)?
         .ok_or(MetadataReadError::NotFound)?;

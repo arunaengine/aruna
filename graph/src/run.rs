@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::profile_shapes::ProfileShaclReport;
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms, record_error};
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleRequestDurability, GraphId,
@@ -27,6 +28,25 @@ impl GraphHandle {
     /// Runs one store effect on the blocking pool and answers with its event. Searches,
     /// queries and best-effort sync need a read scope or the network and are refused here.
     pub async fn run(&self, effect: MetadataEffect) -> MetadataEvent {
+        let effect = match effect {
+            MetadataEffect::CheckStructure { jsonld } => {
+                let report = self.run_profile_shacl(move |engine| {
+                    let structural = engine.structural(&jsonld)?;
+                    Ok(ProfileShaclReport {
+                        results: Vec::new(),
+                        structural,
+                    })
+                });
+                let report = report.await.map(Box::new);
+                return MetadataEvent::ProfileChecked { report };
+            }
+            MetadataEffect::CheckProfile { shapes, jsonld } => {
+                let report = self.run_profile_shacl(move |engine| engine.evaluate(&shapes, &jsonld));
+                let report = report.await.map(Box::new);
+                return MetadataEvent::ProfileChecked { report };
+            }
+            effect => effect,
+        };
         let graph_iri = effect.graph_iri();
         if matches!(
             effect,
@@ -872,7 +892,9 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
-        | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::SyncBestEffort { .. }
+        | MetadataEffect::CheckStructure { .. }
+        | MetadataEffect::CheckProfile { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

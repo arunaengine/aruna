@@ -1361,6 +1361,16 @@ pub enum MetadataEffect {
         graph_iri: String,
         batch: MetadataBatch,
     },
+    // Profile checks of unsaved candidates; nothing is committed.
+    /// Structural RO-Crate findings of a candidate that carries no Profile tag.
+    CheckStructure {
+        jsonld: String,
+    },
+    /// Evaluates a candidate against one Profile revision's shapes.
+    CheckProfile {
+        shapes: crate::profile_shapes::ProfileShapes,
+        jsonld: String,
+    },
 }
 
 impl MetadataEffect {
@@ -1391,6 +1401,8 @@ impl MetadataEffect {
             MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
             MetadataEffect::ExportVersioned { .. } => "export_versioned",
             MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
+            MetadataEffect::CheckStructure { .. } => "check_structure",
+            MetadataEffect::CheckProfile { .. } => "check_profile",
         }
     }
 
@@ -1424,7 +1436,9 @@ impl MetadataEffect {
             MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
                 .as_ref()
                 .and_then(|graph_iris| graph_iris.first().cloned()),
-            MetadataEffect::ListGraphs => None,
+            MetadataEffect::ListGraphs
+            | MetadataEffect::CheckStructure { .. }
+            | MetadataEffect::CheckProfile { .. } => None,
         }
     }
 
@@ -1531,6 +1545,10 @@ pub enum MetadataEvent {
     BatchMerged {
         graph_iri: String,
         applied: bool,
+    },
+    /// The verdict of a structure or Profile check, or why there is none.
+    ProfileChecked {
+        report: Result<Box<crate::profile_shapes::ProfileShaclReport>, crate::profile_shapes::ProfileShaclError>,
     },
     Error {
         graph_iri: Option<String>,

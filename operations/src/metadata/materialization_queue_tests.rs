@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
+use crate::metadata::revision_read::RawViewOperation;
 use super::*;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
@@ -1729,8 +1731,8 @@ async fn late_merges_chain() {
     }
     finish_completed_jobs(&storage, finished).await.unwrap();
 
-    let raw = crate::metadata::raw_revision::load_raw_revision(&context, document_id, None)
-        .await
+    let raw = drive(RawViewOperation::revision(document_id), &context)
+        .await.map(|(_, revision)| revision)
         .unwrap()
         .expect("the merged graph is stored");
     assert_eq!(

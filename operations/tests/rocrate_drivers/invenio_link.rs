@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use super::remote::{RemoteServer, remote};
 use super::*;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -23,7 +24,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::prune_queue::process_prune_batch;
-use aruna_operations::metadata::raw_revision::load_raw_revision;
+use aruna_operations::metadata::revision_read::RawViewOperation;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
@@ -246,8 +247,8 @@ pub(super) async fn change(
     text: &str,
     drop_empty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await.map(|(_, revision)| revision)?
         .ok_or("revision missing")?;
     let mut document: Value = serde_json::from_str(&revision.jsonld)?;
     let graph = document["@graph"].as_array_mut().ok_or("graph missing")?;
@@ -408,8 +409,8 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
             .any(|(method, path)| *method == Method::DELETE && path.ends_with("empty.txt"))
     );
 
-    let event = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let event = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await.map(|(_, revision)| revision)?
         .ok_or("revision missing")?
         .winning_event_id;
     Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
@@ -588,8 +589,8 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     // A drain that submitted the job but stopped before recording it leaves the check queued.
-    let event = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let event = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await.map(|(_, revision)| revision)?
         .ok_or("revision missing")?
         .winning_event_id;
     let spec = ExportRoCrateSpec {
@@ -758,7 +759,7 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    let raw = load_raw_revision(&fixture.context, doc_id(1), None).await?;
+    let raw = drive(RawViewOperation::revision(doc_id(1)), &fixture.context).await.map(|(_, revision)| revision)?;
     assert!(raw.is_none(), "a scaffold keeps no raw revision");
 
     let link = Box::pin(attach(
@@ -902,8 +903,8 @@ async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
     let server = remote(LINK_TOKEN).await;
     let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
     // The crate names a stored object that does not exist in this realm.
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await.map(|(_, revision)| revision)?
         .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     let entity = document["@graph"]

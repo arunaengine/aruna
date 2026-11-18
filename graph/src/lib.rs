@@ -15,7 +15,7 @@ use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleIrokleOptions, CraqleNode, CraqleOptions,
     CrateViolation, GraphId, SearchStorage,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 
 use crate::convert::{error_from_craqle, fjall_persist_mode, irokle_peer_id, policy_from_craqle};
 use crate::persist::flush_metadata_persistence;
@@ -105,7 +105,12 @@ struct GraphInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    /// Striped holds that serialize this node's writes to one document.
+    document_holds: [Arc<tokio::sync::Mutex<()>>; DOCUMENT_HOLDS],
 }
+
+/// Stripes of the document write holds.
+const DOCUMENT_HOLDS: usize = 64;
 
 impl std::fmt::Debug for GraphHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -160,8 +165,15 @@ impl GraphHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
                 profile_shacl,
+                document_holds: std::array::from_fn(|_| Arc::default()),
             }),
         })
+    }
+
+    /// Waits for the write hold of one document; the caller keeps it until it drops the guard.
+    pub async fn hold_document(&self, document_id: ulid::Ulid) -> OwnedMutexGuard<()> {
+        let stripe = usize::from(document_id.to_bytes()[15]) % DOCUMENT_HOLDS;
+        self.inner.document_holds[stripe].clone().lock_owned().await
     }
 
     /// The store's Fjall database, for consistent read snapshots such as live backups.
@@ -303,32 +315,7 @@ impl GraphHandle {
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))
     }
 
-    /// Whether Profile checks can run on this node.
-    pub fn profile_validation_available(&self) -> bool {
-        self.inner.profile_shacl.is_some()
-    }
-
-    /// Structural RO-Crate findings for a candidate that carries no Profile
-    /// tag. Nothing is committed: the document is only prepared.
-    pub async fn preview_crate_structure(
-        &self,
-        jsonld: String,
-    ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
-        self.run_profile_shacl(move |engine| engine.structural(&jsonld))
-            .await
-    }
-
-    /// Evaluates one candidate against a registered Profile's shapes.
-    pub async fn evaluate_profile_shapes(
-        &self,
-        profile: ProfileShapes,
-        jsonld: String,
-    ) -> Result<ProfileShaclReport, ProfileShaclError> {
-        self.run_profile_shacl(move |engine| engine.evaluate(&profile, &jsonld))
-            .await
-    }
-
-    async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
+    pub(crate) async fn run_profile_shacl<T, F>(&self, work: F) -> Result<T, ProfileShaclError>
     where
         T: Send + 'static,
         F: FnOnce(&ProfileShaclEngine) -> Result<T, ProfileShaclError> + Send + 'static,

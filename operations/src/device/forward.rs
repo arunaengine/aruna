@@ -16,7 +16,7 @@ use crate::metadata::protocol::GraphState;
 use crate::metadata::protocol::MAX_DEVICE_GROUPS;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::RealmDocuments;
-use crate::metadata::raw_revision::load_raw_view;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
@@ -370,7 +370,7 @@ pub(super) async fn read_graph_state(
             return Err(SyncRefusal::Unavailable);
         }
     };
-    let raw = load_raw_view(context.as_ref(), document_id, None)
+    let raw = drive(RawDisplayOperation::new(document_id), context.as_ref())
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     // A document created as a scaffold has no authored text yet; its graph is what it shows.

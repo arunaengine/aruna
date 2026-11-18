@@ -35,7 +35,7 @@ use crate::jobs::service::submit_export_job;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::revision_read::RawViewOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
@@ -318,7 +318,7 @@ async fn push_revision(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Option<(Ulid, Option<[u8; 32]>)>, LinkError> {
-    let raw = load_raw_revision(context, document_id, None)
+    let (_, raw) = drive(RawViewOperation::revision(document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(error.to_string()))?;
     if let Some(revision) = raw {

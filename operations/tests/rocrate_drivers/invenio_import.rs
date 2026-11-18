@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use super::*;
 
 #[tokio::test]
@@ -573,7 +574,7 @@ async fn start_update(
 async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
     use aruna_operations::jobs::repository::link_store::list_links;
-    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    use aruna_operations::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, _) = start_update(&fixture, &server).await?;
@@ -581,8 +582,9 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
 
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
+        .1
         .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     assert_eq!(crate_versions(&document), ["1", "2"]);
@@ -643,7 +645,7 @@ async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::er
 #[tokio::test]
 async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    use aruna_operations::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, _) = start_update(&fixture, &server).await?;
@@ -677,8 +679,9 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
 
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
+        .1
         .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     assert_eq!(crate_versions(&document), ["1"]);
@@ -698,7 +701,7 @@ async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::{LinkPatch, LinkStatus};
     use aruna_operations::jobs::repository::link_store::{change_link, list_links};
     use aruna_operations::jobs::repository::links::LinkChange;
-    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    use aruna_operations::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, first) = start_update(&fixture, &server).await?;
@@ -724,8 +727,9 @@ async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
         JobRunOutcome::Cancelled
     ));
 
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
+        .1
         .ok_or("revision missing")?;
     assert_eq!(revision.winning_event_id, first);
     let document: Value = serde_json::from_str(&revision.jsonld)?;

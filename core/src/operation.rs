@@ -16,6 +16,8 @@ pub enum HoldScope {
     /// The document reconcile of `net`, which also excludes its shard membership changes and
     /// topic evictions.
     DocumentReconcile,
+    /// This node's writes to one metadata document, so its actor's dots stay in order.
+    DocumentWrite(ulid::Ulid),
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the
