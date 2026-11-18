@@ -323,3 +323,318 @@ impl Operation for SessionJobOperation {
         }
     }
 }
+
+/// The canonical execution's node, otherwise a successful execution's node, otherwise any
+/// execution's node. `None` names no family here, or a family without executions.
+#[derive(Debug, PartialEq)]
+pub struct FamilyResponderOperation {
+    job_id: JobId,
+    now_ms: u64,
+}
+
+impl FamilyResponderOperation {
+    pub fn new(job_id: JobId, now_ms: u64) -> Self {
+        Self { job_id, now_ms }
+    }
+}
+
+impl Operation for FamilyResponderOperation {
+    type Output = Option<NodeId>;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> Result<Next<Option<NodeId>>, JobRouteError> {
+        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<NodeId>>, JobRouteError> {
+        let Some((projected, _)) = projection_read(result)? else {
+            return Ok(Next::Done(None));
+        };
+        decidable(&projected)?;
+        let projection = projected.projection.ok_or_else(no_projection)?;
+        let executions = &projection.executions;
+        let responder = executions
+            .iter()
+            .find(|execution| execution.role == ExecutionRole::Canonical)
+            .or_else(|| {
+                executions
+                    .iter()
+                    .find(|execution| execution.state == PhysicalExecutionState::Succeeded)
+            })
+            .or_else(|| executions.first())
+            .map(|execution| execution.executor_node_id);
+        Ok(Next::Done(responder))
+    }
+}
+
+/// The report of a projected family with everything read for it.
+fn family_report(
+    job_id: JobId,
+    projected: &ProjectedFamily,
+    projection: &JobProjection,
+    spec: LogicalJobSpec,
+    details: ReportDetails,
+    responder: Option<NodeId>,
+) -> Result<FamilyReport, JobRouteError> {
+    let digest = projection
+        .digest()
+        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
+    let executions = &projection.executions;
+    let canonical = projection.canonical_execution_id;
+    Ok(FamilyReport {
+        job: status_view(job_id, projection, &spec),
+        submission_id: projection.submission_id,
+        request_digest: projection.request_digest,
+        canonical_job_id: projection.canonical_job_id,
+        aliases: projection.aliases.clone(),
+        conflicts: details.conflicts,
+        state: projection.state,
+        canonical_execution_id: canonical,
+        canonical_result: canonical.and_then(|execution_id| {
+            executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+                .and_then(|execution| execution.result.clone())
+        }),
+        executions: executions.len() as u32,
+        started_at_ms: started_at(projection),
+        execution_list: executions.clone(),
+        duplicate_successes: executions
+            .iter()
+            .filter(|execution| execution.role == ExecutionRole::DuplicateSuccess)
+            .count() as u32,
+        outputs: projection.outputs.as_slice().to_vec(),
+        output_endpoints: details.output_endpoints,
+        revision: projected.revision,
+        digest,
+        cancel_requested: projection.cancel_requested,
+        responder,
+        partial: projected.truncated,
+        locally_exhausted: details.locally_exhausted,
+        plan: details.plan,
+        spec,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum ReportStep {
+    Projection,
+    Inputs(Box<ProjectedFamily>),
+    Details(Box<ProjectedFamily>, Box<LogicalJobSpec>),
+}
+
+/// Reduces one alias into the full report; `None` names no family here. Reads stay self-scoped,
+/// and a run its submitter deleted answers as absent on every holder the deletion reached.
+#[derive(Debug, PartialEq)]
+pub struct FamilyReportOperation {
+    user_id: UserId,
+    job_id: JobId,
+    node: ServingNode,
+    now_ms: u64,
+    step: ReportStep,
+}
+
+type ReportNext = Result<Next<Option<FamilyReport>>, JobRouteError>;
+
+impl FamilyReportOperation {
+    pub fn new(auth: &AuthContext, job_id: JobId, node: ServingNode, now_ms: u64) -> Self {
+        Self {
+            user_id: auth.user_id,
+            job_id,
+            node,
+            now_ms,
+            step: ReportStep::Projection,
+        }
+    }
+
+    fn responder(&self) -> Option<NodeId> {
+        self.node.map(|(local, _)| local)
+    }
+
+    fn details(&mut self, projected: ProjectedFamily, spec: LogicalJobSpec) -> ReportNext {
+        let Some(projection) = projected.projection.as_ref() else {
+            return Ok(Next::Done(None));
+        };
+        let family = JobFamilyId {
+            submission_id: projection.submission_id,
+            request_digest: projection.request_digest,
+        };
+        let details = ReportDetailsOperation::new(family, projection, self.responder());
+        self.step = ReportStep::Details(Box::new(projected), Box::new(spec));
+        Ok(Next::Call(IoCall::child(details)))
+    }
+}
+
+impl Operation for FamilyReportOperation {
+    type Output = Option<FamilyReport>;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> ReportNext {
+        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ReportNext {
+        match std::mem::replace(&mut self.step, ReportStep::Projection) {
+            ReportStep::Projection => {
+                let Some((projected, spec)) = projection_read(result)? else {
+                    return Ok(Next::Done(None));
+                };
+                if spec.created_by != self.user_id {
+                    return Err(JobRouteError::NotFound);
+                }
+                // A paged spec reports its inputs as if they were inline.
+                let fill = SpecInputsOperation::new(&spec, self.node);
+                self.step = ReportStep::Inputs(Box::new(projected));
+                Ok(Next::Call(IoCall::child(fill)))
+            }
+            ReportStep::Inputs(projected) => {
+                let spec = result.child::<LogicalJobSpec, PageReadError>()?;
+                self.details(*projected, spec.map_err(unavailable)?)
+            }
+            ReportStep::Details(projected, spec) => {
+                let details = result.child::<ReportDetails, JobRouteError>()??;
+                if details.deleted {
+                    return Err(JobRouteError::NotFound);
+                }
+                let projection = projected.projection.as_ref().ok_or_else(no_projection)?;
+                let report = family_report(
+                    self.job_id,
+                    &projected,
+                    projection,
+                    *spec,
+                    details,
+                    self.responder(),
+                )?;
+                Ok(Next::Done(Some(report)))
+            }
+        }
+    }
+}
+
+/// Pages the immutable log of one alias's family; `None` names no family here. A caller that
+/// did not submit the job gets `NotFound`, so the surface never confirms another user's id.
+#[derive(Debug, PartialEq)]
+pub struct FamilyLogOperation {
+    user_id: UserId,
+    job_id: JobId,
+    range: AuditRange,
+    paging: Option<AuditPaging>,
+    now_ms: u64,
+}
+
+impl FamilyLogOperation {
+    pub fn new(
+        auth: &AuthContext,
+        job_id: JobId,
+        (range, paging): (AuditRange, AuditPaging),
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            user_id: auth.user_id,
+            job_id,
+            range,
+            paging: Some(paging),
+            now_ms,
+        }
+    }
+}
+
+impl Operation for FamilyLogOperation {
+    type Output = Option<AuditPage>;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> Result<Next<Option<AuditPage>>, JobRouteError> {
+        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<AuditPage>>, JobRouteError> {
+        let Some(paging) = self.paging.take() else {
+            let page = result.child::<AuditPage, RecordStoreError>()?;
+            let page = page.map_err(|error| JobRouteError::Internal(error.to_string()))?;
+            return Ok(Next::Done(Some(page)));
+        };
+        let Some((projected, spec)) = projection_read(result)? else {
+            return Ok(Next::Done(None));
+        };
+        if spec.created_by != self.user_id {
+            return Err(JobRouteError::NotFound);
+        }
+        let scope = match self.range {
+            AuditRange::Family => AuditScope::Family(projected.family),
+            AuditRange::Submission => AuditScope::Submission(projected.family.submission_id),
+        };
+        let page = FamilyAuditOperation::new(FamilyAuditConfig {
+            scope,
+            cursor: paging.cursor,
+            limit: paging.limit,
+        });
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+/// Adds the S3 endpoint of every node that holds an output named by `records`. A node whose
+/// advertisement cannot be read simply stays without an endpoint.
+#[derive(Debug, PartialEq)]
+pub struct AuditEndpointsOperation {
+    /// Nodes still to read, the next one last.
+    nodes: Vec<NodeId>,
+    asked: Option<NodeId>,
+    endpoints: BTreeMap<NodeId, String>,
+}
+
+type EndpointsNext = Result<Next<BTreeMap<NodeId, String>>, aruna_core::calls::IoError>;
+
+impl AuditEndpointsOperation {
+    pub fn new(records: &[JobRecordEnvelope], endpoints: BTreeMap<NodeId, String>) -> Self {
+        let mut nodes = Vec::new();
+        for envelope in records {
+            let JobFamilyRecord::Output(output) = &envelope.record else {
+                continue;
+            };
+            for object in output.outputs.as_slice() {
+                let known = endpoints.contains_key(&object.node_id);
+                if !known && !nodes.contains(&object.node_id) {
+                    nodes.push(object.node_id);
+                }
+            }
+        }
+        nodes.reverse();
+        Self {
+            nodes,
+            asked: None,
+            endpoints,
+        }
+    }
+
+    fn read_next(&mut self) -> EndpointsNext {
+        let Some(node) = self.nodes.pop() else {
+            return Ok(Next::Done(std::mem::take(&mut self.endpoints)));
+        };
+        self.asked = Some(node);
+        let read = ReadInfoOperation::new(vec![node]);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+}
+
+impl Operation for AuditEndpointsOperation {
+    type Output = BTreeMap<NodeId, String>;
+    type Error = aruna_core::calls::IoError;
+
+    fn first(&mut self) -> EndpointsNext {
+        self.read_next()
+    }
+
+    fn next(&mut self, result: IoResult) -> EndpointsNext {
+        let read = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+        if let (Some(node), Ok(mut documents)) = (self.asked.take(), read)
+            && let Some(document) = documents.remove(&node)
+            && let Some(endpoint) = document.urls.s3
+        {
+            self.endpoints.insert(node, endpoint);
+        }
+        self.read_next()
+    }
+}
