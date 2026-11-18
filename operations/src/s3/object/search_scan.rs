@@ -264,179 +264,319 @@ fn retain_matches(input: &SearchObjectsInput, live: &mut Vec<LiveHead>) {
     }
 }
 
-async fn load_live(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    heads: Vec<HeadCandidate>,
-    txn_id: TxnId,
-) -> Result<Vec<LiveHead>, SearchObjectsError> {
-    if heads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let version_reads = heads
-        .iter()
-        .map(|candidate| {
-            VersionKey::new(
-                &candidate.head.bucket,
-                &candidate.head.key,
-                candidate.version_id,
-            )
-            .to_bytes()
-            .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let versions = batch_read(context, version_reads, txn_id).await?;
-    if versions.len() != heads.len() {
-        return Err(SearchObjectsError::Storage(
-            "object inventory version batch length mismatch".to_string(),
-        ));
+/// What building hits answers.
+enum BuildTurn {
+    Call(IoCall),
+    Done(Vec<Candidate>),
+}
+
+#[derive(Debug, PartialEq)]
+struct ExistedRead {
+    candidate: HeadCandidate,
+    version: BlobVersion,
+    prefix: Vec<u8>,
+    /// The newest version created by `as_of`, and whether it is live.
+    visible: Option<(SystemTime, bool)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum BuildStep {
+    Versions(Vec<HeadCandidate>),
+    Existed(Box<ExistedRead>),
+    Buckets,
+    Locations(Vec<Option<Value>>, Vec<usize>),
+}
+
+/// Turns current heads into hits inside the read transaction of the operation that holds it:
+/// their versions, whether a changed key existed at the snapshot, buckets and locations.
+#[derive(Debug, PartialEq)]
+struct HitBuilder {
+    input: SearchObjectsInput,
+    loaded: VecDeque<(HeadCandidate, BlobVersion)>,
+    live: Vec<LiveHead>,
+    step: BuildStep,
+}
+
+impl HitBuilder {
+    fn new(input: SearchObjectsInput) -> Self {
+        Self {
+            input,
+            loaded: VecDeque::new(),
+            live: Vec::new(),
+            step: BuildStep::Buckets,
+        }
     }
 
-    let mut live = Vec::new();
-    for (candidate, (_, value)) in heads.into_iter().zip(versions) {
-        let Some(value) = value else {
-            continue;
-        };
-        let version = BlobVersion::from_bytes(value.as_ref())?;
-        let changed = version.created_at > input.as_of;
-        if changed {
-            // A key whose first version is newer than the snapshot did not exist at it.
-            if !existed_at(context, &candidate.head, input.as_of, txn_id).await? {
-                continue;
-            }
-        } else if version.is_deleted() {
-            continue;
+    fn start(&mut self, heads: Vec<HeadCandidate>) -> Result<BuildTurn, SearchObjectsError> {
+        if heads.is_empty() {
+            return Ok(BuildTurn::Done(Vec::new()));
         }
-        live.push(LiveHead {
+        let reads = (heads.iter())
+            .map(|candidate| {
+                let head = &candidate.head;
+                VersionKey::new(&head.bucket, &head.key, candidate.version_id)
+                    .to_bytes()
+                    .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.step = BuildStep::Versions(heads);
+        Ok(BuildTurn::Call(IoCall::Read(reads)))
+    }
+
+    /// Takes the next loaded version; a key whose first version is newer than the snapshot did
+    /// not exist at it.
+    fn settle(&mut self) -> Result<BuildTurn, SearchObjectsError> {
+        while let Some((candidate, version)) = self.loaded.pop_front() {
+            if version.created_at > self.input.as_of {
+                let head = &candidate.head;
+                let prefix = VersionKey::object_prefix(&head.bucket, &head.key)?;
+                let call = versions_page(prefix.clone(), None);
+                self.step = BuildStep::Existed(Box::new(ExistedRead {
+                    candidate,
+                    version,
+                    prefix,
+                    visible: None,
+                }));
+                return Ok(BuildTurn::Call(call));
+            }
+            if !version.is_deleted() {
+                self.keep(candidate, version, false);
+            }
+        }
+        self.read_buckets()
+    }
+
+    fn keep(&mut self, candidate: HeadCandidate, version: BlobVersion, changed: bool) {
+        self.live.push(LiveHead {
             head: candidate.head,
             cursor_key: candidate.cursor_key,
             version,
             changed,
         });
     }
-    Ok(live)
-}
 
-/// Whether the newest version of `head` created by `as_of` is live, so the key existed then.
-/// Ids of one millisecond may swap, so every kept version is read.
-async fn existed_at(
-    context: &DriverContext,
-    head: &BlobHeadKey,
-    as_of: SystemTime,
-    txn_id: TxnId,
-) -> Result<bool, SearchObjectsError> {
-    let prefix = VersionKey::object_prefix(&head.bucket, &head.key)?;
-    let (mut start, mut visible) = (None, None);
-    loop {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone().into()),
-                start: start.take(),
-                limit: VERSION_BATCH,
-                txn_id: Some(txn_id),
+    fn read_buckets(&mut self) -> Result<BuildTurn, SearchObjectsError> {
+        retain_matches(&self.input, &mut self.live);
+        if self.live.is_empty() {
+            return Ok(BuildTurn::Done(Vec::new()));
+        }
+        let reads = (self.live.iter())
+            .map(|candidate| {
+                let bucket = candidate.head.bucket.as_bytes().to_vec();
+                (S3_BUCKET_KEYSPACE.to_string(), Key::from(bucket))
             })
-            .await;
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return Err(storage_event_error(event));
-        };
-        for (_, value) in values {
-            let version = BlobVersion::from_bytes(value.as_ref())?;
-            let newer = |(at, _): &(SystemTime, bool)| version.created_at >= *at;
-            if version.created_at <= as_of && visible.as_ref().is_none_or(newer) {
-                visible = Some((version.created_at, !version.is_deleted()));
+            .collect();
+        self.step = BuildStep::Buckets;
+        Ok(BuildTurn::Call(IoCall::Read(reads)))
+    }
+
+    fn read_locations(
+        &mut self,
+        buckets: Vec<Option<Value>>,
+    ) -> Result<BuildTurn, SearchObjectsError> {
+        if buckets.len() != self.live.len() {
+            return Err(SearchObjectsError::Storage(
+                "object inventory bucket batch length mismatch".to_string(),
+            ));
+        }
+        let (mut slots, mut reads) = (Vec::new(), Vec::new());
+        for (index, candidate) in self.live.iter().enumerate() {
+            if let Some(key) = candidate.version.location_key() {
+                slots.push(index);
+                reads.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    Key::from(key.to_bytes()),
+                ));
             }
         }
-        match next_start_after {
-            Some(next) => start = Some(IterStart::After(next)),
-            None => return Ok(visible.is_some_and(|(_, live)| live)),
+        if reads.is_empty() {
+            return self.build(buckets, HashMap::new());
+        }
+        self.step = BuildStep::Locations(buckets, slots);
+        Ok(BuildTurn::Call(IoCall::Read(reads)))
+    }
+
+    fn build(
+        &mut self,
+        buckets: Vec<Option<Value>>,
+        location_by_index: HashMap<usize, BackendLocation>,
+    ) -> Result<BuildTurn, SearchObjectsError> {
+        let input = &self.input;
+        let live = std::mem::take(&mut self.live);
+        let mut candidates = Vec::new();
+        for (index, (candidate, bucket)) in live.into_iter().zip(buckets).enumerate() {
+            let Some(bucket) = bucket else {
+                continue;
+            };
+            let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
+            let (content_w3id, checksum, size, updated_at) = match &candidate.version.state {
+                // Only its key is used: it is authorized and counted, never shown.
+                _ if candidate.changed => (None, None, None, None),
+                BlobVersionState::Materialized { blob_hash, .. } => {
+                    let digest = hex::encode(blob_hash);
+                    (
+                        Some(W3idIdentifier::ContentHash(*blob_hash).to_w3id()),
+                        Some(ObjectInventoryChecksum {
+                            algorithm: "blake3".to_string(),
+                            value: digest,
+                        }),
+                        location_by_index
+                            .get(&index)
+                            .map(|location| location.blob_size),
+                        Some(candidate.version.created_at),
+                    )
+                }
+                BlobVersionState::Reference {
+                    cached_metadata, ..
+                } => (
+                    None,
+                    None,
+                    Some(cached_metadata.content_length),
+                    cached_metadata
+                        .last_modified
+                        .or(Some(candidate.version.created_at)),
+                ),
+                // No content identity is claimed before the hash is verified.
+                BlobVersionState::PendingContent { .. } => {
+                    (None, None, None, Some(candidate.version.created_at))
+                }
+                BlobVersionState::Deleted => continue,
+            };
+            let hit = SearchNodeHit {
+                cursor_key: candidate.cursor_key,
+                hit: ObjectInventoryHit {
+                    node_id: input.node_id,
+                    group_id: bucket.group_id,
+                    bucket: candidate.head.bucket,
+                    key: candidate.head.key,
+                    content_w3id,
+                    checksum,
+                    size,
+                    updated_at,
+                    metadata: match input.key_match {
+                        ObjectKeyMatch::Metadata => kept_metadata(&candidate.version.metadata),
+                        ObjectKeyMatch::Substring | ObjectKeyMatch::Prefix => BTreeMap::new(),
+                    },
+                },
+            };
+            let changed = candidate.changed;
+            candidates.push(Candidate { hit, changed });
+        }
+        Ok(BuildTurn::Done(candidates))
+    }
+
+    fn answer(&mut self, result: IoResult) -> Result<BuildTurn, SearchObjectsError> {
+        match std::mem::replace(&mut self.step, BuildStep::Buckets) {
+            BuildStep::Versions(heads) => {
+                let versions = result.values()?;
+                if versions.len() != heads.len() {
+                    return Err(SearchObjectsError::Storage(
+                        "object inventory version batch length mismatch".to_string(),
+                    ));
+                }
+                for (candidate, value) in heads.into_iter().zip(versions) {
+                    if let Some(value) = value {
+                        let version = BlobVersion::from_bytes(value.as_ref())?;
+                        self.loaded.push_back((candidate, version));
+                    }
+                }
+                self.settle()
+            }
+            // Ids of one millisecond may swap, so every kept version is read.
+            BuildStep::Existed(mut read) => {
+                let (rows, next) = result.page()?;
+                for (_, value) in rows {
+                    let version = BlobVersion::from_bytes(value.as_ref())?;
+                    let newer = |(at, _): &(SystemTime, bool)| version.created_at >= *at;
+                    if version.created_at <= self.input.as_of
+                        && read.visible.as_ref().is_none_or(newer)
+                    {
+                        read.visible = Some((version.created_at, !version.is_deleted()));
+                    }
+                }
+                if let Some(next) = next {
+                    let call = versions_page(read.prefix.clone(), Some(next));
+                    self.step = BuildStep::Existed(read);
+                    return Ok(BuildTurn::Call(call));
+                }
+                let ExistedRead {
+                    candidate,
+                    version,
+                    visible,
+                    ..
+                } = *read;
+                if visible.is_some_and(|(_, live)| live) {
+                    self.keep(candidate, version, true);
+                }
+                self.settle()
+            }
+            BuildStep::Buckets => self.read_locations(result.values()?),
+            BuildStep::Locations(buckets, slots) => {
+                let mut locations = HashMap::new();
+                for (index, value) in slots.into_iter().zip(result.values()?) {
+                    if let Some(value) = value {
+                        locations.insert(index, BackendLocation::from_bytes(value.as_ref())?);
+                    }
+                }
+                self.build(buckets, locations)
+            }
         }
     }
 }
 
-async fn build_hits(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    live: Vec<LiveHead>,
-    txn_id: TxnId,
-) -> Result<Vec<Candidate>, SearchObjectsError> {
-    if live.is_empty() {
-        return Ok(Vec::new());
+fn versions_page(prefix: Vec<u8>, after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: BLOB_VERSIONS_KEYSPACE.to_string(),
+        prefix: Key::from(prefix),
+        after,
+        limit: VERSION_BATCH,
     }
-    let bucket_reads = live
-        .iter()
-        .map(|candidate| {
-            (
-                S3_BUCKET_KEYSPACE.to_string(),
-                Key::from(candidate.head.bucket.as_bytes().to_vec()),
-            )
-        })
-        .collect();
-    let buckets = batch_read(context, bucket_reads, txn_id).await?;
-    if buckets.len() != live.len() {
-        return Err(SearchObjectsError::Storage(
-            "object inventory bucket batch length mismatch".to_string(),
-        ));
-    }
+}
 
-    let location_reads = live
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            candidate.version.location_key().map(|key| {
-                (
-                    index,
-                    (
-                        BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        Key::from(key.to_bytes()),
-                    ),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let locations = batch_read(
-        context,
-        location_reads
-            .iter()
-            .map(|(_, read)| read.clone())
-            .collect(),
-        txn_id,
-    )
-    .await?;
-    let mut location_by_index = HashMap::new();
-    for ((index, _), (_, value)) in location_reads.into_iter().zip(locations) {
-        if let Some(value) = value {
-            location_by_index.insert(index, BackendLocation::from_bytes(value.as_ref())?);
+#[derive(Debug, PartialEq)]
+enum ScanStep {
+    Heads,
+    Buckets(Vec<String>, Vec<(Key, Value)>),
+    Hits,
+}
+
+/// One batch of current heads in one read snapshot, as hits to authorize.
+#[derive(Debug, PartialEq)]
+struct ScanBatchOperation {
+    input: SearchObjectsInput,
+    start: Option<IterStart>,
+    distributed: HashMap<String, bool>,
+    next_start: Option<IterStart>,
+    hits: HitBuilder,
+    step: ScanStep,
+}
+
+type BatchTurn = SearchTurn<CandidateBatch>;
+
+impl ScanBatchOperation {
+    fn new(
+        input: SearchObjectsInput,
+        start: Option<IterStart>,
+        distributed: HashMap<String, bool>,
+    ) -> Self {
+        Self {
+            hits: HitBuilder::new(input.clone()),
+            input,
+            start,
+            distributed,
+            next_start: None,
+            step: ScanStep::Heads,
         }
     }
 
-    let mut candidates = Vec::new();
-    for (index, (candidate, (_, bucket))) in live.into_iter().zip(buckets).enumerate() {
-        let Some(bucket) = bucket else {
-            continue;
-        };
-        let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
-        let (content_w3id, checksum, size, updated_at) = match &candidate.version.state {
-            // Only its key is used: it is authorized and counted, never shown.
-            _ if candidate.changed => (None, None, None, None),
-            BlobVersionState::Materialized { blob_hash, .. } => {
-                let digest = hex::encode(blob_hash);
-                (
-                    Some(W3idIdentifier::ContentHash(*blob_hash).to_w3id()),
-                    Some(ObjectInventoryChecksum {
-                        algorithm: "blake3".to_string(),
-                        value: digest,
-                    }),
-                    location_by_index
-                        .get(&index)
-                        .map(|location| location.blob_size),
-                    Some(candidate.version.created_at),
-                )
+    /// Which buckets of a realm-wide batch are distributed: their keys are searched only
+    /// through their range indexes, so the scan skips them.
+    fn learn_buckets(&mut self, values: Vec<(Key, Value)>) -> BatchTurn {
+        let mut names = Vec::new();
+        for (key, _) in &values {
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            if !self.distributed.contains_key(&head.bucket) && !names.contains(&head.bucket) {
+                names.push(head.bucket);
             }
             BlobVersionState::Reference {
                 cached_metadata, ..
