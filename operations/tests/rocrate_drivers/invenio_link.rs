@@ -324,10 +324,7 @@ pub(super) async fn run_registration(
         return Err("queued job is not a registration".into());
     };
     let ctx = claim_context(fixture, job_id, record.payload).await?;
-    succeeded(
-        Box::pin(aruna_operations::jobs::persistent_id::run_register_identifiers(&ctx, &spec))
-            .await,
-    );
+    succeeded(Box::pin(super::driven::register_identifiers(&ctx, &spec)).await);
     Ok(spec.auth_context)
 }
 
@@ -1128,7 +1125,6 @@ async fn paged_links_unlinked() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn registration_awaits_mapping() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
-    use aruna_operations::jobs::persistent_id::run_register_identifiers;
     let fixture = build_fixture(false).await?;
     let doi = SecondaryIdentifier::new(
         SecondaryIdKind::Doi,
@@ -1149,7 +1145,7 @@ async fn registration_awaits_mapping() -> Result<(), Box<dyn std::error::Error>>
     let run = async |job_id| -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
         let payload = JobPayload::RegisterIdentifiers(spec.clone());
         let ctx = claim_context(&fixture, job_id, payload).await?;
-        Ok(Box::pin(run_register_identifiers(&ctx, &spec)).await)
+        Ok(Box::pin(super::driven::register_identifiers(&ctx, &spec)).await)
     };
 
     // The authority holds no mapping for the dataset yet, so a new registration waits for it.
