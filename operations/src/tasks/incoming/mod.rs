@@ -690,11 +690,7 @@ impl OperationsTaskHandler {
                 return;
             }
         }
-        let fetched = crate::device::realm_documents::fetch_realm_documents(
-            &self.context,
-            REALM_DOCUMENTS_BUDGET,
-        )
-        .await;
+        let fetched = drive(crate::device::realm_documents::fetch_realm_documents(&self.context, REALM_DOCUMENTS_BUDGET), &self.context).await.unwrap_or(false);
         let note = match fetched {
             true => SyncNote::Contact,
             false => SyncNote::Failure,

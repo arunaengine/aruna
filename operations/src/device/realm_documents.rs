@@ -3,43 +3,50 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::auth::revocation_live;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{
-    GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, NODE_NAME_KEYSPACE, NODE_PLACE_KEYSPACE,
-    REALM_MARKER_KEYSPACE, REALM_REMOVAL_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE,
+    NODE_NAME_KEYSPACE, NODE_PLACE_KEYSPACE, REALM_MARKER_KEYSPACE, REALM_REMOVAL_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
+use aruna_core::node_state::{InstallInfoOperation, NodeInfoError};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_net::streams::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use rand::seq::SliceRandom;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::distribution::forward::{config_of, realm_config};
+use crate::distribution::here::NodeRealm;
+use crate::distribution::inventory::{StagedCall, outside_answer};
+use crate::distribution::peer_call::{peer_call_within, timed_answer};
+use crate::driver::DriverContext;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::realm::load_config::load_realm_config;
+use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
-use aruna_core::node_state::InstallInfoOperation;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a
@@ -63,6 +70,7 @@ struct RealmMarker {
 }
 
 /// One fetch attempt: who this device is, whom it may ask, and what it holds.
+#[derive(Clone, Debug, PartialEq)]
 struct FetchPlan {
     realm_id: RealmId,
     node_id: NodeId,
@@ -72,7 +80,26 @@ struct FetchPlan {
     marker: RealmMarker,
 }
 
+impl FetchPlan {
+    fn new((node_id, realm_id): (NodeId, RealmId), owner: UserId, peers: Vec<NodeId>) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            owner,
+            auth: AuthContext {
+                user_id: owner,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            peers,
+            marker: RealmMarker::default(),
+        }
+    }
+}
+
 /// One answer worth keeping, with the configuration it carries decoded once.
+#[derive(Clone, Debug, PartialEq)]
 struct Accepted {
     documents: RealmDocuments,
     config: RealmConfigDocument,
@@ -82,7 +109,7 @@ struct Accepted {
 
 /// The best of what the peers answered: one copy that covers the marker, or a
 /// copy two peers agreed on below it.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Selection {
     current: Option<Accepted>,
     behind: Option<Accepted>,
@@ -118,141 +145,12 @@ impl Selection {
     }
 }
 
-/// Fetches the realm-wide documents and installs them on this device. `budget`
-/// bounds the whole exchange, so a realm nobody answers for costs that much
-/// once and the stored copy keeps serving until the next attempt.
-pub async fn fetch_realm_documents(context: &Arc<DriverContext>, budget: Duration) -> bool {
-    let Some(plan) = fetch_plan(context).await else {
-        return false;
-    };
-    let realm_id = plan.realm_id;
-    let (installed, refused) = fetch_with_plan(context, plan, budget).await;
-    note_membership(context, realm_id, refused, installed).await;
-    installed
-}
-
-/// The same fetch for a device that holds no realm configuration yet: owner and
-/// peers are supplied instead of read from a stored copy. This is the onboarding
-/// path, where the realm documents are what the device is missing.
-pub async fn fetch_from_peers(
-    context: &Arc<DriverContext>,
-    owner: UserId,
-    peers: Vec<NodeId>,
-    budget: Duration,
-) -> bool {
-    let Some(plan) = build_plan(context, owner, peers).await else {
-        return false;
-    };
-    fetch_with_plan(context, plan, budget).await.0
-}
-
-/// Whether the documents were installed, and whether every realm peer refused this device's
-/// realm membership.
-async fn fetch_with_plan(
-    context: &Arc<DriverContext>,
-    plan: FetchPlan,
-    budget: Duration,
-) -> (bool, bool) {
-    let Ok(selection) = tokio::time::timeout(budget, ask_realm(context, &plan)).await else {
-        return (false, false);
-    };
-    let refused = !plan.peers.is_empty() && selection.membership_refusals == plan.peers.len();
-    // The install is deliberately outside the budget: half of it would leave the
-    // device with a configuration and an authorization document from two ages.
-    let installed = match (selection.current, selection.behind) {
-        (Some(accepted), _) => install_documents(context, &plan, accepted, 0).await,
-        (None, Some(behind)) => rebase_or_wait(context, &plan, behind).await,
-        (None, None) => false,
-    };
-    (installed, refused)
-}
-
 /// Whether a request error is a peer closing the connection because its realm does not admit
 /// this device: a new connection is refused at admission, an open one on a membership change.
 fn membership_refused(error: &str) -> bool {
     [ADMISSION_CLOSE, MEMBERSHIP_CLOSE]
         .iter()
         .any(|reason| error.contains(&format!("closed by peer: {reason}")))
-}
-
-/// Counts fetches that every realm peer refused for realm membership; a fetch that installed
-/// the documents clears the count. A restarting peer refuses once, so one count proves nothing.
-async fn note_membership(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    refused: bool,
-    installed: bool,
-) {
-    let key = Key::from(realm_id.as_bytes().to_vec());
-    let effect = match (installed, refused) {
-        (true, _) => StorageEffect::Delete {
-            key_space: REALM_REMOVAL_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-        (false, true) => {
-            let refusals = membership_refusals(context, realm_id)
-                .await
-                .saturating_add(1);
-            if refusals == REMOVAL_REFUSALS {
-                warn!("Every realm node refused this device's realm membership");
-            }
-            StorageEffect::Write {
-                key_space: REALM_REMOVAL_KEYSPACE.to_string(),
-                key,
-                value: Value::from(refusals.to_be_bytes().to_vec()),
-                txn_id: None,
-            }
-        }
-        (false, false) => return,
-    };
-    if let Event::Storage(StorageEvent::Error { error }) =
-        context.storage_handle.send_storage_effect(effect).await
-    {
-        warn!(error = %error, "Failed to record the realm membership state");
-    }
-}
-
-async fn membership_refusals(context: &Arc<DriverContext>, realm_id: RealmId) -> u32 {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_REMOVAL_KEYSPACE.to_string(),
-            key: Key::from(realm_id.as_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => <[u8; 4]>::try_from(bytes.as_ref()).map_or(0, u32::from_be_bytes),
-        _ => 0,
-    }
-}
-
-/// Whether the realm has removed this device, as repeated membership refusals show.
-pub async fn realm_removed(context: &Arc<DriverContext>, realm_id: RealmId) -> bool {
-    membership_refusals(context, realm_id).await >= REMOVAL_REFUSALS
-}
-
-/// Takes a copy the marker does not cover only once the realm has answered the
-/// same way often enough. Until then the attempt is counted and nothing moves.
-async fn rebase_or_wait(context: &Arc<DriverContext>, plan: &FetchPlan, behind: Accepted) -> bool {
-    let (rebase, attempts) = rebase_after(plan.marker.behind);
-    if !rebase {
-        let marker = RealmMarker {
-            clock: plan.marker.clock.clone(),
-            behind: attempts,
-        };
-        store_marker(context, plan.realm_id, &marker).await;
-        debug!(
-            attempts,
-            "Every realm node answered below this device's marker"
-        );
-        return false;
-    }
-    warn!("Re-basing this device's realm marker on what its realm answers");
-    install_documents(context, plan, behind, 0).await
 }
 
 /// Whether an attempt that found only copies below the marker may re-base it,
@@ -265,91 +163,387 @@ fn rebase_after(behind: u32) -> (bool, u32) {
     }
 }
 
-async fn fetch_plan(context: &Arc<DriverContext>) -> Option<FetchPlan> {
-    let net_handle = context.net_handle.as_ref()?;
-    let realm_id = *net_handle.realm_id();
-    let node_id = net_handle.node_id();
-    let config = load_realm_config(context, realm_id).await?;
-    let owner = node_kind(&config, node_id).and_then(|kind| kind.owner())?;
-    let mut peers = realm_peers(&config, node_id);
-    // A different node answers first every time, so one lagging peer never owns
-    // this device's view of the realm.
-    peers.shuffle(&mut rand::rng());
-    build_plan(context, owner, peers).await
+fn outside_read(key_space: &str, key: Vec<u8>) -> IoCall {
+    StagedCall::Outside(read_row(key_space, key)).into_call()
 }
 
-async fn build_plan(
-    context: &Arc<DriverContext>,
+/// The row an outside read found; an absent, unreadable row is none.
+fn outside_row(result: IoResult) -> Option<Value> {
+    outside_answer(result).and_then(|read| read.value()).ok().flatten()
+}
+
+fn realm_key(realm_id: RealmId) -> Vec<u8> {
+    realm_id.as_bytes().to_vec()
+}
+
+/// The refusal count a stored row holds.
+fn refusal_count(row: Option<Value>) -> u32 {
+    row.and_then(|bytes| <[u8; 4]>::try_from(bytes.as_ref()).ok())
+        .map_or(0, u32::from_be_bytes)
+}
+
+/// Whether the realm has removed this device, as repeated membership refusals show.
+#[derive(Debug, PartialEq)]
+pub struct RealmRemovedOperation {
+    realm_id: RealmId,
+}
+
+/// The check for a realm removal; see [`RealmRemovedOperation`].
+pub fn realm_removed(realm_id: RealmId) -> RealmRemovedOperation {
+    RealmRemovedOperation { realm_id }
+}
+
+impl Operation for RealmRemovedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let read = outside_read(REALM_REMOVAL_KEYSPACE, realm_key(self.realm_id));
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        Ok(Next::Done(
+            refusal_count(outside_row(result)) >= REMOVAL_REFUSALS,
+        ))
+    }
+}
+
+/// Counts fetches that every realm peer refused for realm membership; a fetch that installed
+/// the documents clears the count. A restarting peer refuses once, so one count proves nothing.
+#[derive(Debug, PartialEq)]
+struct NoteMembershipOperation {
+    realm_id: RealmId,
+    refused: bool,
+    installed: bool,
+    writing: bool,
+}
+
+impl NoteMembershipOperation {
+    fn new(realm_id: RealmId, refused: bool, installed: bool) -> Self {
+        Self {
+            realm_id,
+            refused,
+            installed,
+            writing: false,
+        }
+    }
+}
+
+impl Operation for NoteMembershipOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let key = realm_key(self.realm_id);
+        self.writing = self.installed;
+        Ok(match (self.installed, self.refused) {
+            (true, _) => {
+                let row = (REALM_REMOVAL_KEYSPACE.to_string(), key.into());
+                Next::Call(IoCall::Delete(vec![row]))
+            }
+            (false, true) => Next::Call(outside_read(REALM_REMOVAL_KEYSPACE, key)),
+            (false, false) => Next::Done(()),
+        })
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let refusals = refusal_count(outside_row(result)).saturating_add(1);
+        if refusals == REMOVAL_REFUSALS {
+            warn!("Every realm node refused this device's realm membership");
+        }
+        self.writing = true;
+        let row = (
+            REALM_REMOVAL_KEYSPACE.to_string(),
+            Key::from(realm_key(self.realm_id)),
+            Value::from(refusals.to_be_bytes().to_vec()),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+/// Where a fetch finds the owner and the peers it asks.
+#[derive(Clone, Debug, PartialEq)]
+enum FetchSource {
+    /// The stored realm configuration.
+    Stored,
+    /// Supplied by a device that holds no configuration yet.
+    Peers { owner: UserId, peers: Vec<NodeId> },
+}
+
+/// What the pending call of a document fetch answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchStep {
+    Config,
+    Marker,
+    Peer,
+    Install,
+    MarkBehind,
+    Membership,
+}
+
+/// Fetches the realm-wide documents and installs them on this device. The budget bounds the
+/// questions to the realm, so a realm nobody answers for costs that much once and the stored
+/// copy keeps serving until the next attempt. The install is deliberately outside the budget:
+/// half of it would leave the device with a configuration and an authorization document from
+/// two ages.
+#[derive(Debug, PartialEq)]
+pub struct FetchDocumentsOperation {
+    ids: NodeRealm,
+    source: FetchSource,
+    budget: Duration,
+    step: FetchStep,
+    plan: Option<FetchPlan>,
+    peers: VecDeque<NodeId>,
+    asked: Option<NodeId>,
+    selection: Selection,
+    installed: bool,
+}
+
+type Fetching = Result<Next<bool>, IoError>;
+
+/// The fetch of a device that holds its realm configuration.
+pub fn fetch_realm_documents(context: &DriverContext, budget: Duration) -> FetchDocumentsOperation {
+    FetchDocumentsOperation::new(context.node_and_realm(), FetchSource::Stored, budget)
+}
+
+/// The same fetch for a device that holds no realm configuration yet: owner and peers are
+/// supplied instead of read from a stored copy. This is the onboarding path, where the realm
+/// documents are what the device is missing.
+pub fn fetch_from_peers(
+    context: &DriverContext,
     owner: UserId,
     peers: Vec<NodeId>,
-) -> Option<FetchPlan> {
-    let net_handle = context.net_handle.as_ref()?;
-    context.metadata_handle.as_ref()?;
-    let realm_id = *net_handle.realm_id();
-    Some(FetchPlan {
-        realm_id,
-        node_id: net_handle.node_id(),
-        owner,
-        auth: AuthContext {
-            user_id: owner,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        peers,
-        marker: installed_marker(context, realm_id).await,
-    })
+    budget: Duration,
+) -> FetchDocumentsOperation {
+    let source = FetchSource::Peers { owner, peers };
+    FetchDocumentsOperation::new(context.node_and_realm(), source, budget)
 }
 
-/// Asks the realm's nodes in turn, stopping at the first copy that covers the
-/// installed marker.
-async fn ask_realm(context: &Arc<DriverContext>, plan: &FetchPlan) -> Selection {
-    let mut selection = Selection::default();
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return selection;
-    };
-    for peer in &plan.peers {
-        let message = MetadataTransportMessage::FetchRealmDocuments {
-            auth_token: AuthToken::internal(plan.auth.clone()),
+impl FetchDocumentsOperation {
+    fn new(ids: NodeRealm, source: FetchSource, budget: Duration) -> Self {
+        Self {
+            ids,
+            source,
+            budget,
+            step: FetchStep::Config,
+            plan: None,
+            peers: VecDeque::new(),
+            asked: None,
+            selection: Selection::default(),
+            installed: false,
+        }
+    }
+
+    fn plan(&self) -> Result<&FetchPlan, IoError> {
+        self.plan.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn start(&mut self, owner: UserId, peers: Vec<NodeId>) -> Fetching {
+        let ids = self.ids.ok_or(IoError::Unfinished)?;
+        let plan = FetchPlan::new(ids, owner, peers);
+        let read = outside_read(REALM_MARKER_KEYSPACE, realm_key(plan.realm_id));
+        self.plan = Some(plan);
+        self.step = FetchStep::Marker;
+        Ok(Next::Call(read))
+    }
+
+    /// A different node answers first every time, so one lagging peer never owns this device's
+    /// view of the realm.
+    fn configured(&mut self, config: Option<RealmConfigDocument>) -> Fetching {
+        let (Some(config), Some((node_id, _))) = (config, self.ids) else {
+            return Ok(Next::Done(false));
         };
-        match metadata.request_forwarded_write(*peer, message).await {
+        let Some(owner) = node_kind(&config, node_id).and_then(|kind| kind.owner()) else {
+            return Ok(Next::Done(false));
+        };
+        let mut peers = realm_peers(&config, node_id);
+        peers.shuffle(&mut rand::rng());
+        self.start(owner, peers)
+    }
+
+    /// Asks the realm's nodes in turn, stopping at the first copy that covers the marker.
+    fn ask_next(&mut self) -> Fetching {
+        let auth = self.plan()?.auth.clone();
+        while !self.budget.is_zero() {
+            let Some(peer) = self.peers.pop_front() else {
+                return self.asked_all();
+            };
+            let message = MetadataTransportMessage::FetchRealmDocuments {
+                auth_token: AuthToken::internal(auth.clone()),
+            };
+            match peer_call_within(peer, &message, self.budget) {
+                Ok(call) => {
+                    self.asked = Some(peer);
+                    self.step = FetchStep::Peer;
+                    return Ok(Next::Call(call));
+                }
+                Err(error) => {
+                    debug!(%peer, %error, "Could not reach a realm node for the documents");
+                }
+            }
+        }
+        // The budget ran out: this attempt says nothing about the realm.
+        self.finish(false, false)
+    }
+
+    fn answered(&mut self, result: IoResult) -> Fetching {
+        let peer = self.asked.take().ok_or(IoError::Unfinished)?;
+        let (answer, elapsed) = timed_answer(result)?;
+        self.budget = self.budget.saturating_sub(elapsed);
+        let (realm_id, clock) = {
+            let plan = self.plan()?;
+            (plan.realm_id, plan.marker.clock.clone())
+        };
+        match answer {
             Ok(MetadataTransportMessage::FetchedRealmDocuments {
                 result: Ok(documents),
             }) => {
-                let Some(accepted) = accept(documents, plan.realm_id) else {
-                    warn!(peer = %peer, "A realm node served a configuration this device refuses");
-                    continue;
+                let Some(accepted) = accept(documents, realm_id) else {
+                    warn!(%peer, "A realm node served a configuration this device refuses");
+                    return self.ask_next();
                 };
-                if selection.offer(accepted, &plan.marker.clock) {
-                    return selection;
+                if self.selection.offer(accepted, &clock) {
+                    return self.asked_all();
                 }
-                debug!(peer = %peer, "A realm node offered an older realm configuration");
+                debug!(%peer, "A realm node offered an older realm configuration");
             }
             Ok(MetadataTransportMessage::FetchedRealmDocuments {
                 result: Err(refusal),
             }) => {
-                debug!(peer = %peer, refusal = ?refusal, "A realm node refused the document fetch");
+                debug!(%peer, ?refusal, "A realm node refused the document fetch");
                 // An authorization verdict is the same at every peer.
                 if matches!(refusal, SyncRefusal::Unauthorized | SyncRefusal::Forbidden) {
-                    return Selection::default();
+                    self.selection = Selection::default();
+                    return self.asked_all();
                 }
             }
             Ok(other) => {
-                debug!(
-                    peer = %peer,
-                    message = %crate::metadata::transport_message_kind(&other),
-                    "Unexpected answer to a document fetch"
-                );
+                let message = transport_message_kind(&other);
+                debug!(%peer, %message, "Unexpected answer to a document fetch");
             }
             Err(error) => {
-                if membership_refused(&error.to_string()) {
-                    selection.membership_refusals += 1;
+                if membership_refused(&error) {
+                    self.selection.membership_refusals += 1;
                 }
-                debug!(peer = %peer, error = %error, "Could not reach a realm node for the documents");
+                debug!(%peer, %error, "Could not reach a realm node for the documents");
+            }
+        }
+        self.ask_next()
+    }
+
+    /// Installs the best copy found, or counts an attempt that found only older ones.
+    fn asked_all(&mut self) -> Fetching {
+        let selection = std::mem::take(&mut self.selection);
+        let plan = self.plan()?.clone();
+        let refused = !plan.peers.is_empty() && selection.membership_refusals == plan.peers.len();
+        self.selection.membership_refusals = usize::from(refused);
+        let accepted = match (selection.current, selection.behind) {
+            (Some(accepted), _) => accepted,
+            (None, Some(behind)) => {
+                let (rebase, attempts) = rebase_after(plan.marker.behind);
+                if !rebase {
+                    debug!(attempts, "Every realm node answered below this device's marker");
+                    let marker = RealmMarker {
+                        clock: plan.marker.clock.clone(),
+                        behind: attempts,
+                    };
+                    self.step = FetchStep::MarkBehind;
+                    return Ok(Next::Call(marker_write(plan.realm_id, &marker)?));
+                }
+                warn!("Re-basing this device's realm marker on what its realm answers");
+                behind
+            }
+            (None, None) => return self.finish(false, refused),
+        };
+        self.step = FetchStep::Install;
+        let install = InstallDocumentsOperation::new(plan, accepted, 0);
+        Ok(Next::Call(IoCall::child(install)))
+    }
+
+    /// A fetch from the stored configuration keeps count of the realm's refusals.
+    fn finish(&mut self, installed: bool, refused: bool) -> Fetching {
+        if self.source != FetchSource::Stored {
+            return Ok(Next::Done(installed));
+        }
+        let note = NoteMembershipOperation::new(self.plan()?.realm_id, refused, installed);
+        self.installed = installed;
+        self.step = FetchStep::Membership;
+        Ok(Next::Call(IoCall::child(note)))
+    }
+
+    fn was_refused(&self) -> bool {
+        self.selection.membership_refusals > 0
+    }
+}
+
+fn marker_write(realm_id: RealmId, marker: &RealmMarker) -> Result<IoCall, IoError> {
+    let bytes = postcard::to_allocvec(marker).map_err(|error| IoError::Codec(error.to_string()))?;
+    Ok(IoCall::Write(vec![marker_row(realm_id, bytes)]))
+}
+
+fn marker_row(realm_id: RealmId, bytes: Vec<u8>) -> (KeySpace, Key, Value) {
+    (
+        REALM_MARKER_KEYSPACE.to_string(),
+        Key::from(realm_key(realm_id)),
+        Value::from(bytes),
+    )
+}
+
+/// The marker a stored row holds. An absent one reads as nothing seen, which accepts the first
+/// copy and refuses nothing.
+fn marker_of(row: Option<Value>) -> RealmMarker {
+    row.and_then(|bytes| postcard::from_bytes(&bytes).ok())
+        .unwrap_or_default()
+}
+
+impl Operation for FetchDocumentsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Fetching {
+        let Some((_, realm_id)) = self.ids else {
+            return Ok(Next::Done(false));
+        };
+        match self.source.clone() {
+            FetchSource::Stored => Ok(Next::Call(realm_config(realm_id))),
+            FetchSource::Peers { owner, peers } => self.start(owner, peers),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Fetching {
+        match self.step {
+            FetchStep::Config => self.configured(config_of(result)?),
+            FetchStep::Marker => {
+                let marker = marker_of(outside_row(result));
+                let plan = self.plan.as_mut().ok_or(IoError::Unfinished)?;
+                plan.marker = marker;
+                self.peers = plan.peers.clone().into();
+                self.ask_next()
+            }
+            FetchStep::Peer => self.answered(result),
+            FetchStep::Install => {
+                let installed = result.child::<bool, IoError>()??;
+                let refused = self.was_refused();
+                self.finish(installed, refused)
+            }
+            FetchStep::MarkBehind => {
+                result.done().ok();
+                let refused = self.was_refused();
+                self.finish(false, refused)
+            }
+            FetchStep::Membership => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    warn!(%error, "Failed to record the realm membership state");
+                }
+                Ok(Next::Done(self.installed))
             }
         }
     }
-    selection
 }
 
 /// Decodes one answer and keeps it only if it is this realm's configuration.
@@ -419,164 +613,301 @@ fn realm_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// Writes the fetched copies where every local read already looks for them, in
-/// one batch with the marker they were accepted at: a half-installed copy would
-/// leave the device judging itself by two ages of the realm at once.
-async fn install_documents(
-    context: &Arc<DriverContext>,
-    plan: &FetchPlan,
+/// One document's place in storage.
+fn document_read(target: &DocumentTarget) -> (KeySpace, Key) {
+    (target.storage_keyspace().to_string(), target.storage_key())
+}
+
+fn document_row(target: &DocumentTarget, bytes: Vec<u8>) -> (KeySpace, Key, Value) {
+    (
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Value::from(bytes),
+    )
+}
+
+fn decoded_or_default<T: DeserializeOwned + Default>(row: Option<&Value>) -> T {
+    row.and_then(|bytes| postcard::from_bytes(bytes).ok())
+        .unwrap_or_default()
+}
+
+fn realm_row(key_space: &str, realm_id: RealmId) -> (KeySpace, Key) {
+    (key_space.to_string(), Key::from(realm_key(realm_id)))
+}
+
+/// What the pending call of an install answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallStep {
+    Stored,
+    Groups,
+    NodeInfos,
+    Marker,
+    Documents,
+    Peers,
+}
+
+/// The stored copies an install compares the fetched ones with.
+#[derive(Debug, Default, PartialEq)]
+struct StoredCopies {
+    config: Option<Value>,
+    authorization: Option<Value>,
+    owner: Option<Value>,
+    urls: Vec<String>,
+    displays: NodeDisplays,
+}
+
+/// Writes the fetched copies where every local read already looks for them, in one batch with
+/// the marker they were accepted at: a half-installed copy would leave the device judging itself
+/// by two ages of the realm at once.
+#[derive(Debug, PartialEq)]
+struct InstallDocumentsOperation {
+    plan: FetchPlan,
     accepted: Accepted,
     behind: u32,
-) -> bool {
-    let mut config = accepted.config;
-    let stored_config = read_bytes(
-        context,
-        DocumentTarget::RealmConfig {
-            realm_id: plan.realm_id,
-        },
-    )
-    .await;
-    if let Some(installed) = stored_config
-        .as_deref()
-        .and_then(|bytes| RealmConfigDocument::from_bytes(bytes).ok())
-    {
-        keep_revocations(&mut config, &installed, unix_timestamp_secs());
-    }
-    let actor = Actor {
-        node_id: plan.node_id,
-        user_id: plan.owner,
-        realm_id: plan.realm_id,
-    };
-    let Ok(bytes) = config.to_bytes(&actor) else {
-        warn!("A fetched realm configuration could not be stored");
-        return false;
-    };
-    let marker = RealmMarker {
-        clock: accepted.clock,
-        behind,
-    };
-    let Ok(marker_bytes) = postcard::to_allocvec(&marker) else {
-        return false;
-    };
-    let mut writes = vec![(
-        REALM_MARKER_KEYSPACE.to_string(),
-        Key::from(plan.realm_id.as_bytes().to_vec()),
-        Value::from(marker_bytes),
-    )];
+    step: InstallStep,
+    stored: StoredCopies,
+    groups: Vec<DeviceGroupDocuments>,
+    config: Option<RealmConfigDocument>,
+}
 
-    let stored_authorization = read_bytes(
-        context,
+type Installing = Result<Next<bool>, IoError>;
+
+impl InstallDocumentsOperation {
+    fn new(plan: FetchPlan, accepted: Accepted, behind: u32) -> Self {
+        Self {
+            plan,
+            accepted,
+            behind,
+            step: InstallStep::Stored,
+            stored: StoredCopies::default(),
+            groups: Vec::new(),
+            config: None,
+        }
+    }
+
+    fn realm(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
+            realm_id: self.plan.realm_id,
+        }
+    }
+
+    fn authorization(&self) -> DocumentTarget {
         DocumentTarget::RealmAuthorization {
-            realm_id: plan.realm_id,
-        },
-    )
-    .await;
-    let owner_target = DocumentTarget::User {
-        user_id: plan.owner,
-    };
-    let stored_owner = read_bytes(context, owner_target.clone()).await;
-    let stored_groups = installed_group_docs(context).await;
-    let stored_urls = installed_management_urls(context, plan.realm_id).await;
-    let stored = installed_displays(context, plan.realm_id).await;
-    if !install_node_infos(context, &accepted.documents.node_infos).await {
-        return false;
-    }
-    let unchanged = stored_config.as_deref() == Some(bytes.as_slice())
-        && stored_authorization.as_deref() == accepted.documents.realm_authorization.as_deref()
-        && stored_owner.as_deref() == accepted.documents.owner.as_deref()
-        && stored_groups == accepted.documents.groups
-        && stored_urls == accepted.documents.management_urls
-        && stored.names == accepted.documents.node_names
-        && stored.places == accepted.documents.node_places;
-    if unchanged {
-        // Nothing but the marker moves: writing the documents again would re-register
-        // every realm peer on every beat for a copy this device already holds.
-        if marker == plan.marker {
-            return true;
+            realm_id: self.plan.realm_id,
         }
-        debug!("This device already holds the realm documents it fetched");
-        return write_batch(context, writes).await;
     }
 
-    writes.push((
-        DocumentTarget::RealmConfig {
-            realm_id: plan.realm_id,
+    fn owner(&self) -> DocumentTarget {
+        DocumentTarget::User {
+            user_id: self.plan.owner,
         }
-        .storage_keyspace()
-        .to_string(),
-        DocumentTarget::RealmConfig {
-            realm_id: plan.realm_id,
+    }
+
+    fn actor(&self) -> Actor {
+        Actor {
+            node_id: self.plan.node_id,
+            user_id: self.plan.owner,
+            realm_id: self.plan.realm_id,
         }
-        .storage_key(),
-        Value::from(bytes),
-    ));
-    if let Some(authorization) = accepted.documents.realm_authorization {
-        writes.push((
-            DocumentTarget::RealmAuthorization {
-                realm_id: plan.realm_id,
-            }
-            .storage_keyspace()
-            .to_string(),
-            DocumentTarget::RealmAuthorization {
-                realm_id: plan.realm_id,
-            }
-            .storage_key(),
-            Value::from(authorization),
-        ));
     }
-    if let Some(owner) = accepted.documents.owner {
-        writes.push((
-            owner_target.storage_keyspace().to_string(),
-            owner_target.storage_key(),
-            Value::from(owner),
-        ));
+
+    fn stored_read(&self) -> IoCall {
+        let realm_id = self.plan.realm_id;
+        let reads = vec![
+            document_read(&self.realm()),
+            document_read(&self.authorization()),
+            document_read(&self.owner()),
+            realm_row(MANAGEMENT_URL_KEYSPACE, realm_id),
+            realm_row(NODE_NAME_KEYSPACE, realm_id),
+            realm_row(NODE_PLACE_KEYSPACE, realm_id),
+        ];
+        StagedCall::Outside(IoCall::Read(reads)).into_call()
     }
-    for documents in &accepted.documents.groups {
-        let Some(group_writes) = group_doc_writes(documents, &actor) else {
-            warn!(group_id = %documents.group.group_id, "A fetched group could not be stored");
-            return false;
+
+    fn keep_stored(&mut self, result: IoResult) {
+        let rows = outside_answer(result).and_then(|read| read.values());
+        let Ok(rows) = rows else {
+            warn!("Failed to read the installed realm documents");
+            return;
         };
-        writes.extend(group_writes);
+        let row = |index: usize| rows.get(index).cloned().flatten();
+        self.stored = StoredCopies {
+            config: row(0),
+            authorization: row(1),
+            owner: row(2),
+            urls: decoded_or_default(row(3).as_ref()),
+            displays: NodeDisplays {
+                names: decoded_or_default::<BTreeMap<_, _>>(row(4).as_ref()),
+                places: decoded_or_default::<BTreeMap<_, _>>(row(5).as_ref()),
+            },
+        };
     }
-    let Ok(url_bytes) = postcard::to_allocvec(&accepted.documents.management_urls) else {
-        warn!("The fetched management urls could not be stored");
-        return false;
-    };
-    writes.push((
-        MANAGEMENT_URL_KEYSPACE.to_string(),
-        Key::from(plan.realm_id.as_bytes().to_vec()),
-        Value::from(url_bytes),
-    ));
-    let Ok(place_bytes) = postcard::to_allocvec(&accepted.documents.node_places) else {
-        warn!("The fetched node places could not be stored");
-        return false;
-    };
-    writes.push((
-        NODE_PLACE_KEYSPACE.to_string(),
-        Key::from(plan.realm_id.as_bytes().to_vec()),
-        Value::from(place_bytes),
-    ));
-    let Ok(name_bytes) = postcard::to_allocvec(&accepted.documents.node_names) else {
-        warn!("The fetched node display names could not be stored");
-        return false;
-    };
-    writes.push((
-        NODE_NAME_KEYSPACE.to_string(),
-        Key::from(plan.realm_id.as_bytes().to_vec()),
-        Value::from(name_bytes),
-    ));
-    if !write_batch(context, writes).await {
-        return false;
+
+    /// Compares the answer with what is stored, then writes what changed.
+    fn compare(&mut self) -> Installing {
+        let mut config = self.accepted.config.clone();
+        let installed = (self.stored.config.as_deref())
+            .and_then(|bytes| RealmConfigDocument::from_bytes(bytes).ok());
+        if let Some(installed) = installed {
+            keep_revocations(&mut config, &installed, unix_timestamp_secs());
+        }
+        let Ok(bytes) = config.to_bytes(&self.actor()) else {
+            warn!("A fetched realm configuration could not be stored");
+            return Ok(Next::Done(false));
+        };
+        let marker = RealmMarker {
+            clock: self.accepted.clock.clone(),
+            behind: self.behind,
+        };
+        let Ok(marker_bytes) = postcard::to_allocvec(&marker) else {
+            return Ok(Next::Done(false));
+        };
+        let documents = &self.accepted.documents;
+        let stored = &self.stored;
+        let unchanged = stored.config.as_deref() == Some(bytes.as_slice())
+            && stored.authorization.as_deref() == documents.realm_authorization.as_deref()
+            && stored.owner.as_deref() == documents.owner.as_deref()
+            && self.groups == documents.groups
+            && stored.urls == documents.management_urls
+            && stored.displays.names == documents.node_names
+            && stored.displays.places == documents.node_places;
+        let marker_row = marker_row(self.plan.realm_id, marker_bytes);
+        if unchanged {
+            // Nothing but the marker moves: writing the documents again would re-register
+            // every realm peer on every beat for a copy this device already holds.
+            if marker == self.plan.marker {
+                return Ok(Next::Done(true));
+            }
+            debug!("This device already holds the realm documents it fetched");
+            self.step = InstallStep::Marker;
+            return Ok(Next::Call(IoCall::child(WriteDocumentsOperation::new(
+                vec![marker_row],
+            ))));
+        }
+        let Some(writes) = self.document_writes(bytes, marker_row) else {
+            return Ok(Next::Done(false));
+        };
+        self.config = Some(config);
+        self.step = InstallStep::Documents;
+        Ok(Next::Call(IoCall::child(WriteDocumentsOperation::new(writes))))
     }
-    // The peer set and the node kinds this device enforces follow the copy it
-    // just installed, exactly as they follow a synced one on a realm node.
-    if let Some(net_handle) = context.net_handle.as_ref()
-        && let Err(error) = net_handle.refresh_document_peers(&config).await
-    {
-        warn!(error = %error, "Failed to apply the fetched realm configuration");
+
+    fn document_writes(
+        &self,
+        config: Vec<u8>,
+        marker: (KeySpace, Key, Value),
+    ) -> Option<Vec<(KeySpace, Key, Value)>> {
+        let documents = &self.accepted.documents;
+        let realm_id = self.plan.realm_id;
+        let actor = self.actor();
+        let mut writes = vec![marker, document_row(&self.realm(), config)];
+        if let Some(authorization) = &documents.realm_authorization {
+            writes.push(document_row(&self.authorization(), authorization.clone()));
+        }
+        if let Some(owner) = &documents.owner {
+            writes.push(document_row(&self.owner(), owner.clone()));
+        }
+        for group in &documents.groups {
+            let Some(group_writes) = group_doc_writes(group, &actor) else {
+                let group_id = group.group.group_id;
+                warn!(%group_id, "A fetched group could not be stored");
+                return None;
+            };
+            writes.extend(group_writes);
+        }
+        let mut encoded = |key_space: &str, bytes: Result<Vec<u8>, postcard::Error>, what: &str| {
+            match bytes {
+                Ok(bytes) => {
+                    let (space, key) = realm_row(key_space, realm_id);
+                    writes.push((space, key, Value::from(bytes)));
+                    true
+                }
+                Err(_) => {
+                    warn!(what, "Fetched realm documents could not be stored");
+                    false
+                }
+            }
+        };
+        let urls = postcard::to_allocvec(&documents.management_urls);
+        let places = postcard::to_allocvec(&documents.node_places);
+        let names = postcard::to_allocvec(&documents.node_names);
+        let all = encoded(MANAGEMENT_URL_KEYSPACE, urls, "management urls")
+            && encoded(NODE_PLACE_KEYSPACE, places, "node places")
+            && encoded(NODE_NAME_KEYSPACE, names, "node display names");
+        all.then_some(writes)
     }
-    debug!(owner = %plan.owner, "Installed the realm documents on this device");
-    true
+}
+
+impl Operation for InstallDocumentsOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Installing {
+        Ok(Next::Call(self.stored_read()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Installing {
+        match self.step {
+            InstallStep::Stored => {
+                self.keep_stored(result);
+                self.step = InstallStep::Groups;
+                Ok(Next::Call(IoCall::child(installed_group_docs())))
+            }
+            InstallStep::Groups => {
+                self.groups = result.child::<Vec<DeviceGroupDocuments>, IoError>()??;
+                self.step = InstallStep::NodeInfos;
+                let infos = self.accepted.documents.node_infos.clone();
+                Ok(Next::Call(IoCall::child(InstallInfoOperation::new(infos))))
+            }
+            InstallStep::NodeInfos => match result.child::<(), NodeInfoError>()? {
+                Ok(()) => self.compare(),
+                Err(error) => {
+                    warn!(%error, "Failed to install the fetched node info documents");
+                    Ok(Next::Done(false))
+                }
+            },
+            InstallStep::Marker => Ok(Next::Done(written(result)?)),
+            InstallStep::Documents => {
+                if !written(result)? {
+                    return Ok(Next::Done(false));
+                }
+                // The peer set and the node kinds this device enforces follow the copy it
+                // just installed, exactly as they follow a synced one on a realm node.
+                let config = self.config.take().ok_or(IoError::Unfinished)?;
+                let effect = NetEffect::RefreshDocumentPeers(Box::new(config));
+                self.step = InstallStep::Peers;
+                Ok(Next::Call(IoCall::from(Effect::Net(effect))))
+            }
+            InstallStep::Peers => {
+                match result.event()? {
+                    Event::Net(NetEvent::DocumentPeers(Err(error))) => {
+                        warn!(%error, "Failed to apply the fetched realm configuration");
+                    }
+                    Event::Net(NetEvent::DocumentPeers(Ok(()))) => {}
+                    other => {
+                        return Err(IoError::Unexpected {
+                            expected: "Event::Net(NetEvent::DocumentPeers)",
+                            got: other.label(),
+                        });
+                    }
+                }
+                let owner = self.plan.owner;
+                debug!(%owner, "Installed the realm documents on this device");
+                Ok(Next::Done(true))
+            }
+        }
+    }
+}
+
+/// Whether a child write of documents went through.
+fn written(result: IoResult) -> Result<bool, IoError> {
+    Ok(match result.child::<(), DocumentWriteError>()? {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Failed to install the fetched realm documents");
+            false
+        }
+    })
 }
 
 /// Carries the device's own revocations into the copy it is about to install.
@@ -598,47 +929,70 @@ fn keep_revocations(fetched: &mut RealmConfigDocument, installed: &RealmConfigDo
     }
 }
 
-/// The group documents this device holds, in the group-id order both the scan
-/// and a serving node's listing produce, so a fetched set compares directly.
-/// A group whose two rows disagree is treated as absent and reinstalled.
-async fn installed_group_docs(context: &Arc<DriverContext>) -> Vec<DeviceGroupDocuments> {
-    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: GROUP_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: GROUP_SCAN_LIMIT,
-            txn_id: None,
-        })
-        .await
-    else {
-        return Vec::new();
-    };
-    let mut documents = Vec::with_capacity(values.len());
-    for (_, value) in values {
-        let Ok(group) = Group::from_bytes(&value) else {
-            continue;
-        };
-        let read = read_bytes(
-            context,
-            DocumentTarget::GroupAuthorization {
-                group_id: group.group_id,
-            },
-        )
-        .await;
-        let Some(authorization) = read
-            .as_deref()
-            .and_then(|bytes| GroupAuthorizationDocument::from_bytes(bytes).ok())
-        else {
-            continue;
-        };
-        documents.push(DeviceGroupDocuments {
-            group,
-            authorization,
-        });
+/// The group documents this device holds, in the group-id order both the scan and a serving
+/// node's listing produce, so a fetched set compares directly. A group whose two rows disagree
+/// is treated as absent and reinstalled.
+#[derive(Debug, PartialEq)]
+pub struct InstalledGroupsOperation {
+    groups: Vec<Group>,
+    scanned: bool,
+}
+
+/// The read of the installed group documents; see [`InstalledGroupsOperation`].
+pub(crate) fn installed_group_docs() -> InstalledGroupsOperation {
+    InstalledGroupsOperation {
+        groups: Vec::new(),
+        scanned: false,
     }
-    documents
+}
+
+impl Operation for InstalledGroupsOperation {
+    type Output = Vec<DeviceGroupDocuments>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+        let page = IoCall::Page {
+            space: GROUP_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: GROUP_SCAN_LIMIT,
+        };
+        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
+        let answer = outside_answer(result);
+        if self.scanned {
+            let rows = answer.and_then(|read| read.values()).unwrap_or_default();
+            let groups = std::mem::take(&mut self.groups);
+            let documents = (groups.into_iter().zip(rows))
+                .filter_map(|(group, row)| {
+                    let authorization =
+                        GroupAuthorizationDocument::from_bytes(&row?).ok()?;
+                    Some(DeviceGroupDocuments {
+                        group,
+                        authorization,
+                    })
+                })
+                .collect();
+            return Ok(Next::Done(documents));
+        }
+        let Ok(IoResult::Page { rows, .. }) = answer else {
+            return Ok(Next::Done(Vec::new()));
+        };
+        self.groups = (rows.iter())
+            .filter_map(|(_, value)| Group::from_bytes(value).ok())
+            .collect();
+        self.scanned = true;
+        let reads = (self.groups.iter())
+            .map(|group| {
+                document_read(&DocumentTarget::GroupAuthorization {
+                    group_id: group.group_id,
+                })
+            })
+            .collect();
+        Ok(Next::Call(StagedCall::Outside(IoCall::Read(reads)).into_call()))
+    }
 }
 
 /// The two rows one group occupies, encoded as a realm node encodes them.
@@ -663,231 +1017,260 @@ fn group_doc_writes(
     ])
 }
 
-/// Writes one group's documents where every local read already looks for them,
-/// so a group the owner just created answers before the next fetch.
-pub async fn install_group_docs(
-    context: &Arc<DriverContext>,
+/// Why fetched documents were not written.
+#[derive(Clone, Debug, thiserror::Error, PartialEq)]
+#[error("{0}")]
+pub struct DocumentWriteError(String);
+
+impl From<IoError> for DocumentWriteError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+/// Writes document rows in one transaction; the rows of a group this device saw deleted stay
+/// out, so a deleted group never comes back from a cached copy.
+#[derive(Debug, PartialEq)]
+struct WriteDocumentsOperation {
+    writes: Vec<(KeySpace, Key, Value)>,
+    groups: Vec<(KeySpace, Key)>,
+    writing: bool,
+}
+
+impl WriteDocumentsOperation {
+    fn new(writes: Vec<(KeySpace, Key, Value)>) -> Self {
+        let groups = (writes.iter())
+            .filter(|(space, _, _)| space == GROUP_KEYSPACE)
+            .map(|(_, key, _)| (GROUP_DELETE_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        Self {
+            writes,
+            groups,
+            writing: false,
+        }
+    }
+
+    fn write(&mut self) -> Result<Next<()>, DocumentWriteError> {
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+    }
+}
+
+impl Operation for WriteDocumentsOperation {
+    type Output = ();
+    type Error = DocumentWriteError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, DocumentWriteError> {
+        match self.groups.is_empty() {
+            true => self.write(),
+            false => Ok(Next::Call(IoCall::Read(self.groups.clone()))),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, DocumentWriteError> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let mut closed = BTreeSet::new();
+        for ((_, key), row) in self.groups.iter().zip(result.values()?) {
+            let Some(row) = row else {
+                continue;
+            };
+            let record = GroupDeleteRecord::from_bytes(&row)
+                .map_err(|error| DocumentWriteError(error.to_string()))?;
+            if record.phase == GroupDeletePhase::Deleted {
+                closed.insert(key.clone());
+            }
+        }
+        self.writes.retain(|(space, key, _)| {
+            !matches!(space.as_str(), GROUP_KEYSPACE | AUTH_KEYSPACE) || !closed.contains(key)
+        });
+        self.write()
+    }
+}
+
+/// Writes one group's documents where every local read already looks for them, so a group the
+/// owner just created answers before the next fetch.
+#[derive(Debug, PartialEq)]
+pub struct InstallGroupOperation {
+    writes: Option<WriteDocumentsOperation>,
+}
+
+/// The install of one group's documents; see [`InstallGroupOperation`].
+pub fn install_group_docs(
     actor: &Actor,
     group: &Group,
     authorization: &GroupAuthorizationDocument,
-) -> bool {
+) -> InstallGroupOperation {
     let documents = DeviceGroupDocuments {
         group: group.clone(),
         authorization: authorization.clone(),
     };
-    let Some(writes) = group_doc_writes(&documents, actor) else {
-        return false;
-    };
-    write_batch(context, writes.to_vec()).await
-}
-
-async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
-    let install = InstallInfoOperation::new(documents.to_vec());
-    match drive(install, context.as_ref()).await {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(%error, "Failed to install the fetched node info documents");
-            false
-        }
+    let writes = group_doc_writes(&documents, actor);
+    InstallGroupOperation {
+        writes: writes.map(|writes| WriteDocumentsOperation::new(writes.to_vec())),
     }
 }
 
-/// The management api urls a realm node last served this device, in the order
-/// it served them. A device holds no peer node-info document, so relaying a
-/// management-only route has no other target.
-pub async fn installed_management_urls(
-    context: &Arc<DriverContext>,
+impl Operation for InstallGroupOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        match self.writes.take() {
+            Some(write) => Ok(Next::Call(IoCall::child(write))),
+            None => Ok(Next::Done(false)),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        Ok(Next::Done(written(result)?))
+    }
+}
+
+/// The management api urls a realm node last served this device, in the order it served them.
+/// A device holds no peer node-info document, so relaying a management-only route has no other
+/// target.
+#[derive(Debug, PartialEq)]
+pub struct ManagementUrlsOperation {
     realm_id: RealmId,
-) -> Vec<String> {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: MANAGEMENT_URL_KEYSPACE.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return Vec::new();
-    };
-    postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
-/// The node display names and map places a realm node last served this device; empty before
-/// the first copy.
-pub async fn installed_displays(context: &Arc<DriverContext>, realm_id: RealmId) -> NodeDisplays {
-    NodeDisplays {
-        names: installed_map(context, NODE_NAME_KEYSPACE, realm_id).await,
-        places: installed_map(context, NODE_PLACE_KEYSPACE, realm_id).await,
+/// The read of the installed management urls; see [`ManagementUrlsOperation`].
+pub fn installed_management_urls(realm_id: RealmId) -> ManagementUrlsOperation {
+    ManagementUrlsOperation { realm_id }
+}
+
+impl Operation for ManagementUrlsOperation {
+    type Output = Vec<String>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Vec<String>>, IoError> {
+        let key = realm_key(self.realm_id);
+        Ok(Next::Call(outside_read(MANAGEMENT_URL_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<String>>, IoError> {
+        Ok(Next::Done(decoded_or_default(outside_row(result).as_ref())))
     }
 }
 
-async fn installed_map<T: serde::de::DeserializeOwned>(
-    context: &Arc<DriverContext>,
-    key_space: &str,
+/// The node display names and map places a realm node last served this device; empty before the
+/// first copy.
+#[derive(Debug, PartialEq)]
+pub struct InstalledDisplaysOperation {
     realm_id: RealmId,
-) -> BTreeMap<NodeId, T> {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return BTreeMap::new();
-    };
-    postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
-/// What the copy this device holds was accepted at. An absent marker reads as
-/// nothing seen, which accepts the first copy and refuses nothing.
-async fn installed_marker(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmMarker {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_MARKER_KEYSPACE.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return RealmMarker::default();
-    };
-    postcard::from_bytes(&bytes).unwrap_or_default()
+/// The read of the installed node displays; see [`InstalledDisplaysOperation`].
+pub fn installed_displays(realm_id: RealmId) -> InstalledDisplaysOperation {
+    InstalledDisplaysOperation { realm_id }
 }
 
-async fn store_marker(context: &Arc<DriverContext>, realm_id: RealmId, marker: &RealmMarker) {
-    let Ok(bytes) = postcard::to_allocvec(marker) else {
-        return;
-    };
-    write_batch(
-        context,
-        vec![(
-            REALM_MARKER_KEYSPACE.to_string(),
-            Key::from(realm_id.as_bytes().to_vec()),
-            Value::from(bytes),
-        )],
-    )
-    .await;
-}
+impl Operation for InstalledDisplaysOperation {
+    type Output = NodeDisplays;
+    type Error = IoError;
 
-/// One stored document, or `None` when this device holds it not (yet).
-async fn read_bytes(context: &Arc<DriverContext>, target: DocumentTarget) -> Option<Vec<u8>> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.map(|bytes| bytes.as_ref().to_vec())
-        }
-        other => {
-            warn!(event = ?other, "Failed to read an installed realm document");
-            None
-        }
+    fn first(&mut self) -> Result<Next<NodeDisplays>, IoError> {
+        let reads = vec![
+            realm_row(NODE_NAME_KEYSPACE, self.realm_id),
+            realm_row(NODE_PLACE_KEYSPACE, self.realm_id),
+        ];
+        Ok(Next::Call(StagedCall::Outside(IoCall::Read(reads)).into_call()))
     }
-}
 
-async fn write_batch(context: &Arc<DriverContext>, mut writes: Vec<(String, Key, Value)>) -> bool {
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_DELETE_KEYSPACE};
-    use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
-    let groups: Vec<_> = writes
-        .iter()
-        .filter(|(space, _, _)| space == GROUP_KEYSPACE)
-        .map(|(_, key, _)| (GROUP_DELETE_KEYSPACE.to_string(), key.clone()))
-        .collect();
-    let txn_id = if groups.is_empty() {
-        None
-    } else {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        else {
-            return false;
-        };
-        let read = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchRead {
-                reads: groups,
-                txn_id: Some(txn_id),
-            })
-            .await;
-        let closed = match read {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values
-                .into_iter()
-                .try_fold(BTreeSet::new(), |mut closed, (key, value)| {
-                    if let Some(value) = value {
-                        let record = GroupDeleteRecord::from_bytes(&value)?;
-                        if record.phase == GroupDeletePhase::Deleted {
-                            closed.insert(key);
-                        }
-                    }
-                    Ok::<_, aruna_core::errors::ConversionError>(closed)
-                })
-                .ok(),
-            _ => None,
-        };
-        let Some(closed) = closed else {
-            let _ = context
-                .storage_handle
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return false;
-        };
-        writes.retain(|(space, key, _)| {
-            !matches!(space.as_str(), GROUP_KEYSPACE | AUTH_KEYSPACE) || !closed.contains(key)
-        });
-        Some(txn_id)
-    };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
-        .await;
-    if matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
-        if let Some(txn_id) = txn_id {
-            let committed = context
-                .storage_handle
-                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-                .await;
-            if !matches!(
-                committed,
-                Event::Storage(StorageEvent::TransactionCommitted { .. })
-            ) {
-                let _ = context
-                    .storage_handle
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return false;
-            }
-        }
-        return true;
+    fn next(&mut self, result: IoResult) -> Result<Next<NodeDisplays>, IoError> {
+        let rows = (outside_answer(result).and_then(|read| read.values())).unwrap_or_default();
+        let row = |index: usize| rows.get(index).cloned().flatten();
+        Ok(Next::Done(NodeDisplays {
+            names: decoded_or_default(row(0).as_ref()),
+            places: decoded_or_default(row(1).as_ref()),
+        }))
     }
-    if let Some(txn_id) = txn_id {
-        let _ = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-    }
-    warn!(event = ?event, "Failed to install the fetched realm documents");
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
+    use std::sync::Arc;
+
+    async fn note_membership(
+        context: &Arc<DriverContext>,
+        realm_id: RealmId,
+        refused: bool,
+        installed: bool,
+    ) {
+        let note = NoteMembershipOperation::new(realm_id, refused, installed);
+        drive(note, context).await.unwrap();
+    }
+
+    async fn realm_removed(context: &Arc<DriverContext>, realm_id: RealmId) -> bool {
+        drive(super::realm_removed(realm_id), context).await.unwrap()
+    }
+
+    async fn install_documents(
+        context: &Arc<DriverContext>,
+        plan: &FetchPlan,
+        accepted: Accepted,
+        behind: u32,
+    ) -> bool {
+        let install = InstallDocumentsOperation::new(plan.clone(), accepted, behind);
+        drive(install, context).await.unwrap()
+    }
+
+    async fn stored(context: &Arc<DriverContext>, key_space: &str, key: Key) -> Option<Value> {
+        let read = aruna_core::effects::StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value, .. }) => value,
+            _ => None,
+        }
+    }
+
+    async fn installed_marker(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmMarker {
+        let key = Key::from(realm_key(realm_id));
+        marker_of(stored(context, REALM_MARKER_KEYSPACE, key).await)
+    }
+
+    async fn read_bytes(context: &Arc<DriverContext>, target: DocumentTarget) -> Option<Vec<u8>> {
+        let row = stored(context, target.storage_keyspace(), target.storage_key()).await;
+        row.map(|bytes| bytes.as_ref().to_vec())
+    }
+
+    async fn write_batch(
+        context: &Arc<DriverContext>,
+        writes: Vec<(String, Key, Value)>,
+    ) -> bool {
+        drive(WriteDocumentsOperation::new(writes), context).await.is_ok()
+    }
+
+    async fn installed_displays(context: &Arc<DriverContext>, realm_id: RealmId) -> NodeDisplays {
+        drive(super::installed_displays(realm_id), context).await.unwrap()
+    }
+
+    async fn installed_group_docs(context: &Arc<DriverContext>) -> Vec<DeviceGroupDocuments> {
+        drive(super::installed_group_docs(), context).await.unwrap()
+    }
+
+    async fn install_group_docs(
+        context: &Arc<DriverContext>,
+        actor: &Actor,
+        group: &Group,
+        authorization: &GroupAuthorizationDocument,
+    ) -> bool {
+        let install = super::install_group_docs(actor, group, authorization);
+        drive(install, context).await.unwrap()
+    }
+
     use aruna_core::structs::identity::realm::{RealmNodeKind, TokenRevocation};
     use ulid::Ulid;
 

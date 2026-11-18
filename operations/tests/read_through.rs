@@ -57,7 +57,7 @@ async fn keeps_owner_reads() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/field-notes";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -94,7 +94,7 @@ async fn keeps_owner_exports() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/exported";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -134,7 +134,7 @@ async fn keeps_selected_document() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/selected";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -164,7 +164,7 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/replaced";
     let origin = realm.leading_node(group_id, path);
     let document_id =

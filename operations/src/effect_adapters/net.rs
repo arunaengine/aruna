@@ -131,6 +131,15 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             reconcile_topics(context, topics).await,
         ));
     }
+    if let NetEffect::RefreshDocumentPeers(config) = effect {
+        let refreshed = match &context.net_handle {
+            Some(net_handle) => (net_handle.refresh_document_peers(&config).await)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err(UNAVAILABLE.to_string()),
+        };
+        return Event::Net(NetEvent::DocumentPeers(refreshed));
+    }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
     } else {

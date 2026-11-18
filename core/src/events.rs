@@ -504,6 +504,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// Whether the peer set follows the configuration, or why it does not.
+    DocumentPeers(Result<(), String>),
     /// The signed read grant, or `None` when this node cannot sign it.
     GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
@@ -942,6 +944,7 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    DocumentPeers,
                     DatasetSummary,
                     WritePeerAuth,
                     GrantSign,
