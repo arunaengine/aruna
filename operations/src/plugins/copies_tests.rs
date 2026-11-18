@@ -11,6 +11,7 @@ use crate::plugins::artifacts::ArtifactError;
 use crate::plugins::calls::*;
 use crate::plugins::copy_rows::tests::stale_progress;
 use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
+use crate::plugins::rows::{Scan, scan_rows};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -20,7 +21,6 @@ use aruna_core::plugins::{ArtifactBytes, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use aruna_storage::{FjallStorage, StorageHandle};
-use futures_util::TryStreamExt;
 use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
@@ -138,10 +138,8 @@ async fn local(ctx: &DriverContext, digest: &str) -> Option<Vec<u8>> {
 }
 
 async fn rows(ctx: &DriverContext) -> usize {
-    let pages =
-        crate::storage_read::scan_pages(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None);
-    let pages: Vec<_> = pages.try_collect().await.unwrap();
-    pages.iter().map(Vec::len).sum()
+    let scan = Scan::new(PLUGIN_ARTIFACT_KEYSPACE, Vec::new());
+    drive(scan_rows(scan), ctx).await.unwrap().len()
 }
 
 fn after_grace(time: u64) -> u64 {
