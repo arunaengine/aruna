@@ -2,186 +2,271 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BROKEN_VERSION_KEYSPACE, CHECK_QUEUE_KEYSPACE, STORAGE_CHECK_KEYSPACE,
 };
-use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, CurrentVersionPointer, VersionKey, object_permission_path,
+};
 use aruna_core::structs::storage::broken::{BrokenVersion, StorageCheck};
-use aruna_core::types::Key;
+use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::{NodeId, UserId};
 
-use super::check::{CheckOutcome, CheckVersionOperation};
+use super::check::{CheckOutcome, CheckVersionError, CheckVersionOperation};
 use super::drain::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};
-use crate::driver::DriverContext;
+use super::shared::MigrationError;
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::s3::object::delete::{
+    DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
+};
 
-/// Advances the unfinished checks at the head of the queue by one page each. Returns when
-/// the task must run again.
-pub async fn process_checks(context: &DriverContext) -> Result<Option<Duration>, String> {
-    let (rows, more) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        CHECK_QUEUE_KEYSPACE,
-        None,
-        None,
-        BUCKET_PAGE,
-        None,
-    )
-    .await?;
-    let mut next = more.map(|_| MIGRATION_CONTINUE);
-    for (key, _) in rows {
-        let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-        let Some(record) = read_check(context, &bucket).await? else {
-            continue;
-        };
-        if record.finished_at_ms.is_none() && check_page(context, &bucket, record).await? {
-            next = Some(MIGRATION_CONTINUE);
+type Turn<T> = Result<Next<T>, MigrationError>;
+
+fn empty_prefix() -> Key {
+    Key::from(Vec::new())
+}
+
+fn decode_check(value: Option<Value>) -> Result<Option<StorageCheck>, MigrationError> {
+    Ok(value
+        .map(|value| StorageCheck::from_bytes(value.as_ref()))
+        .transpose()?)
+}
+
+#[derive(Debug, PartialEq)]
+enum ChecksStep {
+    Queue,
+    Record(String),
+    Page,
+}
+
+/// Advances the unfinished checks at the head of the queue by one page each. Outputs when the
+/// task must run again.
+#[derive(Debug, PartialEq)]
+pub struct ProcessChecksOperation {
+    step: ChecksStep,
+    buckets: VecDeque<Key>,
+    next: Option<Duration>,
+}
+
+impl ProcessChecksOperation {
+    pub fn new() -> Self {
+        Self {
+            step: ChecksStep::Queue,
+            buckets: VecDeque::new(),
+            next: None,
         }
     }
-    Ok(next)
-}
 
-pub async fn read_check(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<StorageCheck>, String> {
-    let read = StorageEffect::Read {
-        key_space: STORAGE_CHECK_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| StorageCheck::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read check progress: {}", other.label())),
+    fn next_bucket(&mut self) -> Turn<Option<Duration>> {
+        let Some(key) = self.buckets.pop_front() else {
+            return Ok(Next::Done(self.next));
+        };
+        let bucket = String::from_utf8(key.to_vec()).map_err(MigrationError::failed)?;
+        let read = read_row(STORAGE_CHECK_KEYSPACE, bucket.as_bytes().to_vec());
+        self.step = ChecksStep::Record(bucket);
+        Ok(Next::Call(read))
     }
 }
 
-/// Checks one page of current versions and stores the progress. Returns whether more remain.
-async fn check_page(
-    context: &DriverContext,
-    bucket: &str,
-    mut record: StorageCheck,
-) -> Result<bool, String> {
-    let prefix = BlobHeadKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (heads, next) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        BLOB_HEAD_KEYSPACE,
-        Some(prefix.into()),
-        record.cursor.clone().map(Into::into),
-        MIGRATION_PAGE,
-        None,
-    )
-    .await?;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
-    for (key, value) in &heads {
-        record.cursor = Some(key.to_vec());
-        let head = BlobHeadKey::from_bytes(key.as_ref()).map_err(|error| error.to_string())?;
-        let pointer = CurrentVersionPointer::from_bytes(value.as_ref());
-        let pointer = pointer.map_err(|error| error.to_string())?;
-        let version_key = VersionKey::new(head.bucket, head.key, pointer.version_id);
-        let operation = CheckVersionOperation::new(version_key, now_ms);
-        match crate::driver::drive(operation, context).await {
-            Ok(CheckOutcome::Broken(_)) => record.broken += 1,
-            Ok(_) => {}
-            Err(error) => {
-                record.failed += 1;
-                tracing::warn!(bucket, %error, "Failed to check a version");
+impl Default for ProcessChecksOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Operation for ProcessChecksOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        Ok(Next::Call(IoCall::Page {
+            space: CHECK_QUEUE_KEYSPACE.to_string(),
+            prefix: empty_prefix(),
+            after: None,
+            limit: BUCKET_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match std::mem::replace(&mut self.step, ChecksStep::Page) {
+            ChecksStep::Queue => {
+                let (rows, more) = result.page()?;
+                self.next = more.map(|_| MIGRATION_CONTINUE);
+                self.buckets = rows.into_iter().map(|(key, _)| key).collect();
+                self.next_bucket()
+            }
+            ChecksStep::Record(bucket) => match decode_check(result.value()?)? {
+                Some(record) if record.finished_at_ms.is_none() => {
+                    let page = CheckPageOperation::new(bucket, record);
+                    Ok(Next::Call(IoCall::child(page)))
+                }
+                _ => self.next_bucket(),
+            },
+            ChecksStep::Page => {
+                if result.child::<bool, MigrationError>()?? {
+                    self.next = Some(MIGRATION_CONTINUE);
+                }
+                self.next_bucket()
             }
         }
-        record.checked += 1;
     }
-    if next.is_none() {
-        record.finished_at_ms = Some(now_ms);
+}
+
+/// Reads the progress of the check of `bucket`.
+#[derive(Debug, PartialEq)]
+pub struct ReadCheckOperation {
+    bucket: String,
+}
+
+impl ReadCheckOperation {
+    pub fn new(bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+        }
     }
-    store_check(context, bucket, &record).await?;
-    Ok(next.is_some())
+}
+
+impl Operation for ReadCheckOperation {
+    type Output = Option<StorageCheck>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Option<StorageCheck>> {
+        let key = self.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(STORAGE_CHECK_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<StorageCheck>> {
+        Ok(Next::Done(decode_check(result.value()?)?))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PageStep {
+    Heads,
+    Version,
+    Store,
+}
+
+/// Checks one page of current versions and stores the progress. Outputs whether more remain.
+#[derive(Debug, PartialEq)]
+struct CheckPageOperation {
+    bucket: String,
+    record: StorageCheck,
+    now_ms: u64,
+    step: PageStep,
+    heads: VecDeque<(Key, Value)>,
+    more: bool,
+}
+
+impl CheckPageOperation {
+    fn new(bucket: String, record: StorageCheck) -> Self {
+        Self {
+            bucket,
+            record,
+            now_ms: 0,
+            step: PageStep::Heads,
+            heads: VecDeque::new(),
+            more: false,
+        }
+    }
+
+    fn next_head(&mut self) -> Turn<bool> {
+        let Some((key, value)) = self.heads.pop_front() else {
+            if !self.more {
+                self.record.finished_at_ms = Some(self.now_ms);
+            }
+            let store = StoreCheckOperation::new(&self.bucket, self.record.clone());
+            self.step = PageStep::Store;
+            return Ok(Next::Call(IoCall::child(store)));
+        };
+        self.record.cursor = Some(key.to_vec());
+        let head = BlobHeadKey::from_bytes(key.as_ref())?;
+        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+        let version = VersionKey::new(head.bucket, head.key, pointer.version_id);
+        self.step = PageStep::Version;
+        let check = CheckVersionOperation::new(version, self.now_ms);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+}
+
+impl Operation for CheckPageOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<bool> {
+        let prefix = BlobHeadKey::bucket_prefix(&self.bucket)?.into();
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix,
+            after: self.record.cursor.clone().map(Into::into),
+            limit: MIGRATION_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match self.step {
+            PageStep::Heads => {
+                let (heads, next) = result.page()?;
+                self.heads = heads.into();
+                self.more = next.is_some();
+                self.next_head()
+            }
+            PageStep::Version => {
+                match result.child::<CheckOutcome, CheckVersionError>()? {
+                    Ok(CheckOutcome::Broken(_)) => self.record.broken += 1,
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.record.failed += 1;
+                        tracing::warn!(bucket = %self.bucket, %error, "Failed to check a version");
+                    }
+                }
+                self.record.checked += 1;
+                self.next_head()
+            }
+            PageStep::Store => {
+                result.child::<(), MigrationError>()??;
+                Ok(Next::Done(self.more))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum StoreStep {
+    Current,
+    Written,
+    Left,
 }
 
 /// Stores the progress unless a newer check replaced it; a finished check leaves the queue.
-async fn store_check(
-    context: &DriverContext,
-    bucket: &str,
-    record: &StorageCheck,
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => {
-            return Err(format!(
-                "could not start a progress transaction: {}",
-                other.label()
-            ));
+#[derive(Debug, PartialEq)]
+struct StoreCheckOperation {
+    key: Key,
+    record: StorageCheck,
+    step: StoreStep,
+}
+
+impl StoreCheckOperation {
+    fn new(bucket: &str, record: StorageCheck) -> Self {
+        Self {
+            key: bucket.as_bytes().to_vec().into(),
+            record,
+            step: StoreStep::Current,
         }
-    };
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let read = StorageEffect::Read {
-        key_space: STORAGE_CHECK_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: Some(txn_id),
-    };
-    let current = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| StorageCheck::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read check progress: {}", other.label())),
-    };
-    let same = matches!(&current, Ok(Some(stored)) if stored.started_at_ms == record.started_at_ms);
-    let mut writes = Vec::new();
-    if same {
-        let value = record.to_bytes().map_err(|error| error.to_string())?;
-        writes.push((
-            STORAGE_CHECK_KEYSPACE.to_string(),
-            key.clone(),
-            value.into(),
-        ));
-    }
-    let batch = StorageEffect::BatchWrite {
-        writes,
-        txn_id: Some(txn_id),
-    };
-    let written = match (current, storage.send_storage_effect(batch).await) {
-        (Err(error), _) => Err(error),
-        (_, Event::Storage(StorageEvent::BatchWriteResult { .. })) => Ok(()),
-        (_, other) => Err(format!("could not write check progress: {}", other.label())),
-    };
-    let finished = written.is_ok() && same && record.finished_at_ms.is_some();
-    let left = match finished {
-        true => {
-            let delete = StorageEffect::Delete {
-                key_space: CHECK_QUEUE_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            };
-            match storage.send_storage_effect(delete).await {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-                other => Err(format!(
-                    "could not leave the check queue: {}",
-                    other.label()
-                )),
-            }
-        }
-        false => written,
-    };
-    if let Err(error) = left {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Err(error);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(format!("check progress was not stored: {}", other.label())),
     }
 }
 
