@@ -71,11 +71,11 @@ pub(super) fn keep_status(
 /// Bytes the summary of a dataset may have; only its root entity is read.
 const SUMMARY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The JSON-LD summary of a dataset, read from its holders with the caller's own access.
-pub(crate) async fn dataset_summary(
-    context: &DriverContext,
+/// The routed export that reads the JSON-LD summary of a dataset with the caller's own access.
+pub(crate) fn summary_export(
+    local_node: Option<NodeId>,
     request: DatasetSummaryRequest,
-) -> Result<String, DescriptionError> {
+) -> RoutedExportOperation {
     let export = ExportMetadataRequest {
         document_id: request.dataset,
         auth: request.auth,
@@ -84,10 +84,15 @@ pub(crate) async fn dataset_summary(
         offset: None,
         after: None,
     };
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let (realm_id, token) = (request.realm_id, request.token);
-    let routed = RoutedExportOperation::new(local_node, realm_id, export, token, SUMMARY_BYTES);
-    match drive(routed, context).await {
+    RoutedExportOperation::new(local_node, realm_id, export, token, SUMMARY_BYTES)
+}
+
+/// The summary a [`summary_export`] answered, or why the dataset has none for this caller.
+pub(crate) fn summary_answer(
+    export: Result<ExportMetadataResult, MetadataApiError>,
+) -> Result<String, DescriptionError> {
+    match export {
         Ok(ExportMetadataResult::Summary { jsonld, .. }) => Ok(jsonld),
         Err(
             MetadataApiError::NotFound

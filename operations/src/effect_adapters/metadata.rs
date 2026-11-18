@@ -21,7 +21,7 @@ use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::read::dataset_summary;
+use crate::metadata::forward::read::{summary_answer, summary_export};
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed_write::RouteDeleteOperation;
 use crate::metadata::forward::write::route_metadata_update;
@@ -49,7 +49,9 @@ pub(super) fn dispatch_summary(
     context: &DriverContext,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + '_>> {
     Box::pin(async move {
-        let answer = dataset_summary(context, request).await;
+        let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+        let export = crate::driver::drive(summary_export(local_node, request), context).await;
+        let answer = summary_answer(export);
         Event::Net(NetEvent::DatasetSummary(answer))
     })
 }
