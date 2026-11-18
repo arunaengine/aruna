@@ -692,97 +692,203 @@ impl Operation for WalkMemberOperation {
         self.now_ms = now_ms;
     }
 
-    /// Signs a statement about the walks for `member_id` and hands it to the publisher.
-    async fn hand(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        statement: Statement,
-        member_id: Ulid,
-    ) -> Result<Outcome, String> {
+    fn first(&mut self) -> Turn<Walked> {
+        if self.ranges.is_empty() {
+            return Ok(Next::Done((Outcome::Settled, self.budget)));
+        }
+        let first = turn(self.turns(), None) % self.ranges.len();
+        self.order = (first..self.ranges.len()).chain(0..first).collect();
+        self.next_range()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Walked> {
+        match self.step {
+            MemberStep::Cursor => {
+                let intent = self.target.intent;
+                let own = cursor_answer(result)?.filter(|cursor| cursor.intent == intent);
+                if own.is_some() {
+                    return self.cursor_known(own);
+                }
+                let range = self.ranges[self.current].clone();
+                let seed = SeedChildOperation::new(self.scope.clone(), &self.target, range);
+                self.step = MemberStep::Seed;
+                Ok(Next::Call(IoCall::child(seed)))
+            }
+            MemberStep::Seed => {
+                let cursor = result.child::<Option<BootstrapCursor>, BlobQueueError>()??;
+                self.cursor_known(cursor)
+            }
+            MemberStep::Page => match page_answer(result)? {
+                PageProgress::Done { watermark } => {
+                    self.watermark = self.watermark.min(watermark);
+                    self.next_range()
+                }
+                PageProgress::Waiting | PageProgress::Queued(_) => {
+                    self.blocked = true;
+                    self.next_range()
+                }
+            },
+            MemberStep::Hand => {
+                let outcome = result.child::<Outcome, BlobQueueError>()??;
+                Ok(Next::Done((outcome, self.budget)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SeedStep {
+    Own,
+    Ancestor(Ulid),
+    Stored(Box<BootstrapCursor>),
+}
+
+/// A split child of a walked range continues from its ancestor's cursor instead of walking
+/// again from the start; the derived cursor is stored for the page that follows. Only a child
+/// without a cursor of its own is seeded, so an ancestor never resets its progress.
+#[derive(Debug, PartialEq)]
+struct SeedChildOperation {
+    scope: Arc<WalkScope>,
+    member_id: Ulid,
+    intent: [u8; 32],
+    range: KeyRange,
+    /// Ancestors still to look at; a lineage never exceeds the retired ranges.
+    left: usize,
+    step: SeedStep,
+}
+
+impl SeedChildOperation {
+    fn new(scope: Arc<WalkScope>, target: &DistributionMember, range: KeyRange) -> Self {
+        let left = scope.snapshot.retired.len() + 1;
+        Self {
+            scope,
+            member_id: target.member_id,
+            intent: target.intent,
+            range,
+            left,
+            step: SeedStep::Own,
+        }
+    }
+
+    fn key(&self, range_id: Ulid) -> Vec<u8> {
+        bootstrap_key(self.scope.walk.set_id, self.member_id, range_id)
+    }
+
+    fn read_ancestor(&mut self, ancestor: Option<Ulid>) -> Turn<Option<BootstrapCursor>> {
+        let (Some(id), true) = (ancestor, self.left > 0) else {
+            return Ok(Next::Done(None));
+        };
+        self.left -= 1;
+        self.step = SeedStep::Ancestor(id);
+        Ok(Next::Call(read_cursor(self.key(id))))
+    }
+
+    fn ancestor_read(
+        &mut self,
+        id: Ulid,
+        cursor: Option<BootstrapCursor>,
+    ) -> Turn<Option<BootstrapCursor>> {
+        let Some(parent) = cursor.filter(|cursor| cursor.intent == self.intent) else {
+            let retired = self.scope.snapshot.retired_range(id);
+            let ancestor = retired.and_then(|retired| retired.lineage);
+            return self.read_ancestor(ancestor);
+        };
+        let child = parent.for_child(self.scope.walk.set_id, &self.range);
+        let row = (
+            BOOTSTRAP_KEYSPACE.to_string(),
+            self.key(self.range.range_id).into(),
+            child.to_bytes()?.into(),
+        );
+        self.step = SeedStep::Stored(Box::new(child));
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+impl Operation for SeedChildOperation {
+    type Output = Option<BootstrapCursor>;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Option<BootstrapCursor>> {
+        Ok(Next::Call(read_cursor(self.key(self.range.range_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<BootstrapCursor>> {
+        match std::mem::replace(&mut self.step, SeedStep::Own) {
+            SeedStep::Own => {
+                // A cursor of a former intent starts over in the page, never from an ancestor.
+                if cursor_answer(result)?.is_some() {
+                    return Ok(Next::Done(None));
+                }
+                self.read_ancestor(self.range.lineage)
+            }
+            SeedStep::Ancestor(id) => {
+                let cursor = cursor_answer(result)?;
+                self.ancestor_read(id, cursor)
+            }
+            SeedStep::Stored(child) => {
+                result.done()?;
+                Ok(Next::Done(Some(*child)))
+            }
+        }
+    }
+}
+
+/// Signs a statement about the walks for a member and hands it to the publisher.
+#[derive(Debug, PartialEq)]
+struct HandStatementOperation {
+    scope: Arc<WalkScope>,
+    statement: Option<Statement>,
+    member_id: Ulid,
+    submitted: bool,
+}
+
+impl HandStatementOperation {
+    fn new(scope: Arc<WalkScope>, statement: Statement, member_id: Ulid) -> Self {
+        Self {
+            scope,
+            statement: Some(statement),
+            member_id,
+            submitted: false,
+        }
+    }
+}
+
+impl Operation for HandStatementOperation {
+    type Output = Outcome;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Outcome> {
+        let statement = self.statement.take().ok_or(IoError::Unfinished)?;
         let claim = StatementClaim {
-            signer: self.local,
+            signer: self.scope.walk.local,
             statement,
         };
-        let signed = match context.net_handle.as_ref().map_or_else(
-            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
-            |net| net.sign_statement(claim),
-        ) {
-            StatementSignEvent::Signed(signed) => *signed,
-            StatementSignEvent::Unavailable(reason) => return Err(reason),
+        let sign = Effect::Net(NetEffect::StatementSign(Box::new(claim)));
+        Ok(Next::Call(sign.into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Outcome> {
+        if self.submitted {
+            return Ok(Next::Done(match result.child::<(), PublishRefusal>()? {
+                Ok(()) => Outcome::Stated,
+                Err(refusal) => {
+                    let (set_id, member_id) = (self.scope.walk.set_id, self.member_id);
+                    debug!(%set_id, %member_id, %refusal, "Bootstrap statement not taken yet");
+                    Outcome::Waiting
+                }
+            }));
+        }
+        let signed = match result.event()? {
+            Event::Net(NetEvent::StatementSign(StatementSignEvent::Signed(signed))) => *signed,
+            Event::Net(NetEvent::StatementSign(StatementSignEvent::Unavailable(reason))) => {
+                return Err(BlobQueueError::UnexpectedEvent(reason));
+            }
+            other => return Err(failed(other.label())),
         };
-        let publisher = snapshot.root.publisher;
-        let submit = SubmitOperation::new(context.node_and_realm(), publisher, signed);
-        match drive(submit, context).await {
-            Ok(()) => Ok(Outcome::Stated),
-            Err(refusal) => {
-                debug!(set_id = %self.set_id, %member_id, %refusal, "Bootstrap statement not taken yet");
-                Ok(Outcome::Waiting)
-            }
-        }
-    }
-
-    /// A split child of a walked range continues from its ancestor's cursor instead of walking
-    /// again from the start; the derived cursor is stored for the page that follows. Only a
-    /// child without a cursor of its own is seeded, so an ancestor never resets its progress.
-    async fn seed_child(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        target: &DistributionMember,
-        range: &KeyRange,
-    ) -> Result<Option<BootstrapCursor>, String> {
-        let own = bootstrap_key(self.set_id, target.member_id, range.range_id);
-        if read_cursor(context, own.clone()).await?.is_some() {
-            // A cursor of a former intent starts over in the page, never from an ancestor.
-            return Ok(None);
-        }
-        let mut ancestor = range.lineage;
-        for _ in 0..=snapshot.retired.len() {
-            let Some(id) = ancestor else {
-                return Ok(None);
-            };
-            let key = bootstrap_key(self.set_id, target.member_id, id);
-            let parent = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
-            if let Some(parent) = parent {
-                let child = parent.for_child(self.set_id, range);
-                let bytes = child.to_bytes().map_err(|error| error.to_string())?;
-                let write = StorageEffect::Write {
-                    key_space: BOOTSTRAP_KEYSPACE.to_string(),
-                    key: own.into(),
-                    value: bytes.into(),
-                    txn_id: None,
-                };
-                return match context.storage_handle.send_storage_effect(write).await {
-                    Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Some(child)),
-                    other => Err(format!("a child cursor was not stored: {}", other.label())),
-                };
-            }
-            ancestor = snapshot
-                .retired_range(id)
-                .and_then(|retired| retired.lineage);
-        }
-        Ok(None)
-    }
-
-    /// Deletes the cursors of members that are no longer walked, such as a member that left,
-    /// in one bounded batch per drain.
-    async fn clear_departed(&self, context: &DriverContext, walked: &[Ulid]) -> Result<(), String> {
-        let clear = ClearCursorsOperation::new(self.set_id, Some(walked.to_vec()), CLEAR_BATCH);
-        let cleared = drive(clear, context).await;
-        cleared.map(|_| ()).map_err(|error| error.to_string())
-    }
-
-    /// Deletes the set's cursors in bounded batches; settled once none is left.
-    async fn clear(&self, context: &DriverContext) -> Result<Outcome, String> {
-        let clear = ClearCursorsOperation::new(self.set_id, None, CLEAR_BATCH);
-        let all_read = drive(clear, context)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(match all_read {
-            true => Outcome::Settled,
-            false => Outcome::Waiting,
-        })
+        self.submitted = true;
+        let publisher = self.scope.snapshot.root.publisher;
+        let submit = SubmitOperation::new(self.scope.serving, publisher, signed);
+        Ok(Next::Call(IoCall::child(submit)))
     }
 }
 
@@ -790,6 +896,8 @@ impl Operation for WalkMemberOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::StorageEffect;
 
     /// Member 1 coordinates both shards; member 2 keeps a copy of each and catches up.
     fn catching_up() -> DistributionSnapshot {
@@ -811,6 +919,38 @@ mod tests {
         }
     }
 
+    fn scope(snapshot: &DistributionSnapshot, local: Ulid) -> Arc<WalkScope> {
+        let walk = walker(snapshot);
+        Arc::new(WalkScope {
+            walk,
+            serving: Some((walk.local, walk.realm_id)),
+            snapshot: snapshot.clone(),
+            local: snapshot.member(local).unwrap().clone(),
+        })
+    }
+
+    async fn seed_child(
+        context: &DriverContext,
+        scope: &Arc<WalkScope>,
+        target: &DistributionMember,
+        range: &KeyRange,
+    ) -> Result<Option<BootstrapCursor>, BlobQueueError> {
+        let seed = SeedChildOperation::new(scope.clone(), target, range.clone());
+        drive(seed, context).await
+    }
+
+    #[test]
+    fn no_network_no_bootstrap() {
+        let mut process = ProcessBootstrapOperation::new(None);
+        assert_eq!(process.first(), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn outcomes_combine() {
+        assert_eq!(Outcome::Settled.and(Outcome::Stated), Outcome::Stated);
+        assert_eq!(Outcome::Stated.and(Outcome::Waiting), Outcome::Waiting);
+    }
+
     #[tokio::test]
     async fn ranges_take_turns() {
         // A drain whose budget ends before a range starts the next drain at that range.
@@ -819,16 +959,14 @@ mod tests {
         let context = context(&handle);
         let snapshot = catching_up();
         let walk = walker(&snapshot);
-        let local = snapshot.member(member(1)).unwrap();
+        let scope = scope(&snapshot, member(1));
         let target = snapshot.member(member(2)).unwrap();
         let second = &snapshot.config.ranges[1];
         let key = bootstrap_key(walk.set_id, target.member_id, second.range_id);
         for _ in 0..2 {
-            let mut budget = 1;
-            let outcome = walk
-                .walk(&context, &snapshot, local, target, &mut budget)
-                .await;
-            assert_eq!(outcome.unwrap(), Outcome::Waiting);
+            let run = WalkMemberOperation::new(scope.clone(), target.clone(), 1);
+            let (outcome, _) = drive(run, &context).await.unwrap();
+            assert_eq!(outcome, Outcome::Waiting);
         }
         assert!(
             get(&handle, BOOTSTRAP_KEYSPACE, key).await.is_some(),
@@ -844,6 +982,7 @@ mod tests {
         let context = context(&handle);
         let snapshot = catching_up();
         let walk = walker(&snapshot);
+        let scope = scope(&snapshot, member(1));
         let target = snapshot.member(member(2)).unwrap();
         let parent = snapshot.config.ranges[0].clone();
         let child = KeyRange {
@@ -863,12 +1002,12 @@ mod tests {
             async move { handle.send_storage_effect(write).await }
         };
         store(parent.range_id, BootstrapCursor::start(target.intent, 3)).await;
-        let seeded = walk.seed_child(&context, &snapshot, target, &child).await;
+        let seeded = seed_child(&context, &scope, target, &child).await;
         assert_eq!(seeded.unwrap().map(|c| c.watermark), Some(3));
         let mut progressed = BootstrapCursor::start(target.intent, 3);
         progressed.done = true;
         store(child.range_id, progressed.clone()).await;
-        let again = walk.seed_child(&context, &snapshot, target, &child).await;
+        let again = seed_child(&context, &scope, target, &child).await;
         assert_eq!(again.unwrap(), None);
         let key = bootstrap_key(walk.set_id, target.member_id, child.range_id);
         let kept = get(&handle, BOOTSTRAP_KEYSPACE, key).await.unwrap();
