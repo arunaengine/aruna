@@ -195,3 +195,153 @@ impl Operation for ReadAccessOperation {
         }))
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::auth::enforcement::{policy_reads, read_policies};
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmConfigDocument;
+    use aruna_core::types::Value;
+    use ulid::Ulid;
+
+    pub(crate) fn realm() -> RealmId {
+        RealmId::from_bytes([1; 32])
+    }
+
+    /// The policy rows of one group scope as `policy_reads` names them.
+    fn policy_rows(group_id: GroupId) -> Vec<Option<Value>> {
+        let owner = UserId::nil(realm());
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            user_id: owner,
+            realm_id: realm(),
+        };
+        let config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        let auth = GroupAuthorizationDocument::default_group_doc(owner, realm(), group_id);
+        let group = Group {
+            display_name: "policy-fixture".to_string(),
+            group_id,
+            realm_id: realm(),
+            roles: auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let rows = [
+            config.to_bytes(&actor).unwrap(),
+            group.to_bytes(&actor).unwrap(),
+            auth.to_bytes(&actor).unwrap(),
+        ];
+        assert_eq!(policy_reads(realm(), Some(group_id)).len(), rows.len());
+        rows.into_iter().map(|row| Some(Value::from(row))).collect()
+    }
+
+    fn evaluators(records: &[MetadataRegistryRecord]) -> PolicyEvaluators {
+        (records.iter())
+            .map(|record| {
+                let rows = policy_rows(record.group_id);
+                let evaluator = read_policies(realm(), Some(record.group_id), rows).unwrap();
+                ((record.realm_id, record.group_id), evaluator)
+            })
+            .collect()
+    }
+
+    fn finished(results: Vec<GroupResult>) -> IoResult {
+        IoResult::Group(GroupEvent::Finished { results })
+    }
+
+    fn done<T, E>(result: Result<T, E>) -> GroupResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(result))))
+    }
+
+    /// The access of a caller without read rules over `records`, with permissive policies.
+    pub(crate) fn access_for(
+        records: &[MetadataRegistryRecord],
+        auth: Option<AuthContext>,
+    ) -> ReadAccess {
+        let mut access = ReadAccessOperation::new(realm(), auth, records);
+        let Ok(Next::Call(IoCall::Group(group))) = access.first() else {
+            panic!("expected the access group");
+        };
+        let mut results = vec![done(Ok::<_, PolicyEnforcementError>(evaluators(records)))];
+        let failed = || done(Err::<PermissionRules, _>(AuthorizationError::GroupNotFound));
+        results.extend((1..group.members.len()).map(|_| failed()));
+        let Ok(Next::Done(access)) = access.next(finished(results)) else {
+            panic!("expected the access");
+        };
+        access
+    }
+
+    fn record(public: bool) -> MetadataRegistryRecord {
+        let document_id = Ulid::from_parts(3, 3);
+        MetadataRegistryRecord {
+            realm_id: realm(),
+            group_id: Ulid::from_parts(2, 2),
+            document_id,
+            document_path: "datasets/access".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public,
+            permission_path: format!("/{}/g/{}/datasets/access", realm(), Ulid::from_parts(2, 2)),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            establishing_event_id: Ulid::from_parts(4, 4),
+            last_event_id: Ulid::from_parts(4, 4),
+        }
+    }
+
+    fn caller() -> AuthContext {
+        AuthContext {
+            user_id: UserId::local(Ulid::from_parts(8, 8), realm()),
+            realm_id: realm(),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn nothing_listed_reads_nothing() {
+        let mut access = ReadAccessOperation::new(realm(), None, &[]);
+        assert_eq!(access.first(), Ok(Next::Done(ReadAccess::default())));
+    }
+
+    #[test]
+    fn rules_follow_caller() {
+        let records = [record(true)];
+        let mut anonymous = ReadAccessOperation::new(realm(), None, &records);
+        let Ok(Next::Call(IoCall::Group(group))) = anonymous.first() else {
+            panic!("expected the access group");
+        };
+        assert_eq!(group.members.len(), 1);
+        let mut signed = ReadAccessOperation::new(realm(), Some(caller()), &records);
+        let Ok(Next::Call(IoCall::Group(group))) = signed.first() else {
+            panic!("expected the access group");
+        };
+        assert_eq!(group.members.len(), 2);
+    }
+
+    #[test]
+    fn policies_fail_closed() {
+        let records = [record(true)];
+        let mut access = ReadAccessOperation::new(realm(), None, &records);
+        access.first().unwrap();
+        let failed =
+            Err::<PolicyEvaluators, _>(PolicyEnforcementError::Unavailable("down".to_string()));
+        let turn = access.next(finished(vec![done(failed)]));
+        assert_eq!(turn, Err(MetadataApiError::ServiceUnavailable));
+    }
+
+    #[test]
+    fn failed_rules_hide_private() {
+        let records = [record(true), record(false)];
+        let access = access_for(&records, Some(caller()));
+        assert!(access.shows(&records[0]));
+        assert!(!access.shows(&records[1]));
+    }
+}

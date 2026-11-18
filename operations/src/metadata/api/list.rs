@@ -586,3 +586,7 @@ fn path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
     aruna_core::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
 }
+
+#[cfg(test)]
+#[path = "list_tests.rs"]
+mod call_tests;

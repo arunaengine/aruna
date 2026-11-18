@@ -646,3 +646,7 @@ impl Operation for LookupPathOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "path_tests.rs"]
+mod call_tests;
