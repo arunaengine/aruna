@@ -20,6 +20,7 @@ use super::{
 };
 use crate::driver::DriverContext;
 use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
 
 use super::distributed::run_search_distributed;
 use crate::distribution::feed_walks::IndexProgress;
@@ -30,8 +31,6 @@ use crate::realm::load_config::config_unavailable;
 use crate::s3::object::search_scan::changed_until;
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
-
-const CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
 
 const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
@@ -51,26 +50,22 @@ impl SignedCursor<ObjectCursorPayload> {
                 "invalid object search cursor".to_string(),
             ));
         }
-        let cursor = Self::decode_verified(
-            raw,
-            CURSOR_SIGNATURE_CONTEXT,
-            authorized_signers,
-            |cursor| {
+        let cursor =
+            Self::decode_verified(raw, OBJECT_CURSOR_CONTEXT, authorized_signers, |cursor| {
                 if cursor.version != OBJECT_CURSOR_VERSION || cursor.fingerprint != fingerprint {
                     Err(CursorEnvelopeError::QueryMismatch)
                 } else {
                     Ok(())
                 }
-            },
-        )
-        .map_err(|error| match error {
-            CursorEnvelopeError::Invalid => {
-                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
-            }
-            CursorEnvelopeError::QueryMismatch => MetadataApiError::InvalidCursor(
-                "object search cursor does not match query".to_string(),
-            ),
-        })?;
+            })
+            .map_err(|error| match error {
+                CursorEnvelopeError::Invalid => {
+                    MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+                }
+                CursorEnvelopeError::QueryMismatch => MetadataApiError::InvalidCursor(
+                    "object search cursor does not match query".to_string(),
+                ),
+            })?;
         if cursor.payload.partitions.len() > QUERY_MAX_NODES
             || cursor.payload.failed_partitions.len() > QUERY_MAX_NODES
         {
@@ -176,7 +171,7 @@ impl SignedCursor<ObjectCursorPayload> {
             .collect();
         Self::build_signed(
             OBJECT_CURSOR_VERSION,
-            CURSOR_SIGNATURE_CONTEXT,
+            OBJECT_CURSOR_CONTEXT,
             fingerprint,
             ObjectCursorPayload {
                 as_of,

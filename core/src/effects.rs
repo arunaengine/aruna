@@ -832,6 +832,9 @@ pub enum NetEffect {
     /// Signs a read grant; only a grant naming this node as issuer. Answers
     /// `NetEvent::GrantSign`.
     GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
+    /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
+    /// Answers `NetEvent::CursorSigned`.
+    CursorSign(Vec<u8>),
     /// Checks a forwarded caller's token for a write from `peer`; answers
     /// `NetEvent::WritePeerAuth`.
     WritePeerAuth(Box<WritePeerRequest>),

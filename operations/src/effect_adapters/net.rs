@@ -321,6 +321,7 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                 StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::GrantSign(_) => Event::Net(NetEvent::GrantSign(None)),
+            NetEffect::CursorSign(_) => Event::Net(NetEvent::CursorSigned(None)),
             NetEffect::ExecutionSign(_) => Event::Net(NetEvent::ExecutionSign(
                 ExecutionSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
