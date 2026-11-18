@@ -12,11 +12,11 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::driver::node_facts;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::projection::{
     MetadataProjectionError, ReplayPageOperation, max_clock_skew,
 };
-use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
@@ -78,7 +78,12 @@ pub(crate) async fn prepare(
     // Devices fetch governing realm documents before serving because they run no sync.
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        && !drive(fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH), driver_ctx).await.unwrap_or(false)
+        && !drive(
+            fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH),
+            driver_ctx,
+        )
+        .await
+        .unwrap_or(false)
     {
         warn!("Serving this device from its stored realm documents for now");
     }
@@ -340,7 +345,7 @@ async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), Stri
         api: config.api_public_url.clone(),
         s3: config.s3_public_url.clone(),
     };
-    let facts = NodeFacts::gather(ctx);
+    let facts = node_facts(ctx);
     let seed = SeedInfoOperation::new(config.realm_id, config.node_id, urls, facts, false);
     aruna_operations::driver::drive(seed, ctx)
         .await
