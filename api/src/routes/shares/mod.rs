@@ -15,7 +15,7 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::enforcement::enforce_policies;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::shares::lifecycle::{
     CreateShareConfig, CreateShareOperation, RevokeShareOperation, ShareError,
 };
@@ -620,8 +620,9 @@ fn action_name(action: ShareAction) -> &'static str {
 /// Appends a log entry; a failed write is traced and never fails the visit.
 pub(crate) async fn log_event(state: &ServerState, share_id: Ulid, event: ShareEvent) {
     let entry = Ulid::generate();
-    let operation = aruna_operations::shares::store::LogShareOperation::new(share_id, entry, event);
-    if let Err(error) = drive(operation, &state.get_ctx()).await {
+    let build =
+        || aruna_operations::shares::store::LogShareOperation::new(share_id, entry, event.clone());
+    if let Err(error) = drive_retry(build, &state.get_ctx(), &entry.to_bytes()).await {
         tracing::warn!(share_id = %share_id, error = %error, "Share link log entry not written");
     }
 }
