@@ -2,25 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
-use crate::placement::policy::{GateContextError, GateOperation};
-use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
+use crate::placement::policy::{
+    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
+    ReadPolicyError, gate_decision, union_refs, write_gate,
+};
 use crate::s3::fence_store::FenceCheckOperation;
-use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
-use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
+use crate::s3::multipart::part_upload::{
+    UploadPartError, UploadPartInput, UploadPartOperation, UploadPartResult,
+};
+use crate::s3::object::copy::{
+    CopySourceConditions, evaluate_source_conditions, source_etag, source_modified,
+};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::read::{ReadSourceOperation, TokenRead};
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -64,255 +69,21 @@ pub enum PartCopyError {
     PreconditionFailed,
 }
 
-pub async fn upload_part_copy(
-    context: &DriverContext,
-    input: PartCopyInput,
-) -> Result<PartCopyResult, PartCopyError> {
-    upload_part_token(context, input, None).await
-}
-
-/// `upload_part_copy` where `token` admits the source read while its bucket key is locked.
-pub async fn upload_part_token(
-    context: &DriverContext,
-    input: PartCopyInput,
-    token: Option<TokenRead>,
-) -> Result<PartCopyResult, PartCopyError> {
-    drive(
-        FenceCheckOperation::new(&input.dest_bucket, &input.dest_key),
-        context,
-    )
-    .await
-    .map_err(|error| PartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
-    let destination_upload = validate_destination_upload(context, &input).await?;
-
-    let source_input = GetObjectInput {
-        bucket: input.source_bucket,
-        key: input.source_key,
-        version_id: input.source_version_id,
-        range: input.range,
-        group_id: input.source_group_id,
-        user_identity: input.source_auth_context.user_id,
-        realm_id: input.source_auth_context.realm_id,
-        node_id: input.node_id,
-    };
-    let restrictions = input.source_auth_context.path_restrictions.clone();
-    let read = ReadSourceOperation::new(source_input, restrictions, token);
-    let source = drive(read, context).await?;
-
-    let source_version_id = source.version_id;
-    let source_last_modified = source
-        .info
-        .version_created_at
-        .or_else(|| source.location.as_ref().map(|location| location.created_at))
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        });
-
-    // Evaluate preconditions before consuming the (lazy) source stream.
-    let source_etag = source
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    if evaluate_source_conditions(
-        &input.conditions,
-        source_etag.as_deref(),
-        source_last_modified,
-        true,
-    )
-    .is_err()
-    {
-        return Err(PartCopyError::PreconditionFailed);
-    }
-
-    // No byte of a governed source lands here before this node is admitted for
-    // the union the finished part will carry.
-    let refs = union_refs(
-        &destination_upload.placement_policies,
-        &source.source_policies,
-    )
-    .map_err(UploadPartError::from)?;
-    gate_part(
-        context,
-        input.source_auth_context.realm_id,
-        &refs,
-        destination_upload.group_id,
-    )
-    .await?;
-
-    // Stored before the bytes land: a lost merge must not let the completed
-    // object drop the refs its source carried.
-    let target = (input.dest_bucket.as_str(), input.dest_key.as_str());
-    store_source_policies(context, target, input.upload_id, &source.source_policies).await?;
-
-    let content_length = source
-        .resolved_range
-        .as_ref()
-        .map(|range| range.content_length as u64)
-        .or_else(|| source.location.as_ref().map(|location| location.blob_size));
-
-    let part = drive(
-        UploadPartOperation::new(UploadPartInput {
-            bucket: input.dest_bucket,
-            key: input.dest_key,
-            upload_id: input.upload_id,
-            part_number: input.part_number,
-            content_length,
-            body: Some(source.blob),
-            created_by: input.user_id,
-            expected_checksums: Vec::new(),
-        }),
-        context,
-    )
-    .await?;
-
-    Ok(PartCopyResult {
-        part_location: part.location,
-        source_version_id,
-        source_last_modified,
-    })
-}
-
-/// Admits this node for the refs a part copied on another member carries and merges them into
-/// the upload of `target` (bucket and key) before its bytes land, as a part copied here does.
-pub async fn keep_part_policies(
-    context: &DriverContext,
-    (realm_id, upload_id): (RealmId, Ulid),
-    target: (&str, &str),
-    policies: &[PlacementPolicyRef],
-) -> Result<(), PartCopyError> {
-    if policies.is_empty() {
-        return Ok(());
-    }
-    let upload = read_upload(context, upload_id).await?;
-    check_target(&upload, target)?;
-    let refs = union_refs(&upload.placement_policies, policies).map_err(UploadPartError::from)?;
-    gate_part(context, realm_id, &refs, upload.group_id).await?;
-    store_source_policies(context, target, upload_id, policies).await
-}
-
-/// Evaluates this node against every ref the finished part carries. An
-/// ungoverned copy resolves nothing and performs no extra I/O.
-async fn gate_part(
-    context: &DriverContext,
-    realm_id: RealmId,
-    refs: &[PlacementPolicyRef],
-    group_id: GroupId,
-) -> Result<(), PartCopyError> {
-    let destination = drive(
-        GateOperation::new(realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await?;
-    let Some(gate) =
-        write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
-    else {
-        return Ok(());
-    };
-    let outcome = drive(gate, context)
-        .await
-        .map_err(|error| UploadPartError::from(PolicyGateError::from(error)))?;
-    gate_decision(outcome).map_err(UploadPartError::from)?;
-    Ok(())
-}
-
-/// Merges the source's refs into the destination upload record. An ungoverned
-/// copy writes nothing, so its behavior is exactly what it was before.
-async fn store_source_policies(
-    context: &DriverContext,
-    target: (&str, &str),
-    upload_id: Ulid,
-    policies: &[PlacementPolicyRef],
-) -> Result<(), PartCopyError> {
-    if policies.is_empty() {
-        return Ok(());
-    }
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        _ => return Err(UploadPartError::InvalidOperationState.into()),
-    };
-    let result = merge_upload_policies(context, (target, upload_id), policies, txn_id).await;
-    let closing = match result {
-        Ok(()) => StorageEffect::CommitTransaction { txn_id },
-        Err(_) => StorageEffect::AbortTransaction { txn_id },
-    };
-    let event = context.storage_handle.send_storage_effect(closing).await;
-    result?;
-    match event {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(UploadPartError::StorageError(error).into())
-        }
-        _ => Err(UploadPartError::InvalidOperationState.into()),
+impl From<IoError> for PartCopyError {
+    fn from(error: IoError) -> Self {
+        Self::UploadPart(error.into())
     }
 }
 
-async fn merge_upload_policies(
-    context: &DriverContext,
-    (target, upload_id): ((&str, &str), Ulid),
-    policies: &[PlacementPolicyRef],
-    txn_id: aruna_core::types::TxnId,
-) -> Result<(), PartCopyError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })
-        .await;
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-        return Err(UploadPartError::InvalidOperationState.into());
-    };
-    let Some(value) = value else {
-        return Err(UploadPartError::NoSuchUpload.into());
-    };
-    let mut record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
-    check_target(&record, target)?;
-    if !record.merge_policies(policies)? {
-        return Ok(());
-    }
-    let value = record.to_bytes().map_err(UploadPartError::from)?;
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: upload_id.to_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(UploadPartError::StorageError(error).into())
-        }
-        _ => Err(UploadPartError::InvalidOperationState.into()),
-    }
+type CopyTurn<T> = Result<Next<T>, PartCopyError>;
+
+fn read_upload(upload_id: Ulid) -> IoCall {
+    read_row(UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec())
 }
 
-/// Confirms the upload is this copy's open destination and reports the refs it
-/// already stores, which the gate unions with the source's.
-async fn validate_destination_upload(
-    context: &DriverContext,
-    input: &PartCopyInput,
-) -> Result<MultipartUpload, PartCopyError> {
-    let record = read_upload(context, input.upload_id).await?;
-    check_target(&record, (&input.dest_bucket, &input.dest_key))?;
-    Ok(record)
+fn upload_record(value: Option<Value>) -> Result<MultipartUpload, PartCopyError> {
+    let value = value.ok_or(UploadPartError::NoSuchUpload)?;
+    Ok(MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?)
 }
 
 /// Refuses an upload of another bucket or key, or one that is no longer open.
@@ -329,29 +100,99 @@ fn check_target(
     Ok(())
 }
 
-async fn read_upload(
-    context: &DriverContext,
-    upload_id: Ulid,
-) -> Result<MultipartUpload, PartCopyError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: upload_id.to_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await;
-    let value = match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(PartCopyError::UploadPart(UploadPartError::StorageError(
-                error,
-            )));
+/// Evaluates this node against every ref the finished part carries. An ungoverned copy resolves
+/// nothing further.
+#[derive(Debug, PartialEq)]
+struct GatePartOperation {
+    realm_id: RealmId,
+    refs: Vec<PlacementPolicyRef>,
+    group_id: GroupId,
+    now_ms: u64,
+    checking: bool,
+}
+
+impl GatePartOperation {
+    fn new(realm_id: RealmId, refs: Vec<PlacementPolicyRef>, group_id: GroupId) -> Self {
+        Self {
+            realm_id,
+            refs,
+            group_id,
+            now_ms: 0,
+            checking: false,
         }
-        _ => {
-            return Err(PartCopyError::UploadPart(
-                UploadPartError::InvalidOperationState,
-            ));
+    }
+}
+
+impl Operation for GatePartOperation {
+    type Output = ();
+    type Error = PartCopyError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> CopyTurn<()> {
+        let gate = GateOperation::new(self.realm_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(gate)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<()> {
+        if self.checking {
+            let outcome = result.child::<PolicyGateOutcome, ReadPolicyError>()?;
+            let outcome =
+                outcome.map_err(|error| UploadPartError::from(PolicyGateError::from(error)))?;
+            gate_decision(outcome).map_err(UploadPartError::from)?;
+            return Ok(Next::Done(()));
+        }
+        let destination = result.child::<Option<GateContext>, GateContextError>()??;
+        let gate = write_gate(destination.as_ref(), &self.refs, Some(self.group_id))
+            .map_err(UploadPartError::from)?;
+        let Some(gate) = gate else {
+            return Ok(Next::Done(()));
+        };
+        self.checking = true;
+        Ok(Next::Call(IoCall::child(gate)))
+    }
+}
+
+/// Merges a source's refs into the destination upload record in one transaction.
+#[derive(Debug, PartialEq)]
+struct StorePoliciesOperation {
+    bucket: String,
+    key: String,
+    upload_id: Ulid,
+    policies: Vec<PlacementPolicyRef>,
+    writing: bool,
+}
+
+impl StorePoliciesOperation {
+    fn new((bucket, key): (&str, &str), upload_id: Ulid, policies: &[PlacementPolicyRef]) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id,
+            policies: policies.to_vec(),
+            writing: false,
+        }
+    }
+}
+
+impl Operation for StorePoliciesOperation {
+    type Output = ();
+    type Error = PartCopyError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> CopyTurn<()> {
+        Ok(Next::Call(read_upload(self.upload_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<()> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
         }
     };
     let Some(value) = value else {
