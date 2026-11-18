@@ -3,15 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::drain::MIGRATION_CONTINUE;
-use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::DriverContext;
-use crate::driver::drive;
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, SystemTime};
+
 use aruna_core::NodeId;
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_PENDING_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
@@ -19,7 +17,9 @@ use aruna_core::keyspaces::{
     TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, read_row};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
@@ -30,11 +30,16 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionState, cleanup_prefix,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, TxnId};
-use aruna_storage::StorageHandle;
-use std::collections::HashSet;
-use std::time::{Duration, SystemTime};
+use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::{Key, Value};
+
+use super::shared::MigrationError;
+use crate::blob::migration::drain::MIGRATION_CONTINUE;
+use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersionOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::key_locks::KeyUnlockedOperation;
+use crate::replication::parking::WakeParkedOperation;
+use crate::replication::queue::{BlobQueueError, schedule_blob_drain};
 
 /// Versions, or old copies, one run checks per bucket.
 const PAGE: usize = 64;
@@ -44,160 +49,315 @@ const BUCKET_PAGE: usize = 16;
 pub const RECHECK: Duration = Duration::from_secs(60);
 /// Passes with failures started again before the transition reports itself blocked.
 const RETRIES: u32 = 10;
+/// Why a transition waits after every other copy moved.
+const PENDING_REASON: &str = "pending archives, envelopes or copies still use the source key";
+
+type Turn<T> = Result<Next<T>, MigrationError>;
+/// This node and its realm, where it serves one.
+type Serving = Option<(NodeId, RealmId)>;
+type QuotaOrigin = Option<(QuotaConfig, RealmId, NodeId)>;
+
+fn empty_prefix() -> Key {
+    Key::from(Vec::new())
+}
+
+fn soonest(next: &mut Option<Duration>, after: Duration) {
+    *next = Some(next.map_or(after, |next| next.min(after)));
+}
+
+fn read_transition(bucket: &str) -> IoCall {
+    read_row(TRANSITION_KEYSPACE, bucket.as_bytes().to_vec())
+}
+
+fn decode_transition(value: Option<Value>) -> Result<Option<EncryptionTransition>, MigrationError> {
+    Ok(value
+        .map(|value| EncryptionTransition::from_bytes(value.as_ref()))
+        .transpose()?)
+}
+
+/// Takes the answer to a timer effect; a node without a task handler has nothing to wake.
+fn timer_set(result: IoResult) -> Result<(), MigrationError> {
+    match result.event()? {
+        Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
+        Event::Task(TaskEvent::Error { message, .. }) if message == NO_TASK_HANDLE => Ok(()),
+        Event::Task(TaskEvent::Error { message, .. }) => Err(MigrationError::Failed(message)),
+        other => Err(MigrationError::Failed(format!(
+            "could not set a timer: {}",
+            other.label()
+        ))),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ResumeStep {
+    Page,
+    Wake,
+}
 
 /// Clears matching retry deadlines and wakes the worker when a source key becomes usable.
-pub(crate) async fn resume_transitions(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ResumeTransitionsOperation {
     key: BucketKeyRef,
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let (mut after, mut resumed) = (None, false);
-    loop {
-        let mut transaction = storage
-            .start_transaction(false)
-            .await
-            .map_err(|e| e.to_string())?;
-        let txn_id = transaction.id().ok_or("missing wake transaction")?;
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            TRANSITION_KEYSPACE,
-            None,
+    step: ResumeStep,
+    resumed: bool,
+}
+
+impl ResumeTransitionsOperation {
+    pub fn new(key: BucketKeyRef) -> Self {
+        Self {
+            key,
+            step: ResumeStep::Page,
+            resumed: false,
+        }
+    }
+
+    fn page(&self, after: Option<Key>) -> Turn<()> {
+        let page = ResumePageOperation::new(self.key, after);
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl Operation for ResumeTransitionsOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<()> {
+        self.page(None)
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            ResumeStep::Page => {
+                let (resumed, cursor) = result.child::<(bool, Option<Key>), MigrationError>()??;
+                self.resumed |= resumed;
+                if cursor.is_some() {
+                    return self.page(cursor);
+                }
+                if !self.resumed {
+                    return Ok(Next::Done(()));
+                }
+                self.step = ResumeStep::Wake;
+                let wake = Effect::Task(TaskEffect::ShortenTimer {
+                    key: TaskKey::MigrateCompression,
+                    after: Duration::ZERO,
+                });
+                Ok(Next::Call(wake.into()))
+            }
+            ResumeStep::Wake => {
+                timer_set(result)?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+/// Clears the deadlines of one page of transitions in one transaction. Outputs whether any
+/// matched and the key to continue after.
+#[derive(Debug, PartialEq)]
+struct ResumePageOperation {
+    key: BucketKeyRef,
+    after: Option<Key>,
+    written: Option<(bool, Option<Key>)>,
+}
+
+impl ResumePageOperation {
+    fn new(key: BucketKeyRef, after: Option<Key>) -> Self {
+        Self {
+            key,
             after,
-            BUCKET_PAGE,
-            Some(txn_id),
-        )
-        .await?;
+            written: None,
+        }
+    }
+}
+
+impl Operation for ResumePageOperation {
+    type Output = (bool, Option<Key>);
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<(bool, Option<Key>)> {
+        Ok(Next::Call(IoCall::Page {
+            space: TRANSITION_KEYSPACE.to_string(),
+            prefix: empty_prefix(),
+            after: self.after.take(),
+            limit: BUCKET_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<(bool, Option<Key>)> {
+        if let Some(written) = self.written.take() {
+            result.done()?;
+            return Ok(Next::Done(written));
+        }
+        let (rows, cursor) = result.page()?;
+        let mut writes = Vec::new();
         for (row, value) in rows {
-            let mut record = EncryptionTransition::from_bytes(&value).map_err(|e| e.to_string())?;
-            if record.source != Some(key) || record.finished_at_ms.is_some() {
+            let mut record = EncryptionTransition::from_bytes(&value)?;
+            if record.source != Some(self.key) || record.finished_at_ms.is_some() {
                 continue;
             }
             record.retry_at_ms = None;
-            let value = record.to_bytes().map_err(|e| e.to_string())?.into();
-            let write = StorageEffect::Write {
-                key_space: TRANSITION_KEYSPACE.to_string(),
-                key: row,
-                value,
-                txn_id: Some(txn_id),
-            };
-            match storage.send_storage_effect(write).await {
-                Event::Storage(StorageEvent::WriteResult { .. }) => resumed = true,
-                other => return Err(format!("could not resume transition: {}", other.label())),
-            }
+            writes.push((
+                TRANSITION_KEYSPACE.to_string(),
+                row,
+                record.to_bytes()?.into(),
+            ));
         }
-        let event = storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await;
-        if !matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionCommitted { .. })
-        ) {
-            transaction.unknown();
-            return Err(format!("transition wake was not stored: {}", event.label()));
+        if writes.is_empty() {
+            return Ok(Next::Done((false, cursor)));
         }
-        transaction.finish();
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => break,
+        self.written = Some((true, cursor));
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum QueueStep {
+    Page,
+    Record(String),
+    Advance,
+}
+
+/// Advances every queued transition by one page. Outputs when the task must run again.
+#[derive(Debug, PartialEq)]
+pub struct ProcessTransitionsOperation {
+    serving: Serving,
+    now_ms: u64,
+    pages: PrefixPages,
+    buckets: VecDeque<Key>,
+    step: QueueStep,
+    next: Option<Duration>,
+}
+
+impl ProcessTransitionsOperation {
+    pub fn new(serving: Serving) -> Self {
+        Self {
+            serving,
+            now_ms: 0,
+            pages: PrefixPages::new(TRANSITION_QUEUE_KEYSPACE, empty_prefix(), BUCKET_PAGE),
+            buckets: VecDeque::new(),
+            step: QueueStep::Page,
+            next: None,
         }
     }
-    if resumed {
-        let effect = TaskEffect::ShortenTimer {
-            key: TaskKey::MigrateCompression,
-            after: Duration::ZERO,
+
+    fn next_bucket(&mut self) -> Turn<Option<Duration>> {
+        let Some(key) = self.buckets.pop_front() else {
+            if self.pages.done() {
+                return Ok(Next::Done(self.next));
+            }
+            self.step = QueueStep::Page;
+            return Ok(Next::Call(self.pages.call()));
         };
-        crate::tasks::task_persistence::persist_task_effect(storage, &effect).await?;
-        if let Some(tasks) = context.task_handle.as_ref()
-            && let Event::Task(TaskEvent::Error { message, .. }) = tasks
-                .send_effect(aruna_core::effects::Effect::Task(effect))
-                .await
-        {
-            return Err(message);
-        }
+        let bucket = String::from_utf8(key.to_vec()).map_err(MigrationError::failed)?;
+        let read = read_transition(&bucket);
+        self.step = QueueStep::Record(bucket);
+        Ok(Next::Call(read))
     }
-    Ok(())
-}
 
-/// Advances every queued transition by one page. Returns when the task must run again.
-pub async fn process_transitions(context: &DriverContext) -> Result<Option<Duration>, String> {
-    let storage = &context.storage_handle;
-    let now = aruna_core::time::unix_timestamp_millis();
-    let mut next = None::<Duration>;
-    let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
-    let mut after = None;
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            TRANSITION_QUEUE_KEYSPACE,
-            None,
-            after,
-            BUCKET_PAGE,
-            None,
-        )
-        .await?;
-        for (key, _) in rows {
-            let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-            let Some(record) = read_record(storage, &bucket).await? else {
-                continue;
-            };
-            if record.finished_at_ms.is_some() {
-                continue;
-            }
-            if let Some(at) = record.retry_at_ms.filter(|at| *at > now) {
-                soon(Duration::from_millis(at - now));
-                continue;
-            }
-            if let Some(wait) = advance(context, &bucket, record).await? {
-                soon(wait);
-            }
+    fn record_read(
+        &mut self,
+        bucket: String,
+        record: Option<EncryptionTransition>,
+    ) -> Turn<Option<Duration>> {
+        let Some(record) = record.filter(|record| record.finished_at_ms.is_none()) else {
+            return self.next_bucket();
+        };
+        if let Some(at) = record.retry_at_ms.filter(|at| *at > self.now_ms) {
+            soonest(&mut self.next, Duration::from_millis(at - self.now_ms));
+            return self.next_bucket();
         }
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(next),
-        }
+        self.step = QueueStep::Advance;
+        let advance = AdvanceTransitionOperation::new(bucket, record, self.serving);
+        Ok(Next::Call(IoCall::child(advance)))
     }
 }
 
-async fn read_record(
-    storage: &StorageHandle,
-    bucket: &str,
-) -> Result<Option<EncryptionTransition>, String> {
-    let read = StorageEffect::Read {
-        key_space: TRANSITION_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| EncryptionTransition::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!(
-            "could not read transition progress: {}",
-            other.label()
-        )),
+impl Operation for ProcessTransitionsOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match std::mem::replace(&mut self.step, QueueStep::Advance) {
+            QueueStep::Page => {
+                let rows = self.pages.take(result)?;
+                self.buckets = rows.into_iter().map(|(key, _)| key).collect();
+                self.next_bucket()
+            }
+            QueueStep::Record(bucket) => {
+                let record = decode_transition(result.value()?)?;
+                self.record_read(bucket, record)
+            }
+            QueueStep::Advance => {
+                let wait = result.child::<Option<Duration>, MigrationError>()??;
+                if let Some(wait) = wait {
+                    soonest(&mut self.next, wait);
+                }
+                self.next_bucket()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AdvanceStep {
+    Page,
+    Quota,
+    Rewrite(Key),
+    /// A settle or finish child whose answer is this operation's.
+    Tail,
+    StoredMore,
+    StoredWait(Option<Duration>),
+    Unlocked(BucketKeyRef, Option<Duration>),
+    Resumed,
 }
 
 /// One step of a bucket's transition: a page of versions, or a cleanup check after the pass.
-async fn advance(
-    context: &DriverContext,
-    bucket: &str,
-    mut record: EncryptionTransition,
-) -> Result<Option<Duration>, String> {
-    let now = aruna_core::time::unix_timestamp_millis();
-    record.retry_at_ms = None;
-    if record.state == TransitionState::Finished {
-        return finish(context, bucket, record).await;
+#[derive(Debug, PartialEq)]
+struct AdvanceTransitionOperation {
+    bucket: String,
+    record: EncryptionTransition,
+    serving: Serving,
+    now_ms: u64,
+    step: AdvanceStep,
+    versions: VecDeque<Key>,
+    more: bool,
+    quota: QuotaOrigin,
+}
+
+impl AdvanceTransitionOperation {
+    fn new(bucket: String, record: EncryptionTransition, serving: Serving) -> Self {
+        Self {
+            bucket,
+            record,
+            serving,
+            now_ms: 0,
+            step: AdvanceStep::Page,
+            versions: VecDeque::new(),
+            more: false,
+            quota: None,
+        }
     }
-    if record.state == TransitionState::Cleanup {
-        return settle(context, bucket, record).await;
+
+    fn call(&mut self, step: AdvanceStep, call: IoCall) -> Turn<Option<Duration>> {
+        self.step = step;
+        Ok(Next::Call(call))
     }
-    if record.cursor.is_none() {
-        // A new pass counts its own waits and failures.
-        record.remaining = 0;
-        record.failed = 0;
-        record.state = TransitionState::Running;
+
+    fn settle(&mut self) -> Turn<Option<Duration>> {
+        let settle = SettleTransitionOperation::new(&self.bucket, self.record.clone());
+        self.call(AdvanceStep::Tail, IoCall::child(settle))
     }
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (versions, next) = crate::storage_read::iter_prefix_page(
