@@ -1023,7 +1023,9 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                let drain = crate::device::sync::drain_sync_outbox(&self.context);
+                let outcome = drive(drain, &self.context).await;
+                let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

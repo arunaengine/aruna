@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::device::sync::pull::forward_pull;
+use crate::device::sync::pull::ForwardPullOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
@@ -325,7 +325,8 @@ async fn pull_output(
         deleted: false,
     };
     let auth_token = AuthToken::internal(auth.clone());
-    match forward_pull(context, target.node_id, auth_token, pull, |_| async {}).await {
+    let forward = ForwardPullOperation::new(target.node_id, auth_token, pull);
+    match drive(forward, context).await.map_err(|refused| refused.0) {
         Ok(ack) => Ok(OutputObject {
             node_id: target.node_id,
             bucket: target.bucket.clone(),

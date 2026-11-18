@@ -41,9 +41,7 @@ use folders::{list_folders, store_progress};
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
 
-pub use outbox::{
-    UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox, restore_upload_timer,
-};
+pub use outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
 
 /// Delay before the next pass when every folder is settled.
 pub const RECONCILE_IDLE_AFTER: Duration = Duration::from_secs(30);
@@ -408,7 +406,7 @@ async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
 /// documents on; a realm node with no folders schedules nothing.
 pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
     let storage = &context.storage_handle;
-    let due = outbox::has_rows(storage, aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE).await
+    let due = has_rows(storage, aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE).await
         || local_is_device(context).await;
     if due
         && let TaskEvent::Error { message, .. } = task_handle
@@ -417,7 +415,31 @@ pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &Tas
     {
         warn!(message = %message, "Failed to restore the synced-folder timer");
     }
-    restore_upload_timer(storage, task_handle).await;
+    if has_rows(storage, aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE).await
+        && let TaskEvent::Error { message, .. } = task_handle
+            .schedule_idle_timer(TaskKey::DrainUploadOutbox, Duration::ZERO)
+            .await
+    {
+        warn!(%message, "Failed to restore the synced-folder upload timer");
+    }
+}
+
+/// Whether a keyspace holds at least one row.
+async fn has_rows(storage: &aruna_storage::storage::StorageHandle, key_space: &str) -> bool {
+    let iter = aruna_core::effects::StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    matches!(
+        storage.send_storage_effect(iter).await,
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::IterResult {
+            values,
+            ..
+        }) if !values.is_empty()
+    )
 }
 
 /// Whether this node is a user device, which decides who keeps the folder beat.

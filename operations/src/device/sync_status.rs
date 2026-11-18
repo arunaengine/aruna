@@ -25,7 +25,7 @@ use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state}
 use super::replica_store::list_replicas;
 use super::scan_rows::ScanRowsOperation;
 use super::sync::folders::{list_folders, list_transfers};
-use super::sync::outbox::requeue_uploads;
+use super::sync::outbox::RequeueUploadsOperation;
 use super::sync::repository::{SYNC_PAGE_SIZE, folder_prefix};
 use super::sync_note::{DeviceSyncState, read_state, sync_state_key};
 
@@ -212,7 +212,9 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
         return false;
     }
     requeue_publish(context, now).await;
-    requeue_uploads(context, now).await;
+    if let Err(error) = drive(RequeueUploadsOperation::new(now), context).await {
+        warn!(%error, "Failed to requeue the folder uploads");
+    }
     state.run_started_ms = Some(now);
     write_sync_state(context, &state).await;
     for key in [
