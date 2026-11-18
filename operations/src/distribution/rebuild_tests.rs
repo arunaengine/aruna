@@ -10,6 +10,8 @@ use crate::distribution::test_store::{
     stage, write,
 };
 use crate::driver::drive;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_storage::storage::StorageHandle;
 
@@ -175,61 +177,164 @@ async fn keeps_epoch_maximum() {
     assert_eq!(generation(&handle, 2).await.max_epoch, OriginalEpoch(7));
 }
 
-fn accounts_page(rows: Vec<(Vec<u8>, Vec<u8>)>, more: bool) -> Event {
-    let values = rows.into_iter();
-    Event::Storage(StorageEvent::IterResult {
-        values: values
+fn accounts_page(rows: Vec<(Vec<u8>, Vec<u8>)>, more: bool) -> IoResult {
+    IoResult::Page {
+        rows: (rows.into_iter())
             .map(|(key, value)| (key.into(), value.into()))
             .collect(),
-        next_start_after: more.then(|| b"next".to_vec().into()),
-    })
+        next: more.then(|| b"next".to_vec().into()),
+    }
+}
+
+fn answered(end: Result<StepEnd, RebuildError>) -> IoResult {
+    IoResult::Child(ChildOutcome::new(end))
+}
+
+fn fresh() -> RangeAccount {
+    RangeAccount::fresh(String::new(), None)
+}
+
+fn account_value(account: &RangeAccount) -> IoResult {
+    IoResult::Values(vec![Some(account.to_bytes().unwrap().into())])
 }
 
 /// An active account without a rebuild begins one; malformed rows are skipped.
 #[test]
 fn begins_active_rebuilds() {
-    let active = RangeAccount::fresh(String::new(), None).to_bytes().unwrap();
+    let active = fresh().to_bytes().unwrap();
     let rows = vec![
         (b"short".to_vec(), active.clone()),
         (account_key(set(), range_id()), active),
     ];
-    let rebuild = RebuildOperation::new(RebuildConfig {
-        set_id: set(),
-        range_id: range_id(),
-        page_rows: 2,
-        page_bytes: 64,
-        max_pages: 0,
-        group_id: None,
-    })
-    .start();
     let mut begin = BeginRebuildsOperation::new(8, (2, 64));
-    let first = begin.page();
-    aruna_core::operation_check::check_trace(
-        &mut begin,
-        &first,
-        vec![(accounts_page(rows, false), rebuild.into_vec())],
-    );
-    assert!(!begin.is_complete());
+    assert!(matches!(begin.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let child = begin.next(accounts_page(rows, false));
+    assert!(matches!(child, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(begin.current, Some((set(), range_id())));
+    let began: Result<RebuildOutcome, RebuildError> = Ok(RebuildOutcome::Paused);
+    let began = IoResult::Child(ChildOutcome::new(began));
+    assert_eq!(begin.next(began), Ok(Next::Done(1)));
 }
 
-/// A node without accounts begins nothing; a failed scan fails; other events are refused.
+/// A node without accounts begins nothing; a failed child is skipped; other results fail.
 #[test]
 fn begins_nothing_empty() {
     let mut begin = BeginRebuildsOperation::new(8, (2, 64));
-    begin.start();
-    assert!(begin.step(accounts_page(Vec::new(), false)).is_empty());
-    assert_eq!(begin.finalize(), Ok(0));
-    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
-    begin.start();
-    begin.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-    assert!(begin.finalize().is_err());
+    begin.first().unwrap();
+    assert_eq!(begin.next(accounts_page(Vec::new(), false)), Ok(Next::Done(0)));
 
-    use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
-    let fresh = || BeginRebuildsOperation::new(8, (2, 64));
-    let all = sample_events().len();
-    assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
-    rejects_finalize(fresh());
-    assert!(fresh().abort().is_empty());
+    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
+    begin.first().unwrap();
+    let rows = vec![(account_key(set(), range_id()), fresh().to_bytes().unwrap())];
+    begin.next(accounts_page(rows, false)).unwrap();
+    let failed: Result<RebuildOutcome, RebuildError> = Err(IoError::Aborted.into());
+    let failed = IoResult::Child(ChildOutcome::new(failed));
+    assert_eq!(begin.next(failed), Ok(Next::Done(0)));
+
+    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
+    begin.first().unwrap();
+    assert!(begin.next(IoResult::Done).is_err());
+}
+
+// An active account starts a begin step; its commit continues from the new account.
+#[test]
+fn begin_step_advances() {
+    let mut run = RebuildOperation::new(config(2, 0));
+    let read = read_row(RANGE_ACCOUNT_KEYSPACE, account_key(set(), range_id()));
+    assert_eq!(run.first(), Ok(Next::Call(read)));
+    let step = run.next(account_value(&fresh()));
+    assert!(matches!(step, Ok(Next::Call(IoCall::Child(_)))));
+    let began = RangeAccount {
+        rebuild: Some(Rebuild::new(2)),
+        ..fresh()
+    };
+    let end = answered(Ok(StepEnd::Advanced {
+        account: began,
+        page: false,
+    }));
+    assert_eq!(run.next(end), Ok(Next::Done(RebuildOutcome::Paused)));
+}
+
+// A stale step and a lost commit read the account again until the budget runs out.
+#[test]
+fn conflicts_restart_then_pause() {
+    let mut run = RebuildOperation::new(config(2, 1));
+    run.first().unwrap();
+    run.next(account_value(&fresh())).unwrap();
+    let read = read_row(RANGE_ACCOUNT_KEYSPACE, account_key(set(), range_id()));
+    assert_eq!(
+        run.next(answered(Ok(StepEnd::Stale))),
+        Ok(Next::Call(read.clone()))
+    );
+    run.next(account_value(&fresh())).unwrap();
+    let lost = answered(Err(IoError::Conflict.into()));
+    assert_eq!(run.next(lost), Ok(Next::Call(read)));
+    run.conflicts = MAX_CONFLICTS;
+    run.next(account_value(&fresh())).unwrap();
+    assert_eq!(
+        run.next(answered(Ok(StepEnd::Stale))),
+        Ok(Next::Done(RebuildOutcome::Paused))
+    );
+}
+
+// A page step re-reads the account, reads up to the probe, then writes its cursor and counts.
+#[test]
+fn page_step_counts() {
+    let account = RangeAccount {
+        rebuild: Some(Rebuild::new(2)),
+        ..fresh()
+    };
+    let kind = StepKind::Page {
+        walk: Walk::Uploads,
+        probe_end: Some(b"row".to_vec()),
+        terminal: false,
+    };
+    let mut step = RebuildStepOperation::new(config(2, 1), account.clone(), kind);
+    assert_eq!(step.transaction(), TransactionMode::Write);
+    assert!(matches!(step.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(IoCall::Effect(read))) = step.next(account_value(&account)) else {
+        panic!("expected the page read");
+    };
+    let Effect::Storage(StorageEffect::IterRange { end, txn_id, .. }) = *read else {
+        panic!("expected a range read");
+    };
+    assert_eq!(end, IterEnd::Through(b"row".to_vec().into()));
+    assert_eq!(txn_id, None);
+    let rows = IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: vec![(b"row".to_vec().into(), Vec::new().into())],
+        next_start_after: None,
+    })));
+    let Ok(Next::Call(IoCall::Write(writes))) = step.next(rows) else {
+        panic!("expected the account row");
+    };
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        step.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(Vec::new())))
+    );
+    let Ok(Next::Call(IoCall::AddCounters { deltas, .. })) = step.next(IoResult::Done) else {
+        panic!("expected the counted page");
+    };
+    assert_eq!(deltas[0].1.open_uploads, 1);
+    let Ok(Next::Done(StepEnd::Advanced { account, page })) = step.next(IoResult::Done) else {
+        panic!("expected the advanced account");
+    };
+    assert!(page);
+    let cursor = account.rebuild.unwrap().uploads;
+    assert_eq!(cursor, Cursor::At(b"row".to_vec()));
+}
+
+// An account another writer moved makes the step stale without any write.
+#[test]
+fn moved_account_stale() {
+    let mut step = RebuildStepOperation::new(config(2, 1), fresh(), StepKind::Begin);
+    step.first().unwrap();
+    let moved = RangeAccount {
+        rebuild: Some(Rebuild::new(2)),
+        ..fresh()
+    };
+    assert_eq!(
+        step.next(account_value(&moved)),
+        Ok(Next::Done(StepEnd::Stale))
+    );
 }
