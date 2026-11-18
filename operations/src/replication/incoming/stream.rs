@@ -64,218 +64,184 @@ fn closed(result: IoResult) -> StreamTurn {
         error!(error = ?error, "Failed to close rejected inbound bao stream");
     }
     Ok(Next::Done(()))
-    let local_node = net_handle.node_id();
-    // #332: only an authenticated sync-eligible realm peer
-    // may open the blob replication plane at all.
-    if bao_admission(context, realm_id, local_node, node_id)
-        .await
-        .is_none()
-    {
-        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
-        refuse_stream(stream);
-        return;
-    }
-    let stream_id = match blob_handle
-        .accept_stream(node_id, stream, INBOUND_BAO_TIMEOUT)
-        .await
-    {
-        Ok(stream_id) => stream_id,
-        Err(InboundError::TimedOut) => {
-            warn!(peer = %node_id, "Timed out registering inbound bao stream");
-            return;
-        }
-        Err(err) => {
-            error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
-            return;
-        }
-    };
-    let Some(admission) = bao_admission(context, realm_id, local_node, node_id).await else {
-        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
-        blob_handle.close_stream(stream_id).await;
-        return;
-    };
-    let payload = match blob_handle
-        .first_frame(stream_id, INBOUND_BAO_TIMEOUT)
-        .await
-    {
-        Ok(payload) => payload,
-        Err(InboundError::TimedOut) => {
-            warn!(peer = %node_id, stream_id = %stream_id, "Timed out reading inbound bao control message");
-            blob_handle.close_stream(stream_id).await;
-            return;
-        }
-        Err(InboundError::Blob(err)) => {
-            error!(error = ?err, "Failed to read initial inbound bao payload");
-            blob_handle.close_stream(stream_id).await;
-            return;
-        }
-        Err(InboundError::Unexpected(event)) => {
-            error!(event, "Unexpected first event for inbound bao stream");
-            blob_handle.close_stream(stream_id).await;
-            return;
-        }
-    };
-    match VersionReplicationMessage::from_bytes(&payload) {
-        Ok(VersionReplicationMessage::VersionManifest(manifest))
-        | Ok(VersionReplicationMessage::ReferenceAdvance { manifest, .. }) => {
-            // Only infrastructure may publish a self-identifying manifest.
-            if admission != BaoAdmission::Infra {
-                warn!(
-                    peer = %node_id,
-                    stream_id = %stream_id,
-                    "Refusing a replication manifest from a device"
-                );
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-            accept_version_replication(
-                context,
-                rocrate_limits,
-                &blob_handle,
-                realm_id,
-                local_node,
-                node_id,
-                stream_id,
-                manifest,
-            )
-            .await;
-        }
-        Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
-            answer_bao_read(
-                context,
-                &blob_handle,
-                realm_id,
-                local_node,
-                node_id,
-                stream_id,
-                request,
-            )
-            .await;
-        }
-        Ok(VersionReplicationMessage::LocationSummaryRequest(request)) => {
-            // The summary describes what this node
-            // holds; a device is never told.
-            if admission != BaoAdmission::Infra {
-                warn!(
-                    peer = %node_id,
-                    stream_id = %stream_id,
-                    "Refusing a location summary to a device"
-                );
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-            answer_location_summary(
-                context,
-                &blob_handle,
-                realm_id,
-                local_node,
-                node_id,
-                stream_id,
-                request,
-            )
-            .await;
-        }
-        Ok(VersionReplicationMessage::VersionKeyRequest {
-            realm_id: asked,
-            set_id,
-            version_id,
-        }) => {
-            // Keys of a set are told to realm infrastructure only.
-            if admission != BaoAdmission::Infra || asked != realm_id {
-                warn!(peer = %node_id, "Refusing a version key lookup");
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-            answer_version_key(context, &blob_handle, stream_id, set_id, version_id).await;
-        }
-        Ok(VersionReplicationMessage::ContentRequest {
-            realm_id: asked,
-            set_id,
-            identity,
-        }) => {
-            if admission != BaoAdmission::Infra || asked != realm_id {
-                warn!(peer = %node_id, "Refusing a content lookup");
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-            answer_content(context, &blob_handle, stream_id, set_id, identity).await;
-        }
-        _ => {
-            error!(
-                peer = %node_id,
-                stream_id = %stream_id,
-                "Unsupported inbound bao payload"
-            );
-            blob_handle.close_stream(stream_id).await;
-        }
-    }
 }
 
 /// What the bao plane admitted a peer as. A device reaches the read branch and
 /// nothing else, so replication stays infrastructure-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BaoAdmission {
+pub(crate) enum BaoAdmission {
     Infra,
     DeviceRead,
 }
 
-async fn emit_replication_watch(
-    context: &DriverContext,
-    node_id: aruna_core::NodeId,
-    manifest: &VersionReplicationManifest,
-    result: &IncomingVersionResult,
-) {
-    let Some(group_id) = result.group_id else {
-        return;
-    };
-    if !result.applied || manifest.kind != ReplicationItemKind::Materialized {
-        return;
-    }
-    let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
-    let occurred_at_ms = aruna_core::time::unix_timestamp_millis();
-    let emit = EmitEventOperation::new(WatchEvent {
-        event_id: Ulid::generate(),
-        realm_id: manifest.auth_context.realm_id,
-        kind: WatchEventKind::DataUploaded,
-        path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
-        actor: manifest.auth_context.user_id,
-        occurred_at_ms,
-        detail: WatchEventDetail::DataUploaded {
-            group_id,
-            node_id,
-            bucket: manifest.bucket.clone(),
-            key: manifest.key.clone(),
-            size_bytes,
-        },
-    });
-    // Failures only warn inside the operation.
-    let _ = drive(emit, context).await;
+/// What the bao plane admits this peer as. Replication is trusted from sync-eligible realm
+/// nodes only; an owner-bound device gets bao reads alone from a sync-eligible node, never
+/// becoming a replication source. Identity comes from the realm config. Fails closed.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BaoAdmissionOperation {
+    realm_id: RealmId,
+    local: NodeId,
+    peer: NodeId,
 }
 
-async fn allow_policy(
-    context: &DriverContext,
-    auth: &AuthContext,
-    path: &str,
-    permission: &Permission,
-    operation: &str,
-) -> Result<bool, String> {
-    match drive(
-        AuthorizeOperation::new(
-            auth.realm_id,
-            auth,
-            path,
-            permission,
-            PolicyRequestExtras::operation(operation),
-        ),
-        context,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(AuthorizeError::PermissionDenied)
-        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(false),
-        Err(error) => Err(error.to_string()),
+impl BaoAdmissionOperation {
+    pub(crate) fn new(realm_id: RealmId, local: NodeId, peer: NodeId) -> Self {
+        Self {
+            realm_id,
+            local,
+            peer,
+        }
     }
+}
+
+impl Operation for BaoAdmissionOperation {
+    type Output = Option<BaoAdmission>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<BaoAdmission>>, IoError> {
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<BaoAdmission>>, IoError> {
+        let peer = self.peer;
+        let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => config,
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
+                return Ok(Next::Done(None));
+            }
+        };
+        let eligible = match config.sync_eligible_nodes() {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
+                return Ok(Next::Done(None));
+            }
+        };
+        if eligible.contains(&peer) {
+            return Ok(Next::Done(Some(BaoAdmission::Infra)));
+        }
+        // Only a realm node answers a device, so a device never reaches another device's plane.
+        let device = node_kind(&config, peer)
+            .and_then(|kind| kind.owner())
+            .is_some();
+        let read = device && eligible.contains(&self.local);
+        Ok(Next::Done(read.then_some(BaoAdmission::DeviceRead)))
+    }
+}
+
+/// A registered bao stream and the nodes on its two ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BaoPeerStream {
+    pub(crate) realm_id: RealmId,
+    pub(crate) local_node: NodeId,
+    pub(crate) peer: NodeId,
+    pub(crate) stream_id: Ulid,
+}
+
+/// Answers the first frame of an admitted stream. Every family closes the stream when it
+/// refuses, so an error here means an answer could not be read at all.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeBaoOperation {
+    stream: BaoPeerStream,
+    admission: BaoAdmission,
+    payload: Vec<u8>,
+    routing: Option<NodeRouting>,
+    limits: RoCrateLimits,
+    closing: bool,
+}
+
+impl ServeBaoOperation {
+    pub(crate) fn new(
+        stream: BaoPeerStream,
+        admission: BaoAdmission,
+        payload: Vec<u8>,
+        routing: NodeRouting,
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            stream,
+            admission,
+            payload,
+            routing: Some(routing),
+            limits: limits.clone(),
+            closing: false,
+        }
+    }
+
+    fn refuse(&mut self) -> StreamTurn {
+        self.closing = true;
+        Ok(Next::Call(close_call(self.stream.stream_id)))
+    }
+
+    /// Lookups of a set are told to realm infrastructure only.
+    fn lookup(&mut self, asked: RealmId, lookup: SetLookup) -> StreamTurn {
+        if self.admission != BaoAdmission::Infra || asked != self.stream.realm_id {
+            warn!(peer = %self.stream.peer, "Refusing a set index lookup");
+            return self.refuse();
+        }
+        let answer = AnswerLookupOperation::new(self.stream.stream_id, lookup);
+        Ok(Next::Call(IoCall::child(answer)))
+    }
+}
+
+impl Operation for ServeBaoOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> StreamTurn {
+        let stream = self.stream;
+        let (peer, stream_id) = (stream.peer, stream.stream_id);
+        let infra = self.admission == BaoAdmission::Infra;
+        match VersionReplicationMessage::from_bytes(&self.payload) {
+            Ok(VersionReplicationMessage::VersionManifest(manifest))
+            | Ok(VersionReplicationMessage::ReferenceAdvance { manifest, .. }) => {
+                // Only infrastructure may publish a self-identifying manifest.
+                if !infra {
+                    warn!(peer = %peer, stream_id = %stream_id, "Refusing a replication manifest from a device");
+                    return self.refuse();
+                }
+                let routing = self.routing.take().ok_or(IoError::Unfinished)?;
+                let accept = AcceptVersionOperation::new(stream, manifest, routing, &self.limits);
+                Ok(Next::Call(IoCall::child(accept)))
+            }
+            Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
+                let answer = AnswerReadOperation::new(stream, request);
+                Ok(Next::Call(IoCall::child(answer)))
+            }
+            Ok(VersionReplicationMessage::LocationSummaryRequest(request)) => {
+                // The summary describes what this node holds; a device is never told.
+                if !infra {
+                    warn!(peer = %peer, stream_id = %stream_id, "Refusing a location summary to a device");
+                    return self.refuse();
+                }
+                let answer = AnswerSummaryOperation::new(stream, request);
+                Ok(Next::Call(IoCall::child(answer)))
+            }
+            Ok(VersionReplicationMessage::VersionKeyRequest {
+                realm_id,
+                set_id,
+                version_id,
+            }) => self.lookup(realm_id, SetLookup::Key { set_id, version_id }),
+            Ok(VersionReplicationMessage::ContentRequest {
+                realm_id,
+                set_id,
+                identity,
+            }) => self.lookup(realm_id, SetLookup::Content { set_id, identity }),
+            _ => {
+                error!(peer = %peer, stream_id = %stream_id, "Unsupported inbound bao payload");
+                self.refuse()
+            }
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> StreamTurn {
+        if self.closing {
+            return closed(result);
+        }
+        result.child::<(), IoError>()??;
 }
 
 /// A user of another realm signed in here matches; an anonymous identity only in its own realm.
