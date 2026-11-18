@@ -242,6 +242,434 @@ impl Operation for ServeBaoOperation {
             return closed(result);
         }
         result.child::<(), IoError>()??;
+        Ok(Next::Done(()))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AcceptStep {
+    Routing,
+    Policy,
+    Gate,
+    Incoming,
+    Emit,
+    Close,
+}
+
+/// Executes the manifest and reference-advance family for an admitted infra peer: routing,
+/// request policy, placement gate, and the watch emitted on success. Every refusal closes the
+/// stream.
+#[derive(Debug, PartialEq)]
+struct AcceptVersionOperation {
+    stream: BaoPeerStream,
+    manifest: VersionReplicationManifest,
+    routing: NodeRouting,
+    limits: RoCrateLimits,
+    paths: ManifestPaths,
+    event_id: Ulid,
+    now_ms: u64,
+    step: AcceptStep,
+}
+
+impl AcceptVersionOperation {
+    fn new(
+        stream: BaoPeerStream,
+        manifest: VersionReplicationManifest,
+        routing: NodeRouting,
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            stream,
+            manifest,
+            routing,
+            limits: limits.clone(),
+            paths: (None, None),
+            event_id: Ulid::generate(),
+            now_ms: 0,
+            step: AcceptStep::Routing,
+        }
+    }
+
+    fn refuse(&mut self) -> StreamTurn {
+        self.step = AcceptStep::Close;
+        Ok(Next::Call(close_call(self.stream.stream_id)))
+    }
+
+    fn read_policy(&mut self) -> StreamTurn {
+        let stream = self.stream;
+        let policy =
+            ManifestPolicyOperation::new(stream.realm_id, stream.local_node, &self.manifest);
+        self.step = AcceptStep::Policy;
+        Ok(Next::Call(IoCall::child(policy)))
+    }
+
+    fn incoming(&mut self, gate: Option<GateContext>) -> StreamTurn {
+        let stream = self.stream;
+        let (manifest_path, writer_path) = std::mem::take(&mut self.paths);
+        let mut incoming = IncomingVersionOperation::new(
+            stream.stream_id,
+            stream.local_node,
+            stream.realm_id,
+            self.manifest.clone(),
+        )
+        .with_routing(self.routing.clone())
+        .with_rocrate_limits(self.limits.clone())
+        .with_publisher_node(stream.peer)
+        .with_manifest_policy(manifest_path)
+        .with_writer_policy(writer_path);
+        if let Some(gate) = gate {
+            incoming = incoming.with_gate(gate);
+        }
+        self.step = AcceptStep::Incoming;
+        Ok(Next::Call(IoCall::child(incoming)))
+    }
+
+    /// The event of an applied materialized version; nothing else is announced.
+    fn watch_event(&self, result: &IncomingVersionResult) -> Option<WatchEvent> {
+        let manifest = &self.manifest;
+        let group_id = result.group_id?;
+        if !result.applied || manifest.kind != ReplicationItemKind::Materialized {
+            return None;
+        }
+        let node_id = self.stream.local_node;
+        Some(WatchEvent {
+            event_id: self.event_id,
+            realm_id: manifest.auth_context.realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+            actor: manifest.auth_context.user_id,
+            occurred_at_ms: self.now_ms,
+            detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
+                bucket: manifest.bucket.clone(),
+                key: manifest.key.clone(),
+                size_bytes: manifest.blob.as_ref().map_or(0, |blob| blob.size),
+            },
+        })
+    }
+}
+
+impl Operation for AcceptVersionOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> StreamTurn {
+        let (stream, manifest) = (self.stream, &self.manifest);
+        debug!(
+            peer = %stream.peer,
+            stream_id = %stream.stream_id,
+            bucket = %manifest.bucket,
+            key = %manifest.key,
+            version_id = %manifest.version_id,
+            kind = ?manifest.kind,
+            "Received inbound version replication manifest"
+        );
+        // Only a materialized item can place a blob, so only it reads the caps.
+        if manifest.kind != ReplicationItemKind::Materialized {
+            return self.read_policy();
+        }
+        let quota = QuotaOperation::new(self.routing.clone());
+        Ok(Next::Call(IoCall::child(quota)))
+    }
+
+    fn next(&mut self, result: IoResult) -> StreamTurn {
+        let (peer, stream_id) = (self.stream.peer, self.stream.stream_id);
+        match self.step {
+            AcceptStep::Routing => match result.child::<NodeRouting, RoutingInputsError>()? {
+                Ok(routing) => {
+                    self.routing = routing;
+                    self.read_policy()
+                }
+                Err(error) => {
+                    error!(peer = %peer, error = %error, "Refusing inbound replication with unreadable routing inputs");
+                    self.refuse()
+                }
+            },
+            AcceptStep::Policy => match result.child::<ManifestPaths, StreamPolicyError>()? {
+                Ok(paths) => {
+                    self.paths = paths;
+                    self.step = AcceptStep::Gate;
+                    let gate = GateOperation::new(self.stream.realm_id, self.now_ms);
+                    Ok(Next::Call(IoCall::child(gate)))
+                }
+                Err(error) => {
+                    error!(peer = %peer, stream_id = %stream_id, error = %error, "Refusing inbound replication with unavailable request policy");
+                    self.refuse()
+                }
+            },
+            AcceptStep::Gate => match result.child::<Option<GateContext>, GateContextError>()? {
+                Ok(gate) => self.incoming(gate),
+                Err(error) => {
+                    error!(peer = %peer, stream_id = %stream_id, error = %error, "Refusing inbound replication with unreadable placement subject");
+                    self.refuse()
+                }
+            },
+            AcceptStep::Incoming => {
+                match result.child::<IncomingVersionResult, IncomingVersionError>()? {
+                    Ok(applied) => match self.watch_event(&applied) {
+                        Some(event) => {
+                            self.step = AcceptStep::Emit;
+                            Ok(Next::Call(IoCall::child(EmitEventOperation::new(event))))
+                        }
+                        None => Ok(Next::Done(())),
+                    },
+                    Err(error) => {
+                        error!(error = ?error, "Failed to process inbound version replication stream");
+                        self.refuse()
+                    }
+                }
+            }
+            // Failures only warn inside the operation.
+            AcceptStep::Emit => Ok(Next::Done(())),
+            AcceptStep::Close => closed(result),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadAnswerStep {
+    Policy,
+    Read,
+    Close,
+}
+
+/// Answers the bao read family: policy resolution, then the read; a failure refuses the stream.
+#[derive(Debug, PartialEq)]
+struct AnswerReadOperation {
+    stream: BaoPeerStream,
+    request: Option<BaoReadRequest>,
+    now_ms: u64,
+    step: ReadAnswerStep,
+}
+
+impl AnswerReadOperation {
+    fn new(stream: BaoPeerStream, request: BaoReadRequest) -> Self {
+        Self {
+            stream,
+            request: Some(request),
+            now_ms: 0,
+            step: ReadAnswerStep::Policy,
+        }
+    }
+
+    fn refuse(&mut self) -> StreamTurn {
+        self.step = ReadAnswerStep::Close;
+        Ok(Next::Call(close_call(self.stream.stream_id)))
+    }
+}
+
+impl Operation for AnswerReadOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> StreamTurn {
+        let request = self.request.as_ref().ok_or(IoError::Unfinished)?;
+        let stream = self.stream;
+        let policy = ReadPolicyOperation::new(stream.realm_id, stream.local_node, request);
+        Ok(Next::Call(IoCall::child(policy)))
+    }
+
+    fn next(&mut self, result: IoResult) -> StreamTurn {
+        let stream = self.stream;
+        let (peer, stream_id) = (stream.peer, stream.stream_id);
+        match self.step {
+            ReadAnswerStep::Policy => match result.child::<ReadPolicy, StreamPolicyError>()? {
+                Ok((paths, candidates, had_denial)) => {
+                    let request = self.request.take().ok_or(IoError::Unfinished)?;
+                    let read = IncomingBaoOperation::new(
+                        peer,
+                        stream.local_node,
+                        stream.realm_id,
+                        stream_id,
+                        request,
+                    )
+                    .with_policy_paths(paths)
+                    .with_policy_candidates(candidates, had_denial)
+                    .with_now(self.now_ms)
+                    .with_snapshot();
+                    self.step = ReadAnswerStep::Read;
+                    Ok(Next::Call(IoCall::child(read)))
+                }
+                Err(error) => {
+                    error!(peer = %peer, stream_id = %stream_id, error = %error, "Refusing inbound bao read with unavailable request policy");
+                    self.refuse()
+                }
+            },
+            ReadAnswerStep::Read => match result.child::<IncomingBaoResult, BaoReadError>()? {
+                Ok(_) => Ok(Next::Done(())),
+                Err(error) => {
+                    error!(peer = %peer, stream_id = %stream_id, error = ?error, "Failed to process inbound bao read");
+                    self.refuse()
+                }
+            },
+            ReadAnswerStep::Close => closed(result),
+        }
+    }
+}
+
+/// Answers the location summary family. The summary describes what this node holds, so the
+/// request's own authenticated context decides whether anything is disclosed.
+#[derive(Debug, PartialEq)]
+struct AnswerSummaryOperation {
+    stream: BaoPeerStream,
+    request: Option<LocationSummaryRequest>,
+    closing: bool,
+}
+
+impl AnswerSummaryOperation {
+    fn new(stream: BaoPeerStream, request: LocationSummaryRequest) -> Self {
+        Self {
+            stream,
+            request: Some(request),
+            closing: false,
+        }
+    }
+}
+
+impl Operation for AnswerSummaryOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> StreamTurn {
+        let stream = self.stream;
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        let allowed = request.realm_id == stream.realm_id
+            && auth_matches(&request.auth_context, stream.realm_id);
+        let summary = LocationSummaryOperation::new_incoming(
+            stream.peer,
+            stream.local_node,
+            stream.stream_id,
+            request,
+        )
+        .with_policy(allowed);
+        Ok(Next::Call(IoCall::child(summary)))
+    }
+
+    fn next(&mut self, result: IoResult) -> StreamTurn {
+        if self.closing {
+            return closed(result);
+        }
+        let (peer, stream_id) = (self.stream.peer, self.stream.stream_id);
+        match result.child::<LocalSummary, LocationSummaryError>()? {
+            Ok(_) => Ok(Next::Done(())),
+            Err(error) => {
+                error!(peer = %peer, stream_id = %stream_id, error = ?error, "Failed to answer inbound location summary");
+                self.closing = true;
+                Ok(Next::Call(close_call(stream_id)))
+            }
+        }
+    }
+}
+
+/// One question about the index of a set this member belongs to.
+#[derive(Debug, PartialEq)]
+enum SetLookup {
+    Key { set_id: Ulid, version_id: Ulid },
+    Content { set_id: Ulid, identity: [u8; 32] },
+}
+
+#[derive(Debug, PartialEq)]
+enum LookupStep {
+    Find,
+    Send,
+    Close,
+}
+
+/// Answers which key or which versions this member's index holds, then ends the stream.
+#[derive(Debug, PartialEq)]
+struct AnswerLookupOperation {
+    stream_id: Ulid,
+    lookup: SetLookup,
+    step: LookupStep,
+}
+
+impl AnswerLookupOperation {
+    fn new(stream_id: Ulid, lookup: SetLookup) -> Self {
+        Self {
+            stream_id,
+            lookup,
+            step: LookupStep::Find,
+        }
+    }
+
+    fn close(&mut self) -> StreamTurn {
+        self.step = LookupStep::Close;
+        Ok(Next::Call(close_call(self.stream_id)))
+    }
+
+    fn send(&mut self, answer: VersionReplicationMessage) -> StreamTurn {
+        let Ok(payload) = answer.to_bytes() else {
+            return self.close();
+        };
+        self.step = LookupStep::Send;
+        let stream_id = self.stream_id;
+        let send = BlobEffect::SendMessage { stream_id, payload };
+        Ok(Next::Call(Effect::Blob(send).into()))
+    }
+}
+
+impl Operation for AnswerLookupOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> StreamTurn {
+        Ok(Next::Call(match &self.lookup {
+            SetLookup::Key { set_id, version_id } => {
+                IoCall::child(indexed_key(*set_id, *version_id))
+            }
+            SetLookup::Content { set_id, identity } => {
+                IoCall::child(content_versions(*set_id, identity, MAX_CONTENT_VERSIONS))
+            }
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> StreamTurn {
+        match self.step {
+            LookupStep::Find => match self.lookup {
+                SetLookup::Key { .. } => {
+                    let key = (result.child::<Option<String>, ResolveError>()?)
+                        .ok()
+                        .flatten();
+                    self.send(VersionReplicationMessage::VersionKeyResponse(key))
+                }
+                SetLookup::Content { .. } => match result.child::<ContentPage, ResolveError>()? {
+                    Ok((versions, more)) => {
+                        self.send(VersionReplicationMessage::ContentResponse { versions, more })
+                    }
+                    Err(_) => self.close(),
+                },
+            },
+            LookupStep::Send => {
+                if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+                    debug!(error = ?error, "Failed to answer a set index lookup");
+                }
+                self.close()
+            }
+            LookupStep::Close => closed(result),
+        }
+    }
+}
+
+/// Why the request policy of an inbound stream could not be decided.
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum StreamPolicyError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error("{0}")]
+    Failed(String),
+}
+
+fn policy_failed(error: impl std::fmt::Display) -> StreamPolicyError {
+    StreamPolicyError::Failed(error.to_string())
 }
 
 /// A user of another realm signed in here matches; an anonymous identity only in its own realm.
