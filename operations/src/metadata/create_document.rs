@@ -6,20 +6,21 @@ use std::sync::{Mutex, OnceLock};
 
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::events::Event;
+use aruna_core::keyspaces::{CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
     MetadataEventRecord, MetadataGraphPolicy, MetadataRequestDurability, ProfileValidationStatus,
     RAW_BYTES_LIMIT, raw_quotas,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
 use aruna_core::storage_entries::{
-    commit_message_entry, create_acceptance_entry, create_acceptance_key, profile_validation_entry,
-    raw_budget_entry,
+    commit_message_entry, create_acceptance_entry, create_acceptance_key, metadata_document_key,
+    profile_validation_entry, raw_budget_entry,
 };
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, RETENTION_MS, WorkspaceMode, pid_dedup_key,
@@ -33,17 +34,17 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
-use aruna_core::types::{Effects, GroupId, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::metadata::call_results::{effect_event, read_value, read_values};
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
 };
-use crate::metadata::repository::{create_projection_entries, read_document_registry};
+use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
@@ -85,9 +86,8 @@ pub struct CreateDocumentResult {
     pub event_id: Ulid,
 }
 
-/// Validates metadata create input and appends a durable create event.
-///
-/// Success means pipeline acceptance, not materialization or replication.
+/// Validates metadata create input outside a transaction, then appends the durable create
+/// event in a write child. Success means pipeline acceptance, not materialization or replication.
 #[derive(Debug, PartialEq)]
 pub struct CreateDocumentOperation {
     pub(super) config: CreateDocumentConfig,
@@ -95,35 +95,26 @@ pub struct CreateDocumentOperation {
     /// Set when a non-holder forwarded this create; the id was already minted at
     /// the origin with the blind-hash bucket, so this node keeps it unchanged.
     pub(super) forwarded: bool,
+    /// Set on a rerun after a lost conflict: it goes straight to the commit, whose fence read
+    /// finds a concurrent identical create.
     conflict_recheck: bool,
-    txn_id: Option<TxnId>,
-    state: CreateDocumentState,
-    record: Option<MetadataRegistryRecord>,
-    create_event: Option<MetadataEventRecord>,
+    stage: CreateStage,
     pub(super) route_profile_status: Option<ProfileValidationStatus>,
-    pending_realm_config: Option<RealmConfigDocument>,
-    pending_placement: Option<PlacementRef>,
-    pending_holders: Vec<NodeId>,
     /// The author's commit message for the ARC snapshot of this create.
     message: Option<String>,
     /// The phase-time and identity source. Production uses the default source;
     /// tests replace it before the first record is built.
     phase_source: crate::metadata::MetadataPhaseSource,
-    output: Option<Result<CreateDocumentResult, CreateDocumentError>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum CreateDocumentState {
-    Init,
-    ValidateGraph,
-    CheckExisting,
-    StartTransaction,
-    ReadCreateFence,
-    ReadPidFence,
-    AppendCreateEvent,
-    CommitTransaction,
-    Finish,
-    Error,
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CreateStage {
+    /// Validating the crate against the graph.
+    Validate,
+    /// Checking that no registry row holds the id yet.
+    Existing,
+    /// Waiting for the write child.
+    Commit,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -151,23 +142,28 @@ pub enum CreateDocumentError {
     /// The structured-id generator refused to mint under a clock-health fault.
     #[error(transparent)]
     ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
-    #[error("missing active transaction")]
-    MissingTransaction,
-    #[error("operation did not finish")]
-    NotFinished,
     #[error("metadata raw update budget exceeded")]
     RawLimit,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("persistent id mapping bucket is closing; retry the create")]
     PlacementFenced,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error(transparent)]
+    Io(IoError),
 }
+
+// A storage failure keeps its own transience; a lost conflict is the conflict the retry reruns.
+impl From<IoError> for CreateDocumentError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type CreateTurn = Result<Next<CreateDocumentResult>, CreateDocumentError>;
 
 impl CreateDocumentOperation {
     pub fn new(config: CreateDocumentConfig) -> Self {
@@ -183,17 +179,10 @@ impl CreateDocumentOperation {
             skip_existing_check: false,
             forwarded: false,
             conflict_recheck: false,
-            txn_id: None,
-            state: CreateDocumentState::Init,
-            record: None,
-            create_event: None,
+            stage: CreateStage::Validate,
             route_profile_status,
-            pending_realm_config: None,
-            pending_placement: None,
-            pending_holders: Vec::new(),
             message: None,
             phase_source: crate::metadata::MetadataPhaseSource::default(),
-            output: None,
         }
     }
 
@@ -245,33 +234,201 @@ impl CreateDocumentOperation {
             skip_existing_check: self.skip_existing_check,
             forwarded: self.forwarded,
             conflict_recheck: false,
-            txn_id: None,
-            state: CreateDocumentState::Init,
-            record: None,
-            create_event: None,
+            stage: CreateStage::Validate,
             route_profile_status: self.route_profile_status.clone(),
-            pending_realm_config: None,
-            pending_placement: None,
-            pending_holders: Vec::new(),
             message: self.message.clone(),
             phase_source: self.phase_source,
-            output: None,
         }
     }
 
-    fn graph_iri(&self) -> String {
-        MetadataRegistryRecord::graph_iri_for(self.config.document_id)
+    pub(super) fn create_event_payload(config: &CreateDocumentConfig) -> MetadataEventPayload {
+        match &config.payload {
+            CreateDocumentPayload::Scaffold {
+                name,
+                description,
+                date_published,
+                license,
+            } => MetadataEventPayload::Scaffold {
+                name: name.clone(),
+                description: description.clone(),
+                date_published: date_published.clone(),
+                license: license.clone(),
+            },
+            CreateDocumentPayload::RoCrate { jsonld } => MetadataEventPayload::RoCrate {
+                jsonld: jsonld.clone(),
+            },
+        }
     }
 
-    fn permission_path(&self) -> String {
-        MetadataRegistryRecord::permission_path_for(
-            &self.config.actor.realm_id,
-            self.config.group_id,
-            &self.config.document_path,
-            self.config.document_id,
-        )
+    fn graph_policy(&self) -> MetadataGraphPolicy {
+        MetadataGraphPolicy {
+            public: self.config.public,
+            permission_paths: vec![permission_path(&self.config)],
+        }
+        .normalized()
     }
 
+    fn graph_validation_effect(&self) -> Effect {
+        let graph_iri = graph_iri(&self.config);
+        let policy = self.graph_policy();
+        match &self.config.payload {
+            CreateDocumentPayload::Scaffold {
+                name,
+                description,
+                date_published,
+                license,
+            } => Effect::Metadata(MetadataEffect::ValidateCreateCrate {
+                request: MetadataCrateRequest {
+                    graph_iri,
+                    name: name.clone(),
+                    description: description.clone(),
+                    date_published: date_published.clone(),
+                    license: license.clone(),
+                    policy,
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor: None,
+                },
+            }),
+            CreateDocumentPayload::RoCrate { jsonld } => {
+                Effect::Metadata(MetadataEffect::ValidateRoCrate {
+                    request: aruna_core::metadata::ApplyRoCrateRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                        policy,
+                        durability: MetadataRequestDurability::WalAlreadyDurable,
+                        deterministic_actor: None,
+                    },
+                })
+            }
+        }
+    }
+
+    fn validated(&mut self, result: IoResult) -> CreateTurn {
+        match effect_event(result)? {
+            Event::Metadata(MetadataEvent::ValidationResult { .. }) if self.skip_existing_check => {
+                self.commit()
+            }
+            Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
+                self.stage = CreateStage::Existing;
+                let key = metadata_document_key(self.config.document_id);
+                Ok(Next::Call(IoCall::Read(vec![(
+                    DOCUMENT_INDEX_KEYSPACE.to_string(),
+                    key,
+                )])))
+            }
+            Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
+            other => Err(unexpected("metadata validation result", &other)),
+        }
+    }
+
+    fn existing_read(&mut self, result: IoResult) -> CreateTurn {
+        match read_value(result)? {
+            Some(bytes) => {
+                postcard::from_bytes::<MetadataRegistryRecord>(&bytes)
+                    .map_err(aruna_core::errors::ConversionError::from)?;
+                Err(CreateDocumentError::DocumentAlreadyExists)
+            }
+            None => self.commit(),
+        }
+    }
+
+    /// Hands the validated create to the transactional commit.
+    fn commit(&mut self) -> CreateTurn {
+        self.stage = CreateStage::Commit;
+        Ok(Next::Call(IoCall::child(self.commit_operation())))
+    }
+
+    fn commit_operation(&self) -> CreateCommitOperation {
+        CreateCommitOperation {
+            config: self.config.clone(),
+            route_profile_status: self.route_profile_status.clone(),
+            message: self.message.clone(),
+            phase_source: self.phase_source,
+            stage: CommitStage::Fence,
+            pending: None,
+            created: None,
+        }
+    }
+}
+
+impl Operation for CreateDocumentOperation {
+    type Output = CreateDocumentResult;
+    type Error = CreateDocumentError;
+
+    fn first(&mut self) -> CreateTurn {
+        if self.conflict_recheck {
+            return self.commit();
+        }
+        if let CreateDocumentPayload::RoCrate { jsonld } = &self.config.payload {
+            profile_path_rule(&self.config.document_path, || crate_is_profile(jsonld))?;
+        }
+        let validation = self.graph_validation_effect();
+        Ok(Next::Call(IoCall::Effect(Box::new(validation))))
+    }
+
+    fn next(&mut self, result: IoResult) -> CreateTurn {
+        match self.stage {
+            CreateStage::Validate => self.validated(result),
+            CreateStage::Existing => self.existing_read(result),
+            CreateStage::Commit => Ok(Next::Done(
+                result.child::<CreateDocumentResult, CreateDocumentError>()??,
+            )),
+        }
+    }
+
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<CreateDocumentResult> {
+        self.conflict_recheck = true;
+        AfterConflict::rerun_within(attempt, Self::conflict_retries())
+    }
+}
+
+fn unexpected(expected: &'static str, event: &Event) -> CreateDocumentError {
+    CreateDocumentError::Io(IoError::Unexpected {
+        expected,
+        got: event.label(),
+    })
+}
+
+fn graph_iri(config: &CreateDocumentConfig) -> String {
+    MetadataRegistryRecord::graph_iri_for(config.document_id)
+}
+
+fn permission_path(config: &CreateDocumentConfig) -> String {
+    MetadataRegistryRecord::permission_path_for(
+        &config.actor.realm_id,
+        config.group_id,
+        &config.document_path,
+        config.document_id,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CommitStage {
+    /// Reading the accepted create, the realm config and the group fence.
+    Fence,
+    /// Reading the persistent id mapping's bucket fence.
+    PidFence,
+    /// Writing the create event and its rows.
+    Write,
+}
+
+/// The placement a create resolved, kept while its persistent id fence is read.
+type Resolved = (RealmConfigDocument, PlacementRef, Vec<NodeId>);
+
+/// The write transaction of a metadata create: reads its fences, resolves the placement from
+/// the id and appends the create event with all its rows. A matching accepted create is replayed.
+#[derive(Debug, PartialEq)]
+pub struct CreateCommitOperation {
+    config: CreateDocumentConfig,
+    route_profile_status: Option<ProfileValidationStatus>,
+    message: Option<String>,
+    phase_source: crate::metadata::MetadataPhaseSource,
+    stage: CommitStage,
+    pending: Option<Resolved>,
+    created: Option<CreateDocumentResult>,
+}
+
+impl CreateCommitOperation {
     fn holder_node_ids(
         &self,
         config: Option<&RealmConfigDocument>,
@@ -326,34 +483,15 @@ impl CreateDocumentOperation {
             document_path: MetadataRegistryRecord::normalize_document_path(
                 &self.config.document_path,
             ),
-            graph_iri: self.graph_iri(),
+            graph_iri: graph_iri(&self.config),
             public: self.config.public,
-            permission_path: self.permission_path(),
+            permission_path: permission_path(&self.config),
             placement,
             holder_node_ids,
             created_at_ms: now,
             updated_at_ms: now,
             establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
-        }
-    }
-
-    fn create_event_payload(config: &CreateDocumentConfig) -> MetadataEventPayload {
-        match &config.payload {
-            CreateDocumentPayload::Scaffold {
-                name,
-                description,
-                date_published,
-                license,
-            } => MetadataEventPayload::Scaffold {
-                name: name.clone(),
-                description: description.clone(),
-                date_published: date_published.clone(),
-                license: license.clone(),
-            },
-            CreateDocumentPayload::RoCrate { jsonld } => MetadataEventPayload::RoCrate {
-                jsonld: jsonld.clone(),
-            },
         }
     }
 
@@ -368,143 +506,59 @@ impl CreateDocumentOperation {
             record,
             user_id: self.config.actor.user_id,
             node_id: self.config.actor.node_id,
-            payload: Self::create_event_payload(&self.config),
+            payload: CreateDocumentOperation::create_event_payload(&self.config),
             occurred_at_ms,
         }
-    }
-
-    fn graph_policy(&self) -> MetadataGraphPolicy {
-        MetadataGraphPolicy {
-            public: self.config.public,
-            permission_paths: vec![self.permission_path()],
-        }
-        .normalized()
-    }
-
-    fn graph_validation_effect(&self) -> Effect {
-        let graph_iri = self.graph_iri();
-        let policy = self.graph_policy();
-        match &self.config.payload {
-            CreateDocumentPayload::Scaffold {
-                name,
-                description,
-                date_published,
-                license,
-            } => Effect::Metadata(MetadataEffect::ValidateCreateCrate {
-                request: MetadataCrateRequest {
-                    graph_iri,
-                    name: name.clone(),
-                    description: description.clone(),
-                    date_published: date_published.clone(),
-                    license: license.clone(),
-                    policy,
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor: None,
-                },
-            }),
-            CreateDocumentPayload::RoCrate { jsonld } => {
-                Effect::Metadata(MetadataEffect::ValidateRoCrate {
-                    request: aruna_core::metadata::ApplyRoCrateRequest {
-                        graph_iri,
-                        jsonld: jsonld.clone(),
-                        policy,
-                        durability: MetadataRequestDurability::WalAlreadyDurable,
-                        deterministic_actor: None,
-                    },
-                })
-            }
-        }
-    }
-
-    fn validation_effect(&mut self) -> Effects {
-        self.state = CreateDocumentState::ValidateGraph;
-        smallvec![self.graph_validation_effect()]
-    }
-
-    fn start_transaction_effect(&mut self) -> Effects {
-        self.state = CreateDocumentState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
     }
 
     /// The realm config joins the fence read set read-only: it is never written
     /// back, so concurrent creates stay conflict-free, while a real config change
     /// conflicts the commit and makes the retry re-choose its placement.
-    fn read_create_fence(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = CreateDocumentState::ReadCreateFence;
+    fn fence_reads(&self) -> Vec<(String, Key)> {
         let realm_target = DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                    create_acceptance_key(self.config.document_id),
-                ),
-                (
-                    realm_target.storage_keyspace().to_string(),
-                    realm_target.storage_key(),
-                ),
-                crate::groups::fence::group_fence_key(self.config.group_id),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        vec![
+            (
+                CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                create_acceptance_key(self.config.document_id),
+            ),
+            (
+                realm_target.storage_keyspace().to_string(),
+                realm_target.storage_key(),
+            ),
+            crate::groups::fence::group_fence_key(self.config.group_id),
+        ]
     }
 
-    fn finish_accepted_create(&mut self, event: MetadataEventRecord) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.fail(CreateDocumentError::MissingTransaction);
-        };
-        self.record = Some(event.record.clone());
-        self.create_event = Some(event.clone());
-        self.state = CreateDocumentState::Finish;
-        self.output = Some(Ok(CreateDocumentResult {
-            record: event.record,
-            event_id: event.event_id,
-        }));
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn apply_create_fence(
-        &mut self,
-        acceptance_value: Option<Value>,
-        realm_config_value: Option<Value>,
-    ) -> Effects {
-        if let Some(bytes) = acceptance_value {
-            let event: MetadataEventRecord = match postcard::from_bytes(&bytes) {
-                Ok(event) => event,
-                Err(error) => {
-                    return self.fail(CreateDocumentError::ConversionError(error.into()));
-                }
-            };
-            return if accepted_create_matches(&self.config, &event) {
-                self.finish_accepted_create(event)
-            } else {
-                self.fail(CreateDocumentError::DocumentAlreadyExists)
-            };
+    fn fence_read(&mut self, result: IoResult) -> CommitTurn {
+        let values = read_values(result)?;
+        let [acceptance, realm_config, group_fence] =
+            <[_; 3]>::try_from(values).map_err(|_| IoError::Unexpected {
+                expected: "three create fence values",
+                got: "another count of values",
+            })?;
+        aruna_core::structs::identity::group_delete::check_group_write(group_fence.as_deref())?;
+        if let Some(bytes) = acceptance {
+            let event: MetadataEventRecord =
+                postcard::from_bytes(&bytes).map_err(aruna_core::errors::ConversionError::from)?;
+            if !accepted_create_matches(&self.config, &event) {
+                return Err(CreateDocumentError::DocumentAlreadyExists);
+            }
+            return Ok(Next::Done(CreateDocumentResult {
+                record: event.record,
+                event_id: event.event_id,
+            }));
         }
-        if self.conflict_recheck {
-            return self.fail(StorageError::TransactionConflict.into());
-        }
-
-        let Some(config_bytes) = realm_config_value.as_ref() else {
-            return self.fail(CreateDocumentError::PlacementBindingUnavailable(
+        let Some(config_bytes) = realm_config else {
+            return Err(CreateDocumentError::PlacementBindingUnavailable(
                 "realm config unavailable".to_string(),
             ));
         };
-        let config = match RealmConfigDocument::from_bytes(config_bytes) {
-            Ok(config) => config,
-            Err(error) => return self.fail(error.into()),
-        };
-        match self.placement_from_id(Some(&config)) {
-            Ok(placement) => match self.holder_node_ids(Some(&config), &placement) {
-                Ok(holders) => self.ensure_pid_fence(config, placement, holders),
-                Err(error) => self.fail(error),
-            },
-            Err(error) => self.fail(error),
-        }
+        let config = RealmConfigDocument::from_bytes(&config_bytes)?;
+        let placement = self.placement_from_id(Some(&config))?;
+        let holders = self.holder_node_ids(Some(&config), &placement)?;
+        self.ensure_pid_fence(config, placement, holders)
     }
 
     fn ensure_pid_fence(
@@ -512,10 +566,7 @@ impl CreateDocumentOperation {
         realm_config: RealmConfigDocument,
         placement: PlacementRef,
         holders: Vec<NodeId>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateDocumentError::MissingTransaction);
-        };
+    ) -> CommitTurn {
         let route = mapping_route_for(
             &realm_config,
             self.config.actor.realm_id,
@@ -526,22 +577,34 @@ impl CreateDocumentOperation {
             return self.append_create_event(&realm_config, placement, holders);
         };
         if route.peers.first().copied() != Some(self.config.actor.node_id) {
-            return self.fail(CreateDocumentError::HoldsNoBucket);
+            return Err(CreateDocumentError::HoldsNoBucket);
         }
         if route.generation == 0 {
             return self.append_create_event(&realm_config, placement, holders);
         }
-        let (key_space, key) =
-            aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
-        self.pending_realm_config = Some(realm_config);
-        self.pending_placement = Some(placement);
-        self.pending_holders = holders;
-        self.state = CreateDocumentState::ReadPidFence;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space,
-            key,
-            txn_id: Some(txn_id),
-        })]
+        let read = aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
+        self.pending = Some((realm_config, placement, holders));
+        self.stage = CommitStage::PidFence;
+        Ok(Next::Call(IoCall::Read(vec![read])))
+    }
+
+    fn pid_fence_read(&mut self, result: IoResult) -> CommitTurn {
+        let value = read_value(result)?;
+        let Some((config, placement, holders)) = self.pending.take() else {
+            return Err(CreateDocumentError::PlacementFenced);
+        };
+        let Some(route) = mapping_route_for(
+            &config,
+            self.config.actor.realm_id,
+            self.config.document_id,
+            self.config.actor.node_id,
+        ) else {
+            return Err(CreateDocumentError::PlacementFenced);
+        };
+        if !aruna_core::placement::fence::admits(value.as_ref(), route.generation) {
+            return Err(CreateDocumentError::PlacementFenced);
+        }
+        self.append_create_event(&config, placement, holders)
     }
 
     fn append_create_event(
@@ -549,27 +612,15 @@ impl CreateDocumentOperation {
         realm_config: &RealmConfigDocument,
         placement: PlacementRef,
         holders: Vec<NodeId>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateDocumentError::MissingTransaction);
-        };
+    ) -> CommitTurn {
         let record = self.build_record(holders, placement);
         let create_event = self.create_event_record(&record);
-        self.create_event = Some(create_event.clone());
-        self.record = Some(create_event.record.clone());
-        self.state = CreateDocumentState::AppendCreateEvent;
-        let encoded_bytes = match postcard::experimental::serialized_size(&create_event) {
-            Ok(size) => size,
-            Err(error) => {
-                return self.fail(CreateDocumentError::ConversionError(error.into()));
-            }
-        };
-        let encoded_bytes = match u64::try_from(encoded_bytes) {
-            Ok(size) => size,
-            Err(_) => return self.fail(CreateDocumentError::RawLimit),
-        };
+        let encoded_bytes = postcard::experimental::serialized_size(&create_event)
+            .map_err(aruna_core::errors::ConversionError::from)?;
+        let encoded_bytes =
+            u64::try_from(encoded_bytes).map_err(|_| CreateDocumentError::RawLimit)?;
         if encoded_bytes > RAW_BYTES_LIMIT {
-            return self.fail(CreateDocumentError::RawLimit);
+            return Err(CreateDocumentError::RawLimit);
         }
         let Some(raw_budget) = raw_quotas(
             create_event.record.document_id,
@@ -582,125 +633,119 @@ impl CreateDocumentOperation {
                 .into_iter()
                 .find(|budget| budget.node_id == create_event.node_id)
         }) else {
-            return self.fail(CreateDocumentError::RawLimit);
+            return Err(CreateDocumentError::RawLimit);
         };
         let Some(mut status) = self.route_profile_status.clone() else {
-            return self.fail(
-                MetadataError::Backend(
-                    "profile validation status is missing before create commit".to_string(),
-                )
-                .into(),
-            );
+            return Err(MetadataError::Backend(
+                "profile validation status is missing before create commit".to_string(),
+            )
+            .into());
         };
         status.document_id = create_event.record.document_id;
         status.dataset_revision = create_event.event_id;
-        let writes = create_projection_entries(&create_event).and_then(|mut writes| {
-            writes.push(raw_budget_entry(&raw_budget)?);
-            writes.push(create_acceptance_entry(&create_event)?);
-            writes.push(profile_validation_entry(&status)?);
-            // The accepting node journals the creation for plugins in its commit batch.
-            let now = aruna_core::time::unix_timestamp_millis();
-            let created = SourceEvent::dataset_created(&create_event, now);
-            writes.extend(journal_entries(&created)?);
-            if let Some(message) = &self.message {
-                writes.push(commit_message_entry(&create_event, message)?);
-            }
-            Ok(writes)
-        });
-        match writes.and_then(|mut writes| {
-            let profile = match &self.config.payload {
-                CreateDocumentPayload::Scaffold { .. } => false,
-                CreateDocumentPayload::RoCrate { jsonld } => {
-                    crate::metadata::profile::rules::rocrate_is_profile(
-                        jsonld,
-                        &create_event.record.graph_iri,
-                    )
-                    .map_err(aruna_core::errors::ConversionError::FromStrError)?
-                }
-            };
-            let dedup_key = pid_dedup_key(create_event.record.document_id);
-            let job_id = crate::jobs::submit::mint_configured_job(
-                realm_config,
-                create_event.node_id,
-                &dedup_key,
-            )
-            .map_err(|error| {
-                aruna_core::errors::ConversionError::FromStrError(error.to_string())
-            })?;
-            let mut job = JobRecord::new(
-                job_id,
-                JobPayload::MintPersistentId(MintPersistentSpec {
-                    document_id: create_event.record.document_id,
-                    minted_by: create_event.user_id,
-                }),
-                create_event.user_id,
-                create_event.node_id,
-                create_event.occurred_at_ms,
-                create_event.occurred_at_ms,
-                Some(dedup_key),
-            );
-            job.workspace_mode = WorkspaceMode::None;
-            job.retention_ms = RETENTION_MS;
-            writes.extend(aruna_core::structs::execution::job::job_insert_entries(
-                &job,
-            )?);
-
-            let route = mapping_route_for(
-                realm_config,
-                create_event.record.realm_id,
-                create_event.record.document_id,
-                create_event.node_id,
-            );
-            let mapping = PersistentIdMapping::requested(
-                create_event.record.document_id,
-                profile,
-                create_event.user_id,
-                job_id,
-                create_event.record.public,
-                create_event.record.permission_path.clone(),
-                mapping_revision(&route, create_event.occurred_at_ms),
-            );
-            writes.extend(transition_entries(&route, &mapping).map_err(|error| {
-                aruna_core::errors::ConversionError::FromStrError(error.to_string())
-            })?);
-            Ok(writes)
-        }) {
-            Ok(writes) => {
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Err(error) => self.fail(CreateDocumentError::ConversionError(error)),
+        let mut writes = create_projection_entries(&create_event)?;
+        writes.push(raw_budget_entry(&raw_budget)?);
+        writes.push(create_acceptance_entry(&create_event)?);
+        writes.push(profile_validation_entry(&status)?);
+        // The accepting node journals the creation for plugins in its commit batch.
+        let now = aruna_core::time::unix_timestamp_millis();
+        let created = SourceEvent::dataset_created(&create_event, now);
+        writes.extend(journal_entries(&created)?);
+        if let Some(message) = &self.message {
+            writes.push(commit_message_entry(&create_event, message)?);
         }
+        writes.extend(self.pid_entries(realm_config, &create_event)?);
+        self.created = Some(CreateDocumentResult {
+            record: create_event.record,
+            event_id: create_event.event_id,
+        });
+        self.stage = CommitStage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn commit_transaction_effect(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateDocumentError::MissingTransaction);
+    /// The persistent id mint job and the requested mapping of the new document.
+    fn pid_entries(
+        &self,
+        realm_config: &RealmConfigDocument,
+        create_event: &MetadataEventRecord,
+    ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
+        let profile = match &self.config.payload {
+            CreateDocumentPayload::Scaffold { .. } => false,
+            CreateDocumentPayload::RoCrate { jsonld } => {
+                crate::metadata::profile::rules::rocrate_is_profile(
+                    jsonld,
+                    &create_event.record.graph_iri,
+                )
+                .map_err(aruna_core::errors::ConversionError::FromStrError)?
+            }
         };
-        self.state = CreateDocumentState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let dedup_key = pid_dedup_key(create_event.record.document_id);
+        let job_id = crate::jobs::submit::mint_configured_job(
+            realm_config,
+            create_event.node_id,
+            &dedup_key,
+        )
+        .map_err(|error| aruna_core::errors::ConversionError::FromStrError(error.to_string()))?;
+        let mut job = JobRecord::new(
+            job_id,
+            JobPayload::MintPersistentId(MintPersistentSpec {
+                document_id: create_event.record.document_id,
+                minted_by: create_event.user_id,
+            }),
+            create_event.user_id,
+            create_event.node_id,
+            create_event.occurred_at_ms,
+            create_event.occurred_at_ms,
+            Some(dedup_key),
+        );
+        job.workspace_mode = WorkspaceMode::None;
+        job.retention_ms = RETENTION_MS;
+        let mut writes = aruna_core::structs::execution::job::job_insert_entries(&job)?;
+        let route = mapping_route_for(
+            realm_config,
+            create_event.record.realm_id,
+            create_event.record.document_id,
+            create_event.node_id,
+        );
+        let mapping = PersistentIdMapping::requested(
+            create_event.record.document_id,
+            profile,
+            create_event.user_id,
+            job_id,
+            create_event.record.public,
+            create_event.record.permission_path.clone(),
+            mapping_revision(&route, create_event.occurred_at_ms),
+        );
+        writes.extend(transition_entries(&route, &mapping).map_err(|error| {
+            aruna_core::errors::ConversionError::FromStrError(error.to_string())
+        })?);
+        Ok(writes)
+    }
+}
+
+type CommitTurn = Result<Next<CreateDocumentResult>, CreateDocumentError>;
+
+impl Operation for CreateCommitOperation {
+    type Output = CreateDocumentResult;
+    type Error = CreateDocumentError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn fail(&mut self, error: CreateDocumentError) -> Effects {
-        let cleanup = self.abort();
-        self.state = CreateDocumentState::Error;
-        self.output = Some(Err(error));
-        cleanup
+    fn first(&mut self) -> CommitTurn {
+        Ok(Next::Call(IoCall::Read(self.fence_reads())))
     }
 
-    fn fail_without_cleanup(&mut self, error: CreateDocumentError) -> Effects {
-        self.fail(error)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(CreateDocumentError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn next(&mut self, result: IoResult) -> CommitTurn {
+        match self.stage {
+            CommitStage::Fence => self.fence_read(result),
+            CommitStage::PidFence => self.pid_fence_read(result),
+            CommitStage::Write => {
+                result.done()?;
+                Ok(Next::Done(self.created.clone().ok_or(IoError::Unfinished)?))
+            }
+        }
     }
 }
 
@@ -895,243 +940,37 @@ fn id_generator() -> &'static Mutex<StructuredIdGenerator> {
     GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
 }
 
-impl EffectOperation for CreateDocumentOperation {
-    fn is_conflict(error: &CreateDocumentError) -> bool {
-        matches!(
-            error,
-            CreateDocumentError::StorageError(StorageError::TransactionConflict)
-        )
-    }
-
-    type Output = CreateDocumentResult;
-    type Error = CreateDocumentError;
-
-    fn start(&mut self) -> Effects {
-        if let CreateDocumentPayload::RoCrate { jsonld } = &self.config.payload
-            && let Err(error) =
-                profile_path_rule(&self.config.document_path, || crate_is_profile(jsonld))
-        {
-            return self.fail_without_cleanup(error.into());
-        }
-        self.validation_effect()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            CreateDocumentState::ValidateGraph => match event {
-                Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
-                    if self.skip_existing_check {
-                        return self.start_transaction_effect();
-                    }
-                    self.state = CreateDocumentState::CheckExisting;
-                    smallvec![read_document_registry(self.config.document_id, None)]
-                }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("metadata validation result", other.label().to_string())
-                }
-            },
-            CreateDocumentState::CheckExisting => {
-                match crate::metadata::repository::parse_registry_read(event) {
-                    Ok(Some(_)) => {
-                        self.fail_without_cleanup(CreateDocumentError::DocumentAlreadyExists)
-                    }
-                    Ok(None) => self.start_transaction_effect(),
-                    Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
-                        self.fail_without_cleanup(error.into())
-                    }
-                    Err(crate::metadata::repository::StorageReadError::Conversion(error)) => {
-                        self.fail_without_cleanup(error.into())
-                    }
-                }
-            }
-            CreateDocumentState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.read_create_fence(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("transaction start result", other.label().to_string())
-                }
-            },
-            CreateDocumentState::ReadCreateFence => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [
-                        (_, acceptance_value),
-                        (_, realm_config_value),
-                        (_, group_fence),
-                    ] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "metadata create fence read",
-                            format!("batch read with {} values", values.len()),
-                        );
-                    };
-                    if let Err(error) =
-                        aruna_core::structs::identity::group_delete::check_group_write(
-                            group_fence.as_deref(),
-                        )
-                    {
-                        return self.fail(error.into());
-                    }
-                    self.apply_create_fence(acceptance_value.clone(), realm_config_value.clone())
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("create fence read result", other.label().to_string())
-                }
-            },
-            CreateDocumentState::ReadPidFence => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(config) = self.pending_realm_config.take() else {
-                        return self.fail(CreateDocumentError::PlacementFenced);
-                    };
-                    let Some(placement) = self.pending_placement.take() else {
-                        return self.fail(CreateDocumentError::PlacementFenced);
-                    };
-                    let holders = std::mem::take(&mut self.pending_holders);
-                    let Some(route) = mapping_route_for(
-                        &config,
-                        self.config.actor.realm_id,
-                        self.config.document_id,
-                        self.config.actor.node_id,
-                    ) else {
-                        return self.fail(CreateDocumentError::PlacementFenced);
-                    };
-                    if !aruna_core::placement::fence::admits(value.as_ref(), route.generation) {
-                        return self.fail(CreateDocumentError::PlacementFenced);
-                    }
-                    self.append_create_event(&config, placement, holders)
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("persistent id fence read", other.label().to_string())
-                }
-            },
-            CreateDocumentState::AppendCreateEvent => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    self.commit_transaction_effect()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("metadata create event append", other.label().to_string())
-                }
-            },
-            CreateDocumentState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    let Some(record) = self.record.clone() else {
-                        return self.fail_without_cleanup(CreateDocumentError::MissingTransaction);
-                    };
-                    let Some(create_event) = self.create_event.as_ref() else {
-                        return self.fail_without_cleanup(CreateDocumentError::MissingTransaction);
-                    };
-                    self.state = CreateDocumentState::Finish;
-                    self.output = Some(Ok(CreateDocumentResult {
-                        record,
-                        event_id: create_event.event_id,
-                    }));
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) => {
-                    self.txn_id = None;
-                    self.record = None;
-                    self.create_event = None;
-                    self.pending_realm_config = None;
-                    self.pending_placement = None;
-                    self.pending_holders.clear();
-                    self.conflict_recheck = true;
-                    self.start_transaction_effect()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail_without_cleanup(error.into())
-                }
-                other => {
-                    self.unexpected_event("transaction commit result", other.label().to_string())
-                }
-            },
-            CreateDocumentState::Finish
-            | CreateDocumentState::Error
-            | CreateDocumentState::Init => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateDocumentState::Finish | CreateDocumentState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CreateDocumentError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-        accepted_create_matches,
-    };
+    use super::*;
     use crate::metadata::create_entry::create_metadata_document;
 
     use std::sync::Arc;
 
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::StructuredId;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
-        CREATE_ACCEPTANCE_KEYSPACE, DEDUP_INDEX_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
-        EVENT_LOG_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
-        RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
+        DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE,
+        PENDING_PROJECTION_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
     };
-    use aruna_core::metadata::{
-        MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
-        MetadataRequestDurability, RawOriginBudget,
-    };
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::storage_entries::{
-        create_acceptance_key, event_log_prefix, pending_projection_key,
-    };
-    use aruna_core::structs::execution::job::{JobPayload, JobRecord};
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::metadata::RawOriginBudget;
+    use aruna_core::placement::resolve_shard_holders;
+    use aruna_core::storage_entries::{event_log_prefix, pending_projection_key};
+    use aruna_core::structs::PersistentIdStatus;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::record::{
-        DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
-        PlacementRef, PlacementScope,
+        FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_core::structs::{PersistentIdMapping, PersistentIdStatus};
-    use aruna_core::types::{Effects, GroupId, Key};
-    use aruna_core::{MetaResourceId, PlacementHandle, StructuredId};
     use aruna_storage::storage::EffectReceiver;
     use aruna_storage::{FjallStorage, StorageHandle};
-    use ulid::Ulid;
 
     use crate::driver::DriverContext;
     use crate::metadata::MetadataHandle;
-    use aruna_core::placement::resolve_shard_holders;
+
+    type Rows = Vec<(String, Key, Value)>;
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
@@ -1191,251 +1030,6 @@ mod tests {
             .as_ulid()
     }
 
-    fn create_fence_read(
-        actor: &Actor,
-        document_id: Ulid,
-        config: Option<&RealmConfigDocument>,
-    ) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (create_acceptance_key(document_id), None),
-                (
-                    actor.realm_id.as_bytes().to_vec().into(),
-                    config.map(|config| {
-                        config
-                            .to_bytes(actor)
-                            .expect("realm config encodes")
-                            .to_vec()
-                            .into()
-                    }),
-                ),
-                (vec![2].into(), None),
-            ],
-        })
-    }
-
-    fn apply_create_pid(
-        operation: &mut CreateDocumentOperation,
-        actor: &Actor,
-        document_id: Ulid,
-        config: &RealmConfigDocument,
-    ) -> Effects {
-        let effects = operation.step(create_fence_read(actor, document_id, Some(config)));
-        let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
-            return effects;
-        };
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: key.clone(),
-            value: None,
-        }))
-    }
-
-    fn assert_fence_read(effects: &[Effect]) {
-        let [
-            Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: Some(_),
-                ..
-            }),
-        ] = effects
-        else {
-            panic!("expected create fence read");
-        };
-        assert_eq!(reads.len(), 3);
-        assert_eq!(reads[0].0, CREATE_ACCEPTANCE_KEYSPACE);
-        assert_eq!(reads[1].0, REALM_CONFIG_KEYSPACE);
-        assert_eq!(reads[2].0, aruna_core::keyspaces::GROUP_DELETE_KEYSPACE);
-    }
-
-    fn begin_transaction(operation: &mut CreateDocumentOperation, effects: &[Effect]) -> Effects {
-        let [Effect::Storage(StorageEffect::StartTransaction { read: false })] = effects else {
-            panic!("expected create transaction start");
-        };
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([30; 16]),
-        }))
-    }
-
-    #[test]
-    fn create_conflict_fence() {
-        let realm_id = RealmId([31u8; 32]);
-        let actor = actor(realm_id, 9);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor.clone(), group_id, document_id));
-
-        operation.start();
-        let effects = operation.step(validation_result(document_id));
-        let [Effect::Storage(StorageEffect::StartTransaction { read: false })] = effects.as_slice()
-        else {
-            panic!("expected create transaction start");
-        };
-
-        let txn_id = Ulid::from_bytes([32; 16]);
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_fence_read(effects.as_slice());
-        let [
-            Effect::Storage(StorageEffect::BatchRead {
-                txn_id: Some(read_txn),
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected transactional create fence read");
-        };
-        assert_eq!(*read_txn, txn_id);
-
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        let [
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(write_txn),
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected transactional create append");
-        };
-        assert_eq!(*write_txn, txn_id);
-        assert!(
-            !writes
-                .iter()
-                .any(|(key_space, _, _)| { key_space == REALM_CONFIG_KEYSPACE })
-        );
-        assert!(
-            writes
-                .iter()
-                .any(|(key_space, _, _)| key_space == EVENT_LOG_KEYSPACE)
-        );
-        assert!(
-            writes
-                .iter()
-                .any(|(key_space, _, _)| key_space == PENDING_PROJECTION_KEYSPACE)
-        );
-        assert!(
-            writes
-                .iter()
-                .any(|(key_space, _, _)| key_space == CREATE_ACCEPTANCE_KEYSPACE)
-        );
-        assert_eq!(
-            writes
-                .iter()
-                .filter(|(key_space, _, _)| key_space == JOB_KEYSPACE)
-                .count(),
-            1,
-            "one create attempt carries one PID job"
-        );
-
-        let mut winner: MetadataEventRecord = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == CREATE_ACCEPTANCE_KEYSPACE)
-            .and_then(|(_, _, value)| postcard::from_bytes(value.as_ref()).ok())
-            .expect("create acceptance decodes");
-        winner.event_id = Ulid::from_bytes([33; 16]);
-        winner.record.establishing_event_id = winner.event_id;
-        winner.record.last_event_id = winner.event_id;
-        assert!(accepted_create_matches(&operation.config, &winner));
-        let mut mismatched = winner.clone();
-        mismatched.payload = MetadataEventPayload::RoCrate {
-            jsonld: "{}".to_string(),
-        };
-        assert!(!accepted_create_matches(&operation.config, &mismatched));
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed })]
-                if *committed == txn_id
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::TransactionConflict,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        ));
-
-        let retry_txn = Ulid::from_bytes([34; 16]);
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: retry_txn,
-        }));
-        assert_fence_read(effects.as_slice());
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    create_acceptance_key(document_id),
-                    Some(postcard::to_allocvec(&winner).unwrap().into()),
-                ),
-                (actor.realm_id.as_bytes().to_vec().into(), None),
-                (vec![2].into(), None),
-            ],
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
-                if *aborted == retry_txn
-        ));
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize().expect("winner is replayed"),
-            super::CreateDocumentResult {
-                record: winner.record,
-                event_id: winner.event_id,
-            }
-        );
-    }
-
-    // The phase source is sampled when the record and event are built, not in
-    // the constructor, so a fixed source pins the whole create trace.
-    #[test]
-    fn create_source_pinned() {
-        let realm_id = RealmId([43u8; 32]);
-        let actor = actor(realm_id, 5);
-        let document_id = Ulid::from_bytes([43; 16]);
-        let operation = CreateDocumentOperation::new(config(
-            actor,
-            GroupId::from_bytes([0x43; 16]),
-            document_id,
-        ))
-        .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
-            || 1_700_000_000_000,
-            || Ulid::from_bytes([0x77; 16]),
-        ));
-
-        let record = operation.build_record(Vec::new(), PlacementRef::NIL);
-        assert_eq!(record.created_at_ms, 1_700_000_000_000);
-        assert_eq!(record.updated_at_ms, 1_700_000_000_000);
-        let event = operation.create_event_record(&record);
-        assert_eq!(event.event_id, Ulid::from_bytes([0x77; 16]));
-        assert_eq!(event.occurred_at_ms, 1_700_000_000_000);
-    }
-
-    #[test]
-    fn fresh_copy_resets() {
-        let realm_id = RealmId([41u8; 32]);
-        let actor = actor(realm_id, 11);
-        let group_id = GroupId::generate();
-        let document_id = Ulid::from_bytes([41; 16]);
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor.clone(), group_id, document_id));
-
-        operation.start();
-        let effects = operation.step(validation_result(document_id));
-        begin_transaction(&mut operation, effects.as_slice());
-        operation.conflict_recheck = true;
-
-        let mut expected =
-            CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id));
-        // The status carries its construction time; the copy keeps the original's.
-        expected.route_profile_status = operation.route_profile_status.clone();
-        assert_eq!(operation.fresh_copy(), expected);
-    }
-
     fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateDocumentConfig {
         CreateDocumentConfig {
             actor,
@@ -1452,66 +1046,96 @@ mod tests {
         }
     }
 
-    fn validation_result(document_id: Ulid) -> Event {
-        Event::Metadata(MetadataEvent::ValidationResult {
+    fn validation_result(document_id: Ulid) -> IoResult {
+        IoResult::Event(Box::new(Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
-        })
+        })))
     }
 
-    fn assert_validation_effect(effects: &[Effect], document_id: Ulid) {
-        let [Effect::Metadata(MetadataEffect::ValidateCreateCrate { request })] = effects else {
-            panic!("expected metadata validation effect");
+    /// A create in a realm where `actor` holds the bucket its minted id names.
+    fn held_create(seed: u8, path: &str) -> (Actor, RealmConfigDocument, CreateDocumentConfig) {
+        let actor = actor(RealmId([seed; 32]), seed);
+        let realm_config = realm_config(&actor);
+        let group_id = GroupId::generate();
+        let document_id = held_doc_id(&realm_config, &actor, group_id, path);
+        let mut config = config(actor.clone(), group_id, document_id);
+        config.document_path = path.to_string();
+        (actor, realm_config, config)
+    }
+
+    fn fence_values(actor: &Actor, realm_config: &RealmConfigDocument) -> IoResult {
+        let config = realm_config.to_bytes(actor).expect("realm config encodes");
+        IoResult::Values(vec![None, Some(config.to_vec().into()), None])
+    }
+
+    /// Answers the commit's fence reads, and its persistent id fence read if it has one.
+    fn commit_turn(
+        commit: &mut CreateCommitOperation,
+        actor: &Actor,
+        realm_config: &RealmConfigDocument,
+    ) -> CommitTurn {
+        let reads = commit.first().unwrap();
+        let Next::Call(IoCall::Read(reads)) = reads else {
+            panic!("expected the create fence read");
         };
         assert_eq!(
-            request.graph_iri,
-            format!("https://w3id.org/aruna/{document_id}")
+            reads
+                .iter()
+                .map(|(space, _)| space.as_str())
+                .collect::<Vec<_>>(),
+            [
+                CREATE_ACCEPTANCE_KEYSPACE,
+                REALM_CONFIG_KEYSPACE,
+                aruna_core::keyspaces::GROUP_DELETE_KEYSPACE,
+            ]
         );
-        assert_eq!(
-            request.durability,
-            MetadataRequestDurability::WalAlreadyDurable
-        );
+        match commit.next(fence_values(actor, realm_config))? {
+            Next::Call(IoCall::Read(pid)) if pid.len() == 1 => {
+                commit.next(IoResult::Values(vec![None]))
+            }
+            turn => Ok(turn),
+        }
     }
 
-    fn assert_existing_read(effects: &[Effect]) {
-        let [
-            Effect::Storage(StorageEffect::Read {
-                key_space, txn_id, ..
-            }),
-        ] = effects
-        else {
-            panic!("expected metadata document index read");
-        };
-        assert_eq!(key_space, DOCUMENT_INDEX_KEYSPACE);
-        assert_eq!(txn_id, &None);
+    fn create_rows(
+        config: CreateDocumentConfig,
+        actor: &Actor,
+        realm_config: &RealmConfigDocument,
+    ) -> (CreateCommitOperation, Rows) {
+        let mut commit = CreateDocumentOperation::new_generated_id(config).commit_operation();
+        match commit_turn(&mut commit, actor, realm_config) {
+            Ok(Next::Call(IoCall::Write(rows))) => (commit, rows),
+            other => panic!("expected the create writes, got {other:?}"),
+        }
     }
 
-    fn assert_create_event(effects: &[Effect], document_id: Ulid, actor: &Actor) -> Key {
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects else {
-            panic!("expected metadata create event append");
-        };
-        assert!(txn_id.is_some());
+    fn row<'a>(rows: &'a Rows, key_space: &str) -> &'a (String, Key, Value) {
+        rows.iter()
+            .find(|(space, _, _)| space == key_space)
+            .unwrap_or_else(|| panic!("missing {key_space}"))
+    }
+
+    /// Checks the rows of an accepted create and returns its event.
+    fn assert_create_rows(rows: &Rows, document_id: Ulid, actor: &Actor) -> MetadataEventRecord {
         for required in [
             JOB_KEYSPACE,
             SCHEDULE_INDEX_KEYSPACE,
             DEDUP_INDEX_KEYSPACE,
             ID_MAPPING_KEYSPACE,
         ] {
-            assert!(
-                writes.iter().any(|(key_space, _, _)| key_space == required),
-                "atomic create write is missing {required}"
-            );
+            row(rows, required);
         }
-        let (_, key, value) = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == EVENT_LOG_KEYSPACE)
-            .expect("event log write exists");
+        assert!(
+            !rows
+                .iter()
+                .any(|(space, _, _)| space == REALM_CONFIG_KEYSPACE)
+        );
+        let (_, key, value) = row(rows, EVENT_LOG_KEYSPACE);
         assert!(
             key.as_ref()
                 .starts_with(event_log_prefix(document_id).as_ref())
         );
-
-        let event: MetadataEventRecord =
-            postcard::from_bytes(value.as_ref()).expect("create event decodes");
+        let event: MetadataEventRecord = postcard::from_bytes(value).expect("event decodes");
         assert_eq!(event.record.document_id, document_id);
         assert!(event.record.holder_node_ids.contains(&actor.node_id));
         assert!(
@@ -1528,104 +1152,237 @@ mod tests {
             MetadataEventPayload::Scaffold { .. }
         ));
 
-        let job: JobRecord = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == JOB_KEYSPACE)
-            .and_then(|(_, _, value)| JobRecord::from_bytes(value).ok())
-            .expect("atomic PID job decodes");
-        let mapping = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == ID_MAPPING_KEYSPACE)
-            .and_then(|(_, _, value)| PersistentIdMapping::from_bytes(value).ok())
-            .expect("atomic PID intent decodes");
+        let job = JobRecord::from_bytes(&row(rows, JOB_KEYSPACE).2).expect("PID job decodes");
+        let mapping = PersistentIdMapping::from_bytes(&row(rows, ID_MAPPING_KEYSPACE).2)
+            .expect("PID intent decodes");
         assert!(matches!(
             job.payload,
             JobPayload::MintPersistentId(ref spec) if spec.document_id == document_id
         ));
+        assert_eq!(
+            rows.iter()
+                .filter(|(space, _, _)| space == JOB_KEYSPACE)
+                .count(),
+            1,
+            "one create attempt carries one PID job"
+        );
         assert_eq!(mapping.job_id, Some(job.job_id));
         assert_eq!(mapping.status, PersistentIdStatus::Requested);
 
-        let (_, acceptance_key, acceptance_value) = writes
-            .iter()
-            .find(|(key_space, key, _)| {
-                key_space == CREATE_ACCEPTANCE_KEYSPACE
-                    && key == &create_acceptance_key(document_id)
-            })
-            .expect("create acceptance write exists");
+        let (_, acceptance_key, acceptance) = row(rows, CREATE_ACCEPTANCE_KEYSPACE);
         assert_eq!(acceptance_key, &create_acceptance_key(document_id));
-        let accepted: MetadataEventRecord =
-            postcard::from_bytes(acceptance_value.as_ref()).expect("create acceptance decodes");
+        let accepted: MetadataEventRecord = postcard::from_bytes(acceptance).unwrap();
         assert_eq!(accepted, event);
 
-        let (_, marker_key, marker_value) = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == PENDING_PROJECTION_KEYSPACE)
-            .expect("pending projection marker write exists");
+        let (_, marker_key, marker) = row(rows, PENDING_PROJECTION_KEYSPACE);
         assert_eq!(
             marker_key,
             &pending_projection_key(document_id, event.event_id)
         );
-        assert!(marker_value.as_ref().is_empty());
+        assert!(marker.as_ref().is_empty());
 
-        assert!(
-            writes
-                .iter()
-                .any(|(key_space, _, _)| key_space == RAW_BUDGET_KEYSPACE)
-        );
-        let (_, _, budget_value) = writes
-            .iter()
-            .find(|(key_space, _, _)| key_space == RAW_BUDGET_KEYSPACE)
-            .expect("raw origin budget write exists");
-        let budget: RawOriginBudget =
-            postcard::from_bytes(budget_value).expect("raw origin budget decodes");
+        let budget: RawOriginBudget = postcard::from_bytes(&row(rows, RAW_BUDGET_KEYSPACE).2)
+            .expect("raw origin budget decodes");
         assert_eq!(budget.document_id, document_id);
         assert_eq!(budget.node_id, actor.node_id);
         assert_eq!(budget.events, 1);
         assert!(budget.event_limit >= budget.events);
         assert!(budget.byte_limit >= budget.encoded_bytes);
-
-        key.clone()
-    }
-
-    fn commit_create(operation: &mut CreateDocumentOperation, effects: &[Effect]) {
-        let [Effect::Storage(StorageEffect::CommitTransaction { txn_id })] = effects else {
-            panic!("expected create transaction commit");
-        };
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: *txn_id,
-        }));
-        assert!(effects.is_empty());
+        event
     }
 
     #[test]
-    fn generated_id_validates() {
-        let realm_id = RealmId([11u8; 32]);
-        let actor = actor(realm_id, 6);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor.clone(), group_id, document_id));
+    fn create_runs_ordered() {
+        // Validation and the registry check run outside a transaction; the commit is a child.
+        let (_, _, config) = held_create(8, "datasets/fast-create");
+        let document_id = config.document_id;
+        let mut operation = CreateDocumentOperation::new(config);
+        assert_eq!(operation.transaction(), TransactionMode::None);
+        let Ok(Next::Call(IoCall::Effect(validation))) = operation.first() else {
+            panic!("expected the crate validation");
+        };
+        let Effect::Metadata(MetadataEffect::ValidateCreateCrate { request }) = *validation else {
+            panic!("expected the create crate validation");
+        };
+        assert_eq!(
+            request.graph_iri,
+            format!("https://w3id.org/aruna/{document_id}")
+        );
+        assert_eq!(
+            request.durability,
+            MetadataRequestDurability::WalAlreadyDurable
+        );
+        let existing = vec![(
+            DOCUMENT_INDEX_KEYSPACE.to_string(),
+            metadata_document_key(document_id),
+        )];
+        assert_eq!(
+            operation.next(validation_result(document_id)),
+            Ok(Next::Call(IoCall::Read(existing)))
+        );
+        assert!(matches!(
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let created = CreateDocumentResult {
+            record: MetadataRegistryRecord {
+                document_id,
+                ..commit_record()
+            },
+            event_id: Ulid::from_parts(5, 5),
+        };
+        let outcome = ChildOutcome::new(Ok::<_, CreateDocumentError>(created.clone()));
+        assert_eq!(
+            operation.next(IoResult::Child(outcome)),
+            Ok(Next::Done(created))
+        );
+    }
 
-        let effects = operation.start();
-        assert_validation_effect(effects.as_slice(), document_id);
-        let effects = operation.step(validation_result(document_id));
-        let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_fence_read(effects.as_slice());
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        assert_create_event(effects.as_slice(), document_id, &actor);
+    fn commit_record() -> MetadataRegistryRecord {
+        CreateDocumentOperation::new(config(
+            actor(RealmId([1; 32]), 1),
+            GroupId::from_bytes([1; 16]),
+            Ulid::nil(),
+        ))
+        .commit_operation()
+        .build_record(Vec::new(), PlacementRef::NIL)
+    }
+
+    #[test]
+    fn generated_skips_check() {
+        let (_, _, config) = held_create(6, "datasets/fast-create");
+        let document_id = config.document_id;
+        let mut operation = CreateDocumentOperation::new_generated_id(config);
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(validation_result(document_id)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+    }
+
+    #[test]
+    fn existing_row_refuses() {
+        let (_, _, config) = held_create(9, "datasets/fast-create");
+        let document_id = config.document_id;
+        let mut operation = CreateDocumentOperation::new(config);
+        operation.first().unwrap();
+        operation.next(validation_result(document_id)).unwrap();
+        let stored = postcard::to_allocvec(&commit_record()).unwrap();
+        assert_eq!(
+            operation.next(IoResult::Values(vec![Some(stored.into())])),
+            Err(CreateDocumentError::DocumentAlreadyExists)
+        );
+    }
+
+    #[test]
+    fn commit_writes_create() {
+        let (actor, realm_config, config) = held_create(12, "datasets/fast-create");
+        let document_id = config.document_id;
+        let (mut commit, rows) = create_rows(config, &actor, &realm_config);
+        assert_eq!(commit.transaction(), TransactionMode::Write);
+        let event = assert_create_rows(&rows, document_id, &actor);
+        assert_eq!(
+            commit.next(IoResult::Done),
+            Ok(Next::Done(CreateDocumentResult {
+                record: event.record,
+                event_id: event.event_id,
+            }))
+        );
+    }
+
+    #[test]
+    fn create_conflict_fence() {
+        // A rerun after a lost conflict goes straight to the commit; its fence read replays an
+        // identical accepted create and refuses a different one.
+        let (actor, realm_config, config) = held_create(31, "datasets/fast-create");
+        let mut winner: MetadataEventRecord = {
+            let (_, rows) = create_rows(config.clone(), &actor, &realm_config);
+            postcard::from_bytes(&row(&rows, CREATE_ACCEPTANCE_KEYSPACE).2).unwrap()
+        };
+        winner.event_id = Ulid::from_bytes([33; 16]);
+        winner.record.establishing_event_id = winner.event_id;
+        winner.record.last_event_id = winner.event_id;
+        assert!(accepted_create_matches(&config, &winner));
+        let mut mismatched = winner.clone();
+        mismatched.payload = MetadataEventPayload::RoCrate {
+            jsonld: "{}".to_string(),
+        };
+        assert!(!accepted_create_matches(&config, &mismatched));
+
+        let mut rerun = CreateDocumentOperation::new_generated_id(config.clone());
+        assert_eq!(rerun.on_conflict(1), AfterConflict::Rerun);
+        assert!(matches!(rerun.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(
+            CreateDocumentOperation::new_generated_id(config.clone()).on_conflict(4),
+            AfterConflict::Fail
+        );
+
+        let accepted = |event: &MetadataEventRecord| {
+            let mut commit =
+                CreateDocumentOperation::new_generated_id(config.clone()).commit_operation();
+            commit.first().unwrap();
+            let acceptance = postcard::to_allocvec(event).unwrap();
+            commit.next(IoResult::Values(vec![Some(acceptance.into()), None, None]))
+        };
+        assert_eq!(
+            accepted(&winner),
+            Ok(Next::Done(CreateDocumentResult {
+                record: winner.record.clone(),
+                event_id: winner.event_id,
+            }))
+        );
+        assert_eq!(
+            accepted(&mismatched),
+            Err(CreateDocumentError::DocumentAlreadyExists)
+        );
+    }
+
+    // The phase source is sampled when the record and event are built, not in
+    // the constructor, so a fixed source pins the whole create trace.
+    #[test]
+    fn create_source_pinned() {
+        let realm_id = RealmId([43u8; 32]);
+        let actor = actor(realm_id, 5);
+        let document_id = Ulid::from_bytes([43; 16]);
+        let commit = CreateDocumentOperation::new(config(
+            actor,
+            GroupId::from_bytes([0x43; 16]),
+            document_id,
+        ))
+        .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
+            || 1_700_000_000_000,
+            || Ulid::from_bytes([0x77; 16]),
+        ))
+        .commit_operation();
+
+        let record = commit.build_record(Vec::new(), PlacementRef::NIL);
+        assert_eq!(record.created_at_ms, 1_700_000_000_000);
+        assert_eq!(record.updated_at_ms, 1_700_000_000_000);
+        let event = commit.create_event_record(&record);
+        assert_eq!(event.event_id, Ulid::from_bytes([0x77; 16]));
+        assert_eq!(event.occurred_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn fresh_copy_resets() {
+        let (_, _, config) = held_create(41, "datasets/fast-create");
+        let document_id = config.document_id;
+        let mut operation = CreateDocumentOperation::new_generated_id(config.clone());
+        operation.first().unwrap();
+        operation.next(validation_result(document_id)).unwrap();
+        operation.conflict_recheck = true;
+
+        let mut expected = CreateDocumentOperation::new_generated_id(config);
+        // The status carries its construction time; the copy keeps the original's.
+        expected.route_profile_status = operation.route_profile_status.clone();
+        assert_eq!(operation.fresh_copy(), expected);
     }
 
     #[test]
     fn profile_create_records() {
-        let realm_id = RealmId([12u8; 32]);
-        let actor = actor(realm_id, 7);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "profiles/example");
+        let (actor, realm_config, mut config) = held_create(7, "profiles/example");
+        let document_id = config.document_id;
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-        let mut config = config(actor.clone(), group_id, document_id);
-        config.document_path = "profiles/example".to_string();
         config.payload = CreateDocumentPayload::RoCrate {
             jsonld: serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -1643,21 +1400,12 @@ mod tests {
             })
             .to_string(),
         };
-        let mut operation = CreateDocumentOperation::new_generated_id(config);
-
-        operation.start();
-        let effects = operation.step(validation_result(document_id));
-        let _ = begin_transaction(&mut operation, effects.as_slice());
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected atomic create writes");
-        };
-        let mappings = writes
+        let (_, rows) = create_rows(config, &actor, &realm_config);
+        let mappings = rows
             .iter()
-            .filter(|(key_space, _, _)| key_space == ID_MAPPING_KEYSPACE)
+            .filter(|(space, _, _)| space == ID_MAPPING_KEYSPACE)
             .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).unwrap())
             .collect::<Vec<_>>();
-
         assert_eq!(mappings.len(), 1);
         assert_eq!(
             mappings[0].pid,
@@ -1695,84 +1443,41 @@ mod tests {
     }
 
     #[test]
-    fn refuses_profile_outside() {
-        let mut operation =
+    fn profiles_stay_inside() {
+        let mut outside =
             CreateDocumentOperation::new_generated_id(profile_config("resolver-check/profile"));
-
-        assert!(operation.start().is_empty());
         let Err(CreateDocumentError::MetadataError(MetadataError::InvalidInput(message))) =
-            operation.finalize()
+            outside.first()
         else {
             panic!("expected the Profile path refusal");
         };
         assert!(message.contains("Profiles must be stored under profiles/"));
-    }
 
-    #[test]
-    fn accepts_profile_inside() {
-        let mut operation =
+        let mut inside =
             CreateDocumentOperation::new_generated_id(profile_config("/profiles/example/"));
-
-        let effects = operation.start();
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Metadata(MetadataEffect::ValidateRoCrate { .. })]
-            ),
-            "expected crate validation, got {effects:?}"
-        );
-    }
-
-    #[test]
-    fn config_joins_fence() {
-        // The fence reads the realm config so its stamped bucket joins the commit read set.
-        let realm_id = RealmId([22u8; 32]);
-        let actor = actor(realm_id, 5);
-        let group_id = GroupId::generate();
-        let document_id = Ulid::generate();
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id));
-
-        operation.start();
-        let effects = operation.step(validation_result(document_id));
-        let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_fence_read(effects.as_slice());
+        let Ok(Next::Call(IoCall::Effect(validation))) = inside.first() else {
+            panic!("expected crate validation");
+        };
+        assert!(matches!(
+            *validation,
+            Effect::Metadata(MetadataEffect::ValidateRoCrate { .. })
+        ));
     }
 
     #[test]
     fn stamped_bucket_held() {
         // Topic membership is the holder set, so the origin can only publish a
         // create onto a bucket it holds: the stamp must land in its held set.
-        let realm_id = RealmId([21u8; 32]);
-        let actor = actor(realm_id, 4);
-        let realm_config = realm_config(&actor);
-        let group_id = GroupId::generate();
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor.clone(), group_id, document_id));
-
-        operation.start();
-        let effects = operation.step(validation_result(document_id));
-        begin_transaction(&mut operation, effects.as_slice());
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected transactional create append");
+        let (actor, realm_config, config) = held_create(21, "datasets/fast-create");
+        let document_id = config.document_id;
+        let (mut commit, _) = create_rows(config, &actor, &realm_config);
+        let Ok(Next::Done(created)) = commit.next(IoResult::Done) else {
+            panic!("expected the created document");
         };
-        assert!(
-            !writes
-                .iter()
-                .any(|(key_space, _, _)| key_space == REALM_CONFIG_KEYSPACE)
-        );
-
-        let placement = operation
-            .record
-            .as_ref()
-            .expect("create record is built")
-            .placement;
+        let placement = created.record.placement;
         assert_ne!(placement, PlacementRef::NIL);
         assert!(resolve_shard_holders(&realm_config, &placement).contains(&actor.node_id));
-        // Guardrail: the stamped placement bucket is exactly the bucket carried
-        // in the id (D4/D7 single source), which the RF fixtures cannot expose.
+        // The stamped placement bucket is exactly the bucket carried in the id.
         let id = MetaResourceId::from_bytes(document_id.to_bytes()).expect("structured id");
         assert_eq!(u32::from(id.bucket().get()), placement.shard);
     }
@@ -1788,110 +1493,30 @@ mod tests {
         // random == 1 packs handle 0 (bits 60..79): a plain, unstructured ULID.
         let document_id = Ulid::from_parts(1_700_000_000_000, 1);
         assert!(MetaResourceId::from_bytes(document_id.to_bytes()).is_err());
-        let operation =
-            CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id));
+        let commit =
+            CreateDocumentOperation::new_generated_id(config(actor, group_id, document_id))
+                .commit_operation();
         assert!(matches!(
-            operation.placement_from_id(Some(&realm_config)),
+            commit.placement_from_id(Some(&realm_config)),
             Err(CreateDocumentError::PlacementBindingUnavailable(_))
         ));
     }
 
     #[test]
-    fn create_checks_existing() {
-        let realm_id = RealmId([8u8; 32]);
-        let actor = actor(realm_id, 1);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new(config(actor.clone(), group_id, document_id));
-
-        let effects = operation.start();
-        assert_validation_effect(effects.as_slice(), document_id);
-        let effects = operation.step(validation_result(document_id));
-        assert_existing_read(effects.as_slice());
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: document_id.to_bytes().to_vec().into(),
-            value: None,
-        }));
-        let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_fence_read(effects.as_slice());
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        let create_event_key = assert_create_event(effects.as_slice(), document_id, &actor);
-        assert!(operation.record.as_ref().is_some_and(|record| {
-            record.holder_node_ids.contains(&actor.node_id)
-                && record
-                    .holder_node_ids
-                    .windows(2)
-                    .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
-        }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![(EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
-        }));
-        commit_create(&mut operation, effects.as_slice());
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation
-                .finalize()
-                .expect("operation succeeds")
-                .record
-                .document_id,
-            document_id
-        );
-    }
-
-    #[test]
-    fn create_returns_event() {
-        let realm_id = RealmId([12u8; 32]);
-        let actor = actor(realm_id, 7);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new_generated_id(config(actor.clone(), group_id, document_id));
-
-        assert_validation_effect(operation.start().as_slice(), document_id);
-        let effects = operation.step(validation_result(document_id));
-        let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_fence_read(effects.as_slice());
-        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        let create_event_key = assert_create_event(effects.as_slice(), document_id, &actor);
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![(EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
-        }));
-
-        commit_create(&mut operation, effects.as_slice());
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation
-                .finalize()
-                .expect("operation succeeds")
-                .record
-                .document_id,
-            document_id
-        );
-    }
-
-    #[test]
     fn validation_rejects_append() {
-        let realm_id = RealmId([13u8; 32]);
-        let actor = actor(realm_id, 8);
-        let group_id = GroupId::generate();
         let document_id = Ulid::generate();
-        let mut operation = CreateDocumentOperation::new(config(actor, group_id, document_id));
-
-        assert_validation_effect(operation.start().as_slice(), document_id);
-        let effects = operation.step(Event::Metadata(MetadataEvent::Error {
+        let mut operation = CreateDocumentOperation::new(config(
+            actor(RealmId([13u8; 32]), 8),
+            GroupId::generate(),
+            document_id,
+        ));
+        operation.first().unwrap();
+        let rejected = Event::Metadata(MetadataEvent::Error {
             graph_iri: Some(format!("https://w3id.org/aruna/{document_id}")),
             error: MetadataError::InvalidInput("invalid RO-Crate".to_string()),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.create_event.is_none());
-        assert!(operation.is_complete());
+        });
         assert_eq!(
-            operation.finalize(),
+            operation.next(IoResult::Event(Box::new(rejected))),
             Err(CreateDocumentError::MetadataError(
                 MetadataError::InvalidInput("invalid RO-Crate".to_string())
             ))
@@ -1899,44 +1524,28 @@ mod tests {
     }
 
     #[test]
-    fn append_failure_stops() {
-        let realm_id = RealmId([10u8; 32]);
-        let actor = actor(realm_id, 5);
-        let group_id = GroupId::generate();
-        let realm_config = realm_config(&actor);
-        let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation =
-            CreateDocumentOperation::new(config(actor.clone(), group_id, document_id));
-
-        assert_validation_effect(operation.start().as_slice(), document_id);
-        assert_existing_read(operation.step(validation_result(document_id)).as_slice());
-        let existing_read = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: document_id.to_bytes().to_vec().into(),
-            value: None,
-        }));
-        let fence_read = begin_transaction(&mut operation, existing_read.as_slice());
-        assert_fence_read(fence_read.as_slice());
-        let append = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
-        assert_create_event(append.as_slice(), document_id, &actor);
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::WriteError("boom".to_string()),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert!(operation.is_complete());
+    fn errors_map() {
         assert_eq!(
-            operation.finalize(),
-            Err(CreateDocumentError::StorageError(
-                aruna_core::errors::StorageError::WriteError("boom".to_string()),
-            ))
+            CreateDocumentError::from(IoError::Storage(StorageError::WriteError("boom".into()))),
+            CreateDocumentError::StorageError(StorageError::WriteError("boom".into()))
         );
+        assert!(CreateDocumentOperation::is_conflict(
+            &CreateDocumentError::from(IoError::Conflict)
+        ));
+        assert_eq!(
+            CreateDocumentError::from(IoError::Aborted),
+            CreateDocumentError::Io(IoError::Aborted)
+        );
+        let (actor, realm_config, config) = held_create(10, "datasets/fast-create");
+        let (mut commit, _) = create_rows(config, &actor, &realm_config);
+        assert!(matches!(
+            commit.next(IoResult::Values(Vec::new())),
+            Err(CreateDocumentError::Io(IoError::Unexpected { .. }))
+        ));
     }
 
     // Answers each storage effect of the create flow; the first `conflict_commits` commits
-    // fail with a conflict and the rest succeed.
+    // fail with a conflict and the rest succeed. Only the realm config read finds a row.
     fn scripted_conflict_actor(
         receiver: EffectReceiver,
         conflict_commits: u32,
@@ -1956,13 +1565,15 @@ mod tests {
                     StorageEffect::Read { key, .. } => {
                         StorageEvent::ReadResult { key, value: None }
                     }
-                    // The realm config read resolves the id's placement.
-                    StorageEffect::BatchRead { .. } => StorageEvent::BatchReadResult {
-                        values: vec![
-                            (Key::from(vec![0u8]), None),
-                            (Key::from(vec![1u8]), Some(realm_config.clone().into())),
-                            (Key::from(vec![2u8]), None),
-                        ],
+                    StorageEffect::BatchRead { reads, .. } => StorageEvent::BatchReadResult {
+                        values: reads
+                            .into_iter()
+                            .map(|(key_space, key)| {
+                                let found = (key_space == REALM_CONFIG_KEYSPACE)
+                                    .then(|| realm_config.clone().into());
+                                (key, found)
+                            })
+                            .collect(),
                     },
                     StorageEffect::BatchWrite { .. } => StorageEvent::BatchWriteResult {
                         entries: Vec::new(),
@@ -2044,13 +1655,13 @@ mod tests {
 
         drop(context);
         let starts = actor_thread.join().unwrap();
-        assert_eq!(starts, 3, "attempt 1 opens two txns, the retry opens one");
+        assert_eq!(starts, 2, "the lost commit and the rerun each open one txn");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retry_exhausts_conflict() {
         // Every commit conflicts, so the wrapper exhausts its retries and returns
-        // the conflict; each drive opens two txns via the internal recheck.
+        // the conflict; each attempt opens one txn.
         let temp = tempfile::tempdir().unwrap();
         let (storage, receivers) = StorageHandle::new();
 
@@ -2075,6 +1686,6 @@ mod tests {
 
         drop(context);
         let starts = actor_thread.join().unwrap();
-        assert_eq!(starts, 8, "four drive attempts each open two txns");
+        assert_eq!(starts, 4, "four attempts each open one txn");
     }
 }

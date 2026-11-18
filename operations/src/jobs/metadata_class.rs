@@ -176,14 +176,10 @@ mod pure_tests {
             MetadataWriteError::Forbidden,
             MetadataWriteError::NotFound,
             create(CreateDocumentError::DocumentAlreadyExists),
-            create(CreateDocumentError::MissingTransaction),
-            create(CreateDocumentError::NotFinished),
+            create(CreateDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             create(CreateDocumentError::RawLimit),
-            create(CreateDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
             create(CreateDocumentError::MetadataError(
                 MetadataError::InvalidInput("bad".to_string()),
             )),
