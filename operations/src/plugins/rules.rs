@@ -61,9 +61,6 @@ pub fn consumer(install: &PluginInstall) -> SecretConsumer {
     }
 }
 
-/// When a rule edit happens and the ids of the writes it may make.
-pub(crate) type RuleStamp = (u64, [Ulid; 3]);
-
 #[derive(Debug, PartialEq)]
 enum EditPhase {
     Guard,
@@ -82,7 +79,7 @@ pub(crate) struct EditRules {
     consumer: SecretConsumer,
     wanted: Vec<UseRule>,
     guard: RuleGuard,
-    stamp: RuleStamp,
+    now_ms: u64,
     phase: EditPhase,
 }
 
@@ -92,7 +89,7 @@ impl EditRules {
         (group_id, name): (GroupId, &SecretName),
         (consumer, wanted): (&SecretConsumer, Vec<UseRule>),
         guard: RuleGuard,
-        stamp: RuleStamp,
+        now_ms: u64,
     ) -> Self {
         Self {
             actor: actor.clone(),
@@ -101,7 +98,7 @@ impl EditRules {
             consumer: consumer.clone(),
             wanted,
             guard,
-            stamp,
+            now_ms,
             phase: EditPhase::Guard,
         }
     }
@@ -147,7 +144,6 @@ impl EditRules {
             uses,
             expected: Some(entry.revision()),
         };
-        let (now_ms, write_ids) = self.stamp;
         let input = OwnerChange {
             realm_id: self.actor.realm_id,
             node_id: self.actor.node_id,
@@ -155,8 +151,8 @@ impl EditRules {
             actor: self.actor.user_id,
             change,
             readable: false,
-            now_ms,
-            write_ids,
+            now_ms: self.now_ms,
+            write_ids: [(); 3].map(|_| Ulid::generate()),
         };
         self.phase = EditPhase::Writing;
         Ok(Next::Call(IoCall::child(OwnerSecretOperation::new(input))))
@@ -217,7 +213,7 @@ pub(crate) struct EnsureRules {
     consumer: SecretConsumer,
     guard: RuleGuard,
     edits: VecDeque<(SecretName, Vec<UseRule>)>,
-    stamps: VecDeque<RuleStamp>,
+    now_ms: u64,
     current: Option<SecretName>,
 }
 
@@ -226,7 +222,7 @@ impl EnsureRules {
         actor: &Actor,
         install: &PluginInstall,
         manifest: &Manifest,
-        stamps: Vec<RuleStamp>,
+        now_ms: u64,
     ) -> Result<Self, String> {
         let mut wanted = wanted_rules(install, manifest)?;
         let names: BTreeSet<&SecretName> = (install.secrets.values())
@@ -245,7 +241,7 @@ impl EnsureRules {
                 revision: install.revision,
             },
             edits,
-            stamps: stamps.into(),
+            now_ms,
             current: None,
         })
     }
@@ -254,10 +250,9 @@ impl EnsureRules {
         let Some((name, rules)) = self.edits.pop_front() else {
             return Ok(Next::Done(()));
         };
-        let stamp = self.stamps.pop_front().ok_or(IoError::Unfinished)?;
         let target = (self.group_id, &name);
         let rules = (&self.consumer, rules);
-        let edit = EditRules::new(&self.actor, target, rules, self.guard, stamp);
+        let edit = EditRules::new(&self.actor, target, rules, self.guard, self.now_ms);
         self.current = Some(name);
         Ok(Next::Call(IoCall::child(edit)))
     }
@@ -288,12 +283,12 @@ pub(crate) struct RetireRules {
     consumer: SecretConsumer,
     guard: RuleGuard,
     bindings: VecDeque<SecretBinding>,
-    stamps: VecDeque<RuleStamp>,
+    now_ms: u64,
     current: Option<SecretBinding>,
 }
 
 impl RetireRules {
-    pub(crate) fn new(actor: &Actor, install: &PluginInstall, stamps: Vec<RuleStamp>) -> Self {
+    pub(crate) fn new(actor: &Actor, install: &PluginInstall, now_ms: u64) -> Self {
         let bindings = (install.secrets.values())
             .filter(|binding| binding.scope == BoundScope::Group)
             .cloned()
@@ -306,7 +301,7 @@ impl RetireRules {
                 install_id: install.install_id,
             },
             bindings,
-            stamps: stamps.into(),
+            now_ms,
             current: None,
         }
     }
@@ -315,10 +310,9 @@ impl RetireRules {
         let Some(binding) = self.bindings.pop_front() else {
             return Ok(Next::Done(()));
         };
-        let stamp = self.stamps.pop_front().ok_or(IoError::Unfinished)?;
         let target = (self.group_id, &binding.name);
         let rules = (&self.consumer, Vec::new());
-        let edit = EditRules::new(&self.actor, target, rules, self.guard, stamp);
+        let edit = EditRules::new(&self.actor, target, rules, self.guard, self.now_ms);
         self.current = Some(binding);
         Ok(Next::Call(IoCall::child(edit)))
     }

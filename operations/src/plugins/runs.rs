@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ATTENTION_ROW, MAX_ATTEMPTS, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState,
@@ -22,7 +22,6 @@ use std::time::Duration;
 use aruna_core::backoff::capped_backoff;
 use aruna_plugins::{FailureKind, InvokeError};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use super::install::{pick_version, read_manifest};
@@ -33,9 +32,6 @@ use super::rows::{
     read_call, row, unexpected, values, writes,
 };
 use super::work::{WorkRow, work_scan};
-
-/// Serializes admissions on this node, so no install passes its queue bound.
-pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {
@@ -60,7 +56,6 @@ impl From<IoError> for RunError {
 }
 
 /// A sub-plan that admits a run, a new one or one queued again, within its install's bound.
-/// The caller holds `ADMISSIONS` while the transaction runs.
 #[derive(Debug, PartialEq)]
 pub struct Admission {
     run: Box<PluginRun>,
@@ -104,8 +99,7 @@ impl Admission {
     }
 }
 
-/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones. The
-/// caller holds `ADMISSIONS`.
+/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
 pub fn admit(run: PluginRun) -> Admit {
     Admit {
         admission: Admission::new(run),
@@ -122,6 +116,10 @@ pub struct Admit {
 impl Operation for Admit {
     type Output = ();
     type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -665,8 +663,7 @@ pub(crate) fn new_run(
     }
 }
 
-/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound;
-/// the caller holds `ADMISSIONS`.
+/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound.
 pub(crate) fn enqueue_timer(
     install: &PluginInstall,
     handler: String,
@@ -703,6 +700,10 @@ enum TimerPhase {
 impl Operation for EnqueueTimer {
     type Output = bool;
     type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
