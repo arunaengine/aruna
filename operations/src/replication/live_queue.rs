@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use super::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::emit::emit_watch_event;
+use crate::notifications::watch::origin::EmitEventOperation;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_put(
@@ -57,7 +57,8 @@ pub async fn complete_put(
             size_bytes,
         },
     };
-    emit_watch_event(context, event).await;
+    // Failures only warn inside the operation.
+    let _ = drive(EmitEventOperation::new(event), context).await;
 }
 
 /// Queues continuous sync for one committed version or delete marker and wakes the drain.

@@ -821,6 +821,13 @@ pub enum NetEffect {
             Vec<crate::structs::execution::notification_watch::WatchInterestEntry>,
         >,
     },
+    /// Names this node and the holders its watch interest matches for one event; answers
+    /// `NetEvent::WatchHolders`.
+    WatchHolders {
+        realm_id: crate::structs::identity::realm::RealmId,
+        path: String,
+        kind: crate::structs::execution::notification_watch::WatchEventKind,
+    },
 }
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter

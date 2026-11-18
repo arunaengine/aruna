@@ -5,7 +5,8 @@
 pub mod authorization;
 pub mod check;
 pub mod digest;
-pub mod emit;
+#[cfg(test)]
+mod emit;
 #[cfg(test)]
 mod expand;
 pub mod expansion;

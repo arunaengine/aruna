@@ -71,7 +71,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::notifications::watch::emit::emit_metadata_created;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -1154,16 +1154,16 @@ async fn create_document(
             if let Some(pull) = checkpoint.pull.as_mut() {
                 pull.revision = Some(created.event_id);
             }
-            emit_metadata_created(
-                &ctx.driver,
+            let emit = EmitEventOperation::metadata_created(
                 spec.auth_context.realm_id,
                 spec.auth_context.user_id,
                 created.record.group_id,
                 created.record.document_id,
                 &created.record.document_path,
                 created.event_id,
-            )
-            .await;
+            );
+            // Failures only warn inside the operation.
+            let _ = drive(emit, &ctx.driver).await;
             Ok(())
         }
         Err(error) => Err(classify_metadata(error)),

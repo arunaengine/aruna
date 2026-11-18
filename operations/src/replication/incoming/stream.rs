@@ -34,7 +34,7 @@ use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::notifications::watch::emit::emit_watch_event;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::locations::LocationSummaryOperation;
@@ -507,25 +507,23 @@ async fn emit_replication_watch(
     }
     let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
     let occurred_at_ms = aruna_core::time::unix_timestamp_millis();
-    emit_watch_event(
-        context,
-        WatchEvent {
-            event_id: Ulid::generate(),
-            realm_id: manifest.auth_context.realm_id,
-            kind: WatchEventKind::DataUploaded,
-            path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
-            actor: manifest.auth_context.user_id,
-            occurred_at_ms,
-            detail: WatchEventDetail::DataUploaded {
-                group_id,
-                node_id,
-                bucket: manifest.bucket.clone(),
-                key: manifest.key.clone(),
-                size_bytes,
-            },
+    let emit = EmitEventOperation::new(WatchEvent {
+        event_id: Ulid::generate(),
+        realm_id: manifest.auth_context.realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+        actor: manifest.auth_context.user_id,
+        occurred_at_ms,
+        detail: WatchEventDetail::DataUploaded {
+            group_id,
+            node_id,
+            bucket: manifest.bucket.clone(),
+            key: manifest.key.clone(),
+            size_bytes,
         },
-    )
-    .await;
+    });
+    // Failures only warn inside the operation.
+    let _ = drive(emit, context).await;
 }
 
 async fn allow_policy(

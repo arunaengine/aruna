@@ -34,9 +34,9 @@ use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::digest::InterestOperation;
-use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
+use aruna_operations::notifications::watch::origin::EmitEventOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -47,6 +47,11 @@ use crate::topology::store_realm_config;
 use crate::topology::{TestNode, realm_config_for, spawn_replicas, user_with_holder};
 
 const LIST_LIMIT: usize = LIST_MAX_LIMIT;
+
+/// Emits like every caller: failures only warn inside the operation.
+async fn emit_watch_event(context: &aruna_operations::driver::DriverContext, event: WatchEvent) {
+    let _ = drive(EmitEventOperation::new(event), context).await;
+}
 
 // The Definition of Done: a watch created via node A fires for an upload handled by node B and
 // is visible within seconds through node C.
