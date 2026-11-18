@@ -30,6 +30,13 @@ pub struct GitCaches {
     push_keys: Mutex<HashMap<Ulid, String>>,
 }
 
+/// Prints no contents, because the push keys must never reach a log.
+impl std::fmt::Debug for GitCaches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitCaches").finish_non_exhaustive()
+    }
+}
+
 impl Default for GitCaches {
     fn default() -> Self {
         Self {

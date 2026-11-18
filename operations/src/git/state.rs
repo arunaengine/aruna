@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{
-    GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, ZERO_OID, refs_clash,
-};
+use aruna_core::git::{GitChange, GitCheckpoint, GitRecord, LfsLock, ZERO_OID, refs_clash};
 use aruna_core::git_state::{Ancestry, GitState};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
