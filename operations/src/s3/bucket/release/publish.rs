@@ -1,61 +1,69 @@
 //! Publishes database releases: lists current files at each range's coordinator, authorizes them
-//! and writes the tagged crate as one version. Also answers other members and runs its effects.
+//! and writes the tagged crate as one version. Also answers other members.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::pin::Pin;
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE};
+use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::blob::{VersionKey, bucket_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, bucket_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, curator_path, release_prefix,
 };
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::KeyRange;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
 use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::release::{
-    CRATE_CHUNK, CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
-    HolderRequest, RangeFiles, RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
+    CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk, RangeFiles,
+    RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
 };
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::{Key, Value as Row};
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::read::load_access;
-use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
+use super::access::LoadAccessOperation;
+use super::{
+    Access, BucketScope, MembersConfig, MembersOutput, ReleaseError, ReleaseMembersOperation,
+};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
-use crate::distribution::status::read_view;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::metadata::protocol::MetadataReadError;
-use crate::placement::policy::GateOperation;
-use crate::realm::peer_trust::is_sync_eligible;
+use crate::distribution::status::{StatusError, read_view};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use crate::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
+};
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
-use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
-use crate::s3::object::origin::{OriginError, ReadOriginOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::GetRoutedOperation;
-use aruna_core::metadata::AuthToken;
-use aruna_core::time::unix_timestamp_millis;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::list::{
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+};
+use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
@@ -72,6 +80,18 @@ impl From<ReleaseError> for PublishError {
         Self::Unavailable(error.to_string())
     }
 }
+
+impl From<IoError> for PublishError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+fn unavailable(error: impl std::fmt::Display) -> PublishError {
+    PublishError::Unavailable(error.to_string())
+}
+
+type PublishTurn<T> = Result<Next<T>, PublishError>;
 
 /// What a publisher declares about a release besides its files.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,114 +201,240 @@ pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
 }
 
 const UNREADABLE: &str = "a file under the prefix is not readable";
+const CHANGED: &str = "a pinned file changed while the release was written; publish again";
 
 /// Keys listed for one page of release files, so a holder's reply stays far below the transport
 /// ceiling.
 const FILE_PAGE: usize = 256;
+/// Rows read per storage page while looking for a bucket's releases.
+const ROW_PAGE: usize = 256;
+/// How long one question to a range's coordinator may take in all.
+const HOLDER_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Every current file under `prefix` in `range`, page by page.
-async fn all_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    asked: (&str, &str),
-    range: Option<&KeyRange>,
-) -> Result<Vec<ReleaseFile>, PublishError> {
-    let (mut files, mut after) = (Vec::new(), None);
-    loop {
-        let (page, next) = release_files(context, scope, access, asked, (range, after)).await?;
-        files.extend(page);
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(files),
+/// A bucket's identity, kept by the operations that outlive their caller's borrow.
+#[derive(Clone, Debug, PartialEq)]
+struct ReleaseScope {
+    realm_id: RealmId,
+    node_id: NodeId,
+    bucket: String,
+    info: BucketInfo,
+}
+
+impl ReleaseScope {
+    fn of(scope: BucketScope<'_>) -> Self {
+        Self {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            bucket: scope.bucket.to_string(),
+            info: scope.info.clone(),
+        }
+    }
+
+    fn view(&self) -> BucketScope<'_> {
+        BucketScope {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            bucket: &self.bucket,
+            info: &self.info,
         }
     }
 }
 
-/// One page of current versions under `prefix` in `range` (or the whole bucket) after `after`,
-/// `skip` left out, and the key the next page starts after. Each file comes from one exact
-/// version, and the caller must be able to read every file, or nothing is published.
-pub async fn release_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    (prefix, skip): (&str, &str),
-    (range, after): (Option<&KeyRange>, Option<String>),
-) -> Result<(Vec<ReleaseFile>, Option<String>), PublishError> {
-    let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let mut files = Vec::new();
-    let (mut continuation, mut after) = (None, after);
-    loop {
+/// One page of release files and the key the next page starts after.
+pub type FilesPage = (Vec<ReleaseFile>, Option<String>);
+
+/// One page of current versions under a prefix in a range (or the whole bucket) after a key, one
+/// key left out. Each file comes from one exact version, and the caller must be able to read
+/// every file, or nothing is published.
+#[derive(Debug, PartialEq)]
+pub struct ReleaseFilesOperation {
+    scope: ReleaseScope,
+    access: Access,
+    prefix: String,
+    skip: String,
+    range: Option<KeyRange>,
+    after: Option<String>,
+    continuation: Option<ListContinuationToken>,
+    keys: VecDeque<String>,
+    files: Vec<ReleaseFile>,
+    more: Option<ListContinuationToken>,
+    last: Option<String>,
+    current: Option<String>,
+}
+
+impl ReleaseFilesOperation {
+    pub fn new(
+        scope: BucketScope<'_>,
+        access: &Access,
+        (prefix, skip): (&str, &str),
+        (range, after): (Option<&KeyRange>, Option<String>),
+    ) -> Self {
+        Self {
+            scope: ReleaseScope::of(scope),
+            access: access.clone(),
+            prefix: prefix.to_string(),
+            skip: skip.to_string(),
+            range: range.cloned(),
+            after,
+            continuation: None,
+            keys: VecDeque::new(),
+            files: Vec::new(),
+            more: None,
+            last: None,
+            current: None,
+        }
+    }
+
+    /// Only the range's keys are listed, so no key outside it decides the page or its end.
+    fn list(&mut self) -> PublishTurn<FilesPage> {
         let list = ListBucketOperation::new(ListBucketInput {
-            bucket: scope.bucket.to_string(),
-            group_id: scope.info.group_id,
-            continuation_token: continuation.take(),
+            bucket: self.scope.bucket.clone(),
+            group_id: self.scope.info.group_id,
+            continuation_token: self.continuation.take(),
             max_keys: Some(FILE_PAGE),
-            prefix: Some(prefix.to_string()),
+            prefix: Some(self.prefix.clone()),
             delimiter: None,
-            start_after: after.take(),
+            start_after: self.after.take(),
         });
-        // Only the range's keys are listed, so no key outside it decides the page or its end.
-        let list = match range {
+        let list = match &self.range {
             Some(range) => list.with_bounds(range.lower.clone(), range.upper.clone()),
             None => list,
         };
-        let listed = drive(list, context)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let last = (listed.objects.last()).map(|object| object.head.key.clone());
-        for object in listed.objects {
-            let key = object.head.key;
-            if key == skip || range.is_some_and(|range| !range.contains(&key)) {
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn next_key(&mut self) -> PublishTurn<FilesPage> {
+        while let Some(key) = self.keys.pop_front() {
+            let outside = (self.range.as_ref()).is_some_and(|range| !range.contains(&key));
+            if key == self.skip || outside {
                 continue;
             }
-            if !access.0.allows(Some(&key), &Permission::READ) {
+            if !self.access.0.allows(Some(&key), &Permission::READ) {
                 return Err(PublishError::Forbidden(UNREADABLE));
             }
-            let place = (scope.realm_id, scope.node_id);
-            let origin = drive(
-                ReadOriginOperation::new(place.0, scope.bucket, &key, None),
-                context,
-            )
-            .await
-            .map_err(|error| unavailable(&error))?;
-            let Some(version) = scope.exact(&key, origin.version_id) else {
-                continue;
-            };
-            // Every field comes from the one version the origin read pinned.
-            let pin = origin.source.map(|source| {
-                let pin = SourcePin {
-                    url: source.url,
-                    path: source.path,
-                    source_version: source.version,
-                };
-                (pin, source.etag)
-            });
-            files.push(ReleaseFile {
-                key,
-                version,
-                size: origin.size.unwrap_or_default(),
-                content: origin.content_hash.map(content_id),
-                pin,
-            });
+            let scope = &self.scope;
+            let origin = ReadOriginOperation::new(scope.realm_id, &scope.bucket, &key, None);
+            self.current = Some(key);
+            return Ok(Next::Call(IoCall::child(origin)));
         }
         // A page with no key goes on to the next; otherwise its last key is the position.
-        match (listed.continuation_token, last) {
-            (Some(token), None) => continuation = Some(token),
-            (Some(_), last) => return Ok((files, last)),
-            (None, _) => return Ok((files, None)),
+        let files = match (self.more.take(), self.last.take()) {
+            (Some(token), None) => {
+                self.continuation = Some(token);
+                return self.list();
+            }
+            (Some(_), last) => (std::mem::take(&mut self.files), last),
+            (None, _) => (std::mem::take(&mut self.files), None),
+        };
+        Ok(Next::Done(files))
+    }
+
+    /// Every field comes from the one version the origin read pinned.
+    fn add_file(&mut self, key: String, origin: OriginView) {
+        let Some(version) = self.scope.view().exact(&key, origin.version_id) else {
+            return;
+        };
+        let pin = origin.source.map(|source| {
+            let pin = SourcePin {
+                url: source.url,
+                path: source.path,
+                source_version: source.version,
+            };
+            (pin, source.etag)
+        });
+        self.files.push(ReleaseFile {
+            key,
+            version,
+            size: origin.size.unwrap_or_default(),
+            content: origin.content_hash.map(content_id),
+            pin,
+        });
+    }
+}
+
+impl Operation for ReleaseFilesOperation {
+    type Output = FilesPage;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<FilesPage> {
+        self.list()
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<FilesPage> {
+        if let Some(key) = self.current.take() {
+            let origin = result.child::<OriginView, OriginError>()?;
+            self.add_file(key, origin.map_err(unavailable)?);
+            return self.next_key();
+        }
+        let listed = result.child::<ListBucketResult, ListBucketError>()?;
+        let listed = listed.map_err(unavailable)?;
+        self.last = (listed.objects.last()).map(|object| object.head.key.clone());
+        self.more = listed.continuation_token;
+        self.keys = (listed.objects.into_iter())
+            .map(|object| object.head.key)
+            .collect();
+        self.next_key()
+    }
+}
+
+/// Every current file under a prefix in a range, page by page.
+#[derive(Debug, PartialEq)]
+struct AllFilesOperation {
+    scope: ReleaseScope,
+    access: Access,
+    prefix: String,
+    skip: String,
+    range: Option<KeyRange>,
+    files: Vec<ReleaseFile>,
+}
+
+impl AllFilesOperation {
+    fn page(&self, after: Option<String>) -> IoCall {
+        let asked = (self.prefix.as_str(), self.skip.as_str());
+        let at = (self.range.as_ref(), after);
+        let page = ReleaseFilesOperation::new(self.scope.view(), &self.access, asked, at);
+        IoCall::child(page)
+    }
+}
+
+impl Operation for AllFilesOperation {
+    type Output = Vec<ReleaseFile>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        Ok(Next::Call(self.page(None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<ReleaseFile>> {
+        let (page, next) = result.child::<FilesPage, PublishError>()??;
+        self.files.extend(page);
+        match next {
+            Some(next) => Ok(Next::Call(self.page(Some(next)))),
+            None => Ok(Next::Done(std::mem::take(&mut self.files))),
         }
     }
 }
 
-/// One release to publish.
-#[derive(Clone, Debug)]
+/// One release to publish. The bearer never shows in a `Debug` print.
+#[derive(Clone, PartialEq)]
 pub struct PublishInput {
     pub auth: AuthContext,
     /// Asks the coordinators of other ranges; required when the prefix spans them.
     pub bearer: Option<String>,
     pub key: String,
     pub spec: ReleaseSpec,
+}
+
+impl std::fmt::Debug for PublishInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishInput")
+            .field("auth", &self.auth)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("key", &self.key)
+            .field("spec", &self.spec)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,73 +444,37 @@ pub struct Published {
     pub replayed: bool,
 }
 
-/// Publishes a release on the node that writes `key`: the caller needs bucket WRITE and admin
-/// or curator rights, may read every pinned file, and gets the existing version back when the
-/// identical release is already the key's head.
-pub async fn publish_release(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
+/// How one key range of a release is listed.
+#[derive(Debug, PartialEq)]
+enum RangePlan {
+    Here(KeyRange),
+    At(KeyRange, Option<NodeId>),
+}
+
+#[derive(Debug, PartialEq)]
+enum CoordinatedStep {
+    View,
+    Fence(Box<DistributionView>),
+    Local,
+    Remote(KeyRange, NodeId),
+}
+
+/// The current files under the prefix, each range listed by its own coordinator; a range no
+/// coordinator lists now refuses the publish, since a copy may be behind.
+#[derive(Debug, PartialEq)]
+struct CoordinatedFilesOperation {
+    scope: ReleaseScope,
+    access: Access,
     input: PublishInput,
-) -> Result<Published, PublishError> {
-    let realm_id = scope.realm_id;
-    let bucket_path =
-        bucket_permission_path(realm_id, scope.info.group_id, scope.node_id, scope.bucket);
-    allowed(context, realm_id, &input.auth, &bucket_path)
-        .await?
-        .then_some(())
-        .ok_or(PublishError::Forbidden("no WRITE on the bucket"))?;
-    let admin = group_admin_path(realm_id, scope.info.group_id);
-    let curator = curator_path(realm_id);
-    if !allowed(context, realm_id, &input.auth, &admin).await?
-        && !allowed(context, realm_id, &input.auth, &curator).await?
-    {
-        return Err(PublishError::Forbidden("neither group admin nor curator"));
-    }
-    let access = load_access(context, scope, &input.auth).await?;
-    let files = coordinated_files(context, scope, &access, &input).await?;
-    let guards = file_guards(context, scope, &files).await?;
-    let bytes = release_crate(&input.spec, &files);
-    let hash = *blake3::hash(&bytes).as_bytes();
-    // A concurrent publish moves the head; the next pass then finds its release or conflicts.
-    for _ in 0..2 {
-        let place = (realm_id, scope.node_id);
-        let head = match drive(
-            ReadOriginOperation::new(place.0, scope.bucket, &input.key, None),
-            context,
-        )
-        .await
-        {
-            Ok(current) if current.content_hash == Some(hash) => {
-                let rows = release_rows(context, scope.bucket).await?;
-                let same = rows.iter().any(|(version_id, pointer)| {
-                    *version_id == current.version_id
-                        && pointer.label == input.spec.label
-                        && pointer.prefix == input.spec.prefix
-                });
-                if same {
-                    return Ok(Published {
-                        version_id: current.version_id,
-                        files: files.len(),
-                        replayed: true,
-                    });
-                }
-                Some(current.version_id)
-            }
-            Ok(current) => Some(current.version_id),
-            Err(OriginError::VersionMissing) => None,
-            Err(error) => return Err(PublishError::Unavailable(error.to_string())),
-        };
-        let write = (bytes.clone(), head, guards.clone());
-        if let Some(version_id) = put_crate(context, scope, &input, write).await? {
-            return Ok(Published {
-                version_id,
-                files: files.len(),
-                replayed: false,
-            });
-        }
-    }
-    Err(PublishError::Conflict(
-        "the release key changed while the release was written; publish again".to_string(),
+    plans: VecDeque<RangePlan>,
+    files: Vec<ReleaseFile>,
+    step: CoordinatedStep,
+}
+
+fn range_refused(range: &KeyRange) -> PublishError {
+    PublishError::Unavailable(format!(
+        "range {} could not be listed by its coordinator",
+        range.range_id
     ))
 }
 
