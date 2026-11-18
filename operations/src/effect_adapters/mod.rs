@@ -13,7 +13,7 @@ mod task;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
-use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::outbound::{ConnectionError, OutboundEffect, OutboundError, OutboundEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -230,5 +230,10 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
+        OutboundEffect::Connection(_) => OutboundEvent::ConnectionAnswered {
+            result: Err(ConnectionError::NotSent(
+                "this node sends no connection requests".to_string(),
+            )),
+        },
     }
 }

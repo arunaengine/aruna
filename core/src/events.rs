@@ -1025,7 +1025,8 @@ impl Event {
                     Posted,
                     MailSent,
                     Backoff,
-                    Answered
+                    Answered,
+                    ConnectionAnswered
                 }
             ),
         }
