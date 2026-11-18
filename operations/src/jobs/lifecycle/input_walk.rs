@@ -41,7 +41,7 @@ pub(super) struct InputCaller {
 }
 
 impl InputCaller {
-    fn auth(&self) -> AuthContext {
+    pub(super) fn auth(&self) -> AuthContext {
         AuthContext {
             user_id: self.created_by,
             realm_id: self.realm_id,
@@ -51,7 +51,7 @@ impl InputCaller {
     }
 
     /// The check that the caller may read `key` like an S3 GET of it.
-    fn read_check(&self, bucket: &str, key: &str) -> SourceReadOperation {
+    pub(super) fn read_check(&self, bucket: &str, key: &str) -> SourceReadOperation {
         let object = SourceObject {
             node_id: self.local,
             bucket: bucket.to_string(),
@@ -62,7 +62,7 @@ impl InputCaller {
     }
 }
 
-fn source_parts(input: &InputSelection) -> (&str, &str, Option<&str>) {
+pub(super) fn source_parts(input: &InputSelection) -> (&str, &str, Option<&str>) {
     let InputSource::S3 {
         bucket,
         key,
@@ -71,7 +71,7 @@ fn source_parts(input: &InputSelection) -> (&str, &str, Option<&str>) {
     (bucket, key, version_id.as_deref())
 }
 
-fn reference_of(input: &InputSelection) -> String {
+pub(super) fn reference_of(input: &InputSelection) -> String {
     let (bucket, key, version_id) = source_parts(input);
     input_reference(bucket, key, version_id)
 }
