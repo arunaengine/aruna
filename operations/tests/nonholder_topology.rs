@@ -411,8 +411,12 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };
-    aruna_operations::jobs::import::upload_store::write_rocrate_upload(&node.context, &record)
-        .await?;
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+        &node.context,
+    )
+    .await
+    .map_err(|error| error.0)?;
     Ok(())
 }
 

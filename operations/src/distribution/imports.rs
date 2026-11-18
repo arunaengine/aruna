@@ -33,7 +33,7 @@ use crate::connectors::get_connector::{
 use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
-use crate::jobs::staging::{CheckpointError, ReadCheckpointOperation, handed_checkpoint};
+use crate::jobs::staging::{ReadCheckpointOperation, StagingStoreError, handed_checkpoint};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -241,7 +241,7 @@ impl Operation for KeepResumeOperation {
                 self.next_job()
             }
             KeepStep::Checkpoint => {
-                let read = result.child::<Option<StagingJobCheckpoint>, CheckpointError>()?;
+                let read = result.child::<Option<StagingJobCheckpoint>, StagingStoreError>()?;
                 let at = read.map_err(failed)?;
                 let (job_id, spec) = self.current.take().ok_or(IoError::Unfinished)?;
                 self.jobs.push(job_id);

@@ -3,23 +3,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::errors::{StagingSourceError, StorageError};
-use aruna_core::keyspaces::{STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE};
-use aruna_core::structs::checksum::ExpectedChecksum;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::errors::{AuthorizationError, StagingSourceError};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
-    ManifestRead, StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase,
+    JobId, StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase,
     StagingJobSpec, StagingWalk,
 };
 use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ListRequest, SourceDigest, SourceEntry, SourceEntryKind,
     SourceMetadata,
 };
-use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -28,39 +31,23 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use tokio::sync::Mutex;
-use tracing::warn;
 use ulid::Ulid;
 
+use super::limiter::{retried_call, retried_result};
 use super::manifest::{
-    ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
+    ManifestDigest, digest_reads, lasting_resolution, lasting_source, parse_digests,
 };
-use super::retried;
-use super::{
-    ItemFailure, checkpoint_key, moved_away, persist_slot, pinned_bucket, queue_key, stage_item,
-    sync_progress,
-};
+use super::page::{ImportPageOperation, PageSource, SnapshotPageOperation};
+use super::{ItemFailure, PageFailure, StagingRun, committed, pinned, queue_key};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::permission_rules::PermissionRules;
-use crate::auth::request_authorization::rules_operation;
-use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
-use crate::distribution::guard::{
-    GuardError, authority_reads, authority_rows, write_target, write_targets,
+use crate::auth::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
-use crate::driver::drive;
-use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::store::query::batch_delete;
-use crate::jobs::store::read_state;
-use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
+use crate::distribution::guard::{GuardError, authority_reads, write_target, write_targets};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
-use crate::staging::page::import::{
-    PageEntry, PageImportError, PageImportInput, PageImportOperation, PageImportResult,
-    PreparePageOperation,
-};
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
-use crate::storage_read::iter_prefix_page;
 
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;
@@ -72,48 +59,17 @@ const COMMIT_PATH_BYTES: usize = 4 << 20;
 /// Snapshot pages copy every file before their checkpoint, so they stay smaller.
 const SNAPSHOT_PAGE_SIZE: usize = 100;
 
-/// Queue rows one cleanup pass deletes.
-const QUEUE_CLEANUP_PAGE: usize = 256;
-/// Page transactions one listed page runs at most while their commits conflict.
-const PAGE_ATTEMPTS: u32 = 8;
-/// Pause before the next page transaction, times the attempts so far.
-const CONFLICT_PAUSE: Duration = Duration::from_millis(20);
-
-/// Starts the next listing: the next queued directory, else the next spec prefix.
-/// `Ok(false)` once nothing is left to list.
-pub(super) async fn start_walk(
-    ctx: &JobContext,
+/// The next walk of `checkpoint` from the spec's prefixes, with its manifest, when no directory
+/// waits in the queue; `false` once nothing is left to list.
+pub(super) fn start_prefix_walk(
     spec: &StagingJobSpec,
     checkpoint: &mut StagingJobCheckpoint,
-) -> Result<bool, String> {
-    if checkpoint.queue_head < checkpoint.queue_tail {
-        let row = queue_key(ctx.job_id, checkpoint.queue_head);
-        match read_state::<StagingJobDirectory>(
-            &ctx.driver,
-            STAGING_QUEUE_KEYSPACE,
-            row,
-            "staging queue read",
-        )
-        .await?
-        {
-            Some(directory) => {
-                checkpoint.walk = Some(StagingWalk {
-                    source_path: directory.source_path,
-                    target_prefix: directory.target_prefix,
-                    cursor: None,
-                    queue_row: Some(checkpoint.queue_head),
-                    from: None,
-                });
-            }
-            None => checkpoint.queue_head += 1,
-        }
-        return Ok(true);
-    }
+) -> bool {
     let Some(prefix) = usize::try_from(checkpoint.prefixes_done)
         .ok()
         .and_then(|done| spec.prefixes.get(done))
     else {
-        return Ok(false);
+        return false;
     };
     checkpoint.walk = Some(StagingWalk {
         source_path: directory_list_path(&prefix.source_prefix),
@@ -123,57 +79,51 @@ pub(super) async fn start_walk(
         from: None,
     });
     // The prefix's manifest is read before its first page, so every page can look it up.
-    checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| ManifestRead {
-        source_path: format!("{}{name}", directory_list_path(&prefix.source_prefix)),
-        offset: 0,
-        observation: None,
+    checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| {
+        aruna_core::structs::execution::job::ManifestRead {
+            source_path: format!("{}{name}", directory_list_path(&prefix.source_prefix)),
+            offset: 0,
+            observation: None,
+        }
     });
     checkpoint.prefixes_done += 1;
-    Ok(true)
+    true
 }
 
-/// Deletes the job's queue and manifest rows page by page; rows left by a failed pass stay
-/// until the next run and do not change the outcome.
-pub(super) async fn clear_queue(ctx: &JobContext) {
-    for key_space in [STAGING_QUEUE_KEYSPACE, STAGING_MANIFEST_KEYSPACE] {
-        let prefix = ByteView::from(ctx.job_id.to_bytes().to_vec());
-        if let Err(error) = clear_rows(ctx, key_space, prefix).await {
-            warn!(job_id = %ctx.job_id, error = %error, "Staging job row cleanup failed");
+/// Takes the walk of a queued directory, or passes over a row that is gone.
+pub(super) fn start_queued_walk(
+    checkpoint: &mut StagingJobCheckpoint,
+    directory: Option<StagingJobDirectory>,
+) {
+    match directory {
+        Some(directory) => {
+            checkpoint.walk = Some(StagingWalk {
+                source_path: directory.source_path,
+                target_prefix: directory.target_prefix,
+                cursor: None,
+                queue_row: Some(checkpoint.queue_head),
+                from: None,
+            });
         }
+        None => checkpoint.queue_head += 1,
     }
 }
 
-/// Deletes every row of `key_space` under `prefix`, page by page.
-pub(super) async fn clear_rows(
-    ctx: &JobContext,
-    key_space: &str,
-    prefix: ByteView,
-) -> Result<(), String> {
-    let storage = &ctx.driver.storage_handle;
-    loop {
-        let (rows, _) = iter_prefix_page(
-            storage,
-            key_space,
-            Some(prefix.clone()),
-            None,
-            QUEUE_CLEANUP_PAGE,
-            None,
-        )
-        .await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let deletes = rows
-            .into_iter()
-            .map(|(key, _)| (key_space.to_string(), key))
-            .collect();
-        batch_delete(&ctx.driver, deletes, None).await?;
-    }
+/// The queue row the job reads next.
+pub(super) fn queue_read(job_id: JobId, position: u64) -> IoCall {
+    let row = (
+        STAGING_QUEUE_KEYSPACE.to_string(),
+        queue_key(job_id, position),
+    );
+    IoCall::Read(vec![row])
 }
 
-pub(super) async fn finish_failed(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutcome {
-    clear_queue(ctx).await;
-    outcome
+/// Decodes a queued directory.
+pub(super) fn parse_queued(result: IoResult) -> Result<Option<StagingJobDirectory>, String> {
+    let [row] = values::<1>(result).map_err(|error| error.to_string())?;
+    row.map(|value| postcard::from_bytes(&value))
+        .transpose()
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn item_phase(spec: &StagingJobSpec) -> StagingJobPhase {
@@ -201,14 +151,8 @@ pub(super) fn record_failure(
     }
 }
 
-pub(super) enum PageFailure {
-    Retry(String),
-    Permanent(String),
-    /// Page transactions kept conflicting with other writers; the job is deferred.
-    Conflict(String),
-}
-
 /// A file a listing page or a table row found, mapped to its destination key.
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct StagedFile {
     pub(super) source_path: String,
     pub(super) target_key: String,
@@ -223,305 +167,604 @@ pub(super) struct StagedFile {
     pub(super) mirrors: Vec<(Ulid, String)>,
 }
 
-/// Lists one page of the current walk and records it, with the walk's next position and the
-/// queue changes, in one write. Lanes share `turn`, so their page transactions run one at a time.
-pub(super) async fn walk_page(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    (slot, upper): (Option<u64>, Option<&str>),
-    checkpoint: &mut StagingJobCheckpoint,
-    (ahead, turn): (&mut Option<Ahead>, Option<&Mutex<()>>),
-) -> Result<(), PageFailure> {
-    let Some(walk) = checkpoint.walk.clone() else {
-        return Ok(());
-    };
-    let flat = checkpoint.flat == Some(true);
-    checkpoint.phase = StagingJobPhase::Discovering;
-    checkpoint.current_path = Some(walk.source_path.clone());
-    let mut next = checkpoint.clone();
-    let mut writes = Vec::new();
-    let mut deletes = Vec::new();
-    let listed = match ahead.take().filter(|ahead| ahead.walk == walk) {
-        Some(ahead) => ahead.listing,
-        None => listing(ctx, spec, &walk, (flat, upper)).await?,
-    };
-    let (segment, listed) = match listed {
-        Listing::Done => {
-            next.walk = None;
-            return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
-        }
-        Listing::Page(segment, listed) => (segment, listed),
-    };
-    let mut page = match listed {
-        Ok(page) => Some(page),
-        Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-            record_failure(&mut next, &walk.source_path, &walk.target_prefix, message);
-            None
-        }
-        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-        Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
-    };
-    let next_cursor = page.as_ref().and_then(|page| page.next_cursor.clone());
-    if next_cursor.is_some() && next_cursor == walk.cursor {
-        return Err(PageFailure::Permanent(
-            "source listing pagination made no progress".to_string(),
-        ));
-    }
-    match next_cursor {
-        Some(cursor) => {
-            next.walk = Some(StagingWalk {
-                cursor: Some(cursor),
-                ..walk.clone()
-            })
-        }
-        None => {
-            // The next coordinated range continues where this one ends.
-            next.walk = (segment.as_ref())
-                .and_then(|segment| segment.upper.clone())
-                .map(|upper| StagingWalk {
-                    cursor: None,
-                    from: Some(upper),
-                    ..walk.clone()
-                });
-            if let Some(row) = walk.queue_row {
-                deletes.push((
-                    STAGING_QUEUE_KEYSPACE.to_string(),
-                    queue_key(ctx.job_id, row),
-                ));
-                next.queue_head = row + 1;
-            }
-        }
-    }
-    let mut files = Vec::new();
-    // HTTP index pages round sizes and print local minutes, so each file gets a HEAD (step 0).
-    let exact =
-        (page.as_ref()).is_some_and(|page| page.connector.kind != SourceConnectorKind::Http);
-    let listed = page
-        .as_mut()
-        .map(|page| std::mem::take(&mut page.entries))
-        .unwrap_or_default();
-    for entry in listed {
-        match map_source_entry(&walk, entry, (flat, exact)) {
-            Ok(MappedEntry::File(file)) => {
-                next.bytes_discovered =
-                    next.bytes_discovered.saturating_add(file.size.unwrap_or(0));
-                files.push(file);
-            }
-            Ok(MappedEntry::Directory(directory)) => {
-                let value = postcard::to_allocvec(&directory)
-                    .map_err(|error| PageFailure::Permanent(error.to_string()))?;
-                let key = queue_key(ctx.job_id, next.queue_tail);
-                writes.push((
-                    STAGING_QUEUE_KEYSPACE.to_string(),
-                    key,
-                    ByteView::from(value),
-                ));
-                next.queue_tail += 1;
-            }
-            Err(message) => {
-                record_failure(&mut next, &walk.source_path, &walk.target_prefix, message)
-            }
-        }
-    }
-    if spec.checksum_manifest.is_some() {
-        let paths: Vec<&str> = files.iter().map(|file| file.source_path.as_str()).collect();
-        let digests = manifest_digests(ctx, &paths)
-            .await
-            .map_err(PageFailure::Retry)?;
-        for (file, digest) in files.iter_mut().zip(digests) {
-            file.manifest = digest.into_iter().collect();
-        }
-    }
-    next.phase = item_phase(spec);
-    let Some(page) = page else {
-        // The listing failed for good: record that and move on.
-        return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
-    };
-    let rows = PageRows {
-        files,
-        writes,
-        deletes,
-    };
-    match spec.strategy {
-        StagingStrategy::Reference => {
-            // The next page of a flat walk is listed while this one commits; one page at most.
-            let following = (next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
-            let prefetch = async {
-                let walk = following?;
-                let listing = listing(ctx, spec, &walk, (flat, upper)).await.ok()?;
-                Some(Ahead { walk, listing })
-            };
-            let source = Some((page.connector, page.secret_fingerprint));
-            let rows = (rows.files, rows.writes, rows.deletes);
-            let import = import_page(ctx, spec, (slot, turn), checkpoint, next, rows, source);
-            let (imported, fetched) = tokio::join!(import, prefetch);
-            if imported.is_ok() {
-                *ahead = fetched;
-            }
-            imported
-        }
-        StagingStrategy::Snapshot | StagingStrategy::Sync => {
-            snapshot_page(ctx, spec, checkpoint, next, rows).await
-        }
-    }
+/// A walk's position in the job: the checkpoint row it writes, the key it stops before and
+/// whether its page transactions take turns with other lanes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct WalkPlace {
+    pub(super) slot: Option<u64>,
+    pub(super) upper: Option<String>,
+    pub(super) lane: bool,
+}
+
+/// What a walked page leaves: the checkpoint and the next listing, when one was made ahead.
+#[derive(Debug, PartialEq)]
+pub(super) struct WalkedPage {
+    pub(super) checkpoint: StagingJobCheckpoint,
+    pub(super) ahead: Option<Ahead>,
 }
 
 /// A listing made ahead for the walk position it was made for.
+#[derive(Debug, PartialEq)]
 pub(super) struct Ahead {
     walk: StagingWalk,
     listing: Listing,
 }
 
 /// What one listing of a walk position found.
-enum Listing {
+#[derive(Debug, PartialEq)]
+pub(super) enum Listing {
     /// No coordinated range of the walk is left.
     Done,
     Page(Option<Segment>, Result<ListStagingResult, ItemFailure>),
 }
 
-/// Lists the page at `walk`; a flat walk into a distributed bucket lists only the key ranges
-/// this node coordinates.
-async fn listing(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    walk: &StagingWalk,
-    (flat, upper): (bool, Option<&str>),
-) -> Result<Listing, PageFailure> {
-    let segment = match (flat, walk.queue_row) {
-        (true, None) => match segment_of(ctx, spec, walk, upper).await? {
-            Bounds::Whole => None,
-            Bounds::Segment(segment) => Some(segment),
-            Bounds::Done => return Ok(Listing::Done),
-        },
-        _ => None,
-    };
-    let mut page = list_page(ctx, spec, walk, (flat, segment.as_ref())).await;
-    // A flat reference walk is an ordered stream, so its next pages join the same transaction.
-    let gathers = flat && walk.queue_row.is_none() && spec.checksum_manifest.is_none();
-    let gathers = gathers && spec.strategy == StagingStrategy::Reference;
-    while gathers && let Ok(listed) = &mut page {
-        let bytes: usize = (listed.entries.iter()).map(|entry| entry.path.len()).sum();
-        let full = listed.entries.len() + STAGING_PAGE_SIZE > COMMIT_ENTRIES;
-        let Some(cursor) = listed.next_cursor.clone().filter(|_| !full) else {
-            break;
-        };
-        if bytes > COMMIT_PATH_BYTES {
-            break;
-        }
-        let next = StagingWalk {
-            cursor: Some(cursor),
-            ..walk.clone()
-        };
-        // A failed listing ends the gathered page; the walk lists it again from its cursor.
-        let Ok(more) = list_page(ctx, spec, &next, (flat, segment.as_ref())).await else {
-            break;
-        };
-        if (more.connector != listed.connector)
-            || more.secret_fingerprint != listed.secret_fingerprint
-        {
-            break;
-        }
-        listed.entries.extend(more.entries);
-        listed.next_cursor = more.next_cursor;
-    }
-    Ok(Listing::Page(segment, page))
+#[derive(Debug, PartialEq)]
+enum WalkStep {
+    Listing,
+    Digests,
+    Commit,
+    Import,
+    Both,
+    Snapshot,
 }
 
-/// A page's files with the job rows written and deleted with it.
-pub(super) type PageFiles = (
-    Vec<StagedFile>,
-    Vec<(KeySpace, Key, Value)>,
-    Vec<(KeySpace, Key)>,
-);
-
-/// What one listing page adds: files to stage and the job's queue changes.
-struct PageRows {
+/// Lists one page of the current walk and records it, with the walk's next position and the
+/// queue changes, in one write. The next page of a flat reference walk is listed meanwhile.
+#[derive(Debug, PartialEq)]
+pub(super) struct WalkPageOperation {
+    run: StagingRun,
+    place: WalkPlace,
+    checkpoint: StagingJobCheckpoint,
+    next: StagingJobCheckpoint,
+    walk: Option<StagingWalk>,
+    ahead: Option<Ahead>,
+    following: Option<StagingWalk>,
+    page: Option<ListStagingResult>,
     files: Vec<StagedFile>,
     writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
+    step: WalkStep,
 }
 
-pub(super) async fn commit_rows(
-    ctx: &JobContext,
-    checkpoint: &mut StagingJobCheckpoint,
-    next: StagingJobCheckpoint,
-    writes: Vec<(KeySpace, Key, Value)>,
-    deletes: Vec<(KeySpace, Key)>,
-) -> Result<(), PageFailure> {
-    commit_slot(ctx, None, checkpoint, next, writes, deletes).await
-}
-
-async fn commit_slot(
-    ctx: &JobContext,
-    slot: Option<u64>,
-    checkpoint: &mut StagingJobCheckpoint,
-    next: StagingJobCheckpoint,
-    writes: Vec<(KeySpace, Key, Value)>,
-    deletes: Vec<(KeySpace, Key)>,
-) -> Result<(), PageFailure> {
-    persist_slot(ctx, slot, &next, writes, deletes)
-        .await
-        .map_err(PageFailure::Retry)?;
-    committed(ctx, slot, checkpoint, next);
-    Ok(())
-}
-
-/// Takes a committed checkpoint over; a lane adds its own progress to the job's.
-fn committed(
-    ctx: &JobContext,
-    slot: Option<u64>,
-    checkpoint: &mut StagingJobCheckpoint,
-    next: StagingJobCheckpoint,
-) {
-    let before = checkpoint.items_current;
-    *checkpoint = next;
-    match slot {
-        None => sync_progress(ctx, checkpoint),
-        Some(_) => (ctx.progress).advance(checkpoint.items_current.saturating_sub(before)),
+impl WalkPageOperation {
+    pub(super) fn new(
+        run: StagingRun,
+        place: WalkPlace,
+        mut checkpoint: StagingJobCheckpoint,
+        ahead: Option<Ahead>,
+    ) -> Self {
+        let walk = checkpoint.walk.clone();
+        if let Some(walk) = &walk {
+            checkpoint.phase = StagingJobPhase::Discovering;
+            checkpoint.current_path = Some(walk.source_path.clone());
+        }
+        Self {
+            run,
+            place,
+            next: checkpoint.clone(),
+            checkpoint,
+            walk,
+            ahead,
+            following: None,
+            page: None,
+            files: Vec::new(),
+            writes: Vec::new(),
+            deletes: Vec::new(),
+            step: WalkStep::Listing,
+        }
     }
-    ctx.progress.checkpoint();
+
+    fn flat(&self) -> bool {
+        self.checkpoint.flat == Some(true)
+    }
+
+    fn done(&mut self, checkpoint: StagingJobCheckpoint) -> Next<WalkedPage> {
+        let ahead = self.ahead.take();
+        Next::Done(WalkedPage { checkpoint, ahead })
+    }
+
+    fn commit(&mut self) -> Result<Next<WalkedPage>, PageFailure> {
+        self.step = WalkStep::Commit;
+        let (writes, deletes) = (
+            std::mem::take(&mut self.writes),
+            std::mem::take(&mut self.deletes),
+        );
+        let call = (self.run)
+            .commit_call(self.place.slot, &self.next, writes, deletes)
+            .map_err(PageFailure::Retry)?;
+        Ok(Next::Call(call))
+    }
+
+    fn listed(&mut self, listing: Listing) -> Result<Next<WalkedPage>, PageFailure> {
+        let Some(walk) = self.walk.clone() else {
+            return Ok(self.done(self.checkpoint.clone()));
+        };
+        let (segment, listed) = match listing {
+            Listing::Done => {
+                self.next.walk = None;
+                return self.commit();
+            }
+            Listing::Page(segment, listed) => (segment, listed),
+        };
+        let mut page = match listed {
+            Ok(page) => Some(page),
+            Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+                record_failure(
+                    &mut self.next,
+                    &walk.source_path,
+                    &walk.target_prefix,
+                    message,
+                );
+                None
+            }
+            Err(failure) => return Err(failure.into()),
+        };
+        let next_cursor = page.as_ref().and_then(|page| page.next_cursor.clone());
+        if next_cursor.is_some() && next_cursor == walk.cursor {
+            return Err(PageFailure::Permanent(
+                "source listing pagination made no progress".to_string(),
+            ));
+        }
+        match next_cursor {
+            Some(cursor) => {
+                self.next.walk = Some(StagingWalk {
+                    cursor: Some(cursor),
+                    ..walk.clone()
+                })
+            }
+            None => {
+                // The next coordinated range continues where this one ends.
+                self.next.walk = (segment.as_ref())
+                    .and_then(|segment| segment.upper.clone())
+                    .map(|upper| StagingWalk {
+                        cursor: None,
+                        from: Some(upper),
+                        ..walk.clone()
+                    });
+                if let Some(row) = walk.queue_row {
+                    self.deletes.push((
+                        STAGING_QUEUE_KEYSPACE.to_string(),
+                        queue_key(self.run.job_id, row),
+                    ));
+                    self.next.queue_head = row + 1;
+                }
+            }
+        }
+        // HTTP index pages round sizes and print local minutes, so each file gets a HEAD (step 0).
+        let exact =
+            (page.as_ref()).is_some_and(|page| page.connector.kind != SourceConnectorKind::Http);
+        let entries = page
+            .as_mut()
+            .map(|page| std::mem::take(&mut page.entries))
+            .unwrap_or_default();
+        let flat = self.flat();
+        for entry in entries {
+            match map_source_entry(&walk, entry, (flat, exact)) {
+                Ok(MappedEntry::File(file)) => {
+                    self.next.bytes_discovered = self
+                        .next
+                        .bytes_discovered
+                        .saturating_add(file.size.unwrap_or(0));
+                    self.files.push(file);
+                }
+                Ok(MappedEntry::Directory(directory)) => {
+                    let value = postcard::to_allocvec(&directory)
+                        .map_err(|error| PageFailure::Permanent(error.to_string()))?;
+                    let key = queue_key(self.run.job_id, self.next.queue_tail);
+                    self.writes.push((
+                        STAGING_QUEUE_KEYSPACE.to_string(),
+                        key,
+                        ByteView::from(value),
+                    ));
+                    self.next.queue_tail += 1;
+                }
+                Err(message) => record_failure(
+                    &mut self.next,
+                    &walk.source_path,
+                    &walk.target_prefix,
+                    message,
+                ),
+            }
+        }
+        self.page = page;
+        if self.run.spec.checksum_manifest.is_some() {
+            self.step = WalkStep::Digests;
+            let paths: Vec<&str> = (self.files.iter())
+                .map(|file| file.source_path.as_str())
+                .collect();
+            return Ok(Next::Call(digest_reads(self.run.job_id, &paths)));
+        }
+        self.record()
+    }
+
+    /// Records the listed page: the listing failed for good, or its files go on.
+    fn record(&mut self) -> Result<Next<WalkedPage>, PageFailure> {
+        self.next.phase = item_phase(&self.run.spec);
+        let Some(page) = self.page.take() else {
+            return self.commit();
+        };
+        let rows = (
+            std::mem::take(&mut self.files),
+            std::mem::take(&mut self.writes),
+            std::mem::take(&mut self.deletes),
+        );
+        let next = self.next.clone();
+        match self.run.spec.strategy {
+            StagingStrategy::Reference => {
+                let source: PageSource = (page.connector, page.secret_fingerprint);
+                let import = ImportPageOperation::new(
+                    self.run.clone(),
+                    self.place.clone(),
+                    next,
+                    rows,
+                    Some(source),
+                );
+                // The next page of a flat walk is listed while this one commits; one at most.
+                let flat = self.flat();
+                let following =
+                    (self.next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
+                let Some(walk) = following else {
+                    self.step = WalkStep::Import;
+                    return Ok(Next::Call(IoCall::child(import)));
+                };
+                self.step = WalkStep::Both;
+                let upper = self.place.upper.clone();
+                let listing = ListingOperation::new(self.run.clone(), walk.clone(), flat, upper);
+                self.following = Some(walk);
+                let members = vec![member(import), member(listing)];
+                Ok(Next::Call(IoCall::Group(EffectGroup {
+                    members,
+                    limit: 2,
+                    form: GroupForm::All { deadline: None },
+                })))
+            }
+            StagingStrategy::Snapshot | StagingStrategy::Sync => {
+                self.step = WalkStep::Snapshot;
+                let copy = SnapshotPageOperation::new(
+                    self.run.clone(),
+                    self.checkpoint.clone(),
+                    next,
+                    rows,
+                );
+                Ok(Next::Call(IoCall::child(copy)))
+            }
+        }
+    }
 }
 
-async fn list_page(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    walk: &StagingWalk,
-    (flat, segment): (bool, Option<&Segment>),
-) -> Result<ListStagingResult, ItemFailure> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: spec.auth_context.clone(),
-            path: source_permission_path(spec, &walk.source_path),
-            required_permission: Permission::READ,
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| ItemFailure::System(error.to_string()))?;
-    if !allowed {
-        return Err(ItemFailure::Denied("permission denied".to_string()));
+/// A child for an effect group, whose typed outcome the group answers with.
+pub(super) fn member<O>(operation: O) -> Effect
+where
+    O: Operation + 'static,
+    O::Output: PartialEq + 'static,
+    O::Error: 'static,
+{
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::Child(ChildOutcome::new(result))
+    }))
+}
+
+/// The typed outcome of a group member.
+pub(super) fn member_outcome<T: 'static, E: 'static>(
+    result: GroupResult,
+) -> Result<Result<T, E>, aruna_core::calls::IoError> {
+    match result {
+        GroupResult::Done(event) => super::limiter::child_of::<T, E>(*event),
+        GroupResult::Unfinished | GroupResult::Refused => {
+            Err(aruna_core::calls::IoError::Unexpected {
+                expected: "a finished group member",
+                got: "an unfinished or refused member",
+            })
+        }
     }
-    let limit = match spec.strategy {
-        StagingStrategy::Snapshot => SNAPSHOT_PAGE_SIZE,
-        StagingStrategy::Reference | StagingStrategy::Sync => STAGING_PAGE_SIZE,
-    };
-    let input = ListStagingInput {
-        group_id: spec.group_id,
-        connector_id: spec.connector_id,
-        source_path: walk.source_path.clone(),
-        request: ListRequest {
-            cursor: walk.cursor.clone(),
-            lower: segment.and_then(|segment| segment.lower.clone()),
-            stop: segment.and_then(|segment| segment.stop.clone()),
-            limit,
-            recursive: flat,
-            files_only: flat,
-        },
-    };
-    let transient = |error: &ListStagingError| !lasting_list(error);
-    retried(ctx, spec, input, ListStagingOperation::new, transient)
-        .await
-        .map_err(list_failure)
+}
+
+impl Operation for WalkPageOperation {
+    type Output = WalkedPage;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<WalkedPage>, PageFailure> {
+        let Some(walk) = self.walk.clone() else {
+            return Ok(self.done(self.checkpoint.clone()));
+        };
+        match self.ahead.take().filter(|ahead| ahead.walk == walk) {
+            Some(ahead) => self.listed(ahead.listing),
+            None => {
+                let upper = self.place.upper.clone();
+                let listing = ListingOperation::new(self.run.clone(), walk, self.flat(), upper);
+                Ok(Next::Call(IoCall::child(listing)))
+            }
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<WalkedPage>, PageFailure> {
+        match self.step {
+            WalkStep::Listing => {
+                let listing = result.child::<Listing, PageFailure>()??;
+                self.listed(listing)
+            }
+            WalkStep::Digests => {
+                let digests = parse_digests(result).map_err(PageFailure::Retry)?;
+                for (file, digest) in self.files.iter_mut().zip(digests) {
+                    file.manifest = digest.into_iter().collect();
+                }
+                self.record()
+            }
+            WalkStep::Commit => {
+                committed(result).map_err(PageFailure::Retry)?;
+                Ok(self.done(self.next.clone()))
+            }
+            WalkStep::Import | WalkStep::Snapshot => {
+                let checkpoint = result.child::<StagingJobCheckpoint, PageFailure>()??;
+                Ok(self.done(checkpoint))
+            }
+            WalkStep::Both => {
+                let IoResult::Group(GroupEvent::Finished { results }) = result else {
+                    return Err(aruna_core::calls::IoError::Unexpected {
+                        expected: "the finished page and listing",
+                        got: result.label(),
+                    }
+                    .into());
+                };
+                let mut results = results.into_iter();
+                let (Some(imported), Some(fetched)) = (results.next(), results.next()) else {
+                    return Err(PageFailure::Retry("a page member is missing".to_string()));
+                };
+                let checkpoint = member_outcome::<StagingJobCheckpoint, PageFailure>(imported)??;
+                let listing = member_outcome::<Listing, PageFailure>(fetched)?.ok();
+                self.ahead = (self.following.take())
+                    .zip(listing)
+                    .map(|(walk, listing)| Ahead { walk, listing });
+                Ok(self.done(checkpoint))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ListingStep {
+    Bounds,
+    First,
+    More,
+}
+
+/// Lists the page at a walk position; a flat walk into a distributed bucket lists only the key
+/// ranges this node coordinates, and a flat reference walk gathers several listings.
+#[derive(Debug, PartialEq)]
+pub(super) struct ListingOperation {
+    run: StagingRun,
+    walk: StagingWalk,
+    flat: bool,
+    upper: Option<String>,
+    segment: Option<Segment>,
+    page: Option<ListStagingResult>,
+    step: ListingStep,
+}
+
+impl ListingOperation {
+    pub(super) fn new(
+        run: StagingRun,
+        walk: StagingWalk,
+        flat: bool,
+        upper: Option<String>,
+    ) -> Self {
+        Self {
+            run,
+            walk,
+            flat,
+            upper,
+            segment: None,
+            page: None,
+            step: ListingStep::Bounds,
+        }
+    }
+
+    fn list(&self, walk: StagingWalk) -> IoCall {
+        let segment = self.segment.clone();
+        IoCall::child(ListPageOperation::new(
+            self.run.clone(),
+            walk,
+            self.flat,
+            segment,
+        ))
+    }
+
+    fn list_first(&mut self) -> Next<Listing> {
+        self.step = ListingStep::First;
+        Next::Call(self.list(self.walk.clone()))
+    }
+
+    fn end(&mut self, page: Result<ListStagingResult, ItemFailure>) -> Next<Listing> {
+        Next::Done(Listing::Page(self.segment.take(), page))
+    }
+
+    /// Lists on from the gathered page, or ends it: it is full or the listing is exhausted.
+    fn gather(&mut self, page: ListStagingResult) -> Next<Listing> {
+        let spec = &self.run.spec;
+        // A flat reference walk is an ordered stream, so its next pages join the same transaction.
+        let gathers = self.flat
+            && self.walk.queue_row.is_none()
+            && spec.checksum_manifest.is_none()
+            && spec.strategy == StagingStrategy::Reference;
+        let bytes: usize = (page.entries.iter()).map(|entry| entry.path.len()).sum();
+        let full = page.entries.len() + STAGING_PAGE_SIZE > COMMIT_ENTRIES;
+        let cursor = page.next_cursor.clone().filter(|_| !full);
+        match cursor.filter(|_| gathers && bytes <= COMMIT_PATH_BYTES) {
+            Some(cursor) => {
+                self.step = ListingStep::More;
+                self.page = Some(page);
+                Next::Call(self.list(StagingWalk {
+                    cursor: Some(cursor),
+                    ..self.walk.clone()
+                }))
+            }
+            None => self.end(Ok(page)),
+        }
+    }
+}
+
+impl Operation for ListingOperation {
+    type Output = Listing;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<Listing>, PageFailure> {
+        if !self.flat || self.walk.queue_row.is_some() {
+            return Ok(self.list_first());
+        }
+        Ok(Next::Call(IoCall::child(SegmentOperation::new(
+            self.run.clone(),
+            self.walk.clone(),
+            self.upper.clone(),
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Listing>, PageFailure> {
+        match self.step {
+            ListingStep::Bounds => {
+                match result.child::<Bounds, PageFailure>()?? {
+                    Bounds::Whole => {}
+                    Bounds::Segment(segment) => self.segment = Some(segment),
+                    Bounds::Done => return Ok(Next::Done(Listing::Done)),
+                }
+                Ok(self.list_first())
+            }
+            ListingStep::First => match result.child::<ListStagingResult, ItemFailure>()? {
+                Ok(page) => Ok(self.gather(page)),
+                Err(failure) => Ok(self.end(Err(failure))),
+            },
+            ListingStep::More => {
+                let more = result.child::<ListStagingResult, ItemFailure>()?;
+                let Some(mut page) = self.page.take() else {
+                    return Err(PageFailure::Retry("the gathered page is gone".to_string()));
+                };
+                // A failed listing ends the gathered page; the walk lists it again from its cursor.
+                let Ok(more) = more else {
+                    return Ok(self.end(Ok(page)));
+                };
+                if more.connector != page.connector
+                    || more.secret_fingerprint != page.secret_fingerprint
+                {
+                    return Ok(self.end(Ok(page)));
+                }
+                page.entries.extend(more.entries);
+                page.next_cursor = more.next_cursor;
+                Ok(self.gather(page))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ListPageStep {
+    Allowed,
+    Listed,
+}
+
+/// One listing request, after the submitter's READ on the walk's path is checked.
+#[derive(Debug, PartialEq)]
+struct ListPageOperation {
+    run: StagingRun,
+    walk: StagingWalk,
+    flat: bool,
+    segment: Option<Segment>,
+    step: ListPageStep,
+}
+
+impl ListPageOperation {
+    fn new(run: StagingRun, walk: StagingWalk, flat: bool, segment: Option<Segment>) -> Self {
+        Self {
+            run,
+            walk,
+            flat,
+            segment,
+            step: ListPageStep::Allowed,
+        }
+    }
+}
+
+impl Operation for ListPageOperation {
+    type Output = ListStagingResult;
+    type Error = ItemFailure;
+
+    fn first(&mut self) -> Result<Next<ListStagingResult>, ItemFailure> {
+        let spec = &self.run.spec;
+        Ok(Next::Call(read_check_call(
+            spec,
+            source_permission_path(spec, &self.walk.source_path),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ListStagingResult>, ItemFailure> {
+        match self.step {
+            ListPageStep::Allowed => {
+                let allowed = (result.child::<bool, AuthorizationError>()?)
+                    .map_err(|error| ItemFailure::System(error.to_string()))?;
+                if !allowed {
+                    return Err(ItemFailure::Denied("permission denied".to_string()));
+                }
+                self.step = ListPageStep::Listed;
+                let spec = &self.run.spec;
+                let limit = match spec.strategy {
+                    StagingStrategy::Snapshot => SNAPSHOT_PAGE_SIZE,
+                    StagingStrategy::Reference | StagingStrategy::Sync => STAGING_PAGE_SIZE,
+                };
+                let segment = self.segment.as_ref();
+                let input = ListStagingInput {
+                    group_id: spec.group_id,
+                    connector_id: spec.connector_id,
+                    source_path: self.walk.source_path.clone(),
+                    request: ListRequest {
+                        cursor: self.walk.cursor.clone(),
+                        lower: segment.and_then(|segment| segment.lower.clone()),
+                        stop: segment.and_then(|segment| segment.stop.clone()),
+                        limit,
+                        recursive: self.flat,
+                        files_only: self.flat,
+                    },
+                };
+                let transient: fn(&ListStagingError) -> bool = |error| !lasting_list(error);
+                Ok(Next::Call(retried_call(
+                    &self.run,
+                    input,
+                    ListStagingOperation::new,
+                    transient,
+                )))
+            }
+            ListPageStep::Listed => {
+                let listed = retried_result::<ListStagingResult, ListStagingError>(result)?;
+                listed.map(Next::Done).map_err(list_failure)
+            }
+        }
+    }
+}
+
+/// READ on `path` for the job's submitter.
+pub(super) fn read_check_call(spec: &StagingJobSpec, path: String) -> IoCall {
+    IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
+        auth_context: spec.auth_context.clone(),
+        path,
+        required_permission: Permission::READ,
+    }))
+}
+
+/// The submitter's permission rules in the job's group, which holds the source and target paths.
+pub(super) fn rules_call(spec: &StagingJobSpec) -> IoCall {
+    IoCall::child(PermissionRulesOperation::new(PermissionRulesConfig {
+        auth_context: spec.auth_context.clone(),
+        path: source_permission_path(spec, ""),
+    }))
+}
+
+/// The answer to [`rules_call`].
+pub(super) fn rules_result(result: IoResult) -> Result<PermissionRules, String> {
+    (result.child::<PermissionRules, AuthorizationError>())
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Reads the record and fence row of a distributed bucket's set.
+pub(super) fn authority_call(binding: &DistributionBinding) -> IoCall {
+    IoCall::Read(authority_reads(binding.set_id))
 }
 
 /// A source that refuses the path skips it; any other listing error retries the page, so one
@@ -542,49 +785,14 @@ fn lasting_list(error: &ListStagingError) -> bool {
     }
 }
 
-/// Which of `keys` this node imports: in a distributed bucket only the keys of ranges it
-/// coordinates, since every coordinator runs its own job for its keys. A range this node
+/// The range of each of `keys` if this node coordinates it, else `None`. A range this node
 /// fenced for a transfer is skipped; its new coordinator imports it on its next run.
-pub(super) async fn coordinated(
-    ctx: &JobContext,
-    bucket: &BucketInfo,
-    keys: &[&str],
-) -> Result<Vec<bool>, String> {
-    let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok(vec![true; keys.len()]);
-    };
-    let ranges = local_ranges(ctx, binding, keys).await?;
-    Ok(ranges.iter().map(Option::is_some).collect())
-}
-
-/// The range turn each of `keys` is written in, `None` for a key this node does not import; a
-/// bucket without ranges needs no turn.
-pub(super) async fn key_turns(
-    ctx: &JobContext,
-    bucket: &BucketInfo,
-    keys: &[&str],
-) -> Result<Vec<Option<BTreeSet<(Ulid, Ulid)>>>, String> {
-    let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok(vec![Some(BTreeSet::new()); keys.len()]);
-    };
-    let ranges = local_ranges(ctx, binding, keys).await?;
-    let turn = |range| BTreeSet::from([(binding.set_id, range)]);
-    Ok(ranges.into_iter().map(|range| range.map(turn)).collect())
-}
-
-/// The range of each of `keys` if this node coordinates it, else `None`.
-async fn local_ranges(
-    ctx: &JobContext,
+pub(super) fn local_ranges(
     binding: &DistributionBinding,
     keys: &[&str],
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
 ) -> Result<Vec<Option<Ulid>>, String> {
-    let read = StorageEffect::BatchRead {
-        reads: authority_reads(binding.set_id),
-        txn_id: None,
-    };
-    let event = ctx.driver.storage_handle.send_storage_effect(read).await;
-    let (record, fence) = authority_rows(event).map_err(|error| error.to_string())?;
-    let (record, fence) = (record.as_deref(), fence.as_deref());
     let routes = match write_targets(binding, keys.iter().copied(), record, fence) {
         Ok(routes) => routes,
         Err(error) if error.moved_away() => return Ok(vec![None; keys.len()]),
@@ -598,6 +806,134 @@ async fn local_ranges(
             Err(error) => Err(error.to_string()),
         })
         .collect()
+}
+
+/// The range turn each of `keys` is written in, `None` for a key this node does not import; a
+/// bucket without ranges needs no turn.
+pub(super) fn key_turns(
+    binding: &DistributionBinding,
+    keys: &[&str],
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<Vec<Option<Turns>>, String> {
+    let ranges = local_ranges(binding, keys, record, fence)?;
+    let turn = |range| Turns::from([(binding.set_id, range)]);
+    Ok(ranges.into_iter().map(|range| range.map(turn)).collect())
+}
+
+/// Range turns, each a distributed set and one of its ranges.
+pub(super) type Turns = std::collections::BTreeSet<(Ulid, Ulid)>;
+
+/// The turn the lanes of one job share, so their page transactions run one at a time.
+pub(super) fn lane_turn(job_id: JobId) -> (Ulid, Ulid) {
+    (job_id.as_ulid(), Ulid::nil())
+}
+
+/// The files of a page this node imports, and the turn of every range they fall in.
+pub(super) fn own_files(
+    binding: &DistributionBinding,
+    files: Vec<StagedFile>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<(Vec<StagedFile>, Turns), PageFailure> {
+    let keys: Vec<&str> = files.iter().map(|file| file.target_key.as_str()).collect();
+    let ranges = local_ranges(binding, &keys, record, fence).map_err(PageFailure::Retry)?;
+    let mut turns = Turns::new();
+    let files = (files.into_iter().zip(ranges))
+        .filter_map(|(file, range)| {
+            turns.insert((binding.set_id, range?));
+            Some(file)
+        })
+        .collect();
+    Ok((files, turns))
+}
+
+/// The key ranges of a distributed bucket this node coordinates, as lower and upper keys.
+pub(super) fn own_ranges(
+    binding: &DistributionBinding,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<Vec<(String, Option<String>)>, PageFailure> {
+    let retry = |error: GuardError| PageFailure::Retry(error.to_string());
+    let view = (record.map(DistributionView::from_bytes).transpose())
+        .map_err(|error| retry(error.into()))?
+        .ok_or_else(|| retry(GuardError::RecordMissing(binding.set_id)))?;
+    // A range this node fenced for a transfer is left to its new coordinator.
+    let mut coordinated = Vec::new();
+    for range in &view.snapshot().config.ranges {
+        match write_target(binding, &range.lower, record, fence) {
+            Ok(WriteRoute::Local { .. }) => {
+                coordinated.push((range.lower.clone(), range.upper.clone()))
+            }
+            Ok(WriteRoute::Forward { .. }) => {}
+            Err(error) if error.moved_away() => {}
+            Err(error) => return Err(retry(error)),
+        }
+    }
+    Ok(coordinated)
+}
+
+#[derive(Debug, PartialEq)]
+enum SegmentStep {
+    Bucket,
+    Authority(Box<BucketInfo>),
+}
+
+/// The bounds of a flat walk's next listing: the key ranges a distributed destination has this
+/// node coordinate, or the whole bucket, cut at a lane's exclusive upper target key.
+#[derive(Debug, PartialEq)]
+struct SegmentOperation {
+    run: StagingRun,
+    walk: StagingWalk,
+    upper: Option<String>,
+    step: SegmentStep,
+}
+
+impl SegmentOperation {
+    fn new(run: StagingRun, walk: StagingWalk, upper: Option<String>) -> Self {
+        Self {
+            run,
+            walk,
+            upper,
+            step: SegmentStep::Bucket,
+        }
+    }
+}
+
+impl Operation for SegmentOperation {
+    type Output = Bounds;
+    type Error = PageFailure;
+
+    fn first(&mut self) -> Result<Next<Bounds>, PageFailure> {
+        Ok(Next::Call(self.run.bucket_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Bounds>, PageFailure> {
+        let upper = self.upper.as_deref();
+        match std::mem::replace(&mut self.step, SegmentStep::Bucket) {
+            SegmentStep::Bucket => {
+                let bucket = pinned(&self.run.spec, result)?;
+                let Some(binding) = bucket.distribution.as_ref() else {
+                    if upper.is_none() && self.walk.from.is_none() {
+                        return Ok(Next::Done(Bounds::Whole));
+                    }
+                    let whole = clamped(vec![(String::new(), None)], upper);
+                    return Ok(Next::Done(next_segment(&self.walk, whole)));
+                };
+                let call = authority_call(binding);
+                self.step = SegmentStep::Authority(Box::new(bucket));
+                Ok(Next::Call(call))
+            }
+            SegmentStep::Authority(bucket) => {
+                let Some(binding) = bucket.distribution.as_ref() else {
+                    return Ok(Next::Done(Bounds::Whole));
+                };
+                let [record, fence] = values::<2>(result)?;
+                let ranges = own_ranges(binding, record.as_deref(), fence.as_deref())?;
+                Ok(Next::Done(next_segment(&self.walk, clamped(ranges, upper))))
+            }
+        }
+    }
 }
 
 /// Where a target key falls among the source keys of a flat walk.
@@ -634,7 +970,7 @@ fn source_key(walk: &StagingWalk, key: &str) -> Mapped {
 
 /// The source keys of one coordinated key range: listed from `lower`, ending before `stop`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Segment {
+pub(super) struct Segment {
     lower: Option<String>,
     stop: Option<String>,
     /// The range's exclusive upper target key, where the next range starts.
@@ -643,7 +979,7 @@ struct Segment {
 
 /// What a flat walk lists next.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Bounds {
+pub(super) enum Bounds {
     /// The whole prefix: the destination is an ordinary bucket.
     Whole,
     Segment(Segment),
@@ -676,67 +1012,6 @@ fn next_segment(
     Bounds::Done
 }
 
-/// The bounds of the walk's next listing: the key ranges a distributed destination has this node
-/// coordinate, or the whole bucket, cut at a lane's exclusive `upper` target key.
-async fn segment_of(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    walk: &StagingWalk,
-    upper: Option<&str>,
-) -> Result<Bounds, PageFailure> {
-    let bucket = match pinned_bucket(ctx, spec).await {
-        Ok(bucket) => bucket,
-        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-        Err(
-            ItemFailure::Denied(message)
-            | ItemFailure::Stage(message)
-            | ItemFailure::Lasting(message),
-        ) => return Err(PageFailure::Permanent(message)),
-    };
-    let Some(binding) = bucket.distribution.as_ref() else {
-        if upper.is_none() && walk.from.is_none() {
-            return Ok(Bounds::Whole);
-        }
-        return Ok(next_segment(
-            walk,
-            clamped(vec![(String::new(), None)], upper),
-        ));
-    };
-    let coordinated = own_ranges(ctx, binding).await?;
-    Ok(next_segment(walk, clamped(coordinated, upper)))
-}
-
-/// The key ranges of a distributed bucket this node coordinates, as lower and upper keys.
-pub(super) async fn own_ranges(
-    ctx: &JobContext,
-    binding: &DistributionBinding,
-) -> Result<Vec<(String, Option<String>)>, PageFailure> {
-    let read = StorageEffect::BatchRead {
-        reads: authority_reads(binding.set_id),
-        txn_id: None,
-    };
-    let event = ctx.driver.storage_handle.send_storage_effect(read).await;
-    let retry = |error: GuardError| PageFailure::Retry(error.to_string());
-    let (record, fence) = authority_rows(event).map_err(retry)?;
-    let (record, fence) = (record.as_deref(), fence.as_deref());
-    let view = (record.map(DistributionView::from_bytes).transpose())
-        .map_err(|error| retry(error.into()))?
-        .ok_or_else(|| retry(GuardError::RecordMissing(binding.set_id)))?;
-    // A range this node fenced for a transfer is left to its new coordinator.
-    let mut coordinated = Vec::new();
-    for range in &view.snapshot().config.ranges {
-        match write_target(binding, &range.lower, record, fence) {
-            Ok(WriteRoute::Local { .. }) => {
-                coordinated.push((range.lower.clone(), range.upper.clone()))
-            }
-            Ok(WriteRoute::Forward { .. }) => {}
-            Err(error) if error.moved_away() => {}
-            Err(error) => return Err(retry(error)),
-        }
-    }
-    Ok(coordinated)
-}
-
 /// Key ranges cut at a lane's exclusive upper target key; ranges left empty are dropped.
 fn clamped(
     ranges: Vec<(String, Option<String>)>,
@@ -757,276 +1032,17 @@ fn clamped(
         .collect()
 }
 
-/// The first source file at or after `lower` below the walk's path, listed alone.
-pub(super) async fn first_key(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    walk: &StagingWalk,
-    lower: &str,
-) -> Result<Option<String>, PageFailure> {
-    let listed = drive(
-        ListStagingOperation::new(ListStagingInput {
-            group_id: spec.group_id,
-            connector_id: spec.connector_id,
-            source_path: walk.source_path.clone(),
-            request: ListRequest {
-                cursor: None,
-                lower: Some(lower.to_string()),
-                stop: None,
-                limit: 1,
-                recursive: true,
-                files_only: true,
-            },
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| PageFailure::Retry(error.to_string()))?;
-    Ok(listed.entries.into_iter().next().map(|entry| entry.path))
-}
-
 /// The target key a source key below the walk's path maps to.
 pub(super) fn target_of(walk: &StagingWalk, source_key: &str) -> Option<String> {
     let relative = relative_entry_path(&walk.source_path, source_key, true).ok()?;
     Some(join_target_prefix(&walk.target_prefix, &relative))
 }
 
-/// The files of a page this node imports, and the set and range of each distributed one.
-async fn own_files(
-    ctx: &JobContext,
-    bucket: &BucketInfo,
-    files: Vec<StagedFile>,
-) -> Result<(Vec<StagedFile>, BTreeSet<(Ulid, Ulid)>), PageFailure> {
-    let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok((files, BTreeSet::new()));
-    };
-    let keys: Vec<&str> = files.iter().map(|file| file.target_key.as_str()).collect();
-    let ranges = local_ranges(ctx, binding, &keys)
-        .await
-        .map_err(PageFailure::Retry)?;
-    let mut turns = BTreeSet::new();
-    let files = (files.into_iter().zip(ranges))
-        .filter_map(|(file, range)| {
-            turns.insert((binding.set_id, range?));
-            Some(file)
-        })
-        .collect();
-    Ok((files, turns))
-}
-
-/// The connector a page's references name, as resolved for its listing or its first HEAD.
-pub(super) type PageSource = (SourceConnector, Option<[u8; 16]>);
-
-/// Registers a page's files as references with listing metadata, in one transaction with the
-/// checkpoint. Files a listing gives no size for are read with one HEAD each.
-pub(super) async fn import_page(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    (slot, turn): (Option<u64>, Option<&Mutex<()>>),
-    checkpoint: &mut StagingJobCheckpoint,
-    mut next: StagingJobCheckpoint,
-    (files, writes, deletes): PageFiles,
-    mut source: Option<PageSource>,
-) -> Result<(), PageFailure> {
-    let bucket = match pinned_bucket(ctx, spec).await {
-        Ok(bucket) => bucket,
-        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-        Err(
-            ItemFailure::Denied(message)
-            | ItemFailure::Stage(message)
-            | ItemFailure::Lasting(message),
-        ) => {
-            return Err(PageFailure::Permanent(message));
-        }
-    };
-    let (files, ranges) = own_files(ctx, &bucket, files).await?;
-    let mut entries = Vec::with_capacity(files.len());
-    // The submitter's rules are collected once per page and decide every file in memory.
-    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
-    for file in files {
-        let access = file_access(&rules, spec, &file.source_path, &file.target_key);
-        let observation = match access {
-            Ok(()) => match file.observation {
-                Some(observation) => Ok(observation),
-                None => head_observation(ctx, spec, &file.source_path, &mut source).await,
-            }
-            .map(|mut observation| {
-                observation.last_modified = file.modified.or(observation.last_modified);
-                with_manifest(observation, file.manifest)
-            }),
-            Err(failure) => Err(failure),
-        };
-        match observation {
-            Ok(observation) => entries.push((
-                PageEntry {
-                    source_path: file.source_path,
-                    target_key: file.target_key,
-                    observation,
-                    metadata: file.metadata,
-                    mirrors: Vec::new(),
-                },
-                file.mirrors,
-            )),
-            Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                record_failure(&mut next, &file.source_path, &file.target_key, message)
-            }
-            Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-            Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
-        }
-    }
-    let (entries, mirror_connectors) =
-        super::mirrors::add_mirrors(ctx, (spec, &rules), &mut next, entries).await?;
-    // Files a table row describes are not headed; the page then resolves its connector itself.
-    let source = match (source, entries.first()) {
-        (Some(source), _) => source,
-        (None, None) => return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await,
-        (None, Some(entry)) => resolved_source(ctx, spec, &entry.source_path).await?,
-    };
-    let (connector, secret_fingerprint) = source;
-    let input = PageImportInput {
-        job_id: ctx.job_id,
-        claim_token: ctx.claim_token,
-        realm_id: spec.auth_context.realm_id,
-        group_id: spec.group_id,
-        user_id: spec.auth_context.user_id,
-        auth_context: spec.auth_context.clone(),
-        node_id: spec.node_id,
-        bucket: spec.bucket.clone(),
-        expected_bucket: bucket,
-        connector,
-        secret_fingerprint,
-        entries,
-        checkpoint: next,
-        checkpoint_key: checkpoint_key(ctx.job_id, slot),
-        writes,
-        deletes,
-        now: SystemTime::now(),
-        ranges: None,
-        mirror_connectors,
-    };
-    // The rows are built before the turn, so pages of other jobs build theirs meanwhile; a page
-    // whose reads changed by its turn builds them again. A failed preparation only costs time.
-    let preparing = drive(PreparePageOperation::new(input.clone()), &ctx.driver);
-    let mut prepared = preparing.await.ok();
-    let result = {
-        // Listing and the reads above run in parallel; the page transactions take turns.
-        let _turn = match turn {
-            Some(turn) => Some(turn.lock().await),
-            None => None,
-        };
-        let run = |input| {
-            let page = PageImportOperation::new(input).with_prepared(prepared.take());
-            drive(page, &ctx.driver)
-        };
-        retry_page(ctx, (input, &ranges), run).await
-    };
-    match result {
-        Ok(result) => {
-            committed(ctx, slot, checkpoint, result.checkpoint);
-            Ok(())
-        }
-        Err(error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_))) => {
-            Err(PageFailure::Permanent(error.to_string()))
-        }
-        Err(error @ PageImportError::Storage(StorageError::TransactionConflict)) => {
-            Err(PageFailure::Conflict(error.to_string()))
-        }
-        // A changed connector or a lost claim replays the page from its cursor.
-        Err(error) => Err(PageFailure::Retry(error.to_string())),
-    }
-}
-
-/// Runs the page transaction of `input` in the turns of `ranges`, again while its commit
-/// conflicts or its ranges moved, at most [`PAGE_ATTEMPTS`] times. Each run is a new
-/// transaction that checks every guard again.
-pub(super) async fn retry_page<R, F>(
-    ctx: &JobContext,
-    (mut input, ranges): (PageImportInput, &BTreeSet<(Ulid, Ulid)>),
-    mut run: R,
-) -> Result<PageImportResult, PageImportError>
-where
-    R: FnMut(PageImportInput) -> F,
-    F: Future<Output = Result<PageImportResult, PageImportError>>,
-{
-    // Pages of other jobs into these ranges wait here instead of conflicting on their rows.
-    let mut turns = ctx.range_turns.take(ranges).await;
-    let set_id = ranges.first().map(|(set_id, _)| *set_id);
-    input.ranges = set_id.map(|_| ranges.iter().map(|(_, range)| *range).collect());
-    let mut attempts = 1;
-    loop {
-        let result = run(input.clone()).await;
-        if let (Err(PageImportError::RangesMoved(moved)), Some(set_id)) = (&result, set_id)
-            && attempts < PAGE_ATTEMPTS
-        {
-            // A range split or merged meanwhile: the page runs again in the turns of the new ones.
-            drop(turns);
-            let moved_turns = moved.iter().map(|range| (set_id, *range)).collect();
-            turns = ctx.range_turns.take(&moved_turns).await;
-            input.ranges = Some(moved.clone());
-            attempts += 1;
-            continue;
-        }
-        let conflict = PageImportError::Storage(StorageError::TransactionConflict);
-        if result.as_ref().err() != Some(&conflict) || attempts >= PAGE_ATTEMPTS {
-            return result;
-        }
-        tokio::select! {
-            _ = ctx.cancel.cancelled() => return result,
-            _ = ctx.shutdown.cancelled() => return result,
-            _ = tokio::time::sleep(CONFLICT_PAUSE * attempts) => {}
-        }
-        attempts += 1;
-    }
-}
-
-/// Copies a page's files one by one; the page's checkpoint follows its last file, and a
-/// replayed page finds already copied files through the job's retry key.
-async fn snapshot_page(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    checkpoint: &mut StagingJobCheckpoint,
-    mut next: StagingJobCheckpoint,
-    rows: PageRows,
-) -> Result<(), PageFailure> {
-    let bucket = match pinned_bucket(ctx, spec).await {
-        Ok(bucket) => bucket,
-        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-        Err(
-            ItemFailure::Denied(message)
-            | ItemFailure::Stage(message)
-            | ItemFailure::Lasting(message),
-        ) => return Err(PageFailure::Permanent(message)),
-    };
-    for file in own_files(ctx, &bucket, rows.files).await?.0 {
-        if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
-            return Ok(());
-        }
-        next.current_path = Some(file.source_path.clone());
-        let expected = (file.manifest.into_iter())
-            .map(|(algorithm, digest)| ExpectedChecksum { algorithm, digest })
-            .collect();
-        match stage_item(ctx, spec, &file.source_path, &file.target_key, expected).await {
-            Ok(size) => {
-                next.items_current = next.items_current.saturating_add(1);
-                next.items_succeeded = next.items_succeeded.saturating_add(1);
-                next.bytes_current = next.bytes_current.saturating_add(size);
-            }
-            Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                // A key whose range moved meanwhile belongs to its new coordinator's job.
-                if !moved_away(ctx, spec, &file.target_key).await {
-                    record_failure(&mut next, &file.source_path, &file.target_key, message)
-                }
-            }
-            Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-            Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
-        }
-        ctx.progress.set_current(next.items_current);
-    }
-    commit_rows(ctx, checkpoint, next, rows.writes, rows.deletes).await
-}
-
 /// Adds shipped digests to an observation; they bind every complete read.
-fn with_manifest(mut observation: SourceMetadata, digests: Vec<ManifestDigest>) -> SourceMetadata {
+pub(super) fn with_manifest(
+    mut observation: SourceMetadata,
+    digests: Vec<ManifestDigest>,
+) -> SourceMetadata {
     for (algorithm, digest) in digests {
         let origin = DigestOrigin::Manifest;
         let scope = DigestScope::FullObject;
@@ -1040,82 +1056,8 @@ fn with_manifest(mut observation: SourceMetadata, digests: Vec<ManifestDigest>) 
     observation
 }
 
-/// The connector a page's references name, read from storage without a source request.
-async fn resolved_source(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    source_path: &str,
-) -> Result<PageSource, PageFailure> {
-    let input = ResolveConnectorInput {
-        group_id: spec.group_id,
-        connector_id: spec.connector_id,
-        source_path: source_path.to_string(),
-        allow_root: false,
-    };
-    match drive(ResolveConnectorOperation::new(input), &ctx.driver).await {
-        Ok(resolved) => Ok((resolved.connector, resolved.secret_fingerprint)),
-        Err(error) if lasting_resolution(&error) => Err(PageFailure::Permanent(error.to_string())),
-        Err(error) => Err(PageFailure::Retry(error.to_string())),
-    }
-}
-
-/// One HEAD; the page takes its connector from the first one, and a changed one replays it.
-async fn head_observation(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    source_path: &str,
-    source: &mut Option<PageSource>,
-) -> Result<SourceMetadata, ItemFailure> {
-    let input = HeadSourceInput {
-        group_id: spec.group_id,
-        connector_id: spec.connector_id,
-        source_path: source_path.to_string(),
-    };
-    let transient = |error: &HeadSourceError| !lasting_head(error);
-    let result = retried(ctx, spec, input, HeadSourceOperation::new, transient)
-        .await
-        .map_err(|error| match lasting_head(&error) {
-            true => ItemFailure::Stage(error.to_string()),
-            // A transient failure replays the page instead of failing the file for good.
-            false => ItemFailure::System(error.to_string()),
-        })?;
-    let headed = (result.connector, result.secret_fingerprint);
-    match source {
-        Some(known) if *known != headed => Err(ItemFailure::System(
-            "the connector changed while the page was read".to_string(),
-        )),
-        Some(_) => Ok(result.metadata),
-        None => {
-            *source = Some(headed);
-            Ok(result.metadata)
-        }
-    }
-}
-
-/// READ on the source file and WRITE on the destination key, as the submitting user.
-pub(super) async fn check_access(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    source_path: &str,
-    target_key: &str,
-) -> Result<(), ItemFailure> {
-    let rules = access_rules(ctx, spec).await.map_err(ItemFailure::System)?;
-    file_access(&rules, spec, source_path, target_key)
-}
-
-/// The submitter's permission rules in the job's group, which holds the source and target paths.
-pub(super) async fn access_rules(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-) -> Result<PermissionRules, String> {
-    let root = source_permission_path(spec, "");
-    drive(rules_operation(&spec.auth_context, &root), &ctx.driver)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 /// READ on the source file and WRITE on the destination key, decided as a single check would.
-fn file_access(
+pub(super) fn file_access(
     rules: &PermissionRules,
     spec: &StagingJobSpec,
     source_path: &str,
@@ -1246,8 +1188,13 @@ pub(super) fn connector_permission_path(
 }
 
 #[cfg(test)]
+#[path = "walk_tests.rs"]
+mod state_machine_tests;
+
+#[cfg(test)]
 mod pure_tests {
     use super::*;
+    use std::time::Duration;
 
     fn bounded(from: Option<&str>) -> StagingWalk {
         StagingWalk {

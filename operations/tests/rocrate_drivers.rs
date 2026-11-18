@@ -49,7 +49,6 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::export::run_export_job;
 use aruna_operations::jobs::import::run_rocrate_import;
-use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::read_artifact_range;
 use aruna_operations::jobs::store::query::{insert_job, list_job_entries};
 use aruna_operations::jobs::store::state::{
@@ -1339,9 +1338,13 @@ async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(hidden_count(&fixture, upload_id).await?, 0);
     assert!(
-        load_rocrate_upload(&fixture.context, upload_id)
-            .await?
-            .is_none()
+        aruna_operations::driver::drive(
+            aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+            &fixture.context
+        )
+        .await
+        .map_err(|error| error.0)?
+        .is_none()
     );
 
     fixture.stop().await;

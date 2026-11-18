@@ -21,7 +21,6 @@ use aruna_operations::federation::import::ReadImportOperation;
 use aruna_operations::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
 };
-use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_entry::DocumentMintOperation;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -616,10 +615,14 @@ async fn fast_source_check(
             crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
-                .await
-                .map_err(|error| ServerError::InternalError(error.into()))?
-                .ok_or(ServerError::NotFound)?;
+            let record = aruna_operations::driver::drive(
+                aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(*upload_id),
+                &state.get_ctx(),
+            )
+            .await
+            .map_err(|error| error.0)
+            .map_err(|error| ServerError::InternalError(error.into()))?
+            .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
             }

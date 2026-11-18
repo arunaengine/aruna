@@ -5,6 +5,7 @@
 mod audit;
 mod blob;
 mod compute;
+pub(crate) mod job;
 mod metadata;
 mod net;
 mod session;
@@ -217,6 +218,7 @@ async fn dispatch_unboxed(
         Effect::Compute(effect) => {
             Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
         }
+        Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
     trace!(
@@ -255,6 +257,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 

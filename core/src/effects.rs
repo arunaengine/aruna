@@ -65,6 +65,8 @@ pub enum Effect {
     Delay(Duration),
     /// One call to an executor backend of this node; never persisted.
     Compute(Box<crate::compute::effect::ComputeEffect>),
+    /// A request to the host of a running job; never persisted.
+    Job(crate::jobs::JobEffect),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at

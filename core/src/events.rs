@@ -68,6 +68,8 @@ pub enum Event {
     Child(crate::calls::ChildOutcome),
     /// Answers `Effect::Compute`; never persisted.
     Compute(Box<crate::compute::effect::ComputeAnswer>),
+    /// The answer of a running job's host; never persisted.
+    Job(crate::jobs::JobEvent),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -1089,6 +1091,7 @@ impl Event {
             Event::Delayed => "Event::Delayed",
             Event::Hung { .. } => "Event::Hung",
             Event::Child(_) => "Event::Child",
+            Event::Job(_) => "Event::Job",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

@@ -36,7 +36,7 @@ use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
-use aruna_operations::jobs::staging::read_staging_checkpoint;
+use aruna_operations::jobs::staging::ReadCheckpointOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::object::list::{
@@ -52,7 +52,7 @@ use aruna_operations::staging::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
 };
 use aruna_operations::staging::snapshot::{
-    MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
+    MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotOperation,
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -1030,9 +1030,12 @@ pub async fn list_staging_jobs(
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut jobs = Vec::with_capacity(records.len());
     for record in records {
-        let checkpoint = read_staging_checkpoint(&state.get_ctx(), record.job_id)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?;
+        let checkpoint = drive(
+            ReadCheckpointOperation::new(record.job_id),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
     }
     Ok((
@@ -1530,24 +1533,29 @@ async fn snapshot_blob(
 
     let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
 
-    let result = stage_snapshot_blob(
-        &state.get_ctx(),
-        MaterializeSnapshotInput {
-            job_id: None,
-            group_id,
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-            connector_id,
-            source_path: request.source_path,
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
-            quota_ceiling,
-            retry_key: None,
-            expected_bucket: bucket_info,
-            restrictions: auth.path_restrictions.clone(),
-            expected_checksums: Vec::new(),
-        },
+    let context = state.get_ctx();
+    let routing = aruna_operations::driver::node_routing(&context);
+    let result = drive(
+        MaterializeSnapshotOperation::new(
+            MaterializeSnapshotInput {
+                job_id: None,
+                group_id,
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+                node_id: state.get_node_id(),
+                connector_id,
+                source_path: request.source_path,
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                quota_ceiling,
+                retry_key: None,
+                expected_bucket: bucket_info,
+                restrictions: auth.path_restrictions.clone(),
+                expected_checksums: Vec::new(),
+            },
+            routing,
+        ),
+        &context,
     )
     .await
     .map_err(map_snapshot_error)?;

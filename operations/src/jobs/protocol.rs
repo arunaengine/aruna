@@ -30,7 +30,7 @@ use super::service::{
     local_status, read_artifact_range, read_owned_artifact, read_owned_job, read_visible_report,
     resolve_job_owner,
 };
-use super::staging::read_staging_checkpoint;
+use super::staging::ReadCheckpointOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::family_reads::FamilyStatusOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -281,9 +281,9 @@ async fn prepare_record(
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
     };
     let checkpoint = if matches!(&record.payload, JobPayload::Staging(_)) {
-        match read_staging_checkpoint(context, job_id).await {
+        match drive(ReadCheckpointOperation::new(job_id), context).await {
             Ok(checkpoint) => checkpoint,
-            Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+            Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.0)),
         }
     } else {
         None
