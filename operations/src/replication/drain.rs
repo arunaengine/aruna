@@ -1432,155 +1432,214 @@ pub(super) struct ScanJobsOperation {
     repaired: bool,
 }
 
-    for (key, value) in values {
-        let mut key = key.to_vec();
-        last_key = Some(key.clone());
-        let mut job = match BlobJobRecord::from_bytes(&value) {
-            Ok(job) => job,
-            Err(error) => {
-                warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
-                delete_blob_job(storage, key).await?;
-                continue;
-            }
-        };
-        let canonical_key = blob_job_key(&job)?.to_vec();
-        if canonical_key.as_slice() != key.as_slice() {
-            repaired = true;
-            warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
-            if let Some(existing) = read_blob_job(storage, &canonical_key).await?
-                && blob_job_preferred(&existing, &job)
-            {
-                delete_blob_job(storage, key).await?;
-                job = existing;
-            } else {
-                write_blob_job(storage, &job).await?;
-                delete_blob_job(storage, key).await?;
-                canonical_changed = true;
-                jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
-            }
-            key = canonical_key;
-        } else if canonical_changed
-            && let Some(existing) = read_blob_job(storage, &canonical_key).await?
-        {
-            job = existing;
-        }
-        if job.due_at_ms == PARKED_DUE {
-            continue;
-        }
-        if job.due_at_ms > now_ms {
-            next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
-            continue;
-        }
-        if merge_due_job(&mut jobs, key, job, (repaired, limit)) {
-            return Ok(BlobJobScan {
-                next_cursor: ReplicationScanCursor {
-                    generation: cursor.generation,
-                    after: last_key,
-                    next_due_ms,
-                },
-                generation: cursor.generation,
-                jobs,
-                has_more_due: true,
-                next_due_ms,
-            });
+impl ScanJobsOperation {
+    pub(super) fn new(now_ms: u64, limit: usize) -> Self {
+        Self {
+            now_ms,
+            limit,
+            step: ScanStep::Cursor,
+            cursor: ReplicationScanCursor::default(),
+            rows: VecDeque::new(),
+            next_start: None,
+            page_empty: false,
+            last_key: None,
+            jobs: Vec::new(),
+            next_due_ms: None,
+            canonical_changed: false,
+            repaired: false,
         }
     }
 
-    if let Some(next) = next_start_after {
-        return Ok(BlobJobScan {
-            next_cursor: ReplicationScanCursor {
-                generation: cursor.generation,
+    fn call(&mut self, step: ScanStep, call: IoCall) -> Turn<BlobJobScan> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn delete_call(key: Vec<u8>) -> IoCall {
+        let row = (REPLICATION_JOB_KEYSPACE.to_string(), ByteView::from(key));
+        IoCall::Delete(vec![row])
+    }
+
+    fn scan(
+        &mut self,
+        has_more_due: bool,
+        next_cursor: ReplicationScanCursor,
+    ) -> Turn<BlobJobScan> {
+        Ok(Next::Done(BlobJobScan {
+            next_cursor,
+            generation: self.cursor.generation,
+            jobs: std::mem::take(&mut self.jobs),
+            has_more_due,
+            next_due_ms: self.next_due_ms,
+        }))
+    }
+
+    fn next_row(&mut self) -> Turn<BlobJobScan> {
+        while let Some((key, value)) = self.rows.pop_front() {
+            let key = key.to_vec();
+            self.last_key = Some(key.clone());
+            let job = match BlobJobRecord::from_bytes(&value) {
+                Ok(job) => job,
+                Err(error) => {
+                    warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
+                    return self.call(ScanStep::Dropped, Self::delete_call(key));
+                }
+            };
+            let canonical = blob_job_key(&job)?.to_vec();
+            if canonical != key {
+                self.repaired = true;
+                warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
+                let read = read_row(REPLICATION_JOB_KEYSPACE, canonical.clone());
+                let row = RepairRow {
+                    key,
+                    job,
+                    canonical,
+                };
+                return self.call(ScanStep::Canonical(Box::new(row)), read);
+            }
+            if self.canonical_changed {
+                let read = read_row(REPLICATION_JOB_KEYSPACE, canonical);
+                return self.call(ScanStep::Refreshed(Box::new((key, job))), read);
+            }
+            if let Some(done) = self.take_job(key, job) {
+                return done;
+            }
+        }
+        if let Some(next) = self.next_start.take() {
+            let cursor = ReplicationScanCursor {
+                generation: self.cursor.generation,
                 after: Some(next.to_vec()),
-                next_due_ms,
-            },
-            generation: cursor.generation,
-            jobs,
-            has_more_due: true,
-            next_due_ms,
-        });
-    }
-
-    Ok(BlobJobScan {
-        next_cursor: ReplicationScanCursor {
-            generation: if page_empty && cursor.after.is_none() {
-                cursor.generation
-            } else {
-                cursor.generation.saturating_add(1)
-            },
+                next_due_ms: self.next_due_ms,
+            };
+            return self.scan(true, cursor);
+        }
+        let generation = match self.page_empty && self.cursor.after.is_none() {
+            true => self.cursor.generation,
+            false => self.cursor.generation.saturating_add(1),
+        };
+        let cursor = ReplicationScanCursor {
+            generation,
             after: None,
-            next_due_ms,
-        },
-        generation: cursor.generation,
-        jobs,
-        has_more_due: false,
-        next_due_ms,
-    })
-}
+            next_due_ms: self.next_due_ms,
+        };
+        self.scan(false, cursor)
+    }
 
-async fn read_blob_job(
-    storage: &StorageHandle,
-    key: &[u8],
-) -> Result<Option<BlobJobRecord>, BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(BlobJobRecord::from_bytes(&value)?)),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+    /// Notes a job that is not due, or takes a due one; a full batch ends the scan.
+    fn take_job(&mut self, key: Vec<u8>, job: BlobJobRecord) -> Option<Turn<BlobJobScan>> {
+        if job.due_at_ms == PARKED_DUE {
+            return None;
+        }
+        if job.due_at_ms > self.now_ms {
+            self.next_due_ms = min_due_at(self.next_due_ms, job.due_at_ms);
+            return None;
+        }
+        if !merge_due_job(&mut self.jobs, key, job, (self.repaired, self.limit)) {
+            return None;
+        }
+        let cursor = ReplicationScanCursor {
+            generation: self.cursor.generation,
+            after: self.last_key.take(),
+            next_due_ms: self.next_due_ms,
+        };
+        Some(self.scan(true, cursor))
+    }
+
+    fn continue_with(&mut self, key: Vec<u8>, job: BlobJobRecord) -> Turn<BlobJobScan> {
+        match self.take_job(key, job) {
+            Some(done) => done,
+            None => self.next_row(),
+        }
+    }
+
+    fn canonical_read(&mut self, row: RepairRow, value: Option<Value>) -> Turn<BlobJobScan> {
+        let existing = (value.as_deref())
+            .map(BlobJobRecord::from_bytes)
+            .transpose()?;
+        if let Some(existing) = existing.filter(|existing| blob_job_preferred(existing, &row.job)) {
+            let delete = Self::delete_call(row.key);
+            return self.call(ScanStep::Moved(Box::new((row.canonical, existing))), delete);
+        }
+        let write = blob_job_entry(&row.job)?;
+        self.call(ScanStep::Written(Box::new(row)), IoCall::Write(vec![write]))
     }
 }
 
-pub(super) async fn write_blob_job(
-    storage: &StorageHandle,
-    job: &BlobJobRecord,
-) -> Result<(), BlobQueueError> {
-    let (key_space, key, value) = blob_job_entry(job)?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+impl Operation for ScanJobsOperation {
+    type Output = BlobJobScan;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<BlobJobScan> {
+        Ok(Next::Call(cursor_read()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<BlobJobScan> {
+        match std::mem::replace(&mut self.step, ScanStep::Dropped) {
+            ScanStep::Cursor => {
+                self.cursor = (result.value()?)
+                    .and_then(|value| postcard::from_bytes(value.as_ref()).ok())
+                    .unwrap_or_default();
+                // A pass from the start drops the last pass's due time, which may be past.
+                let from_start = self.cursor.after.is_none();
+                self.next_due_ms = self.cursor.next_due_ms.filter(|_| !from_start);
+                let page = IoCall::Page {
+                    space: REPLICATION_JOB_KEYSPACE.to_string(),
+                    prefix: Key::from(Vec::new()),
+                    after: self.cursor.after.clone().map(ByteView::from),
+                    limit: PAGE_RECORDS,
+                };
+                self.call(ScanStep::Page, page)
+            }
+            ScanStep::Page => {
+                let (rows, next) = result.page()?;
+                self.page_empty = rows.is_empty();
+                self.rows = rows.into();
+                self.next_start = next;
+                self.next_row()
+            }
+            ScanStep::Dropped => {
+                result.done()?;
+                self.next_row()
+            }
+            ScanStep::Canonical(row) => self.canonical_read(*row, result.value()?),
+            ScanStep::Written(row) => {
+                result.done()?;
+                let RepairRow {
+                    key,
+                    job,
+                    canonical,
+                } = *row;
+                self.canonical_changed = true;
+                self.jobs.retain(|(existing, _)| *existing != canonical);
+                let delete = Self::delete_call(key);
+                self.call(ScanStep::Moved(Box::new((canonical, job))), delete)
+            }
+            ScanStep::Moved(moved) => {
+                result.done()?;
+                let (key, job) = *moved;
+                self.continue_with(key, job)
+            }
+            ScanStep::Refreshed(row) => {
+                let (key, job) = *row;
+                let job = match result.value()? {
+                    Some(value) => BlobJobRecord::from_bytes(&value)?,
+                    None => job,
+                };
+                self.continue_with(key, job)
+            }
+        }
     }
 }
 
-async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-    }
-}
-
-pub(super) async fn reschedule_blob_job(
-    storage: &StorageHandle,
+/// The write that puts a failed job back with a backoff, and when it is due.
+pub(super) fn reschedule_call(
     key: Vec<u8>,
     job: &BlobJobRecord,
     error: String,
-) -> Result<u64, BlobQueueError> {
+    now_ms: u64,
+) -> Result<(IoCall, u64), BlobQueueError> {
     let attempts = job.attempts.saturating_add(1);
-    let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
+    let due_at_ms = now_ms.saturating_add(retry_delay_ms(attempts));
     let next_job = BlobJobRecord {
         input: job.input.clone(),
         source_delete_marker: job.source_delete_marker,
@@ -1596,56 +1655,70 @@ pub(super) async fn reschedule_blob_job(
         distribution: job.distribution.clone(),
         job_id: job.job_id,
     };
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(next_job.to_bytes()?),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-    }
+    let row = (
+        REPLICATION_JOB_KEYSPACE.to_string(),
+        ByteView::from(key),
+        ByteView::from(next_job.to_bytes()?),
+    );
+    Ok((IoCall::Write(vec![row]), due_at_ms))
 }
 
 #[cfg(test)]
-pub(super) async fn read_relationships(
-    storage: &StorageHandle,
-    bucket: &str,
-) -> Result<Vec<SyncRelationship>, BlobQueueError> {
-    let mut start_after = None;
-    let mut relationships = Vec::new();
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                prefix: Some(aruna_core::structs::sync_relationship_prefix(bucket).into()),
-                start: start_after.take().map(IterStart::After),
-                limit: super::obligations::REPLICATION_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-            }
+mod step_tests {
+    use super::super::page::deliver::MetadataPages;
+    use super::*;
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
+
+    #[test]
+    fn empty_queue_ends_pass() {
+        let mut scan = ScanJobsOperation::new(5, 1);
+        assert!(matches!(scan.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = scan.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let Ok(Next::Done(found)) = scan.next(empty_page()) else {
+            panic!("an empty queue ends the scan");
         };
-        for (key, value) in values {
-            let relationship = SyncRelationship::from_bytes(&value)?;
-            validate_sync_key(bucket, &key, &relationship)?;
-            relationships.push(relationship);
-        }
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(relationships),
-        }
+        assert!(found.jobs.is_empty() && !found.has_more_due);
+        assert_eq!(found.next_cursor.generation, 0);
+    }
+
+    #[test]
+    fn unchanged_cursor_not_written() {
+        let mut advance = AdvanceCursorOperation::new(ReplicationScanCursor::default());
+        assert!(matches!(advance.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = IoResult::Values(vec![None]);
+        assert_eq!(advance.next(answer), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn newer_cursor_written() {
+        let candidate = ReplicationScanCursor {
+            generation: 1,
+            ..ReplicationScanCursor::default()
+        };
+        let mut advance = AdvanceCursorOperation::new(candidate);
+        advance.first().unwrap();
+        let turn = advance.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        assert_eq!(advance.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn no_jobs_read_nothing() {
+        let mut read = JobRelationshipsOperation::new(&[]);
+        assert_eq!(read.first(), Ok(Next::Done(HashMap::new())));
+    }
+
+    #[test]
+    fn batch_starts_with_obligations() {
+        let routing = NodeRouting::default();
+        let mut batch = ProcessBlobBatchOperation::new(MetadataPages, routing, None);
+        assert!(matches!(batch.first(), Ok(Next::Call(IoCall::Child(_)))));
     }
 }
