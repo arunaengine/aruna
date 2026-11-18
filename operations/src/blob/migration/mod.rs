@@ -1476,6 +1476,9 @@ mod tests {
     use std::time::Duration;
 
     use aruna_core::backoff::capped_backoff;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, MIGRATION_AHEAD_KEYSPACE,
         RENAME_MOVE_KEYSPACE,
@@ -1543,22 +1546,59 @@ mod tests {
         }
     }
 
-    fn read_result(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
+    fn read_result(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
+    }
+
+    fn blob_event(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    fn asked(turn: &Turn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
+    /// Turns `operation`, which waits for its publication, into that child and starts it.
+    fn enter_publish(operation: &mut MigrateVersionOperation) -> Turn {
+        assert_eq!(operation.state, MigrateState::Publish);
+        *operation = operation.publish_child();
+        operation.first()
+    }
+
+    /// The calls a run that skipped the version makes after its end.
+    fn skipped_calls(turn: Turn) -> Vec<IoCall> {
+        match turn {
+            Ok(Next::Then {
+                output: MigrateOutcome::Skipped,
+                calls,
+            }) => calls,
+            Ok(Next::Done(MigrateOutcome::Skipped)) => Vec::new(),
+            other => panic!("expected a skipped version, got {other:?}"),
+        }
+    }
+
+    /// The written copy is released, and without an owning commit goes to the cleanup queue.
+    fn leaves_copy(calls: &[IoCall], cleanup: bool) {
+        let IoCall::Effect(release) = &calls[0] else {
+            panic!("expected the release, got {calls:?}")
+        };
+        assert!(matches!(
+            **release,
+            Effect::Blob(BlobEffect::ReleaseReservation { .. })
+        ));
+        assert_eq!(calls.len(), 1 + usize::from(cleanup));
+        if cleanup {
+            assert_eq!(calls[1], IoCall::from(schedule_cleanup_effect()));
+        }
     }
 
     /// The publication's read of the bucket and its encryption settings.
-    fn bucket_read(compression: Compression, settings: Option<BucketEncryption>) -> Event {
+    fn bucket_read(compression: Compression, settings: Option<BucketEncryption>) -> IoResult {
         let settings = settings.map(|settings| settings.to_bytes().unwrap().into());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Vec::new().into(), Some(bucket(compression).into())),
-                (Vec::new().into(), settings),
-            ],
-        })
+        IoResult::Values(vec![Some(bucket(compression).into()), settings])
     }
 
     fn bucket(compression: Compression) -> Vec<u8> {
@@ -1578,28 +1618,32 @@ mod tests {
     }
 
     /// Drives the operation up to the transaction that publishes the new copy.
-    fn written(operation: &mut MigrateVersionOperation, version: &BlobVersion) -> Effects {
-        operation.start();
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
-        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
-        operation.step(read_result(None));
+    fn written(operation: &mut MigrateVersionOperation, version: &BlobVersion) -> Turn {
+        operation.first().unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(location(false).to_bytes().unwrap())))
+            .unwrap();
+        operation.next(read_result(None)).unwrap();
         let blob = BackendStream::new(futures_util::stream::empty::<
             Result<bytes::Bytes, std::io::Error>,
         >());
-        let effects = operation.step(Event::Blob(BlobEvent::ReadFinished {
+        let turn = operation.next(blob_event(BlobEvent::ReadFinished {
             blob,
             stream_size: 40,
         }));
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
-            panic!("expected one write, got {effects:?}")
+        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+            panic!("expected one write, got {turn:?}")
         };
         assert_eq!(resolved.compression, ZSTD);
-        operation.step(Event::Blob(BlobEvent::WriteFinished {
-            location: location(true),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }))
+        operation
+            .next(blob_event(BlobEvent::WriteFinished {
+                location: location(true),
+            }))
+            .unwrap();
+        enter_publish(operation)
     }
 
     fn raw_version() -> BlobVersion {
@@ -1625,25 +1669,26 @@ mod tests {
         if let BlobVersionState::Materialized { encoding, .. } = &mut version.state {
             *encoding = EncodingClass::Zstd { level: 3 };
         }
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+        let turn = operation.next(read_result(Some(version.to_bytes().unwrap())));
 
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+        assert_eq!(turn, Ok(Next::Done(MigrateOutcome::Skipped)));
     }
 
     #[test]
     fn publishes_new_copy() {
         let mut operation = operation();
         let version = raw_version();
-        written(&mut operation, &version);
-        operation.step(bucket_read(ZSTD, None));
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        written(&mut operation, &version).unwrap();
+        operation.next(bucket_read(ZSTD, None)).unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
 
-        let effects = operation.step(read_result(None));
+        let effects = operation.next(read_result(None));
 
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        let Ok(Next::Call(IoCall::Write(writes))) = &effects else {
             panic!("expected the row writes, got {effects:?}")
         };
         let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
@@ -1660,6 +1705,50 @@ mod tests {
         assert_eq!(class, EncodingClass::Zstd { level: 3 });
         let old = ReclaimCandidateKey::from_bytes(&writes[2].1).unwrap();
         assert_eq!(old.encoding, EncodingClass::Raw);
+
+        // The commit makes the copy the row's owner, so it is only released afterwards.
+        operation.usage = None;
+        let Ok(Next::Then { output, calls }) = operation.update_usage() else {
+            panic!("expected the result with its release")
+        };
+        assert_eq!(output, MigrateOutcome::Migrated);
+        leaves_copy(&calls, false);
+    }
+
+    #[test]
+    fn failed_publish_releases() {
+        // A failed publication leaves the copy to the parent, which releases it once; the
+        // copy no commit owns goes to the cleanup queue.
+        let mut parent = operation();
+        let version = raw_version();
+        parent.first().unwrap();
+        parent
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        parent
+            .next(read_result(Some(location(false).to_bytes().unwrap())))
+            .unwrap();
+        parent.state = MigrateState::Publish;
+        parent.new = Some(location(true));
+        let mut child = parent.publish_child();
+        assert_eq!(child.transaction(), TransactionMode::Write);
+        assert!(child.abort().is_empty());
+        let error = MigrateVersionError::TargetMissing;
+        let failed = IoResult::Child(ChildOutcome::new(Err::<MigrateOutcome, _>(error)));
+        assert_eq!(parent.next(failed), Err(MigrateVersionError::TargetMissing));
+        leaves_copy(&parent.abort(), true);
+        assert!(parent.abort().is_empty());
+
+        // After a published version the child already released the copy.
+        let mut parent = operation();
+        parent.state = MigrateState::Publish;
+        parent.new = Some(location(true));
+        let done = IoResult::Child(ChildOutcome::new(Ok::<_, MigrateVersionError>(
+            MigrateOutcome::Migrated,
+        )));
+        let turn = parent.next(done);
+        assert_eq!(turn, Ok(Next::Done(MigrateOutcome::Migrated)));
+        assert!(parent.abort().is_empty());
     }
 
     #[test]
@@ -1667,23 +1756,24 @@ mod tests {
         // Another version already moved this content: nothing is read or written again.
         let mut operation = operation();
         let version = raw_version();
-        operation.start();
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
-        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+        operation.first().unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(location(false).to_bytes().unwrap())))
+            .unwrap();
 
-        let effects = operation.step(read_result(Some(location(true).to_bytes().unwrap())));
+        let turn = operation.next(read_result(Some(location(true).to_bytes().unwrap())));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(bucket_read(ZSTD, None));
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
-        let effects = operation.step(read_result(Some(location(true).to_bytes().unwrap())));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        enter_publish(&mut operation).unwrap();
+        operation.next(bucket_read(ZSTD, None)).unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        let effects = operation.next(read_result(Some(location(true).to_bytes().unwrap())));
+        let Ok(Next::Call(IoCall::Write(writes))) = &effects else {
             panic!("expected the row writes, got {effects:?}")
         };
         let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
@@ -1700,13 +1790,13 @@ mod tests {
                 digest: [4; 32],
             }])
             .unwrap();
-        written(&mut operation, &version);
-        operation.step(bucket_read(ZSTD, None));
-        let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        written(&mut operation, &version).unwrap();
+        operation.next(bucket_read(ZSTD, None)).unwrap();
+        let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
+        let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
             panic!("expected the registration read, got {effects:?}")
         };
-        assert_eq!(key_space, MANAGED_COPY_KEYSPACE);
+        assert_eq!(reads[0].0, MANAGED_COPY_KEYSPACE);
         let old = operation.old.clone().unwrap();
         let copy = ManagedCopyRecord::new(
             operation.version_key.clone(),
@@ -1717,11 +1807,13 @@ mod tests {
             ManagedCopyState::Registered,
         )
         .unwrap();
-        operation.step(read_result(Some(copy.to_bytes().unwrap())));
+        operation
+            .next(read_result(Some(copy.to_bytes().unwrap())))
+            .unwrap();
 
-        let effects = operation.step(read_result(None));
+        let effects = operation.next(read_result(None));
 
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        let Ok(Next::Call(IoCall::Write(writes))) = &effects else {
             panic!("expected the row writes, got {effects:?}")
         };
         let (space, _, value) = &writes[1];
@@ -1741,20 +1833,16 @@ mod tests {
                 digest: [4; 32],
             }])
             .unwrap();
-        written(&mut operation, &version);
-        operation.step(bucket_read(ZSTD, None));
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        written(&mut operation, &version).unwrap();
+        operation.next(bucket_read(ZSTD, None)).unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
 
-        operation.step(read_result(None));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Blob(BlobEvent::ReservationReleased {
-            id: Ulid::nil(),
-        }));
+        let turn = operation.next(read_result(None));
 
         assert_eq!(
-            operation.finalize(),
+            turn,
             Err(MigrateVersionError::ManagedCopy(
                 ManagedCopyError::Unregistered
             ))
@@ -1775,26 +1863,11 @@ mod tests {
         // The setting changed again while the copy was written: nothing is published
         // and the written copy goes back to the cleanup queue.
         let mut operation = operation();
-        written(&mut operation, &raw_version());
+        written(&mut operation, &raw_version()).unwrap();
 
-        let effects = operation.step(bucket_read(Compression::Off, None));
+        let turn = operation.next(bucket_read(Compression::Off, None));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::default(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReleaseReservation { .. })]
-        ));
-        let effects = operation.step(Event::Blob(BlobEvent::ReservationReleased {
-            id: Ulid::nil(),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
-        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+        leaves_copy(&skipped_calls(turn), true);
     }
 
     #[test]
@@ -1803,7 +1876,7 @@ mod tests {
         // published for the version, and the written copy goes back to the cleanup queue.
         use aruna_core::structs::storage::encryption::EncryptionMode;
         let mut operation = operation();
-        written(&mut operation, &raw_version());
+        written(&mut operation, &raw_version()).unwrap();
         let settings = BucketEncryption {
             mode: EncryptionMode::NodeManaged,
             bucket_id: Some(Ulid::from_bytes([3; 16])),
@@ -1811,19 +1884,9 @@ mod tests {
             ..Default::default()
         };
 
-        let effects = operation.step(bucket_read(ZSTD, Some(settings)));
+        let turn = operation.next(bucket_read(ZSTD, Some(settings)));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Blob(BlobEvent::ReservationReleased {
-            id: Ulid::nil(),
-        }));
-        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+        leaves_copy(&skipped_calls(turn), true);
     }
 
     #[test]
@@ -1833,13 +1896,17 @@ mod tests {
         use aruna_core::structs::storage::encryption::EncryptionMode;
         let mut operation = operation();
         let version = raw_version();
-        operation.start();
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
-        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
-        operation.step(read_result(Some(location(true).to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
+        operation.first().unwrap();
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(location(false).to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(location(true).to_bytes().unwrap())))
+            .unwrap();
+        enter_publish(&mut operation).unwrap();
         let settings = BucketEncryption {
             mode: EncryptionMode::VaultLocked,
             bucket_id: Some(Ulid::from_bytes([3; 16])),
@@ -1847,16 +1914,9 @@ mod tests {
             ..Default::default()
         };
 
-        let effects = operation.step(bucket_read(ZSTD, Some(settings)));
+        let turn = operation.next(bucket_read(ZSTD, Some(settings)));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::default(),
-        }));
-        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+        assert_eq!(turn, Ok(Next::Done(MigrateOutcome::Skipped)));
     }
 
     #[tokio::test]
@@ -2479,12 +2539,12 @@ mod tests {
     #[test]
     fn rejects_wrong_event() {
         let mut operation = operation();
-        operation.start();
+        operation.state = MigrateState::ProbeTarget;
 
-        operation.step(Event::Blob(BlobEvent::DeleteFinished));
+        let turn = operation.next(blob_event(BlobEvent::DeleteFinished));
 
         assert!(matches!(
-            operation.finalize(),
+            turn,
             Err(MigrateVersionError::InvalidStateEvent { .. })
         ));
     }
