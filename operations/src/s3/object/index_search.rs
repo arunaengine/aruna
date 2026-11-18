@@ -3,154 +3,249 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ops::Bound;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
+use std::time::{Duration, UNIX_EPOCH};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::key_index::{IndexEffect, IndexEvent, KeyPage, KeyQuery, MetaTerms};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::table::{query_terms, search_tokens};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
-use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
-use aruna_core::types::{GroupId, Key, TxnId};
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView, KeyRange};
+use aruna_core::types::Key;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use futures_util::future::join_all;
 use ulid::Ulid;
 
 use super::{
-    CHANGED_PAGE_CAP, Candidate, HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
-    SearchNodePage, SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits,
-    changed_until, finish_read, load_live, retain_matches, start_read,
+    BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, ObjectKeyMatch,
+    SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput, SearchTurn, WalkTurn,
 };
-use crate::auth::enforcement::PolicyEvaluator;
-use crate::distribution::feed_walks::state_key;
-use crate::distribution::feed_walks::RangeProgressOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::replication::members::ReadRecordOperation;
-use aruna_core::key_index::KeyPage;
-use aruna_core::key_index::KeyQuery;
-use aruna_core::key_index::MetaTerms;
-use aruna_storage::key_index::RangeIndexes;
+use crate::distribution::feed_walks::{
+    FeedError, IndexProgress, RangeProgressOperation, state_key,
+};
+use crate::replication::members::{ReadRecordOperation, RecordError};
+use std::collections::BTreeMap;
 
 /// Index candidates one node page examines at most, visible or not.
 pub(super) const EXAMINE_BUDGET: usize = 1_000;
 /// Range indexes one page queries at once.
 const RANGE_CONCURRENCY: usize = 4;
 
-pub(super) struct RangeSearch {
-    pub(super) binding: DistributionBinding,
-    pub(super) indexes: Option<Arc<RangeIndexes>>,
-    pub(super) budget: usize,
+/// A range's page of a search, and the key a building index covers through.
+type RangeFound = (KeyPage, Option<String>);
+
+#[derive(Debug, PartialEq)]
+enum RangeStep {
+    Record,
+    States(Vec<Ulid>, KeyQuery),
+    Search(Vec<(Ulid, Option<Option<String>>)>),
+    Through(Ulid, String),
+    ThroughCheck(Ulid, String, VecDeque<Candidate>, Option<Candidate>),
+    Keys,
+    Walk,
+    Progress,
 }
 
 /// One page of a distributed bucket. Ranges are read in key order and continue by key; a
 /// missing or building index is reported as incomplete, with its progress, and never replaced
 /// by a scan. A building index answers for the keys up to its cursor and is reported partial.
-pub(super) async fn search_ranges(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    search: RangeSearch,
-) -> Result<SearchNodePage, SearchObjectsError> {
-    let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
-    let record = drive(ReadRecordOperation::new(set_id), context).await;
-    let record = record.map_err(|error| SearchObjectsError::Storage(error.to_string()));
-    let Some(view) = record? else {
-        // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
-    };
-    let ranges = &view.head.snapshot.config.ranges;
-    let mut unready = Vec::new();
-    let mut page = range_page(context, input, search, ranges, &mut unready).await?;
-    page.layout = Some((set_id, layout_digest(ranges)));
-    page.partial_ranges = (unready.iter())
-        .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
-        .collect();
-    if indexes.is_some() && !unready.is_empty() {
-        let bucket = input.bucket.as_deref().unwrap_or_default();
-        // Progress is a hint, so a failed read leaves it out.
-        let progress = (drive(RangeProgressOperation::new(bucket), context).await).unwrap_or_default();
-        page.index_progress = (unready.into_iter())
-            .filter_map(|(range_id, _)| Some((range_id, *progress.get(&range_id)?)))
-            .collect();
-    }
-    Ok(page)
+#[derive(Debug, PartialEq)]
+pub(super) struct RangeSearchOperation {
+    input: SearchObjectsInput,
+    binding: DistributionBinding,
+    budget: usize,
+    indexed: bool,
+    bucket: String,
+    window: Option<(Bound<String>, Bound<String>)>,
+    layout: Option<[u8; 32]>,
+    chunks: VecDeque<Vec<Ulid>>,
+    found: VecDeque<(Ulid, Option<RangeFound>)>,
+    current: Option<KeyPage>,
+    walk: HitWalk,
+    unready: Vec<(Ulid, Option<Option<String>>)>,
+    certain: bool,
+    examined: usize,
+    incomplete: usize,
+    remote: usize,
+    done_page: Option<SearchNodePage>,
+    now_ms: u64,
+    step: RangeStep,
 }
 
-/// Whether the caller may read `key`, a building index's cursor.
-async fn readable(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    bucket: &str,
-    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
-    key: &str,
-) -> Result<bool, SearchObjectsError> {
-    for candidate in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
-        if authorize(context, input, evaluators, &candidate.hit).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+type RangeTurn = SearchTurn<SearchNodePage>;
 
-/// Adds each incomplete range to `unready`, a partial one with the cursor key it may show.
-async fn range_page(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    search: RangeSearch,
-    ranges: &[KeyRange],
-    unready: &mut Vec<(Ulid, Option<Option<String>>)>,
-) -> Result<SearchNodePage, SearchObjectsError> {
-    let bucket = input.bucket.clone().unwrap_or_default();
-    let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
-    let budget = search.budget.max(1);
-    let after = match input.start_after.as_deref() {
-        Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
-        None => None,
-    };
-    let (start, end) = window(input, after);
-    let mut local = Vec::new();
-    let mut remote = 0;
-    for range in ranges {
-        if !overlaps(range, &start, &end) {
-            continue;
-        }
-        match range.coordinator == search.binding.member_id {
-            true => local.push(range.range_id),
-            false => remote += 1,
+impl RangeSearchOperation {
+    pub(super) fn new(
+        input: SearchObjectsInput,
+        binding: DistributionBinding,
+        budget: usize,
+        indexed: bool,
+    ) -> Self {
+        Self {
+            bucket: input.bucket.clone().unwrap_or_default(),
+            input,
+            binding,
+            budget: budget.max(1),
+            indexed,
+            window: None,
+            layout: None,
+            chunks: VecDeque::new(),
+            found: VecDeque::new(),
+            current: None,
+            walk: HitWalk::default(),
+            unready: Vec::new(),
+            certain: true,
+            examined: 0,
+            incomplete: 0,
+            remote: 0,
+            done_page: None,
+            now_ms: 0,
+            step: RangeStep::Record,
         }
     }
 
-    let names = (input.key_match == ObjectKeyMatch::Substring).then(|| input.query.clone());
-    let meta = (input.key_match == ObjectKeyMatch::Metadata).then(|| {
-        let (text, exact) = query_terms(&input.query);
-        let text = search_tokens(&text).into_iter().collect();
-        MetaTerms {
-            text,
-            exact: exact.into_iter().collect(),
-        }
-    });
-    let mut evaluators = HashMap::new();
-    let mut visible = Vec::with_capacity(limit + 1);
-    let mut changed = Vec::new();
-    let mut certain = true;
-    let (mut examined, mut incomplete) = (0, 0);
-    for chunk in local.chunks(RANGE_CONCURRENCY) {
-        let query = KeyQuery {
-            start: start.clone(),
-            end: end.clone(),
-            names: names.clone(),
-            meta: meta.clone(),
-            limit: budget.saturating_sub(examined).max(1),
+    fn record_read(&mut self, view: DistributionView) -> RangeTurn {
+        let ranges = &view.head.snapshot.config.ranges;
+        self.layout = Some(layout_digest(ranges));
+        let after = match self.input.start_after.as_deref() {
+            Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
+            None => None,
         };
-        let found = search_chunk(context, &search, chunk, query).await?;
-        for (range_id, found) in chunk.iter().zip(found) {
-            let Some((found, through)) = found else {
-                unready.push((*range_id, None));
-                incomplete += 1;
+        let (start, end) = window(&self.input, after);
+        let mut local = Vec::new();
+        for range in ranges {
+            if !overlaps(range, &start, &end) {
+                continue;
+            }
+            match range.coordinator == self.binding.member_id {
+                true => local.push(range.range_id),
+                false => self.remote += 1,
+            }
+        }
+        self.chunks = local
+            .chunks(RANGE_CONCURRENCY)
+            .map(<[Ulid]>::to_vec)
+            .collect();
+        self.window = Some((start, end));
+        self.next_chunk()
+    }
+
+    fn query(&self) -> Result<KeyQuery, SearchObjectsError> {
+        let input = &self.input;
+        let (start, end) = self.window.clone().ok_or(SearchObjectsError::Unavailable)?;
+        let names = (input.key_match == ObjectKeyMatch::Substring).then(|| input.query.clone());
+        let meta = (input.key_match == ObjectKeyMatch::Metadata).then(|| {
+            let (text, exact) = query_terms(&input.query);
+            MetaTerms {
+                text: search_tokens(&text).into_iter().collect(),
+                exact: exact.into_iter().collect(),
+            }
+        });
+        Ok(KeyQuery {
+            start,
+            end,
+            names,
+            meta,
+            limit: self.budget.saturating_sub(self.examined).max(1),
+        })
+    }
+
+    fn next_chunk(&mut self) -> RangeTurn {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return self.finish(None);
+        };
+        let set_id = self.binding.set_id;
+        let reads = (chunk.iter())
+            .map(|range_id| {
+                let key = Key::from(state_key(set_id, *range_id));
+                (SEARCH_INDEX_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.step = RangeStep::States(chunk, self.query()?);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// Queries the searchable indexes of the chunk at once. A building index is searched up to
+    /// its cursor; a range without a searchable index is passed on as not found.
+    fn search_chunk(
+        &mut self,
+        chunk: Vec<Ulid>,
+        query: KeyQuery,
+        states: Vec<Option<aruna_core::types::Value>>,
+    ) -> RangeTurn {
+        let set_id = self.binding.set_id;
+        let (mut members, mut slots) = (Vec::new(), Vec::new());
+        for (range_id, state) in chunk.into_iter().zip(states) {
+            let state = state.and_then(|value| IndexState::from_bytes(value.as_ref()).ok());
+            let Some((generation, through, query)) = searchable(state, &query) else {
+                slots.push((range_id, None));
+                continue;
+            };
+            if !self.indexed {
+                slots.push((range_id, None));
+                continue;
+            }
+            let search = IndexEffect::Search {
+                set_id,
+                range_id,
+                generation,
+                query,
+            };
+            members.push(Effect::Index(Box::new(search)));
+            slots.push((range_id, Some(through)));
+        }
+        if members.is_empty() {
+            self.found = slots.into_iter().map(|(id, _)| (id, None)).collect();
+            return self.next_range();
+        }
+        self.step = RangeStep::Search(slots);
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: RANGE_CONCURRENCY,
+            form: GroupForm::All { deadline: None },
+        })))
+    }
+
+    fn searched(
+        &mut self,
+        slots: Vec<(Ulid, Option<Option<String>>)>,
+        result: IoResult,
+    ) -> RangeTurn {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            return Err(SearchObjectsError::Unavailable);
+        };
+        let mut results = results.into_iter();
+        for (range_id, slot) in slots {
+            let found = slot.and_then(|through| {
+                let GroupResult::Done(event) = results.next()? else {
+                    return None;
+                };
+                let Event::Index(IndexEvent::Searched(page)) = *event else {
+                    return None;
+                };
+                Some((*page, through))
+            });
+            self.found.push_back((range_id, found));
+        }
+        self.next_range()
+    }
+
+    fn next_range(&mut self) -> RangeTurn {
+        loop {
+            let Some((range_id, found)) = self.found.pop_front() else {
+                return self.next_chunk();
+            };
+            let Some((page, through)) = found else {
+                self.unready.push((range_id, None));
+                self.incomplete += 1;
                 continue;
             };
             // A key removed from the index after `as_of` leaves no trace, so a commit since
