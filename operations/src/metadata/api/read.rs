@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::list::{load_group_records, load_pending_records};
 use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
@@ -294,47 +293,6 @@ async fn graph_record(
         Err(MetadataApiError::NotFound) => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-pub(super) async fn load_claim_records(
-    context: &DriverContext,
-    realm_id: RealmId,
-    group_id: Option<GroupId>,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let group_ids = check_policy_limit(match group_id {
-        Some(group_id) => vec![group_id],
-        None => drive(
-            ListGroupOperation::with_pagination(REGISTRY_CANDIDATE_LIMIT + 1, 0),
-            context,
-        )
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-        .into_iter()
-        .map(|group| group.group_id)
-        .collect(),
-    })?;
-    let mut pending = load_pending_records(context, group_id, REGISTRY_CANDIDATE_LIMIT).await?;
-    let mut records = Vec::new();
-    for group_id in group_ids {
-        let remaining = REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
-        let mut group_records = load_group_records(context, group_id, remaining).await?;
-        if let Some(pending_records) = pending.remove(&group_id) {
-            merge_pending_records(&mut group_records, pending_records);
-            if group_records.len() > remaining {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-        }
-        group_records.sort_by_key(|record| record.document_id);
-        records.extend(group_records);
-    }
-    for pending_records in pending.into_values() {
-        if records.len().saturating_add(pending_records.len()) > REGISTRY_CANDIDATE_LIMIT {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        records.extend(pending_records);
-    }
-    records.retain(|record| record.realm_id == realm_id);
-    Ok(records)
 }
 
 impl From<LiveRecordsError> for MetadataApiError {

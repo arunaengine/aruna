@@ -698,15 +698,15 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    let result = super::super::api::path::local_path_candidates(
-                                        context.as_ref(),
+                                    let local = super::super::api::path::LocalPathOperation::new(
                                         realm_id,
-                                        group_id,
-                                        &document_path,
-                                        auth.as_ref(),
-                                    )
-                                    .await
-                                    .map_err(crate::forward::transport::read_error);
+                                        (group_id, &document_path),
+                                        auth,
+                                        Some(net.node_id()),
+                                    );
+                                    let result = crate::driver::drive(local, context.as_ref())
+                                        .await
+                                        .map_err(crate::forward::transport::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -735,36 +735,11 @@ impl MetadataHandle {
                 config_digest,
             } => {
                 Box::pin(async {
-                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
-                        Ok(auth) => match context.net_handle.as_ref() {
-                            Some(net) => {
-                                let realm_id = *net.realm_id();
-                                if !config_digest_matches(
-                                    context.as_ref(),
-                                    realm_id,
-                                    &config_digest,
-                                )
-                                .await
-                                {
-                                    Err(MetadataReadError::Unavailable)
-                                } else {
-                                    let result = super::super::api::path::resolve_local_path(
-                                        context.as_ref(),
-                                        realm_id,
-                                        super::super::api::path_types::MetadataLookupRequest {
-                                            group_id,
-                                            document_path,
-                                            auth,
-                                        },
-                                    )
-                                    .await
-                                    .map(|result| {
-                                        Box::new(super::super::protocol::MetadataPathResolution {
-                                            winner: result.winner,
-                                            conflicts: result.conflicts,
-                                        })
-                                    })
-                                    .map_err(crate::forward::transport::read_error);
+                    let result =
+                        match self.authorize_read_peer(peer, auth_token, false).await {
+                            Ok(auth) => match context.net_handle.as_ref() {
+                                Some(net) => {
+                                    let realm_id = *net.realm_id();
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -774,14 +749,44 @@ impl MetadataHandle {
                                     {
                                         Err(MetadataReadError::Unavailable)
                                     } else {
-                                        result
+                                        let request =
+                                            super::super::api::path_types::MetadataLookupRequest {
+                                                group_id,
+                                                document_path,
+                                                auth,
+                                            };
+                                        let lookup =
+                                            super::super::api::path::LookupPathOperation::local(
+                                                realm_id,
+                                                request,
+                                                Some(net.node_id()),
+                                            );
+                                        let result = crate::driver::drive(lookup, context.as_ref())
+                                        .await
+                                    .map(|result| {
+                                        Box::new(super::super::protocol::MetadataPathResolution {
+                                            winner: result.winner,
+                                            conflicts: result.conflicts,
+                                        })
+                                    })
+                                    .map_err(crate::forward::transport::read_error);
+                                        if !config_digest_matches(
+                                            context.as_ref(),
+                                            realm_id,
+                                            &config_digest,
+                                        )
+                                        .await
+                                        {
+                                            Err(MetadataReadError::Unavailable)
+                                        } else {
+                                            result
+                                        }
                                     }
                                 }
-                            }
-                            None => Err(MetadataReadError::Unavailable),
-                        },
-                        Err(error) => Err(error),
-                    };
+                                None => Err(MetadataReadError::Unavailable),
+                            },
+                            Err(error) => Err(error),
+                        };
                     MetadataTransportMessage::ForwardedPathResolution { result }
                 })
                 .await
