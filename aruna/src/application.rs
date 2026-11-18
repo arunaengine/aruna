@@ -389,6 +389,7 @@ async fn run_node_owned(
         graph_handle: resources.driver_ctx.graph_handle.clone(),
         blob_handle: resources.driver_ctx.blob_handle.clone(),
         storage_handle: resources.driver_ctx.storage_handle.clone(),
+        driver_ctx: resources.driver_ctx.clone(),
         ops: Some(resources.ops_handle),
         grace: shutdown_grace_env(),
     }
@@ -556,6 +557,7 @@ async fn release_unready(
         graph_handle: driver_ctx.graph_handle.clone(),
         blob_handle: driver_ctx.blob_handle.clone(),
         storage_handle: driver_ctx.storage_handle.clone(),
+        driver_ctx: driver_ctx.clone(),
         ops: Some(ops_handle),
         grace: shutdown_grace_env(),
     }
@@ -1207,6 +1209,9 @@ mod tests {
             monitoring: None,
             task_handle: aruna_tasks::TaskHandle::new(),
             jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+            driver_ctx: std::sync::Arc::new(aruna_operations::driver::DriverContext::storage_only(
+                storage_handle.clone(),
+            )),
             net_handle: None,
             graph_handle: None,
             blob_handle: None,

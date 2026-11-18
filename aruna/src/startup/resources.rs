@@ -116,7 +116,10 @@ impl Acquired {
     pub(crate) async fn cleanup(self, grace: Duration) -> ShutdownOutcome {
         info!("Startup stopped early; releasing the acquired resources");
         let ops = self.ops_handle;
-        let driver_ctx = self.driver_ctx;
+        // Startup may stop before the context exists; leases are then handed back over storage.
+        let driver_ctx = self
+            .driver_ctx
+            .unwrap_or_else(|| Arc::new(DriverContext::storage_only(self.storage_handle.clone())));
         let outcome = NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
@@ -128,6 +131,7 @@ impl Acquired {
             monitoring: self.monitoring,
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,
+            driver_ctx: driver_ctx.clone(),
             net_handle: self.net_handle,
             graph_handle: self.graph_handle,
             blob_handle: self.blob_handle,
