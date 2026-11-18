@@ -14,7 +14,10 @@ pub mod executor;
 pub mod export;
 pub(crate) mod handed_imports;
 pub mod harvest;
-pub mod host;
+#[cfg(test)]
+pub(crate) mod host {
+    pub(crate) use crate::tasks::job_host::run_staging_job;
+}
 pub mod import;
 mod import_listing;
 pub mod job_artifacts;

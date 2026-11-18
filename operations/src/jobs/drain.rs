@@ -520,10 +520,10 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::reconcile::ExternalReconciler;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::read_job_record;
     use crate::storage_read::iter_prefix_page;
+    use crate::tasks::job_reconcile::ExternalReconciler;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;

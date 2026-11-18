@@ -21,10 +21,10 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::job_dispatch::dispatch_payload;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{
-    JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, dispatch_payload,
-    run_cleanup,
+    JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, run_cleanup,
 };
 use crate::jobs::runtime::{Admission, JobShutdownReport, JobsRuntime, RecoveredAdmission};
 use crate::jobs::runtime_steps::{

@@ -17,11 +17,11 @@ use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use super::backend_import::{BackendImportOperation, ImportJob};
-use super::executor::{JobContext, JobRunOutcome, ProgressReporter, RangeTurns};
-use super::staging::{StagingJobOperation, StagingRun};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
+use crate::jobs::backend_import::{BackendImportOperation, ImportJob};
+use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter, RangeTurns};
+use crate::jobs::staging::{StagingJobOperation, StagingRun};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use crate::s3::object::read::get_object_routed;
 
@@ -71,7 +71,11 @@ impl JobHost for ContextHost {
         turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>> {
         Box::pin(async move {
-            let guards = self.turns.take(turns).await;
+            let locks = self.turns.turn_locks(turns);
+            let mut guards = Vec::with_capacity(locks.len());
+            for lock in locks {
+                guards.push(lock.lock_owned().await);
+            }
             Box::new(guards) as Box<dyn Any + Send>
         })
     }

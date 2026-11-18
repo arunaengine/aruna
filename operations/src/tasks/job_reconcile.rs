@@ -1,4 +1,4 @@
-//! Declares the reconciler trait for job attempts whose external run was lost.
+//! Declares the hook the job runner calls for attempts whose external run was lost.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
