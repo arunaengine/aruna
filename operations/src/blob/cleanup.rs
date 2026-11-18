@@ -709,185 +709,348 @@ impl CleanupWorkOperation {
                 Ok(Next::Done(RowOutcome::Failed))
             }
         }
-        BlobCleanupWork::DropRows { key_space, prefix } => {
-            match drop_rows(context, &key_space, prefix).await {
-                Ok(true) => RowOutcome::Done,
-                Ok(false) => RowOutcome::Kept,
-                Err(error) => {
-                    warn!(%error, "Rows of a removed rule could not be dropped");
-                    RowOutcome::Failed
-                }
-            }
+    }
+}
+
+fn deleted(event: Event) -> RowOutcome {
+    match event {
+        Event::Blob(BlobEvent::DeleteFinished) => RowOutcome::Done,
+        event => {
+            warn!(event = event.label(), "Deferred blob delete failed");
+            RowOutcome::Failed
         }
-        BlobCleanupWork::DropClaims { import_id } => {
-            match crate::blob::release::drop_claims(context, import_id).await {
-                Some(true) => RowOutcome::Done,
-                Some(false) => RowOutcome::Kept,
-                None => RowOutcome::Failed,
-            }
+    }
+}
+
+fn registered(event: Event) -> RowOutcome {
+    match event {
+        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => RowOutcome::Done,
+        event => {
+            warn!(
+                event = event.label(),
+                "Deferred blob DHT registration failed"
+            );
+            RowOutcome::Failed
         }
-        BlobCleanupWork::DropTrail {
-            group_id,
-            bucket,
-            incarnation,
-        } => {
-            let drop = DropTrailOperation::new(group_id, bucket.as_deref(), incarnation);
-            match drive(drop, context).await {
+    }
+}
+
+impl Operation for CleanupWorkOperation {
+    type Output = RowOutcome;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> WorkTurn {
+        match self.work.take() {
+            Some(work) => self.start(work),
+            None => Err(MigrationError::Failed("no cleanup work".to_string())),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> WorkTurn {
+        match std::mem::replace(&mut self.step, WorkStep::Start) {
+            WorkStep::Start => Err(MigrationError::Failed("no cleanup call".to_string())),
+            WorkStep::Outcome => Ok(Next::Done(result.child::<RowOutcome, MigrationError>()??)),
+            WorkStep::Finished => {
+                let done = result.child::<bool, MigrationError>()?;
+                let done = done.unwrap_or_else(|error| {
+                    warn!(%error, "A renamed file could not be released");
+                    false
+                });
+                Ok(Next::Done(done.into()))
+            }
+            WorkStep::Pass(failure) => Ok(Next::Done(
+                match result.child::<bool, MigrationError>()? {
+                    Ok(true) => RowOutcome::Done,
+                    Ok(false) => RowOutcome::Kept,
+                    Err(error) => {
+                        warn!(%error, "{failure}");
+                        RowOutcome::Failed
+                    }
+                },
+            )),
+            WorkStep::Trail => Ok(Next::Done(match result.child::<(), TrailError>()? {
                 Ok(()) => RowOutcome::Done,
                 Err(error) => {
                     warn!(%error, "Delete trail of a removed bucket could not be dropped");
                     RowOutcome::Failed
                 }
+            })),
+            WorkStep::Owner(owner, location) => {
+                let owned = result.child::<Option<bool>, IoError>()?.unwrap_or(None);
+                self.owner_known(owner, *location, owned)
             }
+            WorkStep::Reservation(owner) => {
+                result.event()?;
+                self.reservation_cleared(owner)
+            }
+            WorkStep::Delete => Ok(Next::Done(deleted(result.event()?))),
+            WorkStep::Reconcile => Ok(Next::Done(match result.event()? {
+                Event::Blob(BlobEvent::ReservationReconciled { done }) => done.into(),
+                event => {
+                    let event = event.label();
+                    warn!(event, "Deferred bucket reservation reconciliation failed");
+                    RowOutcome::Failed
+                }
+            })),
+            WorkStep::Dht => Ok(Next::Done(registered(result.event()?))),
+            WorkStep::Planned(file) => self.planned(*file, result.child()?),
+            // The settlement removes the record itself, and only while it is unchanged.
+            WorkStep::Settle => Ok(Next::Done(match result.event()? {
+                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
+                event => {
+                    warn!(event = event.label(), "A copy upload could not be settled");
+                    RowOutcome::Failed
+                }
+            })),
         }
     }
+}
+
+/// The DHT announcement a committed upload still owes.
+type Holder = ([u8; 32], RealmId, u64, bool);
+
+#[derive(Debug, PartialEq)]
+enum TargetStep {
+    Upload,
+    Holder,
+    Reservation(bool),
+    Dht,
+    Row,
+    Settled,
 }
 
 /// A live upload's target row stays queued: it is also the bucket reservation abort or
 /// completion settles. A committed version takes it over; otherwise, after the grace a running
 /// create needs, the target goes with its provider uploads.
-async fn reconcile_target(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+struct ReconcileTargetOperation {
     upload_id: Ulid,
-    holder: Option<([u8; 32], RealmId, u64, bool)>,
+    holder: Option<Holder>,
     location: BackendLocation,
-) -> RowOutcome {
-    match owns_write(context, &WriteOwner::Upload { upload_id }, &location).await {
-        None => return RowOutcome::Failed,
-        Some(true) => return RowOutcome::Kept,
-        Some(false) => {}
+    now_ms: u64,
+    step: TargetStep,
+}
+
+impl ReconcileTargetOperation {
+    fn new(upload_id: Ulid, holder: Option<Holder>, location: BackendLocation) -> Self {
+        Self {
+            upload_id,
+            holder,
+            location,
+            now_ms: 0,
+            step: TargetStep::Upload,
+        }
     }
-    if let Some((blake3, realm_id, ttl_ms, announce)) = holder {
+
+    fn call(&mut self, step: TargetStep, call: IoCall) -> WorkTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn check_holder(&mut self) -> WorkTurn {
+        let Some((blake3, realm_id, ttl_ms, announce)) = self.holder else {
+            return self.past_grace();
+        };
         let owner = WriteOwner::Blob {
             blake3,
             realm_id,
             ttl_ms,
             announce,
         };
-        match owns_write(context, &owner, &location).await {
-            None => return RowOutcome::Failed,
-            Some(true) => {
-                if let Some(blob_handle) = context.blob_handle.as_ref() {
-                    blob_handle.clear_reservation(location.ulid);
+        let owns = OwnsWriteOperation::new(&owner, &self.location);
+        self.call(TargetStep::Holder, IoCall::child(owns))
+    }
+
+    fn past_grace(&mut self) -> WorkTurn {
+        let opened_ms = self.location.ulid.timestamp_ms();
+        let age = self.now_ms.saturating_sub(opened_ms);
+        if age < BLOB_CLEANUP_AFTER.as_millis() as u64 {
+            return Ok(Next::Done(RowOutcome::Kept));
+        }
+        // Read after the upload: a completion replaces this row in the commit that removes it.
+        let key = self.location.ulid.to_bytes().to_vec();
+        self.call(TargetStep::Row, read_row(BLOB_CLEANUP_KEYSPACE, key))
+    }
+
+    /// Whether the target's own row still names an upload. A committed version replaced it
+    /// with its own row, which settles the object instead.
+    fn row_read(&mut self, value: Option<Value>) -> WorkTurn {
+        let names_upload = |value: &Value| {
+            matches!(
+                BlobCleanupWork::from_bytes(value),
+                Ok(BlobCleanupWork::ReconcileWrite {
+                    location: row,
+                    owner: WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. },
+                }) if row.same_object(&self.location)
+            )
+        };
+        let own_row = value.is_some();
+        if value.as_ref().is_some_and(|value| !names_upload(value)) {
+            return Ok(Next::Done(RowOutcome::Kept));
+        }
+        // Only the target's own row may delete it; a later abort's row may outlive a completion.
+        let location = self.location.clone();
+        let settle = match own_row {
+            true => BlobEffect::DiscardTarget { location },
+            false => BlobEffect::AbortTarget { location },
+        };
+        self.call(TargetStep::Settled, Effect::Blob(settle).into())
+    }
+}
+
+impl Operation for ReconcileTargetOperation {
+    type Output = RowOutcome;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> WorkTurn {
+        let owner = WriteOwner::Upload {
+            upload_id: self.upload_id,
+        };
+        let owns = OwnsWriteOperation::new(&owner, &self.location);
+        Ok(Next::Call(IoCall::child(owns)))
+    }
+
+    fn next(&mut self, result: IoResult) -> WorkTurn {
+        match self.step {
+            TargetStep::Upload => match result.child::<Option<bool>, IoError>()?.unwrap_or(None) {
+                None => Ok(Next::Done(RowOutcome::Failed)),
+                Some(true) => Ok(Next::Done(RowOutcome::Kept)),
+                Some(false) => self.check_holder(),
+            },
+            TargetStep::Holder => match result.child::<Option<bool>, IoError>()?.unwrap_or(None) {
+                None => Ok(Next::Done(RowOutcome::Failed)),
+                Some(true) => {
+                    let announce = self.holder.is_some_and(|(.., announce)| announce);
+                    let clear = BlobEffect::ReleaseReservation {
+                        id: self.location.ulid,
+                    };
+                    let step = TargetStep::Reservation(announce);
+                    self.call(step, Effect::Blob(clear).into())
                 }
-                if !announce {
-                    return RowOutcome::Done;
-                }
-                return register_dht(context, blake3, realm_id, ttl_ms).await.into();
+                Some(false) => self.past_grace(),
+            },
+            TargetStep::Reservation(announce) => {
+                result.event()?;
+                let Some((blake3, realm_id, ttl_ms, _)) = self.holder.filter(|_| announce) else {
+                    return Ok(Next::Done(RowOutcome::Done));
+                };
+                let limits = RoCrateLimits {
+                    holder_ttl_ms: ttl_ms,
+                    ..RoCrateLimits::default()
+                };
+                let Ok(effect) = dht_registration_effect(&blake3, realm_id, &limits) else {
+                    return Ok(Next::Done(RowOutcome::Failed));
+                };
+                self.call(TargetStep::Dht, effect.into())
             }
-            Some(false) => {}
-        }
-    }
-    let opened_ms = location.ulid.timestamp_ms();
-    if unix_timestamp_millis().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
-        return RowOutcome::Kept;
-    }
-    // Read after the upload: a completion replaces this row in the commit that removes it.
-    let own_row = match target_current(context, &location).await {
-        None => return RowOutcome::Failed,
-        Some(Some(false)) => return RowOutcome::Kept,
-        Some(row) => row.is_some(),
-    };
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return RowOutcome::Failed;
-    };
-    // Only the target's own row may delete it; a later abort's row may outlive a completion.
-    let settled = match own_row {
-        true => blob_handle.discard_target(location).await,
-        false => blob_handle.abort_target(location).await,
-    };
-    match settled {
-        Ok(()) => RowOutcome::Done,
-        Err(error) => {
-            warn!(%error, "Discarding an in-place upload target failed");
-            RowOutcome::Failed
+            TargetStep::Dht => Ok(Next::Done(registered(result.event()?))),
+            TargetStep::Row => self.row_read(result.value()?),
+            TargetStep::Settled => Ok(Next::Done(match result.event()? {
+                Event::Blob(BlobEvent::DeleteFinished | BlobEvent::UploadAborted) => {
+                    RowOutcome::Done
+                }
+                event => {
+                    let event = event.label();
+                    warn!(event, "Discarding an in-place upload target failed");
+                    RowOutcome::Failed
+                }
+            })),
         }
     }
 }
 
-/// Whether the target's own row still names an upload; `Some(None)` when it is gone. A
-/// committed version replaced it with its own row, which settles the object instead.
-async fn target_current(
-    context: &DriverContext,
-    location: &BackendLocation,
-) -> Option<Option<bool>> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: location.ulid.to_bytes().to_vec().into(),
-            txn_id: None,
+/// Whether committed metadata still names this exact physical copy. `None` means the record
+/// could not be decoded, so nothing is proven; a failed read ends as an error.
+#[derive(Debug, PartialEq)]
+struct OwnsWriteOperation {
+    owner: WriteOwner,
+    location: BackendLocation,
+    scanning: bool,
+}
+
+impl OwnsWriteOperation {
+    fn new(owner: &WriteOwner, location: &BackendLocation) -> Self {
+        Self {
+            owner: owner.clone(),
+            location: location.clone(),
+            scanning: false,
+        }
+    }
+
+    fn owner_row(&self) -> Option<(&'static str, Key)> {
+        let location = &self.location;
+        Some(match &self.owner {
+            WriteOwner::Blob { blake3, .. } => (
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(
+                    *blake3,
+                    location.format.encoding(),
+                    location.backend.clone(),
+                )
+                .to_bytes()
+                .into(),
+            ),
+            WriteOwner::UploadPart {
+                upload_id,
+                part_number,
+            } => (
+                UPLOAD_PART_KEYSPACE,
+                MultipartPartKey::new(*upload_id, *part_number)
+                    .to_bytes()
+                    .ok()?
+                    .into(),
+            ),
+            WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
+                (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
+            }
+            WriteOwner::Pending => (
+                PENDING_LOCATION_KEYSPACE,
+                ArchiveKey::of(location).to_bytes().into(),
+            ),
         })
-        .await;
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-        warn!(?event, "Upload target row could not be read");
-        return None;
-    };
-    Some(value.map(|value| {
-        matches!(
-            BlobCleanupWork::from_bytes(&value),
-            Ok(BlobCleanupWork::ReconcileWrite {
-                location: row,
-                owner: WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. },
-            }) if row.same_object(location)
-        )
-    }))
+    }
+
+    fn owned(&self, value: &[u8]) -> Option<bool> {
+        let owned = match &self.owner {
+            WriteOwner::Blob { .. } | WriteOwner::Pending => {
+                BackendLocation::from_bytes(value).ok()?
+            }
+            WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(value).ok()?.location,
+            WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
+                // An aborting upload still owns its target: a failed abort reopens it for a
+                // completion, and the abort itself, also when resumed, removes the target.
+                match MultipartUpload::from_bytes(value).ok()?.backend_upload {
+                    Some(upload) => upload.location,
+                    None => return Some(false),
+                }
+            }
+        };
+        Some(owned.same_object(&self.location))
+    }
 }
 
-async fn register_dht(
-    context: &DriverContext,
-    blake3: [u8; 32],
-    realm_id: RealmId,
-    ttl_ms: u64,
-) -> bool {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return false;
-    };
-    let limits = RoCrateLimits {
-        holder_ttl_ms: ttl_ms,
-        ..RoCrateLimits::default()
-    };
-    let Ok(effect) = dht_registration_effect(&blake3, realm_id, &limits) else {
-        return false;
-    };
-    match net_handle.send_effect(effect).await {
-        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => true,
-        event => {
-            warn!(?event, "Deferred blob DHT registration failed");
-            false
+impl Operation for OwnsWriteOperation {
+    type Output = Option<bool>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<bool>>, IoError> {
+        match self.owner_row() {
+            Some((space, key)) => Ok(Next::Call(read_row(space, key))),
+            None => Ok(Next::Done(None)),
         }
     }
-}
 
-async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool {
-    // An imported object is never Aruna's to delete; a part still ends its provider part claim.
-    if location.is_external() && !location.partial {
-        return true;
-    }
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return false;
-    };
-    match blob_handle
-        .send_blob_effect(BlobEffect::Delete { location })
-        .await
-    {
-        Event::Blob(BlobEvent::DeleteFinished) => true,
-        event => {
-            warn!(?event, "Deferred blob delete failed");
-            false
-        }
-    }
-}
-
-async fn reconcile_reservation(context: &DriverContext, location: BackendLocation) -> bool {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return false;
-    };
-    match blob_handle.reconcile_reservation(location).await {
-        Ok(done) => done,
-        Err(error) => {
-            warn!(%error, "Deferred bucket reservation reconciliation failed");
-            false
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<bool>>, IoError> {
+        if self.scanning {
+            return Ok(Next::Done(Some(!result.page()?.0.is_empty())));
         }
     }
 }
