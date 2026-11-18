@@ -1,4 +1,4 @@
-//! Holds the job run context, its progress reporter and the payload handler seam.
+//! Holds the job run outcome, its progress reporter and the turns of distribution ranges.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,16 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobResultPayload,
-};
-use futures_util::future::BoxFuture;
+use aruna_core::structs::execution::job::{JobError, JobPayload, JobProgress, JobResultPayload};
 use tokio::sync::futures::Notified;
-use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+pub use crate::tasks::job_context::{JobContext, PayloadHandler};
 
 /// In-memory progress with a persisted snapshot taken on flush and lease renew.
 #[derive(Clone)]
@@ -97,40 +92,6 @@ impl ProgressReporter {
                 .unwrap_or_else(PoisonError::into_inner),
         }
     }
-}
-
-pub struct JobContext {
-    pub driver: Arc<DriverContext>,
-    pub job_id: JobId,
-    pub owner_node_id: NodeId,
-    pub claim_token: ulid::Ulid,
-    pub final_attempt: bool,
-    /// User-initiated cancel: terminal `Cancelled` plus cleanup.
-    pub cancel: CancellationToken,
-    /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
-    pub shutdown: CancellationToken,
-    pub progress: ProgressReporter,
-    pub range_turns: RangeTurns,
-    /// Runs the payload kinds that other domains own, as the node wiring registered them.
-    pub handlers: Vec<Arc<dyn PayloadHandler>>,
-}
-
-/// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring
-/// registers one per owning domain.
-pub trait PayloadHandler: Send + Sync {
-    /// Runs one job, or `None` when this handler does not own the payload.
-    fn run<'a>(
-        &'a self,
-        ctx: &'a JobContext,
-        payload: &'a JobPayload,
-    ) -> Option<BoxFuture<'a, JobRunOutcome>>;
-
-    /// Whether the job prune keeps this job for now.
-    fn keeps_job<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        payload: &'a JobPayload,
-    ) -> BoxFuture<'a, Result<bool, String>>;
 }
 
 /// One turn per distribution range, shared by every job on this node: page imports into one

@@ -17,10 +17,11 @@ use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use super::job_context::JobContext;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
 use crate::jobs::backend_import::{BackendImportOperation, ImportJob};
-use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter, RangeTurns};
+use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
 use crate::jobs::staging::{StagingJobOperation, StagingRun};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use crate::s3::object::read::get_object_routed;
