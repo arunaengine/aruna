@@ -11,10 +11,10 @@ use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use super::{ready_artifact, serving_node};
-use crate::driver::{DriverContext, drive};
-use crate::plugins::artifacts::{ArtifactError, RepairCopies};
-use crate::plugins::install::InstallError;
-use crate::plugins::reconcile::ReconcileInstalls;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::plugins::artifacts::{ArtifactError, RepairCopies};
+use aruna_operations::plugins::install::InstallError;
+use aruna_operations::plugins::reconcile::ReconcileInstalls;
 
 /// How often a node checks its copies and repairs the installs.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(600);

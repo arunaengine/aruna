@@ -18,17 +18,17 @@ use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
-use crate::driver::{drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::placement::policy::GateOperation;
-use crate::plugins::transfer_steps::{
+use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_operations::jobs::executor::{JobContext, JobRunOutcome};
+use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,
 };
-use crate::plugins::work::{WorkChange, WorkRow, begin_send, update_work};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::plugins::work::{WorkChange, WorkRow, begin_send, update_work};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 
 /// What a download writes: its target, the version minted once, expected digests and a bound.
 pub struct Download<'a> {

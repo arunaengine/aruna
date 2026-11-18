@@ -32,7 +32,6 @@ pub mod notifications;
 pub mod onboarding;
 mod owner_index;
 pub mod placement;
-pub mod plugin_host;
 pub mod plugins;
 pub mod realm;
 pub mod realm_vault;

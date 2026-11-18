@@ -1,5 +1,5 @@
 //! Runs plugins on this node: the worker loops, the host calls of a running guest, plugin work
-//! and the repair loop. These shells do the I/O; the decisions live in `crate::plugins`.
+//! and the repair loop. These shells do the I/O; the decisions live in `aruna_operations::plugins`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,18 +7,29 @@ use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::plugins::artifacts::{ArtifactError, FetchArtifact, ServingNode};
-use crate::plugins::copies::Assembled;
-use crate::plugins::copy_rows::StoreCopy;
-use crate::plugins::install::InstallError;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::plugins::artifacts::{ArtifactError, FetchArtifact, ServingNode};
+use aruna_operations::plugins::copies::Assembled;
+use aruna_operations::plugins::copy_rows::StoreCopy;
+use aruna_operations::plugins::install::InstallError;
 
 pub mod broker;
 pub mod plugin_work;
 pub mod repair;
 mod transfers;
 pub mod worker;
+
+#[cfg(test)]
+mod cleanup_tests;
+#[cfg(test)]
+mod decide_tests;
+#[cfg(test)]
+mod delivery_tests;
+#[cfg(test)]
+mod events_tests;
+#[cfg(test)]
+mod submit_tests;
 
 #[cfg(test)]
 #[path = "outbound_tests.rs"]

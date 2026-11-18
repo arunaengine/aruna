@@ -18,21 +18,21 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
-use crate::jobs::key_wake::version_wait;
-use crate::plugins::check::CopyGrants;
-use crate::plugins::objects::{LocalObject, Unmarked};
-use crate::plugins::transfer_steps::account;
-use crate::plugins::work::holds_job;
-use crate::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
+use aruna_operations::jobs::key_wake::version_wait;
+use aruna_operations::plugins::check::CopyGrants;
+use aruna_operations::plugins::objects::{LocalObject, Unmarked};
+use aruna_operations::plugins::transfer_steps::account;
+use aruna_operations::plugins::work::holds_job;
+use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
-use crate::s3::object::copy::{
+use aruna_operations::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
 };
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::get::GetObjectError;
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 
 /// How often the bytes moved so far reach the job's progress.
 pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);
@@ -207,7 +207,7 @@ async fn copy_work(
             })
         }
         Err(error) if source_locked(&error) => key_wait(ctx, install, read).await,
-        Err(error) => JobRunOutcome::Failed(crate::jobs::copy::copy_error(error)),
+        Err(error) => JobRunOutcome::Failed(aruna_operations::jobs::copy::copy_error(error)),
     }
 }
 
