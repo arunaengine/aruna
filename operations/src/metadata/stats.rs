@@ -5,12 +5,14 @@
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
+use aruna_core::types::Key;
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
 
@@ -56,88 +58,55 @@ pub async fn count_realm_documents(
     ))
 }
 
-/// Number of stored groups belonging to one realm. Bounded pages under one
-/// read transaction yield a consistent snapshot, not the default page
-/// `ListGroupOperation` exposes.
-pub async fn count_realm_groups(
-    context: &DriverContext,
+/// Number of stored groups belonging to one realm. Bounded pages under one read snapshot yield a
+/// consistent count, not the default page `ListGroupOperation` exposes.
+#[derive(Debug, PartialEq)]
+pub struct GroupCountOperation {
     realm_id: RealmId,
-) -> Result<u64, MetadataApiError> {
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(MetadataApiError::Internal(error.to_string()));
-        }
-        other => return Err(MetadataApiError::Internal(other.label().to_string())),
-    };
+    pages: PrefixPages,
+    count: u64,
+}
 
-    let mut count = 0_u64;
-    let mut start_after = None;
-    let scan = 'scan: loop {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: GROUP_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.map(IterStart::After),
-                limit: COUNT_PAGE_SIZE,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                for (_, value) in values {
-                    let group = match Group::from_bytes(value.as_ref()) {
-                        Ok(group) => group,
-                        Err(error) => {
-                            break 'scan Err(MetadataApiError::Internal(error.to_string()));
-                        }
-                    };
-                    if group.realm_id == realm_id {
-                        count = match count.checked_add(1) {
-                            Some(count) => count,
-                            None => {
-                                break 'scan Err(MetadataApiError::Internal(
-                                    "realm group count overflow".to_string(),
-                                ));
-                            }
-                        };
-                    }
-                }
-                match next_start_after {
-                    Some(next) => start_after = Some(next),
-                    None => break Ok(count),
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                break Err(MetadataApiError::Internal(error.to_string()));
-            }
-            other => break Err(MetadataApiError::Internal(other.label().to_string())),
+impl GroupCountOperation {
+    pub fn new(realm_id: RealmId) -> Self {
+        Self {
+            realm_id,
+            pages: PrefixPages::new(GROUP_KEYSPACE, Key::from(Vec::new()), COUNT_PAGE_SIZE),
+            count: 0,
         }
-    };
+    }
+}
 
-    let completion = if scan.is_ok() {
-        StorageEffect::CommitTransaction { txn_id }
-    } else {
-        StorageEffect::AbortTransaction { txn_id }
-    };
-    let completion_event = context.storage_handle.send_storage_effect(completion).await;
-    match scan {
-        Err(error) => Err(error),
-        Ok(count) => match completion_event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(count),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(MetadataApiError::Internal(error.to_string()))
+impl Operation for GroupCountOperation {
+    type Output = u64;
+    type Error = MetadataApiError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
+    fn first(&mut self) -> Result<Next<u64>, MetadataApiError> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, MetadataApiError> {
+        let rows = self
+            .pages
+            .take(result)
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        for (_, value) in rows {
+            let group = Group::from_bytes(value.as_ref())
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            if group.realm_id == self.realm_id {
+                self.count = self.count.checked_add(1).ok_or_else(|| {
+                    MetadataApiError::Internal("realm group count overflow".to_string())
+                })?;
             }
-            other => Err(MetadataApiError::Internal(other.label().to_string())),
-        },
+        }
+        match self.pages.done() {
+            true => Ok(Next::Done(self.count)),
+            false => Ok(Next::Call(self.pages.call())),
+        }
     }
 }
 
@@ -528,7 +497,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_groups(&fixture.context, fixture.realm_id)
+            crate::driver::drive(GroupCountOperation::new(fixture.realm_id), &fixture.context)
                 .await
                 .expect("group count succeeds"),
             1
@@ -611,5 +580,31 @@ mod tests {
                 .expect("unconfigured purpose count succeeds"),
             None
         );
+    }
+
+    #[test]
+    fn counts_realm_groups() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut count = GroupCountOperation::new(realm_id);
+        assert_eq!(count.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(
+            count.first(),
+            Ok(Next::Call(aruna_core::calls::IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(count.next(page), Ok(Next::Done(0)));
+        let mut broken = GroupCountOperation::new(realm_id);
+        broken.first().unwrap();
+        let rows = vec![(
+            Key::from(vec![1]),
+            aruna_core::types::Value::from(vec![0xff]),
+        )];
+        assert!(matches!(
+            broken.next(IoResult::Page { rows, next: None }),
+            Err(MetadataApiError::Internal(_))
+        ));
     }
 }
