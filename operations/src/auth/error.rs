@@ -6,6 +6,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::calls::IoError;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
@@ -13,7 +14,7 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use jsonwebtoken::dangerous::insecure_decode;
 use thiserror::Error;
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum PolicyEnforcementError {
     #[error("request denied by policy `{name}`: {reason}")]
     Denied { name: String, reason: String },
@@ -22,7 +23,7 @@ pub enum PolicyEnforcementError {
     Unavailable(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AuthorizeError {
     #[error("permission denied")]
     PermissionDenied,
@@ -34,6 +35,16 @@ pub enum AuthorizeError {
     Storage(StorageError),
     #[error("authorization check failed: {0}")]
     CheckFailed(String),
+}
+
+impl From<IoError> for AuthorizeError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::CheckFailed(other.to_string()),
+        }
+    }
 }
 
 /// A missing or malformed target is an authorization failure, not an internal error, matching
@@ -77,6 +88,13 @@ pub enum ArunaBearerError {
     JwtError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+/// Two errors match when they say the same; several sources have no equality of their own.
+impl PartialEq for ArunaBearerError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
 }
 
 /// The non-secret identity of a token the request already validated, for work that runs as its

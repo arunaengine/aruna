@@ -197,6 +197,42 @@ impl Operation for PolicyLoadOperation {
     }
 }
 
+/// Evaluates realm then group policies for one request. Missing state and read, compile, or
+/// evaluation failures deny. Either scope may deny; neither may grant.
+#[derive(Debug, PartialEq)]
+pub struct EnforcePolicyOperation {
+    realm_id: RealmId,
+    group_id: Option<GroupId>,
+    request: PolicyRequest,
+}
+
+impl EnforcePolicyOperation {
+    pub fn new(realm_id: RealmId, request: PolicyRequest) -> Self {
+        let group_id = group_from_path(&request.path);
+        Self {
+            realm_id,
+            group_id,
+            request,
+        }
+    }
+}
+
+impl Operation for EnforcePolicyOperation {
+    type Output = ();
+    type Error = PolicyEnforcementError;
+
+    fn first(&mut self) -> Result<Next<()>, PolicyEnforcementError> {
+        let reads = policy_reads(self.realm_id, self.group_id);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PolicyEnforcementError> {
+        let values = all_values(result)?;
+        let evaluator = read_policies(self.realm_id, self.group_id, values)?;
+        evaluator.evaluate(&self.request).map(Next::Done)
+    }
+}
+
 /// One evaluator per distinct realm and group scope.
 pub type PolicyEvaluators = HashMap<(RealmId, GroupId), PolicyEvaluator>;
 
@@ -204,32 +240,35 @@ pub type PolicyEvaluators = HashMap<(RealmId, GroupId), PolicyEvaluator>;
 /// Any missing or unreadable scope fails the whole load closed.
 #[derive(Debug, PartialEq)]
 pub struct PolicyBulkOperation {
-    plan: BulkPlan,
+    plan: Result<BulkPlan, PolicyEnforcementError>,
 }
 
 impl PolicyBulkOperation {
-    pub fn new(
-        groups: impl IntoIterator<Item = (RealmId, GroupId)>,
-    ) -> Result<Self, PolicyEnforcementError> {
-        Ok(Self {
-            plan: bulk_plan(groups)?,
-        })
+    pub fn new(groups: impl IntoIterator<Item = (RealmId, GroupId)>) -> Self {
+        Self {
+            plan: bulk_plan(groups),
+        }
+    }
+
+    fn plan(&self) -> Result<&BulkPlan, PolicyEnforcementError> {
+        self.plan.as_ref().map_err(Clone::clone)
     }
 
     fn evaluators(
         &self,
         values: Vec<Option<Value>>,
     ) -> Result<PolicyEvaluators, PolicyEnforcementError> {
+        let plan = self.plan()?;
         let mut values = values.into_iter();
-        let mut realms = HashMap::with_capacity(self.plan.realms.len());
-        for realm_id in &self.plan.realms {
+        let mut realms = HashMap::with_capacity(plan.realms.len());
+        for realm_id in &plan.realms {
             let config = values.next().flatten().ok_or_else(realm_unavailable)?;
             let config = RealmConfigDocument::from_bytes(&config)
                 .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
             realms.insert(*realm_id, compile_scope(&config.request_policies, "realm")?);
         }
-        let mut evaluators = HashMap::with_capacity(self.plan.scopes.len());
-        for (realm_id, group_id) in &self.plan.scopes {
+        let mut evaluators = HashMap::with_capacity(plan.scopes.len());
+        for (realm_id, group_id) in &plan.scopes {
             let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
             else {
                 return Err(group_unavailable());
@@ -254,8 +293,9 @@ impl Operation for PolicyBulkOperation {
     }
 
     fn first(&mut self) -> Result<Next<PolicyEvaluators>, PolicyEnforcementError> {
-        let realms = (self.plan.realms.iter()).flat_map(|realm_id| policy_reads(*realm_id, None));
-        let groups = (self.plan.scopes.iter()).flat_map(|(_, group_id)| group_reads(*group_id));
+        let plan = self.plan()?;
+        let realms = (plan.realms.iter()).flat_map(|realm_id| policy_reads(*realm_id, None));
+        let groups = (plan.scopes.iter()).flat_map(|(_, group_id)| group_reads(*group_id));
         Ok(Next::Call(IoCall::Read(realms.chain(groups).collect())))
     }
 
@@ -506,6 +546,26 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_reads_scope() {
+        // A request outside any group needs the realm row alone, and a match denies it.
+        let realm_id = RealmId([3u8; 32]);
+        let actor = actor(realm_id);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.request_policies = vec![policy("true")];
+        let request = PolicyRequest::basic("/r".to_string(), "read".to_string(), String::new());
+        let mut operation = EnforcePolicyOperation::new(realm_id, request);
+        let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+            panic!("expected the policy read");
+        };
+        assert_eq!(reads.len(), 1);
+        let row = Some(config.to_bytes(&actor).unwrap().into());
+        assert!(matches!(
+            operation.next(IoResult::Values(vec![row])),
+            Err(PolicyEnforcementError::Denied { .. })
+        ));
+    }
+
+    #[test]
     fn loads_one_read() {
         // The realm row alone, or with the group and its authorization row; no realm denies.
         let realm_id = RealmId([3u8; 32]);
@@ -559,7 +619,7 @@ mod tests {
         let realm_id = RealmId([3u8; 32]);
         let (first, second) = (Ulid::from_bytes([4u8; 16]), Ulid::from_bytes([5u8; 16]));
         let mut operation =
-            PolicyBulkOperation::new([(realm_id, first), (realm_id, second)]).unwrap();
+            PolicyBulkOperation::new([(realm_id, first), (realm_id, second)]);
         assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
         let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
             panic!("expected one read");
@@ -592,14 +652,14 @@ mod tests {
             ),
         ];
         for (values, expected) in cases {
-            let mut operation = PolicyBulkOperation::new([(realm_id, group_id)]).unwrap();
+            let mut operation = PolicyBulkOperation::new([(realm_id, group_id)]);
             assert_eq!(operation.next(IoResult::Values(values)), Err(expected));
         }
     }
 
     #[test]
     fn bulk_empty_ends() {
-        let mut operation = PolicyBulkOperation::new([]).unwrap();
+        let mut operation = PolicyBulkOperation::new([]);
         assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(Vec::new()))));
         assert_eq!(
             operation.next(IoResult::Values(Vec::new())),
