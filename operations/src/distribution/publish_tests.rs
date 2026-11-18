@@ -10,7 +10,6 @@ use aruna_core::structs::storage::distribution::snapshot::install;
 use aruna_core::structs::storage::distribution::{
     DistributionConfig, DistributionSettings, SetRoot, Statement, StatementKind,
 };
-use aruna_core::types::Key;
 
 const PUBLISHER: u8 = 1;
 
@@ -91,8 +90,8 @@ fn removed_publisher_refuses() {
     document.ensure_node(secret(2).public(), RealmNodeKind::Server);
     let config: Value = document.to_bytes(&actor).unwrap().into();
     let mut operation = operation(PUBLISHER, create());
-    begin(&mut operation, [None, None, Some(config), None]);
-    assert_eq!(operation.finalize(), Err(PublishError::NotPublisher));
+    let refused = begin(&mut operation, [None, None, Some(config), None]);
+    assert_eq!(refused, Err(PublishError::NotPublisher));
 }
 
 fn view_value(snapshot: DistributionSnapshot) -> Value {
@@ -105,38 +104,29 @@ fn view_value(snapshot: DistributionSnapshot) -> Value {
     view.to_bytes().unwrap().into()
 }
 
-fn read(values: [Option<Value>; 4]) -> Event {
-    Event::Storage(StorageEvent::BatchReadResult {
-        values: values
-            .into_iter()
-            .map(|value| (Key::from(Vec::new()), value))
-            .collect(),
-    })
+/// Answers the first read of the operation with `values`.
+fn begin(operation: &mut PublishOperation, values: [Option<Value>; 4]) -> PublishNext {
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    operation.first().unwrap();
+    operation.next(IoResult::Values(values.into()))
 }
 
-/// Drives an operation through its transaction start and state read.
-fn begin(operation: &mut PublishOperation, values: [Option<Value>; 4]) -> Effects {
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([5; 16]),
-    }));
-    operation.step(read(values))
-}
-
-fn signed_reply(effects: &Effects) -> Event {
-    let [Effect::Net(NetEffect::SnapshotSign(claim))] = effects.as_slice() else {
-        panic!("expected a signing request, got {effects:?}");
+fn signed_reply(next: PublishNext) -> IoResult {
+    let Ok(Next::Call(IoCall::Effect(effect))) = next else {
+        panic!("expected a signing request, got {next:?}");
+    };
+    let Effect::Net(NetEffect::SnapshotSign(claim)) = *effect else {
+        panic!("expected a signing request, got {effect:?}");
     };
     let signed =
         SignedSnapshot::sign(claim.snapshot.clone(), claim.realm_id, &secret(PUBLISHER)).unwrap();
-    Event::Net(NetEvent::SnapshotSign(SnapshotSignEvent::Signed(Box::new(
-        signed,
-    ))))
+    let signed = SnapshotSignEvent::Signed(Box::new(signed));
+    IoResult::Event(Box::new(Event::Net(NetEvent::SnapshotSign(signed))))
 }
 
 /// The rows of the admin check: the realm and the owner group's authorization documents. The
 /// caller administers the group only when `allowed`.
-fn authorized(allowed: bool) -> Event {
+fn authorized(allowed: bool) -> IoResult {
     use aruna_core::structs::identity::auth::Role;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
@@ -162,32 +152,22 @@ fn authorized(allowed: bool) -> Event {
         policies: Vec::new(),
     };
     let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm());
-    let row = |bytes: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(bytes)));
-    Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            row(realm_doc.to_bytes(&actor).unwrap()),
-            row(group.to_bytes(&actor).unwrap()),
-        ],
-    })
+    let row = |bytes: Vec<u8>| Some(Value::from(bytes));
+    IoResult::Values(vec![
+        row(realm_doc.to_bytes(&actor).unwrap()),
+        row(group.to_bytes(&actor).unwrap()),
+    ])
 }
 
 #[test]
 fn head_outbox_atomic() {
     let mut operation = operation(PUBLISHER, create());
-    let effects = begin(&mut operation, [None, None, Some(config_value()), None]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead {
-            txn_id: Some(_),
-            ..
-        })]
-    ));
-    let effects = operation.step(authorized(true));
-    let effects = operation.step(signed_reply(&effects));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
-        panic!("expected one transactional batch, got {effects:?}");
+    let check = begin(&mut operation, [None, None, Some(config_value()), None]);
+    assert!(matches!(check, Ok(Next::Call(IoCall::Read(_)))));
+    let sign = operation.next(authorized(true));
+    let Ok(Next::Call(IoCall::Write(writes))) = operation.next(signed_reply(sign)) else {
+        panic!("expected one transactional batch");
     };
-    assert_eq!(*txn_id, Some(Ulid::from_bytes([5; 16])));
     let spaces: Vec<&str> = writes.iter().map(|(space, ..)| space.as_str()).collect();
     assert_eq!(
         spaces,
@@ -204,34 +184,24 @@ fn head_outbox_atomic() {
     let share = aruna_core::structs::storage::usage::dirty_share_key(root().owner_group);
     assert_eq!(writes.last().unwrap().1.as_ref(), share);
     // Nothing is published before the commit; the drain follows it.
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([5; 16]),
-    }));
-    assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: aruna_core::TaskKey::DrainSyncOutbox,
-        after: std::time::Duration::ZERO,
-    }));
-    assert_eq!(operation.finalize().unwrap().number, 1);
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the revision and the drain wake");
+    };
+    assert_eq!(output.number, 1);
+    let [IoCall::Effect(wake)] = calls.as_slice() else {
+        panic!("expected one wake, got {calls:?}");
+    };
+    assert!(matches!(**wake, Effect::Task(_)));
 }
 
 #[test]
 fn admin_needs_write() {
     let mut operation = operation(PUBLISHER, create());
-    begin(&mut operation, [None, None, Some(config_value()), None]);
-    let effects = operation.step(authorized(false));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(PublishError::Unauthorized));
+    begin(&mut operation, [None, None, Some(config_value()), None]).unwrap();
+    assert_eq!(
+        operation.next(authorized(false)),
+        Err(PublishError::Unauthorized)
+    );
 }
 
 #[test]
@@ -250,15 +220,8 @@ fn accepted_request_replays() {
     };
     let mut replay = operation(PUBLISHER, create());
     let row = accepted(&create(), Some(auth().user_id));
-    let effects = begin(&mut replay, [None, Some(row), None, None]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    replay.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::from_bytes([5; 16]),
-    }));
-    assert_eq!(replay.finalize(), Ok(revision));
+    let replayed = begin(&mut replay, [None, Some(row), None, None]);
+    assert_eq!(replayed, Ok(Next::Done(revision)));
 
     // The same id for another request or another requester is refused.
     let other = DistributionRequest::Activate;
@@ -267,16 +230,31 @@ fn accepted_request_replays() {
         accepted(&create(), None),
     ] {
         let mut reused = operation(PUBLISHER, create());
-        begin(&mut reused, [None, Some(row), None, None]);
-        assert_eq!(reused.finalize(), Err(PublishError::RequestReused));
+        let refused = begin(&mut reused, [None, Some(row), None, None]);
+        assert_eq!(refused, Err(PublishError::RequestReused));
     }
+}
+
+// An unavailable signer stops the publication before anything is written.
+#[test]
+fn unavailable_signer_stops() {
+    let mut operation = operation(PUBLISHER, create());
+    begin(&mut operation, [None, None, Some(config_value()), None]).unwrap();
+    operation.next(authorized(true)).unwrap();
+    let reason = "offline".to_string();
+    let answer = SnapshotSignEvent::Unavailable(reason.clone());
+    let answer = IoResult::Event(Box::new(Event::Net(NetEvent::SnapshotSign(answer))));
+    assert_eq!(
+        operation.next(answer),
+        Err(PublishError::SignUnavailable(reason))
+    );
 }
 
 #[test]
 fn only_publisher_publishes() {
     let mut operation = operation(2, create());
-    begin(&mut operation, [None, None, Some(config_value()), None]);
-    assert_eq!(operation.finalize(), Err(PublishError::NotPublisher));
+    let refused = begin(&mut operation, [None, None, Some(config_value()), None]);
+    assert_eq!(refused, Err(PublishError::NotPublisher));
 }
 
 #[test]
@@ -308,11 +286,11 @@ fn stale_automatic_dropped() {
     .sign(&secret(1));
     let request = DistributionRequest::Statement(Box::new(split));
     let mut operation = operation(PUBLISHER, request);
-    begin(
+    let dropped = begin(
         &mut operation,
         [Some(view_value(head)), None, Some(config_value()), None],
     );
-    assert_eq!(operation.finalize(), Err(PublishError::Dropped));
+    assert_eq!(dropped, Err(PublishError::Dropped));
 }
 
 #[test]
@@ -327,11 +305,11 @@ fn conflicted_set_stops() {
     };
     let mut operation = operation(PUBLISHER, DistributionRequest::Activate);
     let value: Value = view.to_bytes().unwrap().into();
-    begin(
+    let stopped = begin(
         &mut operation,
         [Some(value), None, Some(config_value()), None],
     );
-    assert_eq!(operation.finalize(), Err(PublishError::Conflicted));
+    assert_eq!(stopped, Err(PublishError::Conflicted));
 }
 
 /// The create revision with both members admitted and the set activated.
@@ -357,27 +335,18 @@ fn repeated_activation_answers() {
         Some(config_value()),
         None,
     ];
-    let effects = begin(&mut operation, values);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead {
-            txn_id: Some(_),
-            ..
-        })]
-    ));
-    let effects = operation.step(authorized(true));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::from_bytes([5; 16]),
-    }));
-    assert_eq!(operation.finalize(), Ok(head.revision()));
+    let check = begin(&mut operation, values);
+    assert!(matches!(check, Ok(Next::Call(IoCall::Read(_)))));
+    assert_eq!(
+        operation.next(authorized(true)),
+        Ok(Next::Done(head.revision()))
+    );
     // Without group admin WRITE the caller learns nothing.
     let mut denied = self::operation(PUBLISHER, DistributionRequest::Activate);
     let values = [Some(view_value(head)), None, Some(config_value()), None];
-    begin(&mut denied, values);
-    denied.step(authorized(false));
-    assert_eq!(denied.finalize(), Err(PublishError::Unauthorized));
+    begin(&mut denied, values).unwrap();
+    assert_eq!(
+        denied.next(authorized(false)),
+        Err(PublishError::Unauthorized)
+    );
 }
