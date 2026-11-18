@@ -12,71 +12,28 @@ use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::export_types::RoCrateExportView;
-use crate::metadata::api::read::ensure_record_readable;
-use crate::metadata::api::read::load_live_record;
-use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
-use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::metadata::ProfileValidationStatus;
-use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, DescriptionError};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use futures_util::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio::time::timeout;
 use ulid::Ulid;
 
-use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
 use super::profile_export::ProfileLocalOperation;
 use super::routed_export::{ExportWithinOperation, RoutedExportOperation, ensure_export_limit};
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::is_sync_eligible;
-use futures_util::StreamExt;
 
 pub(super) const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
-
-pub(super) async fn read_holders<T, F>(
-    holders: Vec<NodeId>,
-    request: F,
-) -> (Vec<(NodeId, Result<T, MetadataReadError>)>, bool)
-where
-    T: Send + 'static,
-    F: Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync,
-{
-    let requests = futures_util::stream::iter(holders.into_iter().map(|holder| {
-        let request = request(holder);
-        async move {
-            let result = timeout(READ_PEER_TIMEOUT, request)
-                .await
-                .unwrap_or(Err(MetadataReadError::Unavailable));
-            (holder, result)
-        }
-    }))
-    .buffer_unordered(READ_FANOUT_LIMIT);
-    futures_util::pin_mut!(requests);
-
-    let deadline = Instant::now() + METADATA_READ_DEADLINE;
-    let mut results = Vec::new();
-    loop {
-        match tokio::time::timeout_at(deadline, requests.next()).await {
-            Ok(Some(result)) => results.push(result),
-            Ok(None) => return (results, false),
-            Err(_) => return (results, true),
-        }
-    }
-}
 
 /// The replica this device keeps of one document, when it can answer on its
 /// own. A node that holds buckets is never a device and always reads its own
@@ -95,164 +52,6 @@ pub(super) async fn device_replica(
         .ok()
         .flatten()
         .filter(ReplicaRecord::serves_reads)
-}
-
-/// Reads or recomputes Profile status on the document's holders. The holder
-/// performs the same per-document READ check as the ordinary metadata route.
-pub async fn route_profile_status(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    request: GetVisibleRequest,
-    auth_token: Option<AuthToken>,
-    revalidate: bool,
-) -> Result<ProfileValidationStatus, MetadataApiError> {
-    let registry = load_live_record(context.as_ref(), request.document_id).await?;
-    if context.net_handle.is_none() {
-        ensure_record_readable(
-            context.as_ref(),
-            realm_id,
-            request.auth.as_ref(),
-            &registry,
-            None,
-        )
-        .await?;
-        return if revalidate {
-            drive(
-                RevalidateOperation::new(
-                    context
-                        .as_ref()
-                        .net_handle
-                        .as_ref()
-                        .map(|net| net.node_id()),
-                    registry.clone(),
-                ),
-                context.as_ref(),
-            )
-            .await
-        } else {
-            drive(
-                ValidationStatusOperation::new(registry.clone()),
-                context.as_ref(),
-            )
-            .await
-        }
-        .map_err(|_| MetadataApiError::ServiceUnavailable);
-    }
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders =
-        read_holder_sets(&config, &placement).map_err(MetadataApiError::PlacementUnavailable)?;
-    let holder_count = holders.len();
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let context = Arc::clone(context);
-    let metadata = context.metadata_handle.clone();
-    let request_template = request.clone();
-    let (responses, timed_out) = read_holders(holders, move |holder| {
-        let context = context.clone();
-        let metadata = metadata.clone();
-        let request = request_template.clone();
-        let auth_token = auth_token.clone();
-        Box::pin(async move {
-            if Some(holder) == local_node {
-                let record = load_live_record(context.as_ref(), request.document_id)
-                    .await
-                    .map_err(read_error)?;
-                ensure_record_readable(
-                    context.as_ref(),
-                    realm_id,
-                    request.auth.as_ref(),
-                    &record,
-                    None,
-                )
-                .await
-                .map_err(read_error)?;
-                if revalidate {
-                    drive(
-                        RevalidateOperation::new(
-                            context
-                                .as_ref()
-                                .net_handle
-                                .as_ref()
-                                .map(|net| net.node_id()),
-                            record.clone(),
-                        ),
-                        context.as_ref(),
-                    )
-                    .await
-                } else {
-                    drive(
-                        ValidationStatusOperation::new(record.clone()),
-                        context.as_ref(),
-                    )
-                    .await
-                }
-                .map_err(|_| MetadataReadError::Unavailable)
-            } else {
-                let Some(metadata) = metadata else {
-                    return Err(MetadataReadError::Unavailable);
-                };
-                match metadata
-                    .request_forwarded_write(
-                        holder,
-                        MetadataTransportMessage::ForwardValidationStatus {
-                            auth_token,
-                            config_digest,
-                            document_id: request.document_id,
-                            revalidate,
-                        },
-                    )
-                    .await
-                {
-                    Ok(MetadataTransportMessage::ForwardedValidationStatus { result }) => {
-                        result.map(|status| *status)
-                    }
-                    _ => Err(MetadataReadError::Unavailable),
-                }
-            }
-        })
-    })
-    .await;
-    let mut not_found = 0usize;
-    let mut success = None;
-    let mut auth_error = None;
-    let mut unavailable = timed_out;
-    for (_, response) in responses {
-        match response {
-            Ok(status) => {
-                keep_status(&mut success, status, registry.last_event_id);
-            }
-            Err(MetadataReadError::Unauthorized) => {
-                auth_error.get_or_insert(MetadataApiError::Unauthorized);
-            }
-            Err(MetadataReadError::Forbidden) => {
-                auth_error.get_or_insert(MetadataApiError::Forbidden);
-            }
-            Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => unavailable = true,
-        }
-    }
-    if let Some(error) = auth_error {
-        return Err(error);
-    }
-    if success.is_some() && not_found > 0 {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if let Some(status) = success {
-        return Ok(status);
-    }
-    if !unavailable && holder_count > 0 && not_found == holder_count {
-        Err(MetadataApiError::NotFound)
-    } else {
-        Err(MetadataApiError::ServiceUnavailable)
-    }
 }
 
 pub(super) fn keep_status(
