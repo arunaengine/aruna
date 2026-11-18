@@ -111,6 +111,7 @@ pub mod preflight;
 pub mod preflight_types;
 pub mod read;
 pub mod read_types;
+pub(crate) mod readable;
 pub mod search;
 pub mod search_types;
 
@@ -140,7 +141,7 @@ const QUERY_MAX_NODES: usize = 32;
 
 const DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MetadataApiError {
     #[error("bad request")]
     BadRequest,
@@ -169,6 +170,13 @@ pub enum MetadataApiError {
     /// Even the smallest page of the answer is larger than the asked byte bound.
     #[error("the answer is larger than the byte bound")]
     TooLarge,
+}
+
+/// A runner failure leaves the request unanswered, so the caller may retry.
+impl From<aruna_core::calls::IoError> for MetadataApiError {
+    fn from(_: aruna_core::calls::IoError) -> Self {
+        Self::ServiceUnavailable
+    }
 }
 
 fn map_event_error(error: MetadataError) -> MetadataApiError {
