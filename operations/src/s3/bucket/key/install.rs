@@ -364,7 +364,7 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::driver::drive;
-    use crate::jobs::key_wake::wake_unlocked;
+    use crate::jobs::key_wake::WakeUnlockedOperation;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
@@ -403,9 +403,8 @@ mod tests {
         let status = drive(operation, context).await?;
         let now_ms = aruna_core::time::unix_timestamp_millis();
         let limits = RoCrateLimits::default();
-        wake_unlocked(context, status.key, now_ms, origin, &limits)
-            .await
-            .unwrap();
+        let wake = WakeUnlockedOperation::new(status.key, now_ms, origin, &limits);
+        drive(wake, context).await.unwrap();
         Ok(status)
     }
 
