@@ -727,7 +727,7 @@ mod tests {
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let key = target.storage_key().to_vec();
         let keyspace = target.storage_keyspace().to_string();
-        let row = crate::jobs::key_wake::read_row(context, &keyspace, key.clone());
+        let row = crate::tests::records::read_row(context, &keyspace, key.clone());
         let mut config = RealmConfigDocument::from_bytes(&row.await.unwrap().unwrap()).unwrap();
         config
             .revoked_tokens
@@ -827,7 +827,7 @@ mod tests {
             .map(|(user, _)| user)
             .map_err(link_error);
         assert_eq!(linked, Err(LinkLoginError::CutOff));
-        let row = crate::jobs::key_wake::read_row(&context, USER_KEYSPACE, local(2).to_bytes());
+        let row = crate::tests::records::read_row(&context, USER_KEYSPACE, local(2).to_bytes());
         let user = User::from_bytes(&row.await.unwrap().unwrap()).unwrap();
         assert!(!user.alias_user_ids.contains(&foreign()));
     }
@@ -857,7 +857,7 @@ mod tests {
         let user = drive(unlink(local(2)), &context).await.unwrap();
         assert!(!user.alias_user_ids.contains(&foreign()));
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
-        let row = crate::jobs::key_wake::read_row(
+        let row = crate::tests::records::read_row(
             &context,
             target.storage_keyspace(),
             target.storage_key().to_vec(),

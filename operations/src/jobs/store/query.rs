@@ -39,27 +39,6 @@ pub async fn list_job_entries(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn job_entry_deletes(
-    context: &DriverContext,
-    job_id: JobId,
-    limit: usize,
-) -> Result<(JobDeletes, bool), String> {
-    drive(row_calls::job_entry_deletes(job_id, limit), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// One bounded page of a staging job's queue, manifest and lane rows; `true` while more remain.
-pub(crate) async fn staging_row_deletes(
-    context: &DriverContext,
-    job_id: JobId,
-    limit: usize,
-) -> Result<(JobDeletes, bool), String> {
-    drive(row_calls::staging_row_deletes(job_id, limit), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 pub async fn find_dedup_job(
     context: &DriverContext,
     created_by: UserId,

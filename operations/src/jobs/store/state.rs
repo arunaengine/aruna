@@ -8,7 +8,6 @@ pub use super::job_calls::{
     ClaimOutcome, ExecutionCompleteOutcome, ReleaseOutcome, RenewOutcome, RequeueOutcome,
 };
 use super::row_calls;
-pub(crate) use super::row_calls::artifact_tombstone_key;
 use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.
@@ -18,30 +17,6 @@ pub async fn read_job_record(
     _txn_id: Option<TxnId>,
 ) -> Result<Option<JobRecord>, String> {
     drive(row_calls::read_job_record(job_id), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn preserve_artifact_tombstone(
-    context: &DriverContext,
-    job_id: JobId,
-    owner: UserId,
-    expires_at_ms: u64,
-) -> Result<(), String> {
-    drive(
-        row_calls::preserve_artifact_tombstone(job_id, owner, expires_at_ms),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn read_artifact_tombstone(
-    context: &DriverContext,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<Option<UserId>, String> {
-    drive(row_calls::read_artifact_tombstone(job_id, now_ms), context)
         .await
         .map_err(|error| error.to_string())
 }

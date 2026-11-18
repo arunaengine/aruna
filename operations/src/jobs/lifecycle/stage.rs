@@ -249,7 +249,11 @@ mod tests {
     use aruna_core::structs::execution::job::{JobId, JobPayload};
     use futures_util::stream;
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
         IoResult::Child(ChildOutcome::new(result))
     }
 
@@ -262,7 +266,7 @@ mod tests {
             },
             source_node_id: Some(node(5)),
             dest_key: "input".to_string(),
-            mode: Default::default(),
+            mode: aruna_core::structs::execution::job::InputMode::Snapshot,
             container_path: None,
             name: None,
             description: None,

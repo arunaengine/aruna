@@ -16,8 +16,6 @@ use crate::jobs::key_locks::{KeyCheckError, ParkLockedOperation, VersionWaitOper
 use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::key_wait::wake_key_waits;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::execution::job::{JobError, JobRecord, KeyWait};
 use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::time::unix_timestamp_millis;
@@ -64,25 +62,6 @@ pub async fn wake_unlocked(
     copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;
     envelopes.map_err(|error| KeyWakeError::Envelopes(error.to_string()))?;
     Ok((woken?, promoted?))
-}
-
-pub(crate) async fn read_row(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, String> {
-    let effect = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
-    }
 }
 
 fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
@@ -138,7 +117,7 @@ mod tests {
     };
     use aruna_core::structs::execution::job::CapturedInput;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
-    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion};
+    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex};
     use aruna_core::structs::storage::encryption::BucketEncryption;
     use byteview::ByteView;
 

@@ -35,7 +35,11 @@ fn link(created_by: UserId, run_crate: Option<Ulid>) -> RunLink {
     }
 }
 
-fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
 }
 

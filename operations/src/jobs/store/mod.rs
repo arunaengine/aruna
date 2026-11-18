@@ -29,7 +29,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -241,21 +241,6 @@ pub async fn read_purge_checkpoint(
     job_id: JobId,
 ) -> Result<Option<StoragePurgeCheckpoint>, JobMutationError> {
     drive(row_calls::read_purge_checkpoint(job_id), context).await
-}
-
-/// Writes and deletes a running job's own rows in one transaction, guarded by its claim token.
-pub(crate) async fn put_job_rows(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    writes: Vec<(KeySpace, Key, Value)>,
-    deletes: Vec<(KeySpace, Key)>,
-) -> Result<(), JobMutationError> {
-    drive(
-        job_calls::put_job_rows(job_id, token, writes, deletes),
-        context,
-    )
-    .await
 }
 
 pub async fn put_job_entry<T: Serialize>(
