@@ -540,9 +540,11 @@ pub enum ShardNetEvent {
     Closed(Result<bool, String>),
     Outcome(Result<(), String>),
     Probed(GenesisProbe),
-    /// Whether what the pull brought was applied.
+    /// What a pull brought, for this node and realm to apply.
     Pulled {
-        applied: bool,
+        node_id: NodeId,
+        realm_id: RealmId,
+        sync: Box<DocumentNetEvent>,
     },
     Flag(bool),
     Facts {
