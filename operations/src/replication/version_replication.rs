@@ -3733,29 +3733,27 @@ mod tests {
             .enqueue_version_request(VersionKey::new("bucket", "dir/file.txt", version_id))
             .unwrap();
 
-        let mut effects = scope.run_next_replication();
-        let Effect::SubOperation(mut operation) = effects.pop().expect("version suboperation")
-        else {
+        let Ok(Next::Call(IoCall::Child(mut operation))) = scope.run_next_replication() else {
             panic!("expected version suboperation")
         };
         assert!(scope.reference_advance.is_none());
 
+        // The child runs as the runner runs it, so it answers storage events.
+        let read = |value: Vec<u8>| {
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![(vec![1u8].into(), Some(value.into()))],
+            })
+        };
         operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(reference_blob_version().to_bytes().unwrap().into()),
-        }));
+        let effects = operation.step(read(reference_blob_version().to_bytes().unwrap()));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == BLOB_HEAD_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads[0].0 == BLOB_HEAD_KEYSPACE
         ));
         let newer =
             CurrentVersionPointer::new_with_generation(Ulid::generate(), advance.generation + 1);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: Some(newer.to_bytes().unwrap().into()),
-        }));
+        let effects = operation.step(read(newer.to_bytes().unwrap()));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::OpenConnection { .. })]
@@ -3798,20 +3796,18 @@ mod tests {
         let stored = BlobVersion::reference(compact, reference_cached_metadata(), now, user, now);
         let mut op = ReplicateObjectOperation::new(version_request(Ulid::generate()))
             .with_sync(reference_sync());
-        op.start();
+        op.first().unwrap();
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(stored.to_bytes().unwrap().into()),
-        }));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        let effects = op.next(row(Some(stored.to_bytes().unwrap().into())));
+        let Effect::Storage(StorageEffect::Read { key_space, .. }) = asked(&effects) else {
             panic!("expected the root read, got {effects:?}");
         };
         assert_eq!(key_space, ROOT_RECORD_KEYSPACE);
-        op.step(Event::Storage(StorageEvent::ReadResult {
+        op.next(event_result(Event::Storage(StorageEvent::ReadResult {
             key: vec![2u8].into(),
             value: Some(root.to_bytes().unwrap().into()),
-        }));
+        })))
+        .unwrap();
 
         let Some(ReplicationVersion::Reference { source, .. }) = op.replication_version.as_ref()
         else {
@@ -4098,23 +4094,18 @@ mod tests {
             ReplicateObjectOperation::new(request_with_mode(version_id, ReplicationMode::OnDemand))
                 .with_sync(reference_sync());
 
-        op.start();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(reference_blob_version().to_bytes().unwrap().into()),
-        }));
+        op.first().unwrap();
+        let effects = op.next(row(Some(
+            reference_blob_version().to_bytes().unwrap().into(),
+        )));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == BLOB_HEAD_KEYSPACE
+            &effects,
+            Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_HEAD_KEYSPACE
         ));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: None,
-        }));
+        let effects = op.next(row(None));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::OpenConnection { .. })]
+            asked(&effects),
+            Effect::Blob(BlobEffect::OpenConnection { .. })
         ));
         assert!(matches!(
             op.replication_version,
@@ -4148,15 +4139,12 @@ mod tests {
         let mut op =
             ReplicateObjectOperation::new(request_with_mode(version_id, ReplicationMode::Live))
                 .with_sync(sync);
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(reference_blob_version().to_bytes().unwrap().into()),
-        }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: None,
-        }));
+        op.first().unwrap();
+        op.next(row(Some(
+            reference_blob_version().to_bytes().unwrap().into(),
+        )))
+        .unwrap();
+        op.next(row(None)).unwrap();
         let manifest = op.manifest.expect("manifest built");
         assert_eq!(manifest.distribution, Some(publication));
         let source = manifest.source.expect("reference binding");
@@ -4205,15 +4193,10 @@ mod tests {
             CurrentVersionPointer::new_with_generation(version_id, 4).with_epoch(OriginalEpoch(2));
         let group_id = request.source_group_id;
         let mut op = ReplicateObjectOperation::new(request).with_sync(sync);
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(version.to_bytes().unwrap().into()),
-        }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: Some(head.to_bytes().unwrap().into()),
-        }));
+        op.first().unwrap();
+        op.next(row(Some(version.to_bytes().unwrap().into())))
+            .unwrap();
+        op.next(row(Some(head.to_bytes().unwrap().into()))).unwrap();
         let single = op.manifest.expect("manifest built");
         let job = BlobJobRecord::new(input, Some(false), 0);
         let paged = reference_manifest(&job, version, Some(&head), group_id, &publication);
