@@ -138,7 +138,7 @@ impl Operation for EnsureBucketOperation {
 }
 
 /// This node's own copy of content with `sha256`, if it has stored one.
-pub fn copy(document: &Document, sha256: &str) -> LoadRowOperation<StoredObject> {
+pub(super) fn copy(document: &Document, sha256: &str) -> LoadRowOperation<StoredObject> {
     records::load(LOCAL_OBJECTS, index_key(document, sha256))
 }
 

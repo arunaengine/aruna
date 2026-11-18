@@ -707,6 +707,47 @@ impl JobRecord {
     }
 }
 
+/// Why a change to a stored job was refused or could not be stored.
+#[derive(Debug, PartialEq, Error)]
+pub enum JobMutationError {
+    #[error("job not found")]
+    NotFound,
+    #[error("job claim token mismatch")]
+    TokenMismatch,
+    #[error("attempt intent conflicts with the committed lineage")]
+    IntentConflict,
+    #[error("attempt epoch exhausted")]
+    EpochExhausted,
+    #[error("controller generation exhausted")]
+    GenerationExhausted,
+    #[error("attempt control record is missing")]
+    MissingControl,
+    #[error("job report is frozen")]
+    ReportFrozen,
+    #[error("attempt control epoch mismatch")]
+    EpochMismatch,
+    #[error("execution output record digest conflicts with the stored digest")]
+    OutputRecordConflict,
+    #[error(transparent)]
+    IllegalTransition(#[from] JobTransitionError),
+    #[error("execution outputs are not proven durable: {0}")]
+    OutputsUnproven(#[from] JobRecordError),
+    #[error("{0}")]
+    Storage(String),
+    /// The write transaction lost to a concurrent one; a fresh run may succeed.
+    #[error("job storage transaction conflicted")]
+    Conflict,
+}
+
+impl From<crate::calls::IoError> for JobMutationError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => Self::Conflict,
+            error => Self::Storage(error.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("illegal job transition {from:?} -> {to:?}")]
 pub struct JobTransitionError {
