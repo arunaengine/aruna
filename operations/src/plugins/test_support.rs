@@ -829,8 +829,8 @@ pub async fn ready_copy(
     PluginWorkSpec,
 ) {
     use crate::driver::drive;
-    use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
     use crate::s3::object::put::PutObjectOperation;
+    use crate::testing_objects::{put_config, seed_bucket, with_blob};
     let install = copier(fixture).await;
     let root = tempfile::tempdir().unwrap();
     let blob = with_blob(&fixture.ctx, root.path()).await;
@@ -842,4 +842,25 @@ pub async fn ready_copy(
     drive(PutObjectOperation::new(source), &blob).await.unwrap();
     let spec = recorded(fixture, &install, ("in/a.txt", "out/a.txt")).await;
     (root, blob, install, spec)
+}
+
+/// The keyspaces with a row that holds `canary` in plain bytes.
+pub async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> {
+    use aruna_core::keyspaces::KEYSPACE_CATALOG;
+    let txn = crate::plugins::store::Txn::direct(&fixture.ctx);
+    let held = |bytes: &Vec<u8>| {
+        bytes
+            .windows(canary.len())
+            .any(|part| part == canary.as_bytes())
+    };
+    let mut found = Vec::new();
+    for space in KEYSPACE_CATALOG {
+        let Ok(rows) = txn.scan(space, &[]).await else {
+            continue;
+        };
+        if rows.iter().any(|(key, value)| held(key) || held(value)) {
+            found.push(*space);
+        }
+    }
+    found
 }

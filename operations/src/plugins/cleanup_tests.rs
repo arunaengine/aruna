@@ -10,7 +10,8 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugin_host::worker::tests::worker;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::flow_support::cleanup::count;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::encode;
@@ -18,11 +19,6 @@ use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
 use crate::plugins::test_support::{created, installed};
 use aruna_core::calls::IoCall;
-
-async fn count(fixture: &Fixture, space: &str) -> usize {
-    let txn = Txn::direct(&fixture.ctx);
-    txn.scan(space, &[]).await.unwrap().len()
-}
 
 #[tokio::test]
 async fn expired_gaps() {
@@ -53,41 +49,6 @@ async fn expired_gaps() {
         Ok(2)
     );
     assert_eq!(count(&fixture, PLUGIN_GAPS_KEYSPACE).await, 0);
-}
-
-#[tokio::test]
-async fn removed_install_rows() {
-    let fixture = Fixture::new().await;
-    let install = installed(&fixture).await;
-    let now = unix_timestamp_millis();
-    let mut event = created(&install, "D1").0;
-    (event.journaled_ms, event.anchor_ms) = (now, now);
-    journal(&fixture, &event).await;
-    // Without the account's writes the forwarded event waits on the receiver.
-    let account = reducer_state_key(&install.prerequisites[0].target).to_vec();
-    let txn = Txn::direct(&fixture.ctx);
-    txn.delete(DOCUMENT_STATE_KEYSPACE, vec![account])
-        .await
-        .unwrap();
-    worker(&fixture).claim(now).await.unwrap();
-    assert_eq!(count(&fixture, PLUGIN_WAITING_KEYSPACE).await, 1);
-    assert_eq!(count(&fixture, PLUGIN_OUTBOX_KEYSPACE).await, 0);
-    assert!(count(&fixture, PLUGIN_REPLAYS_KEYSPACE).await > 0);
-    let mut config = config(&fixture).await;
-    config.installs[0].state = InstallState::Removing;
-    assert!(
-        drive(sweep_events(&config, now), &fixture.ctx)
-            .await
-            .unwrap()
-            >= 2
-    );
-    for space in [
-        PLUGIN_WAITING_KEYSPACE,
-        PLUGIN_QUEUE_KEYSPACE,
-        PLUGIN_REPLAYS_KEYSPACE,
-    ] {
-        assert_eq!(count(&fixture, space).await, 0, "{space}");
-    }
 }
 
 #[test]

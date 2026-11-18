@@ -11,12 +11,12 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugin_host::connection_tests::leaks;
 use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
+use crate::plugins::test_support::leaks;
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to
 /// the group secret `hook-key` that checks `x-signature`.

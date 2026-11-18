@@ -12,7 +12,8 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugin_host::worker::tests::worker;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::flow_support::decide::{event, runs};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::tests::child_result;
@@ -22,19 +23,6 @@ use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
 use crate::plugins::test_support::{created, installed, scoped};
 use aruna_plugins::broker::HostError;
-
-/// A created dataset journaled now, and its forward row for `install`.
-fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
-    let mut event = created(install, resource).0;
-    (event.journaled_ms, event.anchor_ms) = (now, now);
-    let row = ForwardRow {
-        install_id: install.install_id,
-        revision: install.revision,
-        event: event.clone(),
-        queued_ms: now,
-    };
-    (event, row)
-}
 
 /// Decides `rows` as one batch from this node.
 async fn decided(fixture: &Fixture, rows: &[ForwardRow]) -> Vec<Outcome> {
@@ -59,33 +47,6 @@ async fn decided_at(
     (decisions.unwrap().events.into_iter())
         .map(|(.., outcome)| outcome)
         .collect()
-}
-
-async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
-    let listed = drive(list_runs(install.install_id, None, 1_000), &fixture.ctx).await;
-    listed.unwrap().0
-}
-
-#[tokio::test]
-async fn end_to_end() {
-    let fixture = Fixture::new().await;
-    let install = installed(&fixture).await;
-    let now = unix_timestamp_millis();
-    journal(&fixture, &event(&install, "D1", now).0).await;
-    let worker = worker(&fixture);
-    worker.claim(now).await.unwrap();
-    worker.settle().await;
-    let runs = runs(&fixture, &install).await;
-    assert_eq!(runs.len(), 1);
-    assert!(matches!(&runs[0].trigger, RunTrigger::Event(event) if event.resource == "D1"));
-    assert_eq!(runs[0].state, RunState::Succeeded, "{:?}", runs[0].message);
-    let txn = Txn::direct(&fixture.ctx);
-    assert!(
-        txn.scan(PLUGIN_OUTBOX_KEYSPACE, &[])
-            .await
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]

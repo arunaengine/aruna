@@ -12,7 +12,6 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::PayloadHandler;
-use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
@@ -21,6 +20,7 @@ use crate::plugins::store::Txn;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::edit_work;
 use crate::plugins::test_support::installed;
+use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
@@ -50,7 +50,36 @@ fn job(nonce: u64) -> JobId {
 
 /// The job handlers whose holds the prune asks: the plugin work one.
 fn plugin_handlers() -> [std::sync::Arc<dyn PayloadHandler>; 1] {
-    [std::sync::Arc::new(PluginWorkHandler)]
+    [std::sync::Arc::new(WorkHolds)]
+}
+
+/// Keeps a job while its work row needs it, as the node's plugin work handler does.
+#[derive(Debug)]
+struct WorkHolds;
+
+impl PayloadHandler for WorkHolds {
+    fn run<'a>(
+        &'a self,
+        _: &'a crate::jobs::executor::JobContext,
+        _: &'a JobPayload,
+    ) -> Option<futures_util::future::BoxFuture<'a, crate::jobs::executor::JobRunOutcome>> {
+        None
+    }
+
+    fn keeps_job<'a>(
+        &'a self,
+        context: &'a DriverContext,
+        payload: &'a JobPayload,
+    ) -> futures_util::future::BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let JobPayload::PluginWork(spec) = payload else {
+                return Ok(false);
+            };
+            drive(holds_job(spec), context)
+                .await
+                .map_err(|error| error.0)
+        })
+    }
 }
 
 #[tokio::test]
