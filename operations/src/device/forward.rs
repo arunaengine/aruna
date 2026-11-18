@@ -23,7 +23,6 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::update_metadata_document;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -65,6 +64,8 @@ use std::str::FromStr;
 use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::write_check;
 use crate::forward::replay::HeldRecordOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub(super) const GROUP_SCAN_PAGE: usize = 10_000;
 
@@ -98,8 +99,7 @@ pub(super) async fn read_realm_documents(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     // Only realm infrastructure answers: a device holds no realm state to serve.
     if !is_sync_eligible(&config, net_handle.node_id()) {
@@ -337,8 +337,7 @@ pub(super) async fn read_graph_state(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
         return Err(SyncRefusal::Unavailable);
@@ -471,8 +470,7 @@ pub(super) async fn run_device_batch(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, net_handle.node_id()) {
         return Err(SyncRefusal::Unavailable);

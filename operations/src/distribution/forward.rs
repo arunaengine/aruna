@@ -31,7 +31,6 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
@@ -39,6 +38,8 @@ use crate::s3::bucket::dataset::{DescriptionError, dataset_description};
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use aruna_core::metadata::AuthToken;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Why the publisher refused or could not take a request.
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,8 +194,7 @@ async fn infrastructure_peer(
         .net_handle
         .as_ref()
         .ok_or_else(|| PublishRefusal::Unavailable("net transport unavailable".to_string()))?;
-    let config = load_realm_config(context, *net.realm_id())
-        .await
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| PublishRefusal::Unavailable("realm config missing".to_string()))?;
     match is_sync_eligible(&config, peer) {
         true => Ok(()),
@@ -250,8 +250,7 @@ pub(crate) async fn admit_member(
         .verify(realm_id)
         .map_err(|error| SyncRefusal::Invalid(error.to_string()))?;
     let snapshot = &signed.snapshot;
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, snapshot.root.publisher) || !is_sync_eligible(&config, node_id) {
         return Err(SyncRefusal::Invalid(

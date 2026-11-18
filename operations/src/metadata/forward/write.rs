@@ -33,7 +33,6 @@ use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -84,6 +83,8 @@ use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::write_check;
 use crate::forward::replay::HeldRecordOperation;
 use crate::forward::routing::ForwardHoldersOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Creates locally when the origin holds the bucket, otherwise at a holder.
 /// Definitely unsent requests may try another holder; ambiguous delivery is
@@ -103,8 +104,7 @@ pub async fn route_metadata_create(
 
     // Mint the forwarded id at the origin with the blind-hash bucket of the
     // subject, so every candidate holder stamps the same bucket.
-    let realm_config = load_realm_config(&context, config.actor.realm_id)
-        .await
+    let realm_config = drive(GetConfigOperation::new(config.actor.realm_id), &context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
@@ -222,8 +222,7 @@ pub async fn create_metadata_authorized(
     if path.is_empty() {
         return Err(CreateAuthorizedError::EmptyPath);
     }
-    let realm_config = load_realm_config(context, realm_id)
-        .await
+    let realm_config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let user_origin =
         is_user_origin(&realm_config, local_node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
@@ -310,8 +309,7 @@ impl PinnedCreate {
         if path.is_empty() {
             return Err(CreateAuthorizedError::EmptyPath);
         }
-        let config = load_realm_config(context, actor.realm_id)
-            .await
+        let config = drive(GetConfigOperation::new(actor.realm_id), context).await.inspect_err(config_unavailable).ok()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
         let user_origin =
             is_user_origin(&config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
@@ -374,8 +372,7 @@ pub async fn create_with_id(
             CreateDocumentOperation::new_generated_id(config).with_message(create.message.clone());
         create_metadata_document(operation, context.clone()).await?
     } else {
-        let realm_config = load_realm_config(context, realm_id)
-            .await
+        let realm_config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
         let token = Some(AuthToken::Internal(auth.clone()));
         let target = (document_id, Some(create.target));
@@ -410,8 +407,7 @@ pub async fn route_metadata_update(
     auth_token: Option<AuthToken>,
     commit_message: Option<String>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let config = load_realm_config(context, actor.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(actor.realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
@@ -541,7 +537,7 @@ pub async fn apply_batch_routed(
     authored: MetadataBatchSource,
     auth_token: AuthToken,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
         MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
     })?;
     let config_digest = config
@@ -625,8 +621,7 @@ pub async fn route_metadata_delete(
     document_id: Ulid,
     auth_token: Option<AuthToken>,
 ) -> Result<(), MetadataWriteError> {
-    let config = load_realm_config(context, actor.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(actor.realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
@@ -700,7 +695,7 @@ pub(crate) async fn apply_forwarded_write(
         return forwarded_unavailable(&message);
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         return forwarded_unavailable(&message);
     };
     let expected_digest = match &message {

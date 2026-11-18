@@ -15,10 +15,11 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
-use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::node_state::DrainStateOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.
@@ -71,8 +72,7 @@ pub async fn submit_local_execution(
     context: &DriverContext,
     mut config: LocalExecutionConfig,
 ) -> Result<SubmitJobResult, LocalExecutionError> {
-    let realm = load_realm_config(context, config.owner.realm_id)
-        .await
+    let realm = drive(GetConfigOperation::new(config.owner.realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| LocalExecutionError::Unavailable("realm configuration".to_string()))?;
     let owner = node_kind(&realm, config.node_id)
         .and_then(|kind| kind.owner())

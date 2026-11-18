@@ -5,7 +5,6 @@
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::s3::bucket::create::CreateBucketError;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -24,6 +23,8 @@ use tracing::warn;
 
 use crate::forward::transport::reject;
 use crate::realm::peer_trust::is_sync_eligible;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub(crate) async fn apply_bucket_create(
     context: &Arc<DriverContext>,
@@ -100,8 +101,7 @@ async fn create_once(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, net_handle.node_id()) {
         return Err(SyncRefusal::Unavailable);
@@ -195,8 +195,7 @@ async fn bucket_writable(
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, node_id) {
         return Err(SyncRefusal::Unavailable);

@@ -17,8 +17,10 @@ use crate::metadata::id_mapping::{
     MappingRoute, PersistentIdError, mapping_route_for, parse_mapping_read, read_mapping_effect,
 };
 use crate::metadata::pid_transition::{PidTransition, PidTransitionOperation};
-use crate::realm::load_config::load_realm_config;
 use crate::sync::outbox_record::schedule_drain_effect;
+use crate::driver::drive;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub async fn read_mapping(
     ctx: &DriverContext,
@@ -128,7 +130,7 @@ pub(crate) async fn mapping_route(
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return Ok(None);
     };
-    let config = load_realm_config(ctx, realm_id).await.ok_or_else(|| {
+    let config = drive(GetConfigOperation::new(realm_id), ctx).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
         PersistentIdError::Unavailable("realm placement config is unavailable".to_string())
     })?;
     mapping_route_for(&config, realm_id, document_id, net_handle.node_id())

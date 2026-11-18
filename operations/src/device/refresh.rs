@@ -20,13 +20,14 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
-use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::placement::read_holder_sets;
 
 use super::install_graph::InstallGraphOperation;
 use super::replica::{ReplicaRecord, ReplicaState};
 use super::replica_store::{list_replicas, read_replica, store_replica};
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.
@@ -86,7 +87,7 @@ async fn refresh_plan(context: &Arc<DriverContext>) -> Option<RefreshPlan> {
     let net_handle = context.net_handle.as_ref()?;
     context.metadata_handle.as_ref()?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id).await?;
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()?;
     let owner = node_kind(&config, net_handle.node_id()).and_then(|kind| kind.owner())?;
     Some(RefreshPlan {
         realm_id,

@@ -53,7 +53,6 @@ use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
-use crate::realm::load_config::load_realm_config;
 use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
@@ -64,6 +63,8 @@ use super::route::{JobRouteOperation, JobRouteOutcome};
 
 use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -84,7 +85,7 @@ pub(crate) async fn mint_local_job(
             "job owner does not match the serving node".to_string(),
         ));
     }
-    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
     mint_configured_job(&config, owner_node_id, subject)
@@ -704,8 +705,7 @@ pub async fn resolve_job_owner(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     config.job_owner(job_id).map_err(|error| match error {
         JobOwnerError::NotJobControl => JobRouteError::NotFound,

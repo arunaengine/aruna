@@ -33,7 +33,6 @@ use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
@@ -47,6 +46,8 @@ use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 struct PreparedReference {
     metadata: SourceMetadata,
@@ -296,8 +297,7 @@ async fn prepare_granted(
     let granted = signed
         .verify(*net.realm_id(), net.node_id(), now)
         .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
-        .await
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| {
             NativeReferenceReject::Unavailable("realm config unavailable".to_string())
         })?;
@@ -355,8 +355,7 @@ async fn prepare_delegated(
     let delegation = signed
         .verify(*net.realm_id(), net.node_id(), now)
         .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
-        .await
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context).await.inspect_err(config_unavailable).ok()
         .ok_or_else(|| {
             NativeReferenceReject::Unavailable("realm config unavailable".to_string())
         })?;

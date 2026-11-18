@@ -26,10 +26,11 @@ use ulid::Ulid;
 use crate::distribution::feed_walks::IndexProgress;
 use crate::distribution::index_feed::range_progress;
 use crate::driver::{DriverContext, drive};
-use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::ReadCursorOperation;
 use crate::replication::members::{CopyLag, CopyLagOperation};
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -358,8 +359,7 @@ pub async fn read_status(
     let reach = heartbeat_reach(net.map(|net| net.node_id()), heard);
     // A publisher removed from the realm accepts no change, reachable or not.
     let publisher = view.snapshot().root.publisher;
-    let eligible = load_realm_config(context, realm_id)
-        .await
+    let eligible = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .and_then(|config| config.sync_eligible_nodes().ok())
         .is_some_and(|nodes| nodes.contains(&publisher));
     let mut status = summarize(realm_id, &view, reach, eligible);

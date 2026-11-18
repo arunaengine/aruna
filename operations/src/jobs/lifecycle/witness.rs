@@ -39,7 +39,6 @@ use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, Re
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::realm::load_config::load_realm_config;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
@@ -168,6 +167,9 @@ async fn build_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realm::load_config::config_unavailable;
+    use crate::document_repository::GetConfigOperation;
+    use crate::driver::drive;
     use crate::tests::records::{Family, context, node};
 
     #[tokio::test]
@@ -326,7 +328,7 @@ async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) ->
     };
     let realm_id = *net.realm_id();
     let local = net.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         return RoundOutcome::Retry { after_ms: 1_000 };
     };
     let base = config.compute.witness_delay_ms;

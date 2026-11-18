@@ -11,7 +11,6 @@ use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
 use crate::metadata::record_reads::load_document_record;
-use crate::placement::process_placements::load_realm_config;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
@@ -45,6 +44,8 @@ use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::write_check;
 use crate::forward::routing::ForwardHoldersOperation;
 use crate::forward::transport::MetadataWriteError;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// The one node that owns a document's PID state: rank-0 holder of the placement
 /// derived from the structured id, never the registry row (a delete removes it
@@ -103,8 +104,7 @@ pub(super) async fn pid_authority(
     realm_id: RealmId,
     document_id: Ulid,
 ) -> Result<(RealmConfigDocument, NodeId), MetadataApiError> {
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let authority = pid_authority_node(&config, realm_id, document_id)
         .ok_or(MetadataApiError::ServiceUnavailable)?;
@@ -442,8 +442,7 @@ pub async fn resolve_pid_routed(
     if context.net_handle.is_none() {
         return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     if outside_realm(&config, realm_id, document_id) {
         return Ok(PersistentIdResolution::Missing);
@@ -577,7 +576,7 @@ pub(crate) async fn apply_forwarded_pid(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if config.digest().ok() != Some(config_digest) {

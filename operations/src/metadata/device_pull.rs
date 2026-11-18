@@ -38,7 +38,6 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::peer_acts_for;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -52,6 +51,8 @@ use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersi
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -340,8 +341,7 @@ pub(crate) async fn authorize_peer(
             WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
             WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
-    let config = load_realm_config(context, auth.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     match peer_acts_for(&config, peer, auth.user_id) {
         true => Ok(auth),
@@ -522,8 +522,7 @@ async fn commit_pull(
     )
     .await
     .map_err(|_| SyncRefusal::Unavailable)?;
-    let quota = load_realm_config(context, auth.realm_id)
-        .await
+    let quota = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
         .and_then(|config| config.quota.effective_group_ceiling(&bucket.group_id));
     let operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
@@ -847,8 +846,7 @@ async fn holder_heads(
     (snapshot, range): (&DistributionSnapshot, &KeyRange),
     listing: SetListing,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let config = load_realm_config(context, auth.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(SyncRefusal::Unavailable)?;
     let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
     let local = local_node(context)?;

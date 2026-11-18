@@ -38,9 +38,10 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
-use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 use aruna_core::placement::holds_placement;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 const QUEUE_PAGE: usize = 256;
 const ERROR_RETRY_MS: u64 = 60_000;
@@ -322,7 +323,7 @@ pub async fn start_push(
 /// Whether the link's owner still holds the dataset; an unknown placement counts as held.
 pub async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
     let realm_id = context.serving_realm(link.created_by.realm_id);
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         return true;
     };
     resolve_metadata_id(&config, realm_id, None, link.document_id).map_or(true, |placement| {

@@ -8,7 +8,6 @@ use crate::driver::DriverContext;
 use crate::driver::{drive, drive_until};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::load_config::load_realm_config;
 use aruna_core::audit::AuditPageRequest;
 use aruna_core::audit::AuditPageResponse;
 use aruna_core::audit::validate_request;
@@ -26,6 +25,8 @@ use crate::metadata::audit::{
     decode_cursor,
 };
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Gathers the group's audit trail from every eligible realm node and merges the
 /// pages. `local_node` reads its own keyspace directly; the remaining nodes are
@@ -54,7 +55,7 @@ pub async fn list_audit(
     let mut digest_ready = false;
     let mut include_local = false;
     let mut user_origin = false;
-    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
+    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() })
         .await
         .map_err(|_| ListAuditError::Unavailable)?;
     match config {
@@ -174,7 +175,7 @@ async fn local_audit_result(
         return Err(MetadataReadError::Unavailable);
     }
     validate_request(&request).map_err(|_| MetadataReadError::Unavailable)?;
-    let config = tokio::time::timeout_at(deadline, load_realm_config(context.as_ref(), realm_id))
+    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context.as_ref()).await.inspect_err(config_unavailable).ok() })
         .await
         .map_err(|_| MetadataReadError::Unavailable)?
         .ok_or(MetadataReadError::Unavailable)?;

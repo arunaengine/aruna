@@ -33,6 +33,8 @@ use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -606,7 +608,7 @@ async fn ensure_strategy_activations(
     }
     // Resolve activations in this pass because the committed successor map is already durable.
     if let Some(published) =
-        crate::placement::process_placements::load_realm_config(context, realm_id).await
+        drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
     {
         activate_newest_map(context, realm_id, local_node_id, &published).await;
     }
@@ -710,7 +712,7 @@ async fn config_activation(
     realm_id: RealmId,
     placement: &PlacementRef,
 ) -> Option<u64> {
-    let config = crate::placement::process_placements::load_realm_config(context, realm_id).await?;
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()?;
     config
         .activation(&placement.strategy_id, placement.shard)
         .map(|activation| activation.activation_epoch)
@@ -1005,8 +1007,7 @@ mod tests {
     }
 
     async fn load_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigDocument {
-        crate::placement::process_placements::load_realm_config(context, realm_id)
-            .await
+        drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
             .expect("the realm config is stored")
     }
 

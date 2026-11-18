@@ -23,6 +23,8 @@ use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
 use crate::driver::drive;
 use crate::auth::bearer_token::UserCutoffOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 impl MetadataHandle {
     /// Validates a forwarded caller's bearer token and confirms the forwarding
@@ -401,8 +403,7 @@ pub(super) async fn config_digest_matches(
     realm_id: RealmId,
     expected: &[u8; 32],
 ) -> bool {
-    crate::realm::load_config::load_realm_config(context, realm_id)
-        .await
+    drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .and_then(|config| config.digest().ok())
         .as_ref()
         == Some(expected)

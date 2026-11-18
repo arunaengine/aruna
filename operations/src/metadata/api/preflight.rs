@@ -27,7 +27,6 @@ use super::{
     select_fanout_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
 
 use super::head_versions::{HeadVersionsError, HeadVersionsOperation};
 use super::prefix_scan::{PrefixScanError, PrefixScanOperation};
@@ -35,6 +34,8 @@ use super::read::{ensure_permission, load_live_record};
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::search_cursor::tie_order;
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub(super) async fn resolve_preflight_targets(
     context: &DriverContext,
@@ -629,7 +630,7 @@ pub(crate) async fn discover_realm_nodes(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> RealmNodeDiscovery {
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         return RealmNodeDiscovery {
             nodes: vec![local_node_id],
             failed: true,

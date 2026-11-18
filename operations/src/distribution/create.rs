@@ -29,9 +29,11 @@ use super::forward::{PublishRefusal, admit_member, publish_local};
 use super::status::{StatusError, read_view};
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::metadata::AuthToken;
+use crate::driver::drive;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// How often and how far apart admission rereads a record that lags the accepted revision.
 const RECORD_POLLS: u32 = 50;
@@ -136,7 +138,7 @@ pub async fn create_set(
         .as_ref()
         .ok_or_else(|| CreateError::Invalid("this node has no realm transport".to_string()))?;
     let (realm_id, publisher) = (*net.realm_id(), net.node_id());
-    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
         PublishRefusal::Unavailable("the realm configuration is not available".to_string())
     })?;
     let nodes = input

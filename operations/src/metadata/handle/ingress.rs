@@ -921,17 +921,28 @@ impl MetadataHandle {
                 MetadataTransportMessage::ForwardedPlacementPolicy { result }
             }
             forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
-                Box::pin(async {
-                    crate::users::vault_route::apply_forwarded_vault(context, peer, forward).await
-                })
-                .await
+                let apply = crate::users::vault_route::ApplyVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Forwarded vault change failed");
+                        MetadataTransportMessage::ForwardedWriteUnavailable
+                    })
             }
             MetadataTransportMessage::FetchVaultRecords { user_id, query } => {
-                Box::pin(async {
-                    crate::users::vault_route::serve_vault_fetch(context, peer, user_id, query)
-                        .await
-                })
-                .await
+                let serve = crate::users::vault_route::ServeVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    user_id,
+                    query,
+                );
+                MetadataTransportMessage::FetchedVaultRecords {
+                    result: Box::pin(crate::driver::drive(serve, context.as_ref())).await,
+                }
             }
             forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
                 Box::pin(async {

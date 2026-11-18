@@ -20,7 +20,6 @@ use super::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::{load_document_record, record_materialized_read};
-use crate::realm::load_config::load_realm_config;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
@@ -29,6 +28,8 @@ use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use aruna_core::handle::Handle;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::enforcement::EnforcePolicyOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub async fn query_metadata_document(
     context: &DriverContext,
@@ -62,7 +63,7 @@ pub async fn query_metadata_document(
         });
     }
 
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
         if !request.allow_partial {
             return Err(MetadataApiError::ServiceUnavailable);
         }

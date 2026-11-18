@@ -20,9 +20,10 @@ use thiserror::Error;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::auth::bearer_token::GrantValidOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
 const SPENT_MARGIN_SECS: u64 = 60;
@@ -89,8 +90,7 @@ pub async fn redeem_ticket(
         .ok_or(RedeemError::Unavailable)?;
     let realm_id = *net.realm_id();
     let ticket = signed.verify(realm_id, net.node_id(), object_id, now)?;
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
         .ok_or(RedeemError::Unavailable)?;
     if !is_sync_eligible(&config, ticket.issuer) {
         return Err(RedeemError::Issuer);

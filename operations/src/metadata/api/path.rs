@@ -16,7 +16,6 @@ use super::{
     stream,
 };
 use crate::driver::DriverContext;
-use crate::realm::load_config::load_realm_config;
 
 use super::read::load_claim_records;
 use aruna_core::StructuredId;
@@ -24,6 +23,8 @@ use futures_util::StreamExt;
 use crate::driver::drive;
 use crate::auth::request_authorization::GroupRulesOperation;
 use crate::auth::enforcement::PolicyBulkOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 pub(super) fn select_forward_peers(
     config: &RealmConfigDocument,
@@ -278,8 +279,7 @@ pub(crate) async fn local_path_candidates(
     let mut records = load_claim_records(context, realm_id, Some(group_id)).await?;
     records.retain(|record| record.document_path == document_path);
     if let Some(net) = context.net_handle.as_ref() {
-        let config = load_realm_config(context, realm_id)
-            .await
+        let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
         registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
         records.retain(|record| {
@@ -371,7 +371,7 @@ pub async fn lookup_metadata_path(
     if context.net_handle.is_none() {
         return resolve_local_path(context, realm_id, request).await;
     }
-    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
+    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() })
         .await
         .ok()
         .flatten()
