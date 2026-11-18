@@ -657,126 +657,315 @@ impl WriteObligationOperation {
             record,
             writing: false,
         }
-    };
-    let (current, valid) = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.clone(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => (None, true),
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => match LiveObligationRecord::from_bytes(&value) {
-            Ok(record) => (Some(record), true),
-            Err(_) => (None, false),
-        },
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_cursor(storage, txn_id).await;
-            return Err(error.into());
-        }
-        other => {
-            abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let should_write = !valid
-        || match current.as_ref() {
-            None => true,
-            Some(current) => match (record.continuation.as_ref(), current.continuation.as_ref()) {
-                (Some(candidate), Some(current)) => continuation_newer(candidate, current),
-                (Some(_), None) => true,
-                (None, None) | (None, Some(_)) => false,
-            },
-        };
-    if !should_write {
-        abort_cursor(storage, txn_id).await;
-        return Ok(());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_cursor(storage, txn_id).await;
-            return Err(error.into());
-        }
-        other => {
-            abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
-pub(super) async fn read_relationships_limit(
-    storage: &StorageHandle,
-    bucket: &str,
-    start: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<RelationshipPage, BlobQueueError> {
-    let mut start_after = start.clone();
-    let mut relationships = Vec::with_capacity(limit.min(REPLICATION_PAGE_SIZE));
-    if limit == 0 {
-        return Ok(RelationshipPage {
-            values: relationships,
-            next: None,
-        });
+impl Operation for WriteObligationOperation {
+    type Output = ();
+    type Error = BlobQueueError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
-    loop {
-        let page_limit = (limit - relationships.len()).min(REPLICATION_PAGE_SIZE);
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                prefix: Some(sync_relationship_prefix(bucket).into()),
-                start: start_after.take().map(|key| IterStart::After(key.into())),
-                limit: page_limit,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
+
+    fn first(&mut self) -> Turn<()> {
+        let (key_space, key, _) = live_obligation_entry(&self.record)?;
+        Ok(Next::Call(read_row(&key_space, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let current = result.value()?;
+        let stored = current.as_deref().map(LiveObligationRecord::from_bytes);
+        let write = match stored {
+            None | Some(Err(_)) => true,
+            Some(Ok(current)) => {
+                match (
+                    self.record.continuation.as_ref(),
+                    current.continuation.as_ref(),
+                ) {
+                    (Some(candidate), Some(current)) => continuation_newer(candidate, current),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
             }
         };
-        for (key, value) in values {
-            let relationship = SyncRelationship::from_bytes(&value)?;
-            validate_sync_key(bucket, &key, &relationship)?;
-            relationships.push((key.to_vec(), relationship));
+        if !write {
+            return Ok(Next::Done(()));
         }
-        if relationships.len() == limit {
-            return Ok(RelationshipPage {
-                values: relationships,
-                next: next_start_after.map(|key| key.to_vec()),
-            });
+        self.writing = true;
+        let entry = live_obligation_entry(&self.record)?;
+        Ok(Next::Call(IoCall::Write(vec![entry])))
+    }
+}
+
+/// Deletes an obligation while it still holds the expected continuation.
+#[derive(Debug, PartialEq)]
+pub(super) struct DeleteObligationOperation {
+    key: Key,
+    expected: Option<LiveReplicationContinuation>,
+    deleting: bool,
+}
+
+impl DeleteObligationOperation {
+    pub(super) fn new(key: Vec<u8>, expected: Option<LiveReplicationContinuation>) -> Self {
+        Self {
+            key: key.into(),
+            expected,
+            deleting: false,
         }
-        match next_start_after {
-            Some(next) => start_after = Some(next.to_vec()),
-            None => {
-                return Ok(RelationshipPage {
-                    values: relationships,
-                    next: None,
+    }
+}
+
+impl Operation for DeleteObligationOperation {
+    type Output = ();
+    type Error = BlobQueueError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        let read = read_row(REPLICATION_OBLIGATION_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let delete =
+            result
+                .value()?
+                .is_some_and(|value| match LiveObligationRecord::from_bytes(&value) {
+                    Ok(record) => record.continuation == self.expected,
+                    Err(_) => self.expected.is_none(),
                 });
+        if !delete {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        let row = (
+            REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            self.key.clone(),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+}
+
+/// Reads a bucket's outgoing relationships after `start`, at most `limit`.
+#[derive(Debug, PartialEq)]
+pub(super) struct ReadRelationshipsOperation {
+    bucket: String,
+    after: Option<Vec<u8>>,
+    limit: usize,
+    values: Vec<(Vec<u8>, SyncRelationship)>,
+}
+
+impl ReadRelationshipsOperation {
+    pub(super) fn new(bucket: &str, start: Option<Vec<u8>>, limit: usize) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            after: start,
+            limit,
+            values: Vec::with_capacity(limit.min(REPLICATION_PAGE_SIZE)),
+        }
+    }
+
+    fn read_page(&mut self) -> Turn<RelationshipPage> {
+        let limit = (self.limit - self.values.len()).min(REPLICATION_PAGE_SIZE);
+        Ok(Next::Call(IoCall::Page {
+            space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            prefix: sync_relationship_prefix(&self.bucket).into(),
+            after: self.after.take().map(Into::into),
+            limit,
+        }))
+    }
+
+    fn finish(&mut self, next: Option<Vec<u8>>) -> Turn<RelationshipPage> {
+        Ok(Next::Done(RelationshipPage {
+            values: std::mem::take(&mut self.values),
+            next,
+        }))
+    }
+}
+
+impl Operation for ReadRelationshipsOperation {
+    type Output = RelationshipPage;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<RelationshipPage> {
+        if self.limit == 0 {
+            return self.finish(None);
+        }
+        self.read_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<RelationshipPage> {
+        let (rows, next) = result.page()?;
+        for (key, value) in rows {
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            validate_sync_key(&self.bucket, &key, &relationship)?;
+            self.values.push((key.to_vec(), relationship));
+        }
+        let next = next.map(|key| key.to_vec());
+        if self.values.len() == self.limit {
+            return self.finish(next);
+        }
+        match next {
+            Some(next) => {
+                self.after = Some(next);
+                self.read_page()
+            }
+            None => self.finish(None),
+        }
+    }
+}
+
+/// The relationship jobs one obligation owes now, and how far they take its cursor.
+fn relationship_jobs(
+    obligation: &LiveObligationRecord,
+    upstream_sources: &[ArunaArn],
+    page: &RelationshipPage,
+    cursor: &mut LiveReplicationContinuation,
+) -> Option<Vec<BlobJobRecord>> {
+    let mut jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
+    let mut found = false;
+    let mut complete = page.next.is_none();
+    for (index, (key, relationship)) in page.values.iter().enumerate() {
+        if (cursor.relationship_after.as_ref()).is_some_and(|after| key <= after) {
+            continue;
+        }
+        found = true;
+        cursor.relationship_after = Some(key.clone());
+        if obligation.reference_advance.is_some()
+            && relationship.mode != SyncMode::Reference
+            && relationship.reference_handling != ReferenceHandling::Preserve
+        {
+            continue;
+        }
+        let job = relationship_job(
+            obligation.local_node_id,
+            RelationshipJobTarget {
+                bucket: &obligation.bucket,
+                key: &obligation.key,
+                version_id: obligation.version_id,
+                delete_marker: obligation.delete_marker,
+            },
+            relationship.clone(),
+            obligation.origin.as_ref(),
+            upstream_sources,
+        );
+        let job = job.map(|mut job| match obligation.reference_advance {
+            Some(advance) => {
+                job.input.auth_context = obligation.auth_context.clone();
+                job.writer_auth_context = None;
+                job.with_reference_advance(advance)
+            }
+            None => job.with_writer_auth(obligation.auth_context.clone()),
+        });
+        if let Some(job) = job {
+            if jobs.len() == REPLICATION_JOB_LIMIT {
+                complete = false;
+                break;
+            }
+            jobs.push(job);
+            if jobs.len() == REPLICATION_JOB_LIMIT {
+                complete = index + 1 == page.values.len() && page.next.is_none();
+                break;
+            }
+        }
+    }
+    if !found {
+        if page.next.is_some() {
+            return None;
+        }
+        cursor.relationship_after = None;
+        cursor.relationships_complete = true;
+    } else if complete {
+        cursor.relationship_after = None;
+        cursor.relationships_complete = true;
+    } else {
+        cursor.relationships_complete = false;
+    }
+    Some(jobs)
+}
+
+#[derive(Debug, PartialEq)]
+enum LiveStep {
+    Inbound,
+    Members,
+    Relationships,
+}
+
+/// Queues the member and relationship jobs one obligation owes now.
+#[derive(Debug, PartialEq)]
+pub(super) struct WriteLiveJobsOperation {
+    obligation: LiveObligationRecord,
+    page: Option<RelationshipPage>,
+    members: Vec<BlobJobRecord>,
+    upstream_sources: Vec<ArunaArn>,
+    cursor: LiveReplicationContinuation,
+    queued: usize,
+    step: LiveStep,
+}
+
+fn no_progress() -> LiveRepairWrite {
+    LiveRepairWrite {
+        queued: 0,
+        continuation: None,
+        progressed: false,
+    }
+}
+
+impl WriteLiveJobsOperation {
+    pub(super) fn new(
+        obligation: &LiveObligationRecord,
+        page: Option<&RelationshipPage>,
+        members: Vec<BlobJobRecord>,
+    ) -> Self {
+        Self {
+            obligation: obligation.clone(),
+            page: page.map(|page| RelationshipPage {
+                values: page.values.clone(),
+                next: page.next.clone(),
+            }),
+            members,
+            upstream_sources: obligation.upstream_sources.clone(),
+            cursor: obligation.continuation.clone().unwrap_or_default(),
+            queued: 0,
+            step: LiveStep::Inbound,
+        }
+    }
+
+    fn inbound_read(&mut self, value: Option<Value>) -> Result<(), BlobQueueError> {
+        let (Some(value), Some(origin)) = (value, self.obligation.origin.as_ref()) else {
+            return Ok(());
+        };
+        let bucket = &self.obligation.bucket;
+        let relationship = SyncRelationship::from_bytes(&value)?;
+        if relationship.id != origin.relationship_id
+            || relationship.target.bucket() != Some(bucket.as_str())
+            || sync_relationship_key(bucket, relationship.id)
+                != sync_relationship_key(bucket, origin.relationship_id)
+        {
+            return Err(ConversionError::FromStrError(
+                "incoming sync relationship key does not match payload".to_string(),
+            )
+            .into());
+        }
+        let source = relationship.source;
+        let known = (self.upstream_sources.iter()).any(|existing| same_endpoint(existing, &source));
+        if !known {
+            self.upstream_sources.push(source);
+        }
+        Ok(())
+    }
+
             }
         }
     }
