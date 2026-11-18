@@ -657,148 +657,148 @@ fn kept_row(key: &HiddenBlobKey, namespace: Ulid) -> Option<(&'static str, Vec<u
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.rsplit_once('_'))
-        .map(|(name, _)| name);
-    let row = match (namespace == ATTACHMENT_NAMESPACE, name) {
-        (true, Some(name)) => name.split_once('-').and_then(|(set, version)| {
-            let (set, version) = (
-                Ulid::from_string(set).ok()?,
-                Ulid::from_string(version).ok()?,
-            );
-            Some((ATTACHMENT_KEYSPACE, attachment_key(set, version)))
-        }),
-        (false, Some(name)) => hex::decode(name)
-            .ok()
-            .filter(|blake3| blake3.len() == 32)
-            .map(|blake3| (CACHE_ENTRY_KEYSPACE, blake3)),
-        (_, None) => None,
-    };
-    let Some((key_space, row_key)) = row else {
-        return Ok(false);
-    };
-    let Some(value) = read_value(
-        &context.storage_handle,
-        key_space,
-        row_key.into(),
-        None,
-        deadline,
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-    let location = match key_space == ATTACHMENT_KEYSPACE {
-        true => Attachment::from_bytes(&value).map(|kept| kept.location),
-        false => CacheEntry::from_bytes(&value).map(|kept| kept.location),
+        .map(|(name, _)| name)?;
+    if namespace == ATTACHMENT_NAMESPACE {
+        let (set, version) = name.split_once('-')?;
+        let (set, version) = (
+            Ulid::from_string(set).ok()?,
+            Ulid::from_string(version).ok()?,
+        );
+        return Some((ATTACHMENT_KEYSPACE, attachment_key(set, version)));
     }
-    .map_err(|error| error.to_string())?;
-    Ok(HiddenBlobKey::try_from(&location).is_ok_and(|kept| kept == *key))
+    let blake3 = hex::decode(name).ok().filter(|blake3| blake3.len() == 32)?;
+    Some((CACHE_ENTRY_KEYSPACE, blake3))
 }
 
-async fn read_value(
-    storage: &StorageHandle,
-    key_space: &str,
-    key: Key,
-    txn_id: Option<TxnId>,
-    deadline: Instant,
-) -> Result<Option<ByteView>, String> {
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id,
-        }),
-    )
-    .await
-    .map_err(|_| "timed out reading sweep metadata".to_string())?;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(value)),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected sweep metadata event: {}",
-            other.label()
-        )),
-    }
+#[derive(Debug, PartialEq)]
+enum ProtectStep {
+    Kept(bool),
+    Upload,
+    UploadJob(Box<RoCrateUploadRecord>),
+    Job,
 }
 
-async fn job_live(
-    storage: &StorageHandle,
-    job_id: JobId,
-    txn_id: Option<TxnId>,
-    deadline: Instant,
-) -> Result<bool, String> {
-    let Some(value) = read_value(
-        storage,
-        JOB_KEYSPACE,
-        job_record_key(job_id),
-        txn_id,
-        deadline,
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-    if value.len() > MAX_JOB_BYTES {
-        return Err("job record exceeds limit".to_string());
-    }
-    let record = JobRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-    Ok(!record.state.is_terminal() && record.payload.is_rocrate())
-}
-
-async fn list_hidden(
-    context: &DriverContext,
-    cursor: Option<Vec<u8>>,
-    deadline: Instant,
-) -> Result<(Vec<HiddenBlobEntry>, Option<Vec<u8>>), String> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Err("blob handle unavailable".to_string());
-    };
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        blob_handle.send_blob_effect(BlobEffect::ListHidden {
-            namespace: None,
-            cursor,
-        }),
-    )
-    .await
-    .map_err(|_| "timed out listing hidden blobs".to_string())?;
-    match event {
-        Event::Blob(BlobEvent::HiddenListed {
-            entries,
-            next_cursor,
-        }) => Ok((entries, next_cursor)),
-        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected hidden blob list event: {}",
-            other.label()
-        )),
-    }
-}
-
-async fn delete_key(
-    context: &DriverContext,
+/// Whether something still needs a hidden blob: a kept copy's row, a live upload or a job.
+#[derive(Debug, PartialEq)]
+struct IsProtectedOperation {
     key: HiddenBlobKey,
-    deadline: Instant,
-) -> Result<(), String> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Err("blob handle unavailable".to_string());
-    };
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        blob_handle.send_blob_effect(BlobEffect::DeleteHidden { key }),
-    )
-    .await
-    .map_err(|_| "timed out deleting hidden blob".to_string())?;
-    match event {
-        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
-        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected hidden blob delete event: {}",
-            other.label()
-        )),
+    now_ms: u64,
+    namespace: Option<Ulid>,
+    step: ProtectStep,
+}
+
+impl IsProtectedOperation {
+    fn new(key: HiddenBlobKey, now_ms: u64) -> Self {
+        Self {
+            key,
+            now_ms,
+            namespace: None,
+            step: ProtectStep::Upload,
+        }
+    }
+
+    fn read_job(&mut self) -> Turn<bool> {
+        let namespace = self.namespace.ok_or_else(|| failed("no blob namespace"))?;
+        let Ok(job_id) = JobId::try_from_bytes(namespace.to_bytes()) else {
+            return Ok(Next::Done(false));
+        };
+        self.step = ProtectStep::Job;
+        Ok(Next::Call(read_row(JOB_KEYSPACE, job_record_key(job_id))))
+    }
+
+    fn upload_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        let Some(value) = value else {
+            return self.read_job();
+        };
+        if value.len() > MAX_JOB_BYTES {
+            return Err(MigrationError::Failed(
+                "RO-Crate upload record exceeds limit".to_string(),
+            ));
+        }
+        let record: RoCrateUploadRecord = postcard::from_bytes(&value).map_err(failed)?;
+        let record_key = HiddenBlobKey::try_from(&record.location).map_err(failed)?;
+        if record_key != self.key {
+            return self.read_job();
+        }
+        match record.claimed_by {
+            Some(job_id) => {
+                self.step = ProtectStep::UploadJob(Box::new(record));
+                Ok(Next::Call(read_row(JOB_KEYSPACE, job_record_key(job_id))))
+            }
+            None => self.upload_checked(&record, false),
+        }
+    }
+
+    fn upload_checked(&mut self, record: &RoCrateUploadRecord, claimed: bool) -> Turn<bool> {
+        match upload_is_live(record, claimed, self.now_ms) {
+            true => Ok(Next::Done(true)),
+            false => self.read_job(),
+        }
+    }
+
+    fn job_read(&self, value: Option<Value>) -> Turn<bool> {
+        let Some(value) = value else {
+            return Ok(Next::Done(false));
+        };
+        let record = job_row(&value)?;
+        if !record.state.is_terminal() && record.payload.is_rocrate() {
+            return Ok(Next::Done(true));
+        }
+        if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
+            && let Some(artifact) = &result.artifact
+        {
+            let artifact_key = HiddenBlobKey::try_from(&artifact.location).map_err(failed)?;
+            return Ok(Next::Done(artifact_key == self.key));
+        }
+        Ok(Next::Done(false))
+    }
+
+    fn kept_read(&self, attachment: bool, value: Option<Value>) -> Turn<bool> {
+        let Some(value) = value else {
+            return Ok(Next::Done(false));
+        };
+        let location = match attachment {
+            true => Attachment::from_bytes(&value).map(|kept| kept.location),
+            false => CacheEntry::from_bytes(&value).map(|kept| kept.location),
+        }
+        .map_err(failed)?;
+        let same = HiddenBlobKey::try_from(&location).is_ok_and(|kept| kept == self.key);
+        Ok(Next::Done(same))
+    }
+}
+
+impl Operation for IsProtectedOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        let namespace = self.key.namespace()?;
+        self.namespace = Some(namespace);
+        if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
+            // An evicted copy a read still holds stays until the read ends.
+            if crate::distribution::pull::pinned_path(&self.key.backend_path) {
+                return Ok(Next::Done(true));
+            }
+            let Some((key_space, row_key)) = kept_row(&self.key, namespace) else {
+                return Ok(Next::Done(false));
+            };
+            self.step = ProtectStep::Kept(namespace == ATTACHMENT_NAMESPACE);
+            return Ok(Next::Call(read_row(key_space, row_key)));
+        }
+        let key = namespace.to_bytes().to_vec();
+        Ok(Next::Call(read_row(ROCRATE_UPLOAD_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, ProtectStep::Job) {
+            ProtectStep::Kept(attachment) => self.kept_read(attachment, result.value()?),
+            ProtectStep::Upload => self.upload_read(result.value()?),
+            ProtectStep::UploadJob(record) => {
+                let claimed = job_live(result.value()?)?;
+                self.upload_checked(&record, claimed)
+            }
+            ProtectStep::Job => self.job_read(result.value()?),
+        }
     }
 }
 
@@ -809,157 +809,58 @@ enum RecordCleanup {
     Deleted,
 }
 
-async fn delete_unclaimed(
-    storage: &StorageHandle,
+#[derive(Debug, PartialEq)]
+enum ClaimStep {
+    Record,
+    Job(Box<RoCrateUploadRecord>),
+    Deleted,
+}
+
+/// Removes an upload record nothing claims any more, in one transaction with its check.
+#[derive(Debug, PartialEq)]
+struct DeleteUnclaimedOperation {
     upload_id: Ulid,
     now_ms: u64,
-    deadline: Instant,
-) -> Result<RecordCleanup, String> {
-    let txn_id = start_txn(storage, deadline).await?;
-    let event = match tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: ByteView::from(upload_id.to_bytes().to_vec()),
-            txn_id: Some(txn_id),
-        }),
-    )
-    .await
-    {
-        Ok(event) => event,
-        Err(_) => {
-            let abort = abort_txn(storage, txn_id).await;
-            return Err(match abort {
-                Ok(()) => "timed out reading upload cleanup record".to_string(),
-                Err(error) => {
-                    format!("timed out reading upload cleanup record; abort failed: {error}")
-                }
-            });
+    step: ClaimStep,
+}
+
+impl DeleteUnclaimedOperation {
+    fn new(upload_id: Ulid, now_ms: u64) -> Self {
+        Self {
+            upload_id,
+            now_ms,
+            step: ClaimStep::Record,
         }
-    };
-    let value = match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => value,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_txn(storage, txn_id).await?;
-            return Ok(RecordCleanup::Missing);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_txn(storage, txn_id).await?;
-            return Err(error.to_string());
-        }
-        other => {
-            abort_txn(storage, txn_id).await?;
-            return Err(format!(
-                "unexpected upload cleanup read event: {}",
-                other.label()
-            ));
-        }
-    };
-    let record: RoCrateUploadRecord = match postcard::from_bytes(value.as_ref()) {
-        Ok(record) => record,
-        Err(error) => {
-            abort_txn(storage, txn_id).await?;
-            return Err(error.to_string());
-        }
-    };
-    let claimed_live = match record.claimed_by {
-        Some(job_id) => match job_live(storage, job_id, Some(txn_id), deadline).await {
-            Ok(live) => live,
-            Err(error) => {
-                abort_txn(storage, txn_id).await?;
-                return Err(error);
-            }
-        },
-        None => false,
-    };
-    if upload_is_live(&record, claimed_live, now_ms) {
-        abort_txn(storage, txn_id).await?;
-        return Ok(RecordCleanup::Protected);
     }
-    let event = match tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::Delete {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: ByteView::from(upload_id.to_bytes().to_vec()),
-            txn_id: Some(txn_id),
-        }),
-    )
-    .await
-    {
-        Ok(event) => event,
-        Err(_) => {
-            let abort = abort_txn(storage, txn_id).await;
-            return Err(match abort {
-                Ok(()) => "timed out deleting upload cleanup record".to_string(),
-                Err(error) => {
-                    format!("timed out deleting upload cleanup record; abort failed: {error}")
-                }
-            });
-        }
-    };
-    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
-        abort_txn(storage, txn_id).await?;
-        return match event {
-            Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-            other => Err(format!(
-                "unexpected upload cleanup delete event: {}",
-                other.label()
-            )),
-        };
+
+    fn row_key(&self) -> Key {
+        self.upload_id.to_bytes().to_vec().into()
     }
-    match commit_txn(storage, txn_id, deadline).await {
-        Ok(()) => Ok(RecordCleanup::Deleted),
-        Err(error) if error.proves_no_commit() => match abort_txn(storage, txn_id).await {
-            Ok(()) => Err(error.to_string()),
-            Err(abort_error) => Err(format!("{error}; abort failed: {abort_error}")),
-        },
-        Err(error) => Err(error.to_string()),
+
+    fn decide(&mut self, record: &RoCrateUploadRecord, claimed: bool) -> Turn<RecordCleanup> {
+        if upload_is_live(record, claimed, self.now_ms) {
+            return Ok(Next::Done(RecordCleanup::Protected));
+        }
+        self.step = ClaimStep::Deleted;
+        let row = (ROCRATE_UPLOAD_KEYSPACE.to_string(), self.row_key());
+        Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 }
 
-async fn delete_cleanup(
-    storage: &StorageHandle,
-    key: Key,
-    deadline: Instant,
-) -> Result<(), String> {
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::Delete {
-            key_space: UPLOAD_CLEANUP_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        }),
-    )
-    .await
-    .map_err(|_| "timed out deleting upload cleanup row".to_string())?;
-    match event {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected upload cleanup row delete event: {}",
-            other.label()
-        )),
-    }
-}
+impl Operation for DeleteUnclaimedOperation {
+    type Output = RecordCleanup;
+    type Error = MigrationError;
 
-async fn start_txn(storage: &StorageHandle, deadline: Instant) -> Result<TxnId, String> {
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::StartTransaction { read: false }),
-    )
-    .await
-    .map_err(|_| "timed out starting upload cleanup transaction".to_string())?;
-    match event {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected upload cleanup transaction event: {}",
-            other.label()
-        )),
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
-}
+
+    fn first(&mut self) -> Turn<RecordCleanup> {
+        Ok(Next::Call(read_row(
+            ROCRATE_UPLOAD_KEYSPACE,
+            self.row_key(),
+        )))
+    }
 
 async fn commit_txn(
     storage: &StorageHandle,
