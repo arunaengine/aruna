@@ -312,272 +312,201 @@ impl ProcessMigrationsOperation {
     }
 }
 
-pub(super) async fn read_progress(
-    context: &crate::driver::DriverContext,
-    key: &Key,
-) -> Result<Option<CompressionMigration>, String> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| CompressionMigration::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!(
-            "could not read migration progress: {}",
-            other.label()
-        )),
+impl Operation for ProcessMigrationsOperation {
+    type Output = MigrationRun;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> RunTurn {
+        Ok(Next::Call(IoCall::Page {
+            space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.take(),
+            limit: BUCKET_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> RunTurn {
+        match std::mem::replace(&mut self.step, RunStep::Page) {
+            RunStep::Queue => {
+                let (rows, cursor) = result.page()?;
+                self.cursor = cursor;
+                self.rows = rows.into_iter().map(|(key, _)| key).collect();
+                self.next_bucket()
+            }
+            RunStep::Progress(key) => self.progress_read(key, result.value()?),
+            RunStep::Encryption(bucket, record) => {
+                if !is_encrypted(result.value()?)? {
+                    let budget = MIGRATION_TIME;
+                    let page =
+                        MigratePageOperation::new(self.routing.clone(), &bucket, record, budget);
+                    return self.call(RunStep::Page, IoCall::child(page));
+                }
+                if !record.moving {
+                    return self.retire(bucket, record);
+                }
+                let started = record.started_at_ms;
+                let hand_over = HandOverOperation::new(self.routing.clone(), &bucket, started);
+                self.call(RunStep::Handover(bucket, record), IoCall::child(hand_over))
+            }
+            RunStep::Handover(bucket, record) => {
+                if result.child::<bool, MigrationError>()?? {
+                    return self.retire(bucket, record);
+                }
+                soonest(&mut self.next, MIGRATION_CONTINUE);
+                self.next_bucket()
+            }
+            RunStep::Retired => {
+                result.child::<(), MigrationError>()??;
+                self.next_bucket()
+            }
+            RunStep::Page => {
+                self.take_wait(result)?;
+                self.next_bucket()
+            }
+            RunStep::Transitions => {
+                self.take_wait(result)?;
+                let checks = ProcessChecksOperation::new();
+                self.call(RunStep::Checks, IoCall::child(checks))
+            }
+            RunStep::Checks => {
+                self.take_wait(result)?;
+                let linked = ProcessLinkedOperation::new(self.routing.clone());
+                self.call(RunStep::Linked, IoCall::child(linked))
+            }
+            RunStep::Linked => {
+                self.take_wait(result)?;
+                self.finish()
+            }
+        }
     }
 }
 
-/// Migrates one page of a bucket's versions and stores the progress, unless a newer
-/// setting replaced the record meanwhile. A run that worked for `budget` starts no more
-/// versions. Returns when the bucket needs the next run.
-pub(super) async fn migrate_page(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    mut record: CompressionMigration,
-    budget: Duration,
-) -> Result<Option<Duration>, String> {
-    let begun = std::time::Instant::now();
-    // A hand-over under way finishes before anything else of the move.
-    if record.moving && handing_over(context, bucket, record.started_at_ms).await? {
-        if !hand_over_moves(context, bucket, record.started_at_ms).await? {
-            return Ok(Some(MIGRATION_CONTINUE));
+fn decode_progress(value: Option<Value>) -> Result<Option<CompressionMigration>, MigrationError> {
+    value
+        .map(|value| CompressionMigration::from_bytes(value.as_ref()))
+        .transpose()
+        .map_err(MigrationError::failed)
+}
+
+/// How one version of a run ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowEnd {
+    /// The rename was paused or aborted before the version started.
+    Halted,
+    Migrated,
+    Skipped,
+    /// A move found a copy it cannot read, which a storage check recorded.
+    Broken,
+    Failed,
+}
+
+/// What a version of a run moves with, when it moves.
+#[derive(Debug, PartialEq)]
+struct RowMove {
+    routing: RoutingSnapshot,
+    earlier: Earlier,
+    started_ms: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum RowStep {
+    Rename,
+    Migrate,
+    Broken(String),
+}
+
+/// Checks that a rename still runs, migrates one version, and checks a copy a move could not
+/// read.
+#[derive(Debug, PartialEq)]
+struct MigrateRowOperation {
+    bucket: String,
+    version: VersionKey,
+    target: Compression,
+    moved: Option<RowMove>,
+    moving: bool,
+    /// The moving flag and start of a move whose rename must still run.
+    rename: Option<(bool, u64)>,
+    now_ms: u64,
+    step: RowStep,
+}
+
+impl MigrateRowOperation {
+    fn migrate(&mut self) -> Turn<RowEnd> {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let mut operation = MigrateVersionOperation::new(self.version.clone(), self.target, now);
+        if let Some(moved) = self.moved.take() {
+            self.moving = true;
+            operation = (operation.with_routing(moved.routing))
+                .with_earlier(moved.earlier)
+                .with_mover(moved.started_ms);
         }
-        record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-        store_progress(context, bucket, &record, None).await?;
-        return Ok(None);
+        self.step = RowStep::Migrate;
+        Ok(Next::Call(IoCall::child(operation)))
     }
-    // A due retry pass counts its own skips and failures.
-    if record.retry_at_ms.take().is_some() {
-        record.skipped = 0;
-        record.failed = 0;
+
+    fn migrated(&mut self, moved: Result<MigrateOutcome, MigrateVersionError>) -> Turn<RowEnd> {
+        let error = match moved {
+            Ok(MigrateOutcome::Migrated) => return Ok(Next::Done(RowEnd::Migrated)),
+            Ok(MigrateOutcome::Skipped) => return Ok(Next::Done(RowEnd::Skipped)),
+            Err(error) => error,
+        };
+        // A taken name says nothing about the old copy, so the provider is not asked about it.
+        let taken = matches!(error, MigrateVersionError::Blob(BlobError::PathTaken));
+        if !self.moving || taken {
+            return self.failed(&error.to_string());
+        }
+        self.step = RowStep::Broken(error.to_string());
+        let check = CheckVersionOperation::new(self.version.clone(), self.now_ms);
+        Ok(Next::Call(IoCall::child(check)))
     }
-    let routing = match record.moving {
-        true => match move_routing(context, bucket).await? {
-            Some(routing) => Some(routing),
-            None => {
-                record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-                store_progress(context, bucket, &record, None).await?;
-                return Ok(None);
+
+    fn failed(&self, error: &str) -> Turn<RowEnd> {
+        tracing::warn!(bucket = %self.bucket, %error, "Failed to re-encode a version");
+        Ok(Next::Done(RowEnd::Failed))
+    }
+}
+
+impl Operation for MigrateRowOperation {
+    type Output = RowEnd;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<RowEnd> {
+        if self.rename.is_some() {
+            return Ok(Next::Call(read_row(
+                RENAME_MOVE_KEYSPACE,
+                bucket_key(&self.bucket),
+            )));
+        }
+        self.migrate()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<RowEnd> {
+        match std::mem::replace(&mut self.step, RowStep::Migrate) {
+            RowStep::Rename => {
+                let record = self.rename.unwrap_or((false, 0));
+                let request = decode_request(result.value()?, record)?;
+                if request.is_none_or(|request| request.paused || request.aborted_at_ms.is_some()) {
+                    return Ok(Next::Done(RowEnd::Halted));
+                }
+                self.migrate()
             }
-        },
-        false => None,
-    };
-    // Without earlier patterns no file is renamed, so only an asked rename reads them; each
-    // file is renamed only while the caller who asked may still write its key.
-    let request = match routing.as_ref() {
-        Some(_) => rename_request(context, bucket, &record).await?,
-        None => None,
-    };
-    // An aborted rename ends here with its counts, once no version of it is in flight.
-    if request
-        .as_ref()
-        .is_some_and(|request| request.aborted_at_ms.is_some())
-    {
-        return end_aborted(context, bucket, record).await;
-    }
-    // A paused rename waits for its resume, which wakes this task again.
-    if request.as_ref().is_some_and(|request| request.paused) {
-        return Ok(None);
-    }
-    let (earlier, access) = match routing.as_ref() {
-        Some(routing) => match request.clone() {
-            Some(request) => match rename_access(context, &request, routing, bucket).await? {
-                Some(access) => (read_earlier(context, routing).await?, Some(access)),
-                None => (Earlier::new(), None),
-            },
-            None => (Earlier::new(), None),
-        },
-        None => (Earlier::new(), None),
-    };
-    let write = aruna_core::structs::identity::auth::Permission::WRITE;
-    let mut denied = 0usize;
-    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        BLOB_VERSIONS_KEYSPACE,
-        Some(prefix.into()),
-        record.cursor.clone().map(Into::into),
-        MIGRATION_ROWS,
-        None,
-    )
-    .await?;
-    let keys = versions
-        .iter()
-        .map(|(key, _)| VersionKey::from_bytes(key.as_ref()));
-    let keys: Vec<VersionKey> = keys.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-    // Keys outside a move's prefix are only re-encoded.
-    let moves =
-        |key: &VersionKey| (routing.as_ref()).filter(|_| key.key.starts_with(&record.prefix));
-    // A rename moves several keys at once, but never two versions of one key or one new name.
-    let limit = match request {
-        Some(_) => RENAME_PARALLEL,
-        None => 1,
-    };
-    let name = |key: &VersionKey| {
-        let routing = moves(key).filter(|_| limit > 1)?;
-        Some(place(routing, key).ok()?.1?.path)
-    };
-    let rows = keys.iter().map(|key| (key.key.clone(), name(key)));
-    let mut batch = batch::Batch::new(rows.collect());
-    // Rows the last run of this pass finished after its cursor already count, so they pass.
-    let ahead = read_ahead(context, bucket).await?;
-    let ahead: std::collections::HashSet<Vec<u8>> = ahead
-        .map(|ahead| ahead.rows_for(&record))
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    for (row, (key, _)) in versions.iter().enumerate() {
-        if ahead.contains(key.as_ref()) {
-            batch.passed(row);
-        }
-    }
-    let worked = AtomicUsize::new(0);
-    let (target, started_ms) = (record.target, record.started_at_ms);
-    let start = |row: usize| {
-        let version_key = keys[row].clone();
-        let routing = moves(&version_key).cloned();
-        let moving = routing.is_some();
-        let object = version_key.key.clone();
-        let mut operation = MigrateVersionOperation::new(version_key, target, SystemTime::now());
-        if let Some(routing) = routing {
-            let allowed =
-                (access.as_ref()).is_some_and(|access| access.allows(Some(&object), &write));
-            denied += usize::from(!earlier.is_empty() && !allowed);
-            let earlier = match allowed {
-                true => earlier.clone(),
-                false => Earlier::new(),
-            };
-            operation = (operation.with_routing(routing))
-                .with_earlier(earlier)
-                .with_mover(started_ms);
-        }
-        let (key, worked) = (&versions[row].0, &worked);
-        async move {
-            let moved = crate::driver::drive(operation, context).await;
-            // A taken name says nothing about the old copy, so the provider is not asked about it.
-            let taken = matches!(moved, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
-            let broken = moved.is_err() && moving && !taken && is_broken(context, key).await;
-            let skipped = matches!(moved, Ok(MigrateOutcome::Skipped));
-            worked.fetch_add(usize::from(!skipped), Ordering::Relaxed);
-            if let (Err(error), false) = (&moved, broken) {
-                tracing::warn!(bucket, %error, "Failed to re-encode a version");
-            }
-            (moved, broken)
-        }
-    };
-    // A run with enough work or time stores its progress, and a pause or an abort of the rename
-    // stops it, before the next version starts.
-    let mut started = 0usize;
-    let proceed = || {
-        let spent = begun.elapsed() >= budget || worked.load(Ordering::Relaxed) >= MIGRATION_WORK;
-        let full = started > 0 && spent;
-        started += 1;
-        let (renaming, record) = (request.is_some(), &record);
-        async move {
-            if full {
-                return Ok(Some(Stop::More));
-            }
-            let stopped = renaming && rename_stopped(context, bucket, record).await?;
-            Ok(stopped.then_some(Stop::Halted))
-        }
-    };
-    let (results, stop) = batch::run_rows(&mut batch, limit, start, proceed).await;
-    let stopped = stop? == Some(Stop::Halted);
-    // Each row this run finished counts once; the next run starts after the rows finished in
-    // storage order and passes over those finished after them.
-    let done = batch.done();
-    let rows = batch.finished_after().map(|row| versions[row].0.to_vec());
-    let ahead = MigrationAhead {
-        rows: rows.collect(),
-        ..MigrationAhead::default()
-    };
-    for (moved, broken) in results.into_iter().flatten() {
-        match moved {
-            Ok(MigrateOutcome::Migrated) => record.migrated += 1,
-            Ok(MigrateOutcome::Skipped) => record.skipped += 1,
-            // A move records a copy that cannot be read as broken instead of retrying it.
-            Err(_) if broken => record.skipped += 1,
-            Err(_) => record.failed += 1,
-        }
-    }
-    if let Some(last) = done.checked_sub(1) {
-        record.cursor = Some(versions[last].0.to_vec());
-    }
-    let ahead = MigrationAhead {
-        started_at_ms: record.started_at_ms,
-        retries: record.retries,
-        cursor: record.cursor.clone(),
-        ..ahead
-    };
-    let more = next.is_some() || done < versions.len();
-    if stopped {
-        let aborted = rename_request(context, bucket, &record).await?;
-        if aborted.is_some_and(|request| request.aborted_at_ms.is_some()) {
-            return end_aborted(context, bucket, record).await;
-        }
-        store_progress(context, bucket, &record, Some(&ahead)).await?;
-        return Ok(None);
-    }
-    if denied > 0 {
-        tracing::warn!(
-            bucket,
-            denied,
-            "Files the rename's caller may not write keep their name"
-        );
-    }
-    let now = aruna_core::time::unix_timestamp_millis();
-    let after = match (more, record.failed > 0) {
-        // This run moved the cursor, so the rows left can go on at once.
-        (true, _) => Some(Duration::ZERO),
-        // Successful versions are already in the target, so a retry pass reads no blob for them.
-        (false, true) if record.retries < MIGRATION_RETRIES => {
-            let wait = capped_backoff(RETRY_BASE, RETRY_MAX, record.retries, 0);
-            record.retries += 1;
-            record.cursor = None;
-            record.retry_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
-            Some(wait)
-        }
-        (false, _) => {
-            // A move that ends hands every attempt it still owns to the cleanup queue first;
-            // a long hand-over goes on in the next runs.
-            match record.moving && !hand_over_moves(context, bucket, record.started_at_ms).await? {
-                true => Some(MIGRATION_CONTINUE),
-                false => {
-                    record.finished_at_ms = Some(now);
-                    None
+            RowStep::Migrate => self.migrated(result.child()?),
+            RowStep::Broken(error) => {
+                let checked = result.child::<CheckOutcome, CheckVersionError>()?;
+                match checked {
+                    Ok(CheckOutcome::Broken(_)) => Ok(Next::Done(RowEnd::Broken)),
+                    _ => self.failed(&error),
                 }
             }
         }
-    };
-    store_progress(context, bucket, &record, Some(&ahead)).await?;
-    Ok(after)
-}
-
-/// The rows the last run of a bucket's migration finished after its cursor.
-pub(super) async fn read_ahead(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-) -> Result<Option<MigrationAhead>, String> {
-    let read = StorageEffect::Read {
-        key_space: MIGRATION_AHEAD_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| MigrationAhead::from_bytes(&value))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the rows ahead: {}", other.label())),
     }
 }
 
