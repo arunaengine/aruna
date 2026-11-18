@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::executor::{PayloadHandler, ProgressReporter, RangeTurns};
-use super::reconcile::ExternalReconciler;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
+use crate::tasks::job_reconcile::ExternalReconciler;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -1168,9 +1168,10 @@ mod tests {
         insert_job(&ctx, &record).await.unwrap();
         assert_eq!(runtime.available_slots(), 0);
 
-        let outcome = crate::jobs::job_reads::tests::cancel_owned_job(&ctx, &runtime, owner, job_id)
-            .await
-            .unwrap();
+        let outcome =
+            crate::jobs::job_reads::tests::cancel_owned_job(&ctx, &runtime, owner, job_id)
+                .await
+                .unwrap();
         assert!(matches!(
             outcome,
             crate::jobs::job_cancel::CancelJobOutcome::Requested(_)

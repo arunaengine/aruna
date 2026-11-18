@@ -14,7 +14,6 @@ use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::attempt::{
     AdoptOutcome, adopt_external_attempt, begin_external_running, record_attempt_started,
@@ -27,6 +26,7 @@ use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
 use super::recovery::{park_attempt, requeue_after_tombstone};
 use super::supervise::{supervise_and_finalize, with_execution_heartbeat};
 use crate::driver::DriverContext;
+use crate::tasks::job_reconcile::ExternalReconciler;
 
 /// The real Stage-0 reconcile seam: a lost external attempt is adopted by name and
 /// resolved by evidence (adopt-and-resume, terminalize, or Indeterminate). It never
