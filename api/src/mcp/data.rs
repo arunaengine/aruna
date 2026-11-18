@@ -1324,9 +1324,6 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         ),
         HeadObjectError::StorageError(error) => internal_error(error),
         HeadObjectError::ConversionError(error) => internal_error(error),
-        HeadObjectError::InvalidState { current, expected } => internal_error(format!(
-            "invalid object head state {current:?}; expected {expected:?}"
-        )),
         HeadObjectError::InvalidStateEvent {
             state,
             expected,
@@ -1334,11 +1331,9 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         } => internal_error(format!(
             "unexpected object head event in {state:?}: expected {expected}, got {received}"
         )),
-        HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
         HeadObjectError::StagingSourceError(error) => internal_error(error),
         HeadObjectError::ManagedCopyError(error) => internal_error(error),
-        HeadObjectError::NotFinished => internal_error("object head did not finish"),
         HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
     }
 }
