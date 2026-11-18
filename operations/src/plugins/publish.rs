@@ -24,25 +24,22 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{info, warn};
 
 use super::artifacts::{ArtifactError, managers};
-use super::copies::store_local;
 use super::copies_needed;
-use super::copy_rows::{chunk_count, chunk_of};
+use super::copy_rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
     #[error("the artifact exceeds {MAX_ARTIFACT} bytes")]
     TooLarge,
@@ -66,69 +63,179 @@ pub enum PublishError {
     Unavailable(String),
 }
 
-/// Checks and publishes `artifact` as a realm admin on this management node. Answers only
-/// after a majority of management nodes stored it durably; otherwise nothing is published.
-pub async fn publish_plugin(
-    ctx: &DriverContext,
+impl From<IoError> for PublishError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+/// The entry of a checked artifact and the realm config it was checked against.
+#[derive(Debug, PartialEq)]
+pub struct PublishPlan {
+    config: RealmConfigDocument,
+    entry: PublishedPlugin,
+}
+
+impl PublishPlan {
+    /// Stores the artifact on this node, as the copy the publish counts first.
+    pub fn store_copy<'a>(&self, artifact: &'a [u8]) -> StoreCopy<'a> {
+        let (digest, now_ms) = (&self.entry.digest, self.entry.published_at_ms);
+        StoreCopy::new(&self.config, digest, artifact, now_ms)
+    }
+}
+
+/// What a checked publish does next.
+#[derive(Debug, PartialEq)]
+pub enum PublishStep {
+    /// The identical version is already published.
+    Known(PublishedPlugin),
+    Store(Box<PublishPlan>),
+}
+
+/// Checks `artifact` for a realm admin on this management node and writes nothing.
+#[derive(Debug, PartialEq)]
+pub struct CheckPublish {
     actor: Actor,
-    auth_context: AuthContext,
+    auth: AuthContext,
+    entry: PublishedPlugin,
+    allowed: bool,
+}
+
+impl CheckPublish {
+    pub fn new(
+        actor: &Actor,
+        auth: &AuthContext,
+        artifact: &[u8],
+        now_ms: u64,
+    ) -> Result<Self, PublishError> {
+        if artifact.len() > MAX_ARTIFACT {
+            return Err(PublishError::TooLarge);
+        }
+        let invalid = |error: String| PublishError::Invalid(error);
+        let manifest = check_artifact(artifact).map_err(|error| invalid(error.to_string()))?;
+        let stored = serde_json::to_string(&manifest);
+        let entry = PublishedPlugin {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            digest: ArtifactDigest::of(artifact).to_string(),
+            size: artifact.len() as u64,
+            manifest: stored.map_err(|error| invalid(error.to_string()))?,
+            published_by: actor.user_id,
+            published_at_ms: now_ms,
+        };
+        Ok(Self {
+            actor: actor.clone(),
+            auth: auth.clone(),
+            entry,
+            allowed: false,
+        })
+    }
+}
+
+impl Operation for CheckPublish {
+    type Output = PublishStep;
+    type Error = PublishError;
+
+    fn first(&mut self) -> Result<Next<PublishStep>, PublishError> {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.auth.clone(),
+            path: policy_admin_path(self.actor.realm_id),
+            required_permission: Permission::WRITE,
+        });
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishStep>, PublishError> {
+        if !self.allowed {
+            let allowed = result.child::<bool, AuthorizationError>()?;
+            if !allowed.unwrap_or(false) {
+                return Err(PublishError::Unauthorized);
+            }
+            self.allowed = true;
+            let read = GetConfigOperation::new(self.actor.realm_id);
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        let config = config
+            .map_err(|error| PublishError::Unavailable(format!("realm config: {error:?}")))?;
+        if !is_management(&config, self.actor.node_id) {
+            return Err(PublishError::NotManagementNode);
+        }
+        if let Some(existing) = same_version(&config, &self.entry)? {
+            return Ok(Next::Done(PublishStep::Known(existing)));
+        }
+        let entry = self.entry.clone();
+        let plan = Box::new(PublishPlan { config, entry });
+        Ok(Next::Done(PublishStep::Store(plan)))
+    }
+}
+
+/// Copies a locally stored artifact to the other management nodes and writes the entry once a
+/// majority holds it durably; otherwise nothing is published.
+#[derive(Debug, PartialEq)]
+pub struct FinishPublish {
+    actor: Actor,
+    auth: AuthContext,
+    plan: PublishPlan,
     artifact: Vec<u8>,
-) -> Result<PublishedPlugin, PublishError> {
-    if artifact.len() > MAX_ARTIFACT {
-        return Err(PublishError::TooLarge);
+    stored: Option<usize>,
+}
+
+impl FinishPublish {
+    pub fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Vec<u8>) -> Self {
+        Self {
+            actor,
+            auth,
+            plan,
+            artifact,
+            stored: None,
+        }
     }
-    let manifest =
-        check_artifact(&artifact).map_err(|err| PublishError::Invalid(err.to_string()))?;
-    let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-        auth_context: auth_context.clone(),
-        path: policy_admin_path(actor.realm_id),
-        required_permission: Permission::WRITE,
-    });
-    if !drive(check, ctx).await.unwrap_or(false) {
-        return Err(PublishError::Unauthorized);
+
+    /// The entry write once enough copies exist; its transaction counts them again.
+    fn write(&mut self, result: IoResult) -> Result<Next<PublishedPlugin>, PublishError> {
+        let copies = result.child::<BTreeSet<NodeId>, CopyError>()?;
+        let mut copies = copies.unwrap_or_default();
+        copies.insert(self.actor.node_id);
+        let managers = managers(&self.plan.config).count();
+        let (stored, needed) = (copies.len(), copies_needed(managers));
+        if stored < needed {
+            return Err(PublishError::TooFewCopies { stored, needed });
+        }
+        self.stored = Some(stored);
+        let write = PublishEntryOperation::new(PublishEntryConfig {
+            actor: self.actor.clone(),
+            auth_context: self.auth.clone(),
+            plugin: self.plan.entry.clone(),
+            copies,
+        });
+        Ok(Next::Call(IoCall::child(write)))
     }
-    let config = drive(GetConfigOperation::new(actor.realm_id), ctx)
-        .await
-        .map_err(|err| PublishError::Unavailable(format!("realm config: {err:?}")))?;
-    if !is_management(&config, actor.node_id) {
-        return Err(PublishError::NotManagementNode);
+}
+
+impl Operation for FinishPublish {
+    type Output = PublishedPlugin;
+    type Error = PublishError;
+
+    fn first(&mut self) -> Result<Next<PublishedPlugin>, PublishError> {
+        let local = self.actor.node_id;
+        let peers = managers(&self.plan.config).filter(|node| *node != local);
+        let digest = self.plan.entry.digest.clone();
+        let artifact = std::mem::take(&mut self.artifact);
+        let copy = copy_artifact(peers.collect(), digest, artifact);
+        Ok(Next::Call(IoCall::child(copy)))
     }
-    let digest = ArtifactDigest::of(&artifact);
-    let published_at = unix_timestamp_millis();
-    let entry = PublishedPlugin {
-        name: manifest.name.clone(),
-        version: manifest.version.clone(),
-        digest: digest.to_string(),
-        size: artifact.len() as u64,
-        manifest: serde_json::to_string(&manifest)
-            .map_err(|err| PublishError::Invalid(err.to_string()))?,
-        published_by: actor.user_id,
-        published_at_ms: published_at,
-    };
-    if let Some(existing) = same_version(&config, &entry)? {
-        return Ok(existing);
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishedPlugin>, PublishError> {
+        let Some(stored) = self.stored else {
+            return self.write(result);
+        };
+        let published = result.child::<PublishedPlugin, EntryError>()??;
+        let (name, version) = (&published.name, &published.version);
+        let digest = &published.digest;
+        info!(%name, %version, %digest, stored, "Published a plugin version");
+        Ok(Next::Done(published))
     }
-    store_local(ctx, &config, digest.as_str(), &artifact, published_at).await?;
-    let peers = managers(&config)
-        .filter(|node| *node != actor.node_id)
-        .collect();
-    let copy = copy_artifact(peers, digest.to_string(), artifact);
-    let mut copies = drive(copy, ctx).await.unwrap_or_default();
-    copies.insert(actor.node_id);
-    let (stored, needed) = (copies.len(), copies_needed(managers(&config).count()));
-    if stored < needed {
-        return Err(PublishError::TooFewCopies { stored, needed });
-    }
-    // The entry transaction counts these copies again against the managers it reads.
-    let write = PublishEntryOperation::new(PublishEntryConfig {
-        actor,
-        auth_context,
-        plugin: entry,
-        copies,
-    });
-    let published = drive(write, ctx).await?;
-    info!(name = %published.name, version = %published.version, digest = %published.digest, stored, "Published a plugin version");
-    Ok(published)
 }
 
 /// The already published identical version, or an error when the version has other bytes.

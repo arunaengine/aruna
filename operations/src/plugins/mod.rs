@@ -5,7 +5,6 @@
 pub mod account;
 pub mod artifacts;
 pub mod bound;
-pub mod broker;
 pub mod check;
 pub mod cleanup;
 pub mod clock;
@@ -24,22 +23,20 @@ pub mod hooks;
 pub(crate) mod host_calls;
 pub mod install;
 pub mod intents;
-pub mod jobs;
 pub mod journal;
 pub mod lifecycle;
 pub mod marks;
 
 pub mod matcher;
 pub mod objects;
-pub mod outbound;
 pub mod outgoing;
-pub mod plugin_work;
+pub(crate) mod peer;
 pub mod prune;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
+pub(crate) mod reconcile;
 pub mod records;
-pub mod release;
 pub mod replay;
 pub mod rows;
 pub mod rules;
@@ -49,14 +46,18 @@ pub mod settings;
 pub mod state;
 pub mod submit;
 pub mod sweep;
-mod transfers;
 pub mod waiting;
 pub mod work;
 pub(crate) mod work_calls;
-pub mod worker;
 
 use aruna_plugins::broker::{ErrorKind, HostError};
 
+#[cfg(test)]
+#[path = "calls_tests.rs"]
+pub(crate) mod calls;
+#[cfg(test)]
+#[path = "fixtures_tests.rs"]
+pub(crate) mod fixtures;
 #[cfg(test)]
 #[path = "store_tests.rs"]
 pub(crate) mod store;
