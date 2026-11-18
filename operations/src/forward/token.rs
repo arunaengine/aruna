@@ -263,7 +263,12 @@ mod tests {
         // A failed or timed out attempt moves on: replaying a revocation is safe.
         let mut operation = planned(&[node(1), node(2), node(3)]);
         operation.ask().unwrap();
-        let failed = failed_answer(node(1), PeerRequestError::Failed("gone".to_string()));
+        let failed = failed_answer(
+            node(1),
+            PeerRequestError::Failed(aruna_core::metadata::MetadataError::Backend(
+                "gone".to_string(),
+            )),
+        );
         assert_eq!(asked(operation.next(failed)).0, node(2));
         let late = failed_answer(node(2), PeerRequestError::TimedOut);
         assert_eq!(asked(operation.next(late)).0, node(3));

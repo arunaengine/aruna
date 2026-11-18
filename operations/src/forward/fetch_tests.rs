@@ -95,7 +95,9 @@ fn misses_not_found() {
     operation.step(reply(
         node(2),
         1,
-        Err(PeerRequestError::Failed(MetadataError::Backend("down".into()))),
+        Err(PeerRequestError::Failed(MetadataError::Backend(
+            "down".into(),
+        ))),
     ));
     operation.step(answer(node(3), 1, "missing"));
     assert_eq!(operation.finalize(), Ok(Fetched::NotFound));
@@ -103,7 +105,13 @@ fn misses_not_found() {
     let mut operation = fetch(Budget::Shared);
     operation.start();
     for peer in [node(1), node(2), node(3)] {
-        operation.step(reply(peer, 1, Err(PeerRequestError::Failed(MetadataError::Backend("down".into())))));
+        operation.step(reply(
+            peer,
+            1,
+            Err(PeerRequestError::Failed(MetadataError::Backend(
+                "down".into(),
+            ))),
+        ));
     }
     assert_eq!(
         operation.finalize(),

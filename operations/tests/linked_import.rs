@@ -35,7 +35,7 @@ use aruna_core::structs::storage::group_backend::{
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::purge::{scope_totals, storage_files};
@@ -155,9 +155,12 @@ async fn setup_pattern(pattern: &str) -> TestContext {
     let root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     std::fs::create_dir_all(format!("{root}/blobs")).unwrap();
     let node = NodeBackend::new(
         BackendConfig {
