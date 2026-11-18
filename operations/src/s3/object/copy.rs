@@ -5,42 +5,48 @@
 pub mod sealed;
 
 use crate::distribution::held::record_only;
-use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContextError, GateOperation};
-use crate::s3::bucket::get::GetBucketOperation;
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::fence_store::FenceCheckOperation;
-use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
+use crate::s3::object::copy::sealed::{
+    SealedCopyError, SealedCopyInput, SealedCopyOperation, SealedCopyResult,
+};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::{TokenRead, read_source};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use crate::s3::object::read::{ReadSourceOperation, TokenRead};
+use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::storage::routing::resolve_backend;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -119,6 +125,14 @@ pub enum CopyObjectError {
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
+
+impl From<IoError> for CopyObjectError {
+    fn from(error: IoError) -> Self {
+        Self::Get(error.into())
+    }
+}
+
+type CopyTurn<T> = Result<Next<T>, CopyObjectError>;
 
 /// A sealed copy fails like the write it stands in for, or like a missing source.
 fn sealed_error(error: SealedCopyError) -> CopyObjectError {
@@ -217,287 +231,6 @@ pub(crate) fn evaluate_source_conditions(
     Ok(())
 }
 
-pub async fn copy_object(
-    context: &DriverContext,
-    input: CopyObjectInput,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_object_tracked(context, input, None).await
-}
-
-/// `copy_object` with the bytes pulled so far published on `progress`, so a
-/// job can report a long source read while it runs.
-pub async fn copy_object_tracked(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    progress: Option<Arc<AtomicU64>>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, progress, (None, None)).await
-}
-
-/// `copy_object_tracked` that writes the version `version_id`, minted once by the caller, so a
-/// retry after a lost answer replays that version instead of writing another one.
-pub async fn copy_object_at(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    version_id: Ulid,
-    progress: Option<Arc<AtomicU64>>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, progress, (None, Some(version_id))).await
-}
-
-/// `copy_object` where `token` admits the source read while its bucket key is locked.
-/// Reads a copy source a member streams to the destination's coordinator; the conditions are
-/// checked before any byte moves.
-pub async fn read_copy_source(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    conditions: &CopySourceConditions,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, CopyObjectError> {
-    let source = read_source(context, input, restrictions, token).await?;
-    let last_modified = (source.info.version_created_at)
-        .or_else(|| source.location.as_ref().map(|location| location.created_at))
-        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.last_modified));
-    let etag = (source.location.as_ref())
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.etag.clone()));
-    evaluate_source_conditions(conditions, etag.as_deref(), last_modified, true)?;
-    Ok(source)
-}
-
-pub async fn copy_object_token(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    token: Option<TokenRead>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, None, (token.as_ref(), None)).await
-}
-
-async fn copy_inner(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    progress: Option<Arc<AtomicU64>>,
-    (token, version): (Option<&TokenRead>, Option<Ulid>),
-) -> Result<CopyResultData, CopyObjectError> {
-    // A given version that already exists was written by an earlier attempt whose answer was
-    // lost; it is answered without the source, which may be gone by now.
-    if let Some(version_id) = version
-        && let Some(committed) = committed_copy(context, &input, version_id).await?
-    {
-        return Ok(committed);
-    }
-    drive(
-        FenceCheckOperation::new(&input.dest_bucket, &input.dest_key),
-        context,
-    )
-    .await
-    .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
-    // The description touches no source, so a reference can be kept without
-    // contacting its connector.
-    let head = drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: input.source_bucket.clone(),
-            key: input.source_key.clone(),
-            version_id: input.source_version_id,
-        }),
-        context,
-    )
-    .await
-    .map_err(head_error)?;
-    let source_last_modified = head
-        .version_created_at
-        .or_else(|| head.location.as_ref().map(|location| location.created_at))
-        .or_else(|| {
-            head.source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        });
-    let source_etag = head
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            head.source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    evaluate_source_conditions(
-        &input.conditions,
-        source_etag.as_deref(),
-        source_last_modified,
-        true,
-    )?;
-    // A record-only version of a distributed bucket is read through a holder, never kept.
-    let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
-    if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
-        // Another bucket reads the reference without the source's lock, so admit it here.
-        if input.source_bucket != input.dest_bucket {
-            admit_source(context, &input).await?;
-        }
-        let source = (head, source_last_modified);
-        return preserve_reference(context, input, source, version).await;
-    }
-    // A sealed source in the same bucket is aliased, never read, so it copies while locked. Its
-    // version cannot be given, so a copy with a given version reads the source instead.
-    if let Some(location) = head.location.clone().filter(|location| {
-        location.format.bucket_key().is_some()
-            && input.source_bucket == input.dest_bucket
-            && version.is_none()
-    }) {
-        return sealed_copy(context, input, head, location, source_last_modified).await;
-    }
-
-    let source_names = (input.source_bucket.clone(), input.source_key.clone());
-    let source_input = GetObjectInput {
-        bucket: input.source_bucket,
-        key: input.source_key,
-        version_id: input.source_version_id,
-        range: None,
-        group_id: input.source_group_id,
-        user_identity: input.source_auth_context.user_id,
-        realm_id: input.source_auth_context.realm_id,
-        node_id: input.node_id,
-    };
-    let restrictions = input.source_auth_context.path_restrictions.clone();
-    let source = read_source(context, source_input, restrictions, token).await?;
-
-    let source_version_id = source.version_id;
-    let materialized = source.location.is_some();
-    let content_length = source.location.as_ref().map(|location| location.blob_size);
-    let version_source = if materialized {
-        source.source_binding.clone()
-    } else {
-        source
-            .source_binding
-            .clone()
-            .map(|binding| VersionSourceBinding {
-                strategy: StagingStrategy::Snapshot,
-                ..binding
-            })
-    };
-    let mut metadata = input.metadata.unwrap_or(source.metadata);
-    // A copy is never a release, even of a release crate.
-    strip_release_keys(&mut metadata);
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(context),
-            input.group_id,
-            BucketRules::Named(input.dest_bucket.to_string()),
-        ),
-        context,
-    )
-    .await?;
-    // Bytes the destination's backend already holds in the destination's encoding
-    // are adopted, not streamed; another encoding gets its own copy. A key under a
-    // backend import folder streams, so its file appears at the folder's path.
-    let (bucket, key) = (&input.dest_bucket, &input.dest_key);
-    let plain = routing.plain_target(bucket, key, Ulid::nil()).is_some();
-    let adopt = source.location.clone().filter(|location| {
-        !plain
-            && resolve_backend(&routing, &input.dest_bucket, &input.dest_key).is_ok_and(
-                |resolved| {
-                    resolved.backend == location.backend
-                        && EncodingClass::from(resolved.compression) == location.format.encoding()
-                },
-            )
-    });
-    let body = match (adopt.is_some(), progress) {
-        (true, _) => None,
-        (false, Some(pulled)) => Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
-            if let Ok(bytes) = chunk {
-                pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            }
-        })))),
-        (false, None) => Some(source.blob),
-    };
-
-    // Materialized source bytes are kept only when they match every recorded full-object digest.
-    let expected_checksums = source
-        .source_metadata
-        .as_ref()
-        .map(SourceMetadata::enforced_checksums)
-        .unwrap_or_default();
-    let gate = drive(
-        GateOperation::new(input.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await?;
-    let origin = copy_origin(
-        context,
-        (input.realm_id, input.node_id),
-        (&source_names.0, &source_names.1),
-        (source_version_id, input.job_id),
-    )
-    .await;
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: input.user_id,
-        group_id: input.group_id,
-        realm_id: input.realm_id,
-        node_id: input.node_id,
-        request: PutObjectInput {
-            bucket: input.dest_bucket,
-            key: input.dest_key,
-            content_length,
-            body,
-        },
-        expected_checksums,
-        checksum_type: None,
-        exists: false,
-        version_source,
-        preassigned_version_id: version,
-        quota_ceiling: input.quota_ceiling,
-        routing,
-    })
-    .without_envelope()
-    .with_metadata(metadata)
-    .with_version_origin(origin)
-    .with_inherited_policies(source.source_policies.clone())
-    .with_restrictions(input.restrictions.clone());
-    if let Some(location) = adopt {
-        operation = operation.with_adopted(location);
-    }
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    let put_result = drive(operation, context).await?;
-
-    // The new version time owns copy time when dedup reuses an older location.
-    let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
-
-    Ok(CopyResultData {
-        size: put_result.location.blob_size,
-        location: Some(put_result.location),
-        source_metadata: None,
-        version_id: put_result.version_id,
-        created_at,
-        source_version_id,
-        source_last_modified,
-    })
-}
-
-/// A copy's origin: its exact source version, by global id in a distributed bucket.
-async fn copy_origin(
-    context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
-    (bucket, key): (&str, &str),
-    (version_id, job_id): (Option<Ulid>, Option<Ulid>),
-) -> Option<VersionOrigin> {
-    let version_id = version_id?;
-    let source = drive(GetBucketOperation::new(bucket.to_string()), context)
-        .await
-        .ok()?;
-    let distributed = source.distribution.is_some();
-    source_origin(
-        (realm_id, node_id),
-        (bucket, key),
-        (version_id, job_id),
-        distributed,
-    )
-}
-
 /// The origin of a copy of `version_id`: its global id in a distributed bucket, else its ARN.
 pub fn source_origin(
     (realm_id, node_id): (RealmId, NodeId),
@@ -517,55 +250,15 @@ pub fn source_origin(
     Some(VersionOrigin::Copy { from, job_id })
 }
 
-/// Publishes the destination as a new version of the source's archive and grants.
-async fn sealed_copy(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    head: HeadObjectResult,
-    location: BackendLocation,
-    source_last_modified: Option<SystemTime>,
-) -> Result<CopyResultData, CopyObjectError> {
-    let source_version_id = head
-        .version_id
-        .ok_or(CopyObjectError::Get(GetObjectError::NoSuchVersion))?;
-    let operation = SealedCopyOperation::new(SealedCopyInput {
-        bucket: input.dest_bucket,
-        source_key: input.source_key,
-        source_version_id,
-        location: location.clone(),
-        source_policies: head.source_policies,
-        size: location.blob_size,
-        dest_key: input.dest_key,
-        metadata: input.metadata,
-        user_id: input.user_id,
-        group_id: input.group_id,
-        realm_id: input.realm_id,
-        node_id: input.node_id,
-        quota_ceiling: input.quota_ceiling,
-        job_id: input.job_id,
-    });
-    let operation = match drive(
-        GateOperation::new(input.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await?
-    {
-        Some(gate) => operation.with_gate(gate),
-        None => operation,
-    };
-    let version_id = drive(operation, context)
-        .await
-        .map_err(sealed_error)?
-        .version_id;
-    Ok(CopyResultData {
-        size: location.blob_size,
-        location: Some(location),
-        source_metadata: None,
-        version_id,
-        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
-        source_version_id: Some(source_version_id),
-        source_last_modified,
-    })
+/// When a source was last modified, as far as its version record or observation tells.
+fn source_modified(
+    created_at: Option<SystemTime>,
+    location: Option<&BackendLocation>,
+    metadata: Option<&SourceMetadata>,
+) -> Option<SystemTime> {
+    created_at
+        .or_else(|| location.map(|location| location.created_at))
+        .or_else(|| metadata.and_then(|metadata| metadata.last_modified))
 }
 
 /// The destination version `version_id` when it exists, described as the copy that wrote it.
