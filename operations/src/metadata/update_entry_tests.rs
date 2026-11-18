@@ -170,7 +170,7 @@ fn record() -> MetadataRegistryRecord {
         graph_iri: MetadataRegistryRecord::graph_iri_for(document()),
         public: false,
         permission_path: String::new(),
-        placement: Default::default(),
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 1,
         updated_at_ms: 2,

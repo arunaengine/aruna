@@ -20,7 +20,7 @@ fn record(cursor: u64) -> MetadataRegistryRecord {
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         public: true,
         permission_path: String::new(),
-        placement: Default::default(),
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -169,7 +169,9 @@ fn visible_needs_record() {
     );
     visible.first().unwrap();
     assert_eq!(
-        visible.next(child(Ok::<_, LiveRecordsError>(None))),
+        visible.next(child(
+            Ok::<Option<MetadataRegistryRecord>, LiveRecordsError>(None)
+        )),
         Err(MetadataApiError::NotFound)
     );
 }

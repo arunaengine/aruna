@@ -350,6 +350,7 @@ mod pure_tests {
     use super::*;
     use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
+    use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
     use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
     use aruna_core::keyspaces::{
         SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,

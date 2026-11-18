@@ -9,8 +9,11 @@ use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::live_records::LiveRecordsOperation;
 use aruna_core::StructuredId;
 use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::storage_entries::document_lifecycle_key;
+use aruna_core::storage_entries::graph_lifecycle_key;
 
 #[tokio::test]
 async fn filters_graph_delete() {

@@ -200,7 +200,9 @@ impl RouteCreateOperation {
                 return self.ask_next();
             }
             Ok(Err(error)) => return Err(possibly_applied(holder, &error.to_string())),
-            Err(PeerRequestError::Failed(error)) => return Err(possibly_applied(holder, &error)),
+            Err(PeerRequestError::Failed(error)) => {
+                return Err(possibly_applied(holder, &error.to_string()));
+            }
             Err(PeerRequestError::TimedOut) => {
                 return Err(possibly_applied(holder, "no answer in time"));
             }

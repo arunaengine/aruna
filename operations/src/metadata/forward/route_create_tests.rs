@@ -55,7 +55,7 @@ fn created() -> CreateDocumentResult {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: false,
             permission_path: String::new(),
-            placement: Default::default(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -132,7 +132,12 @@ fn non_holder_reads_config() {
 fn unsent_tries_next() {
     // A request that never left this node asks the next holder; a failed one stops.
     let mut route = forwarding(&[node(2), node(3)]);
-    let unsent = answered(node(2), Err(PeerRequestError::NotSent("no stream".into())));
+    let unsent = answered(
+        node(2),
+        Err(PeerRequestError::NotSent(MetadataError::Backend(
+            "no stream".into(),
+        ))),
+    );
     let Ok(Next::Call(IoCall::Effect(next))) = route.next(unsent) else {
         panic!("expected the next holder");
     };
@@ -140,7 +145,12 @@ fn unsent_tries_next() {
         *next,
         Effect::Net(NetEffect::MetadataRequest(ref request)) if request.peer == node(3)
     ));
-    let failed = answered(node(3), Err(PeerRequestError::Failed("reset".into())));
+    let failed = answered(
+        node(3),
+        Err(PeerRequestError::Failed(MetadataError::Backend(
+            "reset".into(),
+        ))),
+    );
     let Err(MetadataWriteError::Undeliverable(detail)) = route.next(failed) else {
         panic!("expected the terminal refusal");
     };

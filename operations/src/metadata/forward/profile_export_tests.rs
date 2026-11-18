@@ -27,7 +27,7 @@ fn record() -> MetadataRegistryRecord {
         graph_iri: MetadataRegistryRecord::graph_iri_for(profile_id()),
         public: true,
         permission_path: String::new(),
-        placement: Default::default(),
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -137,7 +137,7 @@ fn peer_answers_collect() {
     let answer = MetadataTransportMessage::ExportAnswer {
         result: Ok(Box::new(served())),
     };
-    let answers = child(Ok::<_, FetchError>(vec![(peer, Ok(answer))]));
+    let answers = child(Ok::<_, FetchError>(vec![(peer, Ok::<_, String>(answer))]));
     assert_eq!(export.next(answers), Ok(Next::Done(served())));
     assert_eq!(
         export_answer(Err("no answer".to_string())),

@@ -128,7 +128,7 @@ mod call_tests {
                 "datasets/read",
                 document_id,
             ),
-            placement: Default::default(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,

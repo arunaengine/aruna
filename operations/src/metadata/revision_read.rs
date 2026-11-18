@@ -307,7 +307,7 @@ mod call_tests {
         event(10).record.document_id
     }
 
-    fn revision(winning: u8) -> MetadataRawRevision {
+    fn raw_revision(winning: u8) -> MetadataRawRevision {
         MetadataRawRevision {
             jsonld: "{}".to_string(),
             winning_event_id: Ulid::from_bytes([winning; 16]),
@@ -376,7 +376,7 @@ mod call_tests {
             revision(4),
         );
         assert_eq!(behind.projected_event_id, None);
-        let missing = displayed(None, revision(4));
+        let missing = displayed(None, raw_revision(4));
         assert_eq!(missing.projection_state, MaterializationState::Pending);
         assert_eq!(missing.projected_event_id, None);
     }

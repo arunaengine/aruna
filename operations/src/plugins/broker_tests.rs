@@ -5,6 +5,7 @@
 
 use crate::driver::drive;
 use crate::metadata::forward::routed_export::RoutedExportOperation;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use std::collections::BTreeMap;
 
 use super::*;

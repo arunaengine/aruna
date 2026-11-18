@@ -11,14 +11,13 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataQueryResults,
-    MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataRoCratePage,
+    MetadataSearchHit,
 };
-use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, pending_projection_target};
+use aruna_core::storage_entries::{event_log_key, pending_projection_target};
 use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

@@ -129,7 +129,7 @@ impl ForwardRevokeOperation {
                 warn!(%peer, "Token revocation forwarding attempt timed out");
                 self.ask()
             }
-            Err(PeerRequestError::Failed(error)) => {
+            Err(PeerRequestError::Failed(error) | PeerRequestError::NotSent(error)) => {
                 warn!(%peer, %error, "Failed to forward a token revocation");
                 self.ask()
             }

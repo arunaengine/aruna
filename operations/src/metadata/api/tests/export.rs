@@ -6,6 +6,9 @@ use super::list::summary_request;
 use super::*;
 use crate::driver::drive;
 use crate::metadata::api::export::ExportOperation;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::metadata::GraphLifecycleRecord;
+use aruna_core::storage_entries::graph_lifecycle_key;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {
@@ -114,60 +117,6 @@ fn raw_identity_fence() {
         TEST_REALM_ID,
         Ulid::generate()
     ));
-}
-
-// The record lives only in the registry cache and the graph was never
-// projected, so a returned summary can only come from the summary cache.
-#[tokio::test]
-async fn summary_from_cache() {
-    let test = metadata_test();
-    let record = public_record(Ulid::generate(), Ulid::generate());
-    seed_registry_cache(&test, &record).await;
-    summary_cache().insert(
-        &record.graph_iri,
-        record.last_event_id,
-        "{\"cached\":true}",
-        Instant::now(),
-    );
-
-    let result = list_visible_documents(
-        &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
-    )
-    .await
-    .expect("summary listing succeeds");
-
-    assert_eq!(result.documents.len(), 1);
-    assert_eq!(
-        result.documents[0].rocrate_summary_jsonld.as_deref(),
-        Some("{\"cached\":true}")
-    );
-}
-
-#[tokio::test]
-async fn stale_summary_refused() {
-    // A cursor advance must fall through to the handle, not serve the entry.
-    let test = metadata_test();
-    let record = public_record(Ulid::generate(), Ulid::generate());
-    seed_registry_cache(&test, &record).await;
-    summary_cache().insert(
-        &record.graph_iri,
-        Ulid::generate(),
-        "{\"stale\":true}",
-        Instant::now(),
-    );
-
-    let result = list_visible_documents(
-        &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
-    )
-    .await
-    .expect("summary listing succeeds");
-
-    assert_eq!(result.documents.len(), 1);
-    assert!(result.documents[0].rocrate_summary_jsonld.is_none());
 }
 
 #[tokio::test]

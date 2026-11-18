@@ -1546,7 +1546,7 @@ mod tests {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: String::new(),
-            placement: Default::default(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -1633,7 +1633,11 @@ mod tests {
     fn missing_status_stale() {
         let mut operation = ValidationStatusOperation::new(digest_record());
         operation.first().unwrap();
-        let Ok(Next::Done(status)) = operation.next(child(Ok::<_, MetadataError>(None))) else {
+        let Ok(Next::Done(status)) = operation
+            .next(child(Ok::<Option<ProfileValidationStatus>, MetadataError>(
+                None,
+            )))
+        else {
             panic!("expected the status");
         };
         assert_eq!(

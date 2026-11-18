@@ -156,7 +156,7 @@ impl Operation for GetDocumentOperation {
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
     use crate::metadata::record_reads::RecordMaterializedOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;

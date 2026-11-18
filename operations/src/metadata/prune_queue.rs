@@ -142,7 +142,7 @@ impl Operation for PruneGraphOperation {
             PruneStage::Lifecycle => {
                 let deleted = result
                     .child::<bool, GraphDeletedError>()?
-                    .map_err(GraphDeletedError::into_error::<MetadataError>)?;
+                    .map_err(MetadataError::from)?;
                 if !deleted {
                     return Ok(Next::Done(false));
                 }
@@ -728,11 +728,17 @@ pub(crate) fn jobs_queued() -> DuePruneOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverContext;
+    use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::handle::Handle;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::FjallStorage;
+    use aruna_storage::StorageHandle;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 

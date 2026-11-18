@@ -101,7 +101,7 @@ mod call_tests {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: false,
             permission_path: String::new(),
-            placement: Default::default(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -171,7 +171,7 @@ mod call_tests {
                 materialization_status_key(current.document_id),
             )])))
         );
-        let answer = |row| read.next(IoResult::Values(vec![row]));
+        let mut answer = |row| read.next(IoResult::Values(vec![row]));
         assert_eq!(answer(None), Ok(Next::Done(true)));
         assert_eq!(
             answer(status(

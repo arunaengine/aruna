@@ -427,6 +427,39 @@ mod tests {
         assert_eq!(options.search_storage, MetadataSearchStorage::Disk);
     }
 
+    // The graph was never written, so a returned summary can only come from the summary cache;
+    // a cursor advance must fall through to the store.
+    #[tokio::test]
+    async fn summary_follows_cursor() {
+        let dir = tempfile::tempdir().expect("graph dir");
+        let graph = GraphHandle::open(dir.path(), node_id(1), None, None, memory_options())
+            .expect("graph opens");
+        let graph_iri = "https://w3id.org/aruna/summary".to_string();
+        let cursor = ulid::Ulid::from_parts(1, 1);
+        let at = |cursor| aruna_core::metadata::MetadataEffect::ExportSummaryAt {
+            graph_iri: graph_iri.clone(),
+            cursor,
+        };
+        (graph.inner.summaries).insert(
+            &graph_iri,
+            cursor,
+            "{\"cached\":true}",
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            graph.run(at(cursor)).await,
+            aruna_core::metadata::MetadataEvent::RoCrateSummaryResult {
+                graph_iri: graph_iri.clone(),
+                jsonld: "{\"cached\":true}".to_string(),
+            }
+        );
+        let stale = graph.run(at(ulid::Ulid::from_parts(2, 2))).await;
+        assert!(!matches!(
+            stale,
+            aruna_core::metadata::MetadataEvent::RoCrateSummaryResult { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn flush_without_sync() {
         let dir = tempfile::tempdir().expect("graph dir");

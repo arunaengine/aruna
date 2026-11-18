@@ -134,7 +134,7 @@ mod call_tests {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: false,
             permission_path: String::new(),
-            placement: Default::default(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             holder_node_ids: holders,
             created_at_ms: 1,
             updated_at_ms: 1,

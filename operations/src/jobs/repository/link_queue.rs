@@ -8,15 +8,12 @@ use std::time::{Duration, SystemTime};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     RepositoryLink,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use aruna_tasks::TaskHandle;
@@ -28,7 +25,6 @@ use super::link_reads::{LinkTimerOperation, QueueDeletedOperation};
 use super::link_store::{change_link, ensure_lineage, read_link};
 use super::links::{
     ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation,
-    schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;

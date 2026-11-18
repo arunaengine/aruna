@@ -11,6 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::metadata::{
     CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
     ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
@@ -21,6 +22,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
