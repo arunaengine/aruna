@@ -41,25 +41,34 @@ pub fn retry_effect(record: &BucketAuditRecord) -> Effect {
 /// Timer rows one resume page reads.
 const TIMER_PAGE: usize = 256;
 
-/// Writes one audit record and, for a record that must survive a crash, syncs it to disk. A
-/// child, so its parent sees a failed write and decides what follows.
+/// Writes audit records in one batch and, for records that must survive a crash, syncs them to
+/// disk. A child, so its parent sees a failed write and decides what follows.
 #[derive(Debug, PartialEq)]
 pub(crate) struct AuditWrite {
-    row: (String, Key, Value),
+    rows: Vec<(String, Key, Value)>,
     sync: bool,
     syncing: bool,
 }
 
 impl AuditWrite {
     pub(crate) fn new(record: &BucketAuditRecord, sync: bool) -> Result<Self, ConversionError> {
-        let key = record.key().into();
-        let row = (
-            BUCKET_AUDIT_KEYSPACE.to_string(),
-            key,
-            record.to_bytes()?.into(),
-        );
+        Self::batch(std::slice::from_ref(record), sync)
+    }
+
+    pub(crate) fn batch(
+        records: &[BucketAuditRecord],
+        sync: bool,
+    ) -> Result<Self, ConversionError> {
+        let row = |record: &BucketAuditRecord| {
+            let value = record.to_bytes()?.into();
+            Ok((
+                BUCKET_AUDIT_KEYSPACE.to_string(),
+                record.key().into(),
+                value,
+            ))
+        };
         Ok(Self {
-            row,
+            rows: records.iter().map(row).collect::<Result<_, _>>()?,
             sync,
             syncing: false,
         })
@@ -71,7 +80,7 @@ impl Operation for AuditWrite {
     type Error = StorageError;
 
     fn first(&mut self) -> Result<Next<()>, StorageError> {
-        Ok(Next::Call(IoCall::Write(vec![self.row.clone()])))
+        Ok(Next::Call(IoCall::Write(self.rows.clone())))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, StorageError> {
