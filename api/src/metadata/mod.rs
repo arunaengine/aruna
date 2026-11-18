@@ -223,15 +223,12 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
 
 /// The crate or entity with objects of local distributed member buckets named by global id.
 pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> ServerResult<Value> {
-    let mut value = value.clone();
-    aruna_operations::metadata::global_entries::normalize_entries(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        &mut value,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    use aruna_operations::metadata::global_entries::NormalizeEntriesOperation;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let normalize = NormalizeEntriesOperation::new(realm_id, node_id, value.clone());
+    let (value, _) = drive(normalize, state.get_ctx().as_ref())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(value)
 }
 

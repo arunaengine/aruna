@@ -24,8 +24,7 @@ use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::metadata::object_version::ObjectVersionOperation;
+use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// At most this many entities are looked at per save.
@@ -56,76 +55,150 @@ fn local_object(
     }
 }
 
-/// Rewrites every entity of `document` (a crate with `@graph`, or one entity) whose `@id` or
-/// `contentUrl` names a version of a local distributed member bucket. Returns how many values
-/// it rewrote; a value it cannot resolve stays unchanged.
-pub async fn normalize_entries(
-    context: &DriverContext,
+/// Why a dataset's entries could not be normalized.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct NormalizeError(String);
+
+impl From<IoError> for NormalizeError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum NormalizeStage {
+    Bucket,
+    Version,
+}
+
+/// Rewrites every entity of a document (a crate with `@graph`, or one entity) whose `@id` or
+/// `contentUrl` names a version of a local distributed member bucket. The output is the
+/// document and how many values were rewritten; a value that cannot be resolved stays.
+#[derive(Debug, PartialEq)]
+pub struct NormalizeEntriesOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    document: &mut Value,
-) -> Result<usize, String> {
-    let candidates = {
+    document: Value,
+    candidates: VecDeque<String>,
+    current: Option<(String, String, String, Option<Ulid>)>,
+    buckets: HashMap<String, Option<BucketInfo>>,
+    rewrites: BTreeMap<String, String>,
+    stage: NormalizeStage,
+}
+
+impl NormalizeEntriesOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId, document: Value) -> Self {
         let entities: Vec<&Value> = match document.get("@graph").and_then(Value::as_array) {
             Some(graph) => graph.iter().take(MAX_ENTITIES).collect(),
-            None => vec![&*document],
+            None => vec![&document],
         };
-        let mut values = Vec::new();
+        let mut candidates = VecDeque::new();
         for entity in entities {
-            values.extend(
+            candidates.extend(
                 entity
                     .get("@id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
             );
-            values.extend(text_values(entity.get(CONTENT_URL)));
+            candidates.extend(text_values(entity.get(CONTENT_URL)));
         }
-        values
-    };
-    let mut buckets = HashMap::<String, Option<BucketInfo>>::new();
-    let mut rewrites = BTreeMap::<String, String>::new();
-    for value in candidates {
-        if rewrites.contains_key(&value) {
-            continue;
+        Self {
+            realm_id,
+            node_id,
+            document,
+            candidates,
+            current: None,
+            buckets: HashMap::new(),
+            rewrites: BTreeMap::new(),
+            stage: NormalizeStage::Bucket,
         }
-        let Some((bucket, key, version)) = local_object(&value, realm_id, node_id) else {
-            continue;
-        };
-        if !buckets.contains_key(&bucket) {
-            let info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
-                Ok(info) => Some(info),
-                Err(GetBucketError::NotFound) => None,
-                Err(error) => return Err(error.to_string()),
+    }
+
+    /// The next candidate that names a local object of a distributed member bucket.
+    fn next_candidate(&mut self) -> Result<Next<(Value, usize)>, NormalizeError> {
+        while let Some(value) = self.candidates.pop_front() {
+            if self.rewrites.contains_key(&value) {
+                continue;
+            }
+            let Some((bucket, key, version)) = local_object(&value, self.realm_id, self.node_id)
+            else {
+                continue;
             };
-            buckets.insert(bucket.clone(), info);
+            let known = self.buckets.contains_key(&bucket);
+            self.current = Some((value, bucket.clone(), key, version));
+            if !known {
+                self.stage = NormalizeStage::Bucket;
+                return Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))));
+            }
+            if let Some(call) = self.version_call() {
+                return Ok(Next::Call(call));
+            }
         }
-        let bound = buckets
-            .get(&bucket)
+        let count = self.rewrites.len();
+        let mut document = std::mem::take(&mut self.document);
+        if count > 0 {
+            rewrite(&mut document, &self.rewrites, false);
+        }
+        Ok(Next::Done((document, count)))
+    }
+
+    /// The version read of the current candidate, when its bucket is a distributed member.
+    fn version_call(&mut self) -> Option<IoCall> {
+        let (_, bucket, key, version) = self.current.as_ref()?;
+        let bound = (self.buckets.get(bucket))
             .and_then(Option::as_ref)
             .is_some_and(|info| info.distribution.is_some());
         if !bound {
-            continue;
+            return None;
         }
-        let object = drive(ObjectVersionOperation::new(&bucket, &key, version), context)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(version_id) = object.version_id else {
-            continue;
-        };
-        if object.version.is_none_or(|version| version.is_deleted()) {
-            continue;
+        self.stage = NormalizeStage::Version;
+        Some(IoCall::child(ObjectVersionOperation::new(
+            bucket, key, *version,
+        )))
+    }
+}
+
+impl Operation for NormalizeEntriesOperation {
+    type Output = (Value, usize);
+    type Error = NormalizeError;
+
+    fn first(&mut self) -> Result<Next<(Value, usize)>, NormalizeError> {
+        self.next_candidate()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(Value, usize)>, NormalizeError> {
+        match self.stage {
+            NormalizeStage::Bucket => {
+                let info = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => Some(info),
+                    Err(GetBucketError::NotFound) => None,
+                    Err(error) => return Err(NormalizeError(error.to_string())),
+                };
+                let bucket = (self.current.as_ref()).map(|(_, bucket, _, _)| bucket.clone());
+                self.buckets.insert(bucket.unwrap_or_default(), info);
+                match self.version_call() {
+                    Some(call) => Ok(Next::Call(call)),
+                    None => self.next_candidate(),
+                }
+            }
+            NormalizeStage::Version => {
+                let object = result.child::<ObjectVersion, ObjectVersionError>()?;
+                let object = object.map_err(|error| NormalizeError(error.to_string()))?;
+                let value = self.current.take().map(|(value, ..)| value);
+                if let (Some(value), Some(version_id)) = (value, object.version_id)
+                    && object.version.is_some_and(|version| !version.is_deleted())
+                {
+                    let global = GlobalId::Version {
+                        realm_id: self.realm_id,
+                        version_id,
+                    };
+                    self.rewrites.insert(value, global.to_url());
+                }
+                self.next_candidate()
+            }
         }
-        let global = GlobalId::Version {
-            realm_id,
-            version_id,
-        };
-        rewrites.insert(value, global.to_url());
     }
-    let count = rewrites.len();
-    if count > 0 {
-        rewrite(document, &rewrites, false);
-    }
-    Ok(count)
 }
 
 /// Replaces every identifier equal to a rewritten value: ids, references and `contentUrl`
@@ -393,13 +466,12 @@ mod tests {
         let realm = RealmId::from_bytes([1; 32]);
         let version_id = seed(&context, "shared", true).await;
         seed(&context, "plain", false).await;
-        let mut crate_value = json!({"@graph": [
+        let crate_value = json!({"@graph": [
             {"@id": "s3://shared/a.txt", "contentUrl": "s3://shared/a.txt"},
             {"@id": "s3://plain/a.txt", "contentUrl": "s3://plain/a.txt"}
         ]});
-        let rewritten = super::normalize_entries(&context, realm, node(3), &mut crate_value)
-            .await
-            .unwrap();
+        let normalize = super::NormalizeEntriesOperation::new(realm, node(3), crate_value);
+        let (crate_value, rewritten) = crate::driver::drive(normalize, &context).await.unwrap();
         assert_eq!(rewritten, 1);
         let global = aruna_core::structs::storage::global_id::GlobalId::Version {
             realm_id: realm,
@@ -459,5 +531,35 @@ mod tests {
             lookup.next(page),
             Ok(Next::Call(IoCall::Page { .. }))
         ));
+    }
+
+    #[test]
+    fn foreign_values_untouched() {
+        // A value that names no local object needs no read and the document stays as it is.
+        let document = json!({"@id": "urn:example:x"});
+        let realm = RealmId::from_bytes([1; 32]);
+        let mut normalize = super::NormalizeEntriesOperation::new(realm, node(3), document.clone());
+        assert_eq!(normalize.first(), Ok(Next::Done((document, 0))));
+    }
+
+    #[test]
+    fn local_object_reads_bucket() {
+        let realm = RealmId::from_bytes([1; 32]);
+        let document = json!({"@id": "s3://shared/a.txt"});
+        let mut normalize = super::NormalizeEntriesOperation::new(realm, node(3), document);
+        assert!(matches!(
+            normalize.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let missing = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<
+            aruna_core::structs::storage::blob::BucketInfo,
+            _,
+        >(
+            crate::s3::bucket::get::GetBucketError::NotFound,
+        )));
+        let Ok(Next::Done((_, count))) = normalize.next(missing) else {
+            panic!("expected the unchanged document");
+        };
+        assert_eq!(count, 0);
     }
 }
