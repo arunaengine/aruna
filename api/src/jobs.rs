@@ -47,7 +47,7 @@ use crate::error::ServerResult;
 use crate::server::state::ServerState;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::structs::execution::job::KeyWait;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, executor_limits};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use serde::Deserialize;
 use serde::Serialize;
@@ -361,12 +361,11 @@ async fn local_submit(
         workspace_mode,
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
-    let result = drive(
-        LocalRunOperation::on_node(config, &context),
-        context.as_ref(),
-    )
-    .await
-    .map_err(JobRequestError::from_local)?;
+    let limits = executor_limits(&context, config.spec.executor_constraint.as_deref());
+    let run = LocalRunOperation::new(config, limits, context.node_and_realm());
+    let result = drive(run, context.as_ref())
+        .await
+        .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await

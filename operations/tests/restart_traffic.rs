@@ -449,7 +449,8 @@ fn spawn_recovery(
         publish_full_usage: false,
     };
     let stop = RecoveryStop::new(cancelled.clone());
-    let recovery = RecoveryOperation::new(&node.context, config, status.clone(), stop);
+    let serving = node.context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let recovery = RecoveryOperation::new(config, serving, status.clone(), stop);
     let context = node.context.clone();
     let driver = tokio::spawn(async move {
         drive(recovery, &context).await.expect("recovery runs");

@@ -682,7 +682,8 @@ fn spawn_usage_rebuild(
             }
         }
         info!("Usage counters rebuilt");
-        let publish = PublishUsageOperation::new(&context, (node_id, realm_id), true, true);
+        let serving = context.node_and_realm().map(|(_, realm_id)| realm_id);
+        let publish = PublishUsageOperation::new((node_id, realm_id), serving, true, true);
         if let Err(error) = drive(publish, context.as_ref()).await {
             warn!(error = %error, "Usage snapshots were not published after the rebuild");
         }

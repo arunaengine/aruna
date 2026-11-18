@@ -389,8 +389,8 @@ impl OperationsTaskHandler {
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
         let publish = crate::node::usage_publish::PublishUsageOperation::new(
-            &self.context,
             (node_id, realm_id),
+            Some(realm_id),
             false,
             true,
         );
@@ -420,7 +420,7 @@ impl OperationsTaskHandler {
                 node_id,
                 sequence,
                 Some(self.jobs_runtime.running_jobs()),
-                crate::node::info::facts::NodeFacts::gather(&self.context),
+                node_facts(&self.context),
             );
             if let Err(error) = drive(refresh, &self.context).await {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
