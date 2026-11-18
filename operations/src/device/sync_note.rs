@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::done;
