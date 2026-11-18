@@ -25,6 +25,8 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
 use aruna_core::types::{GroupId, Key, Value};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -71,6 +73,17 @@ pub struct ListBucketInput {
 pub struct ListContinuationToken {
     pub last_key: Vec<u8>,
     pub last_common_prefix: Option<String>,
+}
+
+/// The S3 continuation token of a listing position.
+pub fn encode_list_token(token: &ListContinuationToken) -> Result<String, ConversionError> {
+    Ok(STANDARD.encode(token.to_bytes()?))
+}
+
+/// The listing position an S3 continuation token names; `None` for any other text.
+pub fn decode_list_token(token: &str) -> Option<ListContinuationToken> {
+    let decoded = STANDARD.decode(token).ok()?;
+    ListContinuationToken::from_bytes(&decoded).ok()
 }
 
 impl ListContinuationToken {
