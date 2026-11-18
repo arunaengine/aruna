@@ -9,76 +9,17 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::*;
-use crate::driver::DriverContext;
-use crate::jobs::executor::ProgressReporter;
-use crate::plugins::bound::tests::edit_config;
-use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{Identity, WorkKind, WorkRow, reserve};
 use aruna_core::plugin_installs::InstallState;
-
-pub(crate) fn job_context(ctx: &DriverContext, fixture: &Fixture) -> JobContext {
-    JobContext {
-        driver: Arc::new(ctx.clone()),
-        job_id: JobId::from_bytes([7u8; 16]),
-        owner_node_id: fixture.actor.node_id,
-        claim_token: Ulid::generate(),
-        final_attempt: false,
-        cancel: CancellationToken::new(),
-        shutdown: CancellationToken::new(),
-        progress: ProgressReporter::from_progress(&JobProgress::new("bytes")),
-        range_turns: Default::default(),
-        handlers: Default::default(),
-    }
-}
-
-/// An active install of a version that requests `objects.copy`, granted the group's data.
-pub(crate) async fn copier(fixture: &Fixture) -> PluginInstall {
-    let copy = json!({ "permissions": { "required": ["objects.copy"] } });
-    let digest = fixture.publish("0.2.0", "cd", copy).await;
-    let mut request = fixture.request(None);
-    request.version = Some(digest);
-    let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
-    request.grants = std::collections::BTreeMap::from([
-        ("read".into(), vec![data.clone()]),
-        ("write".into(), vec![data]),
-    ]);
-    fixture.install(&request).await.unwrap()
-}
-
-/// A recorded copy of `install` between two object paths of its group on this node.
-pub(crate) async fn recorded(
-    fixture: &Fixture,
-    install: &PluginInstall,
-    (source, target): (&str, &str),
-) -> PluginWorkSpec {
-    let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
-    row.version_id = Some(Ulid::generate());
-    let identity = Identity::Call {
-        run_id: row.run_id,
-        ordinal: 0,
-    };
-    let (row, _) = drive(
-        reserve((install, &identity), row, None).unwrap(),
-        &fixture.ctx,
-    )
-    .await
-    .unwrap();
-    let data = format!("/{}/g/{}/data", fixture.actor.realm_id, install.group_id);
-    let node = fixture.actor.node_id;
-    PluginWorkSpec {
-        realm_id: fixture.actor.realm_id,
-        install_id: install.install_id,
-        work_id: row.work_id,
-        group_id: install.group_id,
-        action: PluginWorkAction::Copy {
-            source: format!("{data}/{node}/{source}"),
-            source_version: None,
-            target: format!("{data}/{node}/{target}"),
-            version_id: row.version_id.unwrap(),
-        },
-    }
-}
+use aruna_operations::driver::DriverContext;
+use aruna_operations::jobs::executor::ProgressReporter;
+use aruna_operations::plugins::calls::*;
+use aruna_operations::plugins::test_support::Fixture;
+use aruna_operations::plugins::test_support::edit_config;
+#[allow(unused_imports)]
+pub(crate) use aruna_operations::plugins::test_support::{
+    copier, job_context, ready_copy, recorded,
+};
+use aruna_operations::plugins::work::{Identity, WorkKind, WorkRow, reserve};
 
 fn failure(outcome: JobRunOutcome) -> (JobErrorKind, String) {
     match outcome {
@@ -161,32 +102,6 @@ async fn narrowed_grant_refuses() {
     let (kind, message) = failure(run_plugin_work(&ctx, &spec).await);
     assert_eq!(kind, JobErrorKind::Permanent);
     assert!(message.contains("is not granted"), "{message}");
-}
-
-/// The install's objects `in/a.txt` (5 bytes) and the empty bucket `out` on a blob backend, and
-/// a recorded copy between them.
-pub(crate) async fn ready_copy(
-    fixture: &Fixture,
-) -> (
-    tempfile::TempDir,
-    DriverContext,
-    PluginInstall,
-    PluginWorkSpec,
-) {
-    use crate::driver::drive;
-    use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
-    use crate::s3::object::put::PutObjectOperation;
-    let install = copier(fixture).await;
-    let root = tempfile::tempdir().unwrap();
-    let blob = with_blob(&fixture.ctx, root.path()).await;
-    for bucket in ["in", "out"] {
-        seed_bucket(&blob, bucket, install.group_id, install.account, Vec::new()).await;
-    }
-    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
-    let source = put_config(realm, install.group_id, node, "in", "a.txt", b"bytes");
-    drive(PutObjectOperation::new(source), &blob).await.unwrap();
-    let spec = recorded(fixture, &install, ("in/a.txt", "out/a.txt")).await;
-    (root, blob, install, spec)
 }
 
 /// Whether `outcome` copied the 5 bytes as the work's minted version.
@@ -277,15 +192,14 @@ async fn marked_source_refused() {
     // attempt, and shown as marked.
     use aruna_plugins::broker::Broker;
 
-    use crate::driver::drive;
     use crate::plugin_host::broker::RunBroker;
-    use crate::plugin_host::jobs::start_work;
-    use crate::plugins::marks::{MARKED, Mark, mark_row};
-    use crate::plugins::rows::write_rows;
-    use crate::plugins::submit::WorkRequest;
-    use crate::plugins::submit::tests::{request, scope};
-    use crate::plugins::work::WorkKind;
-    use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+    use aruna_operations::driver::drive;
+    use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
+    use aruna_operations::plugins::rows::write_rows;
+    use aruna_operations::plugins::submit::WorkRequest;
+    use aruna_operations::plugins::test_support::{request, scope};
+    use aruna_operations::plugins::work::WorkKind;
+    use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
     let fixture = Fixture::new().await;
     let (_root, blob, install, spec) = ready_copy(&fixture).await;
     let head = HeadObjectInput {
@@ -331,10 +245,10 @@ async fn small_reads_unmarked() {
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
     use crate::plugin_host::broker::RunBroker;
-    use crate::plugins::marks::{MARKED, Mark, mark_row};
-    use crate::plugins::rows::write_rows;
-    use crate::plugins::submit::tests::scope;
-    use crate::plugins::work::WorkKind;
+    use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
+    use aruna_operations::plugins::rows::write_rows;
+    use aruna_operations::plugins::test_support::scope;
+    use aruna_operations::plugins::work::WorkKind;
     let fixture = Fixture::new().await;
     let (_root, blob, install, _) = ready_copy(&fixture).await;
     let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));
@@ -389,14 +303,14 @@ async fn versioned_info() {
     // is still answered without a version.
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
-    use crate::driver::drive;
     use crate::plugin_host::broker::RunBroker;
-    use crate::plugins::marks::{Mark, mark_row};
-    use crate::plugins::rows::write_rows;
-    use crate::plugins::submit::tests::scope;
-    use crate::plugins::work::WorkKind;
-    use crate::s3::object::copy::test::put_config;
-    use crate::s3::object::put::PutObjectOperation;
+    use aruna_operations::driver::drive;
+    use aruna_operations::plugins::marks::{Mark, mark_row};
+    use aruna_operations::plugins::rows::write_rows;
+    use aruna_operations::plugins::test_support::scope;
+    use aruna_operations::plugins::work::WorkKind;
+    use aruna_operations::s3::object::put::PutObjectOperation;
+    use aruna_operations::testing_objects::put_config;
     let fixture = Fixture::new().await;
     let (_root, blob, install, _) = ready_copy(&fixture).await;
     let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));

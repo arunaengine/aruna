@@ -3,27 +3,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
-use crate::metadata::forward::routed_export::RoutedExportOperation;
-use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::plugins::calls::*;
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+use aruna_operations::plugins::calls::*;
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::metadata::MetadataHandle;
-use crate::metadata::api::document_query::DocumentQueryOperation;
-use crate::metadata::api::read_types::DocumentQueryRequest;
-use crate::metadata::create_document::{
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
+use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
+use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::CreateEntryOperation;
-use crate::metadata::materialization_queue::process_materialization_batch;
-use crate::plugins::dataset::merge_into;
-use crate::plugins::host_calls::VisibleObjects;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::runs::tests::queued;
-use crate::plugins::store::Txn;
-use crate::testing::drain_projection_queue;
+use aruna_operations::metadata::create_entry::CreateEntryOperation;
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::plugins::dataset::merge_into;
+use aruna_operations::plugins::host_calls::VisibleObjects;
+use aruna_operations::plugins::store::Txn;
+use aruna_operations::plugins::test_support::Fixture;
+use aruna_operations::plugins::test_support::queued;
+use aruna_operations::testing::drain_projection_queue;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -492,7 +492,7 @@ async fn write_includes_read() {
 #[tokio::test]
 async fn expected_revision() {
     // A patch starts only from the revision it expects, and writes no intent otherwise.
-    use crate::plugins::intents::open_intent;
+    use aruna_operations::plugins::intents::open_intent;
     let (_fixture, broker, document, _dir) = broker().await;
     let read = broker
         .metadata_get(&cx(), &document.to_string())
@@ -525,7 +525,7 @@ async fn expected_revision() {
 #[tokio::test]
 async fn invalid_patches() {
     // A patch refused before dispatch leaves no intent behind, so the run needs no attention.
-    use crate::plugins::intents::open_intent;
+    use aruna_operations::plugins::intents::open_intent;
     let (_fixture, broker, document, _dir) = broker().await;
     let read = broker
         .metadata_get(&cx(), &document.to_string())
@@ -549,9 +549,9 @@ async fn invalid_patches() {
 
 #[tokio::test]
 async fn secret_values_granted() {
-    use crate::plugins::account::{AccountChange, EnsureRole};
-    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
-    use crate::plugins::grants::role_paths;
+    use aruna_operations::plugins::account::{AccountChange, EnsureRole};
+    use aruna_operations::plugins::grants::role_paths;
+    use aruna_operations::plugins::test_support::{TOKEN, bound, edit_config, hold_keys, secret};
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;
@@ -1052,14 +1052,14 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::record_reads::DocumentRecordOperation;
-    use crate::testing::project_create_events;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
         MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
         MetadataEventRecord,
     };
     use aruna_core::plugin_runs::source_key;
+    use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+    use aruna_operations::testing::project_create_events;
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
     let revision = revision_of(&broker, document).await;
@@ -1076,7 +1076,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = crate::metadata::send_metadata_effect(
+    let planned = aruna_operations::metadata::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1612,7 +1612,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        crate::metadata::send_metadata_effect(&broker.ctx, plan).await
+        aruna_operations::metadata::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };
@@ -1631,7 +1631,7 @@ async fn unprojected_event_refused() {
     let txn = Txn::direct(&broker.ctx);
     let logged = (
         event_log_key(document, event.event_id).to_vec(),
-        crate::plugins::rows::encode(&event).unwrap(),
+        aruna_operations::plugins::rows::encode(&event).unwrap(),
     );
     txn.write(EVENT_LOG_KEYSPACE, vec![logged]).await.unwrap();
     let marker = (

@@ -13,7 +13,6 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
-use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, StartRun};
 use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
@@ -41,6 +40,7 @@ use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError};
 use crate::routes::management_relay::relay_to_node;
 use crate::routes::plugin_installs::parse_id;
+use crate::routes::plugin_installs::read_config;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;

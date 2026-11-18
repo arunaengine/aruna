@@ -4,11 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugin_host::worker::match_journal;
-use crate::plugin_host::worker::tests::{
-    created, echoed_sync, install_artifact, installed, scoped, synced,
-};
-use crate::plugin_host::worker::{plan_replays, run_replays};
 use crate::plugins::calls::*;
 use crate::plugins::clock::ClockReading;
 use crate::plugins::journal::JOURNAL_PAGE;
@@ -17,6 +12,9 @@ use crate::plugins::rows::decode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::{
+    created, echoed_sync, install_artifact, installed, scoped, synced,
+};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
@@ -374,4 +372,95 @@ fn replays_pages_bounded() {
         Ok(Next::Done(5)),
         "the page bound ends it"
     );
+}
+
+mod replay_pass {
+    use aruna_core::UserId;
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::clock::SKEW_MARGIN_MS;
+    use crate::plugins::fixtures::{self, is_child, node};
+    use crate::plugins::rows::tests::child_result;
+
+    fn plans() -> PlanReplays {
+        let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
+        PlanReplays::new(config, node(3), 50)
+    }
+
+    fn start_plan(by: Option<NodeId>) -> ReplayPlan {
+        let install = fixtures::install();
+        let next = CoverageRow {
+            revision: 1,
+            active_since_ms: None,
+            coverage: Default::default(),
+            note: None,
+        };
+        ReplayPlan::Start {
+            target: Box::new(Target {
+                install_id: install.install_id,
+                group_id: install.group_id,
+                revision: 1,
+                coverage: Default::default(),
+                account: install.account,
+            }),
+            next: Box::new(next),
+            old: Default::default(),
+            boundary: SKEW_MARGIN_MS + 100,
+            by,
+        }
+    }
+
+    fn started() -> IoResult {
+        child_result(Ok::<(), StoreError>(()))
+    }
+
+    #[test]
+    fn user_node_skips() {
+        let mut config = fixtures::config(&fixtures::install(), json!({}));
+        let owner = UserId::nil(fixtures::realm());
+        config.ensure_node(node(4), RealmNodeKind::User { owner });
+        let mut plans = PlanReplays::new(Arc::new(config), node(4), 50);
+        assert_eq!(plans.first(), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn local_boundary_starts() {
+        let mut plans = plans();
+        assert!(is_child(&Ok::<_, StoreError>(
+            plans.planned(start_plan(Some(node(3))))
+        )));
+        assert_eq!(plans.next(started()), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn remote_clock_asked() {
+        let mut plans = plans();
+        plans.stamp(1_000);
+        let asked = plans.planned(start_plan(Some(node(1))));
+        assert!(matches!(asked, Next::Call(IoCall::Child(_))));
+        plans.stamp(1_010);
+        let clock = child_result(Ok::<_, IoError>(Some(1_005u64)));
+        assert!(is_child(&plans.next(clock)));
+        assert_eq!(plans.next(started()), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn silent_clock_starts() {
+        let mut plans = plans();
+        plans.planned(start_plan(Some(node(1))));
+        let clock = child_result(Ok::<Option<u64>, IoError>(None));
+        assert!(is_child(&plans.next(clock)));
+    }
+
+    #[test]
+    fn nothing_planned() {
+        let mut plans = plans();
+        plans.targets.clear();
+        let answer = child_result(Ok::<_, StoreError>(ReplayPlan::Nothing));
+        assert_eq!(plans.next(answer), Ok(Next::Done(0)));
+    }
 }

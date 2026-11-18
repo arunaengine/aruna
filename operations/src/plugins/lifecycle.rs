@@ -38,14 +38,14 @@ use crate::realm::mutate_placement::node_kind;
 
 /// An install as the realm config holds it now, for a caller proven group admin.
 #[derive(Debug, PartialEq)]
-pub(crate) struct LoadedInstall {
+pub struct LoadedInstall {
     config: Arc<RealmConfigDocument>,
     current: PluginInstall,
 }
 
 /// Reads the install and refuses a caller who is not an admin of its group.
 #[derive(Debug, PartialEq)]
-pub(crate) struct LoadInstall {
+pub struct LoadInstall {
     auth: AuthContext,
     realm_id: RealmId,
     install_id: Ulid,
@@ -620,10 +620,7 @@ fn preparing(current: &PluginInstall, grants: &Grants) -> PluginInstall {
 
 /// The event coverage of an install: per event trigger kind, the grant patterns its permission
 /// needs. A kind without a needed permission covers everything of the group.
-pub(crate) fn coverage(
-    manifest: &Manifest,
-    grants: &Grants,
-) -> BTreeMap<TriggerKind, BTreeSet<String>> {
+pub fn coverage(manifest: &Manifest, grants: &Grants) -> BTreeMap<TriggerKind, BTreeSet<String>> {
     (manifest.triggers.keys())
         .filter(|kind| kind.needs().is_some())
         .map(|kind| {
@@ -679,7 +676,7 @@ pub fn targets(config: &RealmConfigDocument) -> Vec<Target> {
 
 /// The installs this node matches pending rows to, and whether it keeps its journal: a user
 /// node keeps none, so its rows are deleted unmatched.
-pub(crate) fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
+pub fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
     let keep = !matches!(node_kind(config, local), Some(RealmNodeKind::User { .. }));
     let targets = match keep {
         true => targets(config),

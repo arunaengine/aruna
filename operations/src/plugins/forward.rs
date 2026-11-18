@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
-use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 
 use aruna_core::NodeId;
 use aruna_core::effects::Effect;
@@ -32,8 +32,10 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
+use super::decide::DecideBatch;
 use super::matcher::Outbox;
 use super::peer::{ask_peer, peer_answer};
+use super::receiver::lost_reason;
 use super::rows::{
     Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, values,
@@ -43,20 +45,20 @@ use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
 /// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
-pub(crate) const REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// The longest wait before a receiver is tried again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// When each receiver is tried again after a failed or busy send.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Backoff(BTreeMap<NodeId, (u32, u64)>);
 
 impl Backoff {
-    pub(crate) fn ready(&self, node: NodeId, now_ms: u64) -> bool {
+    pub fn ready(&self, node: NodeId, now_ms: u64) -> bool {
         self.0.get(&node).is_none_or(|(_, at)| *at <= now_ms)
     }
 
-    pub(crate) fn failed(&mut self, node: NodeId, now_ms: u64) {
+    pub fn failed(&mut self, node: NodeId, now_ms: u64) {
         let tries = self.0.get(&node).map_or(0, |(tries, _)| *tries) + 1;
         let wait = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, tries, 0);
         let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
@@ -64,25 +66,25 @@ impl Backoff {
     }
 
     /// A receiver that took every request is tried at once next time.
-    pub(crate) fn cleared(&mut self, node: NodeId) {
+    pub fn cleared(&mut self, node: NodeId) {
         self.0.remove(&node);
     }
 }
 
 /// One request's batch and the outbox key of each event in it by install and source id.
-pub(crate) type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
+pub type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
 
 /// One receiver's requests, each with the encoded row bytes it holds.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct Requests {
+pub struct Requests {
     bound: usize,
-    pub(crate) open: Vec<(Pending, usize)>,
+    pub open: Vec<(Pending, usize)>,
 }
 
 impl Requests {
     /// The request with room for `size` more bytes; a new one when the last is full. A row
     /// larger than the bound gets a request of its own.
-    pub(crate) fn room(&mut self, size: usize) -> &mut Pending {
+    pub fn room(&mut self, size: usize) -> &mut Pending {
         let fits =
             (self.open.last()).is_some_and(|(_, used)| *used == 0 || used + size <= self.bound);
         if !fits {
@@ -96,7 +98,7 @@ impl Requests {
 }
 
 /// The requests to `node`, each holding at most `bound` encoded row bytes.
-pub(crate) fn receiver_requests(
+pub fn receiver_requests(
     batches: &mut BTreeMap<NodeId, Requests>,
     node: NodeId,
     bound: usize,
@@ -107,7 +109,7 @@ pub(crate) fn receiver_requests(
 }
 
 /// The next install after `after` with forward rows on this node.
-pub(crate) fn next_install(after: Option<Ulid>) -> NextInstall {
+pub fn next_install(after: Option<Ulid>) -> NextInstall {
     // A forward key is the install id, then 24 bytes of journal time and event id.
     let start = after.map(|id| [&id.to_bytes()[..], &[0xff; 24]].concat());
     NextInstall(start)
@@ -137,7 +139,7 @@ impl Operation for NextInstall {
 }
 
 /// Deletes every row below `prefix`, a page at a time.
-pub(crate) fn drop_rows(space: &'static str, prefix: Vec<u8>) -> DropRows {
+pub fn drop_rows(space: &'static str, prefix: Vec<u8>) -> DropRows {
     DropRows {
         space,
         prefix,
@@ -183,7 +185,7 @@ impl Operation for DropRows {
 
 /// Counts the install's first rows past their send expiry as gaps and deletes them in one
 /// transaction; answers the other rows.
-pub(crate) fn expire_rows(install_id: Ulid, now_ms: u64) -> ExpireRows {
+pub fn expire_rows(install_id: Ulid, now_ms: u64) -> ExpireRows {
     ExpireRows {
         install_id,
         now_ms,
@@ -263,7 +265,7 @@ impl Operation for ExpireRows {
 
 /// What this node holds about a dataset event: the document's status, the event's own record
 /// and whether the document is deleted.
-pub(crate) fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> DatasetFacts {
+pub fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> DatasetFacts {
     DatasetFacts {
         document,
         event_id,
@@ -284,15 +286,15 @@ pub struct DatasetFacts {
 pub struct Facts {
     status: Option<MaterializationStatusRecord>,
     /// Whether the event's record is in the event log.
-    pub(crate) logged: bool,
+    pub logged: bool,
     /// The graph and batch of a logged change that has one.
-    pub(crate) batch: Option<(String, MetadataBatch)>,
-    pub(crate) deleted: bool,
+    pub batch: Option<(String, MetadataBatch)>,
+    pub deleted: bool,
 }
 
 impl Facts {
     /// Whether the document's status is materialized at an event id that `covers` accepts.
-    pub(crate) fn materialized(&self, covers: impl Fn(Ulid) -> bool) -> bool {
+    pub fn materialized(&self, covers: impl Fn(Ulid) -> bool) -> bool {
         self.status.as_ref().is_some_and(|status| {
             status.state == MaterializationState::Materialized && covers(status.event_id)
         })
@@ -343,7 +345,7 @@ impl Operation for DatasetFacts {
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;
 /// returns how many rows were decided and whether any was busy.
-pub(crate) fn apply(keys: &BTreeMap<(Ulid, String), Vec<u8>>, decisions: Decisions) -> Apply {
+pub fn apply(keys: &BTreeMap<(Ulid, String), Vec<u8>>, decisions: Decisions) -> Apply {
     let busy = (decisions.events.iter()).any(|(.., outcome)| *outcome == Outcome::Busy);
     let decided: Vec<_> = (decisions.events.into_iter())
         .filter(|(.., outcome)| *outcome != Outcome::Busy)
@@ -433,7 +435,7 @@ enum ReadablePhase {
 /// Whether a dataset event is not readable here yet: its own change is not materialized and the
 /// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Unreadable {
+pub struct Unreadable {
     kind: SourceKind,
     ids: Option<(Ulid, Ulid)>,
     /// Whether this node has a metadata store that can be asked about a change.
@@ -442,7 +444,7 @@ pub(crate) struct Unreadable {
 }
 
 impl Unreadable {
-    pub(crate) fn new(row: &ForwardRow, metadata: bool) -> Self {
+    pub fn new(row: &ForwardRow, metadata: bool) -> Self {
         let event = &row.event;
         let ids = (event.resource.parse().ok()).zip(event.revision.parse().ok());
         Self {
@@ -532,7 +534,7 @@ enum CollectPhase {
 /// their send expiry become gaps, rows and unacknowledged gaps of `open` receivers join a request
 /// unless their dataset is not readable here yet.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CollectOutbox {
+pub struct CollectOutbox {
     config: Arc<RealmConfigDocument>,
     open: BTreeSet<NodeId>,
     now_ms: u64,
@@ -544,7 +546,7 @@ pub(crate) struct CollectOutbox {
 }
 
 impl CollectOutbox {
-    pub(crate) fn new(
+    pub fn new(
         config: Arc<RealmConfigDocument>,
         open: BTreeSet<NodeId>,
         (now_ms, bound): (u64, usize),
@@ -708,13 +710,13 @@ impl Operation for CollectOutbox {
 
 /// Hands a batch of events to its receiver over the metadata transport.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SendEvents {
+pub struct SendEvents {
     node: NodeId,
     batch: EventBatch,
 }
 
 impl SendEvents {
-    pub(crate) fn new(node: NodeId, batch: EventBatch) -> Self {
+    pub fn new(node: NodeId, batch: EventBatch) -> Self {
         Self { node, batch }
     }
 }
@@ -735,6 +737,189 @@ impl Operation for SendEvents {
             Some(MetadataTransportMessage::EventsDecided { result }) => Ok(Next::Done(result?)),
             _ => Err(MetadataReadError::Unavailable),
         }
+    }
+}
+
+/// Which receivers one outbox pass serves. This node's own batches are decided under the
+/// admission hold; the others wait for the network without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboxRoute {
+    Local,
+    Remote,
+}
+
+/// What one outbox pass did.
+#[derive(Debug, PartialEq)]
+pub struct OutboxPass {
+    pub decided: usize,
+    pub backoff: Backoff,
+    pub failure: Option<StoreError>,
+}
+
+/// The requests of one receiver still to send.
+#[derive(Debug, PartialEq)]
+struct ReceiverQueue {
+    node: NodeId,
+    requests: VecDeque<Pending>,
+}
+
+#[derive(Debug, PartialEq)]
+enum OutboxPhase {
+    Collect,
+    Sent(BTreeMap<(Ulid, String), Vec<u8>>),
+    Applied,
+}
+
+/// Sends each reachable receiver its batches and applies their decisions. Rows of removed
+/// installs are dropped and rows past their send expiry become gaps. A receiver that fails or
+/// is busy waits; one that took every request is tried at once next time.
+#[derive(Debug, PartialEq)]
+pub struct SendOutbox {
+    config: Arc<RealmConfigDocument>,
+    route: OutboxRoute,
+    local: NodeId,
+    now_ms: u64,
+    bound: usize,
+    metadata: bool,
+    backoff: Backoff,
+    receivers: VecDeque<ReceiverQueue>,
+    current: Option<ReceiverQueue>,
+    decided: usize,
+    phase: OutboxPhase,
+}
+
+impl SendOutbox {
+    pub fn new(
+        config: Arc<RealmConfigDocument>,
+        (route, local): (OutboxRoute, NodeId),
+        (now_ms, metadata): (u64, bool),
+        backoff: Backoff,
+    ) -> Self {
+        Self {
+            config,
+            route,
+            local,
+            now_ms,
+            bound: REQUEST_BYTES,
+            metadata,
+            backoff,
+            receivers: VecDeque::new(),
+            current: None,
+            decided: 0,
+            phase: OutboxPhase::Collect,
+        }
+    }
+
+    fn served(&self, node: NodeId) -> bool {
+        (node == self.local) == (self.route == OutboxRoute::Local)
+    }
+
+    fn collect(&self) -> CollectOutbox {
+        let open = (self.config.installs.iter())
+            .map(|install| install.receiver)
+            .filter(|node| self.served(*node))
+            .filter(|node| lost_reason(&self.config, *node).is_none())
+            .filter(|node| self.backoff.ready(*node, self.now_ms))
+            .collect();
+        let pass = (self.now_ms, self.bound);
+        CollectOutbox::new(self.config.clone(), open, pass, self.metadata)
+    }
+
+    fn finish(&mut self, failure: Option<StoreError>) -> Next<OutboxPass> {
+        Next::Done(OutboxPass {
+            decided: self.decided,
+            backoff: std::mem::take(&mut self.backoff),
+            failure,
+        })
+    }
+
+    /// Sends the next request, moving on to the next receiver when one has none left.
+    fn advance(&mut self) -> Next<OutboxPass> {
+        loop {
+            let Some(mut receiver) = self.current.take().or_else(|| self.receivers.pop_front())
+            else {
+                return self.finish(None);
+            };
+            let Some((batch, keys)) = receiver.requests.pop_front() else {
+                self.backoff.cleared(receiver.node);
+                continue;
+            };
+            let node = receiver.node;
+            self.current = Some(receiver);
+            self.phase = OutboxPhase::Sent(keys);
+            return Next::Call(match self.route {
+                OutboxRoute::Local => {
+                    let nodes = (self.local, self.local);
+                    let config = self.config.clone();
+                    IoCall::child(DecideBatch::new(config, nodes, batch, self.now_ms))
+                }
+                OutboxRoute::Remote => IoCall::child(SendEvents::new(node, batch)),
+            });
+        }
+    }
+
+    /// The receiver waits, and what it still had stays in the outbox.
+    fn receiver_failed(&mut self) -> Next<OutboxPass> {
+        if let Some(receiver) = self.current.take() {
+            self.backoff.failed(receiver.node, self.now_ms);
+        }
+        self.advance()
+    }
+
+    fn decisions(&self, result: IoResult) -> Result<Option<Decisions>, IoError> {
+        Ok(match self.route {
+            OutboxRoute::Local => result.child::<Decisions, StoreError>()?.ok(),
+            OutboxRoute::Remote => result.child::<Decisions, MetadataReadError>()?.ok(),
+        })
+    }
+
+    fn step(&mut self, result: IoResult) -> Result<Next<OutboxPass>, StoreError> {
+        match std::mem::replace(&mut self.phase, OutboxPhase::Applied) {
+            OutboxPhase::Collect => {
+                let batches = result.child::<BTreeMap<NodeId, Requests>, StoreError>()??;
+                self.receivers = (batches.into_iter())
+                    .map(|(node, requests)| ReceiverQueue {
+                        node,
+                        requests: (requests.open.into_iter())
+                            .map(|(pending, _)| pending)
+                            .collect(),
+                    })
+                    .collect();
+                Ok(self.advance())
+            }
+            OutboxPhase::Sent(keys) => match self.decisions(result)? {
+                Some(decisions) => Ok(Next::Call(IoCall::child(apply(&keys, decisions)))),
+                None => Ok(self.receiver_failed()),
+            },
+            OutboxPhase::Applied => {
+                let (count, busy) = result.child::<(usize, bool), StoreError>()??;
+                self.decided += count;
+                Ok(match busy {
+                    true => self.receiver_failed(),
+                    false => self.advance(),
+                })
+            }
+        }
+    }
+}
+
+impl Operation for SendOutbox {
+    type Output = OutboxPass;
+    type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        (self.route == OutboxRoute::Local).then_some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<OutboxPass>, StoreError> {
+        Ok(Next::Call(IoCall::child(self.collect())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<OutboxPass>, StoreError> {
+        Ok(match self.step(result) {
+            Ok(next) => next,
+            Err(error) => self.finish(Some(error)),
+        })
     }
 }
 

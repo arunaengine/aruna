@@ -21,7 +21,6 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_operations::plugin_host::plugin_work::PluginWorkHandler;
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
@@ -32,6 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
 use crate::config::{Config, open_storage, resolve_config};
+use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 

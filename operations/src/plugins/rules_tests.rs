@@ -13,6 +13,8 @@ use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, secret};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::edit_rules;
 use aruna_core::time::unix_timestamp_millis;
 
 fn rule(consumer: &SecretConsumer, response: ResponseExposure) -> UseRule {
@@ -445,16 +447,4 @@ fn retiring_skips_missing() {
     assert!(matches!(retire.first(), Ok(Next::Call(IoCall::Child(_)))));
     let missing = child_result(Err::<bool, _>(RuleError::Missing));
     assert_eq!(retire.next(missing), Ok(Next::Done(())));
-}
-
-/// Sets the rules of one consumer on a group secret, now.
-pub(crate) async fn edit_rules(
-    ctx: &DriverContext,
-    actor: &Actor,
-    target: (GroupId, &SecretName),
-    rules: (&SecretConsumer, Vec<UseRule>),
-    guard: RuleGuard,
-) -> Result<bool, RuleError> {
-    let now_ms = unix_timestamp_millis();
-    drive(EditRules::new(actor, target, rules, guard, now_ms), ctx).await
 }

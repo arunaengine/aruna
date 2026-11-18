@@ -182,14 +182,14 @@ impl Operation for StartRun {
 /// Queues the due `every` occurrence of each active install this node receives. Missed
 /// occurrences collapse into the latest; one over the queue bound is counted as skipped.
 #[derive(Debug, PartialEq)]
-pub(crate) struct EnqueueTimers {
+pub struct EnqueueTimers {
     now_ms: u64,
     timers: VecDeque<(PluginInstall, u64)>,
     queued: usize,
 }
 
 impl EnqueueTimers {
-    pub(crate) fn new(config: &RealmConfigDocument, local: NodeId, now_ms: u64) -> Self {
+    pub fn new(config: &RealmConfigDocument, local: NodeId, now_ms: u64) -> Self {
         let timers = (config.installs.iter())
             .filter(|install| {
                 let lost = lost_reason(config, install.receiver).is_some();

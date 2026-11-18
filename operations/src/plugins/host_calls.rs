@@ -27,7 +27,7 @@ use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
 /// Entries of one object listing page.
-pub(crate) const OBJECT_PAGE: usize = 100;
+pub const OBJECT_PAGE: usize = 100;
 
 /// A host call that ended without a reply; `changed` says the run called differently than an
 /// earlier attempt, so the run fails as changed.
@@ -66,7 +66,7 @@ impl From<StoreError> for CallFailure {
 }
 
 /// The core intent of a guest call.
-pub(crate) fn call_intent(intent: &Intent) -> CallIntent {
+pub fn call_intent(intent: &Intent) -> CallIntent {
     CallIntent {
         ordinal: intent.ordinal,
         digest: intent.digest,
@@ -74,7 +74,7 @@ pub(crate) fn call_intent(intent: &Intent) -> CallIntent {
 }
 
 /// The earlier reply of a call, `None` when its effect may be dispatched now, or why not.
-pub(crate) fn begun_reply(begun: Begun) -> Result<Option<String>, CallFailure> {
+pub fn begun_reply(begun: Begun) -> Result<Option<String>, CallFailure> {
     match begun {
         Begun::Fresh => Ok(None),
         Begun::Settled(reply) => Ok(Some(reply)),
@@ -91,7 +91,7 @@ pub(crate) fn begun_reply(begun: Begun) -> Result<Option<String>, CallFailure> {
 
 /// How a mutating call ended without a reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CallEnd {
+pub enum CallEnd {
     /// It had no effect.
     None(HostError),
     /// It may have had its effect.
@@ -108,7 +108,7 @@ enum RecordPhase {
 /// Records a fresh effect's outcome in its intent: a reply settles it, a refusal that had no
 /// effect clears it, and an error that may have committed leaves it unknown.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RecordCall {
+pub struct RecordCall {
     run_id: Ulid,
     intent: CallIntent,
     outcome: Option<Result<String, CallEnd>>,
@@ -116,7 +116,7 @@ pub(crate) struct RecordCall {
 }
 
 impl RecordCall {
-    pub(crate) fn new(run_id: Ulid, intent: CallIntent, outcome: Result<String, CallEnd>) -> Self {
+    pub fn new(run_id: Ulid, intent: CallIntent, outcome: Result<String, CallEnd>) -> Self {
         Self {
             run_id,
             intent,
@@ -181,7 +181,7 @@ impl Operation for RecordCall {
 
 /// The change of a private state value a call asks for.
 #[derive(Debug, PartialEq)]
-pub(crate) enum StateChange {
+pub enum StateChange {
     Put(StateWrite),
     Remove(StateRemoval),
 }
@@ -205,7 +205,7 @@ enum StatePhase {
 /// One state write or removal through the run's call history; answers the new version, or 0 for
 /// a removal. A refusal clears its intent, and a write that may have happened leaves it unknown.
 #[derive(Debug, PartialEq)]
-pub(crate) struct StateCall {
+pub struct StateCall {
     run_id: Ulid,
     install_id: Ulid,
     intent: CallIntent,
@@ -215,7 +215,7 @@ pub(crate) struct StateCall {
 }
 
 impl StateCall {
-    pub(crate) fn new((run_id, install_id): (Ulid, Ulid), change: StateChange) -> Self {
+    pub fn new((run_id, install_id): (Ulid, Ulid), change: StateChange) -> Self {
         Self {
             run_id,
             install_id,
@@ -297,7 +297,7 @@ impl Operation for StateCall {
 }
 
 /// The version id a plugin gave as text.
-pub(crate) fn version_id(text: &str) -> Result<Ulid, HostError> {
+pub fn version_id(text: &str) -> Result<Ulid, HostError> {
     let invalid = || HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"));
     Ulid::from_string(text).map_err(|_| invalid())
 }
@@ -326,7 +326,7 @@ struct HeadFacts {
 
 /// Size, version and mark of one object the call check admitted.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ObjectInfoCall {
+pub struct ObjectInfoCall {
     locate: Option<LocalObject>,
     path: String,
     version: Option<Ulid>,
@@ -334,7 +334,7 @@ pub(crate) struct ObjectInfoCall {
 }
 
 impl ObjectInfoCall {
-    pub(crate) fn new(
+    pub fn new(
         place: (RealmId, NodeId),
         install: &PluginInstall,
         path: &str,
@@ -425,7 +425,7 @@ enum VisiblePhase {
 /// of its own bucket and key, never by the text of the listing prefix. Only an unavailable check
 /// fails; a target the grants or the authorization refuse is left out.
 #[derive(Debug, PartialEq)]
-pub(crate) struct VisibleObjects {
+pub struct VisibleObjects {
     place: (RealmId, NodeId),
     install: PluginInstall,
     bucket: String,
@@ -435,7 +435,7 @@ pub(crate) struct VisibleObjects {
 }
 
 impl VisibleObjects {
-    pub(crate) fn new(
+    pub fn new(
         place: (RealmId, NodeId),
         install: &PluginInstall,
         bucket: &str,
@@ -523,7 +523,7 @@ enum ListPhase {
 
 /// One page of a local bucket's objects the account may read.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ObjectListCall {
+pub struct ObjectListCall {
     place: (RealmId, NodeId),
     install: PluginInstall,
     locate: Option<LocalObject>,
@@ -532,7 +532,7 @@ pub(crate) struct ObjectListCall {
 }
 
 impl ObjectListCall {
-    pub(crate) fn new(
+    pub fn new(
         place: (RealmId, NodeId),
         install: &PluginInstall,
         prefix_path: &str,

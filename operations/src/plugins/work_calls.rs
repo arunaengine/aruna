@@ -31,7 +31,7 @@ const OUTPUT_PAGE: usize = 100;
 
 /// Why a work attempt does not run now.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum WorkRefusal {
+pub enum WorkRefusal {
     /// State it needs cannot be read now.
     #[error("{0}")]
     Deferred(String),
@@ -54,7 +54,7 @@ impl From<IoError> for WorkRefusal {
 
 /// What an admitted attempt runs with.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AdmittedWork {
+pub struct AdmittedWork {
     pub install: PluginInstall,
     pub config: RealmConfigDocument,
     pub row: WorkRow,
@@ -69,7 +69,7 @@ enum AdmitPhase {
 
 /// The install, account and binding checks of one attempt, before any grant check.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AdmitWork {
+pub struct AdmitWork {
     realm_id: RealmId,
     local: NodeId,
     install_id: Ulid,
@@ -78,7 +78,7 @@ pub(crate) struct AdmitWork {
 }
 
 impl AdmitWork {
-    pub(crate) fn new(spec: &PluginWorkSpec, local: NodeId) -> Self {
+    pub fn new(spec: &PluginWorkSpec, local: NodeId) -> Self {
         Self {
             realm_id: spec.realm_id,
             local,
@@ -159,7 +159,7 @@ impl Operation for AdmitWork {
 /// The current patterns a transfer may use: the row's connection is still granted and authorized
 /// as at submission, then the transfer's own grant on its object.
 #[derive(Debug, PartialEq)]
-pub(crate) struct TransferGrants {
+pub struct TransferGrants {
     install: PluginInstall,
     connection: Option<String>,
     permission: Permission,
@@ -170,11 +170,11 @@ pub(crate) struct TransferGrants {
 }
 
 impl TransferGrants {
-    pub(crate) fn download(install: &PluginInstall, row: &WorkRow, target: &str) -> Self {
+    pub fn download(install: &PluginInstall, row: &WorkRow, target: &str) -> Self {
         Self::new(install, row, Permission::TransfersDownload, None, target)
     }
 
-    pub(crate) fn upload(install: &PluginInstall, row: &WorkRow, source: &str) -> Self {
+    pub fn upload(install: &PluginInstall, row: &WorkRow, source: &str) -> Self {
         let read = Some(Access::READ);
         Self::new(install, row, Permission::TransfersUpload, read, source)
     }
@@ -238,14 +238,14 @@ impl Operation for TransferGrants {
 /// The work row of job `id` of an install; a row of an earlier install under the same id is not
 /// this install's job.
 #[derive(Debug, PartialEq)]
-pub(crate) struct JobRow {
+pub struct JobRow {
     install_id: Ulid,
     account: UserId,
     id: String,
 }
 
 impl JobRow {
-    pub(crate) fn new(install: &PluginInstall, id: &str) -> Self {
+    pub fn new(install: &PluginInstall, id: &str) -> Self {
         Self {
             install_id: install.install_id,
             account: install.account,
@@ -287,7 +287,7 @@ enum OutputsPhase {
 
 /// One page of the objects job `id` wrote, after the output at `cursor`.
 #[derive(Debug, PartialEq)]
-pub(crate) struct JobOutputs {
+pub struct JobOutputs {
     row: Option<JobRow>,
     local: NodeId,
     cursor: Option<String>,
@@ -298,7 +298,7 @@ pub(crate) struct JobOutputs {
 }
 
 impl JobOutputs {
-    pub(crate) fn new(
+    pub fn new(
         (install, local): (&PluginInstall, NodeId),
         id: &str,
         cursor: Option<String>,

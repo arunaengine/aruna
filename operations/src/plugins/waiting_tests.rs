@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger, WAITING_EXPIRY_MS};
@@ -11,9 +12,6 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugin_host::worker::decide_batch;
-use crate::plugin_host::worker::recheck_waiting;
-use crate::plugin_host::worker::tests::{created, installed};
 use crate::plugins::decide::{SeenRow, seen_key};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
@@ -22,6 +20,7 @@ use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::{created, installed};
 use aruna_core::plugin_runs::EventBatch;
 use ulid::Ulid;
 

@@ -4,7 +4,7 @@
 
 pub mod account;
 pub mod artifacts;
-pub(crate) mod attempt;
+pub mod attempt;
 pub mod bound;
 pub mod check;
 pub mod cleanup;
@@ -21,9 +21,11 @@ pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
-pub(crate) mod host_calls;
+pub mod host_calls;
+pub mod host_steps;
 pub mod install;
 pub mod intents;
+pub mod job_work;
 pub mod journal;
 pub mod lifecycle;
 pub mod marks;
@@ -31,48 +33,50 @@ pub mod marks;
 pub mod matcher;
 pub mod objects;
 pub mod outgoing;
-pub(crate) mod peer;
+pub mod peer;
 pub mod prune;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
-pub(crate) mod reconcile;
+pub mod reconcile;
 pub mod records;
 pub mod replay;
 pub mod rows;
 pub mod rules;
 pub mod runs;
-pub(crate) mod secret_use;
+pub mod secret_use;
 pub mod settings;
 pub mod state;
 pub mod submit;
 pub mod sweep;
-pub(crate) mod transfer_steps;
+pub mod transfer_steps;
 pub mod waiting;
 pub mod work;
-pub(crate) mod work_calls;
+pub mod work_calls;
 
 use aruna_plugins::broker::{ErrorKind, HostError};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[path = "calls_tests.rs"]
-pub(crate) mod calls;
+pub mod calls;
 #[cfg(test)]
 #[path = "fixtures_tests.rs"]
 pub(crate) mod fixtures;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_flows.rs"]
+pub mod flow_support;
+#[cfg(any(test, feature = "test-hooks"))]
 #[path = "store_tests.rs"]
-pub(crate) mod store;
+pub mod store;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_support;
 
-#[cfg(test)]
-#[path = "delivery_tests.rs"]
-mod delivery_tests;
 #[cfg(test)]
 #[path = "events_tests.rs"]
 mod events_tests;
 
 /// A host call that cannot be answered now; the guest may try again.
-pub(crate) fn unavailable(message: impl Into<String>) -> HostError {
+pub fn unavailable(message: impl Into<String>) -> HostError {
     HostError::new(ErrorKind::Unavailable, message)
 }
 

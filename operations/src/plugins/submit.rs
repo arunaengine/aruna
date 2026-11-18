@@ -74,7 +74,7 @@ pub enum WorkRequest {
 
 /// How a work request stands after its checks and its row.
 #[derive(Debug, PartialEq)]
-pub(crate) enum PreparedWork {
+pub enum PreparedWork {
     /// The row names a job already; the call answers its work id.
     Known(Ulid),
     /// The row is reserved; this job is to be submitted.
@@ -101,7 +101,7 @@ enum Step {
 /// Checks a work request step by step and reserves its row. It needs the grants of the request's
 /// kind; a paused install starts nothing, and every attempt checks the version it reads again.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareWork {
+pub struct PrepareWork {
     scope: RunScope,
     request: WorkRequest,
     now_ms: u64,
@@ -114,11 +114,7 @@ pub(crate) struct PrepareWork {
 }
 
 impl PrepareWork {
-    pub(crate) fn new(
-        scope: &RunScope,
-        request: WorkRequest,
-        (now_ms, minted): (u64, Ulid),
-    ) -> Self {
+    pub fn new(scope: &RunScope, request: WorkRequest, (now_ms, minted): (u64, Ulid)) -> Self {
         use Step::*;
         let steps: &[Step] = match request {
             WorkRequest::Copy(_) => &[
@@ -422,7 +418,7 @@ impl Operation for PrepareWork {
 }
 
 /// BLAKE3 of length-prefixed parts, so no two argument lists share bytes.
-fn digest(parts: &[&[u8]]) -> [u8; 32] {
+pub fn digest(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for part in parts {
         hasher.update(&(part.len() as u64).to_le_bytes());

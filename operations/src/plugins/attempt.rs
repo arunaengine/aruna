@@ -33,7 +33,7 @@ const INSTALL_REMOVED: &str = "the install was removed";
 
 /// The runs a claim started, and what stopped it early.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ClaimedRuns {
+pub struct ClaimedRuns {
     pub runs: Vec<PluginRun>,
     pub failure: Option<RunError>,
 }
@@ -52,7 +52,7 @@ enum ClaimPhase {
 /// `RUNS_PARALLEL` per install. A `running` run no task runs starts again; a queued run whose
 /// install is gone ends, unless its intents decide otherwise.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ClaimRuns {
+pub struct ClaimRuns {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     active: BTreeMap<Ulid, Ulid>,
@@ -63,7 +63,7 @@ pub(crate) struct ClaimRuns {
 }
 
 impl ClaimRuns {
-    pub(crate) fn new(
+    pub fn new(
         config: Arc<RealmConfigDocument>,
         local: NodeId,
         active: BTreeMap<Ulid, Ulid>,
@@ -180,7 +180,7 @@ impl Operation for ClaimRuns {
 
 /// What an attempt that may run works with.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AttemptStart {
+pub struct AttemptStart {
     pub config: RealmConfigDocument,
     pub install: PluginInstall,
 }
@@ -188,13 +188,13 @@ pub(crate) struct AttemptStart {
 /// Reads the install of an attempt and checks an event run's path again, so a grant removed
 /// after admission cancels the run before the guest sees the event.
 #[derive(Debug, PartialEq)]
-pub(crate) struct BeginAttempt {
+pub struct BeginAttempt {
     scope: RunScope,
     start: Option<AttemptStart>,
 }
 
 impl BeginAttempt {
-    pub(crate) fn new((realm_id, local): (RealmId, NodeId), run: &PluginRun) -> Self {
+    pub fn new((realm_id, local): (RealmId, NodeId), run: &PluginRun) -> Self {
         let run = run.clone();
         Self {
             scope: RunScope {
@@ -251,7 +251,7 @@ impl Operation for BeginAttempt {
 
 /// Writes how an attempt ended, after its intents were inspected.
 #[derive(Debug, PartialEq)]
-pub(crate) struct FinishRun {
+pub struct FinishRun {
     run: Box<PluginRun>,
     ended: Option<Ended>,
     changed: bool,
@@ -259,7 +259,7 @@ pub(crate) struct FinishRun {
 }
 
 impl FinishRun {
-    pub(crate) fn new(run: PluginRun, ended: Ended, changed: bool, now_ms: u64) -> Self {
+    pub fn new(run: PluginRun, ended: Ended, changed: bool, now_ms: u64) -> Self {
         Self {
             run: Box::new(run),
             ended: Some(ended),
@@ -290,7 +290,7 @@ impl Operation for FinishRun {
 
 /// Why the running guests of an install must stop: it was paused or removed, or this node can
 /// no longer run installs. Other changes apply at the next call.
-pub(crate) fn revocation(
+pub fn revocation(
     config: &RealmConfigDocument,
     local: NodeId,
     install_id: Ulid,
@@ -307,7 +307,7 @@ pub(crate) fn revocation(
 
 /// The handler call of a run: its saved invocation and the install's grants. An event's object on
 /// this node is named by its short `bucket/key` path; `path` keeps the permission path.
-pub(crate) fn invocation(
+pub fn invocation(
     run: &PluginRun,
     (install, local): (&PluginInstall, NodeId),
     limits: Limits,

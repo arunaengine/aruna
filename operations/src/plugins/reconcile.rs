@@ -21,10 +21,10 @@ use super::sweep::SweepOrphans;
 use crate::realm::mutate_placement::is_management;
 
 /// The node a repair runs on.
-pub(crate) type RepairNode = (RealmId, NodeId);
+pub type RepairNode = (RealmId, NodeId);
 
 /// The repair of one install's account and role, as the admin who granted it.
-pub(crate) fn repair_account(
+pub fn repair_account(
     (realm_id, node_id): RepairNode,
     install: &PluginInstall,
     now_ms: u64,
@@ -48,7 +48,7 @@ pub(crate) fn repair_account(
 /// Repairs each settled install and answers how many changed; one that fails is logged and the
 /// others are still repaired.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RepairSettled {
+pub struct RepairSettled {
     node: RepairNode,
     now_ms: u64,
     installs: VecDeque<PluginInstall>,
@@ -57,7 +57,7 @@ pub(crate) struct RepairSettled {
 }
 
 impl RepairSettled {
-    pub(crate) fn new(node: RepairNode, installs: &[PluginInstall], now_ms: u64) -> Self {
+    pub fn new(node: RepairNode, installs: &[PluginInstall], now_ms: u64) -> Self {
         let unsettled = [InstallState::Preparing, InstallState::Removing];
         let installs = (installs.iter())
             .filter(|install| !unsettled.contains(&install.state))
@@ -114,14 +114,14 @@ enum ReconcilePhase {
 /// Repairs every settled install from its current record on a management node, then sweeps
 /// accounts no record names any more. Another node has nothing to do.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReconcileInstalls {
+pub struct ReconcileInstalls {
     node: RepairNode,
     now_ms: u64,
     phase: ReconcilePhase,
 }
 
 impl ReconcileInstalls {
-    pub(crate) fn new(node: RepairNode, now_ms: u64) -> Self {
+    pub fn new(node: RepairNode, now_ms: u64) -> Self {
         Self {
             node,
             now_ms,

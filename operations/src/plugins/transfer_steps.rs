@@ -12,6 +12,7 @@ use aruna_core::injection::{OutgoingRequest, expose_response};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::broker::{Field, HostError, Response};
 use ulid::Ulid;
@@ -28,9 +29,25 @@ use crate::s3::object::head::{
 };
 use crate::s3::object::put::PutObjectError;
 
+/// The install's account restricted to `patterns` with WRITE, which also reads.
+pub fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: pattern.clone(),
+            permission: Access::WRITE,
+        })
+        .collect();
+    AuthContext {
+        user_id: install.account,
+        realm_id: install.account.realm_id,
+        path_restrictions: Some(restrictions),
+        session: None,
+    }
+}
+
 /// How a transfer attempt ends.
 #[derive(Debug, PartialEq)]
-pub(crate) enum TransferEnd {
+pub enum TransferEnd {
     Done {
         bytes: u64,
         version: Ulid,
@@ -62,7 +79,7 @@ impl From<StoreError> for TransferEnd {
 
 /// The admitted work one attempt moves bytes for.
 #[derive(Clone, Copy)]
-pub(crate) struct TransferWork<'a> {
+pub struct TransferWork<'a> {
     pub node: (RealmId, NodeId),
     pub config: &'a RealmConfigDocument,
     pub install: &'a PluginInstall,
@@ -114,7 +131,7 @@ fn prepared(result: IoResult) -> Result<PreparedRequest, TransferEnd> {
 
 /// What a download sends and where its answer goes.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DownloadPlan {
+pub struct DownloadPlan {
     pub patterns: BTreeSet<String>,
     pub bucket: String,
     pub key: String,
@@ -132,14 +149,14 @@ enum DownloadPhase {
 /// Checks a download. An earlier attempt that committed the version and lost its answer ends
 /// the work without a request; only a rule that shows the whole answer lets it into a bucket.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareDownload {
+pub struct PrepareDownload {
     work: Admitted,
     version: Ulid,
     phase: DownloadPhase,
 }
 
 impl PrepareDownload {
-    pub(crate) fn new(work: TransferWork<'_>, target: &str, version: Ulid) -> Self {
+    pub fn new(work: TransferWork<'_>, target: &str, version: Ulid) -> Self {
         Self {
             work: Admitted::of(work, target),
             version,
@@ -213,7 +230,7 @@ fn too_large(bound: u64) -> String {
 
 /// Whether a download's answer is written: a 2xx within the bound. A timeout, a throttle or a
 /// server error is tried again.
-pub(crate) fn check_answer(
+pub fn check_answer(
     status: u16,
     length: Option<u64>,
     bound: Option<u64>,
@@ -235,7 +252,7 @@ pub(crate) fn check_answer(
 }
 
 /// How a download ends whose write failed; `over` and `broken` tell what its body did.
-pub(crate) fn write_failure(
+pub fn write_failure(
     error: &PutObjectError,
     (over, broken): (bool, bool),
     bound: Option<u64>,
@@ -251,7 +268,7 @@ pub(crate) fn write_failure(
 
 /// What an upload reads and sends.
 #[derive(Debug, PartialEq)]
-pub(crate) struct UploadPlan {
+pub struct UploadPlan {
     pub patterns: BTreeSet<String>,
     pub bucket: String,
     pub key: String,
@@ -271,7 +288,7 @@ enum UploadPhase {
 /// Checks an upload. A request begun or answered before decides without the source, which may
 /// be gone by now; the version checked is the version sent.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareUpload {
+pub struct PrepareUpload {
     work: Admitted,
     version: Option<Ulid>,
     again: bool,
@@ -279,7 +296,7 @@ pub(crate) struct PrepareUpload {
 }
 
 impl PrepareUpload {
-    pub(crate) fn new(work: TransferWork<'_>, source: &str, version: Option<Ulid>) -> Self {
+    pub fn new(work: TransferWork<'_>, source: &str, version: Option<Ulid>) -> Self {
         let context = work.row.context.as_ref();
         Self {
             again: context.is_some_and(|context| context.method == "PUT"),
@@ -336,13 +353,13 @@ impl Operation for PrepareUpload {
 }
 
 /// The end of an upload whose source no longer exists.
-pub(crate) fn source_gone() -> TransferEnd {
+pub fn source_gone() -> TransferEnd {
     TransferEnd::Permanent("the object to upload is gone".to_string())
 }
 
 /// How an upload ends that an earlier attempt decided: unknown after a begun request that may
 /// not go twice, else by the kept answer. `None` when the attempt sends.
-pub(crate) fn send_end(send: Send, again: bool) -> Option<TransferEnd> {
+pub fn send_end(send: Send, again: bool) -> Option<TransferEnd> {
     match send {
         Send::Now => None,
         Send::Undecided => {
@@ -372,7 +389,7 @@ fn answered_end(status: u16, again: bool, (bytes, version): (u64, Ulid)) -> Tran
 
 /// What the service answered to an upload; `body` is `None` when it was not read whole.
 #[derive(Debug, PartialEq)]
-pub(crate) struct UploadReply {
+pub struct UploadReply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
@@ -381,7 +398,7 @@ pub(crate) struct UploadReply {
 /// Keeps an upload's answer as the rule shows it now, and decides how the work ends. A reply
 /// too large for the bound keeps no body.
 #[derive(Debug, PartialEq)]
-pub(crate) struct KeepReply {
+pub struct KeepReply {
     ids: (Ulid, Ulid),
     exposure: ResponseExposure,
     fields: SecretFields,
@@ -391,7 +408,7 @@ pub(crate) struct KeepReply {
 }
 
 impl KeepReply {
-    pub(crate) fn new(ids: (Ulid, Ulid), plan: UploadPlan, size: u64, reply: UploadReply) -> Self {
+    pub fn new(ids: (Ulid, Ulid), plan: UploadPlan, size: u64, reply: UploadReply) -> Self {
         Self {
             ids,
             exposure: plan.request.exposure,

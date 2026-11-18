@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
+use aruna_operations::driver::drive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,14 +13,16 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 use super::*;
-use crate::driver::DriverContext;
 use crate::plugin_host::plugin_work::run_plugin_work;
-use crate::plugin_host::plugin_work::tests::job_context;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::tests::edit_work;
-use crate::plugins::work::{Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve};
-use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
-use crate::s3::object::put::PutObjectOperation;
+use aruna_operations::driver::DriverContext;
+use aruna_operations::plugins::test_support::Fixture;
+use aruna_operations::plugins::test_support::edit_work;
+use aruna_operations::plugins::test_support::job_context;
+use aruna_operations::plugins::work::{
+    Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve,
+};
+use aruna_operations::s3::object::put::PutObjectOperation;
+use aruna_operations::testing_objects::{put_config, seed_bucket, with_blob};
 
 const CONTENT: &[u8] = b"ACGTACGT";
 
@@ -216,15 +218,15 @@ async fn put_sent_again() {
 #[tokio::test]
 async fn marked_source_kept() {
     // A version a job with a secret wrote never leaves the node.
-    use crate::plugins::marks::{Mark, mark_row};
-    use crate::plugins::rows::write_rows;
+    use aruna_operations::plugins::marks::{Mark, mark_row};
+    use aruna_operations::plugins::rows::write_rows;
     let fixture = Fixture::new().await;
     let install = uploader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;
     let (base, seen) = server(201).await;
     let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
-    let readable = crate::plugins::objects::Unmarked::new(("in", "a.txt"), None);
-    let version = crate::driver::drive(readable, &blob).await;
+    let readable = aruna_operations::plugins::objects::Unmarked::new(("in", "a.txt"), None);
+    let version = aruna_operations::driver::drive(readable, &blob).await;
     let version = version.unwrap().unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),

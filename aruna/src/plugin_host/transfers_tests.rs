@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
-use crate::plugins::calls::*;
+use aruna_operations::driver::drive;
+use aruna_operations::plugins::calls::*;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,13 +15,13 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 use super::*;
-use crate::driver::DriverContext;
 use crate::plugin_host::plugin_work::run_plugin_work;
-use crate::plugin_host::plugin_work::tests::job_context;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve};
-use crate::s3::object::copy::test::{seed_bucket, with_blob};
-use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::driver::DriverContext;
+use aruna_operations::plugins::test_support::Fixture;
+use aruna_operations::plugins::test_support::job_context;
+use aruna_operations::plugins::work::{Identity, RequestContext, WorkKind, reserve};
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::testing_objects::{seed_bucket, with_blob};
 
 const BODY: &[u8] = b"ACGTACGT";
 
@@ -268,7 +268,7 @@ async fn ungranted_target() {
     let ctx = job_context(&blob, &fixture);
     let (base, hits) = server(200).await;
     let (_, spec) = recorded(&fixture, &install, &base, (Vec::new(), None)).await;
-    crate::plugins::bound::tests::edit_config(&fixture, |config| {
+    aruna_operations::plugins::test_support::edit_config(&fixture, |config| {
         config.installs[0].grants.insert("write".into(), Vec::new());
     })
     .await;
@@ -281,8 +281,10 @@ async fn ungranted_target() {
 async fn narrowed_rule() {
     // A secret whose rule shows the status only would hide what the bucket keeps, so the work
     // ends after the release and before any request.
-    use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with};
     use aruna_core::secrets::ResponseExposure;
+    use aruna_operations::plugins::test_support::{
+        ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with,
+    };
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
@@ -317,7 +319,7 @@ async fn narrowed_rule() {
     assert_eq!(kind, JobErrorKind::Permanent);
     assert_eq!(message, "this connection does not expose its whole answer");
     // The released token is in no row the work keeps.
-    let kept = crate::plugins::work::read_work(install.install_id, row.work_id);
+    let kept = aruna_operations::plugins::work::read_work(install.install_id, row.work_id);
     let kept = drive(kept, &fixture.ctx);
     let kept = kept.await.unwrap().unwrap();
     assert!(!format!("{kept:?}").contains(TOKEN));
@@ -327,8 +329,7 @@ async fn narrowed_rule() {
 async fn sweep_during_download() {
     // A sweep while the answer is still on its way keeps the mark of the version not yet
     // written; once written, the version keeps it too.
-    use crate::plugin_host::worker::sweep_marks;
-    use crate::plugins::marks::is_marked;
+    use aruna_operations::plugins::marks::is_marked;
     let fixture = Fixture::new().await;
     let install = downloader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;

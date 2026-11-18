@@ -70,7 +70,7 @@ impl HeldSecrets {
 
 /// One release for a run on `local`. A refusal ends the search; an unavailable node is skipped.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AskRelease {
+pub struct AskRelease {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     request: ReleaseRequest,
@@ -81,11 +81,7 @@ pub(crate) struct AskRelease {
 }
 
 impl AskRelease {
-    pub(crate) fn new(
-        config: Arc<RealmConfigDocument>,
-        local: NodeId,
-        request: ReleaseRequest,
-    ) -> Self {
+    pub fn new(config: Arc<RealmConfigDocument>, local: NodeId, request: ReleaseRequest) -> Self {
         let install =
             (config.installs.iter()).find(|install| install.install_id == request.install_id);
         let binding = install.and_then(|install| install.secrets.get(&request.slot));
@@ -163,7 +159,7 @@ fn call_failure(error: ReleaseError) -> CallError {
 /// A transfer's request with its secret added, the exposure the rule allows now, and the secret's
 /// fields for echo removal.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PreparedRequest {
+pub struct PreparedRequest {
     pub outgoing: OutgoingRequest,
     pub exposure: ResponseExposure,
     pub fields: SecretFields,
@@ -172,7 +168,7 @@ pub(crate) struct PreparedRequest {
 /// The row's request checked against the install's current manifest, with the connection's secret
 /// released and added.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareRequest {
+pub struct PrepareRequest {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     install: PluginInstall,
@@ -181,7 +177,7 @@ pub(crate) struct PrepareRequest {
 }
 
 impl PrepareRequest {
-    pub(crate) fn new(
+    pub fn new(
         config: Arc<RealmConfigDocument>,
         local: NodeId,
         install: &PluginInstall,

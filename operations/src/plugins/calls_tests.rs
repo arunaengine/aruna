@@ -8,40 +8,58 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
-use aruna_core::plugin_runs::{HookRequest, PluginRun};
+use aruna_core::plugin_runs::{Decisions, EventBatch, HookRequest, PluginRun};
 use aruna_core::plugins::Released;
 use aruna_core::plugins::{Chunk, NodeCheckError, PublishedPlugin, ReleaseError, ReleaseRequest};
 use aruna_core::secrets::{SecretKind, SecretName};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_plugins::broker::{HostError, JobStatus, ObjectPage};
 use aruna_plugins::manifest::Manifest;
 use serde_json::{Map, Value};
 use ulid::Ulid;
 
 use super::account::RepairAccount;
-use super::artifacts::ArtifactError;
+use super::artifacts::{ArtifactError, FetchArtifact};
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding};
+use super::check::RunScope;
+use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::copies::Assembled;
 use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
+use super::decide::DecideBatch;
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
+use super::finished::NotifyDue;
+use super::forward::{Backoff, CollectOutbox, REQUEST_BYTES, apply};
 use super::held::AskRelease;
 use super::hooks::{AdmitHook, HookError};
 use super::install::{
     InstallCaller, InstallError, InstallPrepared, InstallRequest, PrepareInstall, Prepared,
 };
+use super::job_work::{CancelWork, JobState, RetireWork, SettleWork, StartWork};
 use super::lifecycle::{RemoveInstall, SetGrants, SetPaused, UpdateInstall};
+use super::lifecycle::{match_targets, targets};
+use super::marks::SweepMarks;
+use super::matcher::MatchJournal;
+use super::prune::PruneAudit;
 use super::publish::{CheckPublish, FinishPublish, PublishError, PublishStep};
+use super::receiver::lost_reason;
 use super::reconcile::{RepairSettled, repair_account};
 use super::records::{InstallEntryConfig, InstallEntryOperation};
+use super::replay::{PlanReplay, ReplayPlan, RunReplays, StartReplay};
 use super::rows::StoreError;
 use super::rules::{EnsureRules, RetireRules};
+use super::runs::{PruneRuns, RunError};
 use super::secret_use::{OpenSealed, ReleaseSecret, Sealed, SelectSecret, Selected};
+use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
+use super::waiting::RecheckWaiting;
+use super::work::WorkRow;
+use super::work_calls::{JobOutputs, JobRow};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-pub(crate) use crate::plugin_host::read_config;
-use crate::plugin_host::ready_artifact;
+use crate::realm::mutate_placement::node_kind;
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {
     ctx.net_handle.as_ref().map(|net| net.node_id())
@@ -51,7 +69,7 @@ fn caller(actor: &Actor, auth: &AuthContext) -> InstallCaller {
     InstallCaller::new(actor, auth, unix_timestamp_millis())
 }
 
-pub(crate) async fn prepare_install(
+pub async fn prepare_install(
     ctx: &DriverContext,
     auth: &AuthContext,
     realm_id: RealmId,
@@ -61,7 +79,7 @@ pub(crate) async fn prepare_install(
     drive(PrepareInstall::new(auth, place, request), ctx).await
 }
 
-pub(crate) async fn install_plugin(
+pub async fn install_plugin(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -71,7 +89,7 @@ pub(crate) async fn install_plugin(
     drive(InstallPrepared::new(caller(actor, auth), prepared), ctx).await
 }
 
-pub(crate) async fn write_record(
+pub async fn write_record(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -92,7 +110,7 @@ pub(crate) async fn write_record(
     Ok(install)
 }
 
-pub(crate) async fn ensure_rules(
+pub async fn ensure_rules(
     ctx: &DriverContext,
     actor: &Actor,
     install: &PluginInstall,
@@ -102,7 +120,7 @@ pub(crate) async fn ensure_rules(
     drive(ensure, ctx).await.map_err(|error| error.0)
 }
 
-pub(crate) async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
+pub async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
     let retire = RetireRules::new(actor, install, unix_timestamp_millis());
     drive(retire, ctx).await.expect("the rules are retired");
 }
@@ -111,7 +129,7 @@ fn repair_of(node: (NodeId, RealmId), install: &PluginInstall) -> RepairAccount 
     repair_account((node.1, node.0), install, unix_timestamp_millis())
 }
 
-pub(crate) async fn repair_install(
+pub async fn repair_install(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -120,7 +138,7 @@ pub(crate) async fn repair_install(
     Ok(drive(repair_of((node_id, realm_id), install), ctx).await?)
 }
 
-pub(crate) async fn repair_settled(
+pub async fn repair_settled(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -130,7 +148,7 @@ pub(crate) async fn repair_settled(
     drive(repair, ctx).await.expect("the repair finishes")
 }
 
-pub(crate) async fn sweep_orphans(
+pub async fn sweep_orphans(
     ctx: &DriverContext,
     node_id: NodeId,
     config: &RealmConfigDocument,
@@ -140,7 +158,7 @@ pub(crate) async fn sweep_orphans(
     drive(sweep, ctx).await.map_err(|error| error.0)
 }
 
-pub(crate) async fn set_grants(
+pub async fn set_grants(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -154,7 +172,7 @@ pub(crate) async fn set_grants(
     .await
 }
 
-pub(crate) async fn update_install(
+pub async fn update_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -166,7 +184,7 @@ pub(crate) async fn update_install(
     drive(UpdateInstall::new(who, install_id, digest, settings), ctx).await
 }
 
-pub(crate) async fn pause_install(
+pub async fn pause_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -175,7 +193,7 @@ pub(crate) async fn pause_install(
     drive(SetPaused::new(caller(actor, auth), install_id, true), ctx).await
 }
 
-pub(crate) async fn resume_install(
+pub async fn resume_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -184,7 +202,7 @@ pub(crate) async fn resume_install(
     drive(SetPaused::new(caller(actor, auth), install_id, false), ctx).await
 }
 
-pub(crate) async fn remove_install(
+pub async fn remove_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -193,7 +211,7 @@ pub(crate) async fn remove_install(
     drive(RemoveInstall::new(caller(actor, auth), install_id), ctx).await
 }
 
-pub(crate) async fn start_run(
+pub async fn start_run(
     ctx: &DriverContext,
     auth: &AuthContext,
     realm_id: RealmId,
@@ -206,7 +224,7 @@ pub(crate) async fn start_run(
     drive(start, ctx).await
 }
 
-pub(crate) async fn enqueue_timers(
+pub async fn enqueue_timers(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -215,7 +233,7 @@ pub(crate) async fn enqueue_timers(
     drive(EnqueueTimers::new(config, local, now_ms), ctx).await
 }
 
-pub(crate) async fn admit_hook(
+pub async fn admit_hook(
     ctx: &DriverContext,
     local: NodeId,
     (realm_id, install_id): (RealmId, Ulid),
@@ -228,7 +246,7 @@ pub(crate) async fn admit_hook(
     Ok(drive(admit, ctx).await?)
 }
 
-pub(crate) async fn checks_authorization(
+pub async fn checks_authorization(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: (NodeId, Ulid),
@@ -237,7 +255,7 @@ pub(crate) async fn checks_authorization(
     drive(check, ctx).await.ok().flatten()
 }
 
-pub(crate) async fn select(
+pub async fn select(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     install: &PluginInstall,
@@ -247,7 +265,7 @@ pub(crate) async fn select(
     drive(select, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn open(
+pub async fn open(
     ctx: &DriverContext,
     realm_id: RealmId,
     sealed: &Sealed,
@@ -256,7 +274,7 @@ pub(crate) async fn open(
     drive(open, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn bind_slots(
+pub async fn bind_slots(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: BindPlace,
@@ -267,7 +285,7 @@ pub(crate) async fn bind_slots(
     drive(bind, ctx).await
 }
 
-pub(crate) async fn check_node_binding(
+pub async fn check_node_binding(
     ctx: &DriverContext,
     place: (NodeId, NodeId),
     name: &SecretName,
@@ -277,7 +295,7 @@ pub(crate) async fn check_node_binding(
     drive(check, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn ask_release(
+pub async fn ask_release(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -287,7 +305,7 @@ pub(crate) async fn ask_release(
     drive(ask, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn release(
+pub async fn release(
     ctx: &DriverContext,
     (config, local, peer): (&RealmConfigDocument, NodeId, NodeId),
     request: &ReleaseRequest,
@@ -297,18 +315,18 @@ pub(crate) async fn release(
     drive(release, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
+pub async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
     Ok(drive(CopyTotal::new(digest), ctx).await?.is_some())
 }
 
-pub(crate) async fn read_local(
+pub async fn read_local(
     ctx: &DriverContext,
     digest: &str,
 ) -> Result<Option<Assembled>, ArtifactError> {
     drive(ReadLocal::new(digest), ctx).await
 }
 
-pub(crate) async fn read_chunk(
+pub async fn read_chunk(
     ctx: &DriverContext,
     digest: &str,
     index: u32,
@@ -316,7 +334,7 @@ pub(crate) async fn read_chunk(
     drive(ReadChunk::new(digest, index), ctx).await
 }
 
-pub(crate) async fn store_local(
+pub async fn store_local(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
@@ -326,7 +344,7 @@ pub(crate) async fn store_local(
     drive(StoreCopy::new(config, digest, bytes, now_ms), ctx).await
 }
 
-pub(crate) async fn store_chunk(
+pub async fn store_chunk(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     chunk: Chunk,
@@ -335,7 +353,7 @@ pub(crate) async fn store_chunk(
     drive(KeepChunk::new(config, chunk, now_ms), ctx).await
 }
 
-pub(crate) async fn sweep_copies(
+pub async fn sweep_copies(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,
@@ -343,15 +361,21 @@ pub(crate) async fn sweep_copies(
     drive(SweepCopies::new(config, now_ms), ctx).await
 }
 
-pub(crate) async fn fetch_artifact(
+pub async fn fetch_artifact(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
 ) -> Result<Assembled, ArtifactError> {
-    ready_artifact(ctx, config, digest, local_of(ctx)).await
+    let fetched = drive(FetchArtifact::new(config, digest, local_of(ctx))?, ctx).await?;
+    if fetched.fresh {
+        let bytes = &fetched.copy.bytes;
+        let store = StoreCopy::new(config, digest, bytes, unix_timestamp_millis());
+        drive(store, ctx).await?;
+    }
+    Ok(fetched.copy)
 }
 
-pub(crate) async fn publish_plugin(
+pub async fn publish_plugin(
     ctx: &DriverContext,
     actor: Actor,
     auth: AuthContext,
@@ -364,4 +388,214 @@ pub(crate) async fn publish_plugin(
     };
     drive(plan.store_copy(&artifact), ctx).await?;
     drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
+}
+
+pub async fn job_row(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    id: &str,
+) -> Result<WorkRow, HostError> {
+    Ok(drive(JobRow::new(install, id), ctx).await?)
+}
+
+pub async fn job_status(
+    ctx: &DriverContext,
+    place: (&PluginInstall, NodeId),
+    id: &str,
+) -> Result<JobStatus, HostError> {
+    Ok(drive(JobState::new(place, id), ctx).await?)
+}
+
+pub async fn cancel_job(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    id: &str,
+    now_ms: u64,
+) -> Result<(), HostError> {
+    Ok(drive(CancelWork::new(install, id, now_ms), ctx).await?)
+}
+
+pub async fn start_work(
+    ctx: &DriverContext,
+    scope: &RunScope,
+    request: WorkRequest,
+) -> Result<Ulid, HostError> {
+    let minted = (unix_timestamp_millis(), Ulid::generate());
+    let start = StartWork::new(scope, request, minted, ctx.node_and_realm());
+    Ok(drive(start, ctx).await?)
+}
+
+pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    drive(SettleWork::new(now_ms), ctx).await
+}
+
+pub async fn retire_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    drive(RetireWork::new(config, now_ms), ctx).await
+}
+
+pub async fn job_outputs(
+    ctx: &DriverContext,
+    place: (&PluginInstall, NodeId),
+    id: &str,
+    cursor: Option<String>,
+) -> Result<ObjectPage, HostError> {
+    Ok(drive(JobOutputs::new(place, id, cursor), ctx).await?)
+}
+
+pub async fn match_journal(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    (now_ms, bound): (u64, usize),
+) -> Result<usize, StoreError> {
+    let targets = match_targets(config, local);
+    drive(MatchJournal::new(targets, now_ms, bound), ctx).await
+}
+
+pub async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+    drive(PruneRuns::new(now_ms), ctx).await
+}
+
+pub async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    drive(PruneAudit::new(now_ms), ctx).await
+}
+
+pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+    drive(SweepMarks::new(), ctx).await
+}
+
+pub async fn decide_batch(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    nodes: (NodeId, NodeId),
+    batch: EventBatch,
+    now_ms: u64,
+) -> Result<Decisions, StoreError> {
+    let decide = DecideBatch::new(Arc::new(config.clone()), nodes, batch, now_ms);
+    drive(decide, ctx).await
+}
+
+/// Runs one outbox pass with `send` in place of the receivers.
+pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
+}
+
+pub async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (now_ms, bound): (u64, usize),
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    let open = (config.installs.iter())
+        .map(|install| install.receiver)
+        .filter(|node| lost_reason(config, *node).is_none() && backoff.ready(*node, now_ms))
+        .collect();
+    let metadata = ctx.net_handle.is_some();
+    let collect = CollectOutbox::new(Arc::new(config.clone()), open, (now_ms, bound), metadata);
+    let mut decided = 0;
+    for (receiver, requests) in drive(collect, ctx).await? {
+        let mut failed = false;
+        for ((batch, keys), _) in requests.open {
+            let Ok(decisions) = send(receiver, batch).await else {
+                failed = true;
+                break;
+            };
+            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
+            decided += count;
+            if busy {
+                failed = true;
+                break;
+            }
+        }
+        match failed {
+            true => backoff.failed(receiver, now_ms),
+            false => backoff.cleared(receiver),
+        }
+    }
+    Ok(decided)
+}
+
+pub async fn notify_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, RunError> {
+    drive(NotifyDue::new(Arc::new(config.clone()), local, now_ms), ctx).await
+}
+
+pub async fn recheck_waiting(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let recheck = RecheckWaiting::new(Arc::new(config.clone()), local, now_ms);
+    drive(recheck, ctx).await
+}
+
+/// Starts the replays that are due, with `probe` in place of another node's clock.
+pub async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+    probe: impl Fn(NodeId) -> F,
+) -> Result<usize, StoreError> {
+    if matches!(node_kind(config, local), Some(RealmNodeKind::User { .. })) {
+        return Ok(0);
+    }
+    let mut started = 0;
+    for target in targets(config) {
+        let id = target.install_id;
+        let Some(install) = config.installs.iter().find(|i| i.install_id == id) else {
+            continue;
+        };
+        let plan = PlanReplay::new(install.clone(), target);
+        let ReplayPlan::Start {
+            target,
+            next,
+            old,
+            boundary,
+            by,
+        } = drive(plan, ctx).await?
+        else {
+            continue;
+        };
+        let start = match by {
+            Some(node) if node == local => Some(boundary.saturating_sub(SKEW_MARGIN_MS)),
+            Some(node) => local_start(boundary, probe(node).await),
+            None => None,
+        };
+        let replay = StartReplay::new(*target, (*next, old), (start, by), now_ms);
+        drive(replay, ctx).await?;
+        started += 1;
+    }
+    Ok(started)
+}
+
+pub async fn run_replays(
+    ctx: &DriverContext,
+    now_ms: u64,
+    pages: (usize, usize),
+) -> Result<usize, StoreError> {
+    drive(RunReplays::new(now_ms, pages), ctx).await
+}
+
+pub async fn read_config(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+) -> Result<RealmConfigDocument, InstallError> {
+    Ok(drive(GetConfigOperation::new(realm_id), ctx).await?)
 }

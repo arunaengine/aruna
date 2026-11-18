@@ -1,41 +1,53 @@
-//! Tests a copy through the worker and the test guest: a run that failed after its job id holds
-//! the job's end; a retry gets the same id and delivers it once, a drop delivers nothing.
+//! Tests finished work delivered to a guest, through the plugin host.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
-use crate::plugins::calls::*;
-use crate::plugins::host_calls::call_intent;
-use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceKind};
-use aruna_core::plugin_runs::{StateRemoval, StateWrite};
-use aruna_core::structs::execution::job::JobPayload;
-use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::Intent;
-use ulid::Ulid;
-
-use crate::driver::{DriverContext, drive};
-use crate::jobs::executor::JobRunOutcome;
-use crate::jobs::store::query::insert_job;
-use crate::jobs::store::state::read_job_record;
-use crate::plugin_host::jobs::settle_work;
 use crate::plugin_host::plugin_work::run_plugin_work;
-use crate::plugin_host::plugin_work::tests::job_context;
-use crate::plugin_host::worker::tests::{install_artifact, job_guest, worker_on};
-use crate::plugin_host::worker::{Worker, notify_work};
-use crate::plugins::finished::{drop_completion, retry_run, waits_for};
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::runs::tests::queued;
-use crate::plugins::runs::{admit, list_runs, read_run};
-use crate::plugins::state::{MAX_STATE_BYTES, MAX_STATE_VALUE, put_state, remove_state};
-use crate::plugins::work::list_work;
-use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
-use crate::s3::object::put::PutObjectOperation;
-
-/// The state key that leaves the install too few bytes for a mapping.
-const PAD: &str = "pad";
+use crate::plugin_host::worker::Worker;
+use crate::plugin_host::worker::tests::worker_on;
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_runs::PluginRun;
+use aruna_core::plugin_runs::RunState;
+use aruna_core::plugin_runs::RunTrigger;
+use aruna_core::plugin_runs::SourceKind;
+use aruna_core::plugin_runs::StateRemoval;
+use aruna_core::plugin_runs::StateWrite;
+use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::identity::admin_audit::AdminAuditAction;
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::drive;
+use aruna_operations::jobs::executor::JobRunOutcome;
+use aruna_operations::jobs::store::row_calls;
+use aruna_operations::plugins::calls::notify_work;
+use aruna_operations::plugins::calls::read_config;
+use aruna_operations::plugins::calls::settle_work;
+use aruna_operations::plugins::finished::drop_completion;
+use aruna_operations::plugins::finished::retry_run;
+use aruna_operations::plugins::finished::waits_for;
+use aruna_operations::plugins::host_calls::call_intent;
+use aruna_operations::plugins::runs::admit;
+use aruna_operations::plugins::runs::list_runs;
+use aruna_operations::plugins::runs::read_run;
+use aruna_operations::plugins::state::MAX_STATE_BYTES;
+use aruna_operations::plugins::state::MAX_STATE_VALUE;
+use aruna_operations::plugins::state::put_state;
+use aruna_operations::plugins::state::remove_state;
+use aruna_operations::plugins::test_support::Fixture;
+use aruna_operations::plugins::test_support::install_artifact;
+use aruna_operations::plugins::test_support::job_context;
+use aruna_operations::plugins::test_support::job_guest;
+use aruna_operations::plugins::test_support::path;
+use aruna_operations::plugins::test_support::queued;
+use aruna_operations::plugins::work::list_work;
+use aruna_operations::s3::object::put::PutObjectOperation;
+use aruna_operations::testing_objects::put_config;
+use aruna_operations::testing_objects::seed_bucket;
+use aruna_operations::testing_objects::with_blob;
+use aruna_plugins::broker::Intent;
+use std::sync::Arc;
+use ulid::Ulid;
 
 /// What a held completion leaves: the node with a blob store, the install and its worker, the
 /// failed run and the job it started.
@@ -48,6 +60,21 @@ struct Held {
     job: String,
     /// The version of the value that fills the state.
     pad: u64,
+}
+
+/// The state key that leaves the install too few bytes for a mapping.
+const PAD: &str = "pad";
+
+fn audit(fixture: &Fixture, action: AdminAuditAction) -> AdminAuditRecord {
+    let actor = fixture.actor.user_id;
+    AdminAuditRecord::new(action, actor, actor)
+}
+
+/// Runs every due run to its end.
+async fn drain(worker: &Arc<Worker>) -> usize {
+    let started = worker.claim(unix_timestamp_millis()).await.unwrap();
+    worker.settle().await;
+    started
 }
 
 /// Fills the install's state, so the guest's mapping write after its copy fails; answers the
@@ -85,44 +112,6 @@ async fn fill(ctx: &DriverContext, install_id: Ulid) -> u64 {
     )
     .await
     .unwrap()
-}
-
-/// Runs every due run to its end.
-async fn drain(worker: &Arc<Worker>) -> usize {
-    let started = worker.claim(unix_timestamp_millis()).await.unwrap();
-    worker.settle().await;
-    started
-}
-
-/// Runs the install's one copy job on this node and records how it ended.
-async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInstall) {
-    let (rows, _) = drive(list_work(install.install_id, None, 10), blob)
-        .await
-        .unwrap();
-    let job = rows[0].job.unwrap();
-    let record = read_job_record(blob, job, None).await;
-    let record = record.unwrap().unwrap();
-    let JobPayload::PluginWork(spec) = record.payload.clone() else {
-        panic!("a plugin copy runs as plugin work");
-    };
-    let JobRunOutcome::Succeeded(result) =
-        run_plugin_work(&job_context(blob, fixture), &spec).await
-    else {
-        panic!("the copy runs");
-    };
-    // The jobs runtime is not running here, so the finished record is written as it would.
-    let mut finished = record;
-    finished.state = aruna_core::structs::execution::job::JobState::Succeeded;
-    (finished.result, finished.finished_at_ms) = (Some(result), Some(1));
-    insert_job(blob, &finished).await.unwrap();
-    assert_eq!(settle_work(blob, 2).await.unwrap(), 1);
-}
-
-async fn notify(fixture: &Fixture, blob: &DriverContext) -> usize {
-    let config = read_config(blob, fixture.actor.realm_id).await.unwrap();
-    notify_work(blob, &config, fixture.actor.node_id, 3)
-        .await
-        .unwrap()
 }
 
 /// The finished runs of `install` that `job_finished` started, with their output.
@@ -188,9 +177,35 @@ async fn held(fixture: &Fixture) -> Held {
     }
 }
 
-fn audit(fixture: &Fixture, action: AdminAuditAction) -> AdminAuditRecord {
-    let actor = fixture.actor.user_id;
-    AdminAuditRecord::new(action, actor, actor)
+async fn notify(fixture: &Fixture, blob: &DriverContext) -> usize {
+    let config = read_config(blob, fixture.actor.realm_id).await.unwrap();
+    notify_work(blob, &config, fixture.actor.node_id, 3)
+        .await
+        .unwrap()
+}
+
+/// Runs the install's one copy job on this node and records how it ended.
+async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInstall) {
+    let (rows, _) = drive(list_work(install.install_id, None, 10), blob)
+        .await
+        .unwrap();
+    let job = rows[0].job.unwrap();
+    let record = drive(row_calls::read_job_record(job), blob).await;
+    let record = record.unwrap().unwrap();
+    let JobPayload::PluginWork(spec) = record.payload.clone() else {
+        panic!("a plugin copy runs as plugin work");
+    };
+    let JobRunOutcome::Succeeded(result) =
+        run_plugin_work(&job_context(blob, fixture), &spec).await
+    else {
+        panic!("the copy runs");
+    };
+    // The jobs runtime is not running here, so the finished record is written as it would.
+    let mut finished = record;
+    finished.state = aruna_core::structs::execution::job::JobState::Succeeded;
+    (finished.result, finished.finished_at_ms) = (Some(result), Some(1));
+    drive(row_calls::insert_job(&finished), blob).await.unwrap();
+    assert_eq!(settle_work(blob, 2).await.unwrap(), 1);
 }
 
 #[tokio::test]
