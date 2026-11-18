@@ -24,7 +24,7 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::report::family_report;
+use aruna_operations::jobs::lifecycle::routing::family_report;
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
     delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,

@@ -4,28 +4,29 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::federation::{
     AcceptedRealms, FederationSettings, LoginProvider, PUBLISH_SOON, RealmDescriptor,
     RegistrationMode, Signed,
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
 };
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use url::Url;
@@ -38,6 +39,7 @@ use crate::sync::outbox_record::{
 };
 use aruna_core::placement::target_placement_ref;
 
+use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetFederationConfig {
     pub actor: Actor,
@@ -64,37 +66,12 @@ pub struct SetFederationConfig {
     pub now: u64,
 }
 
+/// Checks the caller's config permission, then writes the change in a write transaction that
+/// reruns after a lost conflict, since a background config write can win its commit.
 #[derive(Debug, PartialEq)]
 pub struct SetFederationOperation {
-    config: SetFederationConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: SetFederationState,
-    output: Option<Result<RealmConfigDocument, SetFederationError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetFederationState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    SchedulePublication,
-    Finish,
-    Error,
+    config: Arc<SetFederationConfig>,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -115,8 +92,6 @@ pub enum SetFederationError {
     InvalidSettings { reason: String },
     #[error("the federation settings changed since they were read")]
     SettingsChanged,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -127,14 +102,110 @@ pub enum SetFederationError {
     },
 }
 
+impl From<IoError> for SetFederationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetFederation".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl SetFederationOperation {
     pub fn new(config: SetFederationConfig) -> Self {
         Self {
+            config: Arc::new(config),
+            authorized: false,
+        }
+    }
+
+    fn change(&self) -> IoCall {
+        let config = Arc::clone(&self.config);
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || FederationWrite::new(Arc::clone(&config));
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetFederationOperation {
+    type Output = RealmConfigDocument;
+    type Error = SetFederationError;
+
+    /// The node itself acts without a caller context, so only a caller's change is checked.
+    fn first(&mut self) -> Result<Next<Self::Output>, SetFederationError> {
+        let Some(auth_context) = self.config.auth_context.clone() else {
+            self.authorized = true;
+            return Ok(Next::Call(self.change()));
+        };
+        if auth_context.realm_id != self.config.actor.realm_id {
+            return Err(SetFederationError::Unauthorized);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context,
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetFederationError> {
+        if self.authorized {
+            return result
+                .child::<RealmConfigDocument, SetFederationError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetFederationError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(error = %error, "Realm federation authorization check failed");
+                Err(SetFederationError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// What the config write transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+}
+
+/// Reads the realm config and its admin state, then stores the change and its queued admin
+/// events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct FederationWrite {
+    config: Arc<SetFederationConfig>,
+    stage: Stage,
+    document: Option<RealmConfigDocument>,
+    deletes: Vec<(KeySpace, Key)>,
+}
+
+impl FederationWrite {
+    fn new(config: Arc<SetFederationConfig>) -> Self {
+        Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: SetFederationState::Init,
-            output: None,
+            stage: Stage::Read,
+            document: None,
+            deletes: Vec::new(),
         }
     }
 
@@ -150,34 +221,11 @@ impl SetFederationOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetFederationState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetFederationError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(SetFederationError::MissingTransaction);
-        };
+    ) -> Result<Next<RealmConfigDocument>, SetFederationError> {
         let Some(document_value) = document_value else {
             return Err(SetFederationError::ConfigMissing);
         };
@@ -267,16 +315,10 @@ impl SetFederationOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = SetFederationState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document.clone());
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn signed_settings(
@@ -336,229 +378,74 @@ impl SetFederationOperation {
     }
 
     /// With a registry URL, publishes soon instead of at the next 6 hour renewal.
-    fn schedule_publication(&mut self, document: &RealmConfigDocument) -> Effects {
+    fn publication(document: &RealmConfigDocument) -> Option<IoCall> {
         let has_registry = document
             .federation
             .as_ref()
             .is_some_and(|settings| settings.registry_url.is_some());
-        if !has_registry {
-            self.state = SetFederationState::Finish;
-            return smallvec![];
-        }
-        self.state = SetFederationState::SchedulePublication;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+        let shorten = Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishRegistration,
             after: PUBLISH_SOON,
-        })]
+        });
+        has_registry.then(|| IoCall::Effect(Box::new(shorten)))
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetFederationError::MissingTransaction);
-        };
-        self.state = SetFederationState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    /// Opens a transaction that reads, validates and applies the change from the start.
-    fn start_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = SetFederationState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: SetFederationError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetFederationState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetFederationError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain or publication timer leaves the outbox and the renewal retryable.
+    fn finish(&mut self) -> Result<Next<RealmConfigDocument>, SetFederationError> {
+        let output = self
+            .document
+            .take()
+            .ok_or(SetFederationError::NotFinished)?;
+        let mut calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        calls.extend(Self::publication(&output));
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for SetFederationOperation {
+impl Operation for FederationWrite {
     type Output = RealmConfigDocument;
     type Error = SetFederationError;
 
-    fn start(&mut self) -> Effects {
-        let Some(auth_context) = self.config.auth_context.clone() else {
-            return self.start_transaction();
-        };
-        if auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetFederationError::Unauthorized);
-        }
-        self.state = SetFederationState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            SetFederationState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => self.start_transaction(),
-                        Ok(false) => self.fail(SetFederationError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Realm federation authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(SetFederationError::StorageError(error))
-                                }
-                                _ => self.fail(SetFederationError::Unauthorized),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", other.label()),
-            },
-            SetFederationState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            SetFederationState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    match self
-                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            SetFederationState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => {
-                let document = document.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(SetFederationError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = SetFederationState::DeleteAdminConflicts { document };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
-            }
-            SetFederationState::DeleteAdminConflicts { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
-            }
-            SetFederationState::CommitTransaction { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                        self.txn_id = None;
-                        self.state = SetFederationState::ScheduleSyncDrain { document };
-                        smallvec![schedule_drain_effect()]
-                    }
-                    Event::Storage(StorageEvent::Error {
-                        error: StorageError::TransactionConflict,
-                    }) if self.attempts < COMMIT_ATTEMPTS => {
-                        self.txn_id = None;
-                        self.start_transaction()
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => {
-                        self.txn_id = None;
-                        self.fail(error.into())
-                    }
-                    other => self.unexpected_event("transaction commit result", other.label()),
-                }
-            }
-            SetFederationState::ScheduleSyncDrain { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                        self.schedule_publication(&document)
-                    }
-                    Event::Task(TaskEvent::Error { message, .. }) => {
-                        warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                        self.schedule_publication(&document)
-                    }
-                    other => self.unexpected_event(
-                        "document sync outbox drain timer schedule",
-                        other.label(),
-                    ),
-                }
-            }
-            SetFederationState::SchedulePublication => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetFederationState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to shorten the registry publication timer");
-                    self.state = SetFederationState::Finish;
-                    smallvec![]
-                }
-                other => {
-                    self.unexpected_event("registry publication timer schedule", other.label())
-                }
-            },
-            SetFederationState::Finish | SetFederationState::Error | SetFederationState::Init => {
-                smallvec![]
-            }
-        }
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SetFederationState::Finish | SetFederationState::Error
-        )
+    fn first(&mut self) -> Result<Next<Self::Output>, SetFederationError> {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SetFederationError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetFederationError> {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = values::<2>(result)?;
+                self.emit_document_write(document, reducer)
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
 }
@@ -607,6 +494,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue};
@@ -811,12 +699,12 @@ mod tests {
         // A conflict candidate newer than the stored descriptor raises the next issue time.
         let actor = actor();
         let config = request(&actor, "https://api.example.org");
-        let operation = SetFederationOperation::new(config.clone());
+        let operation = FederationWrite::new(Arc::new(config.clone()));
         let empty = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         let settings_at = |issued_at: u64| {
             let mut config = config.clone();
             config.now = issued_at;
-            SetFederationOperation::new(config)
+            FederationWrite::new(Arc::new(config))
                 .signed_settings(&empty, &AdminDocumentState::new(operation.admin_target()))
                 .unwrap()
         };
@@ -843,10 +731,10 @@ mod tests {
         assert_eq!(signed.descriptor.payload.issued_at, 501);
     }
 
-    /// Steps to the batch write without I/O and returns the written realm config and admin ops.
+    /// Runs the write to its batch without I/O and returns the written realm config and admin ops.
     fn written_ops(
         description: Option<&str>,
-    ) -> (SetFederationOperation, String, Vec<AdminDocumentOperation>) {
+    ) -> (FederationWrite, String, Vec<AdminDocumentOperation>) {
         let actor = actor();
         let mut config = request(&actor, "https://api.example.org");
         config.description = description.map(str::to_string);
@@ -854,24 +742,12 @@ mod tests {
         document.description = "Old_Realm".to_string();
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         let value = Value::from(document.to_bytes(&actor).unwrap());
-        let mut operation = SetFederationOperation::new(config);
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::SubOperation(_)]
-        ));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        let txn_id = Ulid::from_bytes([7u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(b"config".as_slice()), Some(value)),
-                (Key::from(b"state".as_slice()), None),
-            ],
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}");
+        let mut write = FederationWrite::new(Arc::new(config));
+        write.first().unwrap();
+        let Ok(Next::Call(IoCall::Write(writes))) =
+            write.next(IoResult::Values(vec![Some(value), None]))
+        else {
+            panic!("expected one batch write");
         };
         let stored = RealmConfigDocument::from_bytes(&writes[0].2).unwrap();
         let ops = writes
@@ -885,26 +761,53 @@ mod tests {
                 }
             })
             .collect();
-        (operation, stored.description, ops)
+        (write, stored.description, ops)
     }
 
     #[test]
-    fn retry_rereads_config() {
-        // A commit lost to a background config write signs the newer description on its retry.
+    fn write_signs_description() {
+        // The signed descriptor carries the realm description the write stores with it.
         let actor = actor();
         let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         first.ensure_node(actor.node_id, RealmNodeKind::Management);
-        let mut operation = SetFederationOperation::new(request(&actor, "https://api.example.org"));
-        let written =
-            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
-        let settings = written.federation.expect("settings written");
+        let mut write = FederationWrite::new(Arc::new(request(&actor, "https://api.example.org")));
+        let (written, output) = crate::realm::commit_retry::write_once(&mut write, &actor, &first);
+        let settings = written.federation.clone().expect("settings written");
         assert_eq!(settings.descriptor.payload.description, written.description);
+        assert_eq!(output, written);
+        crate::realm::commit_retry::retries_conflicts::<FederationWrite>();
+    }
+
+    #[test]
+    fn registry_publishes_soon() {
+        // Only settings with a registry URL shorten the publication timer after the commit.
+        let (mut write, _, _) = written_ops(None);
+        let Ok(Next::Then { mut output, calls }) = write.next(IoResult::Done) else {
+            panic!("expected the config with the timers");
+        };
+        assert_eq!(calls.len(), 1);
+        let settings = output.federation.as_mut().expect("settings written");
+        settings.registry_url = Some(Url::parse("https://registry.example.org").unwrap());
+        assert!(FederationWrite::publication(&output).is_some());
+    }
+
+    #[test]
+    fn node_skips_check() {
+        // The node itself acts without a caller context and goes straight to the write.
+        let mut config = request(&actor(), "https://api.example.org");
+        config.auth_context = None;
+        let mut operation = SetFederationOperation::new(config);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(operation.authorized);
     }
 
     #[test]
     fn description_sets_realm() {
         // A changed description also replaces the replicated realm description in the same write.
-        let (mut operation, description, ops) = written_ops(Some("NFDI4LS"));
+        let (mut write, description, ops) = written_ops(Some("NFDI4LS"));
         assert_eq!(description, "NFDI4LS");
         assert!(matches!(
             ops.as_slice(),
@@ -913,19 +816,10 @@ mod tests {
                 AdminDocumentOperation::ConfigDescriptionSet { description },
             ] if description == "NFDI4LS"
         ));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let txn_id = Ulid::from_bytes([7u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap().description, "NFDI4LS");
+        let Ok(Next::Then { output, .. }) = write.next(IoResult::Done) else {
+            panic!("expected the config after the commit");
+        };
+        assert_eq!(output.description, "NFDI4LS");
 
         // Without a description, or with the current one, the realm description stays.
         for kept in [None, Some("Old_Realm")] {

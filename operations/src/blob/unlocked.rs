@@ -132,7 +132,8 @@ async fn drop_received(
     let mut dropped = 0;
     loop {
         let fence = RejectOwnersOperation::new(archive.clone(), &record)?;
-        let owners = crate::driver::drive(fence, context).await?;
+        let seed = archive.to_bytes();
+        let owners = crate::driver::drive_retry(|| fence.clone(), context, &seed).await?;
         if owners.is_empty() {
             return Ok(dropped);
         }

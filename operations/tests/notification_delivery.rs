@@ -34,7 +34,7 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::notifications::settings::{Delivery, MetadataPeers, delivery_setting};
+use aruna_operations::notifications::settings::{Delivery, DeliveryOperation};
 use aruna_operations::notifications::webhook::{
     WebhookOutcome, read_webhook, remove_webhook, set_webhook,
 };
@@ -748,17 +748,13 @@ impl SettingRealm {
             },
             unix_timestamp_millis(),
         );
-        let context = self.context(index);
-        let peers = MetadataPeers {
-            ctx: context,
-            local: self.id(index),
-        };
-        let managers = self.managers();
+        let local = (self.id(index), owner.realm_id);
+        let managers = Some(self.managers());
         let channel = SettingChannel::Webhook;
-        let backoffs = aruna_outbound::Backoffs::default();
         let now = unix_timestamp_millis();
-        let managers = Some(managers.as_slice());
-        delivery_setting(context, &peers, &backoffs, &record, channel, managers, now).await
+        let decide = DeliveryOperation::new(record, channel, managers, local, now);
+        let decided = drive(decide, self.context(index)).await;
+        decided.expect("the delivery decision runs")
     }
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {

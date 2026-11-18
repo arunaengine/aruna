@@ -5,15 +5,17 @@
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::errors::AuthorizationError;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE,
     NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::{
     conflict_write_entries, group_deletion_entries, reducer_state_key, stale_conflict_deletes,
 };
@@ -26,10 +28,9 @@ use aruna_core::structs::identity::group_delete::{
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::permission_rules::{read_rules, rule_reads};
 use crate::groups::backends::{backend_key, index_prefix};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -37,37 +38,22 @@ use crate::sync::outbox_record::{
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 
+/// What the outer commit waits for: the transaction, the sync, then the drain timer.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
-    Read,
-    GroupAuth,
-    RealmAuth,
+enum Step {
     Write,
-    Backends,
-    Delete,
-    Fence,
-    Commit,
     Persist,
     Schedule,
-    Finish,
 }
 
+/// Commits the tombstone in its own transaction, syncs it to disk, then wakes the outbox drain
+/// when it wrote an outbox record. The event is answered only once it is durable.
 #[derive(Debug, PartialEq)]
 pub(super) struct CommitOperation {
-    certificate: GroupDeleteCertificate,
-    actor: Actor,
-    auth: Option<AuthContext>,
+    write: Option<CommitWrite>,
+    scheduled: bool,
     event: Option<AdminDocumentEvent>,
-    config: Option<RealmConfigDocument>,
-    reducer: Option<AdminDocumentState>,
-    deletes: Vec<(String, Key)>,
-    membership: MembershipFence,
-    txn_id: Option<TxnId>,
-    fence: WriteFence,
-    state: State,
-    output: Option<Result<AdminDocumentEvent, GroupDeletionError>>,
+    step: Step,
 }
 
 impl CommitOperation {
@@ -77,7 +63,13 @@ impl CommitOperation {
         auth: Option<AuthContext>,
         event: Option<AdminDocumentEvent>,
     ) -> Self {
-        Self {
+        let scheduled = auth.is_some();
+        let backends = PrefixPages::new(
+            BACKEND_INDEX_KEYSPACE,
+            index_prefix(certificate.plan.group_id),
+            128,
+        );
+        let write = CommitWrite {
             certificate,
             actor,
             auth,
@@ -86,37 +78,130 @@ impl CommitOperation {
             reducer: None,
             deletes: Vec::new(),
             membership: MembershipFence::default(),
-            txn_id: None,
             fence: Default::default(),
-            state: State::Init,
-            output: None,
+            stage: Stage::Read,
+            backends,
+        };
+        Self {
+            write: Some(write),
+            scheduled,
+            event: None,
+            step: Step::Write,
         }
     }
+}
 
-    fn fail(&mut self, error: GroupDeletionError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Finish;
-        self.abort()
+impl Operation for CommitOperation {
+    type Output = AdminDocumentEvent;
+    type Error = GroupDeletionError;
+
+    fn first(&mut self) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        let write = self.write.take().ok_or_else(|| {
+            GroupDeletionError::Unavailable("deletion commit started twice".into())
+        })?;
+        write.admit()?;
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        match self.step {
+            Step::Write => {
+                self.event = Some(result.child::<AdminDocumentEvent, GroupDeletionError>()??);
+                self.step = Step::Persist;
+                Ok(Next::Call(IoCall::Sync))
+            }
+            Step::Persist => {
+                done(result)?;
+                if !self.scheduled {
+                    return self.finish();
+                }
+                self.step = Step::Schedule;
+                Ok(Next::Call(IoCall::Effect(
+                    Box::new(schedule_drain_effect()),
+                )))
+            }
+            // A failed drain timer only delays the drain; the tombstone is already durable.
+            Step::Schedule => match result {
+                IoResult::Event(event)
+                    if matches!(
+                        *event,
+                        Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. })
+                    ) =>
+                {
+                    self.finish()
+                }
+                _ => Err(GroupDeletionError::Unavailable(
+                    "unexpected group commit event".into(),
+                )),
+            },
+        }
+    }
+}
+
+impl CommitOperation {
+    fn finish(&mut self) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        self.event
+            .take()
+            .map(Next::Done)
+            .ok_or_else(|| GroupDeletionError::Unavailable("deletion did not finish".into()))
+    }
+}
+
+/// What the commit transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    GroupAuth,
+    RealmAuth,
+    Write,
+    Backends,
+    Delete,
+    Fence,
+}
+
+/// Checks the certificate against the stored state and writes the tombstone, in one write
+/// transaction.
+#[derive(Debug, PartialEq)]
+struct CommitWrite {
+    certificate: GroupDeleteCertificate,
+    actor: Actor,
+    auth: Option<AuthContext>,
+    event: Option<AdminDocumentEvent>,
+    config: Option<RealmConfigDocument>,
+    reducer: Option<AdminDocumentState>,
+    deletes: Vec<(String, Key)>,
+    membership: MembershipFence,
+    fence: WriteFence,
+    stage: Stage,
+    backends: PrefixPages,
+}
+
+fn unavailable(error: AuthorizationError) -> GroupDeletionError {
+    GroupDeletionError::Unavailable(error.to_string())
+}
+
+impl CommitWrite {
+    /// Refuses a certificate or actor that cannot commit, before any read.
+    fn admit(&self) -> Result<(), GroupDeletionError> {
+        if self.actor.user_id != self.certificate.plan.requested_by {
+            return Err(GroupDeletionError::Unauthorized);
+        }
+        if !self.certificate.verify() || self.actor.realm_id != self.certificate.plan.realm_id
+            || self.actor.node_id != self.certificate.plan.coordinator
+            || self.auth.as_ref().is_some_and(|auth| auth.user_id != self.actor.user_id || auth.realm_id != self.actor.realm_id || auth.path_restrictions.is_some())
+            || self.event.as_ref().is_some_and(|event| !matches!(&event.op, AdminDocumentOperation::GroupDeleted { certificate } if certificate.as_ref() == &self.certificate) || event.actor != self.actor)
+        {
+            return Err(GroupDeletionError::Invalid("deletion certificate or actor mismatch".into()));
+        }
+        Ok(())
     }
 
     fn inspect(
         &mut self,
-        values: Vec<(Key, Option<Value>)>,
-        txn_id: TxnId,
-    ) -> Result<Effects, GroupDeletionError> {
-        let [
-            (_, record),
-            (_, cancelled),
-            (_, group),
-            (_, reducer),
-            (_, config),
-            (_, membership),
-        ] = values.as_slice()
-        else {
-            return Err(GroupDeletionError::Unavailable(
-                "invalid commit read".into(),
-            ));
-        };
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        let [record, cancelled, group, reducer, config, membership] = <[_; 6]>::try_from(values)
+            .map_err(|_| GroupDeletionError::Unavailable("invalid commit read".into()))?;
         self.membership = MembershipFence::from_value(membership.as_deref())?;
         let record = record.as_deref().ok_or_else(|| {
             GroupDeletionError::Conflict("node has not confirmed emptiness".into())
@@ -131,8 +216,8 @@ impl CommitOperation {
             let event = record.event.ok_or_else(|| {
                 GroupDeletionError::Unavailable("committed deletion event is missing".into())
             })?;
-            self.event = Some(*event);
-            return Ok(self.commit(txn_id));
+            self.event = Some(*event.clone());
+            return Ok(Next::Done(*event));
         }
         if cancelled.is_some() || record.phase != GroupDeletePhase::Preparing {
             return Err(GroupDeletionError::Conflict(
@@ -171,37 +256,50 @@ impl CommitOperation {
         });
         self.config = Some(config);
         if self.auth.is_some() {
-            self.state = State::GroupAuth;
-            Ok(self.authorize(txn_id, false))
+            self.authorize(false)
         } else {
-            self.write(txn_id)
+            self.write()
         }
     }
 
-    fn authorize(&self, txn_id: TxnId, realm: bool) -> Effects {
-        let Some(auth_context) = self.auth.clone() else {
-            return smallvec![];
-        };
+    fn auth_path(&self, realm: bool) -> String {
         let plan = &self.certificate.plan;
-        let path = if realm {
-            format!("/{}/admin/groups", plan.realm_id)
-        } else {
-            format!("/{}/g/{}/admin", plan.realm_id, plan.group_id)
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(
-                CheckPermissionsConfig {
-                    auth_context,
-                    path,
-                    required_permission: Permission::WRITE
-                },
-                txn_id
-            ),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        match realm {
+            true => format!("/{}/admin/groups", plan.realm_id),
+            false => format!("/{}/g/{}/admin", plan.realm_id, plan.group_id),
+        }
     }
 
-    fn write(&mut self, txn_id: TxnId) -> Result<Effects, GroupDeletionError> {
+    /// Reads the caller's rules in this transaction: the group's administrators first, then the
+    /// realm's group administrators.
+    fn authorize(&mut self, realm: bool) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        self.stage = match realm {
+            true => Stage::RealmAuth,
+            false => Stage::GroupAuth,
+        };
+        let reads = rule_reads(&self.auth_path(realm)).map_err(unavailable)?;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn authorized(
+        &mut self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        let realm = self.stage == Stage::RealmAuth;
+        let Some(auth_context) = &self.auth else {
+            return Err(GroupDeletionError::Unauthorized);
+        };
+        let rules = read_rules(auth_context, values).map_err(unavailable)?;
+        if rules.allows(&self.auth_path(realm), &Permission::WRITE) {
+            return self.write();
+        }
+        if !realm {
+            return self.authorize(true);
+        }
+        Err(GroupDeletionError::Unauthorized)
+    }
+
+    fn write(&mut self) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
         let Some(previous) = self.reducer.as_ref() else {
             return Err(GroupDeletionError::Unavailable(
                 "group reducer is missing".into(),
@@ -262,31 +360,16 @@ impl CommitOperation {
         }
         self.event = Some(event);
         self.deletes = deletes;
-        self.state = State::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id)
-        })])
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    /// Pages through this node's backend records of the group; prepare left only retained ones.
-    fn scan_backends(&mut self, start: Option<Key>) -> Effects {
-        self.state = State::Backends;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_INDEX_KEYSPACE.to_string(),
-            prefix: Some(index_prefix(self.certificate.plan.group_id)),
-            start: start.map(aruna_core::effects::IterStart::After),
-            limit: 128,
-            txn_id: self.txn_id,
-        })]
-    }
-
+    /// Drops this node's backend records of the group in one page; prepare left only retained ones.
     fn drop_backends(
         &mut self,
-        values: Vec<(Key, Value)>,
-        next: Option<Key>,
-    ) -> Result<Effects, GroupDeletionError> {
-        for (key, value) in values {
+        result: IoResult,
+    ) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        for (key, value) in self.backends.take(result)? {
             let record = GroupStorage::from_bytes(&value)?;
             if record.group_id != self.certificate.plan.group_id {
                 return Err(GroupDeletionError::Invalid("backend index mismatch".into()));
@@ -301,19 +384,20 @@ impl CommitOperation {
                 (NODE_VAULT_KEYSPACE.to_string(), entry.key().into()),
             ]);
         }
-        if next.is_some() {
-            return Ok(self.scan_backends(next));
+        if !self.backends.done() {
+            return Ok(Next::Call(self.backends.call()));
         }
-        self.state = State::Delete;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id
-        })])
+        self.stage = Stage::Delete;
+        Ok(Next::Call(IoCall::Delete(std::mem::take(
+            &mut self.deletes,
+        ))))
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    fn finish(&mut self) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        self.event
+            .clone()
+            .map(Next::Done)
+            .ok_or_else(|| GroupDeletionError::Unavailable("deletion did not finish".into()))
     }
 }
 
@@ -332,175 +416,77 @@ fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletio
     Ok((space, row.to_bytes().to_vec().into(), value.into()))
 }
 
-impl EffectOperation for CommitOperation {
+impl Operation for CommitWrite {
     type Output = AdminDocumentEvent;
     type Error = GroupDeletionError;
 
-    fn start(&mut self) -> Effects {
-        if self.actor.user_id != self.certificate.plan.requested_by {
-            return self.fail(GroupDeletionError::Unauthorized);
-        }
-        if !self.certificate.verify() || self.actor.realm_id != self.certificate.plan.realm_id
-            || self.actor.node_id != self.certificate.plan.coordinator
-            || self.auth.as_ref().is_some_and(|auth| auth.user_id != self.actor.user_id || auth.realm_id != self.actor.realm_id || auth.path_restrictions.is_some())
-            || self.event.as_ref().is_some_and(|event| !matches!(&event.op, AdminDocumentOperation::GroupDeleted { certificate } if certificate.as_ref() == &self.certificate) || event.actor != self.actor)
-        {
-            return self.fail(GroupDeletionError::Invalid("deletion certificate or actor mismatch".into()));
-        }
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        let result = match (&self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                let plan = &self.certificate.plan;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            GROUP_DELETE_KEYSPACE.to_string(),
-                            plan.group_id.to_bytes().into()
-                        ),
-                        (
-                            GROUP_DELETE_KEYSPACE.to_string(),
-                            plan.cancelled_key().into()
-                        ),
-                        (GROUP_KEYSPACE.to_string(), plan.group_id.to_bytes().into()),
-                        (
-                            DOCUMENT_STATE_KEYSPACE.to_string(),
-                            reducer_state_key(&AdminDocumentTarget::Group {
-                                group_id: plan.group_id
-                            })
-                        ),
-                        (
-                            REALM_CONFIG_KEYSPACE.to_string(),
-                            plan.realm_id.as_bytes().to_vec().into()
-                        ),
-                        (
-                            GROUP_DELETE_KEYSPACE.to_string(),
-                            MembershipFence::key(plan.realm_id)
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                match self.txn_id {
-                    Some(txn_id) => self.inspect(values, txn_id),
-                    None => Err(GroupDeletionError::Unavailable(
-                        "missing transaction".into(),
-                    )),
-                }
-            }
+    fn first(&mut self) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        let plan = &self.certificate.plan;
+        let reducer = AdminDocumentTarget::Group {
+            group_id: plan.group_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![
             (
-                State::GroupAuth | State::RealmAuth,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match self.txn_id {
-                Some(txn_id) => match allowed {
-                    Ok(true) => self.write(txn_id),
-                    Ok(false) if self.state == State::GroupAuth => {
-                        self.state = State::RealmAuth;
-                        Ok(self.authorize(txn_id, true))
-                    }
-                    Ok(false) => Err(GroupDeletionError::Unauthorized),
-                    Err(error) => Err(GroupDeletionError::Unavailable(error.to_string())),
-                },
-                None => Err(GroupDeletionError::Unavailable(
-                    "missing transaction".into(),
-                )),
-            },
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.scan_backends(None))
-            }
+                GROUP_DELETE_KEYSPACE.to_string(),
+                plan.group_id.to_bytes().into(),
+            ),
             (
-                State::Backends,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.drop_backends(values, next_start_after),
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                match self.txn_id {
-                    Some(txn_id) if self.fence.is_empty() => Ok(self.commit(txn_id)),
-                    Some(txn_id) => {
-                        self.state = State::Fence;
-                        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                            reads: self.fence.reads(),
-                            txn_id: Some(txn_id)
-                        })])
-                    }
-                    None => Err(GroupDeletionError::Unavailable(
-                        "missing transaction".into(),
-                    )),
-                }
+                GROUP_DELETE_KEYSPACE.to_string(),
+                plan.cancelled_key().into(),
+            ),
+            (GROUP_KEYSPACE.to_string(), plan.group_id.to_bytes().into()),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&reducer),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                plan.realm_id.as_bytes().to_vec().into(),
+            ),
+            (
+                GROUP_DELETE_KEYSPACE.to_string(),
+                MembershipFence::key(plan.realm_id),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<AdminDocumentEvent>, GroupDeletionError> {
+        match (&self.stage, result) {
+            (Stage::Read, IoResult::Values(values)) => self.inspect(values),
+            (Stage::GroupAuth | Stage::RealmAuth, IoResult::Values(values)) => {
+                self.authorized(values)
             }
-            (State::Fence, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                if self.fence.admits(&values) {
-                    match self.txn_id {
-                        Some(txn_id) => Ok(self.commit(txn_id)),
-                        None => Err(GroupDeletionError::Unavailable(
-                            "missing transaction".into(),
-                        )),
-                    }
-                } else {
-                    Err(GroupDeletionError::Conflict(
+            (Stage::Write, result) => {
+                done(result)?;
+                self.stage = Stage::Backends;
+                Ok(Next::Call(self.backends.call()))
+            }
+            (Stage::Backends, result) => self.drop_backends(result),
+            (Stage::Delete, result) => {
+                done(result)?;
+                if self.fence.is_empty() {
+                    return self.finish();
+                }
+                self.stage = Stage::Fence;
+                Ok(Next::Call(IoCall::Read(self.fence.reads())))
+            }
+            (Stage::Fence, IoResult::Values(values)) => {
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(GroupDeletionError::Conflict(
                         "group placement changed".into(),
-                    ))
+                    ));
                 }
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = State::Persist;
-                Ok(smallvec![Effect::Storage(StorageEffect::SyncAll)])
-            }
-            (State::Persist, Event::Storage(StorageEvent::SyncAllFinished)) => {
-                if self.auth.is_some() {
-                    self.state = State::Schedule;
-                    Ok(smallvec![schedule_drain_effect()])
-                } else {
-                    self.state = State::Finish;
-                    self.output = self.event.take().map(Ok);
-                    Ok(smallvec![])
-                }
-            }
-            (
-                State::Schedule,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                self.state = State::Finish;
-                self.output = self.event.take().map(Ok);
-                Ok(smallvec![])
+                self.finish()
             }
             _ => Err(GroupDeletionError::Unavailable(
                 "unexpected group commit event".into(),
             )),
-        };
-        result.unwrap_or_else(|error| self.fail(error))
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
-
-    fn finalize(self) -> Result<AdminDocumentEvent, GroupDeletionError> {
-        self.output.unwrap_or_else(|| {
-            Err(GroupDeletionError::Unavailable(
-                "deletion did not finish".into(),
-            ))
-        })
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+        }
     }
 }

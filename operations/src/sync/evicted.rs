@@ -10,7 +10,7 @@ use aruna_core::document::DocumentEvictedDocument;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
 use tracing::warn;
 
 use crate::sync::outbox_record::{
@@ -18,22 +18,20 @@ use crate::sync::outbox_record::{
 };
 
 /// What a re-emit wrote. `complete` is false when a record could not be encoded or written,
-/// so the caller keeps its eviction journal; a failed drain schedule leaves it true.
+/// so the caller keeps its eviction journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReemitOutcome {
     pub written: usize,
     pub complete: bool,
-    pub drain_error: Option<String>,
 }
 
 /// Writes one outbox record per evicted document under its evicted event id, so a replay
 /// lands once and mints no genesis, then arms the outbox drain when anything was written.
-/// A failed write only marks the outcome incomplete.
+/// A failed write only marks the outcome incomplete; the runner logs a failed drain schedule.
 #[derive(Debug, PartialEq)]
 pub struct ReemitEvictedOperation {
     writes: VecDeque<Effect>,
     outcome: ReemitOutcome,
-    scheduling: bool,
 }
 
 impl ReemitEvictedOperation {
@@ -63,9 +61,7 @@ impl ReemitEvictedOperation {
             outcome: ReemitOutcome {
                 written: 0,
                 complete,
-                drain_error: None,
             },
-            scheduling: false,
         }
     }
 
@@ -76,8 +72,10 @@ impl ReemitEvictedOperation {
         if self.outcome.written == 0 {
             return Next::Done(self.outcome.clone());
         }
-        self.scheduling = true;
-        Next::Call(IoCall::Effect(Box::new(schedule_drain_effect())))
+        Next::Then {
+            output: self.outcome.clone(),
+            calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+        }
     }
 }
 
@@ -93,31 +91,24 @@ impl Operation for ReemitEvictedOperation {
         let IoResult::Event(event) = result else {
             return Err(unexpected(result.label()));
         };
-        match (self.scheduling, *event) {
-            (false, Event::Storage(StorageEvent::WriteResult { .. })) => {
+        match *event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
                 self.outcome.written += 1;
                 Ok(self.advance())
             }
-            (false, Event::Storage(StorageEvent::Error { error })) => {
+            Event::Storage(StorageEvent::Error { error }) => {
                 warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
                 self.outcome.complete = false;
                 Ok(self.advance())
             }
-            (true, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                Ok(Next::Done(self.outcome.clone()))
-            }
-            (true, Event::Task(TaskEvent::Error { message, .. })) => {
-                self.outcome.drain_error = Some(message);
-                Ok(Next::Done(self.outcome.clone()))
-            }
-            (_, other) => Err(unexpected(other.label())),
+            other => Err(unexpected(other.label())),
         }
     }
 }
 
 fn unexpected(got: &'static str) -> IoError {
     IoError::Unexpected {
-        expected: "an outbox write or drain schedule result",
+        expected: "StorageEvent::WriteResult",
         got,
     }
 }
@@ -132,6 +123,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::task::TaskEvent;
     use std::time::Duration;
     use ulid::Ulid;
 
@@ -202,8 +194,12 @@ mod tests {
         }))
     }
 
-    fn schedule() -> Next<ReemitOutcome> {
-        Next::Call(IoCall::Effect(Box::new(schedule_drain_effect())))
+    /// The outcome, then the drain schedule after the run.
+    fn scheduled_after(written: usize, complete: bool) -> Next<ReemitOutcome> {
+        Next::Then {
+            output: ReemitOutcome { written, complete },
+            calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+        }
     }
 
     #[test]
@@ -214,13 +210,7 @@ mod tests {
         assert_eq!(first.node_id, node());
         let second = written_record(operation.next(written()));
         assert_eq!(second.outbox_id, evicted(2).event_id);
-        assert_eq!(operation.next(written()), Ok(schedule()));
-        let outcome = ReemitOutcome {
-            written: 2,
-            complete: true,
-            drain_error: None,
-        };
-        assert_eq!(operation.next(scheduled()), Ok(Next::Done(outcome)));
+        assert_eq!(operation.next(written()), Ok(scheduled_after(2, true)));
     }
 
     #[test]
@@ -229,11 +219,7 @@ mod tests {
         operation.first().unwrap();
         let second = written_record(operation.next(failed()));
         assert_eq!(second.outbox_id, evicted(2).event_id);
-        assert_eq!(operation.next(written()), Ok(schedule()));
-        let Ok(Next::Done(outcome)) = operation.next(scheduled()) else {
-            panic!("re-emit finishes");
-        };
-        assert_eq!((outcome.written, outcome.complete), (1, false));
+        assert_eq!(operation.next(written()), Ok(scheduled_after(1, false)));
     }
 
     #[test]
@@ -252,25 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_error_reported() {
-        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
-        operation.first().unwrap();
-        operation.next(written()).unwrap();
-        let refused = event(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainSyncOutbox),
-            message: "task handle unavailable".to_string(),
-        }));
-        let Ok(Next::Done(outcome)) = operation.next(refused) else {
-            panic!("re-emit finishes");
-        };
-        assert!(outcome.complete);
-        assert_eq!(
-            outcome.drain_error.as_deref(),
-            Some("task handle unavailable")
-        );
-    }
-
-    #[test]
     fn refuses_other_results() {
         let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
         operation.first().unwrap();
@@ -280,11 +247,6 @@ mod tests {
         ));
         assert!(matches!(
             operation.next(IoResult::Done),
-            Err(IoError::Unexpected { .. })
-        ));
-        operation.next(written()).unwrap();
-        assert!(matches!(
-            operation.next(written()),
             Err(IoError::Unexpected { .. })
         ));
     }

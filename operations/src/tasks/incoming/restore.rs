@@ -44,7 +44,7 @@ async fn durable_rearm_loop(
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
-        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
@@ -53,14 +53,13 @@ async fn durable_rearm_loop(
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
-        restore_drain_timer(&context.storage_handle, &task_handle).await;
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_drain_timer(&context, &task_handle).await;
+        restore_prune_timer(&context, &task_handle).await;
         restore_mirror_timer(&context, &task_handle).await;
         crate::jobs::repository::link_queue::restore_link_timer(
-            &context.storage_handle,
+            &context,
             &task_handle,
         )
         .await;
@@ -288,7 +287,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&task_handle).await;
         if stopped() {
             return;
         }
@@ -313,8 +312,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -331,7 +329,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -451,29 +449,6 @@ impl OperationsTaskHandler {
             .await;
     }
 
-    pub(super) async fn publish_watch_interest(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::PublishWatchInterest, "Cannot publish watch interest without net handle");
-            return;
-        };
-        let node_id = net_handle.node_id();
-        match crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
-            .await
-        {
-            // Fold this node's freshly written digest into the origin-side cache;
-            // the local write bypasses the reconcile path that refreshes remotes.
-            Ok(true) => {
-                net_handle.replace_watch_interest(interest_table(&self.context).await);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
-                self.reschedule_timer(TaskKey::PublishWatchInterest, WATCH_PUBLISH_DEBOUNCE)
-                    .await;
-            }
-        }
-    }
-
     pub(super) async fn drain_materialization_queue(&self) {
         let bulk = self.context.bulk();
         match process_materialization_batch(&bulk).await {
@@ -531,7 +506,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match prune_jobs_exist(&bulk.storage_handle).await {
+            Ok(_) => match prune_jobs_exist(&bulk).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
@@ -746,7 +721,7 @@ impl OperationsTaskHandler {
 
         let reconciler = self.jobs_runtime.reconciler();
         let result = match drain_job_batch(
-            &self.context.storage_handle,
+            &self.context,
             owner_node_id,
             budget,
             reconciler.as_ref(),
@@ -773,7 +748,7 @@ impl OperationsTaskHandler {
                     continue;
                 };
                 if let Err(error) = release_job(
-                    &self.context.storage_handle,
+                    &self.context,
                     record.job_id,
                     token,
                     unix_timestamp_millis(),
@@ -811,7 +786,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn prune_jobs(&self) {
-        let after = match prune_job_batch(&self.context).await {
+        let handlers = self.jobs_runtime.handlers();
+        let after = match prune_job_batch(&self.context, &handlers).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after

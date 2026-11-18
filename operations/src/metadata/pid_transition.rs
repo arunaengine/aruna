@@ -5,7 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{decode, done, encoded_row, read_row};
 use aruna_core::storage_entries::metadata_document_key;
 use aruna_core::structs::storage::metadata_registry::{
@@ -268,8 +268,8 @@ impl Operation for PidTransitionOperation {
     type Output = PidOutcome;
     type Error = PersistentIdError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> PidTurn {
@@ -372,7 +372,10 @@ mod call_tests {
     #[test]
     fn mint_activates_mapping() {
         let mut operation = PidTransitionOperation::new(None, document(), mint());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(operation.first(), Ok(Next::Call(mapping_call(document()))));
         assert_eq!(
             operation.next(stored(&mapping(document()))),

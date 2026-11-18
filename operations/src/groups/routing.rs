@@ -3,23 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::{
-    BackendCatalog, NodeRouting, RoutingSnapshot, StorageRoutingRule,
+    BackendCatalog, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
 };
 use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_keys};
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::groups::backends::{RecordReadError, parse_read};
+use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::{GroupInputsError, GroupInputsOperation};
 
 /// Why a write could not learn where it belongs. Absent records are not an
@@ -75,14 +74,26 @@ impl BucketRules {
     }
 }
 
+impl From<IoError> for RoutingInputsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::BucketRules(RecordReadError::Storage(error)),
+            _ => Self::Incomplete,
+        }
+    }
+}
+
+/// What the snapshot waits for.
 #[derive(Debug, PartialEq)]
 enum SnapshotState {
     Init(BucketRules),
     Bucket,
-    Group(GroupInputsOperation),
+    Group,
     Usage(Vec<(String, u64)>),
     Done,
 }
+
+type SnapshotTurn = Result<Next<RoutingSnapshot>, RoutingInputsError>;
 
 /// Routing inputs for one bucket write: node routing, bucket rules and compression, the owning
 /// group's inputs, then the fullness of each capped backend frozen for this request.
@@ -90,7 +101,6 @@ enum SnapshotState {
 pub struct SnapshotOperation {
     snapshot: Option<RoutingSnapshot>,
     state: SnapshotState,
-    output: Option<Result<RoutingSnapshot, RoutingInputsError>>,
 }
 
 impl SnapshotOperation {
@@ -98,122 +108,82 @@ impl SnapshotOperation {
         Self {
             snapshot: Some(routing.snapshot(group_id)),
             state: SnapshotState::Init(bucket),
-            output: None,
         }
     }
 
-    fn rules(&mut self, rules: Vec<StorageRoutingRule>, compression: Compression) -> Effects {
-        let Some(snapshot) = self.snapshot.take() else {
-            return self.finish(Err(RoutingInputsError::Incomplete));
-        };
-        let mut inputs = GroupInputsOperation::new(snapshot.group_id);
+    fn rules(&mut self, rules: Vec<StorageRoutingRule>, compression: Compression) -> SnapshotTurn {
+        let snapshot = self.snapshot.take().ok_or(RoutingInputsError::Incomplete)?;
+        let inputs = GroupInputsOperation::new(snapshot.group_id);
         self.snapshot = Some(
             snapshot
                 .with_bucket_rules(rules)
                 .with_compression(compression),
         );
-        let effects = inputs.start();
-        self.state = SnapshotState::Group(inputs);
-        effects
+        self.state = SnapshotState::Group;
+        Ok(Next::Call(IoCall::child(inputs)))
     }
 
-    fn group(&mut self, mut inputs: GroupInputsOperation, event: Event) -> Effects {
-        let effects = inputs.step(event);
-        if !inputs.is_complete() {
-            self.state = SnapshotState::Group(inputs);
-            return effects;
-        }
-        let (inputs, Some(snapshot)) = (inputs.finalize(), self.snapshot.take()) else {
-            return self.finish(Err(RoutingInputsError::Incomplete));
-        };
-        let snapshot = match inputs {
-            Ok(inputs) => snapshot.with_group_inputs(inputs),
-            Err(error) => return self.finish(Err(error.into())),
-        };
+    fn group(&mut self, inputs: Result<GroupRoutingInputs, GroupInputsError>) -> SnapshotTurn {
+        let snapshot = self.snapshot.take().ok_or(RoutingInputsError::Incomplete)?;
+        let snapshot = snapshot.with_group_inputs(inputs?);
         let quotas = snapshot.catalog.quotas();
-        self.snapshot = Some(snapshot);
         if quotas.is_empty() {
-            return self.finish(Ok(()));
+            return Ok(Next::Done(snapshot));
         }
-        let effect = usage_read(&quotas);
+        self.snapshot = Some(snapshot);
+        let read = usage_read(&quotas);
         self.state = SnapshotState::Usage(quotas);
-        smallvec![effect]
+        Ok(Next::Call(read))
     }
 
-    fn usage(&mut self, quotas: &[(String, u64)], event: Event) -> Effects {
-        let Some(mut snapshot) = self.snapshot.take() else {
-            return self.finish(Err(RoutingInputsError::Incomplete));
-        };
-        match full_catalog(snapshot.catalog.clone(), quotas, event) {
-            Ok(catalog) => {
-                snapshot.catalog = catalog;
-                self.snapshot = Some(snapshot);
-                self.finish(Ok(()))
-            }
-            Err(error) => self.finish(Err(RoutingInputsError::BackendUsage(error))),
-        }
-    }
-
-    fn finish(&mut self, result: Result<(), RoutingInputsError>) -> Effects {
-        self.state = SnapshotState::Done;
-        self.output =
-            Some(result.and_then(|()| self.snapshot.take().ok_or(RoutingInputsError::Incomplete)));
-        smallvec![]
+    fn usage(&mut self, quotas: &[(String, u64)], result: IoResult) -> SnapshotTurn {
+        let mut snapshot = self.snapshot.take().ok_or(RoutingInputsError::Incomplete)?;
+        let values = usage_values(result).map_err(RoutingInputsError::BackendUsage)?;
+        snapshot.catalog = full_catalog(snapshot.catalog.clone(), quotas, &values)
+            .map_err(RoutingInputsError::BackendUsage)?;
+        Ok(Next::Done(snapshot))
     }
 }
 
-impl EffectOperation for SnapshotOperation {
+impl Operation for SnapshotOperation {
     type Output = RoutingSnapshot;
     type Error = RoutingInputsError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> SnapshotTurn {
         match std::mem::replace(&mut self.state, SnapshotState::Bucket) {
             SnapshotState::Init(BucketRules::Named(bucket)) => {
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: bucket.into_bytes().into(),
-                    txn_id: None,
-                })]
+                Ok(Next::Call(IoCall::Read(vec![(
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    bucket.into_bytes().into(),
+                )])))
             }
             SnapshotState::Init(BucketRules::Known { rules, compression }) => {
                 self.rules(rules, compression)
             }
-            state => {
-                self.state = state;
-                smallvec![]
-            }
+            _ => Err(RoutingInputsError::Incomplete),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> SnapshotTurn {
         match std::mem::replace(&mut self.state, SnapshotState::Done) {
-            SnapshotState::Bucket => match parse_read(event, BucketInfo::from_bytes) {
-                Ok(info) => {
-                    let (rules, compression) = info
-                        .map(|info| (info.storage_routing, info.compression))
-                        .unwrap_or_default();
-                    self.rules(rules, compression)
-                }
-                Err(error) => self.finish(Err(error.into())),
-            },
-            SnapshotState::Group(inputs) => self.group(inputs, event),
-            SnapshotState::Usage(quotas) => self.usage(&quotas, event),
-            SnapshotState::Init(_) | SnapshotState::Done => {
-                self.finish(Err(RoutingInputsError::Incomplete))
+            SnapshotState::Bucket => {
+                let [value] = values::<1>(result).map_err(RecordReadError::from)?;
+                let info = value
+                    .map(|value| BucketInfo::from_bytes(value.as_ref()))
+                    .transpose()
+                    .map_err(RecordReadError::from)?;
+                let (rules, compression) = info
+                    .map(|info| (info.storage_routing, info.compression))
+                    .unwrap_or_default();
+                self.rules(rules, compression)
             }
+            SnapshotState::Group => {
+                let inputs = result.child::<GroupRoutingInputs, GroupInputsError>()?;
+                self.group(inputs)
+            }
+            SnapshotState::Usage(quotas) => self.usage(&quotas, result),
+            SnapshotState::Init(_) | SnapshotState::Done => Err(RoutingInputsError::Incomplete),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<RoutingSnapshot, RoutingInputsError> {
-        self.output.unwrap_or(Err(RoutingInputsError::Incomplete))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -224,7 +194,6 @@ impl EffectOperation for SnapshotOperation {
 pub struct QuotaOperation {
     routing: Option<NodeRouting>,
     quotas: Vec<(String, u64)>,
-    output: Option<Result<NodeRouting, RoutingInputsError>>,
 }
 
 impl QuotaOperation {
@@ -232,47 +201,28 @@ impl QuotaOperation {
         Self {
             quotas: routing.catalog.quotas(),
             routing: Some(routing),
-            output: None,
         }
     }
 }
 
-impl EffectOperation for QuotaOperation {
+impl Operation for QuotaOperation {
     type Output = NodeRouting;
     type Error = RoutingInputsError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<NodeRouting>, RoutingInputsError> {
         if self.quotas.is_empty() {
-            self.output = self.routing.take().map(Ok);
-            return smallvec![];
+            let routing = self.routing.take().ok_or(RoutingInputsError::Incomplete)?;
+            return Ok(Next::Done(routing));
         }
-        smallvec![usage_read(&self.quotas)]
+        Ok(Next::Call(usage_read(&self.quotas)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Some(routing) = self.routing.take() else {
-            self.output = Some(Err(RoutingInputsError::Incomplete));
-            return smallvec![];
-        };
-        self.output = Some(
-            match full_catalog(routing.catalog.clone(), &self.quotas, event) {
-                Ok(catalog) => Ok(NodeRouting { catalog, ..routing }),
-                Err(error) => Err(RoutingInputsError::BackendUsage(error)),
-            },
-        );
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<NodeRouting, RoutingInputsError> {
-        self.output.unwrap_or(Err(RoutingInputsError::Incomplete))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<NodeRouting>, RoutingInputsError> {
+        let routing = self.routing.take().ok_or(RoutingInputsError::Incomplete)?;
+        let values = usage_values(result).map_err(RoutingInputsError::BackendUsage)?;
+        let catalog = full_catalog(routing.catalog.clone(), &self.quotas, &values)
+            .map_err(RoutingInputsError::BackendUsage)?;
+        Ok(Next::Done(NodeRouting { catalog, ..routing }))
     }
 }
 
@@ -281,53 +231,29 @@ impl EffectOperation for QuotaOperation {
 #[derive(Debug, PartialEq)]
 pub struct UsageOperation {
     backend: BackendRef,
-    started: bool,
-    output: Option<Result<u64, RecordReadError>>,
 }
 
 impl UsageOperation {
     pub fn new(backend: BackendRef) -> Self {
-        Self {
-            backend,
-            started: false,
-            output: None,
-        }
+        Self { backend }
     }
 }
 
-impl EffectOperation for UsageOperation {
+impl Operation for UsageOperation {
     type Output = u64;
     type Error = RecordReadError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        smallvec![batch_read(usage_backend_keys(&self.backend))]
+    fn first(&mut self) -> Result<Next<u64>, RecordReadError> {
+        Ok(Next::Call(batch_read(usage_backend_keys(&self.backend))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(if self.started && self.output.is_none() {
-            batch_values(event).and_then(|values| used_bytes(&values))
-        } else {
-            Err(RecordReadError::Unexpected)
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<u64, RecordReadError> {
-        self.output.unwrap_or(Err(RecordReadError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, RecordReadError> {
+        Ok(Next::Done(used_bytes(&usage_values(result)?)?))
     }
 }
 
 /// One batch read of every counter shard of the capped backends, backend by backend.
-fn usage_read(quotas: &[(String, u64)]) -> Effect {
+fn usage_read(quotas: &[(String, u64)]) -> IoCall {
     batch_read(
         quotas
             .iter()
@@ -336,28 +262,24 @@ fn usage_read(quotas: &[(String, u64)]) -> Effect {
     )
 }
 
-fn batch_read(keys: Vec<Vec<u8>>) -> Effect {
+fn batch_read(keys: Vec<Vec<u8>>) -> IoCall {
     let reads = keys
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
         .collect();
-    Effect::Storage(StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    })
+    IoCall::Read(reads)
 }
 
-fn batch_values(event: Event) -> Result<Vec<(Key, Option<Value>)>, RecordReadError> {
-    match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => Ok(values),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+fn usage_values(result: IoResult) -> Result<Vec<Option<Value>>, RecordReadError> {
+    match result {
+        IoResult::Values(values) => Ok(values),
         _ => Err(RecordReadError::Unexpected),
     }
 }
 
-fn used_bytes(values: &[(Key, Option<Value>)]) -> Result<u64, RecordReadError> {
+fn used_bytes(values: &[Option<Value>]) -> Result<u64, RecordReadError> {
     let mut total = 0u64;
-    for value in values.iter().filter_map(|(_, value)| value.as_ref()) {
+    for value in values.iter().flatten() {
         total = total.saturating_add(UsageCounters::from_bytes(value.as_ref())?.stored_bytes);
     }
     Ok(total)
@@ -368,10 +290,9 @@ fn used_bytes(values: &[(Key, Option<Value>)]) -> Result<u64, RecordReadError> {
 fn full_catalog(
     mut catalog: BackendCatalog,
     quotas: &[(String, u64)],
-    event: Event,
+    values: &[Option<Value>],
 ) -> Result<BackendCatalog, RecordReadError> {
-    let values = batch_values(event)?;
-    let mut rest = values.as_slice();
+    let mut rest = values;
     for (name, quota) in quotas {
         let shards = usage_backend_keys(&BackendRef::Node(name.clone())).len();
         if rest.len() < shards {

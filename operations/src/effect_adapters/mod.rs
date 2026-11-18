@@ -118,6 +118,10 @@ async fn dispatch_unboxed(
             }
             Event::Net(NetEvent::InboxWoken)
         }
+        Effect::Net(NetEffect::DashboardChanged) => {
+            context.notify_dashboard_change();
+            Event::Net(NetEvent::Recorded)
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
@@ -216,5 +220,6 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
     match effect {
         OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
+        OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
     }
 }

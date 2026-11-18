@@ -73,14 +73,13 @@ impl AnnouncePresenceOperation {
     }
 
     fn put_presence(&self) -> Next<()> {
-        Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(
-            DhtEffect::Put {
-                key: self.presence_key(),
-                realm_id: self.config.realm_id,
-                value: self.config.node_id.as_bytes().to_vec(),
-                ttl: REALM_PRESENCE_TTL,
-            },
-        ))))
+        let put = Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key: self.presence_key(),
+            realm_id: self.config.realm_id,
+            value: self.config.node_id.as_bytes().to_vec(),
+            ttl: REALM_PRESENCE_TTL,
+        }));
+        Next::Call(IoCall::Effect(Box::new(put)))
     }
 
     fn put_done(&mut self) -> Next<()> {
@@ -92,10 +91,8 @@ impl AnnouncePresenceOperation {
             node_id: self.config.node_id,
         };
         let after = PRESENCE_REFRESH_AFTER;
-        Next::Call(IoCall::Effect(Effect::Task(TaskEffect::ResetTimer {
-            key,
-            after,
-        })))
+        let timer = Effect::Task(TaskEffect::ResetTimer { key, after });
+        Next::Call(IoCall::Effect(Box::new(timer)))
     }
 }
 
@@ -164,10 +161,10 @@ mod pure_tests {
     #[test]
     fn presence_ttl_sufficient() {
         let mut op = operation(true);
-        let Ok(Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            ttl, ..
-        }))))) = op.first()
-        else {
+        let Ok(Next::Call(IoCall::Effect(effect))) = op.first() else {
+            panic!("expected one DHT put effect");
+        };
+        let Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. })) = *effect else {
             panic!("expected one DHT put effect");
         };
         assert!(ttl > PRESENCE_REFRESH_AFTER);

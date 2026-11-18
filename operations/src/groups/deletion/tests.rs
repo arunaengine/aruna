@@ -14,7 +14,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -403,7 +403,8 @@ async fn occupied_peer_refuses() {
 #[tokio::test]
 async fn writer_conflicts_freeze() {
     let fixture = Fixture::new(&[1]).await;
-    let mut operation = CreateBucketOperation::new("racing".into(), fixture.bucket());
+    let mut operation =
+        CreateBucketOperation::new("racing".into(), fixture.bucket()).into_machine();
     let mut effects = VecDeque::from_iter(operation.start());
     let mut prepared = false;
     while !operation.is_complete() {

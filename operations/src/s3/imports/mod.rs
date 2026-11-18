@@ -15,6 +15,7 @@ use crate::groups::backends::{RecordReadError, parse_read};
 use crate::jobs::backend_import::read_checkpoint;
 use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_PATTERN_KEYSPACE};
@@ -56,6 +57,17 @@ pub enum ImportRuleError {
     Submit(#[from] crate::jobs::submit::SubmitJobError),
     #[error("unexpected event in state {0}")]
     Unexpected(&'static str),
+    #[error("import rule storage failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for ImportRuleError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// The run a rule last started, with its counts and kept errors so far.
@@ -104,7 +116,7 @@ pub async fn last_run(
     let (Some(job_id), Some(started_ms)) = (rule.last_job, rule.last_started_ms) else {
         return Ok(None);
     };
-    let Some(record) = read_job_record(&context.storage_handle, job_id, None)
+    let Some(record) = read_job_record(context, job_id, None)
         .await
         .map_err(ImportRuleError::Read)?
     else {

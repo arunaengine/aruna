@@ -5,36 +5,30 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, PENDING_LOCATION_KEYSPACE, PENDING_RECLAIM_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE, PENDING_RECLAIM_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
-use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BlobCleanupWork};
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
+use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BlobCleanupWork, CopyOwner};
+use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimVerdict};
-use crate::blob::records::owners_scan_effect;
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
 
 #[derive(Debug, PartialEq)]
 enum State {
-    Init,
-    StartTransaction,
     ReadPending,
     ScanOwners,
     ReadMarker,
     WriteRows,
     QueueCleanup,
     UpdateUsage,
-    Commit,
-    Abort,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<ReclaimVerdict>, ReclaimBlobError>;
 
 /// Decides one pending archive inside one transaction: owners, marker and free commit together.
 #[derive(Debug, PartialEq)]
@@ -43,10 +37,9 @@ pub struct ReclaimPendingOperation {
     grace: Duration,
     now: SystemTime,
     state: State,
-    txn_id: Option<TxnId>,
     location: Option<BackendLocation>,
     usage: Option<UsageCounterUpdate>,
-    output: Option<Result<ReclaimVerdict, ReclaimBlobError>>,
+    verdict: Option<ReclaimVerdict>,
 }
 
 impl ReclaimPendingOperation {
@@ -55,63 +48,29 @@ impl ReclaimPendingOperation {
             archive,
             grace,
             now,
-            state: State::Init,
-            txn_id: None,
+            state: State::ReadPending,
             location: None,
             usage: None,
-            output: None,
+            verdict: None,
         }
     }
 
-    fn key(&self) -> aruna_core::types::Key {
+    fn key(&self) -> Key {
         self.archive.to_bytes().into()
     }
 
-    fn fail(&mut self, error: ReclaimBlobError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort_or_finish()
-    }
-
-    fn abort_or_finish(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = State::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = State::Error;
-                smallvec![]
-            }
-        }
-    }
-
-    fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        self.fail(ReclaimBlobError::InvalidStateEvent {
-            state,
-            expected: "the storage result of the last effect",
-            received: event.label(),
-        })
+    fn verdict(&mut self) -> Result<ReclaimVerdict, ReclaimBlobError> {
+        self.verdict.take().ok_or(ReclaimBlobError::Failed)
     }
 
     /// Stages one row change; the verdict decides whether the archive is freed after it.
-    fn settle(&mut self, verdict: ReclaimVerdict, effect: Effect) -> Effects {
-        self.output = Some(Ok(verdict));
+    fn settle(&mut self, verdict: ReclaimVerdict, call: IoCall) -> Step {
+        self.verdict = Some(verdict);
         self.state = State::WriteRows;
-        smallvec![effect]
+        Ok(Next::Call(call))
     }
 
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_marker(&mut self, value: Option<aruna_core::types::Value>) -> Effects {
+    fn handle_marker(&mut self, value: Option<Value>) -> Step {
         let since = value
             .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
             .map(|millis| UNIX_EPOCH + Duration::from_millis(u64::from_be_bytes(millis)));
@@ -121,183 +80,115 @@ impl ReclaimPendingOperation {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let effect = Effect::Storage(StorageEffect::Write {
-                key_space: PENDING_RECLAIM_KEYSPACE.to_string(),
-                key: self.key(),
-                value: millis.to_be_bytes().to_vec().into(),
-                txn_id: self.txn_id,
-            });
-            return self.settle(ReclaimVerdict::NotDue, effect);
+            let row = (
+                PENDING_RECLAIM_KEYSPACE.to_string(),
+                self.key(),
+                millis.to_be_bytes().to_vec().into(),
+            );
+            return self.settle(ReclaimVerdict::NotDue, IoCall::Write(vec![row]));
         };
         if since
             .checked_add(self.grace)
             .is_none_or(|due| due > self.now)
         {
-            self.output = Some(Ok(ReclaimVerdict::NotDue));
-            return self.commit();
+            return Ok(Next::Done(ReclaimVerdict::NotDue));
         }
         let bytes = self
             .location
             .as_ref()
             .map_or(0, |location| location.stored_size());
-        let effect = Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![
-                (PENDING_LOCATION_KEYSPACE.to_string(), self.key()),
-                (PENDING_RECLAIM_KEYSPACE.to_string(), self.key()),
-            ],
-            txn_id: self.txn_id,
-        });
-        self.settle(ReclaimVerdict::Freed { bytes }, effect)
+        let deletes = vec![
+            (PENDING_LOCATION_KEYSPACE.to_string(), self.key()),
+            (PENDING_RECLAIM_KEYSPACE.to_string(), self.key()),
+        ];
+        self.settle(ReclaimVerdict::Freed { bytes }, IoCall::Delete(deletes))
     }
 
-    fn handle_rows(&mut self) -> Effects {
-        let freed = matches!(self.output, Some(Ok(ReclaimVerdict::Freed { .. })));
+    fn handle_rows(&mut self) -> Step {
+        let freed = matches!(self.verdict, Some(ReclaimVerdict::Freed { .. }));
         let Some(location) = self.location.clone().filter(|_| freed) else {
-            return self.commit();
+            return Ok(Next::Done(self.verdict()?));
         };
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
-            Ok(work) => work,
-            Err(error) => return self.fail(error.into()),
-        };
+        let work = (BlobCleanupWork::DeleteBlob { location }).to_bytes()?;
         self.state = State::QueueCleanup;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: work.into(),
-            txn_id: self.txn_id,
-        })]
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            Ulid::generate().to_bytes().to_vec().into(),
+            work.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
     /// The archive was charged once on its archive shard; freeing it debits that charge.
-    fn start_usage(&mut self) -> Effects {
-        let (Some(txn_id), Some(location)) = (self.txn_id, self.location.as_ref()) else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
+    fn start_usage(&mut self) -> Step {
+        let location = self.location.as_ref().ok_or(ReclaimBlobError::Failed)?;
         let bytes = -i128::from(location.stored_size());
         let Some(stored) = StoredDelta::of_copy(location, -1, bytes) else {
-            return self.commit();
+            return Ok(Next::Done(self.verdict()?));
         };
         let mut update = UsageCounterUpdate::for_stored(stored);
         self.state = State::UpdateUsage;
-        let effects = update.start(txn_id);
+        let call = update.start_calls().into_call();
         self.usage = Some(update);
-        effects
+        Ok(Next::Call(call))
     }
 }
 
-impl EffectOperation for ReclaimPendingOperation {
+impl Operation for ReclaimPendingOperation {
     type Output = ReclaimVerdict;
     type Error = ReclaimBlobError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(read_row(PENDING_LOCATION_KEYSPACE, self.key())))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (
-                State::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::ReadPending;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-                    key: self.key(),
-                    txn_id: self.txn_id,
-                })]
-            }
-            (State::ReadPending, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let Some(value) = value else {
-                    self.output = Some(Ok(ReclaimVerdict::Dropped));
-                    let effect = Effect::Storage(StorageEffect::Delete {
-                        key_space: PENDING_RECLAIM_KEYSPACE.to_string(),
-                        key: self.key(),
-                        txn_id: self.txn_id,
-                    });
-                    self.state = State::WriteRows;
-                    return smallvec![effect];
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            State::ReadPending => {
+                let Some(value) = result.value()? else {
+                    let delete = (PENDING_RECLAIM_KEYSPACE.to_string(), self.key());
+                    return self.settle(ReclaimVerdict::Dropped, IoCall::Delete(vec![delete]));
                 };
-                match BackendLocation::from_bytes(&value) {
-                    Ok(location) => self.location = Some(location),
-                    Err(error) => return self.fail(error.into()),
-                }
+                self.location = Some(BackendLocation::from_bytes(&value)?);
                 self.state = State::ScanOwners;
-                smallvec![owners_scan_effect(&self.archive, self.txn_id)]
+                Ok(Next::Call(IoCall::Page {
+                    space: COPY_OWNER_KEYSPACE.to_string(),
+                    prefix: CopyOwner::prefix(&self.archive).into(),
+                    after: None,
+                    limit: 2,
+                }))
             }
-            (State::ScanOwners, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                if !values.is_empty() {
+            State::ScanOwners => {
+                let (owners, _) = result.page()?;
+                if !owners.is_empty() {
                     // An owner returned: the grace starts again when it leaves.
-                    let effect = Effect::Storage(StorageEffect::Delete {
-                        key_space: PENDING_RECLAIM_KEYSPACE.to_string(),
-                        key: self.key(),
-                        txn_id: self.txn_id,
-                    });
-                    return self.settle(ReclaimVerdict::Pinned, effect);
+                    let delete = (PENDING_RECLAIM_KEYSPACE.to_string(), self.key());
+                    return self.settle(ReclaimVerdict::Pinned, IoCall::Delete(vec![delete]));
                 }
                 self.state = State::ReadMarker;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: PENDING_RECLAIM_KEYSPACE.to_string(),
-                    key: self.key(),
-                    txn_id: self.txn_id,
-                })]
+                Ok(Next::Call(read_row(PENDING_RECLAIM_KEYSPACE, self.key())))
             }
-            (State::ReadMarker, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.handle_marker(value)
+            State::ReadMarker => self.handle_marker(result.value()?),
+            State::WriteRows => {
+                result.done()?;
+                self.handle_rows()
             }
-            (
-                State::WriteRows,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. }
-                    | StorageEvent::DeleteResult { .. }
-                    | StorageEvent::BatchDeleteResult { .. },
-                ),
-            ) => self.handle_rows(),
-            (State::QueueCleanup, Event::Storage(StorageEvent::WriteResult { .. })) => {
+            State::QueueCleanup => {
+                result.done()?;
                 self.start_usage()
             }
-            (State::UpdateUsage, event) => {
-                let (Some(txn_id), Some(update)) = (self.txn_id, self.usage.as_mut()) else {
-                    return self.fail(ReclaimBlobError::Failed);
-                };
-                match update.step(event, txn_id) {
-                    Ok(Some(effects)) => effects,
-                    Ok(None) => self.commit(),
-                    Err(error) => self.fail(error.into()),
+            State::UpdateUsage => {
+                let update = self.usage.as_mut().ok_or(ReclaimBlobError::Failed)?;
+                match update.step_calls(result)? {
+                    Some(call) => Ok(Next::Call(call.into_call())),
+                    None => Ok(Next::Done(self.verdict()?)),
                 }
             }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = State::Finish;
-                smallvec![]
-            }
-            (State::Abort, _) => {
-                self.state = State::Error;
-                smallvec![]
-            }
-            (State::Finish | State::Error, _) => smallvec![],
-            (_, event) => self.unexpected("ReclaimPending", event),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            State::Finish => self.output.unwrap_or(Err(ReclaimBlobError::Failed)),
-            _ => Err(self
-                .output
-                .and_then(Result::err)
-                .unwrap_or(ReclaimBlobError::Failed)),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.abort_or_finish()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -305,8 +196,9 @@ impl EffectOperation for ReclaimPendingOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
-    use aruna_core::structs::storage::blob::{BackendRef, CopyOwner, VersionKey};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use std::collections::HashMap;

@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_page_without_conflicts() {
+    fn tolerates_conflict_failure() {
         let mut audit = operation();
         assert!(matches!(audit.first(), Ok(Next::Call(IoCall::Page { .. }))));
         assert!(matches!(
@@ -207,7 +207,10 @@ mod tests {
         let failed = Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
         });
-        assert_eq!(audit.next(IoResult::Event(Box::new(failed))), Ok(empty_audit()));
+        assert_eq!(
+            audit.next(IoResult::Event(Box::new(failed))),
+            Ok(empty_audit())
+        );
     }
 
     #[test]

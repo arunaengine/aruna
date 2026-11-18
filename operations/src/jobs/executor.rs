@@ -11,6 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobResultPayload,
 };
+use futures_util::future::BoxFuture;
 use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -110,6 +111,26 @@ pub struct JobContext {
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
     pub range_turns: RangeTurns,
+    /// Runs the payload kinds that other domains own, as the node wiring registered them.
+    pub handlers: Vec<Arc<dyn PayloadHandler>>,
+}
+
+/// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring
+/// registers one per owning domain.
+pub trait PayloadHandler: Send + Sync {
+    /// Runs one job, or `None` when this handler does not own the payload.
+    fn run<'a>(
+        &'a self,
+        ctx: &'a JobContext,
+        payload: &'a JobPayload,
+    ) -> Option<BoxFuture<'a, JobRunOutcome>>;
+
+    /// Whether the job prune keeps this job for now.
+    fn keeps_job<'a>(
+        &'a self,
+        context: &'a DriverContext,
+        payload: &'a JobPayload,
+    ) -> BoxFuture<'a, Result<bool, String>>;
 }
 
 /// One turn per distribution range, shared by every job on this node: page imports into one
@@ -241,8 +262,14 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::EmailDelivery(spec) => {
             Box::pin(crate::notifications::email::run_email_job(ctx, spec)).await
         }
-        JobPayload::PluginWork(spec) => {
-            Box::pin(crate::plugins::plugin_work::run_plugin_work(ctx, spec)).await
+        JobPayload::PluginWork(_) => {
+            let handled = (ctx.handlers.iter()).find_map(|handler| handler.run(ctx, payload));
+            match handled {
+                Some(run) => run.await,
+                None => JobRunOutcome::Failed(JobError::permanent(
+                    "no handler is registered for this payload",
+                )),
+            }
         }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(

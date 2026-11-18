@@ -44,7 +44,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartPartKey, MultipartUpload,
 };
 use aruna_net::dht::storage::StoredEntry;
-use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
+use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
 use aruna_operations::placement::policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
@@ -1007,7 +1007,7 @@ mod tests {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_net::dht::storage::StoredEntry;
-    use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
+    use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
     use aruna_operations::placement::policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{

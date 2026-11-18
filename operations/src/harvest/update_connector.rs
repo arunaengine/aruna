@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
@@ -78,7 +78,7 @@ pub enum UpdateConnectorError {
 
 impl From<IoError> for UpdateConnectorError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or(Self::Unexpected, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
@@ -202,8 +202,8 @@ impl Operation for UpdateRepositoryOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

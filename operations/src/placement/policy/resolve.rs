@@ -4,21 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::POLICY_CACHE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{all_values, done, page, values};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::structs::placement::policy::document::verify_policy_authority;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use tracing::{debug, warn};
+
+use crate::distribution::inventory::{StagedCall, outside_answer};
 
 use super::cache::{
     CacheLookup, MAX_CACHE_ENTRIES, PolicyCacheEntry, PolicyCacheStats, cache_key, lookup,
@@ -47,7 +48,6 @@ pub struct ResolvedPolicy {
 #[derive(Debug, PartialEq)]
 pub struct ResolvePolicyOperation {
     config: ResolvePolicyConfig,
-    reader: Option<ReadPolicyOperation>,
     cached: Option<AuthenticPolicy>,
     pending: Option<PendingEntry>,
     stats: PolicyCacheStats,
@@ -63,45 +63,74 @@ struct PendingEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResolveState {
-    Init,
     ReadCache,
     Revalidate,
     Resolve,
     Scan,
     Evict,
     Store,
-    Finish,
-    Error,
+}
+
+type ResolveTurn = Result<Next<ResolvedPolicy>, ReadPolicyError>;
+
+/// A cache access runs as its own child, so its failure only costs latency.
+fn cache_call(call: IoCall) -> Next<ResolvedPolicy> {
+    Next::Call(StagedCall::Outside(call).into_call())
 }
 
 impl ResolvePolicyOperation {
     pub fn new(config: ResolvePolicyConfig) -> Self {
         Self {
             config,
-            reader: None,
             cached: None,
             pending: None,
             stats: PolicyCacheStats::default(),
-            state: ResolveState::Init,
+            state: ResolveState::ReadCache,
             result: None,
         }
     }
 
-    fn start_read(&mut self) -> Effects {
-        let mut reader = ReadPolicyOperation::new(ReadPolicyConfig {
-            realm_id: self.config.realm_id,
-            policy_ref: self.config.policy_ref,
-            local_node_id: self.config.local_node_id,
-        });
-        let effects = reader.start();
-        self.reader = Some(reader);
+    fn start_read(&mut self) -> ResolveTurn {
         self.state = ResolveState::Resolve;
-        effects
+        Ok(Next::Call(IoCall::child(ReadPolicyOperation::new(
+            ReadPolicyConfig {
+                realm_id: self.config.realm_id,
+                policy_ref: self.config.policy_ref,
+                local_node_id: self.config.local_node_id,
+            },
+        ))))
+    }
+
+    fn cache_read(&mut self, value: Option<Value>) -> ResolveTurn {
+        match lookup(
+            value.as_ref(),
+            self.config.realm_id,
+            &self.config.policy_ref,
+            self.config.now_ms,
+        ) {
+            CacheLookup::Hit { document, policy } => {
+                self.stats.hits = 1;
+                self.revalidate(AuthenticPolicy {
+                    document: *document,
+                    policy: *policy,
+                })
+            }
+            CacheLookup::Negative => {
+                self.stats.hits = 1;
+                self.fail(ReadPolicyError::Unavailable(
+                    "policy holders were recently unreachable".to_string(),
+                ))
+            }
+            CacheLookup::Miss => {
+                self.stats.misses = 1;
+                self.start_read()
+            }
+        }
     }
 
     /// A cached entry is re-authenticated against the realm view, plus the
     /// owning group's roles when the rule names one.
-    fn revalidate(&mut self, authentic: AuthenticPolicy) -> Effects {
+    fn revalidate(&mut self, authentic: AuthenticPolicy) -> ResolveTurn {
         let owner = authentic.document.policy.owner_group_id;
         self.cached = Some(authentic);
         self.state = ResolveState::Revalidate;
@@ -119,17 +148,14 @@ impl ResolvePolicyOperation {
             let group = DocumentTarget::GroupAuthorization { group_id };
             reads.push((group.storage_keyspace().to_string(), group.storage_key()));
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn accept_cached(&mut self, values: Vec<(Key, Option<ByteView>)>) -> Effects {
-        let ([(_, config_value), (_, auth_value)], group_value) = match values.as_slice() {
+    fn accept_cached(&mut self, values: Vec<Option<Value>>) -> ResolveTurn {
+        let ([config_value, auth_value], group_value) = match values.as_slice() {
             [config, auth] => ([config, auth], None),
-            [config, auth, (_, group)] => ([config, auth], Some(group)),
-            other => {
+            [config, auth, group] => ([config, auth], Some(group)),
+            _ => {
                 return self.unexpected_event(
                     "realm config and authorization",
                     "a batch of another length",
@@ -178,7 +204,7 @@ impl ResolvePolicyOperation {
     fn after_read(
         &mut self,
         result: Result<(AuthenticPolicy, PolicySource), ReadPolicyError>,
-    ) -> Effects {
+    ) -> ResolveTurn {
         let entry = match &result {
             Ok((authentic, _)) => Some(PolicyCacheEntry::verified(
                 &authentic.document,
@@ -202,39 +228,52 @@ impl ResolvePolicyOperation {
         }
     }
 
-    fn emit_scan(&mut self, bytes: Vec<u8>) -> Effects {
+    fn emit_scan(&mut self, bytes: Vec<u8>) -> ResolveTurn {
         self.pending = Some(PendingEntry {
             key: cache_key(&self.config.policy_ref),
             bytes,
         });
         self.state = ResolveState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: POLICY_CACHE_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
+        Ok(cache_call(IoCall::Page {
+            space: POLICY_CACHE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
             limit: MAX_CACHE_ENTRIES + 1,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn emit_store(&mut self) -> Effects {
+    /// Evicts what the scan found over the cache bound, then stores the pending entry.
+    fn scanned(&mut self, rows: Vec<(Key, Value)>) -> ResolveTurn {
+        let Some(pending) = self.pending.as_ref() else {
+            return self.finish();
+        };
+        let victims = plan_eviction(&rows, &pending.key, pending.bytes.len(), self.config.now_ms);
+        if victims.is_empty() {
+            return self.emit_store();
+        }
+        self.stats.evictions = victims.len() as u32;
+        self.state = ResolveState::Evict;
+        let deletes = victims
+            .into_iter()
+            .map(|key| (POLICY_CACHE_KEYSPACE.to_string(), key))
+            .collect();
+        Ok(cache_call(IoCall::Delete(deletes)))
+    }
+
+    fn emit_store(&mut self) -> ResolveTurn {
         let Some(pending) = self.pending.take() else {
             return self.finish();
         };
         self.state = ResolveState::Store;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: POLICY_CACHE_KEYSPACE.to_string(),
-            key: pending.key,
-            value: ByteView::from(pending.bytes),
-            txn_id: None,
-        })]
+        let row = (
+            POLICY_CACHE_KEYSPACE.to_string(),
+            pending.key,
+            ByteView::from(pending.bytes),
+        );
+        Ok(cache_call(IoCall::Write(vec![row])))
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = match &self.result {
-            Some(Ok(_)) => ResolveState::Finish,
-            _ => ResolveState::Error,
-        };
+    fn finish(&mut self) -> ResolveTurn {
         debug!(
             policy_id = %self.config.policy_ref.policy_id,
             hits = self.stats.hits,
@@ -243,15 +282,24 @@ impl ResolvePolicyOperation {
             resolved = self.result.as_ref().is_some_and(Result::is_ok),
             "Placement policy resolved"
         );
-        smallvec![]
+        let stats = self.stats;
+        match self.result.take() {
+            Some(Ok((policy, source))) => Ok(Next::Done(ResolvedPolicy {
+                policy,
+                source,
+                stats,
+            })),
+            Some(Err(error)) => Err(error),
+            None => Err(ReadPolicyError::NotFinished),
+        }
     }
 
-    fn fail(&mut self, error: ReadPolicyError) -> Effects {
+    fn fail(&mut self, error: ReadPolicyError) -> ResolveTurn {
         self.result = Some(Err(error));
         self.finish()
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> ResolveTurn {
         let state = format!("{:?}", self.state);
         self.fail(ReadPolicyError::UnexpectedEvent {
             state,
@@ -261,146 +309,53 @@ impl ResolvePolicyOperation {
     }
 }
 
-impl EffectOperation for ResolvePolicyOperation {
+impl Operation for ResolvePolicyOperation {
     type Output = ResolvedPolicy;
     type Error = ReadPolicyError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ResolveState::ReadCache;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: POLICY_CACHE_KEYSPACE.to_string(),
-            key: cache_key(&self.config.policy_ref),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> ResolveTurn {
+        let read = (
+            POLICY_CACHE_KEYSPACE.to_string(),
+            cache_key(&self.config.policy_ref),
+        );
+        Ok(cache_call(IoCall::Read(vec![read])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> ResolveTurn {
         match self.state {
-            ResolveState::ReadCache => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match lookup(
-                        value.as_ref(),
-                        self.config.realm_id,
-                        &self.config.policy_ref,
-                        self.config.now_ms,
-                    ) {
-                        CacheLookup::Hit { document, policy } => {
-                            self.stats.hits = 1;
-                            self.revalidate(AuthenticPolicy {
-                                document: *document,
-                                policy: *policy,
-                            })
-                        }
-                        CacheLookup::Negative => {
-                            self.stats.hits = 1;
-                            self.fail(ReadPolicyError::Unavailable(
-                                "policy holders were recently unreachable".to_string(),
-                            ))
-                        }
-                        CacheLookup::Miss => {
-                            self.stats.misses = 1;
-                            self.start_read()
-                        }
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
+            ResolveState::ReadCache => match outside_answer(result).and_then(values::<1>) {
+                Ok([value]) => self.cache_read(value),
+                Err(error) => {
                     warn!(error = %error, "Policy cache read failed");
                     self.stats.misses = 1;
                     self.start_read()
                 }
-                other => self.unexpected_event("policy cache read", other.label()),
             },
-            ResolveState::Revalidate => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    self.accept_cached(values)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm authority read", other.label()),
-            },
+            ResolveState::Revalidate => self.accept_cached(all_values(result)?),
             ResolveState::Resolve => {
-                let Some(reader) = self.reader.as_mut() else {
-                    return self.unexpected_event("active policy read", event.label());
-                };
-                let effects = reader.step(event);
-                if !reader.is_complete() {
-                    return effects;
-                }
-                let Some(reader) = self.reader.take() else {
-                    return self.unexpected_event("active policy read", "nothing");
-                };
-                self.after_read(reader.finalize())
+                let read = result.child::<(AuthenticPolicy, PolicySource), ReadPolicyError>()?;
+                self.after_read(read)
             }
-            ResolveState::Scan => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    let Some(pending) = self.pending.as_ref() else {
-                        return self.finish();
-                    };
-                    let victims = plan_eviction(
-                        &values,
-                        &pending.key,
-                        pending.bytes.len(),
-                        self.config.now_ms,
-                    );
-                    if victims.is_empty() {
-                        return self.emit_store();
-                    }
-                    self.stats.evictions = victims.len() as u32;
-                    self.state = ResolveState::Evict;
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: victims
-                            .into_iter()
-                            .map(|key| (POLICY_CACHE_KEYSPACE.to_string(), key))
-                            .collect(),
-                        txn_id: None,
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
+            ResolveState::Scan => match outside_answer(result).and_then(page) {
+                Ok((rows, _)) => self.scanned(rows),
+                Err(error) => {
                     warn!(error = %error, "Policy cache scan failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache scan", other.label()),
             },
-            ResolveState::Evict => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_store(),
-                Event::Storage(StorageEvent::Error { error }) => {
+            ResolveState::Evict => match outside_answer(result).and_then(done) {
+                Ok(()) => self.emit_store(),
+                Err(error) => {
                     warn!(error = %error, "Policy cache eviction failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache eviction", other.label()),
             },
-            ResolveState::Store => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => {
+            ResolveState::Store => {
+                if let Err(error) = outside_answer(result).and_then(done) {
                     warn!(error = %error, "Policy cache write failed");
-                    self.finish()
                 }
-                other => self.unexpected_event("policy cache write", other.label()),
-            },
-            ResolveState::Init | ResolveState::Finish | ResolveState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ResolveState::Finish | ResolveState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let stats = self.stats;
-        match self.result {
-            Some(Ok((policy, source))) => Ok(ResolvedPolicy {
-                policy,
-                source,
-                stats,
-            }),
-            Some(Err(error)) => Err(error),
-            None => Err(ReadPolicyError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.reader.as_mut() {
-            Some(reader) => reader.abort(),
-            None => smallvec![],
+                self.finish()
+            }
         }
     }
 
@@ -412,11 +367,12 @@ impl EffectOperation for ResolvePolicyOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::events::{NetEvent, PolicyFetchEvent};
+    use aruna_core::calls::{ChildOutcome, IoError};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
-    use aruna_core::types::Value;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -446,10 +402,6 @@ mod pure_tests {
         crate::tests::policy::signed_document(realm(), policy, 1)
     }
 
-    fn encoded(policy: &VerifiedPolicy) -> Value {
-        ByteView::from(document(policy).to_bytes().expect("document encodes"))
-    }
-
     fn realm_values() -> (Value, Value) {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 2);
         config.seed_default_placement();
@@ -459,32 +411,26 @@ mod pure_tests {
         crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()))
     }
 
-    /// The realm view and policy row the inner read starts with.
-    fn opened(policy_row: Option<Value>) -> Event {
+    fn authority() -> IoResult {
         let (config_value, auth_value) = realm_values();
-        let key = ByteView::from(Vec::new());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (key.clone(), policy_row),
-                (key.clone(), Some(config_value)),
-                (key, Some(auth_value)),
-            ],
-        })
+        IoResult::Values(vec![Some(config_value), Some(auth_value)])
     }
 
-    fn authority() -> Event {
-        let (config_value, auth_value) = realm_values();
-        let key = ByteView::from(Vec::new());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), Some(config_value)), (key, Some(auth_value))],
-        })
+    fn read_result(value: Option<Value>) -> IoResult {
+        IoResult::Values(vec![value])
     }
 
-    fn read_result(value: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value,
-        })
+    /// The outcome of the inner policy read child.
+    fn read_child(result: Result<(AuthenticPolicy, PolicySource), ReadPolicyError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn fetched(policy: &VerifiedPolicy) -> IoResult {
+        let authentic = AuthenticPolicy {
+            document: document(policy),
+            policy: policy.clone(),
+        };
+        read_child(Ok((authentic, PolicySource::Fetched)))
     }
 
     fn operation(policy_ref: PlacementPolicyRef) -> ResolvePolicyOperation {
@@ -496,43 +442,42 @@ mod pure_tests {
         })
     }
 
-    /// Drives a cold resolve up to the holder answer and returns the effects the
-    /// cache insert produced.
-    fn fetch_cold(operation: &mut ResolvePolicyOperation, policy: &VerifiedPolicy) -> Effects {
-        operation.start();
-        operation.step(read_result(None));
-        let effects = operation.step(opened(None));
-        let (holders, _) = crate::tests::policy::fetch_requests(effects);
-        let holder = holders[0];
-        operation.step(Event::Net(NetEvent::PolicyFetch(
-            PolicyFetchEvent::Fetched {
-                publisher: holder,
-                document: Box::new(document(policy)),
-            },
-        )))
+    /// Misses the cache, so the next call is the policy read child.
+    fn missed(operation: &mut ResolvePolicyOperation) {
+        operation.first().unwrap();
+        let read = operation.next(read_result(None));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
     }
 
-    fn iter_result(values: Vec<(Key, Value)>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        })
+    /// The storage effect a cache access child asks for.
+    fn cache_effect(turn: ResolveTurn) -> Effect {
+        let Ok(Next::Call(IoCall::Child(mut child))) = turn else {
+            panic!("expected a cache access child");
+        };
+        child.start().into_iter().next().expect("one cache effect")
+    }
+
+    fn iter_result(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
     }
 
     #[test]
     fn resolves_cold() {
         let policy = policy(1, "eu-west");
         let mut operation = operation(policy.policy_ref());
-        let effects = fetch_cold(&mut operation, &policy);
-
-        let Some(Effect::Storage(StorageEffect::Iter { key_space, .. })) = effects.first() else {
-            panic!("expected a cache scan, got {effects:?}");
+        missed(&mut operation);
+        let scan = cache_effect(operation.next(fetched(&policy)));
+        let Effect::Storage(StorageEffect::Iter { key_space, .. }) = scan else {
+            panic!("expected a cache scan, got {scan:?}");
         };
         assert_eq!(key_space, POLICY_CACHE_KEYSPACE);
 
-        let effects = operation.step(iter_result(Vec::new()));
-        let Some(Effect::Storage(StorageEffect::Write { key, value, .. })) = effects.first() else {
-            panic!("expected a cache write, got {effects:?}");
+        let store = cache_effect(operation.next(iter_result(Vec::new())));
+        let Effect::Storage(StorageEffect::BatchWrite { writes, .. }) = store else {
+            panic!("expected a cache write, got {store:?}");
+        };
+        let [(_, key, value)] = writes.as_slice() else {
+            panic!("expected one cache row");
         };
         assert_eq!(*key, cache_key(&policy.policy_ref()));
         assert_eq!(
@@ -540,13 +485,23 @@ mod pure_tests {
             PolicyCacheEntry::verified(&document(&policy), 1_000)
         );
 
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: key.clone(),
-        }));
-        let resolved = operation.finalize().expect("policy resolves");
+        let Ok(Next::Done(resolved)) = operation.next(IoResult::Done) else {
+            panic!("expected the resolved policy");
+        };
         assert_eq!(resolved.policy, policy);
         assert_eq!(resolved.source, PolicySource::Fetched);
         assert_eq!(resolved.stats.misses, 1);
+    }
+
+    #[test]
+    fn cache_failure_reads() {
+        // A failed cache read only costs latency: the policy is read instead.
+        let policy = policy(1, "eu-west");
+        let mut operation = operation(policy.policy_ref());
+        operation.first().unwrap();
+        let failed: Result<IoResult, IoError> = Err(IoError::Storage(StorageError::Timeout));
+        let read = operation.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
     }
 
     #[test]
@@ -555,16 +510,17 @@ mod pure_tests {
         let policy = policy(1, "eu-west");
         let entry = PolicyCacheEntry::verified(&document(&policy), 10);
         let mut operation = operation(policy.policy_ref());
-        operation.start();
-        let effects = operation.step(read_result(Some(ByteView::from(
+        operation.first().unwrap();
+        let cached = read_result(Some(ByteView::from(
             entry.to_bytes().expect("entry encodes"),
-        ))));
+        )));
         assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::BatchRead { .. }))
+            operation.next(cached),
+            Ok(Next::Call(IoCall::Read(_)))
         ));
-        assert!(operation.step(authority()).is_empty());
-        let resolved = operation.finalize().expect("policy resolves");
+        let Ok(Next::Done(resolved)) = operation.next(authority()) else {
+            panic!("expected the cached policy");
+        };
         assert_eq!(resolved.source, PolicySource::Cached);
         assert_eq!(resolved.stats.hits, 1);
         assert_eq!(resolved.policy, policy);
@@ -576,7 +532,8 @@ mod pure_tests {
         // holders and is stored once the full cache has been trimmed.
         let policy = policy(1, "eu-west");
         let mut operation = operation(policy.policy_ref());
-        fetch_cold(&mut operation, &policy);
+        missed(&mut operation);
+        operation.next(fetched(&policy)).unwrap();
 
         let stale = PolicyCacheEntry::verified(&document(&policy), 1)
             .to_bytes()
@@ -588,35 +545,22 @@ mod pure_tests {
                 (ByteView::from(key), ByteView::from(stale.clone()))
             })
             .collect();
-        let effects = operation.step(iter_result(rows.clone()));
-        let Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) = effects.first()
-        else {
-            panic!("expected an eviction, got {effects:?}");
+        let evict = cache_effect(operation.next(iter_result(rows.clone())));
+        let Effect::Storage(StorageEffect::BatchDelete { deletes, .. }) = evict else {
+            panic!("expected an eviction, got {evict:?}");
         };
         assert_eq!(deletes.len(), 2);
         assert_eq!(deletes[0].1, rows[0].0);
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
+        let store = cache_effect(operation.next(IoResult::Done));
         assert!(
-            matches!(
-                effects.first(),
-                Some(Effect::Storage(StorageEffect::Write { .. }))
-            ),
-            "the refetched policy must still be stored, got {effects:?}"
+            matches!(store, Effect::Storage(StorageEffect::BatchWrite { .. })),
+            "the refetched policy must still be stored, got {store:?}"
         );
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: cache_key(&policy.policy_ref()),
-        }));
-        assert_eq!(
-            operation
-                .finalize()
-                .expect("policy resolves")
-                .stats
-                .evictions,
-            2
-        );
+        let Ok(Next::Done(resolved)) = operation.next(IoResult::Done) else {
+            panic!("expected the resolved policy");
+        };
+        assert_eq!(resolved.stats.evictions, 2);
     }
 
     #[test]
@@ -624,42 +568,31 @@ mod pure_tests {
         // A substituted definition fails closed and must never be remembered.
         let requested = policy(1, "eu-west");
         let mut operation = operation(requested.policy_ref());
-        operation.start();
-        let effects = operation.step(read_result(None));
-        assert!(!effects.is_empty(), "a miss must start a read");
-        let effects = operation.step(opened(Some(encoded(&policy(1, "us-east")))));
-
-        assert!(
-            effects.is_empty(),
-            "a mismatch must not write a cache entry"
+        missed(&mut operation);
+        assert_eq!(
+            operation.next(read_child(Err(ReadPolicyError::DigestMismatch))),
+            Err(ReadPolicyError::DigestMismatch)
         );
-        assert_eq!(operation.finalize(), Err(ReadPolicyError::DigestMismatch));
     }
 
     #[test]
     fn caches_unavailable() {
         let policy = policy(1, "eu-west");
         let mut operation = operation(policy.policy_ref());
-        operation.start();
-        operation.step(read_result(None));
-        operation.step(opened(None));
-        let effects = operation.step(Event::Net(NetEvent::PolicyFetch(
-            PolicyFetchEvent::Unavailable("no holder answered".to_string()),
-        )));
+        missed(&mut operation);
+        let unavailable = ReadPolicyError::Unavailable("no holder answered".to_string());
+        let scan = cache_effect(operation.next(read_child(Err(unavailable))));
         assert!(
-            matches!(
-                effects.first(),
-                Some(Effect::Storage(StorageEffect::Iter { .. }))
-            ),
-            "an availability miss is cached as a hint, got {effects:?}"
+            matches!(scan, Effect::Storage(StorageEffect::Iter { .. })),
+            "an availability miss is cached as a hint, got {scan:?}"
         );
 
-        let effects = operation.step(iter_result(Vec::new()));
-        let Some(Effect::Storage(StorageEffect::Write { value, .. })) = effects.first() else {
-            panic!("expected a negative cache write, got {effects:?}");
+        let store = cache_effect(operation.next(iter_result(Vec::new())));
+        let Effect::Storage(StorageEffect::BatchWrite { writes, .. }) = store else {
+            panic!("expected a negative cache write, got {store:?}");
         };
         assert_eq!(
-            PolicyCacheEntry::from_bytes(value).expect("entry decodes"),
+            PolicyCacheEntry::from_bytes(&writes[0].2).expect("entry decodes"),
             PolicyCacheEntry::unavailable(1_000)
         );
     }
@@ -671,14 +604,12 @@ mod pure_tests {
         let policy = policy(1, "eu-west");
         let entry = PolicyCacheEntry::unavailable(1_000);
         let mut operation = operation(policy.policy_ref());
-        operation.start();
-        let effects = operation.step(read_result(Some(ByteView::from(
+        operation.first().unwrap();
+        let hint = read_result(Some(ByteView::from(
             entry.to_bytes().expect("entry encodes"),
-        ))));
-
-        assert!(effects.is_empty(), "a live hint must emit no effect");
+        )));
         assert!(matches!(
-            operation.finalize(),
+            operation.next(hint),
             Err(ReadPolicyError::Unavailable(_))
         ));
     }

@@ -10,25 +10,25 @@ use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::execution::job::{
-    CancelAuthority, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
-    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+    CancelAuthority, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
+    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Key;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
-use super::routing::{family_projection, status_view};
-use super::witness::{WitnessExplain, has_deadline};
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-use crate::jobs::records::family::LoadFamilyOperation;
+use super::witness_arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
-use crate::storage_read::iter_prefix_page;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
+use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{page, values};
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;
@@ -97,162 +97,13 @@ pub struct FamilyReport {
     pub plan: Option<PlanEstimate>,
 }
 
-/// Reduces one alias into the full report. `None` means the alias names no
-/// family here, so the caller keeps its ordinary routing.
-pub async fn family_report(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> Option<Result<FamilyReport, JobRouteError>> {
-    let (projected, spec) = match family_projection(context, job_id).await {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    // Reads stay self-scoped: another submitter's job is absent, never refused.
-    if spec.created_by != auth.user_id {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    // A paged spec reports its inputs as if they were inline.
-    let spec = match crate::jobs::records::pages::with_inputs(context, &spec).await {
-        Ok(spec) => spec,
-        Err(error) => return Some(Err(JobRouteError::Unavailable(error.to_string()))),
-    };
-    let projection = projected.projection.clone()?;
-    let family = JobFamilyId {
-        submission_id: projection.submission_id,
-        request_digest: projection.request_digest,
-    };
-    // A run its submitter deleted answers as absent on every holder its deletion reached.
-    match deleted(context, family).await {
-        Ok(false) => {}
-        Ok(true) => return Some(Err(JobRouteError::NotFound)),
-        Err(error) => return Some(Err(error)),
-    }
-    let digest = match projection.digest() {
-        Ok(digest) => digest,
-        Err(error) => return Some(Err(JobRouteError::Internal(error.to_string()))),
-    };
-    let exhausted = locally_exhausted(context, &projection, family).await;
-    let mut output_endpoints = BTreeMap::new();
-    for output in projection.outputs.as_slice() {
-        if output_endpoints.contains_key(&output.node_id) {
-            continue;
-        }
-        let read = drive(ReadInfoOperation::new(vec![output.node_id]), context).await;
-        if let Ok(mut documents) = read
-            && let Some(document) = documents.remove(&output.node_id)
-            && let Some(endpoint) = document.urls.s3
-        {
-            output_endpoints.insert(output.node_id, endpoint);
-        }
-    }
-    Some(Ok(FamilyReport {
-        job: status_view(job_id, &projection, &spec),
-        submission_id: projection.submission_id,
-        request_digest: projection.request_digest,
-        canonical_job_id: projection.canonical_job_id,
-        aliases: projection.aliases.clone(),
-        conflicts: sibling_families(context, family).await,
-        state: projection.state,
-        canonical_execution_id: projection.canonical_execution_id,
-        canonical_result: projection.canonical_execution_id.and_then(|execution_id| {
-            projection
-                .executions
-                .iter()
-                .find(|execution| execution.execution_id == execution_id)
-                .and_then(|execution| execution.result.clone())
-        }),
-        executions: projection.executions.len() as u32,
-        started_at_ms: started_at(&projection),
-        execution_list: projection.executions.clone(),
-        duplicate_successes: projection
-            .executions
-            .iter()
-            .filter(|execution| execution.role == ExecutionRole::DuplicateSuccess)
-            .count() as u32,
-        outputs: projection.outputs.as_slice().to_vec(),
-        output_endpoints,
-        revision: projected.revision,
-        digest,
-        cancel_requested: projection.cancel_requested,
-        responder: context.net_handle.as_ref().map(|net| net.node_id()),
-        partial: projected.truncated,
-        locally_exhausted: exhausted,
-        plan: plan_estimate(context, family).await,
-        spec,
-    }))
-}
-
-/// Whether an authentic cancel record of the family records its deletion.
-async fn deleted(context: &DriverContext, family: JobFamilyId) -> Result<bool, JobRouteError> {
-    let cancels = drive(
-        LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
-        context,
-    )
-    .await;
-    let cancels = cancels.map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-    Ok(cancels.iter().any(|envelope| {
-        matches!(&envelope.record, JobFamilyRecord::Cancel(cancel)
-            if cancel.authority == CancelAuthority::Deletion)
-    }))
-}
-
-/// Distinct other request families under the same submission: the idempotency
-/// conflicts a partition may have accepted elsewhere.
-async fn sibling_families(context: &DriverContext, family: JobFamilyId) -> u32 {
-    let Ok((rows, _)) = iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_RECORD_KEYSPACE,
-        Some(submission_prefix(family.submission_id)),
-        None,
-        MAX_SIBLING_SCAN,
-        None,
-    )
-    .await
-    else {
-        return 0;
-    };
-    let mut digests: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
-    for (key, _) in &rows {
-        if let Some(digest) = key
-            .get(32..64)
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            && digest != family.request_digest
-        {
-            digests.insert(digest);
-        }
-    }
-    digests.len() as u32
-}
-
-/// True when every known execution is terminal without success and this node
-/// has no witness deadline armed for the family.
-async fn locally_exhausted(
-    context: &DriverContext,
-    projection: &JobProjection,
-    family: JobFamilyId,
-) -> bool {
-    if projection.state != LogicalJobState::Indeterminate || projection.executions.is_empty() {
-        return false;
-    }
-    if !projection
-        .executions
-        .iter()
-        .all(|execution| terminal(execution.state))
-    {
-        return false;
-    }
-    !has_deadline(context, family).await
-}
-
 fn terminal(state: PhysicalExecutionState) -> bool {
     state.is_terminal()
 }
 
 /// When the family's work started: the canonical execution's start, else the
 /// newest start any execution reports.
-fn started_at(projection: &JobProjection) -> Option<u64> {
+pub(super) fn started_at(projection: &JobProjection) -> Option<u64> {
     projection
         .canonical_execution_id
         .and_then(|execution_id| {
@@ -271,39 +122,199 @@ fn started_at(projection: &JobProjection) -> Option<u64> {
         })
 }
 
-/// The placement of the family: this responder's own stored plan, else the
-/// newest launch any witness published.
-async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
-    match stored_plan(context, family).await {
-        Some(plan) => Some(plan),
-        None => launched_plan(context, family).await,
+/// What a report reads beside the projection: the deletion, the conflicts, the exhaustion, the
+/// placement and the output endpoints.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ReportDetails {
+    /// An authentic cancel record of the family records its deletion.
+    pub deleted: bool,
+    pub conflicts: u32,
+    pub locally_exhausted: bool,
+    pub plan: Option<PlanEstimate>,
+    pub output_endpoints: BTreeMap<NodeId, String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum DetailStep {
+    Cancels,
+    Siblings,
+    Deadline,
+    Explain,
+    Launches,
+    Endpoint(NodeId),
+}
+
+/// Reads the [`ReportDetails`] of one family. The conflicts are the distinct other request
+/// families of the submission, which a partition may have accepted elsewhere. The plan is this
+/// responder's own stored plan, else the newest launch any witness published.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReportDetailsOperation {
+    family: JobFamilyId,
+    /// Every known execution is terminal without success; exhausted unless a deadline is armed.
+    exhaustible: bool,
+    responder: Option<NodeId>,
+    /// Output nodes whose endpoint is still to read, the next one last.
+    nodes: Vec<NodeId>,
+    details: ReportDetails,
+    step: DetailStep,
+}
+
+type DetailNext = Result<Next<ReportDetails>, JobRouteError>;
+
+impl ReportDetailsOperation {
+    pub(crate) fn new(
+        family: JobFamilyId,
+        projection: &JobProjection,
+        responder: Option<NodeId>,
+    ) -> Self {
+        let executions = &projection.executions;
+        let exhaustible = projection.state == LogicalJobState::Indeterminate
+            && !executions.is_empty()
+            && executions.iter().all(|execution| terminal(execution.state));
+        let mut nodes: Vec<NodeId> = projection
+            .outputs
+            .as_slice()
+            .iter()
+            .map(|o| o.node_id)
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.reverse();
+        Self {
+            family,
+            exhaustible,
+            responder,
+            nodes,
+            details: ReportDetails::default(),
+            step: DetailStep::Cancels,
+        }
+    }
+
+    fn siblings(&mut self, result: IoResult) -> DetailNext {
+        let (rows, _) = page(result)?;
+        let digests: BTreeSet<[u8; 32]> = rows
+            .iter()
+            .filter_map(|(key, _)| key.get(32..64)?.try_into().ok())
+            .filter(|digest| *digest != self.family.request_digest)
+            .collect();
+        self.details.conflicts = digests.len() as u32;
+        if !self.exhaustible {
+            return self.explain();
+        }
+        self.step = DetailStep::Deadline;
+        let row = (
+            DEADLINE_INDEX_KEYSPACE.to_string(),
+            deadline_index_key(&self.family),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn explain(&mut self) -> DetailNext {
+        self.step = DetailStep::Explain;
+        Ok(Next::Call(IoCall::Page {
+            space: PLAN_EXPLAIN_KEYSPACE.to_string(),
+            prefix: Key::from(self.family.to_bytes().as_slice()),
+            after: None,
+            limit: MAX_EXPLAIN_ROWS,
+        }))
+    }
+
+    fn stored_plan(&mut self, result: IoResult) -> DetailNext {
+        let (rows, _) = page(result)?;
+        let explain = rows
+            .iter()
+            .find_map(|(_, value)| from_bytes::<WitnessExplain>(value).ok());
+        let Some(explain) = explain else {
+            self.step = DetailStep::Launches;
+            let launches = LoadFamilyOperation::kind(self.family, JobRecordKind::Launch);
+            return Ok(Next::Call(IoCall::child(launches)));
+        };
+        debug!(
+            alternatives = explain.plan.alternatives.len(),
+            rejected = explain.plan.rejected.len(),
+            "Reporting the responder's own stored plan"
+        );
+        self.details.plan = Some(stored_estimate(&explain, self.responder));
+        self.endpoint()
+    }
+
+    fn endpoint(&mut self) -> DetailNext {
+        let Some(node) = self.nodes.pop() else {
+            return Ok(Next::Done(std::mem::take(&mut self.details)));
+        };
+        self.step = DetailStep::Endpoint(node);
+        Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![
+            node,
+        ]))))
     }
 }
 
-/// The plan this responder stored for the family, when it planned one at all.
-async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
-    let (rows, _) = iter_prefix_page(
-        &context.storage_handle,
-        PLAN_EXPLAIN_KEYSPACE,
-        Some(Key::from(family.to_bytes().as_slice())),
-        None,
-        MAX_EXPLAIN_ROWS,
-        None,
-    )
-    .await
-    .ok()?;
-    let explain: WitnessExplain = rows
-        .iter()
-        .find_map(|(_, value)| from_bytes::<WitnessExplain>(value).ok())?;
-    debug!(
-        alternatives = explain.plan.alternatives.len(),
-        rejected = explain.plan.rejected.len(),
-        "Reporting the responder's own stored plan"
-    );
+impl Operation for ReportDetailsOperation {
+    type Output = ReportDetails;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> DetailNext {
+        let cancels = LoadFamilyOperation::kind(self.family, JobRecordKind::Cancel);
+        Ok(Next::Call(IoCall::child(cancels)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DetailNext {
+        match self.step {
+            DetailStep::Cancels => {
+                let cancels = result
+                    .child::<Vec<JobRecordEnvelope>, FamilyReadError>()?
+                    .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
+                let deleted = cancels.iter().any(|envelope| {
+                    matches!(&envelope.record, JobFamilyRecord::Cancel(cancel)
+                        if cancel.authority == CancelAuthority::Deletion)
+                });
+                if deleted {
+                    self.details.deleted = true;
+                    return Ok(Next::Done(std::mem::take(&mut self.details)));
+                }
+                self.step = DetailStep::Siblings;
+                Ok(Next::Call(IoCall::Page {
+                    space: FAMILY_RECORD_KEYSPACE.to_string(),
+                    prefix: submission_prefix(self.family.submission_id),
+                    after: None,
+                    limit: MAX_SIBLING_SCAN,
+                }))
+            }
+            DetailStep::Siblings => self.siblings(result),
+            DetailStep::Deadline => {
+                let [value] = values::<1>(result)?;
+                let armed = value.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok());
+                self.details.locally_exhausted = armed.is_none();
+                self.explain()
+            }
+            DetailStep::Explain => self.stored_plan(result),
+            DetailStep::Launches => {
+                let launches = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
+                self.details.plan = launches
+                    .ok()
+                    .and_then(|records| launched_estimate(&records));
+                self.endpoint()
+            }
+            DetailStep::Endpoint(node) => {
+                let read = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+                if let Ok(mut documents) = read
+                    && let Some(document) = documents.remove(&node)
+                    && let Some(endpoint) = document.urls.s3
+                {
+                    self.details.output_endpoints.insert(node, endpoint);
+                }
+                self.endpoint()
+            }
+        }
+    }
+}
+
+/// The plan this responder stored for the family.
+fn stored_estimate(explain: &WitnessExplain, responder: Option<NodeId>) -> PlanEstimate {
     let selected = explain.plan.selected.as_ref();
-    Some(PlanEstimate {
+    PlanEstimate {
         target: selected.map(|selection| selection.target.clone()),
-        scheduler_node_id: context.net_handle.as_ref().map(|net| net.node_id()),
+        scheduler_node_id: responder,
         estimated_transfer_bytes: selected.map_or(0, |selection| selection.score.transfer_bytes),
         estimated_transfer_ms: selected
             .map_or(0, |selection| selection.score.estimated_transfer_ms),
@@ -315,18 +326,12 @@ async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<Pla
             .map(|selection| selection.inputs.clone())
             .unwrap_or_default(),
         candidates: explain.plan.candidates(),
-    })
+    }
 }
 
-/// The newest launch of the family, read as its placement. It is replicated
-/// evidence, so any responder can answer it even when another node planned.
-async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
-    let records = drive(
-        LoadFamilyOperation::kind(family, JobRecordKind::Launch),
-        context,
-    )
-    .await
-    .ok()?;
+/// The newest launch of the family, read as its placement. It is replicated evidence, so any
+/// responder can answer it even when another node planned.
+fn launched_estimate(records: &[JobRecordEnvelope]) -> Option<PlanEstimate> {
     let launch = records
         .iter()
         .filter_map(|envelope| match &envelope.record {
@@ -370,8 +375,8 @@ pub enum PagingError {
 /// Validated paging of one audit request, built before any effect exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditPaging {
-    cursor: Option<FetchCursor>,
-    limit: PageLimit,
+    pub(super) cursor: Option<FetchCursor>,
+    pub(super) limit: PageLimit,
 }
 
 impl AuditPaging {
@@ -418,63 +423,85 @@ pub enum AuditRange {
     Submission,
 }
 
-/// Pages the immutable log of one alias's family. `None` means the alias names
-/// no family here; a caller that did not submit the job gets `NotFound`, so the
-/// surface never confirms that another user's id exists.
-pub async fn family_audit(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    range: AuditRange,
-    paging: AuditPaging,
-) -> Option<Result<AuditPage, JobRouteError>> {
-    let (projected, spec) = match family_projection(context, job_id).await {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    if spec.created_by != auth.user_id {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    let scope = match range {
-        AuditRange::Family => AuditScope::Family(projected.family),
-        AuditRange::Submission => AuditScope::Submission(projected.family.submission_id),
-    };
-    Some(
-        drive(
-            FamilyAuditOperation::new(FamilyAuditConfig {
-                scope,
-                cursor: paging.cursor,
-                limit: paging.limit,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| JobRouteError::Internal(error.to_string())),
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, node};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::{CancelAuthority, OutputSet};
 
-pub async fn audit_endpoints(
-    context: &DriverContext,
-    records: &[JobRecordEnvelope],
-    mut endpoints: BTreeMap<NodeId, String>,
-) -> BTreeMap<NodeId, String> {
-    for envelope in records {
-        let JobFamilyRecord::Output(output) = &envelope.record else {
-            continue;
-        };
-        for object in output.outputs.as_slice() {
-            if endpoints.contains_key(&object.node_id) {
-                continue;
-            }
-            let read = drive(ReadInfoOperation::new(vec![object.node_id]), context).await;
-            if let Ok(mut documents) = read
-                && let Some(document) = documents.remove(&object.node_id)
-                && let Some(endpoint) = document.urls.s3
-            {
-                endpoints.insert(object.node_id, endpoint);
-            }
+    fn projection(fixture: &Family) -> JobProjection {
+        let family = fixture.family();
+        JobProjection {
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            canonical_job_id: fixture.spec().job_id,
+            aliases: Vec::new(),
+            state: LogicalJobState::Indeterminate,
+            canonical_execution_id: None,
+            executions: Vec::new(),
+            outputs: OutputSet::try_from(Vec::new()).expect("no outputs"),
+            cancel_requested: false,
         }
     }
-    endpoints
+
+    fn records(result: Vec<JobRecordEnvelope>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, FamilyReadError>(result)))
+    }
+
+    // A deletion cancel ends the read at once; nothing else is read.
+    #[test]
+    fn deleted_family_stops() {
+        let fixture = Family::new([1u8; 32]);
+        let mut cancel = fixture.cancel(&fixture.spec());
+        cancel.authority = CancelAuthority::Deletion;
+        let deleted = fixture.sign(&fixture.holder, JobFamilyRecord::Cancel(cancel));
+        let mut details =
+            ReportDetailsOperation::new(fixture.family(), &projection(&fixture), None);
+        assert!(matches!(details.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let Ok(Next::Done(found)) = details.next(records(vec![deleted])) else {
+            panic!("a deleted family answers at once");
+        };
+        assert!(found.deleted);
+    }
+
+    // Other request digests count as conflicts; without a stored plan the newest launch places.
+    #[test]
+    fn reads_conflicts_and_launch() {
+        let fixture = Family::new([2u8; 32]);
+        let family = fixture.family();
+        let mut details = ReportDetailsOperation::new(family, &projection(&fixture), None);
+        details.first().expect("cancels read");
+        let Ok(Next::Call(IoCall::Page { .. })) = details.next(records(Vec::new())) else {
+            panic!("the siblings are paged");
+        };
+        let sibling = |digest: [u8; 32]| {
+            let key = [family.submission_id.0.as_slice(), &digest, &[0u8; 8]].concat();
+            (Key::from(key), aruna_core::types::Value::from(vec![1]))
+        };
+        let siblings = vec![sibling(family.request_digest), sibling([9u8; 32])];
+        let Ok(Next::Call(IoCall::Page { .. })) = details.next(IoResult::Page {
+            rows: siblings,
+            next: None,
+        }) else {
+            panic!("the stored plan is paged");
+        };
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let Ok(Next::Call(IoCall::Child(_))) = details.next(empty) else {
+            panic!("the launches are read");
+        };
+        let launch = fixture.launch(&fixture.spec(), node(4), 0);
+        let launched = fixture.sign(&fixture.holder, JobFamilyRecord::Launch(Box::new(launch)));
+        let Ok(Next::Done(found)) = details.next(records(vec![launched])) else {
+            panic!("no output endpoint is read");
+        };
+        assert_eq!(found.conflicts, 1);
+        assert_eq!(
+            found.plan.and_then(|plan| plan.scheduler_node_id),
+            Some(node(4))
+        );
+    }
 }

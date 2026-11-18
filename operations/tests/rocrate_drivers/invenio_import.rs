@@ -534,8 +534,7 @@ async fn start_update(
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &spec)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    let storage = &fixture.context.storage_handle;
-    let links = list_links(storage, doc_id(1)).await?;
+    let links = list_links(&fixture.context, doc_id(1)).await?;
     let [(link, true)] = links.as_slice() else {
         panic!("the import keeps one pull link with its next check queued: {links:?}");
     };
@@ -559,9 +558,10 @@ async fn start_update(
     .ok_or("link missing")?;
     assert_eq!(link.pull_reason(), Some("update_available"));
     let pull = Box::pin(start_pull(&fixture.context, &link)).await?;
-    let record = aruna_operations::jobs::store::state::read_job_record(storage, pull, None)
-        .await?
-        .ok_or("pull job missing")?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&fixture.context, pull, None)
+            .await?
+            .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
         return Err("pull job is not an import".into());
     };
@@ -604,9 +604,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
         );
         assert_eq!(object_versions(&fixture, &key).await?.len(), 1, "{key}");
     }
-    let (pulled, _) = list_links(&fixture.context.storage_handle, doc_id(1))
-        .await?
-        .remove(0);
+    let (pulled, _) = list_links(&fixture.context, doc_id(1)).await?.remove(0);
     assert_eq!(pulled.active_job, None);
     assert_eq!(pulled.remote.record_id.as_deref(), Some("2"));
     assert_eq!(pulled.remote.identifier.as_deref(), Some("10.1234/2"));
@@ -714,9 +712,7 @@ async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     let task = tokio::spawn(async move { Box::pin(run_rocrate_import(&ctx, &update)).await });
     // The pull is downloading version 2 when the link is paused.
     tokio::time::timeout(std::time::Duration::from_secs(120), started.notified()).await?;
-    let (link, _) = list_links(&fixture.context.storage_handle, doc_id(1))
-        .await?
-        .remove(0);
+    let (link, _) = list_links(&fixture.context, doc_id(1)).await?.remove(0);
     let paused = LinkPatch {
         paused: Some(true),
         ..LinkPatch::default()
@@ -734,9 +730,7 @@ async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(revision.winning_event_id, first);
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     assert_eq!(crate_versions(&document), ["1"]);
-    let (stopped, _) = list_links(&fixture.context.storage_handle, doc_id(1))
-        .await?
-        .remove(0);
+    let (stopped, _) = list_links(&fixture.context, doc_id(1)).await?.remove(0);
     assert_eq!(stopped.status, LinkStatus::Paused);
     assert_eq!(stopped.active_job, None);
     fixture.stop().await;

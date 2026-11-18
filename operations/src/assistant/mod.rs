@@ -115,12 +115,10 @@ pub enum ChatStoreError {
     Stale,
     #[error("the next turn seq is {next_seq}")]
     StaleTurn { next_seq: u32 },
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for ChatStoreError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }

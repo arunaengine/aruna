@@ -7,21 +7,19 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame};
+use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::events::{Event, LaunchDecline};
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementDecision;
-use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, TxnId};
 use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
@@ -30,20 +28,21 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::offer::{OfferLaunchOperation, OfferOutcome};
-use super::plan::build_plan;
+use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
+use super::witness_arm::{
+    ArmFamilyOperation, ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange,
+    WitnessDeadline, WitnessExplain, deadline_index_key, deadline_key,
+};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::store::query::batch_delete;
 use crate::realm::load_config::load_realm_config;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
-/// Domain of the stable witness order.
-const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
 /// Families one drain pass considers.
 const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
@@ -53,151 +52,16 @@ const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
 const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
-const DEADLINE_KEY_BYTES: usize = 8 + 64;
-
-/// One family's persisted fallback deadline. The row exists while this node may
-/// still have to launch, so a restart resumes the same schedule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WitnessDeadline {
-    pub due_at_ms: u64,
-    pub rank: u32,
-}
-
-/// The bounded plan this witness stored before it launched, with the targets
-/// that already refused this request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WitnessExplain {
-    pub sequence: u32,
-    pub plan: ExecutionPlan,
-    pub declined: Vec<ExecutionTargetId>,
-    /// The previous launch was never confirmed, so this one may overlap it.
-    pub overlapping: bool,
-    pub stored_at_ms: u64,
-}
-
-/// Kicks the witness queue without persisting a timer of its own.
-pub fn schedule_witness_drain(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainWitnessQueue,
-        after,
-    })
-}
-
-/// Position of `node` in the witness order. The admitting node ranks first,
-/// because it already holds the request; remaining witnesses follow the
-/// domain-separated digest of the immutable identity, identical on every node.
-pub fn witness_rank(
-    holders: &[NodeId],
-    family: &JobFamilyId,
-    node: NodeId,
-    admitting: Option<NodeId>,
-) -> Option<u32> {
-    let admitting = admitting.filter(|first| holders.contains(first));
-    if admitting == Some(node) {
-        return Some(0);
-    }
-    let mut ordered: Vec<([u8; 32], NodeId)> = holders
-        .iter()
-        .filter(|holder| Some(**holder) != admitting)
-        .map(|holder| (rank_key(family, *holder), *holder))
-        .collect();
-    ordered.sort_unstable();
-    let rank = ordered.iter().position(|(_, holder)| *holder == node)? as u32;
-    Some(rank + u32::from(admitting.is_some()))
-}
-
-fn rank_key(family: &JobFamilyId, node: NodeId) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(WITNESS_RANK_DOMAIN);
-    hasher.update(&family.submission_id.0);
-    hasher.update(&family.request_digest);
-    hasher.update(node.as_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-/// Deterministic jitter below a quarter of the base delay, so equal ranks in
-/// different families never fire in lockstep and a replay picks the same value.
-fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
-    let key = rank_key(family, node);
-    let spread = base_delay_ms / 4 + 1;
-    u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
-}
-
-/// Arms this node's fallback for one family. Rank zero is due immediately; a
-/// later rank waits `base_delay * rank` plus its own jitter. An earlier existing
-/// deadline is kept, so re-arming can only ever bring a round forward.
+/// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
-    let Some(net) = context.net_handle.as_ref() else {
+    let Some((local, realm_id)) = context.node_and_realm() else {
         debug!(?family, "No net handle; witness fallback not armed");
         return;
     };
-    let realm_id = *net.realm_id();
-    let local = net.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        warn!(
-            ?family,
-            "Realm config unavailable; witness fallback not armed"
-        );
-        return;
-    };
-    let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
-        warn!(
-            ?family,
-            "Family placement unresolved; witness fallback not armed"
-        );
-        return;
-    };
-    let admitting = admitting_node(context, family).await;
-    let Some(rank) = witness_rank(view.holders(), &family, local, admitting) else {
-        debug!(?family, "Node is not a witness for this family");
-        return;
-    };
-    let base = config.compute.witness_delay_ms;
-    let due_at_ms = match rank {
-        0 => now_ms,
-        rank => now_ms + base * u64::from(rank) + jitter_ms(&family, local, base),
-    };
-    let existing = match read_deadline_index(context, &family).await {
-        Ok(existing) => existing,
-        Err(error) => {
-            warn!(?family, error = %error, "Witness deadline read failed");
-            return;
-        }
-    };
-    if existing
-        .as_ref()
-        .is_some_and(|existing| existing.due_at_ms <= due_at_ms)
-    {
-        return;
+    let operation = ArmFamilyOperation::new(family, local, realm_id, now_ms);
+    if let Err(error) = drive(operation, context).await {
+        warn!(?family, error = %error, "Witness deadline was not armed");
     }
-    let deadline = WitnessDeadline { due_at_ms, rank };
-    if !replace_deadline(context, &family, existing, deadline).await {
-        return;
-    }
-    let after = Duration::from_millis(due_at_ms.saturating_sub(now_ms));
-    if let Some(task) = context.task_handle.as_ref() {
-        let _ = task.send_effect(schedule_witness_drain(after)).await;
-    }
-}
-
-/// The node that admitted the family: the committing node of the claim with the
-/// lowest order key, which every holder reduces the same way. An unreadable
-/// claim set leaves the order to the digest alone.
-async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
-    let records = drive(
-        LoadFamilyOperation::kind(family, JobRecordKind::Claim),
-        context,
-    )
-    .await
-    .ok()?;
-    records
-        .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Claim(claim) => Some(claim),
-            _ => None,
-        })
-        .min_by_key(|claim| claim.order_key())
-        .map(|claim| claim.committing_node_id)
 }
 
 /// One bounded pass over the persisted deadlines. Returns true while rows
@@ -226,7 +90,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         let deadline = match read_deadline_index(context, &family).await {
             Ok(Some(deadline)) => deadline,
             Ok(None) => {
-                if !remove_stale(context, &family, &key).await {
+                if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
                     remaining = true;
                 }
                 continue;
@@ -237,7 +101,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
             }
         };
         if deadline_key(&family, deadline.due_at_ms) != key {
-            if !remove_stale(context, &family, &key).await {
+            if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
                 remaining = true;
             }
             continue;
@@ -248,7 +112,11 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         }
         match run_round(context, family, now_ms).await {
             RoundOutcome::Done => {
-                if !clear_deadline(context, &family, &key, deadline).await {
+                let clear = DeadlineChange::Clear {
+                    key,
+                    expected: deadline,
+                };
+                if !change_deadline(context, &family, clear).await {
                     remaining = true;
                 }
             }
@@ -257,12 +125,44 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
                     due_at_ms: now_ms + after_ms,
                     rank: deadline.rank,
                 };
-                let _ = replace_deadline(context, &family, Some(deadline), next).await;
+                let replace = DeadlineChange::Replace {
+                    expected: Some(deadline),
+                    next,
+                };
+                change_deadline(context, &family, replace).await;
                 remaining = true;
             }
         }
     }
     remaining
+}
+
+/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
+/// paged inputs of the spec are read in first.
+async fn build_plan(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    spec: &LogicalJobSpec,
+    excluded: &[ExecutionTargetId],
+    now_ms: u64,
+) -> Result<ExecutionPlan, PlanBuildError> {
+    let local = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
+    let spec = crate::jobs::records::pages::with_inputs(context, spec)
+        .await
+        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
+    let round = PlanRound {
+        config: config.clone(),
+        spec,
+        excluded: excluded.to_vec(),
+        now_ms,
+        local,
+        fresh: context.fresh_heartbeats(),
+    };
+    drive(BuildPlanOperation::new(round), context).await
 }
 
 #[cfg(test)]
@@ -280,18 +180,15 @@ mod tests {
                 submission_id: aruna_core::structs::execution::job::SubmissionId([index as u8; 32]),
                 request_digest: [index as u8; 32],
             };
-            assert!(
-                replace_deadline(
-                    &ctx,
-                    &family,
-                    None,
-                    WitnessDeadline {
-                        due_at_ms: 0,
-                        rank: index as u32,
-                    },
-                )
-                .await
-            );
+            let next = WitnessDeadline {
+                due_at_ms: 0,
+                rank: index as u32,
+            };
+            let arm = DeadlineChange::Replace {
+                expected: None,
+                next,
+            };
+            assert!(change_deadline(&ctx, &family, arm).await);
         }
 
         assert!(drain_witness_deadlines(&ctx, 1).await);
@@ -322,8 +219,16 @@ mod tests {
             due_at_ms: 10,
             rank: 1,
         };
-        assert!(replace_deadline(&ctx, &family, None, first).await);
-        assert!(replace_deadline(&ctx, &family, Some(first), second).await);
+        let arm = DeadlineChange::Replace {
+            expected: None,
+            next: first,
+        };
+        assert!(change_deadline(&ctx, &family, arm).await);
+        let moved = DeadlineChange::Replace {
+            expected: Some(first),
+            next: second,
+        };
+        assert!(change_deadline(&ctx, &family, moved).await);
         assert_eq!(
             read_deadline_index(&ctx, &family)
                 .await
@@ -342,26 +247,6 @@ mod tests {
         .expect("deadline scan");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, deadline_key(&family, second.due_at_ms));
-    }
-
-    #[test]
-    fn schedule_uses_shorten() {
-        let Effect::Task(TaskEffect::ShortenTimer { key, after }) =
-            schedule_witness_drain(Duration::from_secs(1))
-        else {
-            panic!("expected shortened witness timer")
-        };
-        assert_eq!(key, TaskKey::DrainWitnessQueue);
-        assert_eq!(after, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn deadlines_ordered() {
-        let family = JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([1; 32]),
-            request_digest: [2; 32],
-        };
-        assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
 
     /// One family with a launch by `holder` that no receipt answers.
@@ -875,17 +760,6 @@ fn empty_plan() -> ExecutionPlan {
     }
 }
 
-fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
-    let mut bytes = Vec::with_capacity(DEADLINE_KEY_BYTES);
-    bytes.extend_from_slice(&due_at_ms.to_be_bytes());
-    bytes.extend_from_slice(&family.to_bytes());
-    Key::from(bytes.as_slice())
-}
-
-fn deadline_index_key(family: &JobFamilyId) -> Key {
-    Key::from(family.to_bytes().as_slice())
-}
-
 fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
     if key.len() != DEADLINE_KEY_BYTES {
         return None;
@@ -904,151 +778,14 @@ fn explain_key(family: &JobFamilyId, node: NodeId) -> Key {
     Key::from(bytes.as_slice())
 }
 
-async fn clear_deadline(
+/// Applies one deadline change; a failed or skipped change reads as unchanged.
+async fn change_deadline(
     context: &DriverContext,
     family: &JobFamilyId,
-    key: &Key,
-    expected: WitnessDeadline,
+    change: DeadlineChange,
 ) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let Ok(current) = current else {
-        abort_txn(context, txn_id).await;
-        return false;
-    };
-    if current != Some(expected) || deadline_key(family, expected.due_at_ms) != *key {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    let deletes = vec![
-        (WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone()),
-        (
-            DEADLINE_INDEX_KEYSPACE.to_string(),
-            deadline_index_key(family),
-        ),
-    ];
-    if batch_delete(&context.storage_handle, deletes, Some(txn_id))
-        .await
-        .is_err()
-    {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let current_key = current
-        .as_ref()
-        .ok()
-        .and_then(Option::as_ref)
-        .map(|deadline| deadline_key(family, deadline.due_at_ms));
-    if current_key.as_ref() == Some(key) {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if current.is_err()
-        || batch_delete(
-            &context.storage_handle,
-            vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
-            Some(txn_id),
-        )
-        .await
-        .is_err()
-    {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-async fn replace_deadline(
-    context: &DriverContext,
-    family: &JobFamilyId,
-    expected: Option<WitnessDeadline>,
-    next: WitnessDeadline,
-) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let Ok(current) = current else {
-        abort_txn(context, txn_id).await;
-        return false;
-    };
-    if current != expected {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if write_row_txn(
-        context,
-        WITNESS_DEADLINE_KEYSPACE,
-        &deadline_key(family, next.due_at_ms),
-        &next,
-        Some(txn_id),
-    )
-    .await
-    .is_err()
-        || write_row_txn(
-            context,
-            DEADLINE_INDEX_KEYSPACE,
-            &deadline_index_key(family),
-            &next,
-            Some(txn_id),
-        )
-        .await
-        .is_err()
-    {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if let Some(previous) = expected {
-        let previous_key = deadline_key(family, previous.due_at_ms);
-        if previous_key != deadline_key(family, next.due_at_ms)
-            && batch_delete(
-                &context.storage_handle,
-                vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
-                Some(txn_id),
-            )
-            .await
-            .is_err()
-        {
-            abort_txn(context, txn_id).await;
-            return false;
-        }
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -> bool {
-    match read_deadline_index(context, &family).await {
-        Ok(deadline) => deadline.is_some(),
-        Err(_) => true,
-    }
+    let operation = ChangeDeadlineOperation::new(*family, change);
+    drive(operation, context).await.unwrap_or(false)
 }
 
 fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
@@ -1103,47 +840,6 @@ async fn read_deadline_index(
         None,
     )
     .await
-}
-
-async fn start_txn(context: &DriverContext) -> Result<TxnId, LifecycleError> {
-    match context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(aruna_core::events::StorageEvent::TransactionStarted { txn_id }) => {
-            Ok(txn_id)
-        }
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "start transaction".to_string(),
-            expected: "transaction started",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> Result<(), LifecycleError> {
-    match context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "commit transaction".to_string(),
-            expected: "transaction committed",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::AbortTransaction { txn_id })
-        .await;
 }
 
 async fn read_row_txn<T: for<'a> Deserialize<'a>>(

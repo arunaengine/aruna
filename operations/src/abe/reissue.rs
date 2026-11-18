@@ -4,8 +4,9 @@
 
 use super::epoch::{parse_progress, progress};
 use super::*;
-use aruna_core::events::SubOperationEvent;
-use aruna_core::operation::boxed_suboperation;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::{NodeId, UserId};
 
@@ -16,12 +17,10 @@ enum Step {
     Page,
     Access,
     Run,
-    Start,
-    Check,
     Save,
-    Commit,
-    Done,
 }
+
+type ReissueTurn = Result<Next<bool>, KeyError>;
 
 /// Reopens member and token key requests at the current epoch for one page of grant or request
 /// rows after a raise; the node issues them at once while it can. Returns whether pages remain,
@@ -40,8 +39,6 @@ pub struct ReissueOperation {
     users: Vec<(UserId, KeyScope, Option<Vec<PathRestriction>>)>,
     tokens: Vec<(String, [u8; 32])>,
     runs: Vec<KeyOperation>,
-    txn: Option<TxnId>,
-    output: Option<Result<bool, KeyError>>,
 }
 impl ReissueOperation {
     pub fn new(bucket: String, auth: AuthContext, node: NodeId, now: u64, page: usize) -> Self {
@@ -58,14 +55,7 @@ impl ReissueOperation {
             users: Vec::new(),
             tokens: Vec::new(),
             runs: Vec::new(),
-            txn: None,
-            output: None,
         }
-    }
-    fn finish(&mut self, result: Result<bool, KeyError>) -> Effects {
-        self.step = Step::Done;
-        self.output = Some(result);
-        self.abort()
     }
     fn bucket_key(&self) -> Key {
         self.bucket_id
@@ -74,16 +64,29 @@ impl ReissueOperation {
             .to_vec()
             .into()
     }
-    fn rows_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let epoch = values.first().and_then(|(_, v)| v.as_deref());
+    fn settings_read(&mut self, value: Option<Value>) -> ReissueTurn {
+        let settings = BucketEncryption::from_row(value.as_deref()).ok();
+        let Some(key) = settings.and_then(|s| s.active_key()) else {
+            return Ok(Next::Done(false));
+        };
+        self.bucket_id = Some(key.bucket_id);
+        self.step = Step::Rows;
+        let id = self.bucket_key();
+        Ok(Next::Call(IoCall::Read(vec![
+            (ABE_EPOCH_KEYSPACE.to_string(), id.clone()),
+            (ABE_REISSUE_KEYSPACE.to_string(), id),
+        ])))
+    }
+    fn rows_read(&mut self, epoch: Option<Value>, seen: Option<Value>) -> ReissueTurn {
         let epoch = epoch
+            .as_deref()
             .and_then(|v| v.try_into().ok())
             .map(u64::from_be_bytes);
-        let Some(seen) = values.get(1).and_then(|(_, v)| v.clone()) else {
-            return self.finish(Ok(false));
+        let Some(seen) = seen else {
+            return Ok(Next::Done(false));
         };
         let (Some(epoch), Some((at, requests, cursor))) = (epoch, parse_progress(&seen)) else {
-            return self.finish(Err(AbeError::Context.into()));
+            return Err(AbeError::Context.into());
         };
         self.seen = seen.to_vec();
         // A newer raise restarts from the first row.
@@ -99,17 +102,16 @@ impl ReissueOperation {
         };
         self.step = Step::Page;
         self.next = Some(progress(epoch, requests, &[]));
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: space.to_string(),
-            prefix: Some(self.bucket_key()),
-            start: (!cursor.is_empty()).then(|| IterStart::After(cursor.into())),
+        Ok(Next::Call(IoCall::Page {
+            space: space.to_string(),
+            prefix: self.bucket_key(),
+            after: (!cursor.is_empty()).then(|| cursor.into()),
             limit: self.page,
-            txn_id: None
-        })]
+        }))
     }
-    fn page_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    fn page_read(&mut self, values: Vec<(Key, Value)>) -> ReissueTurn {
         let Some((epoch, requests, _)) = self.next.as_deref().and_then(parse_progress) else {
-            return self.finish(Err(AbeError::Context.into()));
+            return Err(AbeError::Context.into());
         };
         self.next = match values.last() {
             Some((key, _)) if values.len() >= self.page => Some(progress(epoch, requests, key)),
@@ -155,7 +157,7 @@ impl ReissueOperation {
             self.runs.push(run.quiet());
         }
         if self.tokens.is_empty() {
-            return self.run_next();
+            return Ok(self.run_next());
         }
         self.step = Step::Access;
         let reads = self
@@ -168,14 +170,11 @@ impl ReissueOperation {
                 )
             })
             .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
     /// Continuing token credentials get their requests under their owner, narrowed as before.
-    fn access_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        for ((access_key, public_key), (_, value)) in
+    fn access_read(&mut self, values: Vec<Option<Value>>) -> Next<bool> {
+        for ((access_key, public_key), value) in
             std::mem::take(&mut self.tokens).into_iter().zip(values)
         {
             let Some(access) = value.and_then(|v| UserAccess::from_bytes(&v).ok()) else {
@@ -197,56 +196,77 @@ impl ReissueOperation {
         }
         self.run_next()
     }
-    fn run_next(&mut self) -> Effects {
+    fn run_next(&mut self) -> Next<bool> {
         let Some(run) = self.runs.pop() else {
-            self.step = Step::Start;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
+            self.step = Step::Save;
+            return Next::Call(IoCall::child(ProgressWrite {
+                key: self.bucket_key(),
+                seen: self.seen.clone(),
+                next: self.next.clone(),
+                saving: false,
+            }));
         };
         self.step = Step::Run;
-        // Only a recipient no longer eligible is skipped; other failures keep the page for a retry.
-        let sub = boxed_suboperation(run, |result| match result {
+        Next::Call(IoCall::child(run))
+    }
+    /// Only a recipient no longer eligible is skipped; other failures keep the page for a retry.
+    fn ran(&mut self, result: Result<KeyResult, KeyError>) -> ReissueTurn {
+        match result {
             Ok(_)
             | Err(KeyError::Denied | KeyError::Missing)
-            | Err(KeyError::Abe(AbeError::Stale | AbeError::Scope)) => {
-                Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
-                    request_ids: Vec::new(),
-                })
-            }
+            | Err(KeyError::Abe(AbeError::Stale | AbeError::Scope)) => Ok(self.run_next()),
             Err(error) => {
                 tracing::warn!(event = "abe.reissue.failed", error = %error);
-                Event::SubOperation(SubOperationEvent::KeyRequestsFailed)
+                Err(KeyError::Storage)
             }
-        });
-        smallvec![Effect::SubOperation(sub)]
-    }
-    /// Advances the cursor only while the progress row is the one this page started from.
-    fn check_read(&mut self, value: Option<Value>) -> Effects {
-        let Some(txn_id) = self.txn else {
-            return self.finish(Err(KeyError::Storage));
-        };
-        if value.as_deref() != Some(self.seen.as_slice()) {
-            return self.finish(Ok(true));
         }
-        let key = self.bucket_key();
-        self.step = Step::Save;
-        let effect = match self.next.clone() {
-            Some(row) => StorageEffect::BatchWrite {
-                writes: vec![(ABE_REISSUE_KEYSPACE.to_string(), key, row.into())],
-                txn_id: Some(txn_id),
-            },
-            None => StorageEffect::BatchDelete {
-                deletes: vec![(ABE_REISSUE_KEYSPACE.to_string(), key)],
-                txn_id: Some(txn_id),
-            },
-        };
-        smallvec![Effect::Storage(effect)]
     }
 }
+
+/// Advances the cursor in one write transaction, only while the progress row is the one the
+/// page started from; returns whether pages remain.
+#[derive(Debug, PartialEq)]
+struct ProgressWrite {
+    key: Key,
+    seen: Vec<u8>,
+    next: Option<Vec<u8>>,
+    saving: bool,
+}
+
+impl Operation for ProgressWrite {
+    type Output = bool;
+    type Error = KeyError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> ReissueTurn {
+        let row = (ABE_REISSUE_KEYSPACE.to_string(), self.key.clone());
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> ReissueTurn {
+        if self.saving {
+            done(result)?;
+            return Ok(Next::Done(self.next.is_some()));
+        }
+        let [value] = values::<1>(result)?;
+        if value.as_deref() != Some(self.seen.as_slice()) {
+            return Ok(Next::Done(true));
+        }
+        self.saving = true;
+        let space = ABE_REISSUE_KEYSPACE.to_string();
+        Ok(Next::Call(match self.next.clone() {
+            Some(row) => IoCall::Write(vec![(space, self.key.clone(), row.into())]),
+            None => IoCall::Delete(vec![(space, self.key.clone())]),
+        }))
+    }
+}
+
 impl KeyOperation {
     /// After node issuance, runs the next page of a raise's saved reissue progress, if any.
-    pub(super) fn walk(&mut self) -> Effects {
+    pub(super) fn walk(&self) -> Option<IoCall> {
         let issuing = matches!(
             self.action,
             KeyAction::Request(_)
@@ -255,115 +275,53 @@ impl KeyOperation {
                 | KeyAction::Writes(_)
         );
         if self.quiet || !issuing {
-            self.state = State::Done;
-            self.output = self.result.take().map(Ok);
-            return smallvec![];
+            return None;
         }
-        self.state = State::Reissue;
         let bucket = self.bucket.clone();
         let page =
             ReissueOperation::new(bucket, self.auth.clone(), self.node, self.now, MAX_REQUESTS);
-        let sub = boxed_suboperation(page, |result| {
-            let more = result.unwrap_or_else(|error| {
-                tracing::warn!(event = "abe.reissue.failed", error = %error);
-                false
-            });
-            Event::SubOperation(SubOperationEvent::ReissuePaged { more })
-        });
-        smallvec![Effect::SubOperation(sub)]
+        Some(IoCall::child(page))
     }
 }
-impl EffectOperation for ReissueOperation {
+impl Operation for ReissueOperation {
     type Output = bool;
     type Error = KeyError;
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().to_vec().into(),
-            txn_id: None
-        })]
+
+    fn first(&mut self) -> ReissueTurn {
+        Ok(Next::Call(IoCall::Read(vec![(
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            self.bucket.as_bytes().to_vec().into(),
+        )])))
     }
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (Step::Settings, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let settings = BucketEncryption::from_row(value.as_deref()).ok();
-                let Some(key) = settings.and_then(|s| s.active_key()) else {
-                    return self.finish(Ok(false));
-                };
-                self.bucket_id = Some(key.bucket_id);
-                self.step = Step::Rows;
-                let id = self.bucket_key();
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (ABE_EPOCH_KEYSPACE.to_string(), id.clone()),
-                        (ABE_REISSUE_KEYSPACE.to_string(), id),
-                    ],
-                    txn_id: None
-                })]
+
+    fn next(&mut self, result: IoResult) -> ReissueTurn {
+        match self.step {
+            Step::Settings => {
+                let [value] = values::<1>(result)?;
+                self.settings_read(value)
             }
-            (Step::Rows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.rows_read(values)
+            Step::Rows => {
+                let [epoch, seen] = values::<2>(result)?;
+                self.rows_read(epoch, seen)
             }
-            (Step::Page, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.page_read(values)
+            Step::Page => {
+                let (rows, _) = result.page()?;
+                self.page_read(rows)
             }
-            (Step::Access, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.access_read(values)
+            Step::Access => Ok(self.access_read(result.values()?)),
+            Step::Run => {
+                let ran = result.child::<KeyResult, KeyError>()?;
+                self.ran(ran)
             }
-            (Step::Run, Event::SubOperation(SubOperationEvent::KeyRequestsOpened { .. })) => {
-                self.run_next()
-            }
-            (Step::Run, Event::SubOperation(SubOperationEvent::KeyRequestsFailed)) => {
-                self.finish(Err(KeyError::Storage))
-            }
-            (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                self.step = Step::Check;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ABE_REISSUE_KEYSPACE.to_string(),
-                    key: self.bucket_key(),
-                    txn_id: Some(txn_id)
-                })]
-            }
-            (Step::Check, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.check_read(value)
-            }
-            (
-                Step::Save,
-                Event::Storage(
-                    StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
-                ),
-            ) => match self.txn {
-                Some(txn_id) => {
-                    self.step = Step::Commit;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                None => self.finish(Err(KeyError::Storage)),
-            },
-            (Step::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn = None;
-                let more = self.next.is_some();
-                self.finish(Ok(more))
-            }
-            _ => self.finish(Err(KeyError::Storage)),
+            Step::Save => result.child::<bool, KeyError>()?.map(Next::Done),
         }
-    }
-    fn is_complete(&self) -> bool {
-        self.step == Step::Done
-    }
-    fn finalize(self) -> Result<bool, KeyError> {
-        self.output.unwrap_or(Err(KeyError::Storage))
-    }
-    fn abort(&mut self) -> Effects {
-        self.txn.take().map_or_else(Effects::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
 
     #[test]
     fn reopens_saved_scopes() {
@@ -407,11 +365,8 @@ mod tests {
         operation.step = Step::Page;
         operation.next = Some(progress(2, true, &[]));
         let rows = vec![saved(1, "foo/", restricted.clone()), saved(2, "bar/", None)];
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: None,
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let turn = operation.next(IoResult::Page { rows, next: None });
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         // The narrow scope keeps its restrictions instead of a scope derived from direct roles.
         let [waiting] = operation.runs.as_slice() else {
             panic!("one run waits");
@@ -435,10 +390,41 @@ mod tests {
         let mut operation = ReissueOperation::new("bucket".into(), auth, node, 1, 1);
         operation.step = Step::Run;
         operation.next = Some(progress(2, false, b"next"));
-        let failed = Event::SubOperation(SubOperationEvent::KeyRequestsFailed);
+        let failed = Err::<KeyResult, _>(KeyError::Conflict);
         // No progress write follows: a later run resumes from the saved cursor.
-        assert!(operation.step(failed).is_empty());
-        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert_eq!(turn, Err(KeyError::Storage));
+    }
+
+    #[test]
+    fn progress_moves_once() {
+        // The cursor moves only while the stored progress is the row this page started from.
+        let key = Key::from(vec![1u8; 16]);
+        let mut write = ProgressWrite {
+            key: key.clone(),
+            seen: b"seen".to_vec(),
+            next: Some(b"next".to_vec()),
+            saving: false,
+        };
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        write.first().unwrap();
+        let moved = IoResult::Values(vec![Some(Value::from(b"other".to_vec()))]);
+        assert_eq!(write.next(moved), Ok(Next::Done(true)));
+
+        let mut write = ProgressWrite {
+            key: key.clone(),
+            seen: b"seen".to_vec(),
+            next: None,
+            saving: false,
+        };
+        write.first().unwrap();
+        let same = IoResult::Values(vec![Some(Value::from(b"seen".to_vec()))]);
+        let space = ABE_REISSUE_KEYSPACE.to_string();
+        assert_eq!(
+            write.next(same),
+            Ok(Next::Call(IoCall::Delete(vec![(space, key)])))
+        );
+        assert_eq!(write.next(IoResult::Done), Ok(Next::Done(false)));
     }
 
     #[test]
@@ -453,18 +439,11 @@ mod tests {
         let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let mut run = KeyOperation::new("bucket".into(), auth, node, action, 1).quiet();
         run.state = State::Snapshot;
-        operation.runs.push(run);
-        let Some(Effect::SubOperation(mut sub)) = operation.run_next().pop() else {
-            panic!("one run starts");
-        };
-        let values = vec![(Key::from(Vec::new()), None); 8];
-        assert!(
-            sub.step(Event::Storage(StorageEvent::BatchReadResult { values }))
-                .is_empty()
-        );
-        assert!(sub.is_complete());
+        let failed = run.next(IoResult::Values(vec![None; 8]));
+        assert_eq!(failed, Err(KeyError::Storage));
         // No progress write follows: a later run resumes from the saved cursor.
-        assert!(operation.step(sub.finalize()).is_empty());
-        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        let failed = failed.map(|_| KeyResult::Opened(Vec::new()));
+        let ran = IoResult::Child(ChildOutcome::new(failed));
+        assert_eq!(operation.next(ran), Err(KeyError::Storage));
     }
 }

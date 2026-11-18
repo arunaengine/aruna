@@ -299,8 +299,8 @@ impl Operation for SplitOperation {
         Ok(Next::Call(call))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 

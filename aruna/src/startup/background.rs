@@ -175,7 +175,7 @@ pub(crate) async fn start(
             }
             StartupPhase::RecoverStaleJobs => {
                 if let Err(error) = jobs_runtime
-                    .recover_until_stopped(&driver_ctx.storage_handle, stop, || {
+                    .recover_until_stopped(&driver_ctx, stop, || {
                         matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
                     })
                     .await
@@ -193,10 +193,10 @@ pub(crate) async fn start(
                     .await;
             }
             StartupPhase::RestoreDrainTimer => {
-                restore_drain_timer(&driver_ctx.storage_handle, &task_handle).await;
+                restore_drain_timer(&driver_ctx, &task_handle).await;
             }
             StartupPhase::RestoreLifecycleTimers => {
-                restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
+                restore_lifecycle_timers(&driver_ctx, &task_handle).await;
             }
             StartupPhase::WarmMetadata => spawn_metadata_warmup(driver_ctx.clone(), &shutdown),
             StartupPhase::SweepSessions => spawn_session_sweep(driver_ctx.clone(), &shutdown),

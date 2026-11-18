@@ -9,37 +9,10 @@ use aruna_core::types::TxnId;
 use super::rows::{Rows, StoreError};
 use crate::driver::DriverContext;
 
-/// One open storage transaction; `transact` commits or aborts it.
+/// Plugin row reads and writes; `direct` runs each on its own.
 pub struct Txn<'a> {
     ctx: &'a DriverContext,
     id: Option<TxnId>,
-}
-
-/// Runs `body` in one transaction and commits it, or aborts it when `body` fails.
-pub(crate) async fn transact<T, E: From<StoreError>>(
-    ctx: &DriverContext,
-    body: impl AsyncFnOnce(&Txn<'_>) -> Result<T, E>,
-) -> Result<T, E> {
-    let start = StorageEffect::StartTransaction { read: false };
-    let id = match ctx.storage_handle.send_storage_effect(start).await {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(failed(other).into()),
-    };
-    let txn = Txn { ctx, id: Some(id) };
-    match body(&txn).await {
-        Ok(value) => {
-            let commit = StorageEffect::CommitTransaction { txn_id: id };
-            match ctx.storage_handle.send_storage_effect(commit).await {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(value),
-                other => Err(failed(other).into()),
-            }
-        }
-        Err(error) => {
-            let abort = StorageEffect::AbortTransaction { txn_id: id };
-            ctx.storage_handle.send_storage_effect(abort).await;
-            Err(error)
-        }
-    }
 }
 
 impl<'a> Txn<'a> {

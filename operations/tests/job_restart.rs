@@ -18,7 +18,8 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::attempt::set_cancel_requested;
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{claim_job, read_job_record};
-use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle};
+use aruna_operations::testing::test_context;
+use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use aruna_tasks::TaskHandle;
 use ulid::Ulid;
 
@@ -92,9 +93,6 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
 
     let storage = FjallStorage::open(storage_dir.path().to_str().unwrap())?;
     let runtime = JobsRuntime::new();
-    let recovered = runtime.recover_stale_jobs(&storage).await?;
-    assert_eq!(recovered, 2, "both in-flight jobs are re-queued at startup");
-
     let context = Arc::new(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -105,11 +103,13 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
         compute_handle: None,
         outbound_handle: None,
     });
+    let recovered = runtime.recover_stale_jobs(&context).await?;
+    assert_eq!(recovered, 2, "both in-flight jobs are re-queued at startup");
 
     drive_until_terminal(&context, &runtime).await?;
 
-    let a = read_job_record(&storage, job_a(), None).await?.unwrap();
-    let b = read_job_record(&storage, job_b(), None).await?.unwrap();
+    let a = read_job_record(&context, job_a(), None).await?.unwrap();
+    let b = read_job_record(&context, job_b(), None).await?.unwrap();
     assert_eq!(
         a.state,
         JobState::Succeeded,
@@ -129,7 +129,7 @@ async fn drive_until_terminal(
     runtime: &Arc<JobsRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = drain_job_batch(
-        &context.storage_handle,
+        &context,
         node_id(1),
         JobClassBudget {
             in_process: 8,
@@ -143,8 +143,8 @@ async fn drive_until_terminal(
     }
 
     let (a, b) = tokio::join!(
-        runtime.wait_for_terminal(&context.storage_handle, job_a(), Duration::from_secs(60)),
-        runtime.wait_for_terminal(&context.storage_handle, job_b(), Duration::from_secs(60)),
+        runtime.wait_for_terminal(&context, job_a(), Duration::from_secs(60)),
+        runtime.wait_for_terminal(&context, job_b(), Duration::from_secs(60)),
     );
     if a.is_none() || b.is_none() {
         return Err("jobs did not reach terminal state after restart".into());
@@ -168,23 +168,24 @@ async fn restart_recovery_child() -> Result<(), Box<dyn std::error::Error>> {
         storage_path.to_str().ok_or("invalid storage path")?,
         FjallPersistPolicy::SyncAll,
     )?;
+    let context = test_context(storage.clone());
 
-    seed_claimed(&storage, probe(job_a(), 3, 0, marker_a.to_str().unwrap())).await;
+    seed_claimed(&context, probe(job_a(), 3, 0, marker_a.to_str().unwrap())).await;
     std::fs::write(&marker_a, b"partial")?;
 
     seed_claimed(
-        &storage,
+        &context,
         probe(job_b(), 100, 10, marker_b.to_str().unwrap()),
     )
     .await;
-    set_cancel_requested(&storage, job_b(), 2).await.unwrap();
+    set_cancel_requested(&context, job_b(), 2).await.unwrap();
     std::fs::write(&marker_b, b"partial")?;
 
     storage.sync_all().await?;
     std::process::exit(0);
 }
 
-async fn seed_claimed(storage: &StorageHandle, mut record: JobRecord) {
+async fn seed_claimed(storage: &DriverContext, mut record: JobRecord) {
     record.has_run = true;
     insert_job(storage, &record).await.unwrap();
     claim_job(storage, record.job_id, node_id(1), 1)

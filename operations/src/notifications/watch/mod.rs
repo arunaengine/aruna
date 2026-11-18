@@ -3,14 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod authorization;
+pub mod check;
 pub mod digest;
 pub mod emit;
-pub mod expand;
+#[cfg(test)]
+mod expand;
+pub mod expansion;
 pub mod interest;
 pub mod listing;
+pub mod origin;
 pub mod paths;
 pub mod records;
 pub mod remove;
 pub mod store;
-pub mod subscriptions;
+#[cfg(test)]
+mod subscriptions;
 pub mod table;

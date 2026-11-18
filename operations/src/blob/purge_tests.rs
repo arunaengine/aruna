@@ -228,7 +228,7 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::query::insert_job(&context.storage_handle, &record)
+    crate::jobs::store::query::insert_job(&context, &record)
         .await
         .unwrap();
     crate::blob::cleanup::process_cleanup_batch(&context)

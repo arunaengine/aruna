@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -29,33 +28,27 @@ pub struct CreateSecretInput {
     pub record: OnboardingSecretRecord,
 }
 
-#[derive(Debug, PartialEq)]
-pub struct CreateSecretOperation {
-    input: CreateSecretInput,
-    state: CreateSecretState,
-    output: Option<Result<OnboardingSecretRecord, CreateSecretError>>,
-}
-
+/// What the minting transaction waits for.
 #[derive(Clone, Debug, PartialEq)]
-enum CreateSecretState {
-    Init,
-    StartTransaction,
-    ReadRealmConfig {
-        txn_id: TxnId,
-    },
-    CountPending {
-        txn_id: TxnId,
+enum Stage {
+    Config,
+    /// Counts the owner's outstanding secrets page by page against `cap`.
+    Count {
         cap: u32,
         enrolled: Vec<String>,
         /// Secrets counted by the pages already read.
         pending: u32,
     },
-    WriteRecord {
-        txn_id: TxnId,
-    },
-    CommitTransaction,
-    Finish,
-    Error,
+    Write,
+}
+
+/// Stores a new onboarding secret in one write transaction; a device secret first counts the
+/// owner's enrolled devices and outstanding secrets against the realm's device cap.
+#[derive(Debug, PartialEq)]
+pub struct CreateSecretOperation {
+    input: CreateSecretInput,
+    stage: Stage,
+    pages: PrefixPages,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -76,38 +69,95 @@ pub enum CreateSecretError {
     },
 }
 
+impl From<IoError> for CreateSecretError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreateSecret".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type CreateTurn = Result<Next<OnboardingSecretRecord>, CreateSecretError>;
+
 impl CreateSecretOperation {
     pub fn new(input: CreateSecretInput) -> Self {
         Self {
             input,
-            state: CreateSecretState::Init,
-            output: None,
+            stage: Stage::Config,
+            pages: secret_pages(),
         }
     }
 
-    fn emit_write_record(&mut self, txn_id: TxnId) -> Effects {
-        self.state = CreateSecretState::WriteRecord { txn_id };
+    fn write_record(&mut self) -> CreateTurn {
+        self.stage = Stage::Write;
         let key = secret_record_key(self.input.record.enrollment_id);
-        let value = match postcard::to_allocvec(&self.input.record) {
-            Ok(value) => value,
-            Err(error) => {
-                return fail(self, CreateSecretError::ConversionError(error.into()));
-            }
-        };
-        let state_entry = match secret_state_entry(
+        let value = postcard::to_allocvec(&self.input.record).map_err(ConversionError::from)?;
+        let state_entry = secret_state_entry(
             self.input.record.enrollment_id,
             OnboardingSecretState::Available,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => return fail(self, CreateSecretError::ConversionError(error)),
+        )?;
+        Ok(Next::Call(IoCall::Write(vec![
+            (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(value)),
+            state_entry,
+        ])))
+    }
+
+    fn handle_config(&mut self, value: Option<Value>) -> CreateTurn {
+        let config = value
+            .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+            .transpose()?;
+        let cap = config
+            .as_ref()
+            .and_then(|config| config.quota.devices_per_user);
+        let (Some(cap), Some(owner)) = (cap, self.input.record.mode.owner()) else {
+            return self.write_record();
         };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(value)),
-                state_entry
-            ],
-            txn_id: Some(txn_id),
-        })]
+        let enrolled = enrolled_devices(config.as_ref(), owner);
+        if enrolled.len() as u32 >= cap {
+            return Err(CreateSecretError::DeviceCapExceeded { limit: cap });
+        }
+        // Unclaimed secrets already occupy a slot: two mints followed by
+        // two enrollments would otherwise cross the cap.
+        self.stage = Stage::Count {
+            cap,
+            enrolled,
+            pending: 0,
+        };
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn handle_page(&mut self, result: IoResult) -> CreateTurn {
+        let Stage::Count {
+            cap,
+            enrolled,
+            pending,
+        } = &mut self.stage
+        else {
+            return Err(CreateSecretError::NotFinished);
+        };
+        let rows = self.pages.take(result)?;
+        *pending = pending.saturating_add(pending_devices(
+            &rows,
+            self.input.record.mode.owner(),
+            self.input.record.enrollment_id,
+            enrolled,
+        ));
+        if enrolled.len() as u32 + *pending >= *cap {
+            return Err(CreateSecretError::DeviceCapExceeded { limit: *cap });
+        }
+        // The range is followed to its end: a slot this owner holds may
+        // sit behind any number of other owners' records.
+        match self.pages.done() {
+            true => self.write_record(),
+            false => Ok(Next::Call(self.pages.call())),
+        }
     }
 }
 
@@ -148,220 +198,46 @@ pub(crate) fn pending_devices(
         .count() as u32
 }
 
-impl EffectOperation for CreateSecretOperation {
+impl Operation for CreateSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = CreateSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = CreateSecretState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, CreateSecretError::StorageError(error));
-            }
-            other => other,
+    fn first(&mut self) -> CreateTurn {
+        // Only a device secret is capped, and the owner it is bound to
+        // names the realm whose quota decides the cap.
+        let Some(owner) = self.input.record.mode.owner() else {
+            return self.write_record();
         };
-
-        match &self.state {
-            CreateSecretState::StartTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return fail(
-                        self,
-                        CreateSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction started",
-                            got,
-                        },
-                    );
-                };
-
-                // Only a device secret is capped, and the owner it is bound to
-                // names the realm whose quota decides the cap.
-                let Some(owner) = self.input.record.mode.owner() else {
-                    return self.emit_write_record(txn_id);
-                };
-                self.state = CreateSecretState::ReadRealmConfig { txn_id };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                    key: ByteView::from(*owner.realm_id.as_bytes()),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            CreateSecretState::ReadRealmConfig { txn_id } => {
-                let txn_id = txn_id.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return fail(
-                        self,
-                        CreateSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "read result",
-                            got,
-                        },
-                    );
-                };
-                let config = match value
-                    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-                    .transpose()
-                {
-                    Ok(config) => config,
-                    Err(error) => {
-                        return fail(self, CreateSecretError::ConversionError(error));
-                    }
-                };
-                let cap = config
-                    .as_ref()
-                    .and_then(|config| config.quota.devices_per_user);
-                let (Some(cap), Some(owner)) = (cap, self.input.record.mode.owner()) else {
-                    return self.emit_write_record(txn_id);
-                };
-                let enrolled = enrolled_devices(config.as_ref(), owner);
-                if enrolled.len() as u32 >= cap {
-                    return fail(self, CreateSecretError::DeviceCapExceeded { limit: cap });
-                }
-                // Unclaimed secrets already occupy a slot: two mints followed by
-                // two enrollments would otherwise cross the cap.
-                self.state = CreateSecretState::CountPending {
-                    txn_id,
-                    cap,
-                    enrolled,
-                    pending: 0,
-                };
-                smallvec![scan_secrets(txn_id, None)]
-            }
-            CreateSecretState::CountPending {
-                txn_id,
-                cap,
-                enrolled,
-                pending,
-            } => {
-                let txn_id = txn_id.clone();
-                let cap = cap.clone();
-                let enrolled = enrolled.clone();
-                let pending = pending.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return fail(
-                        self,
-                        CreateSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "iter result",
-                            got,
-                        },
-                    );
-                };
-                let pending = pending.saturating_add(pending_devices(
-                    &values,
-                    self.input.record.mode.owner(),
-                    self.input.record.enrollment_id,
-                    &enrolled,
-                ));
-                if enrolled.len() as u32 + pending >= cap {
-                    return fail(self, CreateSecretError::DeviceCapExceeded { limit: cap });
-                }
-                // The range is followed to its end: a slot this owner holds may
-                // sit behind any number of other owners' records.
-                match next_start_after {
-                    Some(next) => {
-                        self.state = CreateSecretState::CountPending {
-                            txn_id,
-                            cap,
-                            enrolled,
-                            pending,
-                        };
-                        smallvec![scan_secrets(txn_id, Some(next))]
-                    }
-                    None => self.emit_write_record(txn_id),
-                }
-            }
-            CreateSecretState::WriteRecord { txn_id } => {
-                let txn_id = txn_id.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return fail(
-                        self,
-                        CreateSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch write result",
-                            got,
-                        },
-                    );
-                };
-                self.state = CreateSecretState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            CreateSecretState::CommitTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return fail(
-                        self,
-                        CreateSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction committed",
-                            got,
-                        },
-                    );
-                };
-                self.state = CreateSecretState::Finish;
-                self.output = Some(Ok(self.input.record.clone()));
-                smallvec![]
-            }
-            CreateSecretState::Init | CreateSecretState::Finish | CreateSecretState::Error => {
-                smallvec![]
-            }
-        }
+        Ok(Next::Call(IoCall::Read(vec![(
+            REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*owner.realm_id.as_bytes()),
+        )])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateSecretState::Finish | CreateSecretState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateSecretError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            CreateSecretState::ReadRealmConfig { txn_id }
-            | CreateSecretState::CountPending { txn_id, .. }
-            | CreateSecretState::WriteRecord { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> CreateTurn {
+        match self.stage {
+            Stage::Config => {
+                let [value] = values::<1>(result)?;
+                self.handle_config(value)
             }
-            _ => smallvec![],
+            Stage::Count { .. } => self.handle_page(result),
+            Stage::Write => {
+                done(result)?;
+                Ok(Next::Done(self.input.record.clone()))
+            }
         }
     }
 }
 
-fn fail(operation: &mut CreateSecretOperation, error: CreateSecretError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = CreateSecretState::Error;
-    operation.output = Some(Err(error));
-    cleanup
-}
-
-/// One page of the outstanding-secret range, inside the minting transaction so
-/// the read conflicts with a concurrent insert.
-pub(crate) fn scan_secrets(txn_id: TxnId, start_after: Option<Key>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: ONBOARDING_KEYSPACE.to_string(),
-        prefix: Some(ByteView::from(SECRET_RECORD_PREFIX.as_bytes().to_vec())),
-        start: start_after.map(IterStart::After),
-        limit: MAX_SCANNED_SECRETS,
-        txn_id: Some(txn_id),
-    })
+/// The outstanding-secret range, read inside the minting transaction so the read conflicts
+/// with a concurrent insert.
+pub(crate) fn secret_pages() -> PrefixPages {
+    let prefix = ByteView::from(SECRET_RECORD_PREFIX.as_bytes().to_vec());
+    PrefixPages::new(ONBOARDING_KEYSPACE, prefix, MAX_SCANNED_SECRETS)
 }
 
 pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
@@ -377,7 +253,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
@@ -445,7 +321,7 @@ mod tests {
     /// Runs a mint's effects against storage up to its commit and hands that
     /// commit back, so two mints can be interleaved deliberately.
     async fn run_to_commit(
-        operation: &mut CreateSecretOperation,
+        operation: &mut impl EffectOperation,
         context: &DriverContext,
     ) -> StorageEffect {
         let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
@@ -581,10 +457,12 @@ mod tests {
         let (_dir, context) = context_with_cap(Some(1), &[]).await;
         let mut first = CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        });
+        })
+        .into_machine();
         let mut second = CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        });
+        })
+        .into_machine();
 
         let first_commit = run_to_commit(&mut first, &context).await;
         let second_commit = run_to_commit(&mut second, &context).await;

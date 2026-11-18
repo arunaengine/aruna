@@ -16,7 +16,6 @@ use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_
 use aruna_core::managed_copy::{
     CopyRegistration, ManagedCopyError, register_effect, scan_effect, version_scope,
 };
-use aruna_core::operation::EffectOperation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
@@ -29,7 +28,7 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
@@ -178,22 +177,38 @@ async fn write_copy(context: &DriverContext, record: &ManagedCopyRecord) {
 /// Runs a put until the version transaction would start, which is exactly a
 /// crash after the blob bytes landed and before anything was registered.
 async fn drive_until_txn(operation: &mut PutObjectOperation, context: &DriverContext) {
-    let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
-    while let Some(effect) = queue.pop_front() {
-        let event = match effect {
-            Effect::Storage(StorageEffect::StartTransaction { .. }) => return,
-            Effect::Storage(effect) => context.storage_handle.send_storage_effect(effect).await,
-            Effect::Blob(effect) => {
-                context
-                    .blob_handle
-                    .as_ref()
-                    .expect("blob handle")
-                    .send_blob_effect(effect)
-                    .await
-            }
-            other => panic!("unexpected pre-transaction effect {other:?}"),
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    let mut turn = operation.first();
+    loop {
+        let Ok(Next::Call(call)) = turn else {
+            panic!("unexpected pre-transaction turn {turn:?}");
         };
-        queue.extend(operation.step(event));
+        let result = match call {
+            IoCall::Read(reads) => {
+                let read = StorageEffect::BatchRead {
+                    reads,
+                    txn_id: None,
+                };
+                let Event::Storage(StorageEvent::BatchReadResult { values }) =
+                    context.storage_handle.send_storage_effect(read).await
+                else {
+                    panic!("expected the read answer");
+                };
+                IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+            }
+            IoCall::Effect(effect) => match *effect {
+                Effect::Blob(effect) => {
+                    let blob = context.blob_handle.as_ref().expect("blob handle");
+                    IoResult::Event(Box::new(blob.send_blob_effect(effect).await))
+                }
+                other => panic!("unexpected pre-transaction effect {other:?}"),
+            },
+            // The version transaction runs as a child.
+            IoCall::Child(_) => return,
+            other => panic!("unexpected pre-transaction call {other:?}"),
+        };
+        turn = operation.next(result);
     }
 }
 

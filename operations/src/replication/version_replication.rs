@@ -12,7 +12,7 @@ use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
@@ -21,6 +21,7 @@ use crate::replication::protocol::{
 };
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
@@ -1161,7 +1162,6 @@ pub struct ReplicateObjectOperation {
     /// Destination details of this node, evaluated before reference bytes are
     /// materialized locally.
     gate_context: Option<GateContext>,
-    gate: Option<PolicyGateOperation>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectError>,
     /// A permitted plaintext request: encrypted items may reach a plain target.
@@ -1217,7 +1217,6 @@ impl ReplicateObjectOperation {
             version_hop: None,
             pending_copy: None,
             gate_context: None,
-            gate: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
             plaintext: false,
@@ -1702,37 +1701,24 @@ impl ReplicateObjectOperation {
             self.bucket_group,
         ) {
             Ok(None) => self.open_reference_source(),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
+            Ok(Some(gate)) => {
                 self.state = ReplicateObjectState::ReferencePolicyGate;
-                match complete {
-                    true => self.finish_reference_gate(),
-                    false => effects,
-                }
+                let child =
+                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
+                smallvec![Effect::SubOperation(child)]
             }
             Err(error) => self.fail(error.into()),
         }
     }
 
     fn accept_reference_gate(&mut self, event: Event) -> Effects {
-        let Some(gate) = self.gate.as_mut() else {
-            return self.fail(ReplicateObjectError::UnresolvedReferenceVersion);
+        let Event::Child(outcome) = event else {
+            return self.fail(PolicyGateError::InvalidEvent.into());
         };
-        let effects = gate.step(event);
-        match gate.is_complete() {
-            true => self.finish_reference_gate(),
-            false => effects,
-        }
-    }
-
-    fn finish_reference_gate(&mut self) -> Effects {
-        let Some(gate) = self.gate.take() else {
-            return self.fail(ReplicateObjectError::UnresolvedReferenceVersion);
+        let Some(outcome) = outcome.take::<PolicyGateOutcome, ReadPolicyError>() else {
+            return self.fail(PolicyGateError::InvalidEvent.into());
         };
-        let decision = gate
-            .finalize()
+        let decision = outcome
             .map_err(PolicyGateError::from)
             .and_then(gate_decision);
         match decision {

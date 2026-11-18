@@ -2,19 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoCall;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE;
+use aruna_core::keyspaces::{
+    MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, OBJECT_METADATA_KEYSPACE,
+};
 use aruna_core::managed_copy::{
     CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
 };
+use aruna_core::rows::read_row;
+use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartObjectKey, MultipartObjectSummary};
+use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -67,7 +73,36 @@ pub(crate) fn finish_copy_check(
     let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
         return Err(LookupError::InvalidEvent(event));
     };
-    let (copy, subject) = split_serve_reads(values).map_err(LookupError::Managed)?;
+    let values = values.into_iter().map(|(_, value)| value).collect();
+    check_copy_values(values, pending_copy, pending_location, refs, node_id)
+}
+
+/// The registration and subject rows of a copy check, in this order.
+pub(crate) fn copy_check_call(copy_key: &ManagedCopyKey) -> Result<IoCall, ManagedCopyError> {
+    Ok(IoCall::Read(vec![
+        (
+            MANAGED_COPY_KEYSPACE.to_string(),
+            copy_key.to_bytes()?.into(),
+        ),
+        (
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+        ),
+    ]))
+}
+
+/// Checks the values [`copy_check_call`] read.
+pub(crate) fn check_copy_values(
+    values: Vec<Option<Value>>,
+    pending_copy: &mut Option<ManagedCopyKey>,
+    pending_location: &mut Option<BlobLocationKey>,
+    refs: &[PlacementPolicyRef],
+    node_id: ExpectedNode,
+) -> Result<BlobLocationKey, LookupError> {
+    let values = values
+        .into_iter()
+        .map(|value| (Key::from(Vec::new()), value));
+    let (copy, subject) = split_serve_reads(values.collect()).map_err(LookupError::Managed)?;
     let (Some(copy_key), Some(location_key)) = (pending_copy.take(), pending_location.take())
     else {
         return Err(LookupError::Missing);
@@ -120,6 +155,12 @@ pub(crate) fn location_from_read(event: Event) -> Result<Option<BackendLocation>
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
         return Err(LookupError::InvalidEvent(event));
     };
+    location_from_value(value)
+}
+
+pub(crate) fn location_from_value(
+    value: Option<Value>,
+) -> Result<Option<BackendLocation>, LookupError> {
     match value {
         Some(value) => Ok(Some(
             BackendLocation::from_bytes(value.as_ref()).map_err(LookupError::Conversion)?,
@@ -140,12 +181,24 @@ pub(crate) fn multipart_summary_read(
     }))
 }
 
+/// The call form of [`multipart_summary_read`].
+pub(crate) fn summary_call(version_id: Ulid) -> Result<IoCall, ConversionError> {
+    let key = MultipartObjectKey::summary(version_id).to_bytes()?;
+    Ok(read_row(OBJECT_METADATA_KEYSPACE, key))
+}
+
 pub(crate) fn summary_from_read(
     event: Event,
 ) -> Result<Option<MultipartObjectSummary>, LookupError> {
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
         return Err(LookupError::InvalidEvent(event));
     };
+    summary_from_value(value)
+}
+
+pub(crate) fn summary_from_value(
+    value: Option<Value>,
+) -> Result<Option<MultipartObjectSummary>, LookupError> {
     value
         .map(|value| {
             MultipartObjectSummary::from_bytes(value.as_ref()).map_err(LookupError::Conversion)

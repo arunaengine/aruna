@@ -20,7 +20,7 @@ use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::report::family_report;
+use aruna_operations::jobs::lifecycle::routing::family_report;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
 };

@@ -14,6 +14,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::structs::storage::bucket_metadata::release_key;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::release::RangeMembers;
 use serde_json::json;
 
 use super::read::load_access;
@@ -153,7 +154,7 @@ async fn operation(
     })
 }
 
-fn rows(pointers: &[(Ulid, &str)]) -> Event {
+fn rows(pointers: &[(Ulid, &str)]) -> IoResult {
     let values = (pointers.iter())
         .map(|(version_id, key)| {
             let pointer = ReleasePointer {

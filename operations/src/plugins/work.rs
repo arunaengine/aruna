@@ -6,7 +6,7 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::{
@@ -282,8 +282,8 @@ impl Operation for ReserveWork {
     type Output = (WorkRow, Reserve);
     type Error = WorkError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, WorkError> {
@@ -416,9 +416,15 @@ impl Operation for HoldsJob {
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
+        let holds = |row: Option<WorkRow>| row.is_some_and(|row| row.state != WorkState::Settled);
         Ok(match self.0.next(answer)? {
             Next::Call(ask) => Next::Call(ask),
-            Next::Done(row) => Next::Done(row.is_some_and(|row| row.state != WorkState::Settled)),
+            Next::Done(row) => Next::Done(holds(row)),
+            Next::Wait => Next::Wait,
+            Next::Then { output, calls } => Next::Then {
+                output: holds(output),
+                calls,
+            },
         })
     }
 }
@@ -519,8 +525,8 @@ impl Operation for UpdateWork {
     type Output = Option<WorkRow>;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
@@ -569,8 +575,8 @@ impl Operation for BeginSend {
     type Output = Option<Send>;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {

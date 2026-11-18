@@ -88,11 +88,7 @@ async fn target_locks(
             key,
             version_id,
         } => {
-            let row = read_row(
-                &context.storage_handle,
-                S3_BUCKET_KEYSPACE,
-                bucket.clone().into(),
-            );
+            let row = read_row(context, S3_BUCKET_KEYSPACE, bucket.clone().into());
             let Some(info) = row.await? else {
                 return Ok(Vec::new());
             };
@@ -169,8 +165,7 @@ pub(crate) async fn accept_wake(
     job_id: JobId,
     key: BucketKeyRef,
 ) -> Result<bool, String> {
-    let storage = &context.storage_handle;
-    let Some(record) = read_job_record(storage, job_id, None).await? else {
+    let Some(record) = read_job_record(context, job_id, None).await? else {
         return Ok(true);
     };
     if record.created_by != auth.user_id {
@@ -179,12 +174,12 @@ pub(crate) async fn accept_wake(
     match record.state {
         JobState::Claimed | JobState::Preparing => Ok(false),
         JobState::AwaitingKey => {
-            let waits = read_key_waits(storage, job_id).await?;
+            let waits = read_key_waits(context, job_id).await?;
             if waits
                 .iter()
                 .any(|wait| wait.node_id == peer && wait.key == key)
             {
-                satisfy_key_wait(storage, job_id, key, unix_timestamp_millis())
+                satisfy_key_wait(context, job_id, key, unix_timestamp_millis())
                     .await
                     .map_err(|error| error.to_string())?;
             }
@@ -417,7 +412,6 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let storage = &context.storage_handle;
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
         let (local, source) = (node(1), node(2));
         let job_id = JobId::from_bytes([5; 16]);
@@ -430,9 +424,9 @@ mod tests {
         };
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, local, 1_000, 1_000, None);
-        insert_job(storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(storage, job_id, local, 2_000).await.unwrap()
+            claim_job(&context, job_id, local, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -452,7 +446,7 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(storage, job_id, token, 3_000, vec![wait])
+        park_job(&context, job_id, token, 3_000, vec![wait])
             .await
             .unwrap();
         // Only the node holding the key wakes the job; another node's wake is acknowledged only.
@@ -460,7 +454,7 @@ mod tests {
             accept_wake(&context, local, &auth, job_id, key).await,
             Ok(true)
         );
-        let parked = read_job_record(storage, job_id, None)
+        let parked = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -470,7 +464,7 @@ mod tests {
             accept_wake(&context, source, &auth, job_id, key).await,
             Ok(true)
         );
-        let woken = read_job_record(storage, job_id, None)
+        let woken = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -716,7 +710,6 @@ mod tests {
         let (key_node, waiter_node) = (empty_context(&key_dir), empty_context(&waiter_dir));
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
         let (source, waiter) = (node(1), node(2));
-        let storage = &waiter_node.storage_handle;
         let job_id = JobId::from_bytes([5; 16]);
         let payload = JobPayload::Probe {
             steps: 1,
@@ -727,9 +720,10 @@ mod tests {
         };
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
-        insert_job(storage, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            claim_job(storage, job_id, waiter, 2_000).await.unwrap()
+        insert_job(&waiter_node, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(&waiter_node, job_id, waiter, 2_000)
+            .await
+            .unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -742,7 +736,7 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(storage, job_id, token, 3_000, vec![wait])
+        park_job(&waiter_node, job_id, token, 3_000, vec![wait])
             .await
             .unwrap();
         let register = WaitRowOperation::register(key, waiter, job_id, &auth);
@@ -779,7 +773,7 @@ mod tests {
                 next: None
             }
         );
-        let woken = read_job_record(storage, job_id, None)
+        let woken = read_job_record(&waiter_node, job_id, None)
             .await
             .unwrap()
             .unwrap();

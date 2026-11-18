@@ -775,6 +775,8 @@ pub enum NetEffect {
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
+    /// Signs one job record of an execution; only a claim naming this node as publisher.
+    ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
@@ -787,6 +789,30 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
+    DashboardChanged,
+    /// Records one suppressed watch delivery in this node's watch metrics.
+    RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Notes a watch a local user just created on `holder`, so events reach the holder before
+    /// its interest digest arrives.
+    RegisterInterest {
+        watch_id: ulid::Ulid,
+        realm_id: crate::structs::identity::realm::RealmId,
+        holder: NodeId,
+        entry: crate::structs::execution::notification_watch::WatchInterestEntry,
+    },
+    /// Removes a watch a local user just deleted from this node's watch interest.
+    RetractInterest(ulid::Ulid),
+    /// Replaces this node's whole watch interest cache with a rebuilt table.
+    ReplaceInterest(Box<crate::structs::execution::notification_watch::WatchInterestTable>),
+    /// Replaces one realm's node map in this node's watch interest cache.
+    UpdateRealmInterest {
+        realm_id: crate::structs::identity::realm::RealmId,
+        nodes: std::collections::HashMap<
+            NodeId,
+            Vec<crate::structs::execution::notification_watch::WatchInterestEntry>,
+        >,
+    },
 }
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter

@@ -14,6 +14,7 @@ pub mod executor;
 pub mod export;
 pub mod harvest;
 pub mod import;
+mod import_listing;
 pub mod key_wake;
 pub mod lifecycle;
 pub mod metadata_class;
@@ -37,6 +38,7 @@ pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
+pub mod submit_execution;
 pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.

@@ -147,7 +147,7 @@ pub(super) async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
 pub(super) async fn minted(ctx: &DriverContext) -> usize {
     let mut count = 0;
     for execution in [1u8, 2u8] {
-        if read_job_record(&ctx.storage_handle, physical(execution), None)
+        if read_job_record(ctx, physical(execution), None)
             .await
             .expect("job row read")
             .is_some()

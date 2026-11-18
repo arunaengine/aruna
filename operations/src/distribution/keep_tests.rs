@@ -6,6 +6,7 @@
 use super::*;
 use crate::distribution::test_store::{context, get, open};
 use crate::driver::drive;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::on_use::{
     CLAIM_TTL_MS, CacheTotals, attachment_key, claim_key,
@@ -118,7 +119,10 @@ fn claim_calls() {
         claimed_at_ms,
     };
     let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(1, 1_000));
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let read = read_row(FILL_CLAIM_KEYSPACE, b"fill".to_vec());
     assert_eq!(operation.first(), Ok(Next::Call(read)));
     let row = (
@@ -127,8 +131,14 @@ fn claim_calls() {
         claim(1, 1_000).to_bytes().unwrap().into(),
     );
     let absent = IoResult::Values(vec![None]);
-    assert_eq!(operation.next(absent), Ok(Next::Call(IoCall::Write(vec![row]))));
-    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(Claimed::Claimed)));
+    assert_eq!(
+        operation.next(absent),
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    );
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Done(Claimed::Claimed))
+    );
 
     let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(2, 1_001));
     operation.first().unwrap();

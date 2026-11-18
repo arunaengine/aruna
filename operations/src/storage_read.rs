@@ -22,9 +22,7 @@ pub enum StorageReadError {
 /// A runner failure as a storage failure; one that is none reads as a read error.
 impl From<IoError> for StorageReadError {
     fn from(error: IoError) -> Self {
-        let error = (error.into_storage())
-            .unwrap_or_else(|other| StorageError::ReadError(other.to_string()));
-        Self::Storage(error)
+        Self::Storage(StorageError::from(error))
     }
 }
 

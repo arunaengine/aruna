@@ -25,7 +25,7 @@ use crate::document_repository::{GetConfigError, read_effect};
 use crate::notifications::setting_rows::{
     SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
-use crate::notifications::unexpected;
+use crate::notifications::{unexpected, unexpected_event};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmailError {
@@ -144,6 +144,10 @@ fn written(turn: Result<Next<Vec<u8>>, SettingError>) -> Turn {
         Next::Call(call) => Ok(Next::Call(call)),
         Next::Done(bytes) => Ok(Next::Done(EmailPreference::from_bytes(&bytes)?)),
         Next::Wait => Ok(Next::Wait),
+        Next::Then { output, calls } => Ok(Next::Then {
+            output: EmailPreference::from_bytes(&output)?,
+            calls,
+        }),
     }
 }
 
@@ -155,21 +159,20 @@ impl Operation for SetEmailOperation {
         let opt_in = self.opt_in.as_ref().ok_or(EmailError::NotVerified)?;
         let realm_id = opt_in.owner.realm_id;
         let read = read_effect(&DocumentTarget::RealmConfig { realm_id }, None);
-        Ok(Next::Call(IoCall::Effect(read)))
+        Ok(Next::Call(IoCall::from(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
         match (&mut self.state, result) {
             // A failed config read means the realm cannot be checked now, not a storage fault.
-            (OptInState::Config, IoResult::Event(Event::Storage(event))) => match event {
-                StorageEvent::ReadResult { value, .. } => self.configured(value.as_deref()),
-                StorageEvent::Error { error } => {
+            (OptInState::Config, result) => match result.event()? {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.configured(value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
                     Err(SettingError::Config(GetConfigError::from(error).to_string()).into())
                 }
-                other => {
-                    let other = IoResult::Event(Event::Storage(other));
-                    Err(unexpected("the realm config read", &other).into())
-                }
+                other => Err(unexpected_event("the realm config read", &other).into()),
             },
             (OptInState::User, result @ IoResult::Values(_)) => {
                 let [value] = values::<1>(result)?;
@@ -218,7 +221,7 @@ mod tests {
         };
         assert_eq!(
             set.first(),
-            Ok(Next::Call(IoCall::Effect(read_effect(&target, None))))
+            Ok(Next::Call(IoCall::from(read_effect(&target, None))))
         );
     }
 
@@ -230,7 +233,7 @@ mod tests {
             value: None,
         });
         assert!(matches!(
-            set.next(IoResult::Event(missing)),
+            set.next(IoResult::Event(Box::new(missing))),
             Err(EmailError::Setting(SettingError::Config(_)))
         ));
         let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
@@ -238,7 +241,7 @@ mod tests {
             error: StorageError::Timeout,
         });
         assert!(matches!(
-            set.next(IoResult::Event(failed)),
+            set.next(IoResult::Event(Box::new(failed))),
             Err(EmailError::Setting(SettingError::Config(_)))
         ));
     }

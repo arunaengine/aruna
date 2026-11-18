@@ -451,7 +451,7 @@ pub(in crate::routes) async fn managed(
 ) -> ServerResult<(AuthContext, RepositoryLink)> {
     let (auth, document_id) = readable(state, auth, document_id).await?;
     let link_id = parse_ulid(link_id)?;
-    let link = read_link(&state.get_ctx().storage_handle, document_id, link_id)
+    let link = read_link(&state.get_ctx(), document_id, link_id)
         .await
         .map_err(link_error)?
         .ok_or(ServerError::NotFound)?;
@@ -484,7 +484,7 @@ async fn responses(
 ) -> ServerResult<Vec<RepositoryLinkResponse>> {
     let context = state.get_ctx();
     let mut views = Vec::new();
-    for (link, queued) in list_links(&context.storage_handle, document_id)
+    for (link, queued) in list_links(&context, document_id)
         .await
         .map_err(link_error)?
     {

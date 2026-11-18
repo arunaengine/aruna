@@ -662,7 +662,7 @@ mod tests {
         let spec = family.spec();
         let intent = family.launch(&spec, local, 0);
         let declined =
-            crate::jobs::lifecycle::target::local_capability(&ctx, &config, local, &intent, &spec)
+            crate::tests::records::local_capability(&ctx, &config, local, &intent, &spec)
                 .await
                 .expect_err("a device is never a launch target");
 

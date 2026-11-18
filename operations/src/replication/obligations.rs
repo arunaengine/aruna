@@ -50,12 +50,12 @@ pub(super) const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 const OBLIGATION_CURSOR_KEY: &[u8] = b"live_obligation_cursor";
 
 pub(super) struct RelationshipPage {
-    values: Vec<(Vec<u8>, SyncRelationship)>,
-    next: Option<Vec<u8>>,
+    pub(super) values: Vec<(Vec<u8>, SyncRelationship)>,
+    pub(super) next: Option<Vec<u8>>,
 }
 
 pub(super) struct LiveRepairWrite {
-    queued: usize,
+    pub(super) queued: usize,
     continuation: Option<LiveReplicationContinuation>,
     progressed: bool,
 }

@@ -57,6 +57,11 @@ enum Phase {
 
 type Step = Result<Next<Option<ExecutionChain>>, LifecycleError>;
 
+/// A read this chain steps itself never ends with calls after a commit.
+fn after_commit() -> LifecycleError {
+    LifecycleError::unexpected(&"Chain", "a call or an outcome", "Next::Then")
+}
+
 impl ExecutionChainOperation {
     /// The chain of one local job, if a target admitted it here. A job with no
     /// reservation is purely local and has no chain at all.
@@ -105,6 +110,7 @@ impl ExecutionChainOperation {
             Ok(Next::Done(held)) => self.reserved(Ok(held)),
             Ok(Next::Call(call)) => Ok(Next::Call(call)),
             Ok(Next::Wait) => Ok(Next::Wait),
+            Ok(Next::Then { .. }) => Err(after_commit()),
             Err(error) => self.reserved(Err(error)),
         }
     }
@@ -114,6 +120,7 @@ impl ExecutionChainOperation {
             Ok(Next::Done(family)) => self.aliased(Ok(family)),
             Ok(Next::Call(call)) => Ok(Next::Call(call)),
             Ok(Next::Wait) => Ok(Next::Wait),
+            Ok(Next::Then { .. }) => Err(after_commit()),
             Err(error) => self.aliased(Err(error)),
         }
     }
@@ -126,6 +133,7 @@ impl ExecutionChainOperation {
             Ok(Next::Done(records)) => self.receipted(Ok(records)),
             Ok(Next::Call(call)) => Ok(Next::Call(call)),
             Ok(Next::Wait) => Ok(Next::Wait),
+            Ok(Next::Then { .. }) => Err(after_commit()),
             Err(error) => self.receipted(Err(error)),
         }
     }

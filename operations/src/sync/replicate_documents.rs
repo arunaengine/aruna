@@ -18,7 +18,7 @@ use aruna_core::task::TaskEvent;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::sync::announce::AnnounceTopicOperation;
+use crate::sync::announce::{AnnounceTopicError, AnnounceTopicOperation};
 use crate::sync::shard_placement::{
     new_placement, placement_key, placement_satisfied, schedule_retry_effect,
 };
@@ -232,14 +232,7 @@ impl ReplicateDocumentsOperation {
             placement,
             self.config.allow_genesis,
         );
-        Ok(Some(Next::Call(IoCall::Child(boxed_suboperation(
-            announce,
-            |result| {
-                Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                })
-            },
-        )))))
+        Ok(Some(Next::Call(IoCall::child(announce))))
     }
 
     fn emit_placement_update(&mut self) -> Result<Next<()>, ReplicateDocumentsError> {
@@ -284,17 +277,16 @@ impl ReplicateDocumentsOperation {
         self.emit_placement_update()
     }
 
-    fn publish_result(&mut self, event: Event) -> Result<Next<()>, ReplicateDocumentsError> {
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return Err(unexpected(
-                "SubOperationEvent::DocumentSyncResult",
-                event.label(),
-            ));
-        };
+    fn published(
+        &mut self,
+        result: Result<(), AnnounceTopicError>,
+    ) -> Result<Next<()>, ReplicateDocumentsError> {
         match result {
             Ok(()) => self.emit_placement_update(),
-            Err(error) if self.strict => Err(ReplicateDocumentsError::DocumentSync(error)),
-            Err(error) => self.retry_failed_publish(error),
+            Err(error) if self.strict => {
+                Err(ReplicateDocumentsError::DocumentSync(error.to_string()))
+            }
+            Err(error) => self.retry_failed_publish(error.to_string()),
         }
     }
 
@@ -332,7 +324,10 @@ impl Operation for ReplicateDocumentsOperation {
                     .transpose()?;
                 self.emit_next_publish()
             }
-            Phase::Publish => self.publish_result(event(result)?),
+            Phase::Publish => {
+                let published = result.child::<(), AnnounceTopicError>()?;
+                self.published(published)
+            }
             Phase::StorePlacement => {
                 done(result)?;
                 if !self.retry_needed {
@@ -368,9 +363,9 @@ mod pure_tests {
     use aruna_core::task::TaskEvent;
     use ulid::Ulid;
 
-    fn synced(result: Result<(), String>) -> IoResult {
-        let event = Event::SubOperation(SubOperationEvent::DocumentSyncResult { result });
-        IoResult::Event(Box::new(event))
+    fn synced(result: Result<(), &str>) -> IoResult {
+        let result = result.map_err(|error| AnnounceTopicError::DocumentSync(error.to_string()));
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
     }
 
     fn node(seed: u8) -> NodeId {
@@ -516,6 +511,12 @@ mod pure_tests {
             Some(PlacementAction::Delete(_))
         ));
         assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        // A published document clears its satisfied placement.
+        assert!(matches!(
+            operation.next(synced(Ok(()))),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
     }
 
     #[test]
@@ -636,7 +637,7 @@ mod pure_tests {
             shard: 1,
         }));
 
-        let next = operation.next(synced(Err("publish failed".to_string())));
+        let next = operation.next(synced(Err("publish failed")));
 
         let Ok(Next::Call(IoCall::Write(rows))) = next else {
             panic!("expected placement write");
@@ -671,7 +672,7 @@ mod pure_tests {
         }));
 
         assert!(matches!(
-            operation.next(synced(Err("outbox write failed".to_string()))),
+            operation.next(synced(Err("outbox write failed"))),
             Err(ReplicateDocumentsError::DocumentSync(_))
         ));
     }

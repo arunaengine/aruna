@@ -86,8 +86,8 @@ impl Operation for SpendNonceOperation {
         Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 
     /// A replay is final; a fresh run would read the same spent row.
@@ -184,7 +184,7 @@ mod tests {
     fn spends_then_prunes() {
         let key = nonce_key(50, [1; 16]);
         let mut spend = SpendNonceOperation::new([1; 16], 50, 40);
-        assert!(spend.transaction());
+        assert_eq!(spend.transaction(), aruna_core::operation::TransactionMode::Write);
         let read = read_row(DELEGATION_NONCE_KEYSPACE, key.clone());
         assert_eq!(spend.first(), Ok(Next::Call(read)));
         let row = (DELEGATION_NONCE_KEYSPACE.to_string(), key.into(), Vec::new().into());

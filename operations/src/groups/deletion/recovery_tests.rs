@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use aruna_core::keyspaces::*;
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::identity::group_delete::*;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -224,9 +224,8 @@ async fn missing_vote_refuses() {
         Some(fixture.auth.clone()),
         None,
     );
-    assert!(operation.start().is_empty());
     assert!(matches!(
-        operation.finalize(),
+        operation.first(),
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(

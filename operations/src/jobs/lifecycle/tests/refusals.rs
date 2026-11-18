@@ -60,7 +60,10 @@ fn reserve() -> ReserveExecutionOperation {
 fn reads_config_outside() {
     // The realm view is read outside the reservation transaction.
     let mut operation = reserve();
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(
         operation.first(),
         Ok(Next::Call(IoCall::Effect(effect)))

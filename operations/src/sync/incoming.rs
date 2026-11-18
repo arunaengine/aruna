@@ -13,18 +13,14 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
-use crate::notifications::watch::interest::refresh_target_interest;
+use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
-use crate::replication::protocol::{
-    LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-};
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
-use aruna_core::events::Event;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -36,7 +32,7 @@ use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
@@ -421,7 +417,10 @@ async fn reconcile_inbound_topics(
     crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
-    refresh_target_interest(context, &targets.targets).await;
+    let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
+    if let Err(error) = drive(refresh, context).await {
+        warn!(%error, "Watch interest refresh stopped after a document sync");
+    }
     let timings = apply_metadata(context, Some(net_handle.node_id()), targets, true).await;
     info!(
         event = "pipeline.reconcile.summary",
@@ -645,9 +644,6 @@ async fn reemit_evicted_documents(
             return false;
         }
     };
-    if let Some(message) = &outcome.drain_error {
-        warn!(task_id = ?TaskKey::DrainSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
-    }
     if outcome.written > 0 {
         info!(
             count = outcome.written,
@@ -748,20 +744,13 @@ mod tests {
     };
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::staging::{
-        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-    };
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
-    use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;

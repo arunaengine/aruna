@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ATTENTION_ROW, MAX_ATTEMPTS, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState,
@@ -116,8 +116,8 @@ impl Operation for Admit {
     type Output = ();
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, RunError> {
@@ -163,23 +163,24 @@ impl Operation for ReadRun {
 /// At most `limit` runs of an install after the run `after`, oldest first, and the id of the
 /// last one when more may follow.
 pub fn list_runs(install_id: Ulid, after: Option<Ulid>, limit: usize) -> ListRuns {
-    ListRuns(page_call(
+    ListRuns(Some(page_call(
         PLUGIN_RUNS_KEYSPACE,
         run_prefix(install_id),
         after.map(|run_id| run_key(install_id, run_id)),
         limit,
-    ))
+    )))
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListRuns(IoCall);
+pub struct ListRuns(Option<IoCall>);
 
 impl Operation for ListRuns {
     type Output = (Vec<PluginRun>, Option<Ulid>);
     type Error = RunError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, RunError> {
-        Ok(Next::Call(self.0.clone()))
+        let page = self.0.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(page))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, RunError> {
@@ -295,8 +296,8 @@ impl Operation for ResolveRun {
     type Output = PluginRun;
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<PluginRun>, RunError> {
@@ -480,8 +481,8 @@ impl Operation for DropRun {
     type Output = ();
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {
@@ -696,8 +697,8 @@ impl Operation for EnqueueTimer {
     type Output = bool;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<bool>, StoreError> {
@@ -747,7 +748,12 @@ impl Operation for EnqueueTimer {
                 let mut row = row;
                 row.skipped += u64::from(!admitted);
                 let mut rows = rows;
-                rows.push(row(PLUGIN_RUNS_KEYSPACE, self.key.clone(), encode(&row)?));
+                let value = encode(&row)?;
+                rows.push(super::rows::row(
+                    PLUGIN_RUNS_KEYSPACE,
+                    self.key.clone(),
+                    value,
+                ));
                 self.phase = TimerPhase::Writing(admitted);
                 Ok(Next::Call(IoCall::Write(rows)))
             }
@@ -756,31 +762,6 @@ impl Operation for EnqueueTimer {
                 Ok(Next::Done(admitted))
             }
         }
-    }
-}
-
-/// The timer row of an install, if its timer ran before.
-pub(crate) fn read_timer(install_id: Ulid) -> ReadTimer {
-    ReadTimer(timer_key(install_id))
-}
-
-#[derive(Debug, PartialEq)]
-pub struct ReadTimer(Vec<u8>);
-
-impl Operation for ReadTimer {
-    type Output = Option<TimerRow>;
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
-        Ok(Next::Call(read_call(vec![(
-            PLUGIN_RUNS_KEYSPACE,
-            self.0.clone(),
-        )])))
-    }
-
-    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
-        let [found] = values::<1>(answer)?;
-        Ok(Next::Done(found.map(|bytes| decode(&bytes)).transpose()?))
     }
 }
 

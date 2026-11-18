@@ -6,6 +6,8 @@ use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use ed25519_dalek::SigningKey;
@@ -179,28 +181,53 @@ async fn refuses_server_node() {
 }
 
 #[test]
-fn retry_rereads_config() {
-    // A commit lost to a background config write reads again and keeps that write.
+fn conflict_reruns_change() {
+    // A commit lost to a background config write reruns the whole change, reading again.
+    let conflict = SetEmailError::from(IoError::Conflict);
+    assert!(EmailWrite::is_conflict(&conflict));
+    assert_eq!(EmailWrite::conflict_retries(), COMMIT_ATTEMPTS as u32 - 1);
+    let write = EmailWrite::new(Arc::new(email_config(&actor(1), None)));
+    assert_eq!(write.transaction(), TransactionMode::Write);
+}
+
+#[test]
+fn write_seals_password() {
+    // One transaction reads the config and writes it with the sealed password and its profile.
     let actor = actor(1);
-    let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-    first.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Management);
     let profile = input(Some("mailer"), Some("secret-1"));
-    let mut operation = SetEmailOperation::new(email_config(&actor, Some(profile)));
-    let written = crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
-    assert_eq!(written.email, operation.finalize().unwrap());
+    let mut write = EmailWrite::new(Arc::new(email_config(&actor, Some(profile))));
+    write.first().unwrap();
+    let read = IoResult::Values(vec![Some(config.to_bytes(&actor).unwrap().into()), None]);
+    let Ok(Next::Call(IoCall::Write(rows))) = write.next(read) else {
+        panic!("expected the config write");
+    };
+    let target = DocumentTarget::RealmConfig {
+        realm_id: actor.realm_id,
+    };
+    let (_, _, value) = rows
+        .iter()
+        .find(|(space, key, _)| space == target.storage_keyspace() && *key == target.storage_key())
+        .expect("the config is written");
+    let written = RealmConfigDocument::from_bytes(value).unwrap();
     assert_eq!(opened(&written), vec![b"secret-1".to_vec()]);
+    let Ok(Next::Then { output, calls }) = write.next(IoResult::Done) else {
+        panic!("expected the profile with the drain wake");
+    };
+    assert_eq!(output, written.email);
+    assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
 }
 
 #[test]
 fn denied_is_terminal() {
     let mut operation = SetEmailOperation::new(email_config(&actor(1), None));
-    let effects = operation.start();
-    let emitted = format!("{effects:?}");
-    assert!(emitted.contains(&policy_admin_path(actor(1).realm_id)));
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
     ));
-    assert_eq!(operation.finalize(), Err(SetEmailError::Unauthorized));
+    let denied = IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(false)));
+    assert_eq!(operation.next(denied), Err(SetEmailError::Unauthorized));
 }
 
 /// Two management nodes set a first profile without seeing each other.
@@ -214,10 +241,10 @@ fn concurrent_firsts() -> (AdminDocumentState, BTreeSet<RealmVaultEntry>) {
     let mut rivals = Vec::new();
     for seed in [1u8, 2] {
         let mut state = base.clone();
-        let operation = SetEmailOperation::new(email_config(
+        let operation = EmailWrite::new(Arc::new(email_config(
             &actor(seed),
             Some(input(Some("mailer"), Some("first"))),
-        ));
+        )));
         let (operations, profile) = operation.email_writes(&state).unwrap();
         entries.insert(profile.unwrap().password.unwrap().entry);
         for operation in operations {
@@ -236,7 +263,7 @@ fn apply_change(
     state: &mut AdminDocumentState,
     profile: Option<EmailInput>,
 ) -> Option<RealmEmailProfile> {
-    let operation = SetEmailOperation::new(email_config(&actor(1), profile));
+    let operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
     let (operations, profile) = operation.email_writes(state).unwrap();
     for operation in operations {
         state.apply_operation(&actor(1), operation).unwrap();
