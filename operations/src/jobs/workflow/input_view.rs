@@ -1090,4 +1090,110 @@ mod tests {
         staged.input.mode = InputMode::Snapshot;
         assert!(!mounted(&staged.input, &staged.captured));
     }
+
+    fn viewer() -> AuthContext {
+        AuthContext {
+            user_id: Default::default(),
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn holder_node() -> NodeId {
+        entry("a").captured.source_node_id
+    }
+
+    fn other_node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[2; 32]).public()
+    }
+
+    fn source_group() -> GroupId {
+        Ulid::from_parts(2, 2)
+    }
+
+    fn entry_reply<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn source_read(operation: &'static str) -> IoCall {
+        let object = ("b", "a");
+        let read = SourceReadOperation::of_object(&viewer(), holder_node(), object, operation);
+        IoCall::child(read)
+    }
+
+    // A head of a local entry only checks the creator may still read it.
+    #[test]
+    fn local_head_authorizes() {
+        let mut head = ViewEntryOperation::head(viewer(), entry("a"), holder_node());
+        assert_eq!(head.first(), Ok(Next::Call(source_read(HEAD_OPERATION))));
+        let allowed = entry_reply(Ok::<_, SourceReadError>(source_group()));
+        assert_eq!(head.next(allowed), Ok(Next::Done(None)));
+    }
+
+    // A local read fetches the captured version, with an end-exclusive range made inclusive.
+    #[test]
+    fn local_read_fetches() {
+        let mut read = ViewEntryOperation::read(viewer(), entry("a"), holder_node(), Some(2..5));
+        assert_eq!(read.first(), Ok(Next::Call(source_read(READ_OPERATION))));
+        let get = GetObjectOperation::new(GetObjectInput {
+            bucket: "b".to_string(),
+            key: "a".to_string(),
+            version_id: Some(Ulid::from_parts(1, 1)),
+            range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
+            group_id: source_group(),
+            user_identity: viewer().user_id,
+            realm_id: viewer().realm_id,
+            node_id: holder_node(),
+        });
+        let allowed = entry_reply(Ok::<_, SourceReadError>(source_group()));
+        assert_eq!(read.next(allowed), Ok(Next::Call(IoCall::child(get))));
+        let failed = entry_reply(Err::<GetObjectResult, _>(GetObjectError::NoSuchKey));
+        let message = GetObjectError::NoSuchKey.to_string();
+        assert_eq!(read.next(failed), Err(ViewError::Unavailable(message)));
+    }
+
+    // A refused source keeps its meaning for the S3 caller.
+    #[test]
+    fn refused_source_mapped() {
+        let cases = [
+            (SourceReadError::Denied, ViewError::Denied),
+            (SourceReadError::NotFound, ViewError::NotFound),
+        ];
+        for (error, expected) in cases {
+            let mut read = ViewEntryOperation::read(viewer(), entry("a"), holder_node(), None);
+            read.first().unwrap();
+            let refused = entry_reply(Err::<GroupId, _>(error));
+            assert_eq!(read.next(refused), Err(expected));
+        }
+    }
+
+    // An entry on another node is read from its holder at the exact hash and version.
+    #[test]
+    fn remote_entry_managed() {
+        let mut head = ViewEntryOperation::head(viewer(), entry("a"), other_node());
+        let request = head.managed_request([1; 32]);
+        assert!(request.metadata_only);
+        let read = ManagedReadOperation::new(holder_node(), request);
+        assert_eq!(head.first(), Ok(Next::Call(IoCall::child(read))));
+        let denied = BaoReadError::Refused(BaoReadRefusal::ReadDenied);
+        let refused = entry_reply(Err::<BaoReadOutput, _>(denied));
+        assert_eq!(head.next(refused), Err(ViewError::Denied));
+    }
+
+    // A reference on another node without a grant cannot be read.
+    #[test]
+    fn ungranted_reference_denied() {
+        let mut reference = entry("a");
+        reference.captured.content = InputContent::Reference {
+            etag: None,
+            range_bound: false,
+        };
+        let mut read = ViewEntryOperation::read(viewer(), reference, other_node(), None);
+        assert_eq!(read.first(), Err(ViewError::Denied));
+    }
 }
