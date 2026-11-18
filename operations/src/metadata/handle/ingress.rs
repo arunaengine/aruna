@@ -882,6 +882,29 @@ impl MetadataHandle {
         (response, response_body)
     }
 
+    /// This node's audit page for a peer, under its forwarded caller and the merge deadline.
+    async fn serve_audit(
+        &self,
+        context: &Arc<DriverContext>,
+        peer: NodeId,
+        request: aruna_core::audit::AuditPageRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<aruna_core::audit::AuditPageResponse, MetadataReadError> {
+        use crate::metadata::audit_entry::{ServeAuditOperation, inbound_admission};
+        let _admission = inbound_admission().ok_or(MetadataReadError::Unavailable)?;
+        let node = context
+            .node_and_realm()
+            .ok_or(MetadataReadError::Unavailable)?;
+        let auth_token = request.auth_token.clone();
+        let auth =
+            tokio::time::timeout_at(deadline, self.authorize_read_peer(peer, auth_token, false))
+                .await
+                .map_err(|_| MetadataReadError::Unavailable)??
+                .ok_or(MetadataReadError::Unauthorized)?;
+        let serve = ServeAuditOperation::new((node.1, node.0), auth, request);
+        crate::driver::drive_until(serve, context.as_ref(), deadline).await
+    }
+
     async fn forward_request(
         &self,
         context: &Arc<DriverContext>,
@@ -902,16 +925,9 @@ impl MetadataHandle {
                 .await
             }
             MetadataTransportMessage::ForwardAuditPage { request } => {
-                Box::pin(async {
-                    super::super::audit_entry::serve_local_audit(
-                        context,
-                        peer,
-                        request,
-                        audit_deadline,
-                    )
-                    .await
-                })
-                .await
+                let result =
+                    Box::pin(self.serve_audit(context, peer, request, audit_deadline)).await;
+                MetadataTransportMessage::ForwardedAuditPage { result }
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
