@@ -9,6 +9,8 @@ pub mod head_source;
 pub mod list_offers;
 pub mod list_source;
 pub mod native_source;
+mod offer_observe;
+mod offer_run;
 pub mod offered_directory;
 pub mod page;
 pub mod read_source;

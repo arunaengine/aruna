@@ -555,14 +555,14 @@ pub(crate) async fn finish_unbind(
     }
     // The offer keeps the bucket read-only for clients until the bucket is gone.
     delete_local_bucket(context, &folder, node_id, CLEANUP_LIMIT).await?;
-    match withdraw_offer(
-        context,
-        WithdrawOfferInput {
+    match drive(
+        withdraw_offer(WithdrawOfferInput {
             bucket: folder.local_bucket.clone(),
             realm_id: folder.created_by.realm_id,
             node_id,
             user_id: folder.created_by,
-        },
+        }),
+        context,
     )
     .await
     {
@@ -1015,7 +1015,9 @@ mod tests {
             node_id: node(),
             user_id: folder.created_by,
         };
-        offer_directory(context, offer).await.expect("offered");
+        drive(offer_directory(offer), context)
+            .await
+            .expect("offered");
         let upload = CreateMultipartOperation::new(CreateMultipartInput {
             bucket: folder.local_bucket.clone(),
             key: "late.bin".to_string(),
@@ -1055,7 +1057,7 @@ mod tests {
             node_id: node(),
             user_id: folder.created_by,
         };
-        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        assert_eq!(drive(withdraw_offer(withdrawal), &context).await, Ok(1));
 
         for attempt in ["withdrawn offer", "deleted bucket"] {
             store_folder(&context, &folder).await.expect("row stored");
@@ -1105,7 +1107,7 @@ mod tests {
             node_id: node(),
             user_id: folder.created_by,
         };
-        offer_directory(&context, offer)
+        drive(offer_directory(offer), &context)
             .await
             .expect("offer refreshed");
 
@@ -1159,7 +1161,7 @@ mod tests {
             node_id: node(),
             user_id: folder.created_by,
         };
-        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        assert_eq!(drive(withdraw_offer(withdrawal), &context).await, Ok(1));
 
         assert_eq!(
             drive(BucketGuardOperation::new(&bucket), &context)

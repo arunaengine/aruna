@@ -75,7 +75,7 @@ fn missing_handle_named() {
 #[test]
 fn walks_all_pages() {
     let mut offer = walking();
-    let cursor = ListCursor::Token("next".to_string());
+    let cursor = ListCursor::After("next".to_string());
     let first = StagingSourceEvent::ListResult {
         entries: vec![entry("a")],
         next_cursor: Some(cursor),

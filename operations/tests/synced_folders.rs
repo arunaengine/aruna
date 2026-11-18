@@ -43,8 +43,9 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_operations::staging::list_offers::ListOffersOperation;
 use aruna_operations::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, list_offers, offer_directory,
+    OfferDirectoryInput, OfferedDirectoryError, offer_directory,
 };
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
@@ -745,7 +746,7 @@ async fn skips_unbound_folder() -> TestResult<()> {
     reconcile_folders(&manual_context(&device.context)).await;
     let plan = reconcile_folder(&device.context, &listed).await?;
     assert_eq!(plan.uploads, 0);
-    let offers = list_offers(&device.context).await?;
+    let offers = drive(ListOffersOperation::new(), &device.context).await?;
     assert!(
         offers
             .iter()
@@ -770,7 +771,7 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
     let folder = bind(&realm, root.path(), group_id).await?;
     reconcile_folder(&device.context, &folder).await?;
     assert!(
-        list_offers(&device.context)
+        drive(ListOffersOperation::new(), &device.context)
             .await?
             .iter()
             .any(|offer| offer.bucket == folder.local_bucket)
@@ -782,7 +783,7 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
         drive(read_bound(folder.folder_id), &device.context).await,
         Err(FolderError::NotFound)
     );
-    let offers = list_offers(&device.context).await?;
+    let offers = drive(ListOffersOperation::new(), &device.context).await?;
     assert!(
         offers
             .iter()
@@ -1068,16 +1069,16 @@ async fn recovers_missing_bucket() -> TestResult<()> {
     assert_eq!(failed.observed_files, 1);
     assert_eq!(failed.last_reconcile_ms, folder.last_reconcile_ms);
 
-    let sweep = offer_directory(
-        &device.context,
-        OfferDirectoryInput {
+    let sweep = drive(
+        offer_directory(OfferDirectoryInput {
             bucket: folder.local_bucket.clone(),
             root: folder.root.clone(),
             group_id,
             realm_id: realm.realm_id,
             node_id: device.node_id(),
             user_id: realm.user_id,
-        },
+        }),
+        &device.context,
     )
     .await?;
     let local = sweep.observed.first().ok_or("the local file is observed")?;

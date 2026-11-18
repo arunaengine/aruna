@@ -599,10 +599,9 @@ impl Operation for WriteReferenceOperation {
                 Some(existing) if self.same_reference(&existing) => {
                     self.finish((self.version_id, false))
                 }
-                Some(_) => Err(StorageError::WriteError(
-                    "planned reference version changed".into(),
-                )
-                .into()),
+                Some(_) => {
+                    Err(StorageError::WriteError("planned reference version changed".into()).into())
+                }
                 None => self.pointer(),
             },
             WriteState::Pointer => {
@@ -1462,7 +1461,9 @@ mod tests {
             node_id: iroh::SecretKey::generate().public(),
             user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
         };
-        offer_directory(context, offer.clone()).await.unwrap();
+        drive(offer_directory(offer.clone()), context)
+            .await
+            .unwrap();
 
         let write = ReferenceWrite {
             job_id: None,
@@ -1649,8 +1650,11 @@ mod tests {
     fn materialize_runs_children() {
         use aruna_core::calls::ChildOutcome;
         let version_id = Ulid::from_bytes([5; 16]);
-        let mut operation =
-            MaterializeReferenceOperation::new(materialize_input(), SystemTime::UNIX_EPOCH, version_id);
+        let mut operation = MaterializeReferenceOperation::new(
+            materialize_input(),
+            SystemTime::UNIX_EPOCH,
+            version_id,
+        );
         assert!(matches!(
             operation.first(),
             Ok(Next::Call(IoCall::Child(_)))
