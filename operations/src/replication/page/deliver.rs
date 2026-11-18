@@ -3,24 +3,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::future::Future;
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, Publication,
-};
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::Publication;
 use tracing::{info, warn};
 
-use super::apply::{ApplyInput, PageApplyOperation, page_answer};
-use super::build::{BuildInput, Built, PageBuildOperation};
+use super::apply::{ApplyInput, PageApplyOperation, PageError, page_answer};
+use super::build::{BuildError, BuildInput, Built, PageBuildOperation};
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
-use crate::driver::{DriverContext, drive};
-use crate::replication::members::{BoundRecordOperation, member_publication};
+use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use crate::replication::members::{
+    BoundRecord, BoundRecordOperation, RecordError, member_publication,
+};
 use crate::replication::queue::BlobQueueError;
 use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
@@ -31,35 +33,62 @@ use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 const PAGE_SINGLE: &str = "left to single delivery by a reference page";
 /// Failed attempts that each halve the pages a job travels in.
 const PAGE_SHRINKS: u32 = 4;
+/// Upper bound of one page request; a member answers only after its one commit.
+const PAGE_DEADLINE: Duration = Duration::from_secs(150);
 
-/// Sends one page to a member and returns its answer; an error leaves the outcome unknown.
-pub trait PageSender {
-    fn send(
-        &self,
-        node: NodeId,
-        page: ReferencePage,
-    ) -> impl Future<Output = Result<PageAnswer, String>> + Send;
+type Turn<T> = Result<Next<T>, BlobQueueError>;
+
+/// How a page reaches a member: the call that sends it and the reading of its answer. An error
+/// leaves the outcome unknown.
+pub trait PageTransport: Clone + std::fmt::Debug + PartialEq + Send + 'static {
+    fn request(&self, node: NodeId, page: ReferencePage) -> Result<IoCall, String>;
+    fn answer(&self, result: IoResult) -> Result<PageAnswer, String>;
 }
 
 /// Sends pages over the metadata transport, never over a blob stream.
-pub struct MetadataSender<'a>(pub &'a DriverContext);
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MetadataPages;
 
-impl PageSender for MetadataSender<'_> {
-    async fn send(&self, node: NodeId, page: ReferencePage) -> Result<PageAnswer, String> {
-        let metadata = (self.0.metadata_handle.as_ref()).ok_or("no transport to the member")?;
-        metadata.request_reference_page(node, page).await
+impl PageTransport for MetadataPages {
+    fn request(&self, node: NodeId, page: ReferencePage) -> Result<IoCall, String> {
+        let message = MetadataTransportMessage::ReferencePage {
+            page: Box::new(page),
+        };
+        let frame = encode_message(&message).map_err(|error| error.to_string())?;
+        let request = MetadataRequestEffect {
+            peer: node,
+            frame,
+            timeout: PAGE_DEADLINE,
+        };
+        let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
+        Ok(effect.into())
+    }
+
+    fn answer(&self, result: IoResult) -> Result<PageAnswer, String> {
+        let event = result.event().map_err(|error| error.to_string())?;
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = event else {
+            return Err(format!("unexpected page answer: {}", event.label()));
+        };
+        let MetadataAnswer { result, .. } = *answer;
+        let bytes = result.map_err(|error| format!("{error:?}"))?;
+        match decode_message(&bytes).map_err(|error| error.to_string())? {
+            MetadataTransportMessage::ReferencePageAnswer { answer } => Ok(answer),
+            _ => Err("the member answered something else".to_string()),
+        }
     }
 }
 
+type Job = (Vec<u8>, BlobJobRecord);
+
 /// What one drain's pages did with their jobs.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct PageReport {
     pub delivered: usize,
     pub failed: usize,
     /// Jobs held back for a later page.
     pub later: usize,
     /// Jobs single delivery sends, in the order they came.
-    pub single: Vec<(Vec<u8>, BlobJobRecord)>,
+    pub single: Vec<Job>,
     pub next_due_ms: Option<u64>,
 }
 
@@ -69,9 +98,15 @@ impl PageReport {
             self.next_due_ms = min_due_at(self.next_due_ms, due);
         }
     }
-}
 
-type Job = (Vec<u8>, BlobJobRecord);
+    fn absorb(&mut self, other: PageReport) {
+        self.delivered += other.delivered;
+        self.failed += other.failed;
+        self.later += other.later;
+        self.single.extend(other.single);
+        self.note_due(other.next_due_ms);
+    }
+}
 
 /// Whether a page may carry the job: a member publication of one version, not held back for
 /// single delivery.
@@ -89,57 +124,8 @@ fn page_limit(job: &BlobJobRecord) -> usize {
     PAGE_RECORDS >> job.attempts.min(PAGE_SHRINKS)
 }
 
-/// Delivers `jobs` in pages per bucket, member, publication and page size.
-pub(crate) async fn deliver_pages(
-    context: &DriverContext,
-    jobs: Vec<Job>,
-    sender: &impl PageSender,
-) -> Result<PageReport, BlobQueueError> {
-    let mut report = PageReport::default();
-    let mut records = HashMap::<String, Option<(DistributionBinding, DistributionSnapshot)>>::new();
-    let mut pages: Vec<(Publication, Vec<Job>)> = Vec::new();
-    let mut retire = Vec::new();
-    for (key, job) in jobs {
-        if !records.contains_key(&job.input.bucket) {
-            let record = drive(BoundRecordOperation::new(&job.input.bucket), context)
-                .await
-                .map_err(|error| error.to_string());
-            let record = record.map_err(BlobQueueError::UnexpectedEvent)?;
-            records.insert(job.input.bucket.clone(), record);
-        }
-        let publication = publication(records.get(&job.input.bucket), &job);
-        let Some(publication) = publication else {
-            // This node no longer owes it: the current coordinator does.
-            retire.push(key);
-            continue;
-        };
-        let limit = page_limit(&job);
-        let target = (&job.input.bucket, job.input.target_node_id);
-        let page = (pages.iter_mut()).find(|(other, jobs)| {
-            let first = &jobs[0].1;
-            *other == publication
-                && jobs.len() < limit
-                && page_limit(first) == limit
-                && (&first.input.bucket, first.input.target_node_id) == target
-        });
-        match page {
-            Some((_, jobs)) => jobs.push((key, job)),
-            None => pages.push((publication, vec![(key, job)])),
-        }
-    }
-    report.delivered += retire.len();
-    delete_jobs(context, retire).await?;
-    for (publication, jobs) in pages {
-        deliver_page(context, publication, jobs, sender, &mut report).await?;
-    }
-    Ok(report)
-}
-
-fn publication(
-    record: Option<&Option<(DistributionBinding, DistributionSnapshot)>>,
-    job: &BlobJobRecord,
-) -> Option<Publication> {
-    let (binding, snapshot) = record?.as_ref()?;
+fn publication(record: Option<&BoundRecord>, job: &BlobJobRecord) -> Option<Publication> {
+    let (binding, snapshot) = record?;
     let (ReplicateScopeTarget::Version { key, .. }, Some(target)) =
         (&job.input.target, job.distribution.as_ref())
     else {
@@ -151,96 +137,6 @@ fn publication(
         .map(|(publication, _)| publication)
 }
 
-async fn deliver_page(
-    context: &DriverContext,
-    publication: Publication,
-    jobs: Vec<Job>,
-    sender: &impl PageSender,
-    report: &mut PageReport,
-) -> Result<(), BlobQueueError> {
-    let (bucket, node) = (
-        jobs[0].1.input.bucket.clone(),
-        jobs[0].1.input.target_node_id,
-    );
-    let input = BuildInput {
-        bucket: bucket.clone(),
-        publication: publication.clone(),
-        jobs: jobs.iter().map(|(_, job)| job.clone()).collect(),
-    };
-    let built = match drive(PageBuildOperation::new(input), context).await {
-        Ok(built) => built,
-        Err(error) => {
-            report.failed += jobs.len();
-            let due = reschedule(context, jobs, Some(error.to_string())).await?;
-            report.note_due(due);
-            return Ok(());
-        }
-    };
-    let (mut retire, mut paged, mut manifests) = (Vec::new(), Vec::new(), Vec::new());
-    for ((key, job), built) in jobs.into_iter().zip(built) {
-        match built {
-            Built::Record(manifest) => {
-                manifests.push(*manifest);
-                paged.push((key, job));
-            }
-            Built::Gone => retire.push(key),
-            Built::Single => report.single.push((key, job)),
-            // Still due; a later drain pages it.
-            Built::Later => report.later += 1,
-        }
-    }
-    report.delivered += retire.len();
-    if manifests.is_empty() {
-        return delete_jobs(context, retire).await;
-    }
-    let count = manifests.len();
-    let page = ReferencePage {
-        bucket: bucket.clone(),
-        publication,
-        manifests,
-    };
-    let answer = sender.send(node, page).await;
-    let (single, retry) = match answer {
-        Ok(PageAnswer::Applied { applied, single }) => {
-            info!(%bucket, %node, records = count, applied, single = single.len(), "Delivered a reference page");
-            (single, None)
-        }
-        Ok(PageAnswer::Refused {
-            reason,
-            retry: false,
-        }) => {
-            warn!(%bucket, %node, %reason, "A member refused a reference page; sending its records singly");
-            (
-                paged
-                    .iter()
-                    .filter_map(|(_, job)| version_of(job))
-                    .collect(),
-                None,
-            )
-        }
-        Ok(PageAnswer::Refused {
-            reason,
-            retry: true,
-        }) => (Vec::new(), Some(reason)),
-        Err(error) => (Vec::new(), Some(error)),
-    };
-    if let Some(reason) = retry {
-        warn!(%bucket, %node, %reason, "A reference page was not acknowledged; retrying later");
-        report.failed += paged.len();
-        let due = reschedule(context, paged, Some(reason)).await?;
-        report.note_due(due);
-        return delete_jobs(context, retire).await;
-    }
-    let (left, taken): (Vec<_>, Vec<_>) = (paged.into_iter())
-        .partition(|(_, job)| version_of(job).is_some_and(|id| single.contains(&id)));
-    report.delivered += taken.len();
-    retire.extend(taken.into_iter().map(|(key, _)| key));
-    // The acknowledged page's jobs go in one batch, never one delete per record.
-    delete_jobs(context, retire).await?;
-    reschedule(context, left, None).await?;
-    Ok(())
-}
-
 fn version_of(job: &BlobJobRecord) -> Option<ulid::Ulid> {
     match job.input.target {
         ReplicateScopeTarget::Version { version_id, .. } => Some(version_id),
@@ -248,43 +144,29 @@ fn version_of(job: &BlobJobRecord) -> Option<ulid::Ulid> {
     }
 }
 
-async fn delete_jobs(context: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), BlobQueueError> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let deletes = (keys.into_iter())
+/// The batch delete of finished jobs; the jobs of a page go together, never one by one.
+fn delete_call(keys: Vec<Vec<u8>>) -> Option<IoCall> {
+    let deletes: Vec<_> = (keys.into_iter())
         .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), key.into()))
         .collect();
-    let delete = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-    }
+    (!deletes.is_empty()).then_some(IoCall::Delete(deletes))
 }
 
 /// Writes the jobs back in one batch: with an error after a backoff, without one due now for
-/// single delivery. Returns the earliest due time.
-async fn reschedule(
-    context: &DriverContext,
+/// single delivery. Also gives the earliest due time.
+fn reschedule_call(
     jobs: Vec<Job>,
-    error: Option<String>,
-) -> Result<Option<u64>, BlobQueueError> {
-    if jobs.is_empty() {
-        return Ok(None);
-    }
-    let now_ms = unix_timestamp_millis();
+    error: Option<&str>,
+    now_ms: u64,
+) -> Result<(Option<IoCall>, Option<u64>), BlobQueueError> {
     let mut due = None;
     let mut writes = Vec::with_capacity(jobs.len());
     for (key, mut job) in jobs {
-        match &error {
+        match error {
             Some(error) => {
                 job.attempts = job.attempts.saturating_add(1);
                 job.due_at_ms = now_ms.saturating_add(retry_delay_ms(job.attempts));
-                job.last_error = Some(error.clone());
+                job.last_error = Some(error.to_string());
             }
             None => {
                 job.due_at_ms = now_ms;
@@ -298,14 +180,156 @@ async fn reschedule(
             job.to_bytes()?.into(),
         ));
     }
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(due),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+    Ok(((!writes.is_empty()).then_some(IoCall::Write(writes)), due))
+}
+
+#[derive(Debug, PartialEq)]
+enum DeliverStep {
+    Record(Box<Job>),
+    Deleted,
+    Page,
+}
+
+/// Delivers jobs in pages per bucket, member, publication and page size.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DeliverPagesOperation<T> {
+    transport: T,
+    jobs: VecDeque<Job>,
+    records: HashMap<String, Option<BoundRecord>>,
+    pages: Vec<(Publication, Vec<Job>)>,
+    retire: Vec<Vec<u8>>,
+    report: PageReport,
+    step: DeliverStep,
+}
+
+impl<T: PageTransport> DeliverPagesOperation<T> {
+    pub(crate) fn new(transport: T, jobs: Vec<Job>) -> Self {
+        Self {
+            transport,
+            jobs: jobs.into(),
+            records: HashMap::new(),
+            pages: Vec::new(),
+            retire: Vec::new(),
+            report: PageReport::default(),
+            step: DeliverStep::Page,
+        }
+    }
+
+    fn next_job(&mut self) -> Turn<PageReport> {
+        while let Some((key, job)) = self.jobs.pop_front() {
+            if !self.records.contains_key(&job.input.bucket) {
+                let read = BoundRecordOperation::new(&job.input.bucket);
+                self.step = DeliverStep::Record(Box::new((key, job)));
+                return Ok(Next::Call(IoCall::child(read)));
+            }
+            self.place((key, job));
+        }
+        self.report.delivered += self.retire.len();
+        self.step = DeliverStep::Deleted;
+        match delete_call(std::mem::take(&mut self.retire)) {
+            Some(call) => Ok(Next::Call(call)),
+            None => self.next_page(),
+        }
+    }
+
+    fn place(&mut self, (key, job): Job) {
+        let record = self.records.get(&job.input.bucket).and_then(Option::as_ref);
+        let Some(publication) = publication(record, &job) else {
+            // This node no longer owes it: the current coordinator does.
+            self.retire.push(key);
+            return;
+        };
+        let limit = page_limit(&job);
+        let target = (&job.input.bucket, job.input.target_node_id);
+        let page = (self.pages.iter_mut()).find(|(other, jobs)| {
+            let first = &jobs[0].1;
+            *other == publication
+                && jobs.len() < limit
+                && page_limit(first) == limit
+                && (&first.input.bucket, first.input.target_node_id) == target
+        });
+        match page {
+            Some((_, jobs)) => jobs.push((key, job)),
+            None => self.pages.push((publication, vec![(key, job)])),
+        }
+    }
+
+    fn next_page(&mut self) -> Turn<PageReport> {
+        if self.pages.is_empty() {
+            return Ok(Next::Done(std::mem::take(&mut self.report)));
+        }
+        let (publication, jobs) = self.pages.remove(0);
+        let page = DeliverPageOperation::new(self.transport.clone(), publication, jobs);
+        self.step = DeliverStep::Page;
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl<T: PageTransport> Operation for DeliverPagesOperation<T> {
+    type Output = PageReport;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<PageReport> {
+        self.next_job()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<PageReport> {
+        match std::mem::replace(&mut self.step, DeliverStep::Page) {
+            DeliverStep::Record(job) => {
+                let record = (result.child::<Option<BoundRecord>, RecordError>()?)
+                    .map_err(|error| BlobQueueError::UnexpectedEvent(error.to_string()))?;
+                self.records.insert(job.1.input.bucket.clone(), record);
+                self.place(*job);
+                self.next_job()
+            }
+            DeliverStep::Deleted => {
+                result.done()?;
+                self.next_page()
+            }
+            DeliverStep::Page => {
+                let page = result.child::<PageReport, BlobQueueError>()??;
+                self.report.absorb(page);
+                self.next_page()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PageStep {
+    Build,
+    Sent,
+    Stored,
+}
+
+/// Builds and sends one page, then settles its jobs by the member's answer.
+#[derive(Debug, PartialEq)]
+struct DeliverPageOperation<T> {
+    transport: T,
+    publication: Option<Publication>,
+    bucket: String,
+    node: NodeId,
+    jobs: Vec<Job>,
+    paged: Vec<Job>,
+    retire: Vec<Vec<u8>>,
+    count: usize,
+    calls: VecDeque<IoCall>,
+    report: PageReport,
+    now_ms: u64,
+    step: PageStep,
+}
+
+impl<T: PageTransport> DeliverPageOperation<T> {
+    fn new(transport: T, publication: Publication, jobs: Vec<Job>) -> Self {
+        let first = &jobs[0].1.input;
+        let (bucket, node) = (first.bucket.clone(), first.target_node_id);
+        Self {
+            transport,
+            publication: Some(publication),
+            bucket,
+            node,
+            jobs,
+            paged: Vec::new(),
     }
 }
 
