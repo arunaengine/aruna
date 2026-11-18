@@ -5,7 +5,7 @@
 use super::objects::{self, Blob};
 use super::project::author;
 use super::snapshot::execute;
-use super::{GitError, lfs, location, publish};
+use super::{GitError, download, lfs, location, publish};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
@@ -242,7 +242,7 @@ impl Content {
                     return copied(context, auth, (&local, group_id), (name, bucket, key)).await;
                 }
                 let holders = drive(publish::holders(context, document), context).await?;
-                let blob = objects::open(context, auth, document, &source, &holders).await?;
+                let blob = download::open(context, auth, document, &source, &holders).await?;
                 (source.size, blob)
             }
         };

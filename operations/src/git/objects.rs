@@ -6,11 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::git::{
-    GitEffect, GitEvent, GitPack, GitPackRecord, GitRecord, LOCAL_OBJECTS, MAX_PACK_BYTES,
-    StoredObject, git_pack_key,
-};
-use aruna_core::keyspaces::GIT_PACK_KEYSPACE;
+use aruna_core::git::{GitEffect, GitEvent, GitPack, LOCAL_OBJECTS, MAX_PACK_BYTES, StoredObject};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
@@ -20,11 +16,9 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::GroupId;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -32,22 +26,17 @@ use super::calls::{git_call, git_event, node_of};
 use super::records::{InsertRowOperation, LoadRowOperation, SyncedOperation};
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::driver::{DriverContext, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::GetObjectInput;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::read::get_object_routed;
 
 pub type Blob = BackendStream<Result<Bytes, StreamError>>;
 
@@ -523,109 +512,6 @@ pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
         sha256,
         size: pack.len() as u64,
     })
-}
-
-/// The bytes of a pack `owner` names first. A pack this node still keeps only as an object
-/// from before packs moved into Fjall is moved there once and replicated.
-pub async fn pack_bytes(
-    context: &DriverContext,
-    document: &MetadataRegistryRecord,
-    pack: &GitPack,
-    owner: &GitRecord,
-) -> Result<Bytes, GitError> {
-    let digest = pack.digest().ok_or(GitError::Invalid)?;
-    let key = git_pack_key(document.document_id, &digest).to_vec();
-    if let Some(stored) = drive(
-        records::load::<GitPackRecord>(GIT_PACK_KEYSPACE, key),
-        context,
-    )
-    .await?
-    {
-        return Ok(stored.bytes);
-    }
-    let Some(object) = drive(copy(document, &pack.sha256), context).await? else {
-        return Err(GitError::Unavailable);
-    };
-    let auth = super::project::author(owner.user_id);
-    let mut blob = open(context, &auth, document, &object, &[]).await?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = blob.next().await {
-        bytes.extend_from_slice(&chunk.map_err(|_| GitError::Unavailable)?);
-        if bytes.len() as u64 > pack.size {
-            return Err(GitError::Invalid);
-        }
-    }
-    let bytes = Bytes::from(bytes);
-    if describe_pack(&bytes).ok().as_ref() != Some(pack) {
-        return Err(GitError::Invalid);
-    }
-    let record = super::publish::pack_record(owner, bytes.clone());
-    drive(
-        super::publish::publish_pack(context, document, record),
-        context,
-    )
-    .await?;
-    Ok(bytes)
-}
-
-/// Opens exact bytes: this node's copy, the recording node's version, or any holder's copy.
-pub async fn open(
-    context: &DriverContext,
-    auth: &AuthContext,
-    document: &MetadataRegistryRecord,
-    object: &StoredObject,
-    holders: &[NodeId],
-) -> Result<Blob, GitError> {
-    let node = node_of(context).ok_or(GitError::Unavailable)?;
-    let own = drive(copy(document, &object.sha256), context).await?;
-    if let Some(own) = own.as_ref().or((object.node_id == node).then_some(object)) {
-        let input = GetObjectInput {
-            bucket: own.bucket.clone(),
-            key: own.key.clone(),
-            version_id: Some(own.version_id),
-            range: None,
-            group_id: own.group_id.ok_or(GitError::Unavailable)?,
-            user_identity: auth.user_id,
-            realm_id: auth.realm_id,
-            node_id: node,
-        };
-        return get_object_routed(context, input, auth.path_restrictions.clone())
-            .await
-            .map(|result| result.blob)
-            .map_err(|_| GitError::Unavailable);
-    }
-    let exact = BaoReadTarget::ExactVersion(VersionedObjectArn {
-        realm_id: auth.realm_id,
-        node_id: object.node_id,
-        bucket: object.bucket.clone(),
-        key: object.key.clone(),
-        version: object.version_id,
-    });
-    let sources = std::iter::once((object.node_id, exact)).chain(
-        holders
-            .iter()
-            .filter(|holder| **holder != node && **holder != object.node_id)
-            .map(|holder| (*holder, BaoReadTarget::Blake3(object.blake3))),
-    );
-    for (source, target) in sources {
-        let request = BaoReadRequest {
-            auth_context: auth.clone(),
-            realm_id: auth.realm_id,
-            target,
-            expected_blake3: Some(object.blake3),
-            metadata_only: false,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        };
-        if let Ok(BaoReadOutput::Stream { blob, size, .. }) =
-            drive(ManagedReadOperation::new(source, request), context).await
-            && size == object.size
-        {
-            return Ok(blob);
-        }
-    }
-    Err(GitError::Unavailable)
 }
 
 /// Notes a published pack that was made from this node's cache as imported there, so the next

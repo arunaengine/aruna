@@ -7,6 +7,7 @@ mod calls;
 pub mod changes;
 pub mod cleanup;
 mod dataset;
+pub mod download;
 pub mod lfs;
 pub mod location;
 pub mod locks;
@@ -21,19 +22,16 @@ pub mod snapshot;
 pub mod state;
 #[cfg(test)]
 mod testing;
+mod transport;
 pub mod versions;
 
 pub use self::access::{DocumentAccessOperation, RepositoryOperation, document, repository};
 use self::changes::PropertyConflict;
+pub use self::transport::transport;
 use crate::auth::error::AuthorizeError;
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
-use aruna_core::git::{GitEffect, GitEvent, GitRequest};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use std::collections::HashMap;
-use std::sync::LazyLock;
 use thiserror::Error;
-use ulid::Ulid;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum GitError {
@@ -86,98 +84,4 @@ pub(crate) fn store(context: &DriverContext) -> Result<&GitStore, GitError> {
     (context.blob_handle.as_ref())
         .and_then(|handle| handle.git())
         .ok_or(GitError::Unavailable)
-}
-
-/// Serves Git over HTTP after bringing the local cache up to date from the records.
-pub async fn transport(
-    context: &DriverContext,
-    auth: &AuthContext,
-    request: GitRequest,
-) -> Result<GitEvent, GitError> {
-    let store = store(context)?;
-    let permission =
-        if request.action == "git-receive-pack" || request.query == "service=git-receive-pack" {
-            Permission::WRITE
-        } else {
-            Permission::READ
-        };
-    let write = permission == Permission::WRITE;
-    let (document, repository) = drive(
-        repository(context, auth, request.repository.document_id, permission),
-        context,
-    )
-    .await?;
-    if repository != request.repository {
-        return Err(GitError::Conflict);
-    }
-    let mut request = request;
-    let guard = match write {
-        true => {
-            let guard = store.lock(document.document_id).await;
-            snapshot::refresh(context, store, &document).await?;
-            Some(guard)
-        }
-        false => {
-            snapshot::read_view(context, store, &document).await?;
-            None
-        }
-    };
-    // Reads need a current cache but not the lock; pushes keep it until their record is out.
-    let _guard = guard;
-    let _key = write.then(|| {
-        let key = PushKey::open(document.document_id);
-        request.push_key = key.value.clone();
-        key
-    });
-    let served = store
-        .execute(GitEffect::Http(Box::new(request)), auth.user_id)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    // A recorded push to main brings metadata; it applies now, or on a later refresh.
-    if write && let Err(error) = pending::apply(context, store, &document).await {
-        tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
-    }
-    Ok(served)
-}
-
-/// Keys of receive-pack requests running on this node, one per document under its lock.
-static PUSH_KEYS: LazyLock<std::sync::Mutex<HashMap<Ulid, String>>> =
-    LazyLock::new(Default::default);
-
-/// A push key that is valid while the receive-pack request that created it runs.
-struct PushKey {
-    document_id: Ulid,
-    value: String,
-}
-
-impl PushKey {
-    fn open(document_id: Ulid) -> Self {
-        let value = hex::encode(rand::random::<[u8; 32]>());
-        if let Ok(mut keys) = PUSH_KEYS.lock() {
-            keys.insert(document_id, value.clone());
-        }
-        Self { document_id, value }
-    }
-}
-
-impl Drop for PushKey {
-    fn drop(&mut self) {
-        if let Ok(mut keys) = PUSH_KEYS.lock() {
-            keys.remove(&self.document_id);
-        }
-    }
-}
-
-/// Whether `key` belongs to the push now running for the document.
-pub fn push_key_valid(document_id: Ulid, key: &str) -> bool {
-    PUSH_KEYS.lock().is_ok_and(|keys| {
-        keys.get(&document_id).is_some_and(|expected| {
-            expected.len() == key.len()
-                && expected
-                    .bytes()
-                    .zip(key.bytes())
-                    .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-                    == 0
-        })
-    })
 }

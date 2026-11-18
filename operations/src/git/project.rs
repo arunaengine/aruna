@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::state::{Ancestry, GitState, reduce};
-use super::{GitError, objects, publish, records};
+use super::{GitError, download, publish, records};
 use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
@@ -190,7 +190,7 @@ pub async fn project(
             _ => false,
         };
         let owner = records.iter().find(named).ok_or(GitError::Unavailable)?;
-        let read = objects::pack_bytes(context, document, pack, owner);
+        let read = download::pack_bytes(context, document, pack, owner);
         let bytes = time_stage("git_pack_read", read).await?;
         let digest = pack.sha256.clone();
         let effect = GitEffect::Import {

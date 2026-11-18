@@ -8,23 +8,20 @@ use aruna_core::git::{GitRecord, LfsObject, StoredObject};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::NodeRouting;
-use tokio::time::Instant;
 use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
 use super::calls::node_of;
 use super::objects::{self, Blob, StoreObjectOperation};
 use super::state::{Ancestry, reduce};
-use super::{GitError, publish, records, repository};
+use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
-use crate::driver::{DriverContext, drive, drive_until, node_routing};
+use crate::driver::{DriverContext, node_routing};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -112,7 +109,7 @@ pub(super) struct PermitObjectOperation {
 }
 
 impl PermitObjectOperation {
-    fn new(auth: &AuthContext, object: &StoredObject, permission: Permission) -> Self {
+    pub(super) fn new(auth: &AuthContext, object: &StoredObject, permission: Permission) -> Self {
         Self {
             auth: auth.clone(),
             object: object.clone(),
@@ -394,49 +391,6 @@ impl Operation for UploadObjectOperation {
             }
         }
     }
-}
-
-/// The members that keep a pinned distributed version, found through the resolver.
-async fn set_holders(context: &DriverContext, object: &StoredObject) -> Vec<NodeId> {
-    match &object.global {
-        Some(GlobalId::Version { version_id, .. }) => {
-            let deadline = Instant::now() + RESOLVE_BUDGET;
-            let resolve = resolve_version(context, *version_id, deadline);
-            version_found(drive_until(resolve, context, deadline).await)
-                .map(|resolved| resolved.holders)
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Streams LFS content after authorizing the original object. Content held elsewhere is
-/// relayed from its node and not stored here.
-pub async fn download(
-    context: &DriverContext,
-    auth: &AuthContext,
-    id: Ulid,
-    oid: &str,
-) -> Result<(Blob, u64), GitError> {
-    let (document, _) = drive(repository(context, auth, id, Permission::READ), context).await?;
-    let original = drive(locate(&document, oid), context)
-        .await?
-        .ok_or(GitError::NotFound)?;
-    let permit = PermitObjectOperation::new(auth, &original, Permission::READ);
-    drive(permit, context).await?;
-    let node = node_of(context).ok_or(GitError::Unavailable)?;
-    let local = match drive(objects::copy(&document, oid), context).await? {
-        Some(copy) => copy,
-        None if original.node_id == node => original,
-        None => {
-            let mut holders = drive(publish::holders(context, &document), context).await?;
-            holders.extend(set_holders(context, &original).await);
-            let blob = objects::open(context, auth, &document, &original, &holders).await?;
-            return Ok((blob, original.size));
-        }
-    };
-    let blob = objects::open(context, auth, &document, &local, &[]).await?;
-    Ok((blob, local.size))
 }
 
 #[cfg(test)]

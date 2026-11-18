@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::LazyLock;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -38,6 +39,48 @@ fn objects_in(pack: &[u8]) -> u32 {
     pack.get(8..12)
         .and_then(|count| <[u8; 4]>::try_from(count).ok())
         .map_or(0, u32::from_be_bytes)
+}
+
+/// Keys of receive-pack requests running on this node, one per document under its lock.
+static PUSH_KEYS: LazyLock<std::sync::Mutex<HashMap<Ulid, String>>> =
+    LazyLock::new(Default::default);
+
+/// A push key that is valid while the receive-pack request that created it runs.
+pub(super) struct PushKey {
+    document_id: Ulid,
+    pub(super) value: String,
+}
+
+impl PushKey {
+    pub(super) fn open(document_id: Ulid) -> Self {
+        let value = hex::encode(rand::random::<[u8; 32]>());
+        if let Ok(mut keys) = PUSH_KEYS.lock() {
+            keys.insert(document_id, value.clone());
+        }
+        Self { document_id, value }
+    }
+}
+
+impl Drop for PushKey {
+    fn drop(&mut self) {
+        if let Ok(mut keys) = PUSH_KEYS.lock() {
+            keys.remove(&self.document_id);
+        }
+    }
+}
+
+/// Whether `key` belongs to the push now running for the document.
+fn push_key_valid(document_id: Ulid, key: &str) -> bool {
+    PUSH_KEYS.lock().is_ok_and(|keys| {
+        keys.get(&document_id).is_some_and(|expected| {
+            expected.len() == key.len()
+                && expected
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                    == 0
+        })
+    })
 }
 
 /// What the pending call of accepting a push answers.
@@ -98,7 +141,7 @@ type AcceptTurn = Result<Next<GitRecord>, GitError>;
 
 impl AcceptPushOperation {
     fn opened(&mut self, document: Document) -> AcceptTurn {
-        if !super::push_key_valid(self.id, &self.key) {
+        if !push_key_valid(self.id, &self.key) {
             return Err(GitError::NotHook);
         }
         let request = &self.request;

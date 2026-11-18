@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::state::{Ancestry, reduce};
-use super::{GitError, lfs, objects, records};
+use super::{GitError, download, lfs, objects, records};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
@@ -122,7 +122,7 @@ async fn moved(
         matches!(&record.change, GitChange::Objects { pack: Some(own), .. } if own == pack)
     });
     match owner {
-        Some(owner) => objects::pack_bytes(context, document, pack, owner)
+        Some(owner) => download::pack_bytes(context, document, pack, owner)
             .await
             .map(|_| Ok(())),
         None => Ok(Ok(())),

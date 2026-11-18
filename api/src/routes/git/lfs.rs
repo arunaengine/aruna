@@ -159,7 +159,7 @@ pub async fn download(
     Path((repository, oid)): Path<(String, String)>,
 ) -> ServerResult<Response> {
     let (blob, size) =
-        git::lfs::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
+        git::download::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
             .await
             .map_err(map_error)?;
     Response::builder()
