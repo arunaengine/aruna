@@ -256,7 +256,7 @@ async fn reference_import_counted() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    aruna_operations::jobs::store::query::insert_job(&ctx, &record)
+    crate::job_test_calls::insert_job(&ctx, &record)
         .await
         .unwrap();
     let checkpoint = StagingJobCheckpoint {

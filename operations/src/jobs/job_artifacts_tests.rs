@@ -9,7 +9,8 @@ use aruna_core::jobs::WireArtifact;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::ExportOmissionCounts;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, StoredFormat};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::format::StoredFormat;
 use futures_util::stream;
 
 use super::*;

@@ -36,8 +36,9 @@ use super::store::JobMutationError;
 use super::store::attempt::{begin_external_running, transition_to_preparing, transition_to_ready};
 use super::store::state::{cancel_running_job, read_job_record, record_attempt_intent};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::key_locks::ParkLockedOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::jobs::lifecycle::publish::publish_progress;
+use crate::jobs::lifecycle::updates::PublishProgressOperation;
 use crate::placement::policy::LocalSubjectOperation;
 use finalize::{cleanup_and_crate, fail_and_crate, finalize_cancel};
 use prepare::{build_task_spec, job_bucket, prepare_task};
@@ -141,10 +142,11 @@ pub async fn run_execution_job(
     }
     publish_progress(&context, job_id, PhysicalExecutionState::Preparing).await;
     // Staging reads input plaintext, so a locked input parks the job before any attempt intent.
-    if Box::pin(crate::jobs::key_wake::park_locked(
-        &context, &record, token, node_id,
-    ))
-    .await
+    let node = (node_id, context.node_and_realm());
+    let park = ParkLockedOperation::new(&record, token, node, unix_timestamp_millis());
+    if Box::pin(drive(park, context.as_ref()))
+        .await
+        .unwrap_or(false)
     {
         return;
     }
@@ -161,22 +163,23 @@ pub async fn run_execution_job(
 
     // Boxed so the large per-stage futures never inflate caller stacks.
     let mut prepare_and_submit = Box::pin(async {
-        let prepared = match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket))
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let parked =
-                    crate::jobs::key_wake::park_on_lock(&context, &record, token, node_id, &error);
-                if !Box::pin(parked).await {
-                    Box::pin(pre_submit_failure(
-                        &context, job_id, token, &record, error, false,
-                    ))
-                    .await;
+        let prepared =
+            match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket)).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let node = (node_id, context.node_and_realm());
+                    let now_ms = unix_timestamp_millis();
+                    let park = ParkLockedOperation::on_error(&record, token, node, &error, now_ms);
+                    let parked = Box::pin(drive(park, context.as_ref())).await;
+                    if !parked.unwrap_or(false) {
+                        Box::pin(pre_submit_failure(
+                            &context, job_id, token, &record, error, false,
+                        ))
+                        .await;
+                    }
+                    return AttemptOutcome::Stopped;
                 }
-                return AttemptOutcome::Stopped;
-            }
-        };
+            };
 
         // Preparing -> Ready.
         if transition_to_ready(&context, job_id, token, unix_timestamp_millis())
@@ -534,6 +537,16 @@ async fn stored_site(
         0 => None,
         generation => Some((generation, reservation.subject_digest)),
     })
+}
+
+/// Publishes a non-terminal state of a receipted execution. A job with no receipt here is a
+/// purely local execution and publishes nothing.
+async fn publish_progress(context: &DriverContext, job_id: JobId, state: PhysicalExecutionState) {
+    let node = context.node_and_realm();
+    let publish = PublishProgressOperation::new(job_id, state, node, unix_timestamp_millis());
+    if let Err(error) = drive(publish, context).await {
+        warn!(error = %error, "Execution publication failed");
+    }
 }
 
 #[cfg(test)]

@@ -785,7 +785,11 @@ impl OperationsTaskHandler {
                     continue;
                 };
                 if let Err(error) =
-                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
+                    drive(
+                        job_calls::release_job(record.job_id, token, unix_timestamp_millis()),
+                        self.context.as_ref(),
+                    )
+                    .await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }

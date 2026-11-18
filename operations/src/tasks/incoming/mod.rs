@@ -65,17 +65,16 @@ use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::realm::RelayAdminOperation;
 use crate::jobs::JOB_PRUNE_PAGE;
 use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
-use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
 use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
-use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::store::state::release_job;
+use crate::jobs::store::job_calls;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,
@@ -86,6 +85,8 @@ use crate::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
 };
+use crate::tasks::job_context::PayloadHandler;
+use crate::tasks::job_node::witness_node;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -1051,8 +1052,12 @@ impl OperationsTaskHandler {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();
                         for start in imports {
-                            let started = crate::jobs::handed_imports::start_kept(context, start);
-                            if let Err(error) = started.await {
+                            let started = crate::jobs::handed_imports::StartKeptOperation::new(
+                                start,
+                                context.node_and_realm(),
+                                unix_timestamp_millis(),
+                            );
+                            if let Err(error) = crate::driver::drive(started, context).await {
                                 warn!(%error, "Handed over imports could not start");
                             }
                         }

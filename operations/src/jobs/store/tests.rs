@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::jobs::store::test_calls::{adopt_external_attempt, begin_external_running, cancel_running_job, claim_job, complete_execution, complete_job, defer_job, delete_finished_run, exhaust_job, fail_job, find_dedup_job, handoff_external_attempt, insert_job, list_job_entries, list_user_jobs, mark_indeterminate, persist_output_record, put_job_entry, put_state, read_attempt_control, read_crate_status, read_job_record, read_launch_record, read_state, record_attempt_intent, release_job, renew_lease, requeue_before_attempt, requeue_job, set_cancel_requested, transition_to_running};
 use super::attempt::*;
 use super::control_mutation::ControlChange;
 use super::query::*;

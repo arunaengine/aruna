@@ -38,19 +38,6 @@ pub async fn reserve_output_commits(
     .await
 }
 
-pub async fn authorize_cleanup(
-    context: &DriverContext,
-    job_id: JobId,
-    intent: &AttemptIntent,
-    token: Ulid,
-) -> Result<FenceContext, JobMutationError> {
-    drive(
-        job_calls::authorize_cleanup(job_id, intent.clone(), token),
-        context,
-    )
-    .await
-}
-
 pub async fn record_attempt_tombstone(
     context: &DriverContext,
     job_id: JobId,
@@ -150,56 +137,6 @@ pub async fn transition_to_cancelling(
     .await
 }
 
-/// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
-/// lease sweep later re-routes it to reconciliation. Exits only on evidence or the
-/// attempt cap; adoption that resumes supervision is free, a failure terminalizes.
-pub async fn mark_indeterminate(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    error: JobError,
-    now_ms: u64,
-) -> Result<ParkOutcome, JobMutationError> {
-    drive(
-        job_calls::mark_indeterminate(job_id, token, error, now_ms),
-        context,
-    )
-    .await
-}
-
-/// Terminal `Failed` for an execution job, capturing the exit evidence in the
-/// result so a failed run still yields a crate.
-pub async fn fail_execution(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    error: JobError,
-    result: JobResultPayload,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::fail_execution(job_id, token, error, result, now_ms),
-        context,
-    )
-    .await
-}
-
-/// Terminal `Cancelled` for an execution job (from `Cancelling`), recording the
-/// exit evidence.
-pub async fn cancel_execution(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    result: JobResultPayload,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::cancel_execution(job_id, token, result, now_ms),
-        context,
-    )
-    .await
-}
-
 /// Take over a lost external attempt with a fresh claim token so the reconciler
 /// can supervise it. No token guard: the previous holder is provably dead (lease
 /// swept or node restarted). State is preserved for the reconcile decision.
@@ -211,23 +148,6 @@ pub async fn adopt_external_attempt(
 ) -> Result<AdoptOutcome, JobMutationError> {
     drive(
         job_calls::adopt_external_attempt(job_id, holder_node_id, now_ms),
-        context,
-    )
-    .await
-}
-
-/// Requeue an execution job that failed BEFORE its attempt was submitted (image
-/// pull, prepare error): from `Preparing`/`Ready` back to `Queued` with backoff,
-/// or terminal `Failed` once attempts are spent. Safe because no container exists.
-pub async fn requeue_before_attempt(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    now_ms: u64,
-    error: JobError,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::requeue_before_attempt(job_id, token, now_ms, error),
         context,
     )
     .await

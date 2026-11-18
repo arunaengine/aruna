@@ -694,7 +694,7 @@ mod pure_tests {
     #[test]
     fn owner_gate_applies() {
         let family = JobFamilyId {
-            submission_id: Ulid::from_bytes([7u8; 16]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         };
         let mut serve = authed(status_request());
@@ -826,7 +826,7 @@ mod pure_tests {
         let mut serve = cancel();
         serve.step = CancelStep::Runs;
         serve.family = Some(JobFamilyId {
-            submission_id: Ulid::from_bytes([7u8; 16]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         });
         let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));

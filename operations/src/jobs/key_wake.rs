@@ -3,27 +3,25 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
-use crate::blob::migration::queue::resume_transitions;
+use crate::blob::migration::queue::ResumeTransitionsOperation;
+use crate::blob::migration::shared::MigrationError;
 use crate::blob::promote::PromoteError;
-use crate::blob::unlocked::promote_unlocked;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::key_locks::{KeyCheckError, ParkLockedOperation, VersionWaitOperation};
+use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
-use crate::jobs::store::key_wait::wake_key_waits;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structs::execution::job::{JobError, JobRecord, KeyWait};
-use aruna_core::structs::storage::blob::VersionKey;
-use aruna_core::time::unix_timestamp_millis;
-use ulid::Ulid;
+use crate::jobs::store::row_calls;
+use crate::replication::parking::WakeParkedOperation;
+use crate::replication::queue::BlobQueueError;
+use crate::s3::abe_copies::{CompleteCopiesError, CompleteCopiesOperation};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum KeyWakeError {
     #[error(transparent)]
     Jobs(#[from] JobMutationError),
@@ -37,110 +35,304 @@ pub enum KeyWakeError {
     Envelopes(String),
 }
 
+impl From<IoError> for KeyWakeError {
+    fn from(error: IoError) -> Self {
+        Self::Jobs(error.into())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum WakeStep {
+    Jobs,
+    Remote,
+    Resume,
+    Promote,
+    ResumeAgain,
+    Copies,
+    Envelopes,
+}
+
 /// Resumes jobs, remote wakes, transitions, pending promotion, waiting copies and pending copy
-/// envelopes whenever a key becomes usable.
-pub async fn wake_unlocked(
-    context: &DriverContext,
+/// envelopes whenever a key becomes usable. Every step runs even after another failed, so one
+/// corrupt archive holds nothing back; the first failure in report order is the answer.
+#[derive(Debug, PartialEq)]
+pub struct WakeUnlockedOperation {
     key: BucketKeyRef,
     now_ms: u64,
     origin: (RealmId, NodeId),
-    limits: &RoCrateLimits,
-) -> Result<(usize, usize), KeyWakeError> {
-    let woken = wake_key_waits(context, key, now_ms).await;
-    // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
-    let queued = drive(RemoteWakesOperation::new(key), context).await;
-    let mut resumed = resume_transitions(context, key).await;
-    let promoted = promote_unlocked(context, key, origin, limits).await;
-    if !matches!(promoted, Ok(0)) {
-        resumed = resumed.and(resume_transitions(context, key).await);
-    }
-    // Copies waiting for this source key run after promotion, so pending sources are hashed.
-    let wake = crate::replication::parking::WakeParkedOperation::new(key, now_ms);
-    let copies = drive(wake, context).await;
-    let walk = crate::s3::abe_copies::CompleteCopiesOperation::new(key, origin);
-    let envelopes = drive(walk, context).await;
-    queued?;
-    resumed.map_err(KeyWakeError::Transition)?;
-    copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;
-    envelopes.map_err(|error| KeyWakeError::Envelopes(error.to_string()))?;
-    Ok((woken?, promoted?))
+    limits: RoCrateLimits,
+    step: WakeStep,
+    woken: Result<usize, JobMutationError>,
+    queued: Result<(), JobMutationError>,
+    resumed: Result<(), String>,
+    promoted: Result<usize, PromoteError>,
+    copies: Result<(), String>,
 }
 
-pub(crate) async fn read_row(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, String> {
-    let effect = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
+type WakeNext = Result<Next<(usize, usize)>, KeyWakeError>;
+
+impl WakeUnlockedOperation {
+    pub fn new(
+        key: BucketKeyRef,
+        now_ms: u64,
+        origin: (RealmId, NodeId),
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            key,
+            now_ms,
+            origin,
+            limits: limits.clone(),
+            step: WakeStep::Jobs,
+            woken: Ok(0),
+            queued: Ok(()),
+            resumed: Ok(()),
+            promoted: Ok(0),
+            copies: Ok(()),
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
+    }
+
+    fn call(&mut self, step: WakeStep, call: IoCall) -> WakeNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn resume(&mut self, step: WakeStep) -> WakeNext {
+        let resume = ResumeTransitionsOperation::new(self.key);
+        self.call(step, IoCall::child(resume))
+    }
+
+    /// A failed earlier resume stays the answer.
+    fn note_resume(&mut self, result: IoResult) -> Result<(), IoError> {
+        let resumed = result.child::<(), MigrationError>()?;
+        if self.resumed.is_ok() {
+            self.resumed = resumed.map_err(|error| error.to_string());
+        }
+        Ok(())
+    }
+
+    /// Copies waiting for this source key run after promotion, so pending sources are hashed.
+    fn wake_copies(&mut self) -> WakeNext {
+        let wake = WakeParkedOperation::new(self.key, self.now_ms);
+        self.call(WakeStep::Copies, IoCall::child(wake))
+    }
+
+    fn finish(&mut self, envelopes: Result<(), String>) -> WakeNext {
+        std::mem::replace(&mut self.queued, Ok(()))?;
+        std::mem::replace(&mut self.resumed, Ok(())).map_err(KeyWakeError::Transition)?;
+        std::mem::replace(&mut self.copies, Ok(())).map_err(KeyWakeError::Copies)?;
+        envelopes.map_err(KeyWakeError::Envelopes)?;
+        let woken = std::mem::replace(&mut self.woken, Ok(0))?;
+        let promoted = std::mem::replace(&mut self.promoted, Ok(0))?;
+        Ok(Next::Done((woken, promoted)))
     }
 }
 
-fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
-    result.map_err(|error| error.0)
+impl Operation for WakeUnlockedOperation {
+    type Output = (usize, usize);
+    type Error = KeyWakeError;
+
+    fn first(&mut self) -> WakeNext {
+        let wake = row_calls::wake_key_waits(self.key, self.now_ms);
+        Ok(Next::Call(IoCall::child(wake)))
+    }
+
+    fn next(&mut self, result: IoResult) -> WakeNext {
+        match self.step {
+            // Remote waiters get owed wakes before promotion, so a corrupt archive never
+            // holds them back.
+            WakeStep::Jobs => {
+                self.woken = result.child::<usize, JobMutationError>()?;
+                let remote = RemoteWakesOperation::new(self.key);
+                self.call(WakeStep::Remote, IoCall::child(remote))
+            }
+            WakeStep::Remote => {
+                self.queued = result.child::<(), JobMutationError>()?;
+                self.resume(WakeStep::Resume)
+            }
+            WakeStep::Resume => {
+                self.note_resume(result)?;
+                let promote = PromoteUnlockedOperation::new(self.key, self.origin, &self.limits);
+                self.call(WakeStep::Promote, IoCall::child(promote))
+            }
+            WakeStep::Promote => {
+                self.promoted = result.child::<usize, PromoteError>()?;
+                match self.promoted {
+                    Ok(0) => self.wake_copies(),
+                    _ => self.resume(WakeStep::ResumeAgain),
+                }
+            }
+            WakeStep::ResumeAgain => {
+                self.note_resume(result)?;
+                self.wake_copies()
+            }
+            WakeStep::Copies => {
+                let copies = result.child::<usize, BlobQueueError>()?;
+                self.copies = copies.map(|_| ()).map_err(|error| error.to_string());
+                let walk = CompleteCopiesOperation::new(self.key, self.origin);
+                self.call(WakeStep::Envelopes, IoCall::child(walk))
+            }
+            WakeStep::Envelopes => {
+                let envelopes = result.child::<usize, CompleteCopiesError>()?;
+                self.finish(envelopes.map(|_| ()).map_err(|error| error.to_string()))
+            }
+        }
+    }
 }
 
-/// See [`VersionWaitOperation`].
-pub(crate) async fn version_wait(
-    context: &DriverContext,
-    place: (NodeId, Ulid),
-    version: &VersionKey,
-) -> Result<Option<KeyWait>, String> {
-    lookup(drive(VersionWaitOperation::new(place, version.clone()), context).await)
-}
-
-/// See [`ParkLockedOperation::on_error`].
-pub(crate) async fn park_on_lock(
-    context: &DriverContext,
-    record: &JobRecord,
-    token: Ulid,
-    node_id: NodeId,
-    error: &JobError,
-) -> bool {
-    let node = (node_id, context.node_and_realm());
-    let now_ms = unix_timestamp_millis();
-    let park = ParkLockedOperation::on_error(record, token, node, error, now_ms);
-    drive(park, context).await.unwrap_or(false)
-}
-
-/// See [`ParkLockedOperation`].
-pub(crate) async fn park_locked(
-    context: &DriverContext,
-    record: &JobRecord,
-    token: Ulid,
-    node_id: NodeId,
-) -> bool {
-    let node = (node_id, context.node_and_realm());
-    let park = ParkLockedOperation::new(record, token, node, unix_timestamp_millis());
-    drive(park, context).await.unwrap_or(false)
-}
+#[cfg(test)]
+pub(crate) use tests::wake_unlocked;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::key_locks::LockedInputsOperation;
-    use crate::jobs::store::key_wait::park_job;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+    use crate::driver::{DriverContext, drive};
+    use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
+    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::test_calls::park_job;
+    use crate::jobs::store::test_calls::{claim_job, read_job_record};
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
         PATHS_INDEX_KEYSPACE,
     };
     use aruna_core::structs::execution::job::CapturedInput;
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
-    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion};
+    use aruna_core::structs::execution::job::{
+        JobError, JobId, JobPayload, JobRecord, JobState, KeyWait,
+    };
+    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
     use aruna_core::structs::storage::encryption::BucketEncryption;
+    use aruna_core::time::unix_timestamp_millis;
     use byteview::ByteView;
+    use ulid::Ulid;
+
+    pub(crate) async fn wake_unlocked(
+        context: &DriverContext,
+        key: BucketKeyRef,
+        now_ms: u64,
+        origin: (RealmId, NodeId),
+        limits: &RoCrateLimits,
+    ) -> Result<(usize, usize), KeyWakeError> {
+        drive(
+            WakeUnlockedOperation::new(key, now_ms, origin, limits),
+            context,
+        )
+        .await
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    fn wake_op() -> WakeUnlockedOperation {
+        let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        WakeUnlockedOperation::new(key, 5, (RealmId([1; 32]), node), &RoCrateLimits::default())
+    }
+
+    fn is_call(next: &WakeNext) -> bool {
+        matches!(next, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    /// Runs the steps up to the promotion result.
+    fn at_promotion(operation: &mut WakeUnlockedOperation) {
+        assert!(is_call(&operation.first()));
+        assert!(is_call(
+            &operation.next(child(Ok::<_, JobMutationError>(1usize)))
+        ));
+        assert!(is_call(
+            &operation.next(child(Ok::<_, JobMutationError>(())))
+        ));
+        assert!(is_call(&operation.next(child(Ok::<_, MigrationError>(())))));
+        assert_eq!(operation.step, WakeStep::Promote);
+    }
+
+    fn after_copies(operation: &mut WakeUnlockedOperation) -> WakeNext {
+        assert!(is_call(
+            &operation.next(child(Ok::<_, BlobQueueError>(0usize)))
+        ));
+        operation.next(child(Ok::<_, CompleteCopiesError>(0usize)))
+    }
+
+    // Nothing promoted needs no second resume, and the counts are the answer.
+    #[test]
+    fn plain_wake_counts() {
+        let mut operation = wake_op();
+        at_promotion(&mut operation);
+        assert!(is_call(
+            &operation.next(child(Ok::<_, PromoteError>(0usize)))
+        ));
+        assert_eq!(operation.step, WakeStep::Copies);
+        assert_eq!(after_copies(&mut operation), Ok(Next::Done((1, 0))));
+    }
+
+    // A promotion can unblock transitions, so they resume once more.
+    #[test]
+    fn promotion_resumes_again() {
+        let mut operation = wake_op();
+        at_promotion(&mut operation);
+        assert!(is_call(
+            &operation.next(child(Ok::<_, PromoteError>(2usize)))
+        ));
+        assert_eq!(operation.step, WakeStep::ResumeAgain);
+        assert!(is_call(&operation.next(child(Ok::<_, MigrationError>(())))));
+        assert_eq!(after_copies(&mut operation), Ok(Next::Done((1, 2))));
+    }
+
+    // A failed promotion stops nothing behind it and is reported at the end.
+    #[test]
+    fn promotion_failure_last() {
+        let mut operation = wake_op();
+        at_promotion(&mut operation);
+        let failed = child(Err::<usize, _>(PromoteError::NoKey));
+        assert!(is_call(&operation.next(failed)));
+        assert!(is_call(&operation.next(child(Ok::<_, MigrationError>(())))));
+        assert_eq!(
+            after_copies(&mut operation),
+            Err(KeyWakeError::Promote(PromoteError::NoKey))
+        );
+    }
+
+    // The first resume failure is kept when the second resume passes.
+    #[test]
+    fn resume_failure_kept() {
+        let mut operation = wake_op();
+        operation.first().unwrap();
+        operation
+            .next(child(Ok::<_, JobMutationError>(0usize)))
+            .unwrap();
+        operation
+            .next(child(Ok::<_, JobMutationError>(())))
+            .unwrap();
+        let failed = child(Err::<(), _>(MigrationError::Failed("stuck".to_string())));
+        operation.next(failed).unwrap();
+        operation
+            .next(child(Ok::<_, PromoteError>(1usize)))
+            .unwrap();
+        operation.next(child(Ok::<_, MigrationError>(()))).unwrap();
+        assert_eq!(
+            after_copies(&mut operation),
+            Err(KeyWakeError::Transition("stuck".to_string()))
+        );
+    }
+
+    async fn park_on_lock(
+        context: &DriverContext,
+        record: &JobRecord,
+        token: Ulid,
+        node_id: NodeId,
+        error: &JobError,
+    ) -> bool {
+        let node = (node_id, context.node_and_realm());
+        let now_ms = unix_timestamp_millis();
+        let park = ParkLockedOperation::on_error(record, token, node, error, now_ms);
+        drive(park, context).await.unwrap_or(false)
+    }
 
     #[tokio::test]
     async fn corrupt_archive_wakes() {
@@ -453,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::store::key_wait::read_key_waits;
+        use crate::jobs::store::test_calls::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;

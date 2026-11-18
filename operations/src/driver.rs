@@ -6,7 +6,6 @@ use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
-use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
@@ -78,17 +77,6 @@ fn read_load_permille() -> Option<u32> {
             None
         }
     }
-}
-
-/// Static ceilings of the executor backend a request with `constraint` would run on.
-pub fn executor_limits(
-    context: &DriverContext,
-    constraint: Option<&str>,
-) -> Option<ResourceEnvelope> {
-    let registry = context.compute_handle.as_ref()?;
-    let constraint = constraint.map(ExecutorKind::from_wire);
-    let backend = registry.select(constraint.as_ref())?;
-    Some(backend.capabilities().limits)
 }
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is

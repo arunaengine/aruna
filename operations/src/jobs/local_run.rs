@@ -410,7 +410,7 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive, executor_limits};
+    use crate::driver::{DriverContext, drive};
     use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
@@ -448,13 +448,7 @@ mod tests {
         ctx: &DriverContext,
         config: LocalExecutionConfig,
     ) -> Result<SubmitJobResult, LocalExecutionError> {
-        let constraint = config.spec.executor_constraint.as_deref();
-        let limits = executor_limits(ctx, constraint);
-        drive(
-            LocalRunOperation::new(config, limits, ctx.node_and_realm()),
-            ctx,
-        )
-        .await
+        drive(crate::tasks::job_node::local_run(config, ctx), ctx).await
     }
 
     const REALM: RealmId = RealmId([3u8; 32]);

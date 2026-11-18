@@ -62,7 +62,11 @@ pub(crate) fn record_of(payload: JobPayload) -> JobRecord {
     JobRecord::new(job_id(), payload, owner(), node(7), 1, 1, None)
 }
 
-pub(crate) fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+pub(crate) fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(ChildOutcome::new(result))
 }
 
