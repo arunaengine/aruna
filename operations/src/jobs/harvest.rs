@@ -2,38 +2,40 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashSet;
-use std::future::Future;
-use std::time::{Duration, SystemTime};
+use std::collections::{HashSet, VecDeque};
+use std::time::Duration;
 
-use aruna_blob::blob::BlobHandle;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::repository::remote::{
+    HarvestWrite, HarvestWriteFailure, RemoteAnswer, RemoteCall, RemoteFailure, StopReason,
+};
+use aruna_core::rows::{event, page};
 use aruna_core::structs::execution::harvest::{
-    HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
-    HarvestSource, IncomingRecord, ProvenanceDecision, RepositoryConnector,
-    RepositoryConnectorKind, provenance_decision,
+    HarvestCursor, HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSource,
+    IncomingRecord, ProvenanceDecision, RepositoryConnector, RepositoryConnectorKind,
+    provenance_decision,
 };
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
-use aruna_core::types::GroupId;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::error::AuthorizeError;
-use crate::auth::error::PolicyEnforcementError;
+use super::repository::access::{AccessCheckOperation, AccessError};
+use super::repository::link_store::time_of;
+use super::repository::{JobScope, NodeScope, remote_answer, remote_call};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::forward::authorize::{CreateScope, authorize_create};
-use crate::forward::transport::MetadataWriteError;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
-    OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
+    OaiPage, OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
 use crate::harvest::oai_pmh::request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
@@ -42,18 +44,9 @@ use crate::harvest::repository::{
     write_source_effect,
 };
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
-use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
-use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-};
-use crate::metadata::create_entry::mint_job_document;
-use crate::metadata::forward::write::{
-    route_metadata_create, route_metadata_delete, route_metadata_update,
-};
-use crate::metadata::record_reads::load_document_record;
-use crate::metadata::update_document::UpdateDocumentMutation;
-use aruna_core::metadata::AuthToken;
+use crate::jobs::executor::JobRunOutcome;
+use crate::metadata::create_document::mint_document_for;
+use crate::metadata::repository::{parse_registry_read, read_document_registry};
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -61,31 +54,43 @@ use aruna_core::metadata::AuthToken;
 const MAX_HARVEST_PAGES: u32 = 10_000;
 /// Total wall clock one harvest run may spend paging.
 const HARVEST_RUN_DEADLINE: Duration = Duration::from_secs(1800);
-/// Hard cap on one decoded OAI-PMH response body.
-const HARVEST_BODY_BYTES: usize = 32 * 1024 * 1024;
-/// Total wall clock one fetch may take, connect through last byte.
-const HARVEST_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 
-#[derive(Default)]
-struct HarvestCounts {
+/// What one harvest run did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HarvestCounts {
     minted: u64,
     updated: u64,
     tombstoned: u64,
     skipped: u64,
 }
 
-#[derive(Debug)]
-enum HarvestFailure {
+impl HarvestCounts {
+    fn add(&mut self, applied: RecordApplied) {
+        match applied {
+            RecordApplied::Minted => self.minted += 1,
+            RecordApplied::Updated => self.updated += 1,
+            RecordApplied::Tombstoned => self.tombstoned += 1,
+            RecordApplied::Skipped => self.skipped += 1,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum HarvestFailure {
     Cancelled,
     Interrupted,
     Job(JobError),
 }
 
-/// Run one harvest: page through OAI-PMH ListRecords, apply each record through
-/// the metadata write seam with the source's group authority, and advance the
-/// cursor. Idempotent by harvest provenance, so a fenced re-run re-applies nothing.
-pub async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
-    match harvest(ctx, spec).await {
+impl From<IoError> for HarvestFailure {
+    fn from(error: IoError) -> Self {
+        retryable(format!("harvest storage: {error}"))
+    }
+}
+
+/// The job outcome of a finished harvest run.
+pub fn harvest_outcome(result: Result<HarvestCounts, HarvestFailure>) -> JobRunOutcome {
+    match result {
         Ok(counts) => JobRunOutcome::Succeeded(JobResultPayload::Harvest {
             minted: counts.minted,
             updated: counts.updated,
@@ -98,145 +103,401 @@ pub async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunO
     }
 }
 
-async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCounts, HarvestFailure> {
-    let mut source = read_source(ctx, spec.group_id, spec.source_id)
-        .await?
-        .ok_or_else(|| permanent("harvest source not found"))?;
-    let connector = read_connector(ctx, source.group_id, source.connector_id)
-        .await?
-        .ok_or_else(|| permanent("repository connector not found"))?;
-    if connector.kind != RepositoryConnectorKind::OaiPmh {
-        return Err(permanent(
-            "harvest requires an OAI-PMH repository connector",
-        ));
-    }
+type Turn<T> = Result<Next<T>, HarvestFailure>;
 
-    let net = ctx
-        .driver
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| permanent("net plane unavailable for harvest"))?;
-    let realm_id = *net.realm_id();
-    let blob = ctx
-        .driver
-        .blob_handle
-        .as_ref()
-        .ok_or_else(|| permanent("blob handle unavailable for harvest"))?;
-    let actor = Actor {
-        node_id: ctx.owner_node_id,
-        user_id: source.created_by,
-        realm_id,
-    };
+/// What runs after the source row was written.
+#[derive(Debug, PartialEq)]
+enum AfterSave {
+    Listing,
+    NextPage,
+    Finish,
+    Fail(HarvestFailure),
+    /// The provider disowned its token: restart the window once, else fail with this error.
+    Restart(OaiParseError),
+}
 
-    let original_last = source
-        .cursor
-        .as_ref()
-        .map(|cursor| cursor.last_datestamp_ms)
-        .unwrap_or(0);
-    if source.granularity.is_none() {
-        source.granularity = discover_granularity(ctx, blob, &connector.endpoint).await;
-        if source.granularity.is_some() {
-            persist_source(ctx, &source).await?;
+#[derive(Debug, PartialEq)]
+enum HarvestStep {
+    Source,
+    Connector,
+    Identify,
+    Save(AfterSave),
+    Gate,
+    Fetch,
+    RecordGate,
+    Record,
+}
+
+/// One harvest: pages through OAI-PMH ListRecords, applies each record through the metadata
+/// write seam with the source's group authority, and advances the cursor. Idempotent by harvest
+/// provenance, so a fenced re-run re-applies nothing.
+#[derive(Debug, PartialEq)]
+pub struct HarvestJobOperation {
+    scope: NodeScope,
+    job: JobScope,
+    spec: HarvestJobSpec,
+    source: Option<HarvestSource>,
+    endpoint: String,
+    actor: Option<Actor>,
+    original_last: u64,
+    from: Option<String>,
+    token: Option<String>,
+    resumed: Option<String>,
+    overall_max: u64,
+    counts: HarvestCounts,
+    // One restart per run at most: a provider that keeps rejecting its own tokens must not be
+    // able to loop the listing back to the start forever.
+    restarted: bool,
+    warned_datestamp: bool,
+    seen_tokens: HashSet<[u8; 32]>,
+    page_index: u32,
+    records: VecDeque<OaiRecord>,
+    page_size: u64,
+    page_token: Option<String>,
+    started_ms: Option<u64>,
+    now_ms: u64,
+    step: HarvestStep,
+}
+
+impl HarvestJobOperation {
+    pub fn new(scope: NodeScope, job: JobScope, spec: HarvestJobSpec) -> Self {
+        Self {
+            scope,
+            job,
+            spec,
+            source: None,
+            endpoint: String::new(),
+            actor: None,
+            original_last: 0,
+            from: None,
+            token: None,
+            resumed: None,
+            overall_max: 0,
+            counts: HarvestCounts::default(),
+            restarted: false,
+            warned_datestamp: false,
+            seen_tokens: HashSet::new(),
+            page_index: 0,
+            records: VecDeque::new(),
+            page_size: 0,
+            page_token: None,
+            started_ms: None,
+            now_ms: 0,
+            step: HarvestStep::Source,
         }
     }
-    let from = format_window(original_last, source.granularity.unwrap_or_default());
-    let mut resumption_token = source
-        .cursor
-        .as_ref()
-        .and_then(|cursor| cursor.resumption_token.clone());
-    let mut overall_max = original_last;
-    let mut counts = HarvestCounts::default();
 
-    // One restart per run at most: a provider that keeps rejecting its own
-    // tokens must not be able to loop the listing back to the start forever.
-    let mut restarted = false;
-    let mut warned_datestamp = false;
-    let mut seen_tokens: HashSet<[u8; 32]> = HashSet::new();
-    let started = tokio::time::Instant::now();
+    fn source(&self) -> Result<&HarvestSource, HarvestFailure> {
+        self.source
+            .as_ref()
+            .ok_or_else(|| permanent("harvest source not found"))
+    }
 
-    for page_index in 0..MAX_HARVEST_PAGES {
-        check_signals(ctx)?;
-        if page_index + 1 == MAX_HARVEST_PAGES || started.elapsed() > HARVEST_RUN_DEADLINE {
-            // Budget exhaustion is not a defect in the source: keep the position
-            // so the next run continues where this one stopped.
-            persist_cursor(ctx, &source, original_last, resumption_token).await?;
-            return Err(retryable("harvest exhausted its paging or time budget"));
+    fn checkpoint(&self) -> IoCall {
+        remote_call(RemoteCall::Checkpoint, Some(self.job.stop.clone()))
+    }
+
+    fn fetch(&self, url: url::Url) -> IoCall {
+        remote_call(RemoteCall::OaiFetch { url }, Some(self.job.stop.clone()))
+    }
+
+    fn connector(&mut self, connector: RepositoryConnector) -> Turn<HarvestCounts> {
+        if connector.kind != RepositoryConnectorKind::OaiPmh {
+            return Err(permanent(
+                "harvest requires an OAI-PMH repository connector",
+            ));
         }
-        let resumed = resumption_token.clone();
+        let (_, realm_id) = self
+            .scope
+            .node
+            .ok_or_else(|| permanent("net plane unavailable for harvest"))?;
+        if !self.scope.has_blob {
+            return Err(permanent("blob handle unavailable for harvest"));
+        }
+        let source = self.source()?;
+        let actor = Actor {
+            node_id: self.job.owner_node,
+            user_id: source.created_by,
+            realm_id,
+        };
+        let original_last = source
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.last_datestamp_ms);
+        let needs_granularity = source.granularity.is_none();
+        self.actor = Some(actor);
+        self.original_last = original_last;
+        self.endpoint = connector.endpoint;
+        if needs_granularity {
+            // `Identify` is a hint, not a gate: an unreachable or unparseable answer leaves
+            // this run on the baseline and is rediscovered next run.
+            if let Ok(url) = identify_url(&self.endpoint) {
+                self.step = HarvestStep::Identify;
+                return Ok(Next::Call(self.fetch(url)));
+            }
+        }
+        self.begin_listing()
+    }
+
+    fn begin_listing(&mut self) -> Turn<HarvestCounts> {
+        let source = self.source()?;
+        let from = format_window(self.original_last, source.granularity.unwrap_or_default());
+        let token = source
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.resumption_token.clone());
+        self.from = from;
+        self.token = token;
+        self.overall_max = self.original_last;
+        self.gate()
+    }
+
+    fn gate(&mut self) -> Turn<HarvestCounts> {
+        self.step = HarvestStep::Gate;
+        Ok(Next::Call(self.checkpoint()))
+    }
+
+    fn save_source(&mut self, source: &HarvestSource, then: AfterSave) -> Turn<HarvestCounts> {
+        let mut updated = source.clone();
+        updated.updated_at = time_of(self.now_ms);
+        let effect = write_source_effect(&updated, None)
+            .map_err(|error| permanent(format!("harvest source encode: {error}")))?;
+        self.step = HarvestStep::Save(then);
+        Ok(Next::Call(effect.into()))
+    }
+
+    fn save_cursor(
+        &mut self,
+        last_datestamp_ms: u64,
+        resumption_token: Option<String>,
+        then: AfterSave,
+    ) -> Turn<HarvestCounts> {
+        let mut updated = self.source()?.clone();
+        updated.cursor = Some(HarvestCursor {
+            last_datestamp_ms,
+            resumption_token,
+        });
+        self.save_source(&updated, then)
+    }
+
+    fn request_page(&mut self) -> Turn<HarvestCounts> {
+        let elapsed = self
+            .now_ms
+            .saturating_sub(self.started_ms.unwrap_or(self.now_ms));
+        if self.page_index + 1 == MAX_HARVEST_PAGES
+            || elapsed > HARVEST_RUN_DEADLINE.as_millis() as u64
+        {
+            // Budget exhaustion is not a defect in the source: keep the position so the next
+            // run continues where this one stopped.
+            let token = self.token.clone();
+            let failure = retryable("harvest exhausted its paging or time budget");
+            return self.save_cursor(self.original_last, token, AfterSave::Fail(failure));
+        }
+        self.resumed = self.token.clone();
+        let source = self.source()?;
         let url = list_records_url(
-            &connector.endpoint,
+            &self.endpoint,
             &source.selector,
-            from.as_deref(),
-            resumed.as_deref(),
+            self.from.as_deref(),
+            self.resumed.as_deref(),
         )
         .map_err(|error| permanent(format!("invalid OAI endpoint URL: {error}")))?;
+        self.step = HarvestStep::Fetch;
+        Ok(Next::Call(self.fetch(url)))
+    }
 
-        let body = fetch(ctx, blob, url).await?;
-        let page = match parse_list_page(&body) {
+    fn take_page(&mut self, body: &str) -> Turn<HarvestCounts> {
+        let page = match parse_list_page(body) {
             Ok(page) => page,
-            Err(error) if resumed.is_some() => {
-                persist_cursor(ctx, &source, original_last, None).await?;
-                // The provider disowned its own token. Restart the same window
-                // once in this run; a second rejection is the provider's fault.
-                if !restarted && is_bad_token(&error) {
-                    restarted = true;
-                    resumption_token = None;
-                    // A restart is a fresh listing: the provider may legitimately
-                    // hand back the same token names again.
-                    seen_tokens.clear();
-                    continue;
-                }
-                return Err(retryable(format!(
-                    "OAI resumption token rejected, listing restarts next run: {error}"
-                )));
+            Err(error) if self.resumed.is_some() => {
+                return self.save_cursor(self.original_last, None, AfterSave::Restart(error));
             }
             Err(error) => return Err(classify_parse(error)),
         };
-
-        for record in &page.records {
-            check_signals(ctx)?;
-            // An unparseable datestamp harvests as epoch zero; one warning per
-            // run names the offending value without flooding a large listing.
-            let datestamp_ms = parse_datestamp_ms(&record.header.datestamp).unwrap_or_else(|| {
-                if !warned_datestamp {
-                    warned_datestamp = true;
-                    warn!(
-                        datestamp = %record.header.datestamp,
-                        identifier = %record.header.identifier,
-                        "Unparseable OAI datestamp; harvesting the record as epoch zero"
-                    );
-                }
-                0
-            });
-            overall_max = overall_max.max(datestamp_ms);
-            Box::pin(apply_record(
-                ctx,
-                &source,
-                &actor,
-                realm_id,
-                record,
-                datestamp_ms,
-                &mut counts,
-            ))
-            .await?;
-        }
-        ctx.progress.advance(page.records.len() as u64);
-
-        resumption_token = page.resumption_token.clone();
-        let Some(token) = resumption_token.clone() else {
-            // Complete: advance the window so the next harvest is incremental.
-            persist_cursor(ctx, &source, overall_max, None).await?;
-            return Ok(counts);
-        };
-        if !seen_tokens.insert(*blake3::hash(token.as_bytes()).as_bytes()) {
-            persist_cursor(ctx, &source, original_last, None).await?;
-            return Err(retryable("OAI provider returned a resumption token twice"));
-        }
-        // Mid-list: keep the window fixed and store the token so a re-run resumes.
-        persist_cursor(ctx, &source, original_last, Some(token)).await?;
+        let OaiPage {
+            records,
+            resumption_token,
+        } = page;
+        self.page_size = records.len() as u64;
+        self.records = records.into();
+        self.page_token = resumption_token;
+        self.next_record()
     }
 
-    Err(retryable("harvest exhausted its paging budget"))
+    fn next_record(&mut self) -> Turn<HarvestCounts> {
+        if self.records.is_empty() {
+            return self.end_page();
+        }
+        self.step = HarvestStep::RecordGate;
+        Ok(Next::Call(self.checkpoint()))
+    }
+
+    fn apply_next(&mut self) -> Turn<HarvestCounts> {
+        let record = self
+            .records
+            .pop_front()
+            .ok_or_else(|| retryable("harvest record missing"))?;
+        // An unparseable datestamp harvests as epoch zero; one warning per run names the
+        // offending value without flooding a large listing.
+        let datestamp_ms = parse_datestamp_ms(&record.header.datestamp).unwrap_or_else(|| {
+            if !self.warned_datestamp {
+                self.warned_datestamp = true;
+                warn!(
+                    datestamp = %record.header.datestamp,
+                    identifier = %record.header.identifier,
+                    "Unparseable OAI datestamp; harvesting the record as epoch zero"
+                );
+            }
+            0
+        });
+        self.overall_max = self.overall_max.max(datestamp_ms);
+        let actor = self
+            .actor
+            .clone()
+            .ok_or_else(|| permanent("net plane unavailable for harvest"))?;
+        let apply = ApplyRecordOperation::new(self.source()?.clone(), actor, record, datestamp_ms);
+        self.step = HarvestStep::Record;
+        Ok(Next::Call(IoCall::child(apply)))
+    }
+
+    fn end_page(&mut self) -> Turn<HarvestCounts> {
+        self.job.progress.advance(self.page_size);
+        self.token = self.page_token.take();
+        let Some(token) = self.token.clone() else {
+            // Complete: advance the window so the next harvest is incremental.
+            return self.save_cursor(self.overall_max, None, AfterSave::Finish);
+        };
+        if !self.seen_tokens.insert(*blake3::hash(token.as_bytes()).as_bytes()) {
+            let failure = retryable("OAI provider returned a resumption token twice");
+            return self.save_cursor(self.original_last, None, AfterSave::Fail(failure));
+        }
+        // Mid-list: keep the window fixed and store the token so a re-run resumes.
+        self.save_cursor(self.original_last, Some(token), AfterSave::NextPage)
+    }
+
+    fn after_save(&mut self, then: AfterSave) -> Turn<HarvestCounts> {
+        match then {
+            AfterSave::Listing => self.begin_listing(),
+            AfterSave::NextPage => {
+                self.page_index += 1;
+                self.gate()
+            }
+            AfterSave::Finish => Ok(Next::Done(std::mem::take(&mut self.counts))),
+            AfterSave::Fail(failure) => Err(failure),
+            AfterSave::Restart(error) => {
+                if !self.restarted && is_bad_token(&error) {
+                    self.restarted = true;
+                    self.token = None;
+                    // A restart is a fresh listing: the provider may legitimately hand back
+                    // the same token names again.
+                    self.seen_tokens.clear();
+                    self.page_index += 1;
+                    return self.gate();
+                }
+                Err(retryable(format!(
+                    "OAI resumption token rejected, listing restarts next run: {error}"
+                )))
+            }
+        }
+    }
+}
+
+/// The text of a fetch, or the failure it ended with.
+fn fetched(result: IoResult) -> Result<Result<String, HarvestFailure>, HarvestFailure> {
+    Ok(match remote_answer(result)? {
+        Ok(RemoteAnswer::Text(body)) => Ok(body),
+        Ok(_) => Err(retryable("OAI fetch: unexpected answer")),
+        Err(failure) => Err(remote_failure(failure)),
+    })
+}
+
+fn passed(result: IoResult) -> Result<(), HarvestFailure> {
+    match remote_answer(result)? {
+        Ok(_) => Ok(()),
+        Err(failure) => Err(remote_failure(failure)),
+    }
+}
+
+fn remote_failure(failure: RemoteFailure) -> HarvestFailure {
+    match failure {
+        RemoteFailure::Stopped(StopReason::Cancelled) => HarvestFailure::Cancelled,
+        RemoteFailure::Stopped(StopReason::Interrupted) => HarvestFailure::Interrupted,
+        RemoteFailure::Permanent(message) => permanent(message),
+        RemoteFailure::Retryable(message) => retryable(message),
+        RemoteFailure::Invenio(error) => retryable(error.to_string()),
+    }
+}
+
+impl Operation for HarvestJobOperation {
+    type Output = HarvestCounts;
+    type Error = HarvestFailure;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.started_ms.get_or_insert(now_ms);
+    }
+
+    fn first(&mut self) -> Turn<HarvestCounts> {
+        Ok(Next::Call(
+            read_source_effect(self.spec.group_id, self.spec.source_id, None).into(),
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<HarvestCounts> {
+        match std::mem::replace(&mut self.step, HarvestStep::Gate) {
+            HarvestStep::Source => {
+                let source = parse_source_read(event(result)?)
+                    .map_err(read_failure)?
+                    .ok_or_else(|| permanent("harvest source not found"))?;
+                let call = read_connector_effect(source.group_id, source.connector_id, None);
+                self.source = Some(source);
+                self.step = HarvestStep::Connector;
+                Ok(Next::Call(call.into()))
+            }
+            HarvestStep::Connector => {
+                let connector = parse_connector_read(event(result)?)
+                    .map_err(read_failure)?
+                    .ok_or_else(|| permanent("repository connector not found"))?;
+                self.connector(connector)
+            }
+            HarvestStep::Identify => {
+                let granularity = fetched(result)?
+                    .ok()
+                    .and_then(|body| parse_granularity(&body));
+                let Some(granularity) = granularity else {
+                    return self.begin_listing();
+                };
+                let source = self
+                    .source
+                    .as_mut()
+                    .ok_or_else(|| permanent("harvest source not found"))?;
+                source.granularity = Some(granularity);
+                let source = source.clone();
+                self.save_source(&source, AfterSave::Listing)
+            }
+            HarvestStep::Save(then) => {
+                expect_write(event(result)?)?;
+                self.after_save(then)
+            }
+            HarvestStep::Gate => {
+                passed(result)?;
+                self.request_page()
+            }
+            HarvestStep::Fetch => {
+                let body = fetched(result)??;
+                self.take_page(&body)
+            }
+            HarvestStep::RecordGate => {
+                passed(result)?;
+                self.apply_next()
+            }
+            HarvestStep::Record => {
+                let applied = result.child::<RecordApplied, HarvestFailure>()??;
+                self.counts.add(applied);
+                self.next_record()
+            }
+        }
+    }
 }
 
 fn is_bad_token(error: &OaiParseError) -> bool {
@@ -252,343 +513,482 @@ fn classify_parse(error: OaiParseError) -> HarvestFailure {
     }
 }
 
-async fn apply_record(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    actor: &Actor,
-    realm_id: RealmId,
-    record: &OaiRecord,
+/// How one source record changed the harvest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecordApplied {
+    Minted,
+    Updated,
+    Tombstoned,
+    Skipped,
+}
+
+#[derive(Debug, PartialEq)]
+enum ApplyStep {
+    Provenance,
+    MintConfig,
+    MintPending(Ulid),
+    CreateAccess(Ulid),
+    Create(Ulid),
+    CreateStored(Ulid),
+    CreateUpdate,
+    UpdateAccess(Ulid),
+    UpdateStored(Ulid),
+    UpdatePending(Ulid),
+    Update(Ulid, bool),
+    TombstoneAccess(Ulid),
+    TombstoneStored(Ulid),
+    TombstonePending(Ulid),
+    Delete(Ulid),
+    Final(RecordApplied),
+}
+
+/// Applies one source record: its provenance decides, the metadata seam writes, and the
+/// provenance row records the outcome.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ApplyRecordOperation {
+    source: HarvestSource,
+    actor: Actor,
+    record: OaiRecord,
     datestamp_ms: u64,
-    counts: &mut HarvestCounts,
-) -> Result<(), HarvestFailure> {
-    let identifier = &record.header.identifier;
-    if identifier.is_empty() {
-        counts.skipped += 1;
-        return Ok(());
+    row: Option<HarvestProvenance>,
+    step: ApplyStep,
+}
+
+type ApplyTurn = Turn<RecordApplied>;
+
+impl ApplyRecordOperation {
+    pub(crate) fn new(
+        source: HarvestSource,
+        actor: Actor,
+        record: OaiRecord,
+        datestamp_ms: u64,
+    ) -> Self {
+        Self {
+            source,
+            actor,
+            record,
+            datestamp_ms,
+            row: None,
+            step: ApplyStep::Provenance,
+        }
     }
-    let existing = read_provenance(ctx, source.group_id, &source.namespace, identifier).await?;
-    let incoming = IncomingRecord {
-        datestamp_ms,
-        deleted: record.header.deleted,
-    };
 
-    let mut row = HarvestProvenance {
-        group_id: source.group_id,
-        namespace: source.namespace.clone(),
-        source_record_id: identifier.to_string(),
-        meta_resource_id: Ulid::nil(),
-        version: next_version(existing.as_ref()),
-        source_datestamp_ms: datestamp_ms,
-        state: HarvestRecordState::PendingCreate,
-        predecessors: existing
-            .as_ref()
-            .map(|provenance| provenance.predecessors.clone())
-            .unwrap_or_default(),
-    };
+    fn row(&mut self) -> Result<&mut HarvestProvenance, HarvestFailure> {
+        self.row
+            .as_mut()
+            .ok_or_else(|| retryable("harvest provenance row missing"))
+    }
 
-    match provenance_decision(existing.as_ref(), &incoming) {
-        ProvenanceDecision::Skip => counts.skipped += 1,
-        ProvenanceDecision::Mint => {
-            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
-            counts.minted += 1;
+    fn owner(&self) -> AuthContext {
+        AuthContext {
+            user_id: self.source.created_by,
+            realm_id: self.actor.realm_id,
+            path_restrictions: None,
+            session: None,
         }
-        ProvenanceDecision::Revive { predecessor } => {
-            row.predecessors.push(predecessor);
-            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
-            counts.minted += 1;
+    }
+
+    fn path(&self) -> Result<String, HarvestFailure> {
+        harvest_document_path(&self.source.target_prefix, &self.record.header.identifier)
+    }
+
+    fn write_row(&mut self, then: ApplyStep) -> ApplyTurn {
+        let row = self.row()?.clone();
+        let effect = write_provenance_effect(&row, None)
+            .map_err(|error| permanent(format!("provenance encode: {error}")))?;
+        self.step = then;
+        Ok(Next::Call(effect.into()))
+    }
+
+    fn finish_live(&mut self, document_id: Ulid, applied: RecordApplied) -> ApplyTurn {
+        let row = self.row()?;
+        row.meta_resource_id = document_id;
+        row.state = HarvestRecordState::Live;
+        self.write_row(ApplyStep::Final(applied))
+    }
+
+    /// Allocates a document id through the realm config; see [`ApplyStep::MintPending`].
+    fn mint(&mut self) -> ApplyTurn {
+        self.path()?;
+        self.step = ApplyStep::MintConfig;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.actor.realm_id,
+        ))))
+    }
+
+    /// Checks the source owner as a direct metadata create of the record's document path would.
+    fn access(&self, document_id: Ulid) -> Result<IoCall, HarvestFailure> {
+        let path = self.path()?;
+        Ok(IoCall::child(HarvestAccessOperation::new(
+            self.owner(),
+            self.source.group_id,
+            path,
+            document_id,
+        )))
+    }
+
+    fn create_access(&mut self, document_id: Ulid) -> ApplyTurn {
+        let call = self.access(document_id)?;
+        self.step = ApplyStep::CreateAccess(document_id);
+        Ok(Next::Call(call))
+    }
+
+    fn routed(&self, write: HarvestWrite) -> IoCall {
+        IoCall::Effect(Box::new(Effect::Net(NetEffect::HarvestWrite(Box::new(
+            write,
+        )))))
+    }
+
+    fn update_call(
+        &self,
+        document_id: Ulid,
+        record: Option<MetadataRegistryRecord>,
+    ) -> IoCall {
+        self.routed(HarvestWrite::Update {
+            actor: self.actor.clone(),
+            owner: self.owner(),
+            record: record.map(Box::new),
+            document_id,
+            jsonld: dc_to_jsonld(&self.record),
+        })
+    }
+
+    fn registry_call(document_id: Ulid) -> IoCall {
+        read_document_registry(document_id, None).into()
+    }
+
+    fn pending_call(document_id: Ulid) -> IoCall {
+        // An empty registry read is only evidence of absence once nothing committed for the
+        // document is still queued for projection here.
+        IoCall::Page {
+            space: PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: ByteView::from(document_id.to_bytes().to_vec()),
+            after: None,
+            limit: 1,
         }
-        ProvenanceDecision::ResumeCreate { meta_resource_id } => {
-            row.meta_resource_id = meta_resource_id;
-            row.source_datestamp_ms = datestamp_ms.max(
-                existing
-                    .as_ref()
-                    .map(|provenance| provenance.source_datestamp_ms)
-                    .unwrap_or(0),
-            );
-            create_document(ctx, source, actor, realm_id, meta_resource_id, record).await?;
-            row.state = HarvestRecordState::Live;
-            write_provenance(ctx, &row).await?;
-            counts.minted += 1;
-        }
-        ProvenanceDecision::Update { meta_resource_id } => {
-            authorize_write(ctx, source, realm_id, record, meta_resource_id).await?;
-            match read_stored(ctx, meta_resource_id).await? {
-                Some(stored) => {
-                    update_document(
-                        ctx,
-                        source,
-                        actor,
-                        realm_id,
-                        meta_resource_id,
-                        Some(&stored),
-                        record,
-                    )
-                    .await
-                    .map_err(apply_failure)?;
-                    row.meta_resource_id = meta_resource_id;
-                    row.state = HarvestRecordState::Live;
-                    write_provenance(ctx, &row).await?;
-                    counts.updated += 1;
-                }
-                // Local absence may be registry lag: ask the routed holders to update first
-                // and retire the identity only when all report it gone.
-                None => {
-                    confirm_absent(ctx, meta_resource_id).await?;
-                    match update_document(
-                        ctx,
-                        source,
-                        actor,
-                        realm_id,
-                        meta_resource_id,
-                        None,
-                        record,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            row.meta_resource_id = meta_resource_id;
-                            row.state = HarvestRecordState::Live;
-                            write_provenance(ctx, &row).await?;
-                            counts.updated += 1;
-                        }
-                        Err(MetadataWriteError::NotFound) => {
-                            row.predecessors.push(meta_resource_id);
-                            mint_and_create(ctx, source, actor, realm_id, record, &mut row).await?;
-                            counts.minted += 1;
-                        }
-                        Err(error) => return Err(apply_failure(error)),
-                    }
-                }
+    }
+
+    fn delete_call(&self, document_id: Ulid, record: Option<MetadataRegistryRecord>) -> IoCall {
+        self.routed(HarvestWrite::Delete {
+            actor: self.actor.clone(),
+            owner: self.owner(),
+            record: record.map(Box::new),
+            document_id,
+        })
+    }
+
+    fn decide(&mut self, existing: Option<HarvestProvenance>) -> ApplyTurn {
+        let incoming = IncomingRecord {
+            datestamp_ms: self.datestamp_ms,
+            deleted: self.record.header.deleted,
+        };
+        let decision = provenance_decision(existing.as_ref(), &incoming);
+        let mut row = HarvestProvenance {
+            group_id: self.source.group_id,
+            namespace: self.source.namespace.clone(),
+            source_record_id: self.record.header.identifier.clone(),
+            meta_resource_id: Ulid::nil(),
+            version: next_version(existing.as_ref()),
+            source_datestamp_ms: self.datestamp_ms,
+            state: HarvestRecordState::PendingCreate,
+            predecessors: existing
+                .as_ref()
+                .map(|provenance| provenance.predecessors.clone())
+                .unwrap_or_default(),
+        };
+        match decision {
+            ProvenanceDecision::Skip => Ok(Next::Done(RecordApplied::Skipped)),
+            ProvenanceDecision::Mint => {
+                self.row = Some(row);
+                self.mint()
+            }
+            ProvenanceDecision::Revive { predecessor } => {
+                row.predecessors.push(predecessor);
+                self.row = Some(row);
+                self.mint()
+            }
+            ProvenanceDecision::ResumeCreate { meta_resource_id } => {
+                row.meta_resource_id = meta_resource_id;
+                let stored = existing.map_or(0, |provenance| provenance.source_datestamp_ms);
+                row.source_datestamp_ms = self.datestamp_ms.max(stored);
+                self.row = Some(row);
+                self.create_access(meta_resource_id)
+            }
+            ProvenanceDecision::Update { meta_resource_id } => {
+                self.row = Some(row);
+                let call = self.access(meta_resource_id)?;
+                self.step = ApplyStep::UpdateAccess(meta_resource_id);
+                Ok(Next::Call(call))
+            }
+            ProvenanceDecision::Tombstone { meta_resource_id } => {
+                self.row = Some(row);
+                let call = self.access(meta_resource_id)?;
+                self.step = ApplyStep::TombstoneAccess(meta_resource_id);
+                Ok(Next::Call(call))
             }
         }
-        ProvenanceDecision::Tombstone { meta_resource_id } => {
-            authorize_write(ctx, source, realm_id, record, meta_resource_id).await?;
-            confirm_withdrawn(ctx, source, actor, realm_id, meta_resource_id).await?;
-            row.meta_resource_id = meta_resource_id;
-            row.state = HarvestRecordState::Tombstoned;
-            write_provenance(ctx, &row).await?;
-            counts.tombstoned += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Prove the harvested document is gone before its provenance may go terminal.
-/// An empty local read is not evidence of absence, since the create may still be
-/// queued here; only a routed delete that succeeds or an all-absent answer retires it.
-async fn confirm_withdrawn(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    actor: &Actor,
-    realm_id: RealmId,
-    document_id: Ulid,
-) -> Result<(), HarvestFailure> {
-    let stored = read_stored(ctx, document_id).await?;
-    if stored.is_none() {
-        confirm_absent(ctx, document_id).await?;
-    }
-    match route_metadata_delete(
-        &ctx.driver,
-        actor.clone(),
-        stored.as_ref(),
-        document_id,
-        Some(internal_token(source.created_by, realm_id)),
-    )
-    .await
-    {
-        // Every holder reporting the document absent is the same evidence as a
-        // delete this run performed.
-        Ok(()) | Err(MetadataWriteError::NotFound) => Ok(()),
-        Err(error) => Err(apply_failure(error)),
     }
 }
 
-async fn read_stored(
-    ctx: &JobContext,
-    document_id: Ulid,
-) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    load_document_record(&ctx.driver, document_id)
-        .await
+fn stored_record(result: IoResult) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
+    parse_registry_read(event(result)?)
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
 
-/// An empty registry read is only evidence of absence once nothing committed
-/// for the document is still queued for projection here.
-async fn confirm_absent(ctx: &JobContext, document_id: Ulid) -> Result<(), HarvestFailure> {
-    if projection_pending(ctx, document_id).await? {
-        return Err(retryable(format!(
-            "harvest waits for the pending registry projection of {document_id}"
-        )));
+fn confirm_absent(result: IoResult, document_id: Ulid) -> Result<(), HarvestFailure> {
+    let (rows, _) = page(result)
+        .map_err(|error| retryable(format!("harvest pending projection scan: {error}")))?;
+    if rows.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(retryable(format!(
+        "harvest waits for the pending registry projection of {document_id}"
+    )))
 }
 
-/// Whether a committed metadata event for this document is still waiting to be
-/// projected into the local registry.
-async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool, HarvestFailure> {
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
-            prefix: Some(ByteView::from(document_id.to_bytes().to_vec())),
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(retryable(format!(
-            "harvest pending projection scan: {error}"
-        ))),
+fn routed_result(result: IoResult) -> Result<Result<(), HarvestWriteFailure>, HarvestFailure> {
+    match event(result)? {
+        Event::Net(NetEvent::HarvestWrite(answer)) => Ok(answer),
         other => Err(retryable(format!(
-            "harvest pending projection scan: unexpected {}",
+            "harvest write: unexpected {}",
             other.label()
         ))),
     }
 }
 
-/// Allocate a structured document id, record it as `PendingCreate` before the
-/// create runs, then confirm it. A crash in between leaves a retry the same id,
-/// so a replay converges on one document instead of orphaning one per attempt.
-async fn mint_and_create(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    actor: &Actor,
-    realm_id: RealmId,
-    record: &OaiRecord,
-    row: &mut HarvestProvenance,
-) -> Result<(), HarvestFailure> {
-    let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let document_id = mint_job_document(&ctx.driver, actor, source.group_id, &document_path)
-        .await
-        .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
-        .as_ulid();
-    row.meta_resource_id = document_id;
-    row.state = HarvestRecordState::PendingCreate;
-    write_provenance(ctx, row).await?;
-    create_document(ctx, source, actor, realm_id, document_id, record).await?;
-    row.state = HarvestRecordState::Live;
-    write_provenance(ctx, row).await
-}
+impl Operation for ApplyRecordOperation {
+    type Output = RecordApplied;
+    type Error = HarvestFailure;
 
-async fn create_document(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    actor: &Actor,
-    realm_id: RealmId,
-    document_id: Ulid,
-    record: &OaiRecord,
-) -> Result<(), HarvestFailure> {
-    let document_path = authorize_write(ctx, source, realm_id, record, document_id).await?;
-    let created = Box::pin(route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor: actor.clone(),
-            group_id: source.group_id,
-            document_id,
-            document_path: document_path.clone(),
-            public: false,
-            payload: CreateDocumentPayload::RoCrate {
-                jsonld: dc_to_jsonld(record),
-            },
-        }),
-        ctx.driver.clone(),
-        Some(internal_token(source.created_by, realm_id)),
-    ))
-    .await;
-    match created {
-        Ok(_) => Ok(()),
-        // A create the pending identity already committed under a different
-        // payload: the id is resolved, and the newer content lands as an update.
-        Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
-            let stored = read_stored(ctx, document_id).await?;
-            update_document(
-                ctx,
-                source,
-                actor,
-                realm_id,
-                document_id,
-                stored.as_ref(),
-                record,
-            )
-            .await
-            .map_err(apply_failure)
+    fn first(&mut self) -> ApplyTurn {
+        let identifier = &self.record.header.identifier;
+        if identifier.is_empty() {
+            return Ok(Next::Done(RecordApplied::Skipped));
         }
-        Err(error) => Err(apply_failure(error)),
+        Ok(Next::Call(
+            read_provenance_effect(
+                self.source.group_id,
+                &self.source.namespace,
+                identifier,
+                None,
+            )
+            .into(),
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> ApplyTurn {
+        match std::mem::replace(&mut self.step, ApplyStep::Provenance) {
+            ApplyStep::Provenance => {
+                let existing = parse_provenance_read(event(result)?).map_err(read_failure)?;
+                self.decide(existing)
+            }
+            // A pending row before the create leaves a retry the same id, so a replay converges
+            // on one document instead of orphaning one per attempt.
+            ApplyStep::MintConfig => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|error| retryable(format!("harvest mint document id: {error}")))?;
+                let path = self.path()?;
+                let document_id =
+                    mint_document_for(&config, &self.actor, self.source.group_id, &path, true)
+                        .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
+                        .as_ulid();
+                let row = self.row()?;
+                row.meta_resource_id = document_id;
+                row.state = HarvestRecordState::PendingCreate;
+                self.write_row(ApplyStep::MintPending(document_id))
+            }
+            ApplyStep::MintPending(document_id) => {
+                expect_write(event(result)?)?;
+                self.create_access(document_id)
+            }
+            ApplyStep::CreateAccess(document_id) => {
+                access_result(result)?;
+                let write = HarvestWrite::Create {
+                    actor: self.actor.clone(),
+                    owner: self.owner(),
+                    group_id: self.source.group_id,
+                    document_id,
+                    document_path: self.path()?,
+                    jsonld: dc_to_jsonld(&self.record),
+                };
+                self.step = ApplyStep::Create(document_id);
+                Ok(Next::Call(self.routed(write)))
+            }
+            ApplyStep::Create(document_id) => match routed_result(result)? {
+                Ok(()) => self.finish_live(document_id, RecordApplied::Minted),
+                // A create the pending identity already committed under a different payload:
+                // the id is resolved, and the newer content lands as an update.
+                Err(HarvestWriteFailure::AlreadyExists) => {
+                    self.step = ApplyStep::CreateStored(document_id);
+                    Ok(Next::Call(Self::registry_call(document_id)))
+                }
+                Err(error) => Err(apply_failure(error)),
+            },
+            ApplyStep::CreateStored(document_id) => {
+                let stored = stored_record(result)?;
+                let call = self.update_call(document_id, stored);
+                self.row()?.meta_resource_id = document_id;
+                self.step = ApplyStep::CreateUpdate;
+                Ok(Next::Call(call))
+            }
+            ApplyStep::CreateUpdate => {
+                routed_result(result)?.map_err(apply_failure)?;
+                let document_id = self.row()?.meta_resource_id;
+                self.finish_live(document_id, RecordApplied::Minted)
+            }
+            ApplyStep::UpdateAccess(document_id) => {
+                access_result(result)?;
+                self.step = ApplyStep::UpdateStored(document_id);
+                Ok(Next::Call(Self::registry_call(document_id)))
+            }
+            ApplyStep::UpdateStored(document_id) => match stored_record(result)? {
+                Some(stored) => {
+                    let call = self.update_call(document_id, Some(stored));
+                    self.step = ApplyStep::Update(document_id, true);
+                    Ok(Next::Call(call))
+                }
+                // Local absence may be registry lag: ask the routed holders to update first and
+                // retire the identity only when all report it gone.
+                None => {
+                    self.step = ApplyStep::UpdatePending(document_id);
+                    Ok(Next::Call(Self::pending_call(document_id)))
+                }
+            },
+            ApplyStep::UpdatePending(document_id) => {
+                confirm_absent(result, document_id)?;
+                let call = self.update_call(document_id, None);
+                self.step = ApplyStep::Update(document_id, false);
+                Ok(Next::Call(call))
+            }
+            ApplyStep::Update(document_id, stored) => match routed_result(result)? {
+                Ok(()) => self.finish_live(document_id, RecordApplied::Updated),
+                Err(HarvestWriteFailure::NotFound) if !stored => {
+                    self.row()?.predecessors.push(document_id);
+                    self.mint()
+                }
+                Err(error) => Err(apply_failure(error)),
+            },
+            // Prove the harvested document is gone before its provenance may go terminal. An
+            // empty local read is not evidence of absence, since the create may still be queued
+            // here; only a routed delete that succeeds or an all-absent answer retires it.
+            ApplyStep::TombstoneAccess(document_id) => {
+                access_result(result)?;
+                self.step = ApplyStep::TombstoneStored(document_id);
+                Ok(Next::Call(Self::registry_call(document_id)))
+            }
+            ApplyStep::TombstoneStored(document_id) => match stored_record(result)? {
+                Some(stored) => {
+                    let call = self.delete_call(document_id, Some(stored));
+                    self.step = ApplyStep::Delete(document_id);
+                    Ok(Next::Call(call))
+                }
+                None => {
+                    self.step = ApplyStep::TombstonePending(document_id);
+                    Ok(Next::Call(Self::pending_call(document_id)))
+                }
+            },
+            ApplyStep::TombstonePending(document_id) => {
+                confirm_absent(result, document_id)?;
+                let call = self.delete_call(document_id, None);
+                self.step = ApplyStep::Delete(document_id);
+                Ok(Next::Call(call))
+            }
+            ApplyStep::Delete(document_id) => {
+                match routed_result(result)? {
+                    // Every holder reporting the document absent is the same evidence as a
+                    // delete this run performed.
+                    Ok(()) | Err(HarvestWriteFailure::NotFound) => {}
+                    Err(error) => return Err(apply_failure(error)),
+                }
+                let row = self.row()?;
+                row.meta_resource_id = document_id;
+                row.state = HarvestRecordState::Tombstoned;
+                self.write_row(ApplyStep::Final(RecordApplied::Tombstoned))
+            }
+            ApplyStep::Final(applied) => {
+                expect_write(event(result)?)?;
+                Ok(Next::Done(applied))
+            }
+        }
     }
 }
 
-async fn update_document(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    actor: &Actor,
-    realm_id: RealmId,
-    document_id: Ulid,
-    stored: Option<&MetadataRegistryRecord>,
-    record: &OaiRecord,
-) -> Result<(), MetadataWriteError> {
-    Box::pin(route_metadata_update(
-        &ctx.driver,
-        actor.clone(),
-        stored,
-        document_id,
-        None,
-        UpdateDocumentMutation::ReplaceRoCrate {
-            jsonld: dc_to_jsonld(record),
-        },
-        None,
-        Some(internal_token(source.created_by, realm_id)),
-        None,
-    ))
-    .await?;
-    Ok(())
+fn access_result(result: IoResult) -> Result<(), HarvestFailure> {
+    result.child::<(), HarvestFailure>()?
 }
 
-/// Harvest writes run as the source owner, unrestricted, after [`authorize_write`].
-fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthToken {
-    AuthToken::internal(owner_auth(created_by, realm_id))
+/// Checks the source owner on the group's metadata and on the document's own path.
+#[derive(Debug, PartialEq)]
+struct HarvestAccessOperation {
+    owner: AuthContext,
+    group_id: aruna_core::types::GroupId,
+    record_path: String,
+    permission_path: String,
+    second: bool,
 }
 
-fn owner_auth(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id: created_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
+impl HarvestAccessOperation {
+    fn new(
+        owner: AuthContext,
+        group_id: aruna_core::types::GroupId,
+        record_path: String,
+        document_id: Ulid,
+    ) -> Self {
+        let permission_path = MetadataRegistryRecord::permission_path_for(
+            &owner.realm_id,
+            group_id,
+            &record_path,
+            document_id,
+        );
+        Self {
+            owner,
+            group_id,
+            record_path,
+            permission_path,
+            second: false,
+        }
+    }
+
+    fn check(&self, path: String) -> IoCall {
+        IoCall::child(AccessCheckOperation::new(
+            self.owner.realm_id,
+            &self.owner,
+            path,
+            Permission::WRITE,
+            PolicyRequestExtras::default(),
+        ))
     }
 }
 
-/// Checks the source owner as a direct metadata create of the record's document path would,
-/// and returns that path.
-async fn authorize_write(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    realm_id: RealmId,
-    record: &OaiRecord,
-    document_id: Ulid,
-) -> Result<String, HarvestFailure> {
-    let path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let checked = authorize_create(
-        &ctx.driver,
-        realm_id,
-        &owner_auth(source.created_by, realm_id),
-        PolicyRequestExtras::default(),
-        source.group_id,
-        &path,
-        document_id,
-        CreateScope::Group,
-    )
-    .await;
-    match checked {
-        Ok(()) => Ok(path),
-        Err(
-            AuthorizeError::PermissionDenied
-            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Err(permanent(format!(
-            "harvest write to [{path}] is not permitted"
-        ))),
-        Err(error) => Err(retryable(format!("harvest permission check: {error}"))),
+impl Operation for HarvestAccessOperation {
+    type Output = ();
+    type Error = HarvestFailure;
+
+    fn first(&mut self) -> Turn<()> {
+        let realm_id: RealmId = self.owner.realm_id;
+        Ok(Next::Call(
+            self.check(format!("/{realm_id}/g/{}/meta/**", self.group_id)),
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        result
+            .child::<(), AccessError>()?
+            .map_err(|error| match error {
+                AccessError::Denied(_) => permanent(format!(
+                    "harvest write to [{}] is not permitted",
+                    self.record_path
+                )),
+                AccessError::Unavailable(message) => {
+                    retryable(format!("harvest permission check: {message}"))
+                }
+            })?;
+        if self.second {
+            return Ok(Next::Done(()));
+        }
+        self.second = true;
+        Ok(Next::Call(self.check(self.permission_path.clone())))
     }
 }
 
@@ -623,168 +1023,6 @@ fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, Harve
     Ok(format!("{prefix}/{segment}"))
 }
 
-async fn write_provenance(
-    ctx: &JobContext,
-    provenance: &HarvestProvenance,
-) -> Result<(), HarvestFailure> {
-    let effect = write_provenance_effect(provenance, None)
-        .map_err(|error| permanent(format!("provenance encode: {error}")))?;
-    expect_write(ctx.driver.storage_handle.send_effect(effect).await)
-}
-
-async fn persist_cursor(
-    ctx: &JobContext,
-    source: &HarvestSource,
-    last_datestamp_ms: u64,
-    resumption_token: Option<String>,
-) -> Result<(), HarvestFailure> {
-    let mut updated = source.clone();
-    updated.cursor = Some(HarvestCursor {
-        last_datestamp_ms,
-        resumption_token,
-    });
-    persist_source(ctx, &updated).await
-}
-
-async fn persist_source(ctx: &JobContext, source: &HarvestSource) -> Result<(), HarvestFailure> {
-    let mut updated = source.clone();
-    updated.updated_at = SystemTime::now();
-    let effect = write_source_effect(&updated, None)
-        .map_err(|error| permanent(format!("harvest source encode: {error}")))?;
-    expect_write(ctx.driver.storage_handle.send_effect(effect).await)
-}
-
-/// Ask the provider once which datestamp precision it accepts. `Identify` is a
-/// hint, not a gate: an unreachable or unparseable answer leaves this run on the
-/// baseline and is rediscovered next run.
-async fn discover_granularity(
-    ctx: &JobContext,
-    blob: &BlobHandle,
-    endpoint: &str,
-) -> Option<HarvestGranularity> {
-    let url = identify_url(endpoint).ok()?;
-    let body = fetch(ctx, blob, url).await.ok()?;
-    parse_granularity(&body)
-}
-
-/// Fetch one OAI-PMH response under a hard byte cap and wall-clock deadline.
-/// Egress bounds only connect and read *inactivity*, so a slow-drip response
-/// would otherwise run until the node stops; the cap counts decoded bytes.
-async fn fetch(
-    ctx: &JobContext,
-    blob: &BlobHandle,
-    url: url::Url,
-) -> Result<String, HarvestFailure> {
-    let deadline = tokio::time::Instant::now() + HARVEST_FETCH_DEADLINE;
-    let request = blob
-        .egress_request(url)
-        .map_err(|error| permanent(format!("egress screen: {error}")))?;
-    let mut response = bounded(ctx, deadline, request.send())
-        .await?
-        .map_err(|error| retryable(format!("OAI fetch: {error}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let hint = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| format!(", retry after {value}"))
-            .unwrap_or_default();
-        return Err(retryable(format!("OAI HTTP status {status}{hint}")));
-    }
-    if let Some(declared) = response.content_length()
-        && declared > HARVEST_BODY_BYTES as u64
-    {
-        return Err(permanent(format!(
-            "OAI response declares {declared} bytes, over the {HARVEST_BODY_BYTES} byte cap"
-        )));
-    }
-
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = bounded(ctx, deadline, response.chunk())
-        .await?
-        .map_err(|error| retryable(format!("OAI body: {error}")))?
-    {
-        if body.len() + chunk.len() > HARVEST_BODY_BYTES {
-            return Err(permanent(format!(
-                "OAI response body exceeds the {HARVEST_BODY_BYTES} byte cap"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    String::from_utf8(body).map_err(|error| permanent(format!("OAI body is not UTF-8: {error}")))
-}
-
-/// Await one network step under the fetch deadline while staying responsive to
-/// cancel and shutdown, so the job drain budget holds against a slow provider.
-async fn bounded<T>(
-    ctx: &JobContext,
-    deadline: tokio::time::Instant,
-    future: impl Future<Output = T>,
-) -> Result<T, HarvestFailure> {
-    tokio::select! {
-        result = future => Ok(result),
-        () = ctx.cancel.cancelled() => Err(HarvestFailure::Cancelled),
-        () = ctx.shutdown.cancelled() => Err(HarvestFailure::Interrupted),
-        () = tokio::time::sleep_until(deadline) => {
-            Err(retryable("OAI fetch exceeded the total deadline"))
-        }
-    }
-}
-
-async fn read_source(
-    ctx: &JobContext,
-    group_id: GroupId,
-    source_id: Ulid,
-) -> Result<Option<HarvestSource>, HarvestFailure> {
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_effect(read_source_effect(group_id, source_id, None))
-        .await;
-    parse_source_read(event).map_err(read_failure)
-}
-
-async fn read_connector(
-    ctx: &JobContext,
-    group_id: GroupId,
-    connector_id: Ulid,
-) -> Result<Option<RepositoryConnector>, HarvestFailure> {
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_effect(read_connector_effect(group_id, connector_id, None))
-        .await;
-    parse_connector_read(event).map_err(read_failure)
-}
-
-async fn read_provenance(
-    ctx: &JobContext,
-    group_id: GroupId,
-    namespace: &str,
-    identifier: &str,
-) -> Result<Option<HarvestProvenance>, HarvestFailure> {
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_effect(read_provenance_effect(
-            group_id, namespace, identifier, None,
-        ))
-        .await;
-    parse_provenance_read(event).map_err(read_failure)
-}
-
-fn check_signals(ctx: &JobContext) -> Result<(), HarvestFailure> {
-    if ctx.cancel.is_cancelled() {
-        return Err(HarvestFailure::Cancelled);
-    }
-    if ctx.shutdown.is_cancelled() {
-        return Err(HarvestFailure::Interrupted);
-    }
-    Ok(())
-}
-
 fn expect_write(event: Event) -> Result<(), HarvestFailure> {
     match event {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
@@ -807,15 +1045,18 @@ fn read_failure(error: StorageReadError) -> HarvestFailure {
     retryable(format!("harvest storage read: {error}"))
 }
 
-fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
-    match classify_metadata(error) {
-        MetadataFailure::Retryable(message) => retryable(format!("harvest apply: {message}")),
-        MetadataFailure::Permanent(message) => {
+fn apply_failure(error: HarvestWriteFailure) -> HarvestFailure {
+    match error {
+        HarvestWriteFailure::Retryable(message) => retryable(format!("harvest apply: {message}")),
+        HarvestWriteFailure::Permanent(message) => {
             permanent(format!("harvest apply failed: {message}"))
         }
-        MetadataFailure::Validation(violations) => permanent(format!(
+        HarvestWriteFailure::Rejected(violations) => permanent(format!(
             "harvest record rejected by validation: {violations:?}"
         )),
+        error @ (HarvestWriteFailure::NotFound | HarvestWriteFailure::AlreadyExists) => {
+            permanent(format!("harvest apply failed: {error}"))
+        }
     }
 }
 
@@ -915,3 +1156,7 @@ mod pure_tests {
         assert_eq!(next_version(Some(&provenance)), 5);
     }
 }
+
+#[cfg(test)]
+#[path = "harvest_tests.rs"]
+mod operation_tests;
