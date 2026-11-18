@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
+use crate::jobs::records::pages::ServePageOperation;
+use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::after_sync::{apply_metadata, run_maintenance};
@@ -174,16 +176,19 @@ async fn peer_request(
     match message {
         record @ (MetadataTransportMessage::ForwardJobRecord { .. }
         | MetadataTransportMessage::ForwardRecordPage { .. }) => {
-            let answer = Box::pin(async {
-                crate::jobs::records::transport::serve_job_record(context, peer, record).await
-            });
-            Ok(answer.await)
+            let now_ms = aruna_core::time::unix_timestamp_millis();
+            let serving = context.node_and_realm();
+            let serve = ServeRecordOperation::new(peer, record, serving, now_ms);
+            Ok(Box::pin(drive(serve, context.as_ref()))
+                .await
+                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let answer = Box::pin(async {
-                crate::jobs::records::transport::serve_launch_offer(context, peer, *launch).await
-            });
-            Ok(answer.await)
+            let node = crate::jobs::lifecycle::target::launch_node(context, &launch);
+            let serve = ServeLaunchOperation::new(peer, *launch, node);
+            Ok(Box::pin(drive(serve, context.as_ref()))
+                .await
+                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardJobSubmission {
             auth_token,
@@ -217,10 +222,16 @@ async fn peer_request(
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page = crate::jobs::records::transport::serve_input_page(
-                context, peer, submission, digest,
-            );
-            let page = Box::pin(page).await;
+            let page = match context.node_and_realm() {
+                Some((_, realm_id)) => {
+                    let serve = ServePageOperation::new(realm_id, peer, submission, digest);
+                    Box::pin(drive(serve, context.as_ref()))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => None,
+            };
             Ok(MetadataTransportMessage::InputPageResult { page })
         }
         message => Err(message),

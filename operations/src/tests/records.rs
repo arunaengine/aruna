@@ -25,7 +25,11 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::target::launch_node;
+use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
+use crate::metadata::protocol::MetadataTransportMessage;
+use aruna_core::effects::LaunchFrame;
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
 use crate::jobs::records::verify::FamilyView;
 
@@ -425,4 +429,30 @@ pub async fn local_capability(
     crate::driver::drive(operation, context)
         .await
         .unwrap_or(Err(aruna_core::events::LaunchDecline::Draining))
+}
+
+/// Answers one record message the way the peer transport does.
+pub async fn serve_job_record(
+    context: &DriverContext,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let serve = ServeRecordOperation::new(peer, message, context.node_and_realm(), now_ms);
+    drive(serve, context)
+        .await
+        .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable)
+}
+
+/// Answers one launch offer the way the peer transport does.
+pub async fn serve_launch_offer(
+    context: &DriverContext,
+    peer: NodeId,
+    launch: LaunchFrame,
+) -> MetadataTransportMessage {
+    let node = launch_node(context, &launch);
+    let serve = ServeLaunchOperation::new(peer, launch, node);
+    drive(serve, context)
+        .await
+        .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable)
 }

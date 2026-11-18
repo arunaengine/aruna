@@ -21,10 +21,9 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::store::state::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::records::{Family, REALM, user};
+use crate::tests::records::{Family, REALM, serve_job_record, user};
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext {
