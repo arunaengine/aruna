@@ -109,7 +109,7 @@ use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
 use aruna_operations::s3::multipart::part_copy::{
-    PartCopyInput as UploadPartCopyData, keep_part_policies, upload_part_token,
+    KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
 };
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
@@ -1636,7 +1636,8 @@ impl S3 for ArunaS3Service {
         if let Some(copied) = forward::copy_context(&req.extensions, &req.headers)? {
             let upload = (self.realm_id, upload_id);
             let target = (req.input.bucket.as_str(), req.input.key.as_str());
-            keep_part_policies(&self.state, upload, target, &copied.policies)
+            let keep = KeepPoliciesOperation::new(upload, target, &copied.policies);
+            drive(keep, &self.state)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
         }
@@ -1832,24 +1833,26 @@ impl S3 for ArunaS3Service {
         let upload_id = self
             .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
             .await?;
-        let result = upload_part_token(
+        let result = drive(
+            PartCopyOperation::new(
+                UploadPartCopyData {
+                    source_bucket,
+                    source_key,
+                    source_version_id,
+                    source_group_id: source_bucket_info.group_id,
+                    dest_bucket: req.input.bucket,
+                    dest_key: req.input.key,
+                    upload_id,
+                    part_number,
+                    range,
+                    user_id: user_access.user_identity,
+                    node_id: self.node_id,
+                    conditions,
+                    source_auth_context,
+                },
+                token,
+            ),
             &self.state,
-            UploadPartCopyData {
-                source_bucket,
-                source_key,
-                source_version_id,
-                source_group_id: source_bucket_info.group_id,
-                dest_bucket: req.input.bucket,
-                dest_key: req.input.key,
-                upload_id,
-                part_number,
-                range,
-                user_id: user_access.user_identity,
-                node_id: self.node_id,
-                conditions,
-                source_auth_context,
-            },
-            token,
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;

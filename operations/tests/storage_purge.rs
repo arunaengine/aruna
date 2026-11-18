@@ -58,7 +58,7 @@ use aruna_operations::s3::multipart::complete::{
 use aruna_operations::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, upload_part_copy};
+use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
 };
@@ -304,23 +304,26 @@ async fn scoped_fence_isolates() {
         )))
     ));
     assert!(matches!(
-        upload_part_copy(
-            &context.driver,
-            PartCopyInput {
-                source_bucket: "bucket".to_string(),
-                source_key: "source.txt".to_string(),
-                source_version_id: None,
-                source_group_id: context.group_id,
-                dest_bucket: upload.bucket.clone(),
-                dest_key: upload.key.clone(),
-                upload_id: upload.upload_id,
-                part_number: 2,
-                range: None,
-                user_id: context.user_id,
-                node_id: context.node_id,
-                source_auth_context: auth(&context),
-                conditions: CopySourceConditions::default(),
-            },
+        drive(
+            PartCopyOperation::new(
+                PartCopyInput {
+                    source_bucket: "bucket".to_string(),
+                    source_key: "source.txt".to_string(),
+                    source_version_id: None,
+                    source_group_id: context.group_id,
+                    dest_bucket: upload.bucket.clone(),
+                    dest_key: upload.key.clone(),
+                    upload_id: upload.upload_id,
+                    part_number: 2,
+                    range: None,
+                    user_id: context.user_id,
+                    node_id: context.node_id,
+                    source_auth_context: auth(&context),
+                    conditions: CopySourceConditions::default(),
+                },
+                None
+            ),
+            &context.driver
         )
         .await,
         Err(PartCopyError::UploadPart(UploadPartError::PurgeFence(
