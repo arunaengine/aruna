@@ -504,6 +504,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// This node's signature over a group deletion plan.
+    DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// The caller a forwarded credential names, or why the peer may not act for it.
     WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
     /// The verified claims of a token named for revocation, or why it is invalid.
@@ -934,6 +936,7 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    DeletePlanSigned,
                     WritePeerChecked,
                     RevocationClaims,
                     Notification,

@@ -789,6 +789,9 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Signs this node's statement that it is ready for a group deletion plan; answers
+    /// `NetEvent::DeletePlanSigned`.
+    SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
     /// Checks a forwarded caller's credential and that the sending peer is a realm member;
     /// answers `NetEvent::WritePeerChecked`.
     AuthorizeWritePeer {

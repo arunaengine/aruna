@@ -5,6 +5,7 @@
 
 use aruna_core::events::{PolicySignEvent, VaultSignEvent};
 use aruna_core::structs::identity::user::vault::VaultRecords;
+use aruna_core::structs::identity::group_delete::{GroupDeletePlan, GroupDeleteProof};
 use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
 
 /// Signs one publication claim. A claim naming another publisher is refused, so no operation can
@@ -17,6 +18,18 @@ pub(crate) fn sign_publication(
         return PolicySignEvent::Unavailable("claim names another publisher".to_string());
     }
     PolicySignEvent::Signed(Box::new(claim.sign(key)))
+}
+
+/// This node's signed confirmation that it is ready for the group deletion `plan`.
+pub(crate) fn sign_delete_plan(
+    key: &iroh::SecretKey,
+    plan: &GroupDeletePlan,
+) -> Result<GroupDeleteProof, String> {
+    let bytes = plan.signing_bytes().map_err(|error| error.to_string())?;
+    Ok(GroupDeleteProof {
+        node_id: key.public(),
+        signature: key.sign(&bytes),
+    })
 }
 
 /// Signs records this node publishes. A record naming another node stays unsigned and fails the

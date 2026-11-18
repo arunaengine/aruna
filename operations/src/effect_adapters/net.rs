@@ -149,6 +149,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
                 VaultSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
+            NetEffect::SignDeletePlan(_) => {
+                Event::Net(NetEvent::DeletePlanSigned(Err(UNAVAILABLE.to_string())))
+            }
             NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
                 SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
