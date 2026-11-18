@@ -592,7 +592,7 @@ mod tests {
         let mut keep = KeepAudit::new(vec![record()]);
         keep.state = KeepState::ArmTimers;
         keep.waiting = Some(retry_timer(&record()));
-        let stray = IoResult::Event(Box::new(Event::Search()));
+        let stray = IoResult::Event(Box::new(Event::Storage(StorageEvent::SyncAllFinished)));
         assert!(matches!(keep.next(stray), Err(AuditError::Unexpected(_))));
     }
 

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, AuditWrite, retry_effect, retry_timer};
+use crate::s3::bucket::audit_retry::{AuditError, KeepAudit};
 use crate::s3::bucket::key::rows::{SettingsError, authority_keys, parse_authority};
 use crate::s3::object::put::abe::keyed;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -61,7 +61,6 @@ enum LockStep {
     LockKeys,
     RearmTimer,
     WriteAudit,
-    ArmRetries,
     CancelTimers,
 }
 
@@ -95,6 +94,21 @@ impl From<IoError> for LockError {
     }
 }
 
+impl From<AuditError> for LockError {
+    fn from(error: AuditError) -> Self {
+        match error {
+            AuditError::Conversion(error) => Self::Conversion(error),
+            AuditError::Storage(error) => Self::Storage(error),
+            AuditError::NotAuditTimer => Self::NotFinished,
+            AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                state: "WriteAudit".to_string(),
+                expected: "the audit retry timer's answer",
+                received,
+            },
+        }
+    }
+}
+
 type LockTurn = Result<Next<LockResult>, LockError>;
 
 /// A lock by a holder or group admin. Without a caller the node locks one timed `session`.
@@ -123,9 +137,7 @@ pub struct LockBucketOperation {
     bucket_id: Option<Ulid>,
     locked: Vec<KeyTicket>,
     audited: bool,
-    /// The records of the audit batch, kept for the retry timers if the batch is not stored.
     records: Vec<BucketAuditRecord>,
-    attempts: u32,
     /// Timer effects still to send, one at a time, and the timer the running one names.
     timers: VecDeque<(Effect, TaskKey)>,
     waiting: Option<TaskKey>,
@@ -140,7 +152,6 @@ impl LockBucketOperation {
             locked: Vec::new(),
             audited: false,
             records: Vec::new(),
-            attempts: 0,
             timers: VecDeque::new(),
             waiting: None,
         }
@@ -254,44 +265,21 @@ impl LockBucketOperation {
         self.call(LockStep::RearmTimer, arm.into())
     }
 
-    /// The audit records stay with the operation until written, so a failed write is retried.
+    /// The lock already applied; it stays even when its audit cannot be written, and records a
+    /// lasting outage keeps from storage move to retry timers.
     fn write_audit(&mut self) -> LockTurn {
-        let write = AuditWrite::batch(&self.records, false)?;
-        self.attempts += 1;
-        self.call(LockStep::WriteAudit, IoCall::child(write))
+        let keep = KeepAudit::new(self.records.clone());
+        self.call(LockStep::WriteAudit, IoCall::child(keep))
     }
 
-    /// The lock already applied; it stays even when its audit cannot be written.
-    fn audit_written(&mut self, written: Result<(), StorageError>) -> LockTurn {
-        if written.is_ok() {
-            return self.finish(true);
-        }
-        if self.attempts < AUDIT_ATTEMPTS {
-            return self.write_audit();
-        }
-        self.arm_retries()
-    }
-
-    /// Records still not stored move to retry timers that write them until storage answers.
-    fn arm_retries(&mut self) -> LockTurn {
-        self.timers = (self.records.iter())
-            .map(|record| (retry_effect(record), retry_timer(record)))
-            .collect();
-        self.step = LockStep::ArmRetries;
-        self.next_timer()
-    }
-
-    /// Sends the next timer effect, or moves on once all of them were answered.
+    /// Sends the next timer effect, or ends the run once all of them were answered.
     fn next_timer(&mut self) -> LockTurn {
         if let Some((effect, key)) = self.timers.pop_front() {
             self.waiting = Some(key);
             return Ok(Next::Call(effect.into()));
         }
         self.waiting = None;
-        match self.step {
-            LockStep::ArmRetries => self.finish(false),
-            _ => self.complete(),
-        }
+        self.complete()
     }
 
     /// A manual lock ends the timers of the sessions it locked; a timed lock is its own timer.
@@ -336,9 +324,7 @@ impl LockBucketOperation {
                 self.finish(true)
             }
             // A timer that cannot be cancelled fires later and finds its session gone.
-            (LockStep::ArmRetries | LockStep::CancelTimers, Event::Task(event))
-                if self.answers_waiting(&event) =>
-            {
+            (LockStep::CancelTimers, Event::Task(event)) if self.answers_waiting(&event) => {
                 self.next_timer()
             }
             (_, received) => self.refused(received),
@@ -363,7 +349,10 @@ impl Operation for LockBucketOperation {
         match self.step {
             LockStep::ReadBucket => self.authorize(result.values()?),
             LockStep::ReadGrant => self.grant_read(result.value()?),
-            LockStep::WriteAudit => self.audit_written(result.child::<(), StorageError>()?),
+            LockStep::WriteAudit => {
+                let stored = result.child::<bool, AuditError>()??;
+                self.finish(stored)
+            }
             _ => self.event_answered(result.event()?),
         }
     }
@@ -393,7 +382,6 @@ pub fn lock_timer(ticket: &KeyTicket) -> TaskKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::bucket::audit_retry::AUDIT_RETRY;
     use crate::s3::bucket::key::rows::authority_rows;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::blob::BucketInfo;
@@ -420,8 +408,8 @@ mod tests {
         }
     }
 
-    fn write_done(result: Result<(), StorageError>) -> IoResult {
-        IoResult::Child(ChildOutcome::new(result))
+    fn kept(stored: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuditError>(stored)))
     }
 
     fn read(caller: Option<UserId>, session: Option<KeyTicket>) -> (LockBucketOperation, LockTurn) {
@@ -494,27 +482,8 @@ mod tests {
                 .iter()
                 .all(|record| record.action == AuditAction::Lock)
         );
-        // A failed audit write is retried, and a lasting failure leaves the lock in place.
-        for _ in 1..AUDIT_ATTEMPTS {
-            let retry = operation.next(write_done(Err(StorageError::Timeout)));
-            assert!(matches!(retry, Ok(Next::Call(IoCall::Child(_)))));
-        }
-        // The records move to retry timers that keep writing them; the lock stays in place.
-        let mut turn = operation.next(write_done(Err(StorageError::Timeout)));
-        let mut kept = Vec::new();
-        for _ in &records {
-            let Effect::Task(TaskEffect::ResetTimer { key, after }) = asked(&turn).clone() else {
-                panic!("expected a retry timer, got {turn:?}");
-            };
-            assert_eq!(after, AUDIT_RETRY);
-            let TaskKey::RecordAudit { record } = &key else {
-                panic!("expected an audit record timer, got {key:?}");
-            };
-            // Each timer keeps the very record that was not stored.
-            kept.push((**record).clone());
-            turn = operation.next(event(Event::Task(TaskEvent::TimerScheduled { key, after })));
-        }
-        assert_eq!(kept, records);
+        // A lasting audit failure leaves the lock in place.
+        let mut turn = operation.next(kept(false));
         // The sessions' timers end once the records are handed to their retry timers.
         for ticket in &locked {
             let key = lock_timer(ticket);

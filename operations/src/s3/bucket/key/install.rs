@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, AuditWrite, retry_effect, retry_timer};
+use crate::s3::bucket::audit_retry::{AuditError, AuditWrite, KeepAudit};
 use crate::s3::bucket::key::lock::{answers_timer, lock_timer};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
@@ -31,7 +31,6 @@ enum InstallState {
     ArmTimer,
     DiscardKey,
     WriteOutcome,
-    ArmRetry,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -55,6 +54,21 @@ pub enum InstallError {
 impl From<IoError> for InstallError {
     fn from(error: IoError) -> Self {
         Self::Storage(error.into())
+    }
+}
+
+impl From<AuditError> for InstallError {
+    fn from(error: AuditError) -> Self {
+        match error {
+            AuditError::Conversion(error) => Self::Conversion(error),
+            AuditError::Storage(error) => Self::Storage(error),
+            AuditError::NotAuditTimer => Self::NotFinished,
+            AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                state: "WriteOutcome".to_string(),
+                expected: "the audit retry timer's answer",
+                received,
+            },
+        }
     }
 }
 
@@ -99,7 +113,6 @@ pub struct InstallKeyOperation {
     /// The event id of the stored intent, which the outcome names.
     intent_id: Option<Ulid>,
     outcome: Option<BucketAuditRecord>,
-    attempts: u32,
 }
 
 impl InstallKeyOperation {
@@ -119,7 +132,6 @@ impl InstallKeyOperation {
             intent_synced: false,
             intent_id: None,
             outcome: None,
-            attempts: 0,
         }
     }
 
@@ -248,32 +260,19 @@ impl InstallKeyOperation {
         }
     }
 
+    /// The key state is settled, so a lost outcome write moves to the record's retry timer.
     fn write_outcome(&mut self) -> InstallTurn {
-        let record = self.outcome.as_ref().ok_or(InstallError::NotFinished)?;
-        let write = AuditWrite::new(record, false)?;
-        self.attempts += 1;
-        self.call(InstallState::WriteOutcome, IoCall::child(write))
+        let record = self.outcome.clone().ok_or(InstallError::NotFinished)?;
+        let keep = KeepAudit::new(vec![record]);
+        self.call(InstallState::WriteOutcome, IoCall::child(keep))
     }
 
-    /// The key state is settled, so the run ends with what the activation decided.
-    fn finish(&mut self) -> InstallTurn {
+    /// The run ends with what the activation decided.
+    fn finish(&mut self, kept: Result<bool, AuditError>) -> InstallTurn {
+        kept?;
         self.outcome = None;
         let result = self.finished.take().ok_or(InstallError::NotFinished)?;
         result.map(Next::Done)
-    }
-
-    /// A failed outcome write is retried here first; a lasting outage hands the record to its
-    /// own retry timer.
-    fn outcome_written(&mut self, written: Result<(), StorageError>) -> InstallTurn {
-        if written.is_ok() {
-            return self.finish();
-        }
-        if self.attempts < AUDIT_ATTEMPTS {
-            return self.write_outcome();
-        }
-        let record = self.outcome.as_ref().ok_or(InstallError::NotFinished)?;
-        let retry = retry_effect(record);
-        self.call(InstallState::ArmRetry, retry.into())
     }
 
     fn matches_ticket(&self, status: &UnlockStatus) -> bool {
@@ -316,12 +315,6 @@ impl InstallKeyOperation {
                 self.key_discarded()
             }
             (InstallState::DiscardKey, Event::Blob(BlobEvent::Error(_))) => self.key_discarded(),
-            (InstallState::ArmRetry, Event::Task(event))
-                if (self.outcome.as_ref())
-                    .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
-            {
-                self.finish()
-            }
             (_, received) => self.refused(received),
         }
     }
@@ -353,7 +346,7 @@ impl Operation for InstallKeyOperation {
                 }
                 Err(error) => self.discard(error),
             },
-            InstallState::WriteOutcome => self.outcome_written(result.child::<(), StorageError>()?),
+            InstallState::WriteOutcome => self.finish(result.child::<bool, AuditError>()?),
             _ => self.event_answered(result.event()?),
         }
     }
@@ -397,6 +390,10 @@ mod tests {
 
     fn write_done(result: Result<(), StorageError>) -> IoResult {
         IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn kept(stored: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuditError>(stored)))
     }
 
     /// The audit record the write child of `turn` stores.
@@ -510,7 +507,9 @@ mod tests {
             key: lock_timer(&ticket),
             after: Duration::from_secs(60),
         };
-        let record = audit_record(operation.next(event(Event::Task(armed))));
+        let turn = operation.next(event(Event::Task(armed)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let record = operation.outcome.clone().unwrap();
         assert_eq!(
             (record.deadline_ms, record.sequence),
             (Some(91_000), Some(active.sequence))
@@ -541,11 +540,14 @@ mod tests {
         );
         let mut open = status(ticket);
         (open.remaining, open.max_remaining) = (None, None);
-        let outcome = audit_record(operation.next(blob(BlobEvent::KeyActivated {
-            status: open.clone(),
-        })));
+        operation
+            .next(blob(BlobEvent::KeyActivated {
+                status: open.clone(),
+            }))
+            .unwrap();
+        let outcome = operation.outcome.clone().unwrap();
         assert_eq!(outcome.outcome, AuditOutcome::Applied);
-        assert_eq!(operation.next(write_done(Ok(()))), Ok(Next::Done(open)));
+        assert_eq!(operation.next(kept(true)), Ok(Next::Done(open)));
     }
 
     #[test]
@@ -568,8 +570,8 @@ mod tests {
     }
 
     #[test]
-    fn outcome_moves_to_timer() {
-        // The key is active either way; a lasting outage hands the record to its retry timer.
+    fn unstored_outcome_finishes() {
+        // The key is active either way; the keeper already handed the record to its timer.
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let mut operation = InstallKeyOperation::new(input(None, None)).audited(node, None, 1_000);
         operation.first().unwrap();
@@ -585,21 +587,7 @@ mod tests {
                 status: open.clone(),
             }))
             .unwrap();
-        for _ in 1..AUDIT_ATTEMPTS {
-            let turn = operation.next(write_done(Err(StorageError::Timeout)));
-            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-        }
-        let turn = operation.next(write_done(Err(StorageError::Timeout)));
-        let record = operation.outcome.clone().unwrap();
-        assert_eq!(asked(&turn), &retry_effect(&record));
-        let armed = aruna_core::task::TaskEvent::TimerScheduled {
-            key: retry_timer(&record),
-            after: crate::s3::bucket::audit_retry::AUDIT_RETRY,
-        };
-        assert_eq!(
-            operation.next(event(Event::Task(armed))),
-            Ok(Next::Done(open))
-        );
+        assert_eq!(operation.next(kept(false)), Ok(Next::Done(open)));
     }
 
     #[test]
