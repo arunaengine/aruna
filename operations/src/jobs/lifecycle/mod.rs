@@ -26,7 +26,6 @@ pub(crate) mod launch_checks;
 pub mod offer;
 pub mod outbox;
 pub mod plan;
-mod policies;
 pub mod publish;
 pub mod report;
 pub mod reservation;

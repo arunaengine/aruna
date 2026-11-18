@@ -29,11 +29,13 @@ use ulid::Ulid;
 
 use super::ids;
 use super::plan::{REALM_STAGING, network_access};
-use super::policies::{Resolutions, ResolvePoliciesOperation};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::{
+    GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
+    ResolveMode,
+};
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
 pub(crate) type Verdict = Result<ExecutorCapability, LaunchDecline>;
@@ -316,7 +318,7 @@ impl LaunchChecksOperation {
         self.policy_sets = std::iter::once(outputs).chain(inputs).collect();
         self.step = CheckStep::Policies;
         let (realm_id, now_ms) = (self.check.spec.realm_id, self.check.now_ms);
-        let resolve = ResolvePoliciesOperation::new(realm_id, local, now_ms, refs);
+        let resolve = PolicySetResolver::new(realm_id, local, now_ms, ResolveMode::Lenient, &refs);
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
@@ -385,7 +387,8 @@ impl Operation for LaunchChecksOperation {
                 self.policies()
             }
             CheckStep::Policies => {
-                let policies = result.child::<Resolutions, IoError>()?.unwrap_or_default();
+                let policies = result.child::<Resolutions, PolicySetError>()?;
+                let policies = policies.unwrap_or_default();
                 Ok(Next::Done(self.placement(policies)))
             }
         }
