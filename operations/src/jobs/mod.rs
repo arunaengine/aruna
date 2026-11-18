@@ -40,6 +40,7 @@ pub mod staging;
 pub mod store;
 pub mod submit;
 pub mod submit_execution;
+pub mod submit_local;
 pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
