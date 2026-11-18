@@ -31,7 +31,7 @@ use super::rows::{
 };
 use crate::realm::mutate_placement::node_kind;
 
-pub(crate) const COVERAGE_ROW: u8 = b'c';
+pub const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
 
 type Coverage = BTreeMap<TriggerKind, BTreeSet<String>>;
@@ -58,13 +58,13 @@ pub struct ReplayRow {
     pub until: Vec<u8>,
 }
 
-pub(crate) fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
+pub fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
     [&[kind][..], &install_id.to_bytes()].concat()
 }
 
 /// The coverage this node held before, the boundary the grown part starts at, and the node
 /// whose clock it uses; `None` when nothing grew since the coverage row.
-pub(crate) fn growth(
+pub fn growth(
     install: &PluginInstall,
     row: Option<&CoverageRow>,
     coverage: &Coverage,
@@ -90,7 +90,7 @@ pub(crate) fn growth(
 }
 
 /// The coverage row and the replay row of an install.
-pub(crate) fn replay_rows(install_id: Ulid) -> ReplayRows {
+pub fn replay_rows(install_id: Ulid) -> ReplayRows {
     ReplayRows(install_id)
 }
 
@@ -134,7 +134,7 @@ enum StartPhase {
 }
 
 impl StartReplay {
-    pub(crate) fn new(
+    pub fn new(
         target: Target,
         (mut next, old): (CoverageRow, Coverage),
         (start, by): (Option<u64>, Option<NodeId>),
@@ -226,14 +226,14 @@ impl Operation for StartReplay {
 }
 
 /// Every replay key, for [`replay_page`].
-pub(crate) fn replay_scan() -> Scan {
+pub fn replay_scan() -> Scan {
     Scan::new(PLUGIN_REPLAYS_KEYSPACE, vec![REPLAY_ROW])
 }
 
 /// One page of `page` rows of the replay at `key` in one transaction: forward rows for the newly
 /// covered events it reads, then the replay row continued, or the coverage row written once the
 /// replay reaches `until`. Answers the rows read and whether the replay ended.
-pub(crate) fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> ReplayPage {
+pub fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> ReplayPage {
     ReplayPage {
         key,
         now_ms,
@@ -400,7 +400,7 @@ impl Operation for ReplayPage {
 
 /// What one install's coverage needs now.
 #[derive(Debug, PartialEq)]
-pub(crate) enum ReplayPlan {
+pub enum ReplayPlan {
     Nothing,
     /// A replay of the grown part starts; the node's clock is `by`'s unless it is this one.
     Start {
@@ -415,14 +415,14 @@ pub(crate) enum ReplayPlan {
 /// Decides from the coverage row whether the install's coverage grew here; a record that moved on
 /// without growth only updates the row.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PlanReplay {
+pub struct PlanReplay {
     install: PluginInstall,
     target: Option<Target>,
     writing: bool,
 }
 
 impl PlanReplay {
-    pub(crate) fn new(install: PluginInstall, target: Target) -> Self {
+    pub fn new(install: PluginInstall, target: Target) -> Self {
         Self {
             install,
             target: Some(target),
@@ -481,7 +481,7 @@ impl Operation for PlanReplay {
 /// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
 /// answers the rows read.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RunReplays {
+pub struct RunReplays {
     now_ms: u64,
     page: usize,
     pages: usize,
@@ -492,7 +492,7 @@ pub(crate) struct RunReplays {
 }
 
 impl RunReplays {
-    pub(crate) fn new(now_ms: u64, (page, pages): (usize, usize)) -> Self {
+    pub fn new(now_ms: u64, (page, pages): (usize, usize)) -> Self {
         Self {
             now_ms,
             page,
@@ -568,7 +568,7 @@ enum PlanPhase {
 /// activation time on another node's clock is mapped with one round trip to it. Answers how many
 /// replays started; a user node keeps no journal and starts none.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PlanReplays {
+pub struct PlanReplays {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     now_ms: u64,
@@ -579,7 +579,7 @@ pub(crate) struct PlanReplays {
 }
 
 impl PlanReplays {
-    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+    pub fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
         Self {
             targets: targets(&config).into(),
             config,

@@ -56,7 +56,7 @@ impl Operation for JournalPage {
 
 /// Deletes kept rows journaled longer than the retention ago, and source-id rows past the
 /// dedup horizon, after which a source is not journaled again; returns how many rows.
-pub(crate) fn prune_journal(now_ms: u64) -> PruneJournal {
+pub fn prune_journal(now_ms: u64) -> PruneJournal {
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
     PruneJournal {
         now_ms,
@@ -257,9 +257,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
         for _ in 0..3 {
-            crate::testing::drain_projection_queue(&ctx)
-                .await
-                .unwrap();
+            crate::testing::drain_projection_queue(&ctx).await.unwrap();
         }
         let page = journal_page(JOURNAL_ROW, None, 10);
         let (kept, _) = drive(page, &ctx).await.unwrap();

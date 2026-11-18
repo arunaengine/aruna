@@ -156,13 +156,13 @@ impl InstallCaller {
     }
 
     /// The change of `install`'s account and role by this caller.
-    pub(crate) fn change(&self, install: &PluginInstall) -> AccountChange {
+    pub fn change(&self, install: &PluginInstall) -> AccountChange {
         let who = (&self.actor, &self.auth);
         AccountChange::of(who, install, self.now_ms / 1000)
     }
 
     /// Writes the record as the caller, expecting the revision it read.
-    pub(crate) fn write(
+    pub fn write(
         &self,
         expected: Option<u64>,
         install: &PluginInstall,
@@ -180,36 +180,32 @@ impl InstallCaller {
     }
 
     /// The audit row of `action` on `install` by this caller.
-    pub(crate) fn audit(
-        &self,
-        action: AdminAuditAction,
-        install: &PluginInstall,
-    ) -> AdminAuditRecord {
+    pub fn audit(&self, action: AdminAuditAction, install: &PluginInstall) -> AdminAuditRecord {
         AdminAuditRecord::for_install(action, self.actor.user_id, install)
     }
 
     /// Removes the rules of a removing or abandoned install from its group secrets.
-    pub(crate) fn retire(&self, install: &PluginInstall) -> IoCall {
+    pub fn retire(&self, install: &PluginInstall) -> IoCall {
         IoCall::child(RetireRules::new(&self.actor, install, self.now_ms))
     }
 }
 
 /// The answer of a [`InstallCaller::write`] call.
-pub(crate) fn written(result: IoResult) -> Result<(), InstallError> {
+pub fn written(result: IoResult) -> Result<(), InstallError> {
     result.child::<Option<PluginInstall>, RecordError>()??;
     Ok(())
 }
 
-pub(crate) fn config_call(realm_id: RealmId) -> IoCall {
+pub fn config_call(realm_id: RealmId) -> IoCall {
     IoCall::child(GetConfigOperation::new(realm_id))
 }
 
-pub(crate) fn config_answer(result: IoResult) -> Result<RealmConfigDocument, InstallError> {
+pub fn config_answer(result: IoResult) -> Result<RealmConfigDocument, InstallError> {
     Ok(result.child::<RealmConfigDocument, GetConfigError>()??)
 }
 
 /// Asks whether the caller is an admin of the group.
-pub(crate) fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
+pub fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
     IoCall::child(ServiceCheckOperation::new(ServiceCheckConfig {
         auth_context: auth.clone(),
         group_id,
@@ -218,7 +214,7 @@ pub(crate) fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
 }
 
 /// Refuses a caller who is not an admin of the group.
-pub(crate) fn admin_answer(result: IoResult) -> Result<(), InstallError> {
+pub fn admin_answer(result: IoResult) -> Result<(), InstallError> {
     (result.child::<Option<User>, ServiceCheckError>()?)
         .map(drop)
         .map_err(|_| InstallError::Unauthorized)
@@ -494,7 +490,7 @@ enum SettlePhase {
 /// blocked while something required is not granted, else paused or active. A failure undoes
 /// the account and role, but only while the record is still the revision this call wrote.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SettleInstall {
+pub struct SettleInstall {
     caller: InstallCaller,
     record: PluginInstall,
     audit: Option<AdminAuditAction>,
@@ -502,7 +498,7 @@ pub(crate) struct SettleInstall {
 }
 
 impl SettleInstall {
-    pub(crate) fn new(
+    pub fn new(
         caller: InstallCaller,
         record: PluginInstall,
         audit: Option<AdminAuditAction>,
@@ -698,7 +694,7 @@ struct HeldPattern {
 /// operation `plugin.<permission>`, against roles, denies below a subtree, restrictions and
 /// policies. Any policy reading the path refuses every subtree, even one guarded off for plugins.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CheckHolder {
+pub struct CheckHolder {
     auth: AuthContext,
     scope: InstallScope,
     patterns: VecDeque<(Permission, String)>,
@@ -709,7 +705,7 @@ pub(crate) struct CheckHolder {
 }
 
 impl CheckHolder {
-    pub(crate) fn new(
+    pub fn new(
         auth: &AuthContext,
         (scope, grants): (&InstallScope, &Grants),
         config: &RealmConfigDocument,
@@ -868,7 +864,7 @@ fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginIns
     }
 }
 
-pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
+pub fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
     InstallScope {
         realm_id,
         group_id: install.group_id,

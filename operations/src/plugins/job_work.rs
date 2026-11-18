@@ -58,7 +58,7 @@ fn call_unavailable(message: impl Into<String>) -> CallError {
 
 /// What job `id` did: from its kept summary once settled, else from its job record.
 #[derive(Debug, PartialEq)]
-pub(crate) struct JobState {
+pub struct JobState {
     install: PluginInstall,
     local: NodeId,
     id: String,
@@ -66,7 +66,7 @@ pub(crate) struct JobState {
 }
 
 impl JobState {
-    pub(crate) fn new((install, local): (&PluginInstall, NodeId), id: &str) -> Self {
+    pub fn new((install, local): (&PluginInstall, NodeId), id: &str) -> Self {
         Self {
             install: install.clone(),
             local,
@@ -150,7 +150,7 @@ impl Operation for JobState {
 /// Records the job of a reserved work whose submission committed but whose answer was lost; the
 /// job is found by the work's dedup key. `None` while no job was submitted.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReconcileWork {
+pub struct ReconcileWork {
     install_id: Ulid,
     work_id: Ulid,
     account: UserId,
@@ -158,7 +158,7 @@ pub(crate) struct ReconcileWork {
 }
 
 impl ReconcileWork {
-    pub(crate) fn new(install_id: Ulid, row: &WorkRow) -> Self {
+    pub fn new(install_id: Ulid, row: &WorkRow) -> Self {
         Self {
             install_id,
             work_id: row.work_id,
@@ -284,7 +284,7 @@ enum SettlePhase {
 /// Keeps the summary of every work whose job finished, so its status outlives the job record;
 /// a reserved work first takes the job its dedup key names. Answers how many settled.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SettleWork {
+pub struct SettleWork {
     now_ms: u64,
     rows: VecDeque<(Vec<u8>, Vec<u8>)>,
     settled: usize,
@@ -292,7 +292,7 @@ pub(crate) struct SettleWork {
 }
 
 impl SettleWork {
-    pub(crate) fn new(now_ms: u64) -> Self {
+    pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms,
             rows: VecDeque::new(),
@@ -384,7 +384,7 @@ enum RetirePhase {
 /// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
 /// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RetireWork {
+pub struct RetireWork {
     kept: Vec<Ulid>,
     now_ms: u64,
     rows: VecDeque<(Vec<u8>, Vec<u8>)>,
@@ -393,7 +393,7 @@ pub(crate) struct RetireWork {
 }
 
 impl RetireWork {
-    pub(crate) fn new(config: &RealmConfigDocument, now_ms: u64) -> Self {
+    pub fn new(config: &RealmConfigDocument, now_ms: u64) -> Self {
         let kept = (config.installs.iter())
             .filter(|install| install.state != InstallState::Removing)
             .map(|install| install.install_id)
@@ -570,7 +570,7 @@ enum StartPhase {
 /// so a repeated submission with the same payload answers the same job. The work's row stays
 /// reserved after any refusal, so the same call submits again later.
 #[derive(Debug, PartialEq)]
-pub(crate) struct StartWork {
+pub struct StartWork {
     scope: RunScope,
     request: Option<WorkRequest>,
     now_ms: u64,
@@ -580,7 +580,7 @@ pub(crate) struct StartWork {
 }
 
 impl StartWork {
-    pub(crate) fn new(
+    pub fn new(
         scope: &RunScope,
         request: WorkRequest,
         (now_ms, work_id): (u64, Ulid),

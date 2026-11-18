@@ -31,7 +31,7 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreEr
 }
 
 /// Runs `operation` as a child whose outcome `map` reduces to what the parent decides with.
-pub(crate) fn mapped_child<O, K, T, E>(
+pub fn mapped_child<O, K, T, E>(
     operation: O,
     map: impl FnOnce(Result<O::Output, O::Error>) -> Result<T, E> + Send + 'static,
 ) -> IoCall
@@ -181,7 +181,7 @@ impl Operation for ReadRows {
 }
 
 /// Every row a scan reads, each page on its own.
-pub(crate) fn scan_rows(scan: Scan) -> ScanRows {
+pub fn scan_rows(scan: Scan) -> ScanRows {
     ScanRows(scan)
 }
 
@@ -246,12 +246,12 @@ pub fn sync_all() -> Change {
 }
 
 /// Writes rows, each batch on its own.
-pub(crate) fn write_rows(rows: Vec<Row>) -> Change {
+pub fn write_rows(rows: Vec<Row>) -> Change {
     Change(Some(IoCall::Write(rows)))
 }
 
 /// Deletes rows, each batch on its own.
-pub(crate) fn delete_rows(keys: Vec<(&'static str, Vec<u8>)>) -> Change {
+pub fn delete_rows(keys: Vec<(&'static str, Vec<u8>)>) -> Change {
     Change(Some(delete_call(keys)))
 }
 

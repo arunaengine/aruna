@@ -230,9 +230,7 @@ impl Operation for Unfinished {
 
 /// The rows that save a run: its record, and its queue row marked for attention or, once it
 /// ended, removed.
-pub(crate) fn saved_rows(
-    run: &PluginRun,
-) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
+pub fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
     let mut rows = vec![row(
         PLUGIN_RUNS_KEYSPACE,
         run_key(run.install_id, run.run_id),
@@ -356,7 +354,7 @@ impl Operation for ResolveRun {
 /// The runs that ended longer than `RUN_RETENTION_MS` ago and may go, as install and run ids.
 /// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
 /// be read stays.
-pub(crate) fn expired_runs(now_ms: u64) -> ExpiredRuns {
+pub fn expired_runs(now_ms: u64) -> ExpiredRuns {
     ExpiredRuns {
         now_ms,
         phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
@@ -460,7 +458,7 @@ impl Operation for ExpiredRuns {
 }
 
 /// Deletes one run record and every intent and stored reply of the run in one transaction.
-pub(crate) fn drop_run((install_id, run_id): (Ulid, Ulid)) -> DropRun {
+pub fn drop_run((install_id, run_id): (Ulid, Ulid)) -> DropRun {
     DropRun {
         key: run_key(install_id, run_id),
         intents: intent_scan(run_id),
@@ -521,7 +519,7 @@ impl Operation for DropRun {
 
 /// The runs a completion still waits on among the work `rows`: those of works not notified yet,
 /// which keep their record until the completion is delivered or dropped.
-pub(crate) fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
+pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
     let mut runs = Vec::new();
     for (_, value) in rows {
         let row: WorkRow = decode(&value)?;
@@ -546,7 +544,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// How one attempt of a run ended, before its intents are inspected.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Ended {
+pub enum Ended {
     Output(Option<String>),
     Failed(String),
     /// A host or infrastructure error: the run starts again later.
@@ -560,7 +558,7 @@ pub(crate) enum Ended {
 
 /// How an invocation ended. A runtime without a free slot never entered the guest, so the run
 /// waits without using an attempt.
-pub(crate) fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
+pub fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
     match invoked {
         Ok(output) => Ended::Output(output),
         Err(InvokeError::Guest(failure)) => match failure.kind {
@@ -578,7 +576,7 @@ pub(crate) fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
 /// makes it need attention, and unreadable intents keep it queued without using an attempt.
-pub(crate) fn conclude(
+pub fn conclude(
     run: &mut PluginRun,
     ended: Ended,
     changed: bool,
@@ -635,7 +633,7 @@ pub struct TimerRow {
 }
 
 /// A queued run of the install's current revision, due at `due_ms`.
-pub(crate) fn new_run(
+pub fn new_run(
     install: &PluginInstall,
     handler: String,
     trigger: RunTrigger,
@@ -664,7 +662,7 @@ pub(crate) fn new_run(
 }
 
 /// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound.
-pub(crate) fn enqueue_timer(
+pub fn enqueue_timer(
     install: &PluginInstall,
     handler: String,
     interval_ms: u64,
@@ -776,14 +774,14 @@ impl Operation for EnqueueTimer {
 /// Removes the runs that ended longer than the retention ago, each with its intents in one
 /// transaction; answers how many went.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PruneRuns {
+pub struct PruneRuns {
     now_ms: u64,
     expired: Option<VecDeque<(Ulid, Ulid)>>,
     count: usize,
 }
 
 impl PruneRuns {
-    pub(crate) fn new(now_ms: u64) -> Self {
+    pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms,
             expired: None,
@@ -821,7 +819,7 @@ impl Operation for PruneRuns {
 }
 
 /// The trigger of `kind` the install's pinned version declares.
-pub(crate) fn declared_trigger(
+pub fn declared_trigger(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     kind: TriggerKind,
@@ -832,7 +830,7 @@ pub(crate) fn declared_trigger(
 
 /// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
 /// manifest has no trigger of that kind.
-pub(crate) fn event_run(
+pub fn event_run(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     event: &SourceEvent,

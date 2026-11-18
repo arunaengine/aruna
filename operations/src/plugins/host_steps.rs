@@ -93,13 +93,13 @@ fn api_error(error: MetadataApiError) -> CallError {
 
 /// Steps 0 to 2 and 5: the run may call now, within the install's call rate.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AdmitCall {
+pub struct AdmitCall {
     scope: RunScope,
     target: Option<(Permission, String)>,
 }
 
 impl AdmitCall {
-    pub(crate) fn new(scope: &RunScope, target: Option<(Permission, &str)>) -> Self {
+    pub fn new(scope: &RunScope, target: Option<(Permission, &str)>) -> Self {
         Self {
             scope: scope.clone(),
             target: target.map(|(permission, path)| (permission, path.to_string())),
@@ -135,14 +135,14 @@ impl Operation for AdmitCall {
 
 /// An admitted call with the account restricted to the grants it uses.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Granted {
+pub struct Granted {
     pub install: PluginInstall,
     pub auth: AuthContext,
 }
 
 /// Steps 0 to 4 for a target, or steps 0 to 2 for a listing, and the restricted account.
 #[derive(Debug, PartialEq)]
-pub(crate) struct GrantedCall {
+pub struct GrantedCall {
     scope: RunScope,
     permission: Permission,
     target: Option<String>,
@@ -150,7 +150,7 @@ pub(crate) struct GrantedCall {
 
 impl GrantedCall {
     /// The call on `target`, under the grants that cover it.
-    pub(crate) fn target(scope: &RunScope, permission: Permission, target: &str) -> Self {
+    pub fn target(scope: &RunScope, permission: Permission, target: &str) -> Self {
         Self {
             scope: scope.clone(),
             permission,
@@ -159,7 +159,7 @@ impl GrantedCall {
     }
 
     /// A listing, under every grant of `permission`.
-    pub(crate) fn listing(scope: &RunScope, permission: Permission) -> Self {
+    pub fn listing(scope: &RunScope, permission: Permission) -> Self {
         Self {
             scope: scope.clone(),
             permission,
@@ -200,7 +200,7 @@ fn granted_call(call: GrantedCall) -> IoCall {
 
 /// Where a run reads documents from.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ReadPlace {
+pub struct ReadPlace {
     pub scope: RunScope,
     pub network_node: Option<NodeId>,
     pub max_bytes: usize,
@@ -254,7 +254,7 @@ enum ReadPhase {
 
 /// The dataset entity of a document from the given export view, checked under the read grants.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadDataset {
+pub struct ReadDataset {
     place: ReadPlace,
     resource: String,
     view: RoCrateExportView,
@@ -262,7 +262,7 @@ pub(crate) struct ReadDataset {
 }
 
 impl ReadDataset {
-    pub(crate) fn new(place: ReadPlace, resource: &str, view: RoCrateExportView) -> Self {
+    pub fn new(place: ReadPlace, resource: &str, view: RoCrateExportView) -> Self {
         Self {
             place,
             resource: resource.to_string(),
@@ -326,7 +326,7 @@ struct PageDraft {
 
 /// One page of a document's file entities.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadFiles {
+pub struct ReadFiles {
     place: ReadPlace,
     resource: String,
     cursor: Option<String>,
@@ -334,7 +334,7 @@ pub(crate) struct ReadFiles {
 }
 
 impl ReadFiles {
-    pub(crate) fn new(place: ReadPlace, resource: &str, cursor: Option<String>) -> Self {
+    pub fn new(place: ReadPlace, resource: &str, cursor: Option<String>) -> Self {
         Self {
             place,
             resource: resource.to_string(),
@@ -396,7 +396,7 @@ enum ListPhase {
 /// One page of the documents the account may read now: the grants must cover each and it must
 /// pass the same authorization as an individual call. Only an unavailable check fails.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ListDatasets {
+pub struct ListDatasets {
     scope: RunScope,
     cursor: Option<String>,
     offset: usize,
@@ -408,7 +408,7 @@ pub(crate) struct ListDatasets {
 }
 
 impl ListDatasets {
-    pub(crate) fn new(scope: &RunScope, cursor: Option<String>) -> Self {
+    pub fn new(scope: &RunScope, cursor: Option<String>) -> Self {
         Self {
             scope: scope.clone(),
             cursor,
@@ -501,14 +501,14 @@ impl Operation for ListDatasets {
 
 /// The objects an entity names, and the content hash they must have.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct NamedObjects {
+pub struct NamedObjects {
     objects: Vec<(String, Option<Ulid>)>,
     hash: Option<[u8; 32]>,
 }
 
 /// Reads what an entity names. Export renders each stored value as is, without `./`, or as
 /// literal text, under any term the context gives, so every value of every predicate counts.
-pub(crate) fn named_objects(
+pub fn named_objects(
     scope: &RunScope,
     group: aruna_core::types::GroupId,
     (graph, file): (&str, &Value),
@@ -579,7 +579,7 @@ enum ObjectPhase {
 /// Checks each Aruna object an entity names through the plugin's own `objects.read` call check
 /// and that it lies in a group bucket here. A named hash must be the object's verified digest.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CheckObjects {
+pub struct CheckObjects {
     scope: RunScope,
     install: PluginInstall,
     objects: VecDeque<(String, Option<Ulid>)>,
@@ -588,7 +588,7 @@ pub(crate) struct CheckObjects {
 }
 
 impl CheckObjects {
-    pub(crate) fn new(scope: &RunScope, install: &PluginInstall, named: NamedObjects) -> Self {
+    pub fn new(scope: &RunScope, install: &PluginInstall, named: NamedObjects) -> Self {
         Self {
             scope: scope.clone(),
             install: install.clone(),
@@ -667,7 +667,7 @@ impl Operation for CheckObjects {
 
 /// What a metadata write changes.
 #[derive(Debug, PartialEq)]
-pub(crate) enum ChangeInput {
+pub enum ChangeInput {
     /// A JSON merge patch of the dataset entity.
     Patch(String),
     /// A file entity, checked when one is written; a removal names none.
@@ -676,7 +676,7 @@ pub(crate) enum ChangeInput {
 
 /// A checked metadata write, ready to be routed.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadyChange {
+pub struct ReadyChange {
     pub record: Box<MetadataRegistryRecord>,
     pub granted: Granted,
     pub document_id: Ulid,
@@ -687,7 +687,7 @@ pub(crate) struct ReadyChange {
 
 /// How the checks before a mutating call ended.
 #[derive(Debug, PartialEq)]
-pub(crate) enum CallStep<T> {
+pub enum CallStep<T> {
     /// The same call settled before; its stored reply answers it.
     Replied(String),
     Proceed(T),
@@ -707,7 +707,7 @@ enum ChangePhase {
 /// first, and a new call starts only from the copy it expects; an earlier attempt's intent
 /// decides otherwise. An invalid change is refused before its intent exists.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareChange {
+pub struct PrepareChange {
     place: ReadPlace,
     document_id: Ulid,
     expected: Ulid,
@@ -720,7 +720,7 @@ pub(crate) struct PrepareChange {
 }
 
 impl PrepareChange {
-    pub(crate) fn new(
+    pub fn new(
         place: ReadPlace,
         (resource, expected): (&str, &str),
         intent: CallIntent,
@@ -837,7 +837,7 @@ impl Operation for PrepareChange {
 
 /// A new document's call, checked and with its id and node pinned; `minted` says why not.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadyCreate {
+pub struct ReadyCreate {
     pub actor: Actor,
     pub granted: Granted,
     pub minted: Result<Box<PinnedCreate>, String>,
@@ -855,7 +855,7 @@ enum CreatePhase {
 /// Checks a create under the create grants and pins its document. An invalid dataset is refused
 /// before its intent exists, so it leaves no uncertainty.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareCreate {
+pub struct PrepareCreate {
     scope: RunScope,
     path: String,
     dataset: String,
@@ -866,7 +866,7 @@ pub(crate) struct PrepareCreate {
 }
 
 impl PrepareCreate {
-    pub(crate) fn new(
+    pub fn new(
         scope: &RunScope,
         (path, key): (&str, &str),
         dataset: &str,
@@ -917,7 +917,7 @@ impl PrepareCreate {
 }
 
 /// The commit message of a run's metadata change.
-pub(crate) fn change_message(install: &PluginInstall, run_id: Ulid) -> String {
+pub fn change_message(install: &PluginInstall, run_id: Ulid) -> String {
     let (plugin, id) = (&install.plugin, install.install_id);
     format!("plugin {plugin} install {id} run {run_id}")
 }
@@ -983,7 +983,7 @@ impl Operation for PrepareCreate {
 
 /// The admitted install with the realm config a secret or connection is decided on.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ConfiguredCall {
+pub struct ConfiguredCall {
     pub install: PluginInstall,
     pub config: Arc<RealmConfigDocument>,
 }
@@ -1001,7 +1001,7 @@ enum ConfiguredPhase {
 
 /// The per call check of the path `path_of` names for the admitted install, then the config.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CheckConfigured {
+pub struct CheckConfigured {
     scope: RunScope,
     permission: Permission,
     name: String,
@@ -1010,12 +1010,12 @@ pub(crate) struct CheckConfigured {
 
 impl CheckConfigured {
     /// Sending through the connection `name`.
-    pub(crate) fn connection(scope: &RunScope, name: &str) -> Self {
+    pub fn connection(scope: &RunScope, name: &str) -> Self {
         Self::of(scope, Permission::ConnectionsSend, name)
     }
 
     /// Reading the value of the secret slot `name`.
-    pub(crate) fn secret(scope: &RunScope, name: &str) -> Self {
+    pub fn secret(scope: &RunScope, name: &str) -> Self {
         Self::of(scope, Permission::SecretsValue, name)
     }
 
@@ -1072,7 +1072,7 @@ impl Operation for CheckConfigured {
 
 /// The address and guest parts of a connection request.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ConnectionAsk {
+pub struct ConnectionAsk {
     pub connection: String,
     pub method: Method,
     pub path: String,
@@ -1082,7 +1082,7 @@ pub(crate) struct ConnectionAsk {
 
 /// A checked connection request before its secret is released.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ConnectionPlan {
+pub struct ConnectionPlan {
     pub call: ConfiguredCall,
     pub context: RequestContext,
     pub outgoing: OutgoingRequest,
@@ -1093,14 +1093,14 @@ pub(crate) struct ConnectionPlan {
 /// built its request from the settings saved at admission, so the address follows them, while
 /// the grant and release checks use the current install.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareConnection {
+pub struct PrepareConnection {
     check: CheckConfigured,
     settings: String,
     ask: ConnectionAsk,
 }
 
 impl PrepareConnection {
-    pub(crate) fn new(scope: &RunScope, ask: ConnectionAsk) -> Self {
+    pub fn new(scope: &RunScope, ask: ConnectionAsk) -> Self {
         Self {
             check: CheckConfigured::connection(scope, &ask.connection),
             settings: scope.run.settings.clone(),
@@ -1153,7 +1153,7 @@ impl Operation for PrepareConnection {
 
 /// A kept reply's request as it would go now: its secret still has to release.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReplyPlan {
+pub struct ReplyPlan {
     pub call: ConfiguredCall,
     pub outgoing: OutgoingRequest,
     pub slot: Option<String>,
@@ -1162,13 +1162,13 @@ pub(crate) struct ReplyPlan {
 /// Whether a kept reply of `context` may still be considered: the connection is still granted
 /// and declared. `None` when it is not.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CheckReply {
+pub struct CheckReply {
     check: CheckConfigured,
     context: RequestContext,
 }
 
 impl CheckReply {
-    pub(crate) fn new(scope: &RunScope, context: &RequestContext) -> Self {
+    pub fn new(scope: &RunScope, context: &RequestContext) -> Self {
         Self {
             check: CheckConfigured::connection(scope, &context.connection),
             context: context.clone(),
@@ -1218,7 +1218,7 @@ enum NativePhase {
 /// refused before any work is reserved, a settled call answers its job id again, and an earlier
 /// attempt is safe to repeat, as the work row names the job by run and ordinal.
 #[derive(Debug, PartialEq)]
-pub(crate) struct NativeCall {
+pub struct NativeCall {
     scope: RunScope,
     intent: CallIntent,
     request: Option<WorkRequest>,
@@ -1228,7 +1228,7 @@ pub(crate) struct NativeCall {
 }
 
 impl NativeCall {
-    pub(crate) fn new(
+    pub fn new(
         scope: &RunScope,
         intent: CallIntent,
         request: WorkRequest,

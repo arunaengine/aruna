@@ -83,12 +83,12 @@ fn stored_auth(row: Option<Vec<u8>>) -> Result<Option<GroupAuthorizationDocument
 }
 
 /// The call that reads an account, for an operation that decides with it.
-pub(crate) fn read_user_call(user_id: UserId) -> IoCall {
+pub fn read_user_call(user_id: UserId) -> IoCall {
     read_call(vec![user_row(user_id)])
 }
 
 /// The account a [`read_user_call`] answered.
-pub(crate) fn read_user_result(result: IoResult) -> Result<Option<User>, AccountError> {
+pub fn read_user_result(result: IoResult) -> Result<Option<User>, AccountError> {
     let [row] = values::<1>(result)?;
     stored_user(row)
 }
@@ -113,13 +113,13 @@ fn stepped(result: IoResult) -> Result<(), AccountError> {
 /// The account and role an install record names. Both are chosen by the node that writes the
 /// record first, so a caller-chosen install id never names an existing user or role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Identity {
+pub struct Identity {
     pub account: UserId,
     pub role_id: RoleId,
 }
 
 impl Identity {
-    pub(crate) fn of(install: &PluginInstall) -> Self {
+    pub fn of(install: &PluginInstall) -> Self {
         Self {
             account: install.account,
             role_id: install.role_id,
@@ -128,14 +128,14 @@ impl Identity {
 }
 
 /// The guard that ties a prerequisite write to the record revision it was computed from.
-pub(crate) fn guard_of(install: &PluginInstall) -> InstallGuard {
+pub fn guard_of(install: &PluginInstall) -> InstallGuard {
     InstallGuard::Revision {
         install_id: install.install_id,
         revision: install.revision,
     }
 }
 
-pub(crate) fn owned(user: &User, scope: &InstallScope) -> bool {
+pub fn owned(user: &User, scope: &InstallScope) -> bool {
     user.service_group() == Some(scope.group_id) && user.install() == Some(scope.install_id)
 }
 
@@ -170,7 +170,7 @@ fn check_alone(
 
 /// Who changes which install's account and role, under which guard.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AccountChange {
+pub struct AccountChange {
     pub actor: Actor,
     pub auth: AuthContext,
     pub scope: InstallScope,
@@ -182,7 +182,7 @@ pub(crate) struct AccountChange {
 
 impl AccountChange {
     /// The change of `install`'s account and role by `actor`, tied to the record's revision.
-    pub(crate) fn of(
+    pub fn of(
         (actor, auth): (&Actor, &AuthContext),
         install: &PluginInstall,
         now_secs: u64,
@@ -217,14 +217,14 @@ impl AccountChange {
 /// Creates the account, or reactivates it. An account with another owner or marker, or one that
 /// holds any role but the install's, fails the install.
 #[derive(Debug, PartialEq)]
-pub(crate) struct EnsureAccount {
+pub struct EnsureAccount {
     change: AccountChange,
     name: String,
     writing: bool,
 }
 
 impl EnsureAccount {
-    pub(crate) fn new(change: AccountChange, name: String) -> Self {
+    pub fn new(change: AccountChange, name: String) -> Self {
         Self {
             change,
             name,
@@ -282,14 +282,14 @@ impl Operation for EnsureAccount {
 /// Sets the install's role to the computed paths, also on every retry. A role with that id that
 /// is not the install's own is never replaced.
 #[derive(Debug, PartialEq)]
-pub(crate) struct EnsureRole {
+pub struct EnsureRole {
     change: AccountChange,
     paths: HashMap<String, Access>,
     writing: bool,
 }
 
 impl EnsureRole {
-    pub(crate) fn new(change: AccountChange, paths: HashMap<String, Access>) -> Self {
+    pub fn new(change: AccountChange, paths: HashMap<String, Access>) -> Self {
         Self {
             change,
             paths,
@@ -340,18 +340,14 @@ impl Operation for EnsureRole {
 /// Checks the account and role once more against current state and answers the writes the
 /// install depends on. The install's role must be the account's only role.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CheckReady {
+pub struct CheckReady {
     scope: InstallScope,
     identity: Identity,
     paths: HashMap<String, Access>,
 }
 
 impl CheckReady {
-    pub(crate) fn new(
-        scope: InstallScope,
-        identity: Identity,
-        paths: HashMap<String, Access>,
-    ) -> Self {
+    pub fn new(scope: InstallScope, identity: Identity, paths: HashMap<String, Access>) -> Self {
         Self {
             scope,
             identity,
@@ -427,13 +423,13 @@ enum TeardownPhase {
 /// Undoes the account and role steps: deactivates the account and removes the install's own
 /// role, each only if needed. Another role with the same id is left alone.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Teardown {
+pub struct Teardown {
     change: AccountChange,
     phase: TeardownPhase,
 }
 
 impl Teardown {
-    pub(crate) fn new(change: AccountChange) -> Self {
+    pub fn new(change: AccountChange) -> Self {
         Self {
             change,
             phase: TeardownPhase::ReadingUser,
@@ -505,13 +501,13 @@ impl Operation for Teardown {
 
 /// `plugin <name> (<group>)`, with the group's display name when it is known.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AccountName {
+pub struct AccountName {
     plugin: String,
     group_id: GroupId,
 }
 
 impl AccountName {
-    pub(crate) fn new(plugin: &str, group_id: GroupId) -> Self {
+    pub fn new(plugin: &str, group_id: GroupId) -> Self {
         Self {
             plugin: plugin.to_string(),
             group_id,
@@ -634,13 +630,13 @@ impl Provision {
 /// The account, its role, then a check of both against current state, each write refused once
 /// the record moved on. Answers the writes the install depends on.
 #[derive(Debug, PartialEq)]
-pub(crate) struct MakeReady {
+pub struct MakeReady {
     provision: Provision,
     checking: bool,
 }
 
 impl MakeReady {
-    pub(crate) fn new(change: AccountChange, record: &PluginInstall) -> Self {
+    pub fn new(change: AccountChange, record: &PluginInstall) -> Self {
         let paths = role_paths(&parse_grants(&record.grants));
         Self {
             provision: Provision::new(change, &record.plugin, paths),
@@ -684,13 +680,13 @@ enum RepairPhase {
 /// changed anything. An administrator's deactivation stands: repair restores only what the
 /// install stopped.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RepairAccount {
+pub struct RepairAccount {
     provision: Provision,
     phase: RepairPhase,
 }
 
 impl RepairAccount {
-    pub(crate) fn new(change: AccountChange, install: &PluginInstall) -> Self {
+    pub fn new(change: AccountChange, install: &PluginInstall) -> Self {
         let paths = role_paths(&parse_grants(&install.grants));
         Self {
             provision: Provision::new(change, &install.plugin, paths),
@@ -738,7 +734,7 @@ impl Operation for RepairAccount {
 
 /// A group's authorization document, read on its own.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadGroupAuth(pub GroupId);
+pub struct ReadGroupAuth(pub GroupId);
 
 impl Operation for ReadGroupAuth {
     type Output = Option<GroupAuthorizationDocument>;
@@ -756,7 +752,7 @@ impl Operation for ReadGroupAuth {
 
 /// The realm administrator with the smallest id, so every node acts as the same one.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RealmAdmin(pub RealmId);
+pub struct RealmAdmin(pub RealmId);
 
 impl Operation for RealmAdmin {
     type Output = Option<UserId>;
@@ -778,10 +774,10 @@ impl Operation for RealmAdmin {
 
 /// Whether this node holds every account and group write the install record names.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrerequisitesHeld(Vec<Prerequisite>);
+pub struct PrerequisitesHeld(Vec<Prerequisite>);
 
 impl PrerequisitesHeld {
-    pub(crate) fn new(install: &PluginInstall) -> Self {
+    pub fn new(install: &PluginInstall) -> Self {
         Self(install.prerequisites.clone())
     }
 }

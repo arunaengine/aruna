@@ -5,7 +5,7 @@
 pub(crate) mod bao_read;
 pub(crate) mod bootstrap;
 pub(crate) mod catch_up;
-pub(crate) mod drain;
+pub mod drain;
 mod error;
 pub(crate) mod incoming;
 pub mod live_queue;

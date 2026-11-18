@@ -52,7 +52,7 @@ impl From<StoreError> for ArtifactError {
 }
 
 /// Whether `bytes` are exactly the artifact `plugin` publishes: digest, size and manifest.
-pub(crate) fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
+pub fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
     let digest = ArtifactDigest::of(bytes);
     if digest.as_str() != plugin.digest || bytes.len() as u64 != plugin.size {
         return Err(ArtifactError::Mismatch);
@@ -102,7 +102,7 @@ impl PartialEq for Arriving {
 /// The published artifact with `digest`: this node's copy, else one from a management node, each
 /// chunk placed and sized exactly and the whole checked. The answer holds the bytes' memory.
 #[derive(Debug, PartialEq)]
-pub(crate) struct FetchArtifact {
+pub struct FetchArtifact {
     plugin: PublishedPlugin,
     peers: VecDeque<NodeId>,
     asked: Option<NodeId>,
@@ -112,7 +112,7 @@ pub(crate) struct FetchArtifact {
 }
 
 impl FetchArtifact {
-    pub(crate) fn new(
+    pub fn new(
         config: &RealmConfigDocument,
         digest: &str,
         local: Option<NodeId>,
@@ -236,7 +236,7 @@ impl Operation for FetchArtifact {
 }
 
 /// Who may hand this node a copy to keep: only another management node, to a management node.
-pub(crate) fn check_store(
+pub fn check_store(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -251,7 +251,7 @@ pub(crate) fn check_store(
 }
 
 /// Who may fetch a copy from this node: infrastructure nodes, and only published digests.
-pub(crate) fn check_fetch(
+pub fn check_fetch(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -270,10 +270,10 @@ pub(crate) fn check_fetch(
 }
 
 /// This node as a peer request sees it: its realm and id.
-pub(crate) type ServingNode = (RealmId, NodeId);
+pub type ServingNode = (RealmId, NodeId);
 
 /// The realm config a peer request is decided on.
-pub(crate) fn served_config(result: IoResult) -> Result<RealmConfigDocument, MetadataReadError> {
+pub fn served_config(result: IoResult) -> Result<RealmConfigDocument, MetadataReadError> {
     (result.child::<RealmConfigDocument, GetConfigError>()?)
         .map_err(|_| MetadataReadError::Unavailable)
 }
@@ -282,7 +282,7 @@ pub(crate) fn served_config(result: IoResult) -> Result<RealmConfigDocument, Met
 /// completes the copy once all chunks arrived and the whole artifact checks out. A stored but
 /// never published copy only takes space.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ServeStore {
+pub struct ServeStore {
     node: ServingNode,
     peer: NodeId,
     chunk: Option<Chunk>,
@@ -291,7 +291,7 @@ pub(crate) struct ServeStore {
 }
 
 impl ServeStore {
-    pub(crate) fn new(node: ServingNode, peer: NodeId, chunk: Chunk, now_ms: u64) -> Self {
+    pub fn new(node: ServingNode, peer: NodeId, chunk: Chunk, now_ms: u64) -> Self {
         Self {
             node,
             peer,
@@ -336,7 +336,7 @@ impl Operation for ServeStore {
 
 /// The management side of a fetch: one chunk of a published artifact this node keeps.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ServeFetch {
+pub struct ServeFetch {
     node: ServingNode,
     peer: NodeId,
     digest: String,
@@ -345,7 +345,7 @@ pub(crate) struct ServeFetch {
 }
 
 impl ServeFetch {
-    pub(crate) fn new(node: ServingNode, peer: NodeId, digest: String, index: u32) -> Self {
+    pub fn new(node: ServingNode, peer: NodeId, digest: String, index: u32) -> Self {
         Self {
             node,
             peer,
@@ -396,7 +396,7 @@ enum PlanPhase {
 /// What a repair pass does: reclaims abandoned copies, and on a management node answers the
 /// config and the published digests this node lacks.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RepairCopies {
+pub struct RepairCopies {
     node: ServingNode,
     now_ms: u64,
     config: Option<RealmConfigDocument>,
@@ -407,7 +407,7 @@ pub(crate) struct RepairCopies {
 }
 
 impl RepairCopies {
-    pub(crate) fn new(node: ServingNode, now_ms: u64) -> Self {
+    pub fn new(node: ServingNode, now_ms: u64) -> Self {
         Self {
             node,
             now_ms,
@@ -436,7 +436,7 @@ impl RepairCopies {
 
 /// The realm config of a repair pass and the digests to fetch.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RepairPlan {
+pub struct RepairPlan {
     pub config: RealmConfigDocument,
     pub missing: Vec<String>,
 }

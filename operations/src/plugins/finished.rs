@@ -54,7 +54,7 @@ impl NotifyWork {
 
 impl NotifyWork {
     /// The work this delivery settles.
-    pub(crate) fn work_id(&self) -> Ulid {
+    pub fn work_id(&self) -> Ulid {
         self.work_id
     }
 }
@@ -284,7 +284,7 @@ impl Operation for DropCompletion {
 
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and
 /// how it ended.
-pub(crate) fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
+pub fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
     let path = match row.kind {
         WorkKind::Copy | WorkKind::Download => row.target.clone(),
         WorkKind::Upload => row.source.clone(),
@@ -313,7 +313,7 @@ struct Candidate {
 /// The `job_finished` deliveries due now: one per settled work whose starting run succeeded or is
 /// gone, for the installs this node receives. A manifest without the trigger delivers no run.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DueCompletions {
+pub struct DueCompletions {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     now_ms: u64,
@@ -324,7 +324,7 @@ pub(crate) struct DueCompletions {
 }
 
 impl DueCompletions {
-    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+    pub fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
         Self {
             config,
             local,
@@ -407,7 +407,7 @@ impl Operation for DueCompletions {
 /// work notified in the same transaction; a manifest without the trigger is notified without a
 /// run. Answers how many works were notified.
 #[derive(Debug, PartialEq)]
-pub(crate) struct NotifyDue {
+pub struct NotifyDue {
     due: Option<DueCompletions>,
     pending: VecDeque<NotifyWork>,
     current: Option<Ulid>,
@@ -415,7 +415,7 @@ pub(crate) struct NotifyDue {
 }
 
 impl NotifyDue {
-    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+    pub fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
         Self {
             due: Some(DueCompletions::new(config, local, now_ms)),
             pending: VecDeque::new(),

@@ -90,7 +90,7 @@ fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
 }
 
 /// See [`VersionWaitOperation`].
-pub(crate) async fn version_wait(
+pub async fn version_wait(
     context: &DriverContext,
     place: (NodeId, Ulid),
     version: &VersionKey,

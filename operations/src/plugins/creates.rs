@@ -51,7 +51,7 @@ pub enum Step {
 
 /// The next step of a keyed create from how its row was found and what a lookup found. A
 /// missing document is sent again only to the stored node, with the stored arguments.
-pub(crate) fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
+pub fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
     match (claim, lookup) {
         (Claim::Fresh, _) => Step::Dispatch,
         (Claim::Earlier, None) => Step::Lookup,
@@ -147,7 +147,7 @@ impl Operation for ClaimKey {
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub(crate) fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
+pub fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
     SettleKey {
         row: create_key(install.install_id, key),
         account: install.account,
@@ -201,12 +201,12 @@ impl Operation for SettleKey {
 }
 
 /// The intent reply of a create: the document id and its establishing revision.
-pub(crate) fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+pub fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
     format!("{document_id} {revision}")
 }
 
 /// A create reply read back from its stored form.
-pub(crate) fn stored_created(reply: &str) -> Result<Created, HostError> {
+pub fn stored_created(reply: &str) -> Result<Created, HostError> {
     let (resource, revision) = (reply.split_once(' '))
         .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
     Ok(Created {

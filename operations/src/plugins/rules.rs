@@ -72,7 +72,7 @@ enum EditPhase {
 /// consumer's rules; answers whether it wrote. A guard the local record no longer meets writes
 /// nothing, and so does a list that is already in place.
 #[derive(Debug, PartialEq)]
-pub(crate) struct EditRules {
+pub struct EditRules {
     actor: Actor,
     group_id: GroupId,
     name: SecretName,
@@ -84,7 +84,7 @@ pub(crate) struct EditRules {
 }
 
 impl EditRules {
-    pub(crate) fn new(
+    pub fn new(
         actor: &Actor,
         (group_id, name): (GroupId, &SecretName),
         (consumer, wanted): (&SecretConsumer, Vec<UseRule>),
@@ -207,7 +207,7 @@ impl From<IoError> for RulesFailure {
 /// Ensures the install's rules on every group secret it binds, for its current revision. Slots
 /// may share a secret; each secret is edited once with all of its rules.
 #[derive(Debug, PartialEq)]
-pub(crate) struct EnsureRules {
+pub struct EnsureRules {
     actor: Actor,
     group_id: GroupId,
     consumer: SecretConsumer,
@@ -218,7 +218,7 @@ pub(crate) struct EnsureRules {
 }
 
 impl EnsureRules {
-    pub(crate) fn new(
+    pub fn new(
         actor: &Actor,
         install: &PluginInstall,
         manifest: &Manifest,
@@ -277,7 +277,7 @@ impl Operation for EnsureRules {
 /// Removes the rules of a removing, abandoned or removed install from its group secrets. A
 /// secret that cannot be edited is logged and the others are still edited.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RetireRules {
+pub struct RetireRules {
     actor: Actor,
     group_id: GroupId,
     consumer: SecretConsumer,
@@ -288,7 +288,7 @@ pub(crate) struct RetireRules {
 }
 
 impl RetireRules {
-    pub(crate) fn new(actor: &Actor, install: &PluginInstall, now_ms: u64) -> Self {
+    pub fn new(actor: &Actor, install: &PluginInstall, now_ms: u64) -> Self {
         let bindings = (install.secrets.values())
             .filter(|binding| binding.scope == BoundScope::Group)
             .cloned()
@@ -339,7 +339,7 @@ impl Operation for RetireRules {
 /// The rules the install needs on each group secret it binds, from its manifest, grants and
 /// settings: `inject` for granted connections, `verify` for the webhook, `value` for a granted
 /// `secrets.value`.
-pub(crate) fn wanted_rules(
+pub fn wanted_rules(
     install: &PluginInstall,
     manifest: &Manifest,
 ) -> Result<BTreeMap<SecretName, Vec<UseRule>>, String> {
