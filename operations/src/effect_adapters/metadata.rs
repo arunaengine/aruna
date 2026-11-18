@@ -61,9 +61,7 @@ pub(super) async fn dispatch_request(
 ) -> Event {
     let started = Instant::now();
     let result = match &context.metadata_handle {
-        None => Err(PeerRequestError::Failed(
-            "metadata transport unavailable".to_string(),
-        )),
+        None => Err(PeerRequestError::Failed(MetadataError::HandleMissing)),
         Some(handle) => match timeout(
             effect.timeout,
             handle.request_frame(effect.peer, &effect.frame),
@@ -71,7 +69,7 @@ pub(super) async fn dispatch_request(
         .await
         {
             Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(error)) => Err(PeerRequestError::Failed(error.to_string())),
+            Ok(Err(error)) => Err(PeerRequestError::Failed(error.into_metadata_error())),
             Err(_) => Err(PeerRequestError::TimedOut),
         },
     };

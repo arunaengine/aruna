@@ -12,7 +12,8 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
-use aruna_operations::plugins::account::plugin_account;
+use aruna_operations::driver::drive;
+use aruna_operations::plugins::account::PluginAccount;
 use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, Summary, install_plugin, installed_summary, pick_version,
@@ -566,12 +567,12 @@ pub(crate) async fn refuse_plugin_account(
     state: &ServerState,
     user_id: UserId,
 ) -> ServerResult<()> {
-    match plugin_account(&state.get_ctx(), user_id).await {
+    match drive(PluginAccount(user_id), &state.get_ctx()).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(ServerError::Conflict(
             "the account acts for a plugin install; change the install instead".into(),
         )),
-        Err(error) => Err(ServerError::InternalError(error.into())),
+        Err(error) => Err(ServerError::InternalError(error.0.into())),
     }
 }
 

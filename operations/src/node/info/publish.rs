@@ -13,7 +13,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
-use crate::node::info_write::PUBLISH_OWED_KEY;
+use crate::node::info::write::PUBLISH_OWED_KEY;
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,

@@ -3,8 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
+use aruna_core::operation::{Operation, Runnable, TransactionMode, boxed_suboperation};
 use aruna_core::rows;
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -27,6 +28,24 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
 
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
     Ok(rows::decode(bytes)?)
+}
+
+/// Runs `operation` as a child whose outcome `map` reduces to what the parent decides with.
+pub(crate) fn mapped_child<O, K, T, E>(
+    operation: O,
+    map: impl FnOnce(Result<O::Output, O::Error>) -> Result<T, E> + Send + 'static,
+) -> IoCall
+where
+    O: Runnable<K> + 'static,
+    K: 'static,
+    O::Output: Send + 'static,
+    O::Error: Send + 'static,
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoCall::Child(boxed_suboperation(operation, move |result| {
+        Event::Child(ChildOutcome::new(map(result)))
+    }))
 }
 
 /// A read of these rows, in this order.
@@ -185,36 +204,6 @@ impl Operation for ScanRows {
     }
 }
 
-/// At most `limit` rows below `prefix` after the key `after`, and the key to continue after.
-pub(crate) fn page_rows(
-    space: &'static str,
-    prefix: Vec<u8>,
-    after: Option<Vec<u8>>,
-    limit: usize,
-) -> PageRows {
-    PageRows(Some(page_call(space, prefix, after, limit)))
-}
-
-#[derive(Debug, PartialEq)]
-pub struct PageRows(Option<IoCall>);
-
-impl Operation for PageRows {
-    type Output = (Rows, Option<Vec<u8>>);
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
-        let page = self
-            .0
-            .take()
-            .ok_or_else(|| StoreError("paged twice".into()))?;
-        Ok(Next::Call(page))
-    }
-
-    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
-        Ok(Next::Done(page_of(answer)?))
-    }
-}
-
 /// Writes rows, then deletes rows, in one transaction.
 pub fn writes(rows: Vec<Row>, deletes: Vec<(&'static str, Vec<u8>)>) -> Writes {
     Writes {
@@ -304,28 +293,6 @@ pub fn unexpected(result: IoResult) -> StoreError {
     StoreError(format!("unexpected answer {}", result.label()))
 }
 
-/// The answer to a read, from plain bytes.
-#[cfg(test)]
-pub(crate) fn values_result(values: Vec<Option<Vec<u8>>>) -> IoResult {
-    IoResult::Values(
-        values
-            .into_iter()
-            .map(|value| value.map(Into::into))
-            .collect(),
-    )
-}
-
-/// The answer to a page, from plain bytes.
-#[cfg(test)]
-pub(crate) fn page_result(rows: Rows, next: Option<Vec<u8>>) -> IoResult {
-    IoResult::Page {
-        rows: (rows.into_iter())
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect(),
-        next: next.map(Into::into),
-    }
-}
-
 #[cfg(test)]
 #[path = "rows_tests.rs"]
-mod tests;
+pub(crate) mod tests;

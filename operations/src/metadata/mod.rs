@@ -28,6 +28,7 @@ mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
 pub mod materialization_queue;
+pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
 pub(crate) mod pid_transition;

@@ -6,7 +6,9 @@
 use super::*;
 use crate::driver::drive;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::rows::{StoreError, decode, page_result, read_call, values, values_result};
+use crate::plugins::matcher::event_trigger;
+use crate::plugins::rows::tests::{page_result, values_result};
+use crate::plugins::rows::{StoreError, decode, read_call, values};
 use crate::plugins::runs::{TimerRow, list_runs, read_run};
 use crate::plugins::worker::tests::installed;
 use aruna_core::calls::{IoCall, IoResult, Next};

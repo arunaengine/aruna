@@ -20,7 +20,7 @@ use aruna_core::structs::storage::share::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::distribution::nonce::SpendNonceOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -827,8 +827,9 @@ async fn claim_key(
         }
         let permission = (Permission::WRITE, "share.upload");
         authorize_object(state, auth, (bucket, info), &candidate, permission).await?;
-        let claim = ClaimNameOperation::new(bucket, &candidate, now, until);
-        if drive(claim, &state.get_ctx()).await.map_err(visit_error)? {
+        let claim = || ClaimNameOperation::new(bucket, &candidate, now, until);
+        let claimed = drive_retry(claim, &state.get_ctx(), candidate.as_bytes()).await;
+        if claimed.map_err(visit_error)? {
             return Ok(candidate);
         }
     }

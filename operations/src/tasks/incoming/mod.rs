@@ -103,7 +103,7 @@ use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};
 use crate::sync::mirror_repair::{
-    REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
 };
 use crate::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use crate::sync::shard_placement::{
@@ -507,7 +507,7 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::forward::realm::relay_admin_event(
+        match crate::forward::entry::relay_admin_event(
             &self.context,
             &holders,
             record.target.clone(),

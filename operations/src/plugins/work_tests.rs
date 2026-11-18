@@ -15,9 +15,8 @@ use crate::jobs::executor::PayloadHandler;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::{retire_work, settle_work};
 use crate::plugins::plugin_work::PluginWorkHandler;
-use crate::plugins::rows::{
-    page_call, page_result, read_call, read_rows, values_result, write_rows,
-};
+use crate::plugins::rows::tests::{page_result, values_result};
+use crate::plugins::rows::{page_call, read_call, read_rows, write_rows};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::installed;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

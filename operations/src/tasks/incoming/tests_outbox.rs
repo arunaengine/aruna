@@ -811,11 +811,8 @@ async fn deferred_head_paginates() {
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )
@@ -1058,11 +1055,8 @@ async fn draining_a_topics() {
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )
@@ -1329,11 +1323,8 @@ async fn pull_reaches_holder() {
         FjallStorage::open(ex_dir.path().to_str().expect("temp path")).expect("storage opens");
     let ex_holder = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         ex_storage.clone(),
     )
@@ -1344,11 +1335,8 @@ async fn pull_reaches_holder() {
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )

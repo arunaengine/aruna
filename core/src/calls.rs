@@ -297,6 +297,17 @@ impl From<IoError> for StorageError {
 
 /// A runner failure as an authorization error: storage faults stay storage errors, a conflict
 /// stays the storage conflict, so the conflict check finds it.
+impl From<IoError> for crate::metadata::MetadataError {
+    /// A storage failure stays typed; any other runner failure is a backend error naming it.
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Backend(other.to_string()),
+        }
+    }
+}
+
 impl From<IoError> for crate::errors::AuthorizationError {
     fn from(error: IoError) -> Self {
         match error {

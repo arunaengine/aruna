@@ -7,15 +7,15 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::broker::call_intent;
 use crate::plugins::copies::store_local;
-use crate::plugins::dispatch::event_run;
+use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::unknown_row;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::rows::write_rows;
+use crate::plugins::runs::event_run;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, ended};
 use aruna_core::plugin_runs::{MAX_ATTEMPTS, SourceEvent, SourceKind};

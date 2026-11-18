@@ -10,12 +10,15 @@ use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
-use crate::plugins::broker::call_intent;
+use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::rows::values_result;
+use crate::plugins::jobs::start_work;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::page_result;
+use crate::plugins::rows::tests::values_result;
 use crate::plugins::runs::{list_runs, save_run};
-use crate::plugins::submit::start_copy;
+use crate::plugins::submit::WorkRequest;
 use crate::plugins::submit::tests::{path, ready, request, scope};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
@@ -51,7 +54,9 @@ async fn finisher(fixture: &Fixture) -> PluginInstall {
 async fn settled(fixture: &Fixture, install: &PluginInstall, ended: RunState) -> Ulid {
     let scope = scope(fixture, install);
     let copy = request(fixture, install, "out/a.txt");
-    let work_id = start_copy(&fixture.ctx, &scope, copy).await.unwrap();
+    let work_id = start_work(&fixture.ctx, &scope, WorkRequest::Copy(copy))
+        .await
+        .unwrap();
     let mut run = scope.run.clone();
     run.finish(ended, None, 1);
     drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
@@ -305,4 +310,50 @@ fn drop_needs_held() {
         gone.next(values_result(vec![None])),
         Err(RunError::NotFound)
     );
+}
+
+fn completions(install: &PluginInstall) -> DueCompletions {
+    let mut config = RealmConfigDocument::new(install.account.realm_id, Vec::new(), 3);
+    config.installs.push(install.clone());
+    DueCompletions::new(Arc::new(config), install.receiver, 9)
+}
+
+fn work_row_of(install: &PluginInstall, row: &WorkRow) -> (Vec<u8>, Vec<u8>) {
+    let key = [b"w".as_slice(), &install.install_id.to_bytes(), b"x"].concat();
+    (key, encode(row).unwrap())
+}
+
+#[test]
+fn due_after_success() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let (row, _) = settled_work();
+    let mut due = completions(&install);
+    assert!(matches!(due.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = page_result(vec![work_row_of(&install, &row)], None);
+    assert!(matches!(due.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    let succeeded = child_result(Ok::<_, String>(Some(RunState::Succeeded)));
+    let Next::Done(found) = due.next(succeeded).unwrap() else {
+        panic!("the last row ends the pass");
+    };
+    assert_eq!(
+        found.iter().map(NotifyWork::work_id).collect::<Vec<_>>(),
+        [row.work_id]
+    );
+}
+
+#[test]
+fn failed_run_not_due() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let (row, _) = settled_work();
+    let mut due = completions(&install);
+    due.next(page_result(vec![work_row_of(&install, &row)], None))
+        .unwrap();
+    let failed = child_result(Ok::<_, String>(Some(RunState::Failed)));
+    assert_eq!(due.next(failed), Ok(Next::Done(Vec::new())));
+    // A row already notified needs no read of its run.
+    let mut told = row;
+    told.notified = true;
+    let mut due = completions(&install);
+    let page = page_result(vec![work_row_of(&install, &told)], None);
+    assert_eq!(due.next(page), Ok(Next::Done(Vec::new())));
 }
