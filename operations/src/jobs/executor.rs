@@ -249,7 +249,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         }
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => {
-            Box::pin(crate::jobs::backend_import::run_backend_import(ctx, spec)).await
+            Box::pin(crate::jobs::host::run_backend_import(ctx, spec)).await
         }
         JobPayload::RegisterIdentifiers(spec) => {
             Box::pin(crate::jobs::persistent_id::run_register_identifiers(

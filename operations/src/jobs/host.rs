@@ -11,11 +11,13 @@ use aruna_blob::pace::{Pace, paced};
 use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure};
 use aruna_core::operation::Runnable;
 use aruna_core::structs::execution::job::{JobError, StagingJobSpec};
+use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use futures_util::future::BoxFuture;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use super::backend_import::{BackendImportOperation, ImportJob};
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, RangeTurns};
 use super::staging::{StagingJobOperation, StagingRun};
 use crate::driver::{DriverContext, drive, node_routing};
@@ -127,6 +129,17 @@ where
         Ok(outcome) => outcome,
         Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
     }
+}
+
+pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> JobRunOutcome {
+    let job = ImportJob {
+        spec: Arc::new(spec.clone()),
+        job_id: ctx.job_id,
+        claim_token: ctx.claim_token,
+        routing: node_routing(&ctx.driver),
+        seed: rand::rng().random(),
+    };
+    run_hosted(ctx, BackendImportOperation::new(job)).await
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {

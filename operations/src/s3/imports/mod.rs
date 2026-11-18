@@ -10,9 +10,9 @@ pub mod remove;
 pub mod schedule;
 pub mod shared;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
-use crate::jobs::backend_import::read_checkpoint;
+use crate::jobs::run_rows::ReadStateOperation;
 use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::calls::IoError;
@@ -122,9 +122,9 @@ pub async fn last_run(
     else {
         return Ok(None);
     };
-    let checkpoint = read_checkpoint(context, job_id)
+    let checkpoint = drive(ReadStateOperation::<BackendImportCheckpoint>::new(job_id), context)
         .await
-        .map_err(ImportRuleError::Read)?
+        .map_err(|error| ImportRuleError::Read(error.0))?
         .unwrap_or_default();
     Ok(Some(LastRun {
         job_id,

@@ -44,7 +44,7 @@ use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::backend_import::run_backend_import;
+use aruna_operations::jobs::host::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
