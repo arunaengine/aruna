@@ -180,7 +180,7 @@ async fn ticket_installs_tombstone() {
     let dir = tempdir().unwrap();
     let joined = context(dir.path());
     for _ in 0..2 {
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(2), 100)
+        drive(super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 100), &joined)
             .await
             .unwrap();
     }
@@ -206,15 +206,15 @@ async fn ticket_installs_tombstone() {
     let mut tampered = ticket.clone();
     tampered.payload.group_deletions.clear();
     assert!(matches!(
-        super::install_onboarding(&joined, &tampered, fixture.plan.realm_id, node(2), 100).await,
+        drive(super::InstallOnboardingOperation::new(&tampered, fixture.plan.realm_id, node(2), 100), &joined).await,
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(matches!(
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(3), 100).await,
+        drive(super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(3), 100), &joined).await,
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(matches!(
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(2), 401).await,
+        drive(super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 401), &joined).await,
         Err(GroupDeletionError::Invalid(_))
     ));
 }
