@@ -194,6 +194,13 @@ pub enum SourceResolutionError {
     ResolveFailed,
 }
 
+/// A runner failure as a read error of the source.
+impl From<crate::calls::IoError> for StagingSourceError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
 /// A runner failure as a storage failure; one that is none reads as a read error.
 impl From<crate::calls::IoError> for SourceResolutionError {
     fn from(error: crate::calls::IoError) -> Self {

@@ -792,6 +792,9 @@ pub enum NetEffect {
     /// Applies a realm configuration to this node's peer set; answers
     /// `NetEvent::DocumentPeers`.
     RefreshDocumentPeers(Box<crate::structs::identity::realm::RealmConfigDocument>),
+    /// Reads one version from another node under a read grant; answers
+    /// `NetEvent::GrantedRead`.
+    GrantedRead(Box<crate::native_reference::GrantedReadEffect>),
     /// Signs a read grant; only a grant naming this node as issuer. Answers
     /// `NetEvent::GrantSign`.
     GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),

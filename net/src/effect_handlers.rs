@@ -269,6 +269,12 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::RefreshDocumentPeers(_) => NetEvent::DocumentPeers(Err(
             "peer refreshes must be dispatched by the operations runner".to_string(),
         )),
+        // A granted read streams through the native protocol the runner opens.
+        NetEffect::GrantedRead(_) => {
+            NetEvent::GrantedRead(Err(aruna_core::errors::StagingSourceError::ReadError(
+                "granted reads must be dispatched by the operations runner".to_string(),
+            )))
+        }
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
@@ -616,6 +622,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",
+        NetEffect::GrantedRead(_) => "granted_read",
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::GrantSign(_) => "grant_sign",

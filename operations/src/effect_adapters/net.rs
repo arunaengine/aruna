@@ -2,16 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_blob::native::{body_stream, send_request};
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{
     Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
     SnapshotSignEvent, StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use aruna_core::native_reference::{
+    GrantedBody, GrantedReadEffect, NativeAuthority, NativeReferenceRequest,
+    NativeReferenceResponse,
+};
+use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
 use tokio::io::AsyncWriteExt;
@@ -121,11 +128,49 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
     Ok(Event::Net(NetEvent::Recorded))
 }
 
+/// Signs a granted read with this node's key, sends it and opens the holder's answer.
+async fn granted_read(
+    read: GrantedReadEffect,
+    context: &DriverContext,
+) -> Result<Box<GrantedBody>, StagingSourceError> {
+    let net = (context.net_handle.as_ref()).ok_or(StagingSourceError::HandleMissing)?;
+    if read.request.issuer != net.node_id() {
+        return Err(StagingSourceError::AccessDenied);
+    }
+    let bytes = (read.request.signing_bytes())
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let holder = read.request.target;
+    let signed = SignedRequest {
+        signature: net.sign(&bytes),
+        request: read.request,
+    };
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Granted(Box::new(signed)),
+        bucket: read.bucket,
+        key: read.key,
+        version_id: read.version_id,
+        head: read.head,
+        range: read.range,
+    };
+    let (response, stream) = send_request(net, holder, request).await?;
+    match response {
+        NativeReferenceResponse::Content(metadata)
+        | NativeReferenceResponse::Described { metadata, .. } => Ok(Box::new(GrantedBody {
+            metadata,
+            blob: body_stream(stream),
+        })),
+        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
+    }
+}
+
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     let effect = match record_watch(effect, context.net_handle.as_ref()) {
         Ok(recorded) => return recorded,
         Err(effect) => effect,
     };
+    if let NetEffect::GrantedRead(read) = effect {
+        return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
+    }
     if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
         return Event::Net(NetEvent::DocumentSync(
             reconcile_topics(context, topics).await,

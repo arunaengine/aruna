@@ -30,9 +30,8 @@ use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::visible::SCAN_BUDGET;
-use crate::staging::native_source::granted_read;
-use aruna_blob::native::body_stream;
-use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
+use crate::staging::granted_read::GrantedReadOperation;
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION, SignedGrant};
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;
@@ -399,12 +398,23 @@ pub async fn head_entry(
         }
         None => {
             let grant = entry.captured.grant.as_ref().ok_or(ViewError::Denied)?;
-            granted_read(context, source, grant, None, true)
+            let read = granted_read(context, source, grant, None, true);
+            drive(read, context)
                 .await
                 .map(|_| ())
                 .map_err(granted_error)
         }
     }
+}
+
+fn granted_read(
+    context: &DriverContext,
+    source: NodeId,
+    grant: &SignedGrant,
+    range: Option<Range<u64>>,
+    head: bool,
+) -> GrantedReadOperation {
+    GrantedReadOperation::new(context.node_and_realm(), source, grant, range, head)
 }
 
 /// The bytes of one entry, or of `range` of it, at its exact version from its source.
@@ -455,10 +465,9 @@ pub async fn read_entry(
         }
         None => {
             let grant = entry.captured.grant.as_ref().ok_or(ViewError::Denied)?;
-            let (_, stream) = granted_read(context, source, grant, range, false)
-                .await
-                .map_err(granted_error)?;
-            Ok(body_stream(stream))
+            let read = granted_read(context, source, grant, range, false);
+            let body = drive(read, context).await.map_err(granted_error)?;
+            Ok(body.blob)
         }
     }
 }
