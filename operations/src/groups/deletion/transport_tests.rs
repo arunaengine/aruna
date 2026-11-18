@@ -72,7 +72,7 @@ async fn peers_delete_together() {
         &second_context
     };
     for _ in 0..2 {
-        super::delete_group(context, auth.clone(), None, group_id)
+        crate::driver::drive(super::DeleteGroupOperation::new((context.node_and_realm(), auth.clone(), None, group_id, Ulid::generate()), context)
             .await
             .unwrap();
     }
@@ -110,7 +110,7 @@ async fn check_reports_nodes() {
     let second_context = Arc::new(second.context);
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
-    let replies = super::check_group(&first_context, auth, group_id)
+    let replies = crate::driver::drive(super::CheckGroupOperation::new(first_context.node_and_realm(), auth, group_id), &first_context)
         .await
         .unwrap();
     let reply = |seed| {
