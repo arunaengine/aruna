@@ -261,9 +261,6 @@ impl CompleteUploadOperation {
     pub(super) fn evidence_written(&mut self, result: IoResult) -> Turn {
         match result.child::<Fenced, StorageError>()? {
             Ok(Fenced::Written | Fenced::RuleGone) => self.start_finalize(),
-            Ok(Fenced::Failed(error)) => {
-                Err(error.map_or(CompleteUploadError::InvalidOperationState, Into::into))
-            }
             Err(error) => Err(error.into()),
         }
     }
@@ -276,9 +273,6 @@ impl CompleteUploadOperation {
             Ok(Fenced::RuleGone) => {
                 self.written_intent.clear();
                 Err(CompleteUploadError::ImportRemoved)
-            }
-            Ok(Fenced::Failed(error)) => {
-                Err(error.map_or(CompleteUploadError::InvalidOperationState, Into::into))
             }
             Err(error) => Err(error.into()),
         }

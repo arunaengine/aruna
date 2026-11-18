@@ -808,9 +808,6 @@ impl MigrateVersionOperation {
                 self.written_intent.clear();
                 self.skip()
             }
-            Ok(Fenced::Failed(error)) => {
-                Err(error.map_or(MigrateVersionError::NotFinished, Into::into))
-            }
             Err(error) => Err(error.into()),
         }
     }
