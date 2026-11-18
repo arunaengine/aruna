@@ -450,9 +450,9 @@ impl ReadExactOperation {
         let extras = PolicyRequestExtras::operation(request_operation(request));
         let authorize = AuthorizeOperation::new(
             self.auth.realm_id,
-            self.auth.clone(),
-            path,
-            Permission::READ,
+            &self.auth,
+            &path,
+            &Permission::READ,
             extras,
         );
         self.step = ReadStep::Authorize;

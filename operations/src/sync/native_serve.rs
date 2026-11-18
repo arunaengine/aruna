@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::driver::{DriverContext, drive};
 use crate::staging::native_source::PrepareReferenceOperation;
 
-pub(super) async fn handle_native_stream(
+pub(crate) async fn handle_native_stream(
     context: &DriverContext,
     mut stream: BiStream,
     peer: NodeId,

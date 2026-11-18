@@ -6,7 +6,7 @@ pub mod announce;
 pub mod document_outbox;
 pub(crate) mod evicted;
 pub mod mirror_repair;
-mod native_serve;
+pub(crate) mod native_serve;
 pub mod outbox_record;
 pub mod reconcile;
 pub mod replicate_documents;
