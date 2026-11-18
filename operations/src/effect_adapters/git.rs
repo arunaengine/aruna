@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{GitAnswer, GitCall};
+use futures_util::StreamExt;
 
 use crate::driver::DriverContext;
 
@@ -20,5 +21,18 @@ pub(super) async fn dispatch_git(call: GitCall, context: &DriverContext) -> GitA
             GitAnswer::Configured(store.configured(document_id).await)
         }
         GitCall::Busy(document_id) => GitAnswer::Busy(store.try_lock(document_id).is_none()),
+        GitCall::Collect { mut blob, limit } => {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = blob.next().await {
+                match chunk {
+                    Ok(chunk) => bytes.extend_from_slice(&chunk),
+                    Err(error) => return GitAnswer::Failed(error.to_string()),
+                }
+                if bytes.len() as u64 > limit {
+                    break;
+                }
+            }
+            GitAnswer::Collected(bytes.into())
+        }
     }
 }

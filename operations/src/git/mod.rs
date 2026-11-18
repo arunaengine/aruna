@@ -8,7 +8,9 @@ pub mod changes;
 pub mod cleanup;
 mod dataset;
 pub mod download;
+mod generate;
 pub mod lfs;
+pub mod linked;
 pub mod location;
 pub mod locks;
 pub mod merge;
@@ -27,10 +29,11 @@ pub mod versions;
 
 pub use self::access::{DocumentAccessOperation, RepositoryOperation, document, repository};
 use self::changes::PropertyConflict;
-pub use self::transport::transport;
+pub use self::transport::{TransportOperation, transport};
 use crate::auth::error::AuthorizeError;
-use crate::driver::DriverContext;
-use aruna_blob::git::GitStore;
+use aruna_core::NodeId;
+use aruna_core::structs::identity::realm::NodeRealm;
+use aruna_core::structs::storage::routing::NodeRouting;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -79,9 +82,15 @@ pub struct MergeConflict {
     pub properties: Vec<PropertyConflict>,
 }
 
-/// The node's Git store, which startup installs on the blob handle.
-pub(crate) fn store(context: &DriverContext) -> Result<&GitStore, GitError> {
-    (context.blob_handle.as_ref())
-        .and_then(|handle| handle.git())
-        .ok_or(GitError::Unavailable)
+/// What the Git operations need to know about this node; the input reads it from its context.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitNode {
+    pub ids: NodeRealm,
+    pub routing: NodeRouting,
+}
+
+impl GitNode {
+    pub(crate) fn node(&self) -> Option<NodeId> {
+        self.ids.map(|(node_id, _)| node_id)
+    }
 }

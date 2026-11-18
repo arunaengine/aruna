@@ -403,7 +403,7 @@ struct AskSetOperation {
     snapshot: DistributionSnapshot,
     version_id: Ulid,
     probes: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
     step: AskStep,
     local_proves: bool,
     complete: bool,
@@ -418,7 +418,7 @@ impl AskSetOperation {
         ids: NodeRealm,
         snapshot: DistributionSnapshot,
         version_id: Ulid,
-        (probes, deadline): (usize, Instant),
+        (probes, deadline): (usize, Option<Instant>),
     ) -> Self {
         Self {
             ids,
@@ -468,7 +468,10 @@ impl AskSetOperation {
         let Some((_, realm_id)) = self.ids else {
             return self.answer(SetAnswer::Unknown);
         };
-        if self.probes >= MAX_PROBES || Instant::now() >= self.deadline {
+        let late = self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if self.probes >= MAX_PROBES || late {
             return self.answer(SetAnswer::Unknown);
         }
         self.probes += 1;
@@ -525,7 +528,7 @@ impl Operation for AskSetOperation {
 pub struct ResolveVersionOperation {
     ids: NodeRealm,
     version_id: Ulid,
-    deadline: Instant,
+    deadline: Option<Instant>,
     candidates: VecDeque<DistributionSnapshot>,
     current: Option<DistributionSnapshot>,
     probes: usize,
@@ -539,7 +542,12 @@ pub fn resolve_version(
     version_id: Ulid,
     deadline: Instant,
 ) -> ResolveVersionOperation {
-    ResolveVersionOperation::new(ids, version_id, deadline)
+    ResolveVersionOperation::new(ids, version_id, Some(deadline))
+}
+
+/// The resolution of `version_id` for a caller whose own group deadline bounds the run.
+pub(crate) fn resolve_bounded(ids: NodeRealm, version_id: Ulid) -> ResolveVersionOperation {
+    ResolveVersionOperation::new(ids, version_id, None)
 }
 
 /// The resolution a run reached; a run that did not finish in time resolves nothing now.
@@ -558,7 +566,7 @@ pub fn version_found(run: Result<GlobalResolution, IoError>) -> Option<ResolvedV
 type Resolving = Result<Next<GlobalResolution>, IoError>;
 
 impl ResolveVersionOperation {
-    pub(crate) fn new(ids: NodeRealm, version_id: Ulid, deadline: Instant) -> Self {
+    pub(crate) fn new(ids: NodeRealm, version_id: Ulid, deadline: Option<Instant>) -> Self {
         Self {
             ids,
             version_id,

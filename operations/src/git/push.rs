@@ -44,6 +44,7 @@ static PUSH_KEYS: LazyLock<std::sync::Mutex<HashMap<Ulid, String>>> =
     LazyLock::new(Default::default);
 
 /// A push key that is valid while the receive-pack request that created it runs.
+#[derive(PartialEq)]
 pub(super) struct PushKey {
     document_id: Ulid,
     pub(super) value: String,
@@ -56,6 +57,15 @@ impl PushKey {
             keys.insert(document_id, value.clone());
         }
         Self { document_id, value }
+    }
+}
+
+/// Names the document only: the key never reaches a log.
+impl std::fmt::Debug for PushKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (formatter.debug_struct("PushKey"))
+            .field("document_id", &self.document_id)
+            .finish_non_exhaustive()
     }
 }
 

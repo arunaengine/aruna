@@ -394,6 +394,11 @@ pub enum GitCall {
     Configured(Ulid),
     /// Whether another run holds the document's repository right now.
     Busy(Ulid),
+    /// Reads a stream to its end, stopping once it holds more than `limit` bytes.
+    Collect {
+        blob: crate::stream::BackendStream<Result<Bytes, crate::stream::StreamError>>,
+        limit: u64,
+    },
 }
 
 /// What the Git store answered.
@@ -402,6 +407,7 @@ pub enum GitAnswer {
     Ran(GitEvent),
     Configured(bool),
     Busy(bool),
+    Collected(Bytes),
     /// The store is missing or the effect failed.
     Failed(String),
 }
