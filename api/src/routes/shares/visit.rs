@@ -24,7 +24,7 @@ use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::read::get_object_routed;
+use aruna_operations::s3::object::read::GetRoutedOperation;
 use aruna_operations::shares::lifecycle::{
     OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
 };
@@ -759,19 +759,22 @@ pub async fn download_file(
     let (blob, size) = match remote {
         Some(remote) => remote,
         None => {
-            let result = get_object_routed(
+            let result = drive(
+                GetRoutedOperation::new(
+                    GetObjectInput {
+                        bucket: bucket.clone(),
+                        key: ticket.key.clone(),
+                        version_id: ticket.version_id,
+                        range: None,
+                        group_id: info.group_id,
+                        user_identity: auth.user_id,
+                        realm_id: state.get_realm_id(),
+                        node_id: state.get_node_id(),
+                    },
+                    auth.path_restrictions.clone(),
+                    None,
+                ),
                 &state.get_ctx(),
-                GetObjectInput {
-                    bucket: bucket.clone(),
-                    key: ticket.key.clone(),
-                    version_id: ticket.version_id,
-                    range: None,
-                    group_id: info.group_id,
-                    user_identity: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                    node_id: state.get_node_id(),
-                },
-                auth.path_restrictions.clone(),
             )
             .await
             .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
