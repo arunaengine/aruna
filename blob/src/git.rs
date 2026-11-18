@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::git_cache::GitCaches;
 use aruna_core::git::{GitEffect, GitEvent, MAX_GIT_BYTES};
 use aruna_core::repo_layout::Layout;
 use aruna_core::telemetry::{record_stage, time_stage};
@@ -25,6 +26,7 @@ pub struct GitStore {
     slots: Semaphore,
     /// The layout of each seen commit; a commit never changes, so the answer stays valid.
     layouts: std::sync::Mutex<lru::LruCache<(ulid::Ulid, String), Layout>>,
+    caches: GitCaches,
 }
 
 /// Commits whose layout is kept; older answers are read from the repository again.
@@ -72,7 +74,13 @@ impl GitStore {
             documents: DocumentLocks::default(),
             slots: Semaphore::new(2),
             layouts: std::sync::Mutex::new(lru::LruCache::new(LAYOUTS)),
+            caches: GitCaches::default(),
         }
+    }
+
+    /// What this node remembers about its repositories between operations.
+    pub fn caches(&self) -> &GitCaches {
+        &self.caches
     }
 
     /// The stored layout when `revision` is a full commit id seen before.

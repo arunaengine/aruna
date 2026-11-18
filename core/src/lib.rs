@@ -29,6 +29,7 @@ pub mod errors;
 pub mod events;
 pub mod federation;
 pub mod git;
+pub mod git_state;
 pub mod handle;
 pub mod handoff;
 pub mod heartbeat;

@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::git_state::{Ancestry, Projection, ProjectionInputs};
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
+use crate::operation::SubOperation;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::dataset_location::DatasetLocation;
@@ -399,6 +401,62 @@ pub enum GitCall {
         blob: crate::stream::BackendStream<Result<Bytes, crate::stream::StreamError>>,
         limit: u64,
     },
+    /// Runs a receive-pack request under a new push key that lasts as long as the run.
+    Push {
+        request: Box<GitRequest>,
+        actor: UserId,
+    },
+    /// Whether `proof` is the key of the push now running for the document.
+    PushKeyValid { document_id: Ulid, proof: PushProof },
+    /// The remembered projection of the document, if `inputs` still match it.
+    Recent {
+        document_id: Ulid,
+        inputs: ProjectionInputs,
+    },
+    /// The last completed projection of the document, whatever changed since.
+    Last(Ulid),
+    Remember {
+        document_id: Ulid,
+        inputs: ProjectionInputs,
+        projection: Box<Projection>,
+    },
+    /// Drops the remembered projection, so the next refresh projects again.
+    Forget(Ulid),
+    /// The ancestry answers kept for the document.
+    KnownAncestry(Ulid),
+    /// Keeps a finished projection's true ancestry answers and the refs it served.
+    Projected {
+        document_id: Ulid,
+        ancestry: Ancestry,
+        refs: Refs,
+    },
+    /// The refs this node last served for the document, which a push must build on.
+    ServedRefs(Ulid),
+    /// How often this process stored a Git record of the document.
+    RecordWrites(Ulid),
+    /// The next id in the order pending merges are accepted.
+    NextSequence,
+    /// Starts `child` beside the caller unless a refresh of the document already runs.
+    RefreshOnce {
+        document_id: Ulid,
+        child: Box<dyn SubOperation>,
+    },
+    /// Runs `child` under its own stage timers and answers them with its event.
+    Timed(Box<dyn SubOperation>),
+    /// The canonical digest of a JSON-LD graph, timed as a request stage.
+    Canonicalize(String),
+    /// Adds finished stage times, in milliseconds, to the current request.
+    Stages(Vec<(&'static str, u64)>),
+}
+
+/// A push key a receive hook presents; it never reaches a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushProof(pub String);
+
+impl std::fmt::Debug for PushProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PushProof(..)")
+    }
 }
 
 /// What the Git store answered.
@@ -408,6 +466,22 @@ pub enum GitAnswer {
     Configured(bool),
     Busy(bool),
     Collected(Bytes),
+    /// The answer of [`GitCall::Recent`] or [`GitCall::Last`].
+    Projection(Option<Box<Projection>>),
+    Ancestry(Ancestry),
+    ServedRefs(Option<Refs>),
+    RecordWrites(u64),
+    Sequence(Ulid),
+    PushKeyValid(bool),
+    /// Whether [`GitCall::RefreshOnce`] started its child.
+    RefreshStarted(bool),
+    Timed {
+        event: Box<crate::events::Event>,
+        stages: String,
+    },
+    Canonical(Option<[u8; 32]>),
+    /// A cache update or stage report was taken.
+    Noted,
     /// The store is missing or the effect failed.
     Failed(String),
 }
