@@ -310,62 +310,207 @@ impl CleanupPageOperation {
             pass: PagePass::default(),
             step: CleanupStep::Page,
         }
-        let record: RoCrateUploadRecord = match postcard::from_bytes(&value) {
-            Ok(record) => record,
-            Err(error) => {
-                warn!(error = %error, "Failed to decode RO-Crate upload");
-                continue;
-            }
-        };
-        if storage_key.as_ref() != record.upload_id.to_bytes().as_slice() {
-            warn!("RO-Crate upload key does not match its upload id");
-            pending = true;
-            continue;
-        }
-        let key = match HiddenBlobKey::try_from(&record.location) {
-            Ok(key) => key,
-            Err(error) => {
-                warn!(error = %error, "Invalid RO-Crate upload location");
-                continue;
-            }
-        };
-        let record_cleanup =
-            match delete_unclaimed(&context.storage_handle, record.upload_id, now_ms, deadline)
-                .await
-            {
+    }
+
+    fn next_row(&mut self) -> Turn<PagePass> {
+        while let Some((key, value)) = self.rows.pop_front() {
+            within_budget(self.scope.started_ms)?;
+            let cleanup = match RoCrateUploadCleanup::from_bytes(&value) {
                 Ok(cleanup) => cleanup,
                 Err(error) => {
-                    warn!(error = %error, "Failed to claim stale RO-Crate upload cleanup");
-                    pending = true;
+                    warn!(error = %error, "Failed to decode RO-Crate upload cleanup");
                     continue;
                 }
             };
-        if matches!(record_cleanup, RecordCleanup::Protected) {
-            continue;
+            if key.as_ref() != cleanup.upload_id.to_bytes().as_slice() {
+                warn!("RO-Crate upload cleanup key does not match its upload id");
+                self.pass.pending = true;
+                continue;
+            }
+            let claim = DeleteUnclaimedOperation::new(cleanup.upload_id, self.scope.now_ms);
+            self.step = CleanupStep::Claim(key, cleanup.hidden_key);
+            return Ok(Next::Call(IoCall::child(claim)));
         }
-        if let Err(error) = delete_key(context, key, deadline).await {
-            warn!(error = %error, "Failed to delete stale upload blob");
-            pending = true;
-            continue;
-        }
-        deleted = deleted.saturating_add(1);
+        Ok(Next::Done(std::mem::take(&mut self.pass)))
     }
-    let more = next.is_some();
-    *cursor = next.map(|key| key.to_vec());
-    Ok((deleted, more, pending))
+
+    fn claimed(
+        &mut self,
+        key: Key,
+        hidden: HiddenBlobKey,
+        claim: Result<RecordCleanup, MigrationError>,
+    ) -> Turn<PagePass> {
+        match claim {
+            Ok(RecordCleanup::Protected) => self.pass.pending = true,
+            Ok(RecordCleanup::Missing | RecordCleanup::Deleted) => {
+                let delete = DeleteHiddenOperation::of_key(hidden);
+                self.step = CleanupStep::Blob(key);
+                return Ok(Next::Call(IoCall::child(delete)));
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to compensate RO-Crate upload record");
+                self.pass.pending = true;
+            }
+        }
+        self.next_row()
+    }
 }
 
-async fn upload_live(
-    context: &DriverContext,
-    record: &RoCrateUploadRecord,
-    now_ms: u64,
-    deadline: Instant,
-) -> Result<bool, String> {
-    let claimed_live = match record.claimed_by {
-        Some(job_id) => job_live(&context.storage_handle, job_id, None, deadline).await?,
-        None => false,
-    };
-    Ok(upload_is_live(record, claimed_live, now_ms))
+impl Operation for CleanupPageOperation {
+    type Output = PagePass;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<PagePass> {
+        let after = self.scope.after.take();
+        Ok(Next::Call(page_call(UPLOAD_CLEANUP_KEYSPACE, after)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<PagePass> {
+        match std::mem::replace(&mut self.step, CleanupStep::Row) {
+            CleanupStep::Page => {
+                self.rows = take_page(result, &mut self.pass)?;
+                self.next_row()
+            }
+            CleanupStep::Claim(key, hidden) => self.claimed(key, hidden, result.child()?),
+            CleanupStep::Blob(key) => {
+                if let Err(error) = result.child::<(), MigrationError>()? {
+                    warn!(error = %error, "Failed to delete upload cleanup blob");
+                    self.pass.pending = true;
+                    return self.next_row();
+                }
+                let delete = DeleteRowOperation { key: Some(key) };
+                self.step = CleanupStep::Row;
+                Ok(Next::Call(IoCall::child(delete)))
+            }
+            CleanupStep::Row => {
+                if let Err(error) = result.child::<(), MigrationError>()? {
+                    warn!(error = %error, "Failed to delete upload cleanup row");
+                    self.pass.pending = true;
+                }
+                self.next_row()
+            }
+        }
+    }
+}
+
+/// Deletes one upload cleanup row; a failure leaves it for a later sweep.
+#[derive(Debug, PartialEq)]
+struct DeleteRowOperation {
+    key: Option<Key>,
+}
+
+impl Operation for DeleteRowOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<()> {
+        let key = self.key.take().ok_or_else(|| failed("no cleanup row"))?;
+        let row = (UPLOAD_CLEANUP_KEYSPACE.to_string(), key);
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        result.done()?;
+        Ok(Next::Done(()))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum UploadsStep {
+    Page,
+    Claim(HiddenBlobKey),
+    Blob,
+}
+
+/// Claims and deletes the stale RO-Crate uploads of one page.
+#[derive(Debug, PartialEq)]
+struct UploadsPageOperation {
+    scope: PageScope,
+    rows: VecDeque<(Key, Value)>,
+    pass: PagePass,
+    step: UploadsStep,
+}
+
+impl UploadsPageOperation {
+    fn new(scope: PageScope) -> Self {
+        Self {
+            scope,
+            rows: VecDeque::new(),
+            pass: PagePass::default(),
+            step: UploadsStep::Page,
+        }
+    }
+
+    fn next_row(&mut self) -> Turn<PagePass> {
+        while let Some((key, value)) = self.rows.pop_front() {
+            within_budget(self.scope.started_ms)?;
+            let record: RoCrateUploadRecord = match postcard::from_bytes(&value) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(error = %error, "Failed to decode RO-Crate upload");
+                    continue;
+                }
+            };
+            if key.as_ref() != record.upload_id.to_bytes().as_slice() {
+                warn!("RO-Crate upload key does not match its upload id");
+                self.pass.pending = true;
+                continue;
+            }
+            let hidden = match HiddenBlobKey::try_from(&record.location) {
+                Ok(hidden) => hidden,
+                Err(error) => {
+                    warn!(error = %error, "Invalid RO-Crate upload location");
+                    continue;
+                }
+            };
+            let claim = DeleteUnclaimedOperation::new(record.upload_id, self.scope.now_ms);
+            self.step = UploadsStep::Claim(hidden);
+            return Ok(Next::Call(IoCall::child(claim)));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.pass)))
+    }
+}
+
+impl Operation for UploadsPageOperation {
+    type Output = PagePass;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<PagePass> {
+        let after = self.scope.after.take();
+        Ok(Next::Call(page_call(ROCRATE_UPLOAD_KEYSPACE, after)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<PagePass> {
+        match std::mem::replace(&mut self.step, UploadsStep::Blob) {
+            UploadsStep::Page => {
+                self.rows = take_page(result, &mut self.pass)?;
+                self.next_row()
+            }
+            UploadsStep::Claim(hidden) => match result.child::<RecordCleanup, MigrationError>()? {
+                Ok(RecordCleanup::Protected) => self.next_row(),
+                Ok(_) => {
+                    let delete = DeleteHiddenOperation::of_key(hidden);
+                    self.step = UploadsStep::Blob;
+                    Ok(Next::Call(IoCall::child(delete)))
+                }
+                Err(error) => {
+                    warn!(error = %error, "Failed to claim stale RO-Crate upload cleanup");
+                    self.pass.pending = true;
+                    self.next_row()
+                }
+            },
+            UploadsStep::Blob => {
+                match result.child::<(), MigrationError>()? {
+                    Ok(()) => self.pass.deleted = self.pass.deleted.saturating_add(1),
+                    Err(error) => {
+                        warn!(error = %error, "Failed to delete stale upload blob");
+                        self.pass.pending = true;
+                    }
+                }
+                self.next_row()
+            }
+        }
+    }
 }
 
 fn upload_is_live(record: &RoCrateUploadRecord, claimed_live: bool, now_ms: u64) -> bool {
@@ -384,119 +529,130 @@ fn hidden_is_old(entry: &HiddenBlobEntry, cutoff_ms: u64) -> bool {
     })
 }
 
-async fn sweep_hidden(
-    context: &DriverContext,
-    now_ms: u64,
-    cursor: &mut Option<Vec<u8>>,
-    deadline: Instant,
-) -> Result<(usize, bool, bool), String> {
-    let (entries, next) = list_hidden(context, cursor.take(), deadline).await?;
-    let cutoff_ms = now_ms.saturating_sub(ORPHAN_GRACE.as_millis() as u64);
-    let mut deleted = 0usize;
-    let mut pending = false;
-    for entry in entries {
-        if time_left(deadline).is_zero() {
-            return Err("hidden sweep budget exhausted".to_string());
+#[derive(Debug, PartialEq)]
+enum HiddenStep {
+    List,
+    Protected(HiddenBlobKey),
+    Blob,
+}
+
+/// Deletes the old hidden blobs of one listing page that nothing protects.
+#[derive(Debug, PartialEq)]
+struct HiddenPageOperation {
+    scope: PageScope,
+    entries: VecDeque<HiddenBlobEntry>,
+    pass: PagePass,
+    step: HiddenStep,
+}
+
+impl HiddenPageOperation {
+    fn new(scope: PageScope) -> Self {
+        Self {
+            scope,
+            entries: VecDeque::new(),
+            pass: PagePass::default(),
+            step: HiddenStep::List,
         }
-        if !hidden_is_old(&entry, cutoff_ms) {
-            continue;
+    }
+
+    fn listed(&mut self, event: Event) -> Turn<PagePass> {
+        match event {
+            Event::Blob(BlobEvent::HiddenListed {
+                entries,
+                next_cursor,
+            }) => {
+                self.entries = entries.into();
+                self.pass.next = next_cursor;
+                self.next_entry()
+            }
+            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Err(no_blob_handle()),
+            Event::Blob(BlobEvent::Error(error)) => Err(failed(error)),
+            other => Err(MigrationError::Failed(format!(
+                "unexpected hidden blob list event: {}",
+                other.label()
+            ))),
         }
-        match is_protected(context, &entry.key, now_ms, deadline).await {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(error = %error, "Failed to validate hidden blob ownership");
-                pending = true;
+    }
+
+    fn next_entry(&mut self) -> Turn<PagePass> {
+        let grace = ORPHAN_GRACE.as_millis() as u64;
+        let cutoff_ms = self.scope.now_ms.saturating_sub(grace);
+        while let Some(entry) = self.entries.pop_front() {
+            within_budget(self.scope.started_ms)?;
+            if !hidden_is_old(&entry, cutoff_ms) {
                 continue;
             }
+            let check = IsProtectedOperation::new(entry.key.clone(), self.scope.now_ms);
+            self.step = HiddenStep::Protected(entry.key);
+            return Ok(Next::Call(IoCall::child(check)));
         }
-        if let Err(error) = delete_key(context, entry.key, deadline).await {
-            warn!(error = %error, "Failed to delete hidden orphan");
-            pending = true;
-            continue;
-        }
-        deleted = deleted.saturating_add(1);
+        Ok(Next::Done(std::mem::take(&mut self.pass)))
     }
-    let more = next.is_some();
-    *cursor = next;
-    Ok((deleted, more, pending))
 }
 
-async fn is_protected(
-    context: &DriverContext,
-    key: &HiddenBlobKey,
-    now_ms: u64,
-    deadline: Instant,
-) -> Result<bool, String> {
-    let namespace = key.namespace().map_err(|error| error.to_string())?;
-    if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
-        return kept_protected(context, key, namespace, deadline).await;
+impl Operation for HiddenPageOperation {
+    type Output = PagePass;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<PagePass> {
+        let list = BlobEffect::ListHidden {
+            namespace: None,
+            cursor: self.scope.after.take(),
+        };
+        Ok(Next::Call(Effect::Blob(list).into()))
     }
-    if let Some(value) = read_value(
-        &context.storage_handle,
-        ROCRATE_UPLOAD_KEYSPACE,
-        ByteView::from(namespace.to_bytes().to_vec()),
-        None,
-        deadline,
-    )
-    .await?
-    {
-        if value.len() > MAX_JOB_BYTES {
-            return Err("RO-Crate upload record exceeds limit".to_string());
-        }
-        let record: RoCrateUploadRecord =
-            postcard::from_bytes(&value).map_err(|error| error.to_string())?;
-        let record_key =
-            HiddenBlobKey::try_from(&record.location).map_err(|error| error.to_string())?;
-        if record_key == *key && upload_live(context, &record, now_ms, deadline).await? {
-            return Ok(true);
+
+    fn next(&mut self, result: IoResult) -> Turn<PagePass> {
+        match std::mem::replace(&mut self.step, HiddenStep::Blob) {
+            HiddenStep::List => self.listed(result.event()?),
+            HiddenStep::Protected(key) => match result.child::<bool, MigrationError>()? {
+                Ok(true) => self.next_entry(),
+                Ok(false) => {
+                    let delete = DeleteHiddenOperation::of_key(key);
+                    self.step = HiddenStep::Blob;
+                    Ok(Next::Call(IoCall::child(delete)))
+                }
+                Err(error) => {
+                    warn!(error = %error, "Failed to validate hidden blob ownership");
+                    self.pass.pending = true;
+                    self.next_entry()
+                }
+            },
+            HiddenStep::Blob => {
+                match result.child::<(), MigrationError>()? {
+                    Ok(()) => self.pass.deleted = self.pass.deleted.saturating_add(1),
+                    Err(error) => {
+                        warn!(error = %error, "Failed to delete hidden orphan");
+                        self.pass.pending = true;
+                    }
+                }
+                self.next_entry()
+            }
         }
     }
-    let Ok(job_id) = JobId::try_from_bytes(namespace.to_bytes()) else {
-        return Ok(false);
-    };
-    let Some(value) = read_value(
-        &context.storage_handle,
-        JOB_KEYSPACE,
-        job_record_key(job_id),
-        None,
-        deadline,
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
+}
+
+fn job_row(value: &[u8]) -> Result<JobRecord, MigrationError> {
     if value.len() > MAX_JOB_BYTES {
-        return Err("job record exceeds limit".to_string());
+        return Err(MigrationError::Failed(
+            "job record exceeds limit".to_string(),
+        ));
     }
-    let record = JobRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-    if !record.state.is_terminal() && record.payload.is_rocrate() {
-        return Ok(true);
-    }
-    if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
-        && let Some(artifact) = &result.artifact
-    {
-        let artifact_key =
-            HiddenBlobKey::try_from(&artifact.location).map_err(|error| error.to_string())?;
-        if artifact_key == *key {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    JobRecord::from_bytes(value).map_err(failed)
 }
 
-/// Whether a kept copy is still the one its attachment or cache entry names. The blob name is
-/// the row's key: set and version id for an attachment, the hex BLAKE3 for a cache entry.
-async fn kept_protected(
-    context: &DriverContext,
-    key: &HiddenBlobKey,
-    namespace: Ulid,
-    deadline: Instant,
-) -> Result<bool, String> {
-    // An evicted copy a read still holds stays until the read ends.
-    if crate::distribution::pull::pinned_path(&key.backend_path) {
-        return Ok(true);
-    }
+/// Whether a stored job row keeps an RO-Crate job running.
+fn job_live(value: Option<Value>) -> Result<bool, MigrationError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let record = job_row(&value)?;
+    Ok(!record.state.is_terminal() && record.payload.is_rocrate())
+}
+
+/// The row a kept copy's name points at: set and version id for an attachment, the hex BLAKE3
+/// for a cache entry.
+fn kept_row(key: &HiddenBlobKey, namespace: Ulid) -> Option<(&'static str, Vec<u8>)> {
     let name = std::path::Path::new(&key.backend_path)
         .file_name()
         .and_then(|name| name.to_str())
