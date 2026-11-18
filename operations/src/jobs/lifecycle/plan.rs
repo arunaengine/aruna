@@ -25,9 +25,10 @@ use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 use ulid::Ulid;
 
+use super::advertised::{Advertised, AdvertisementsOperation};
 use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
@@ -36,7 +37,6 @@ use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::types::Value;
 
@@ -81,7 +81,7 @@ pub struct PlanRound {
 
 #[derive(Debug, PartialEq)]
 enum PlanStep {
-    Advertisement(NodeId),
+    Advertisements,
     Holders(usize),
     Policies,
     PolicyRows,
@@ -95,8 +95,6 @@ enum PlanStep {
 #[derive(Debug, PartialEq)]
 pub struct BuildPlanOperation {
     round: PlanRound,
-    /// Members whose advertisement is still to read, the next one last.
-    members: Vec<NodeId>,
     documents: BTreeMap<NodeId, NodeInfoDocument>,
     unread: bool,
     inputs: Vec<ResolvedInput>,
@@ -113,32 +111,22 @@ type PlanNext = Result<Next<ExecutionPlan>, PlanBuildError>;
 
 impl BuildPlanOperation {
     pub fn new(round: PlanRound) -> Self {
-        let (mut members, unread) = match round.config.sync_eligible_nodes() {
-            Ok(members) => (members, false),
-            Err(_) => (Vec::new(), true),
-        };
-        members.reverse();
         Self {
             round,
-            members,
             documents: BTreeMap::new(),
-            unread,
+            unread: false,
             inputs: Vec::new(),
             policies: BTreeMap::new(),
             targets: Vec::new(),
             policy_allows: BTreeMap::new(),
             allowed: BTreeMap::new(),
-            step: PlanStep::Policies,
+            step: PlanStep::Advertisements,
         }
     }
 
-    fn advertisement(&mut self) -> PlanNext {
-        if let Some(node) = self.members.pop() {
-            self.step = PlanStep::Advertisement(node);
-            return Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![
-                node,
-            ]))));
-        }
+    fn advertised(&mut self, (documents, unread): Advertised) -> PlanNext {
+        self.documents = documents;
+        self.unread = unread;
         live_telemetry(&self.round.fresh, &mut self.documents, self.round.now_ms);
         self.inputs = pinned_inputs(&self.round.config, &self.round.spec)?;
         self.holders(0)
@@ -254,24 +242,15 @@ impl Operation for BuildPlanOperation {
     type Error = PlanBuildError;
 
     fn first(&mut self) -> PlanNext {
-        self.advertisement()
+        let read = AdvertisementsOperation::new(&self.round.config);
+        Ok(Next::Call(IoCall::child(read)))
     }
 
     fn next(&mut self, result: IoResult) -> PlanNext {
         match self.step {
-            PlanStep::Advertisement(node) => {
-                let read = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
-                match read.map(|mut documents| documents.remove(&node)) {
-                    Ok(Some(document)) => {
-                        self.documents.insert(node, document);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!(node = %node, error = %error, "Node info advertisement stayed unread");
-                        self.unread = true;
-                    }
-                }
-                self.advertisement()
+            PlanStep::Advertisements => {
+                let read = result.child::<Advertised, IoError>()??;
+                self.advertised(read)
             }
             PlanStep::Holders(index) => {
                 let registered = result
@@ -582,7 +561,7 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 mod tests {
     use super::*;
     use crate::driver::DriverContext;
-    use crate::jobs::lifecycle::ingress::advertisements;
+    use crate::driver::drive;
     use crate::tests::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
@@ -684,6 +663,11 @@ mod tests {
         ));
     }
 
+    async fn read_all(context: &DriverContext, config: &RealmConfigDocument) -> Advertised {
+        let read = AdvertisementsOperation::new(config);
+        drive(read, context).await.expect("advertisements read")
+    }
+
     /// One planning walk over the advertisements in the order they were
     /// published, with the cursor kept before the plan is stored.
     async fn walk(
@@ -696,7 +680,7 @@ mod tests {
             publish(&context, document).await;
         }
         let spec = family.spec();
-        let (read, _) = advertisements(&context, config).await;
+        let (read, _) = read_all(&context, config).await;
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
         let scan = candidates(
@@ -745,7 +729,7 @@ mod tests {
         }
         let spec = family.spec();
 
-        let (read, unread) = advertisements(&context, &config).await;
+        let (read, unread) = read_all(&context, &config).await;
         assert!(!unread && read.len() == 129);
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
@@ -781,7 +765,7 @@ mod tests {
         let spec = family.spec();
         let excluded = vec![documents[0].executors[0].target(documents[0].node_id)];
 
-        let (read, _) = advertisements(&context, &config).await;
+        let (read, _) = read_all(&context, &config).await;
         let request = round_request(&spec);
         let mut planner = Planner::new(&request, &config.compute).expect("request is well formed");
         let scan = candidates(
@@ -935,13 +919,10 @@ mod tests {
                 other => panic!("unexpected turn {other:?}"),
             };
             let answer = match (&operation.step, call) {
-                (PlanStep::Advertisement(_), IoCall::Child(_)) => {
+                (PlanStep::Advertisements, IoCall::Child(_)) => {
                     unread += 1;
-                    let error = NodeInfoError::Decode("unreadable".to_string());
-                    IoResult::Child(ChildOutcome::new(Err::<
-                        BTreeMap<NodeId, NodeInfoDocument>,
-                        _,
-                    >(error)))
+                    let read: Advertised = (BTreeMap::new(), true);
+                    IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(read)))
                 }
                 (PlanStep::Holders(_), IoCall::Child(_)) => IoResult::Child(ChildOutcome::new(
                     Ok::<_, GetHoldersError>(Vec::<NodeId>::new()),
@@ -964,7 +945,7 @@ mod tests {
         let config = family.config.clone();
         let mut operation = BuildPlanOperation::new(round(&config, &family.spec(), &[]));
         let (unread, plan) = quiet_round(&mut operation);
-        assert_eq!(unread, config.sync_eligible_nodes().expect("members").len());
-        assert!(unread > 0 && plan.selected.is_none() && plan.retryable);
+        assert_eq!(unread, 1);
+        assert!(plan.selected.is_none() && plan.retryable);
     }
 }
