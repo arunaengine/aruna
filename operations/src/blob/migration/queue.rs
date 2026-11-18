@@ -2109,13 +2109,6 @@ mod tests {
         .await;
         let row = old.to_bytes().unwrap();
         put(&context, BLOB_LOCATIONS_KEYSPACE, old_key.clone(), row).await;
-        let started = storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await;
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-            panic!("no transaction: {started:?}")
-        };
-
         let delete = StorageEffect::Delete {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
             key: old_key.into(),
@@ -2133,19 +2126,14 @@ mod tests {
         )
         .await;
         let prefix = aruna_core::structs::storage::transition::cleanup_prefix("b").len();
-        let left = stage_forget(storage, txn_id, prefix, vec![cleanup.clone().into()]).await;
-
-        assert_eq!(left, Ok(1));
-        storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await;
         assert!(
             exists(storage, TRANSITION_CLEANUP_KEYSPACE, cleanup.clone(), None)
                 .await
                 .unwrap()
         );
         // A later check sees the queued delete instead and still keeps the copy.
-        let left = forget_removed(storage, prefix, vec![cleanup.into()]).await;
+        let forget = ForgetRemovedOperation::new(prefix, vec![cleanup.into()]);
+        let left = drive(forget, &context).await;
         assert_eq!(left, Ok(1));
     }
 
@@ -2195,18 +2183,9 @@ mod tests {
             let upload = Ulid::generate().to_bytes().to_vec();
             put(&context, ABE_PENDING_KEYSPACE, upload, envelope.clone()).await;
         }
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: true })
-            .await
-        else {
-            panic!("no transaction")
-        };
-
-        let counted = envelopes_on_source(storage, txn_id, "b", &record).await;
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        let reclaimed = reclaim_uploads(storage, &record).await;
+        let scan = SourceScan::new("b", &record).unwrap();
+        let counted = drive(ScanOperation(scan), &context).await;
+        let reclaimed = drive(ReclaimUploadsOperation::new(&record), &context).await;
         let (left, _) = crate::storage_read::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
