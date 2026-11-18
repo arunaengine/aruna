@@ -45,11 +45,8 @@ use crate::s3::object::read::GetRoutedOperation;
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
 pub const REPORT_PATH: &str = "_report.json";
 const RENAMED_DIR: &str = "_renamed";
-/// Objects one folder page lists; tests use small pages so a folder spans several.
-#[cfg(not(test))]
+/// Objects one folder page lists.
 const FOLDER_PAGE: usize = 1000;
-#[cfg(test)]
-const FOLDER_PAGE: usize = 2;
 
 /// One selected file, pinned to `version_id` when given, or one folder of a bucket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +418,7 @@ pub struct WriteSelectionOperation {
     bucket: Option<BucketWork>,
     paths: WrittenPaths,
     report: Report,
+    folder_page: usize,
     now_ms: u64,
     step: ArchiveStep,
 }
@@ -443,6 +441,7 @@ impl WriteSelectionOperation {
             bucket: None,
             paths: WrittenPaths::default(),
             report: Report::default(),
+            folder_page: FOLDER_PAGE,
             now_ms: 0,
             step: ArchiveStep::Report,
         }
@@ -591,7 +590,7 @@ impl WriteSelectionOperation {
             prefix: Some(listing.prefix.clone()),
             delimiter: None,
             cursor: listing.cursor.take(),
-            limit: FOLDER_PAGE,
+            limit: self.folder_page,
             partial: true,
         };
         let list = ObjectPageOperation::<FolderKey>::new(

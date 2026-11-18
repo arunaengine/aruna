@@ -107,7 +107,9 @@ impl Fixture {
         };
         let access = MemberAccess::Bearer(None);
         let caller = (&self.auth, u64::MAX);
-        let write = WriteSelectionOperation::new(zip, node, access, caller, entries);
+        let mut write = WriteSelectionOperation::new(zip, node, access, caller, entries);
+        // Small pages, so a folder spans several.
+        write.folder_page = 2;
         drive(write, self.context()).await
     }
 
@@ -222,7 +224,7 @@ async fn folders_page_through() {
         fixture.put(&format!("data/{index}"), b"x").await;
     }
     fixture.put("other.txt", b"o").await;
-    // FOLDER_PAGE lists two keys a page, so the folder spans three pages.
+    // The test lists two keys a page, so the folder spans three pages.
     let entries = vec![
         file("other.txt", None),
         folder("data/"),
