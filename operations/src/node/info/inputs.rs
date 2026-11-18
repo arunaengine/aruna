@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 
+use aruna_compute::registry::ExecutorOffer;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
@@ -58,7 +59,7 @@ pub(in crate::node) fn child_answer<T: 'static, E: Display + 'static>(
 
 /// Reads this node's placement subject record.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct SubjectRecordOperation;
+struct SubjectRecordOperation;
 
 impl Operation for SubjectRecordOperation {
     type Output = Option<NodeSubjectRecord>;
@@ -86,19 +87,22 @@ pub(in crate::node) fn advertises_executors(config: &RealmConfigDocument, node_i
     node_kind(config, node_id).is_some_and(|kind| kind.is_sync_eligible())
 }
 
-/// This node's advertised execution targets, with availability as static ceilings minus local
-/// reservations. Ranking only: exact admission stays the target-side reservation.
+/// This node's advertised execution targets at its placement subject (none without one), with
+/// availability as static ceilings minus local reservations. Ranking only: exact admission stays
+/// the target-side reservation.
 fn advertised_executors(
-    config: &RealmConfigDocument,
-    node_id: NodeId,
-    facts: &NodeFacts,
+    offers: &[ExecutorOffer],
+    record: Option<&NodeSubjectRecord>,
     reserved: &ResourceTotals,
     now_ms: u64,
 ) -> Result<Vec<ExecutorCapability>, String> {
-    if !advertises_executors(config, node_id) {
+    let Some(record) = record else {
         return Ok(Vec::new());
-    }
-    let mut capabilities = facts.executors.clone()?;
+    };
+    let mut capabilities = (offers.iter())
+        .map(|offer| offer.capability(&record.subject, record.policy_draining))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to build executor advertisements: {error}"))?;
     for capability in &mut capabilities {
         capability.availability = Some(availability(&capability.limits, reserved, now_ms));
     }
@@ -135,7 +139,7 @@ pub(in crate::node) fn held_placement_set(
 
 /// Counts the registry documents in `held` buckets, one page at a time.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct HeldDocumentsOperation {
+pub struct HeldDocumentsOperation {
     held: HashSet<(Ulid, u32)>,
     pages: PrefixPages,
     count: u64,
@@ -180,7 +184,7 @@ impl Operation for HeldDocumentsOperation {
 
 /// The epoch and capacity snapshots one advertisement revision states.
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::node) struct RevisionInputs {
+pub struct RevisionInputs {
     pub epoch: AdvertisementEpoch,
     pub reservation: ComputeReservationSnapshot,
     /// The reservations the snapshot sums.
@@ -199,7 +203,7 @@ enum InputStep {
 /// Reads the membership generation, settles finished executions, then snapshots this node's
 /// exact reservations and its bounded logical demand.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct RevisionInputsOperation {
+pub struct RevisionInputsOperation {
     realm_id: RealmId,
     publisher_generation: u64,
     now_ms: u64,
@@ -291,7 +295,7 @@ impl Operation for RevisionInputsOperation {
 
 /// The advertised executors, labels and utilization of one revision.
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::node) struct Telemetry {
+pub struct Telemetry {
     pub executors: Vec<ExecutorCapability>,
     pub labels: BTreeMap<String, String>,
     pub utilization: NodeUtilization,
@@ -299,6 +303,7 @@ pub(in crate::node) struct Telemetry {
 
 #[derive(Debug, PartialEq)]
 enum TelemetryStep {
+    Subject,
     Counters,
     Documents,
 }
@@ -306,7 +311,7 @@ enum TelemetryStep {
 /// Builds the telemetry of one revision from the host facts and two local reads. A failed
 /// document count only warns, so a storage hiccup never fails the heartbeat.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct TelemetryOperation {
+pub struct TelemetryOperation {
     config: RealmConfigDocument,
     node_id: NodeId,
     facts: NodeFacts,
@@ -333,8 +338,26 @@ impl TelemetryOperation {
             now_ms,
             built: None,
             storage_bytes_used: 0,
-            step: TelemetryStep::Counters,
+            step: TelemetryStep::Subject,
         }
+    }
+
+    /// Builds what the facts decide, then reads the local usage counters.
+    fn build(
+        &mut self,
+        record: Option<&NodeSubjectRecord>,
+    ) -> Result<Next<Telemetry>, InfoFlowError> {
+        let facts = &self.facts;
+        let executors = advertised_executors(&facts.offers, record, &self.reserved, self.now_ms)
+            .map_err(InfoFlowError::Step)?;
+        // Class labels stay advertisement only and never enter the placement selector input.
+        let mut labels =
+            placement_labels(&self.config, self.node_id).map_err(InfoFlowError::Step)?;
+        labels.extend(facts.class_labels.clone());
+        self.built = Some((executors, labels));
+        self.step = TelemetryStep::Counters;
+        let counters = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        Ok(Next::Call(IoCall::child(counters)))
     }
 }
 
@@ -354,20 +377,18 @@ impl Operation for TelemetryOperation {
     type Error = InfoFlowError;
 
     fn first(&mut self) -> Result<Next<Telemetry>, InfoFlowError> {
-        let (config, node_id) = (&self.config, self.node_id);
-        let executors =
-            advertised_executors(config, node_id, &self.facts, &self.reserved, self.now_ms)
-                .map_err(InfoFlowError::Step)?;
-        // Class labels stay advertisement only and never enter the placement selector input.
-        let mut labels = placement_labels(config, node_id).map_err(InfoFlowError::Step)?;
-        labels.extend(self.facts.class_labels.clone());
-        self.built = Some((executors, labels));
-        let counters = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
-        Ok(Next::Call(IoCall::child(counters)))
+        if self.facts.offers.is_empty() || !advertises_executors(&self.config, self.node_id) {
+            return self.build(None);
+        }
+        Ok(Next::Call(IoCall::child(SubjectRecordOperation)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Telemetry>, InfoFlowError> {
         match self.step {
+            TelemetryStep::Subject => {
+                let record = child_answer::<Option<NodeSubjectRecord>, InfoFlowError>(result)?;
+                self.build(record.as_ref())
+            }
             TelemetryStep::Counters => {
                 let counters: UsageCounters = child_answer::<_, LoadCountersError>(result)?;
                 self.storage_bytes_used = counters.stored_bytes;
@@ -413,7 +434,7 @@ pub(super) mod tests {
 
     pub(in crate::node) fn facts() -> NodeFacts {
         NodeFacts {
-            executors: Ok(Vec::new()),
+            offers: Vec::new(),
             class_labels: BTreeMap::from([("class".to_string(), "true".to_string())]),
             load_permille: Some(10),
             storage_capacity: Some(20),
@@ -521,21 +542,29 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn unbuilt_executors_fail() {
+    fn offers_need_subject() {
         let mut facts = facts();
-        facts.executors = Err("no subject".to_string());
-        let answer = telemetry(facts.clone()).first();
+        let caps = aruna_compute::executor::BackendCaps::default();
+        facts.offers = vec![ExecutorOffer::new("local".to_string(), caps)];
+        let mut operation = telemetry(facts.clone());
+        let read = IoCall::child(SubjectRecordOperation);
+        assert_eq!(operation.first(), Ok(Next::Call(read)));
+        // A node without a subject offers nothing and goes on to its counters.
+        let none = child::<Option<NodeSubjectRecord>, InfoFlowError>(Ok(None));
+        let counters = IoCall::child(LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()));
+        assert_eq!(operation.next(none), Ok(Next::Call(counters)));
+        let failed = InfoFlowError::Step("no subject".to_string());
+        let mut broken = telemetry(facts.clone());
+        let answer = broken.next(child::<Option<NodeSubjectRecord>, _>(Err(failed)));
         assert_eq!(answer, Err(InfoFlowError::Step("no subject".to_string())));
-        // A node that advertises nothing never reports the failed build.
-        let mut operation = telemetry(facts);
-        operation.node_id = iroh::SecretKey::from_bytes(&[9; 32]).public();
-        assert_eq!(
-            operation.first(),
-            Err(InfoFlowError::Step(format!(
-                "node {} is missing from the realm placement view",
-                operation.node_id
-            )))
+        // A node that advertises nothing never reads the subject.
+        let mut silent = telemetry(facts);
+        silent.node_id = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let message = format!(
+            "node {} is missing from the realm placement view",
+            silent.node_id
         );
+        assert_eq!(silent.first(), Err(InfoFlowError::Step(message)));
     }
 
     #[test]

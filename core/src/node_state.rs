@@ -10,7 +10,7 @@ use crate::compute::quota::ComputeDepartureReport;
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
 use crate::operation::Operation;
 use crate::rows::{done, values};
-use crate::structs::storage::node_info::{NodeInfoDocument, node_info_key};
+use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, node_info_key};
 use crate::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
@@ -75,6 +75,37 @@ impl Operation for ReadInfoOperation {
             documents.insert(*node_id, document);
         }
         Ok(Next::Done(documents))
+    }
+}
+
+/// The published endpoints of one node, from its info document.
+#[derive(Debug, PartialEq)]
+pub struct NodeUrlsOperation {
+    node_id: NodeId,
+}
+
+impl NodeUrlsOperation {
+    pub fn new(node_id: NodeId) -> Self {
+        Self { node_id }
+    }
+}
+
+impl Operation for NodeUrlsOperation {
+    type Output = Option<NodeUrls>;
+    type Error = NodeInfoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, NodeInfoError> {
+        let reads = info_reads(std::iter::once(self.node_id));
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeInfoError> {
+        let [row] = crate::rows::values::<1>(result)?;
+        let document = row
+            .map(|bytes| postcard::from_bytes::<NodeInfoDocument>(bytes.as_ref()))
+            .transpose()
+            .map_err(|error| NodeInfoError::Decode(error.to_string()))?;
+        Ok(Next::Done(document.map(|document| document.urls)))
     }
 }
 
@@ -362,6 +393,26 @@ impl Operation for SetDrainOperation {
             false => IoCall::Delete(vec![drain_row()]),
         };
         Ok(Next::Call(call))
+    }
+}
+
+#[cfg(test)]
+mod urls_tests {
+    use super::*;
+
+    #[test]
+    fn missing_node_no_urls() {
+        let node_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let mut operation = NodeUrlsOperation::new(node_id);
+        let read = IoCall::Read(info_reads(std::iter::once(node_id)));
+        assert_eq!(operation.first(), Ok(Next::Call(read)));
+        let answer = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(None)));
+        let garbled = IoResult::Values(vec![Some(Value::from(vec![0xff]))]);
+        assert!(matches!(
+            operation.next(garbled),
+            Err(NodeInfoError::Decode(_))
+        ));
     }
 }
 

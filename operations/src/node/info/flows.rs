@@ -133,7 +133,7 @@ enum SeedStep {
 /// tick performs; `publish` replicates it at once. The published drain is the operator's durable
 /// flag or a departure, never a value carried forward from the previous document.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct SeedInfoOperation {
+pub struct SeedInfoOperation {
     realm_id: RealmId,
     node_id: NodeId,
     urls: NodeUrls,
@@ -148,7 +148,7 @@ pub(in crate::node) struct SeedInfoOperation {
 }
 
 impl SeedInfoOperation {
-    pub(in crate::node) fn new(
+    pub fn new(
         realm_id: RealmId,
         node_id: NodeId,
         urls: NodeUrls,
@@ -293,7 +293,7 @@ struct HeartbeatParts {
 /// still owed to replication, then pushes live telemetry to the sync peers. Snapshots run
 /// outside the revision, so it never carries a stale drain backwards.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct RefreshInfoOperation {
+pub struct RefreshInfoOperation {
     realm_id: RealmId,
     node_id: NodeId,
     sequence: u64,
@@ -309,7 +309,7 @@ pub(in crate::node) struct RefreshInfoOperation {
 }
 
 impl RefreshInfoOperation {
-    pub(in crate::node) fn new(
+    pub fn new(
         realm_id: RealmId,
         node_id: NodeId,
         sequence: u64,
@@ -494,7 +494,7 @@ enum DepartureStep {
 /// offers and admissions and records reserved executions as unresolved without blocking removal;
 /// returning clears the flags. False when the state already matched or no row changed.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct DepartureStateOperation {
+pub struct DepartureStateOperation {
     realm_id: RealmId,
     node_id: NodeId,
     departing: bool,
@@ -507,12 +507,7 @@ pub(in crate::node) struct DepartureStateOperation {
 }
 
 impl DepartureStateOperation {
-    pub(in crate::node) fn new(
-        realm_id: RealmId,
-        node_id: NodeId,
-        departing: bool,
-        facts: NodeFacts,
-    ) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId, departing: bool, facts: NodeFacts) -> Self {
         Self {
             realm_id,
             node_id,
@@ -635,7 +630,7 @@ enum DrainStep {
 /// node plans no new execution and never cancels work holding a receipt; departure state is
 /// untouched. False means the durable flag already matched.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct OperatorDrainOperation {
+pub struct OperatorDrainOperation {
     realm_id: RealmId,
     node_id: NodeId,
     draining: bool,
@@ -647,12 +642,7 @@ pub(in crate::node) struct OperatorDrainOperation {
 }
 
 impl OperatorDrainOperation {
-    pub(in crate::node) fn new(
-        realm_id: RealmId,
-        node_id: NodeId,
-        draining: bool,
-        facts: NodeFacts,
-    ) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId, draining: bool, facts: NodeFacts) -> Self {
         Self {
             realm_id,
             node_id,
@@ -743,7 +733,7 @@ impl Operation for OperatorDrainOperation {
 /// or no longer placed departs, blocking admission and recording copies unresolved. Compute
 /// follows the departure state as best effort because departure cannot block on it.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct ObservePlacementOperation {
+pub struct ObservePlacementOperation {
     realm_id: RealmId,
     node_id: NodeId,
     now_ms: u64,
@@ -752,12 +742,7 @@ pub(in crate::node) struct ObservePlacementOperation {
 }
 
 impl ObservePlacementOperation {
-    pub(in crate::node) fn new(
-        realm_id: RealmId,
-        node_id: NodeId,
-        now_ms: u64,
-        facts: NodeFacts,
-    ) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId, now_ms: u64, facts: NodeFacts) -> Self {
         Self {
             realm_id,
             node_id,
@@ -803,7 +788,7 @@ impl Operation for ObservePlacementOperation {
 /// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
 /// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
 #[derive(Debug, PartialEq)]
-pub(in crate::node) struct GroupDemandOperation {
+pub struct GroupDemandOperation {
     realm_id: RealmId,
     node_id: NodeId,
     group_id: GroupId,
@@ -812,7 +797,7 @@ pub(in crate::node) struct GroupDemandOperation {
 }
 
 impl GroupDemandOperation {
-    pub(in crate::node) fn new(
+    pub fn new(
         realm_id: RealmId,
         node_id: NodeId,
         group_id: GroupId,

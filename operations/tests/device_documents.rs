@@ -22,7 +22,8 @@ use aruna_operations::auth::revoke_token::{
 use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -204,7 +205,9 @@ async fn device_fetches_nodes() -> TestResult<()> {
             s3: Some(format!("https://s3-{index}.example.test")),
         };
         expected.insert(node.node_id(), urls.clone());
-        seed_info_document(node.context.as_ref(), node.node_id(), realm.realm_id, urls)
+        let facts = NodeFacts::gather(node.context.as_ref());
+        let seed = SeedInfoOperation::new(realm.realm_id, node.node_id(), urls, facts, false);
+        drive(seed, node.context.as_ref())
             .await
             .map_err(std::io::Error::other)?;
         drive(
