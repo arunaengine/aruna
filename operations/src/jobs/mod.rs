@@ -14,10 +14,6 @@ pub mod executor;
 pub mod export;
 pub(crate) mod handed_imports;
 pub mod harvest;
-#[cfg(test)]
-pub(crate) mod host {
-    pub(crate) use crate::tasks::job_host::run_staging_job;
-}
 pub mod import;
 mod import_listing;
 pub mod job_artifacts;
@@ -39,7 +35,6 @@ pub mod prune;
 pub mod quota;
 pub mod read_access;
 pub mod recent;
-pub mod reconcile;
 pub mod records;
 pub mod remote_key;
 pub mod repository;

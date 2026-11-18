@@ -59,7 +59,7 @@ use crate::replication::protocol::{LocationSummary, LocationSummaryRequest};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;

@@ -180,8 +180,6 @@ impl Operation for WakeUnlockedOperation {
     }
 }
 
-#[cfg(test)]
-pub(crate) use tests::wake_unlocked;
 
 #[cfg(test)]
 mod tests {
@@ -207,7 +205,7 @@ mod tests {
     use byteview::ByteView;
     use ulid::Ulid;
 
-    pub(crate) async fn wake_unlocked(
+    async fn wake_unlocked(
         context: &DriverContext,
         key: BucketKeyRef,
         now_ms: u64,

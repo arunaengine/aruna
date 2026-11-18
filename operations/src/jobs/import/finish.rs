@@ -56,7 +56,7 @@ use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 fn actor_of(run: &ImportRun) -> Actor {
     let auth = &run.spec.auth_context;

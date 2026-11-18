@@ -20,7 +20,8 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::repository::{JobScope, NodeScope};
+use super::repository::JobScope;
+use aruna_core::repository::remote::NodeScope;
 use crate::replication::bao_read::BaoReadOutput;
 use archive::blocking_omissions;
 use resolve::ExportCandidate;

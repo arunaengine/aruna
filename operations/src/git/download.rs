@@ -23,7 +23,7 @@ use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::GetObjectInput;
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::read::GetRoutedOperation;
 
 /// The bytes of a pack `owner` names first. A pack this node still keeps only as an object
 /// from before packs moved into Fjall is moved there once and replicated.
@@ -89,10 +89,13 @@ pub(super) async fn open(
             realm_id: auth.realm_id,
             node_id: node,
         };
-        return get_object_routed(context, input, auth.path_restrictions.clone())
-            .await
-            .map(|result| result.blob)
-            .map_err(|_| GitError::Unavailable);
+        return drive(
+            GetRoutedOperation::new(input, auth.path_restrictions.clone(), None),
+            context,
+        )
+        .await
+        .map(|result| result.blob)
+        .map_err(|_| GitError::Unavailable);
     }
     let exact = BaoReadTarget::ExactVersion(VersionedObjectArn {
         realm_id: auth.realm_id,

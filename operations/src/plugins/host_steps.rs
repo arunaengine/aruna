@@ -46,7 +46,7 @@ use super::rows::StoreError;
 use super::submit::WorkRequest;
 use super::unavailable;
 use super::work::RequestContext;
-use crate::jobs::submit_local::ServingNode;
+use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,

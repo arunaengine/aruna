@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use aruna_core::compute::AttemptPhase;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure};
+use aruna_core::jobs::{JobReport, JobStops};
 use aruna_core::operation::Runnable;
 use aruna_core::structs::execution::job::{
     JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
@@ -521,14 +521,6 @@ impl JobHost for ExecutionHost {
         _turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>> {
         Box::pin(std::future::ready(Box::new(()) as Box<dyn Any + Send>))
-    }
-
-    fn read_object(
-        &self,
-        _read: ObjectRead,
-    ) -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>> {
-        let failure = ObjectReadFailure::Failed("an execution run reads no objects".to_string());
-        Box::pin(std::future::ready(Err(failure)))
     }
 }
 

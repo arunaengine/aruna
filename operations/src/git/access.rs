@@ -18,7 +18,7 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 type Document = MetadataRegistryRecord;
 

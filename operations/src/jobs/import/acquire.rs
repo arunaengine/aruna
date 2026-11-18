@@ -25,7 +25,8 @@ use super::{
     unexpected,
 };
 use crate::jobs::export::CrateJsonOperation;
-use crate::jobs::repository::connector::{ConnectorView, ConnectorViewOperation};
+use crate::harvest::read_connector::ConnectorView;
+use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::import::{AcquireOperation, AcquireRequest, Acquired};
 use crate::jobs::repository::pull::PullProgress;
 use crate::jobs::repository::{Action, TransferError, ensure_supported};

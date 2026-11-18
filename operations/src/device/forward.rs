@@ -11,7 +11,7 @@ use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
-use aruna_core::events::{Event, WritePeerRefusal};
+use aruna_core::events::{Event, PeerAuthRefusal};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::{
     AuthToken, MetadataEffect, MetadataError, MetadataEvent, graph_version,
@@ -38,9 +38,7 @@ use crate::auth::error::AuthorizeError;
 use crate::document_repository::{
     GetConfigError, GetConfigOperation, GetGroupConfig, GetGroupError, GetGroupOperation,
 };
-use crate::forward::authorize::{
-    ForwardAuthError, ForwardedCallerOperation, peer_answer, peer_check, write_check,
-};
+use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation, write_check};
 use crate::forward::replay::{HeldRecordError, HeldRecordOperation};
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::reject;
@@ -60,8 +58,9 @@ use crate::metadata::update_document::{
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::node_name::{NodeDisplays, NodeNameError, ReadNamesOperation};
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 pub(super) const GROUP_SCAN_PAGE: usize = 10_000;
 
@@ -89,9 +88,10 @@ fn peer_caller(
     config: &RealmConfigDocument,
     (peer, realm_id): (NodeId, RealmId),
 ) -> Result<AuthContext, SyncRefusal> {
-    let auth = peer_answer(result)?.map_err(|refusal| match refusal {
-        WritePeerRefusal::Unauthorized => SyncRefusal::Unauthorized,
-        WritePeerRefusal::Unavailable(_) => SyncRefusal::Unavailable,
+    let checked = result.child::<AuthContext, PeerAuthRefusal>()?;
+    let auth = checked.map_err(|refusal| match refusal {
+        PeerAuthRefusal::Unauthorized => SyncRefusal::Unauthorized,
+        PeerAuthRefusal::Unavailable(_) => SyncRefusal::Unavailable,
     })?;
     // The documents are this realm's own; nothing about another realm is served.
     if auth.realm_id != realm_id || !peer_acts_for(config, peer, auth.user_id) {
@@ -282,7 +282,10 @@ impl ReadDocumentsOperation {
         }
         self.config = Some(config);
         self.step = DocumentsStep::Peer;
-        Ok(Next::Call(peer_check(self.peer, self.auth_token.take())))
+        let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
+        Ok(Next::Call(IoCall::child(WritePeerOperation::new(
+            self.peer, token,
+        ))))
     }
 
     /// The realm config, its authorization, and the token subject's own user document: for a
@@ -679,7 +682,10 @@ impl Operation for ReadGraphOperation {
                 }
                 self.config = Some(config);
                 self.step = GraphStep::Peer;
-                Ok(Next::Call(peer_check(self.peer, self.auth_token.take())))
+                let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
+                Ok(Next::Call(IoCall::child(WritePeerOperation::new(
+                    self.peer, token,
+                ))))
             }
             GraphStep::Peer => {
                 let config = self.config.as_ref().ok_or(IoError::Unfinished)?;
@@ -949,7 +955,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{NetEvent, StorageEvent};
+    use aruna_core::events::StorageEvent;
     use std::sync::Arc;
 
     fn node(seed: u8) -> NodeId {
@@ -1143,8 +1149,8 @@ mod tests {
             path_restrictions: None,
             session: None,
         };
-        let checked = NetEvent::WritePeerChecked(Ok(Box::new(auth)));
-        let answer = read.next(IoResult::Event(Box::new(Event::Net(checked))));
+        let checked = Ok::<_, PeerAuthRefusal>(auth);
+        let answer = read.next(IoResult::Child(ChildOutcome::new(checked)));
         assert_eq!(answer, Err(SyncRefusal::Unauthorized));
     }
 
@@ -1155,8 +1161,8 @@ mod tests {
         let mut read = ReadDocumentsOperation::new(ids, node(1), token());
         read.config = Some(config());
         read.step = DocumentsStep::Peer;
-        let checked = NetEvent::WritePeerChecked(Err(WritePeerRefusal::Unauthorized));
-        let answer = read.next(IoResult::Event(Box::new(Event::Net(checked))));
+        let checked = Err::<AuthContext, _>(PeerAuthRefusal::Unauthorized);
+        let answer = read.next(IoResult::Child(ChildOutcome::new(checked)));
         assert_eq!(answer, Err(SyncRefusal::Unauthorized));
     }
 

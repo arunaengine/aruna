@@ -285,7 +285,7 @@ mod tests {
     use std::any::Any;
     use std::collections::BTreeSet;
 
-    use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure};
+    use aruna_core::jobs::{JobReport, JobStops};
     use futures_util::future::BoxFuture;
     use ulid::Ulid;
 
@@ -307,14 +307,6 @@ mod tests {
             _turns: &'a BTreeSet<(Ulid, Ulid)>,
         ) -> BoxFuture<'a, Box<dyn Any + Send>> {
             Box::pin(std::future::ready(Box::new(()) as Box<dyn Any + Send>))
-        }
-
-        fn read_object(
-            &self,
-            _read: ObjectRead,
-        ) -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>> {
-            let failure = ObjectReadFailure::Failed("no objects".to_string());
-            Box::pin(std::future::ready(Err(failure)))
         }
     }
 
