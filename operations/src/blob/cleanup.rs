@@ -2,37 +2,41 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::blob::holders::dht_registration_effect;
-use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, CLEANUP_CURSOR_KEYSPACE, COPY_OWNER_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, read_row};
+use aruna_core::structs::execution::job::{JobId, JobRecord, RoCrateLimits};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
     WriteOwner,
 };
-use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
     COMPLETION_DEADLINE_MS, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
-use aruna_core::types::Key;
+use aruna_core::types::{Key, Value};
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::blob::release::release_renamed;
-use crate::blob::trail::DropTrailOperation;
-use crate::driver::{DriverContext, drive};
-use crate::groups::backends::{backend_key, parse_read};
-use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
-use crate::storage_read::iter_prefix_page;
-use aruna_core::time::unix_timestamp_millis;
+use crate::blob::migration::drain::SettleMoveOperation;
+use crate::blob::migration::shared::MigrationError;
+use crate::blob::release::{DropClaimsOperation, ReleaseFile, ReleaseRenamedOperation};
+use crate::blob::trail::{DropTrailOperation, TrailError};
+use crate::groups::backends::backend_key;
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::row_calls::read_job_record;
+use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
+use aruna_core::structs::storage::routing::NodeRouting;
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -50,55 +54,22 @@ const UPLOAD_SWEEP_BATCH: usize = 32;
 /// for a leftover; each part renews it.
 const SETTLE_GRACE_MS: u64 = 60 * 60 * 1000;
 
-/// Drops a page of `key_space` rows under `prefix`; `true` once none is left.
-async fn drop_rows(
-    context: &DriverContext,
-    key_space: &str,
-    prefix: Vec<u8>,
-) -> Result<bool, String> {
-    let page = iter_prefix_page(
-        &context.storage_handle,
-        key_space,
-        Some(prefix.into()),
-        None,
-        CLEANUP_PAGE_SIZE,
-        None,
-    );
-    let (rows, _) = page.await?;
-    if rows.is_empty() {
-        return Ok(true);
-    }
-    let deletes = rows
-        .into_iter()
-        .map(|(key, _)| (key_space.to_string(), key))
-        .collect();
-    let effect = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(false),
-        other => Err(format!("could not drop rows: {}", other.label())),
-    }
+/// Rows one drain pass looks at, at most; the next pass continues after the last one.
+const PASS_ROWS: usize = 4096;
+/// Where the next drain pass starts.
+const CURSOR_KEY: &[u8] = b"cursor";
+
+type Turn<T> = Result<Next<T>, MigrationError>;
+
+/// What a drain needs to know about this node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CleanupNode {
+    pub routing: NodeRouting,
+    /// Whether this node has blob storage to delete files with.
+    pub has_blob: bool,
 }
 
-/// Whether the purge job `job_id` has ended, or is gone; `None` while unreadable.
-async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
-    let job_id = aruna_core::structs::execution::job::JobId::try_from_bytes(job_id.to_bytes());
-    let Ok(job_id) = job_id else {
-        return Some(true);
-    };
-    let record = crate::jobs::store::state::read_job_record(context, job_id, None);
-    match record.await {
-        Ok(record) => Some(record.is_none_or(|record| record.is_settled())),
-        Err(error) => {
-            warn!(%error, "A purge job could not be read");
-            None
-        }
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct BlobCleanupOutcome {
     pub processed: usize,
     pub failed: usize,
@@ -109,12 +80,8 @@ pub struct BlobCleanupOutcome {
     pub more: bool,
 }
 
-/// Rows one drain pass looks at, at most; the next pass continues after the last one.
-const PASS_ROWS: usize = 4096;
-/// Where the next drain pass starts.
-const CURSOR_KEY: &[u8] = b"cursor";
-
 /// What one drain pass did with a row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowOutcome {
     Done,
     Failed,
@@ -131,116 +98,220 @@ impl From<bool> for RowOutcome {
     }
 }
 
-// Pages through the whole queue so persistently failing rows cannot starve the
-// rows behind them, deleting each page's completed rows before the next fetch.
-pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanupOutcome, String> {
-    let mut outcome = BlobCleanupOutcome::default();
-    let mut start_after = read_cursor(context).await?;
-    let mut seen = 0usize;
+#[derive(Debug, PartialEq)]
+enum DrainStep {
+    Cursor,
+    Page,
+    Backend(Key, Box<BlobCleanupWork>),
+    Work(Key),
+    Deleted,
+    Stored,
+}
 
-    loop {
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            BLOB_CLEANUP_KEYSPACE,
-            None,
-            start_after,
-            CLEANUP_PAGE_SIZE,
-            None,
-        )
-        .await?;
+/// Pages through the whole queue so persistently failing rows cannot starve the rows behind
+/// them, deleting each page's completed rows before the next fetch.
+#[derive(Debug, PartialEq)]
+pub struct ProcessCleanupOperation {
+    node: CleanupNode,
+    step: DrainStep,
+    outcome: BlobCleanupOutcome,
+    rows: VecDeque<(Key, Value)>,
+    done: Vec<(String, Key)>,
+    last: Option<Key>,
+    more: Option<Key>,
+    seen: usize,
+}
 
-        let mut done: Vec<(String, Key)> = Vec::new();
-        let last = values.last().map(|(key, _)| key.clone());
-        seen += values.len();
-        for (key, value) in values {
+type DrainTurn = Turn<BlobCleanupOutcome>;
+
+impl ProcessCleanupOperation {
+    pub fn new(node: CleanupNode) -> Self {
+        Self {
+            node,
+            step: DrainStep::Cursor,
+            outcome: BlobCleanupOutcome::default(),
+            rows: VecDeque::new(),
+            done: Vec::new(),
+            last: None,
+            more: None,
+            seen: 0,
+        }
+    }
+
+    fn call(&mut self, step: DrainStep, call: IoCall) -> DrainTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn read_page(&mut self, after: Option<Key>) -> DrainTurn {
+        let page = IoCall::Page {
+            space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: CLEANUP_PAGE_SIZE,
+        };
+        self.call(DrainStep::Page, page)
+    }
+
+    fn row_done(&mut self, key: Key) {
+        self.done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+    }
+
+    fn row_dropped(&mut self, key: Key) {
+        self.row_done(key);
+        self.outcome.dropped = self.outcome.dropped.saturating_add(1);
+    }
+
+    fn next_row(&mut self) -> DrainTurn {
+        while let Some((key, value)) = self.rows.pop_front() {
             // A row nobody can decode would wedge the drain forever.
             let work = match BlobCleanupWork::from_bytes(&value) {
                 Ok(work) => work,
                 Err(error) => {
                     warn!(error = %error, "Dropping undecodable blob cleanup row");
-                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                    outcome.dropped = outcome.dropped.saturating_add(1);
+                    self.row_dropped(key);
                     continue;
                 }
             };
-            // A tenant backend that is gone can never resolve credentials, so
-            // retrying this row forever would wedge the drain.
-            if let Some(backend) = work_backend(&work)
-                && is_removed_backend(context, backend).await
-            {
-                error!(backend = %backend, "Dropping blob cleanup for a removed backend");
-                done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                outcome.dropped = outcome.dropped.saturating_add(1);
-                continue;
+            // A tenant backend that is gone can never resolve credentials, so retrying this
+            // row forever would wedge the drain.
+            if let Some(BackendRef::Group(id)) = work_backend(&work) {
+                let check = RemovedBackendOperation { backend_id: *id };
+                let step = DrainStep::Backend(key, Box::new(work));
+                return self.call(step, IoCall::child(check));
             }
-            match run_cleanup_work(context, work).await {
-                RowOutcome::Done => {
-                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                    outcome.processed = outcome.processed.saturating_add(1);
-                }
-                RowOutcome::Failed => outcome.failed = outcome.failed.saturating_add(1),
-                RowOutcome::Kept => outcome.kept = outcome.kept.saturating_add(1),
-            }
+            return self.run_work(key, work);
         }
+        self.page_done()
+    }
 
-        delete_cleanup_rows(context, done).await?;
+    fn run_work(&mut self, key: Key, work: BlobCleanupWork) -> DrainTurn {
+        let run = CleanupWorkOperation::new(work, self.node.clone());
+        self.call(DrainStep::Work(key), IoCall::child(run))
+    }
 
-        let Some(next) = next else {
-            store_cursor(context, None).await?;
-            return Ok(outcome);
+    fn worked(&mut self, key: Key, outcome: RowOutcome) {
+        let totals = &mut self.outcome;
+        match outcome {
+            RowOutcome::Done => {
+                totals.processed = totals.processed.saturating_add(1);
+                self.row_done(key);
+            }
+            RowOutcome::Failed => totals.failed = totals.failed.saturating_add(1),
+            RowOutcome::Kept => totals.kept = totals.kept.saturating_add(1),
+        }
+    }
+
+    fn page_done(&mut self) -> DrainTurn {
+        if self.done.is_empty() {
+            return self.after_deletes();
+        }
+        let deletes = std::mem::take(&mut self.done);
+        self.call(DrainStep::Deleted, IoCall::Delete(deletes))
+    }
+
+    fn after_deletes(&mut self) -> DrainTurn {
+        let Some(next) = self.more.take() else {
+            return self.store_cursor(None);
         };
         // A bounded pass keeps its place, so every row gets its turn over the passes.
-        if seen >= PASS_ROWS {
-            store_cursor(context, last).await?;
-            outcome.more = true;
-            return Ok(outcome);
+        if self.seen >= PASS_ROWS {
+            self.outcome.more = true;
+            let last = self.last.take();
+            return self.store_cursor(last);
         }
-        start_after = Some(next);
+        self.read_page(Some(next))
+    }
+
+    fn store_cursor(&mut self, cursor: Option<Key>) -> DrainTurn {
+        let key: Key = CURSOR_KEY.to_vec().into();
+        let space = CLEANUP_CURSOR_KEYSPACE.to_string();
+        let call = match cursor {
+            Some(value) => IoCall::Write(vec![(space, key, value)]),
+            None => IoCall::Delete(vec![(space, key)]),
+        };
+        self.call(DrainStep::Stored, call)
     }
 }
 
-async fn read_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
-    let read = StorageEffect::Read {
-        key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
-        key: CURSOR_KEY.to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!(
-            "could not read the cleanup cursor: {}",
-            other.label()
-        )),
-    }
-}
+impl Operation for ProcessCleanupOperation {
+    type Output = BlobCleanupOutcome;
+    type Error = MigrationError;
 
-async fn store_cursor(context: &DriverContext, cursor: Option<Key>) -> Result<(), String> {
-    let key: Key = CURSOR_KEY.to_vec().into();
-    let effect = match cursor {
-        Some(value) => StorageEffect::Write {
-            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: None,
-        },
-        None => StorageEffect::Delete {
-            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
+    fn first(&mut self) -> DrainTurn {
+        Ok(Next::Call(read_row(
+            CLEANUP_CURSOR_KEYSPACE,
+            CURSOR_KEY.to_vec(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> DrainTurn {
+        match std::mem::replace(&mut self.step, DrainStep::Stored) {
+            DrainStep::Cursor => self.read_page(result.value()?),
+            DrainStep::Page => {
+                let (rows, next) = result.page()?;
+                self.last = rows.last().map(|(key, _)| key.clone());
+                self.seen += rows.len();
+                self.rows = rows.into();
+                self.more = next;
+                self.next_row()
+            }
+            DrainStep::Backend(key, work) => {
+                // Only a record that is provably absent counts as removed; an unreadable one
+                // leaves the row queued.
+                if result.child::<bool, IoError>()?.unwrap_or(false) {
+                    if let Some(backend) = work_backend(&work) {
+                        error!(backend = %backend, "Dropping blob cleanup for a removed backend");
+                    }
+                    self.row_dropped(key);
+                    return self.next_row();
+                }
+                self.run_work(key, *work)
+            }
+            DrainStep::Work(key) => {
+                let outcome = match result.child::<RowOutcome, MigrationError>()? {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        warn!(%error, "A blob cleanup row failed");
+                        RowOutcome::Failed
+                    }
+                };
+                self.worked(key, outcome);
+                self.next_row()
+            }
+            DrainStep::Deleted => {
+                result.done()?;
+                self.after_deletes()
+            }
+            DrainStep::Stored => {
+                result.done()?;
+                Ok(Next::Done(std::mem::take(&mut self.outcome)))
+            }
         }
-        other => Err(format!(
-            "could not store the cleanup cursor: {}",
-            other.label()
-        )),
     }
 }
 
-#[derive(Debug, Default)]
+/// Whether the record of a tenant backend is absent.
+#[derive(Debug, PartialEq)]
+struct RemovedBackendOperation {
+    backend_id: Ulid,
+}
+
+impl Operation for RemovedBackendOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let read = read_row(STORAGE_BACKEND_KEYSPACE, backend_key(self.backend_id));
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        Ok(Next::Done(result.value()?.is_none()))
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
 pub struct UploadSweepOutcome {
     pub aborted: usize,
     pub failed: usize,
@@ -264,55 +335,46 @@ fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
     }
 }
 
-/// Reclaims stale multipart uploads, their part rows and their part blobs. The
-/// abort operation owns the transaction, so a refused record stays for the next
-/// run instead of leaving half-deleted state behind.
-pub async fn sweep_stale_uploads(
-    context: &DriverContext,
+/// Reclaims stale multipart uploads, their part rows and their part blobs. The abort operation
+/// owns the transaction, so a refused record stays for the next run instead of leaving
+/// half-deleted state behind.
+#[derive(Debug, PartialEq)]
+pub struct SweepUploadsOperation {
     now_ms: u64,
-) -> Result<UploadSweepOutcome, String> {
-    let mut outcome = UploadSweepOutcome::default();
-    let mut start_after = None;
-    let mut stale: Vec<MultipartUpload> = Vec::new();
+    pages: PrefixPages,
+    stale: VecDeque<MultipartUpload>,
+    /// The upload being aborted, with the status the scan saw.
+    aborting: Option<(Ulid, MultipartUploadStatus)>,
+    outcome: UploadSweepOutcome,
+}
 
-    while stale.len() < UPLOAD_SWEEP_BATCH {
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            UPLOAD_KEYSPACE,
-            None,
-            start_after,
-            CLEANUP_PAGE_SIZE,
-            None,
-        )
-        .await?;
-        for (_, value) in values {
-            match MultipartUpload::from_bytes(&value) {
-                Ok(record) if stale_upload(&record, now_ms) => stale.push(record),
-                Ok(_) => {}
-                Err(error) => warn!(error = %error, "Skipping an undecodable multipart upload"),
-            }
-            if stale.len() >= UPLOAD_SWEEP_BATCH {
-                break;
-            }
+impl SweepUploadsOperation {
+    pub fn new(now_ms: u64) -> Self {
+        let prefix = Key::from(Vec::new());
+        Self {
+            now_ms,
+            pages: PrefixPages::new(UPLOAD_KEYSPACE, prefix, CLEANUP_PAGE_SIZE),
+            stale: VecDeque::new(),
+            aborting: None,
+            outcome: UploadSweepOutcome::default(),
         }
-        let Some(next) = next else {
-            break;
-        };
-        start_after = Some(next);
     }
 
-    for record in stale {
+    fn next_abort(&mut self) -> Turn<UploadSweepOutcome> {
+        let Some(record) = self.stale.pop_front() else {
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
+        };
         let upload_id = record.upload_id;
-        let mut operation = AbortUploadOperation::new(AbortUploadInput {
+        let mut abort = AbortUploadOperation::new(AbortUploadInput {
             bucket: record.bucket,
             key: record.key,
             upload_id,
-            now_ms,
+            now_ms: self.now_ms,
         });
         // An abort is transactional, so finishing one that stopped midway is safe to repeat.
         // The status is checked again in that transaction: this scan may be stale.
         if record.status == MultipartUploadStatus::Aborting {
-            operation = operation.resuming_abort();
+            abort = abort.resuming_abort();
         }
         match drive(operation, context).await {
             Ok(_) => {
