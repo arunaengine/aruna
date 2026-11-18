@@ -2080,26 +2080,12 @@ fn indexes_noncurrent_version() {
 
     let effects = op.next(IoResult::Done);
     assert_eq!(op.state, IncomingVersionState::UpdateUsage);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AddUsage { .. })]
-    ));
+    assert!(matches!(&effects, Ok(Next::Call(IoCall::AddUsage { .. }))));
 
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchWrite { .. })]
-    ));
-    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
+    let effects = op.next(IoResult::Done);
+    assert!(matches!(&effects, Ok(Next::Call(IoCall::Write(_)))));
+    let effects = op.next(IoResult::Done);
+    assert!(matches!(effects, Ok(Next::Done(_))));
 }
 
 #[test]
@@ -2115,49 +2101,31 @@ fn newer_generation_rollback() {
         RealmId::from_bytes([7u8; 32]),
         manifest.clone(),
     );
-    let txn_id = start_apply_transaction(&mut op);
+    start_apply_transaction(&mut op);
     let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 10);
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(existing_pointer.to_bytes().unwrap().into()),
-    }));
+    let effects = op.next(row(Some(existing_pointer.to_bytes().unwrap().into())));
     assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_VERSIONS_KEYSPACE
     ));
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(
-            BlobVersion::materialized(
-                [2u8; 32],
-                BackendRef::node_default(),
-                EncodingClass::Raw,
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
-                test_user_id(),
-                None,
-            )
-            .to_bytes()
-            .unwrap()
-            .into(),
-        ),
-    }));
+    let effects = op.next(row(Some(
+        BlobVersion::materialized(
+            [2u8; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
+            test_user_id(),
+            None,
+        )
+        .to_bytes()
+        .unwrap()
+        .into(),
+    )));
 
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space,
-            value,
-            txn_id: write_txn_id,
-            ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected blob head write")
-    };
+    let (key_space, _, value) = &written(&effects)[0];
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-    assert_eq!(*write_txn_id, Some(txn_id));
     assert_eq!(
         CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
         CurrentVersionPointer::new_with_generation(
@@ -2182,29 +2150,23 @@ fn materialized_restores_object() {
     start_apply_transaction(&mut op);
     let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::from_parts(49, 49), 1);
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(existing_pointer.to_bytes().unwrap().into()),
-    }));
+    let effects = op.next(row(Some(existing_pointer.to_bytes().unwrap().into())));
     assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_VERSIONS_KEYSPACE
     ));
 
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(
-            BlobVersion::deleted(
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1600000240),
-                test_user_id(),
-            )
-            .to_bytes()
-            .unwrap()
-            .into(),
-        ),
-    }));
+    op.next(row(Some(
+        BlobVersion::deleted(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1600000240),
+            test_user_id(),
+        )
+        .to_bytes()
+        .unwrap()
+        .into(),
+    )))
+    .unwrap();
 
     let delta = op.usage_delta().unwrap();
     assert_eq!(delta.objects, 1);
@@ -2228,15 +2190,11 @@ fn higher_ulid_skips() {
     start_apply_transaction(&mut op);
     let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(existing_pointer.to_bytes().unwrap().into()),
-    }));
+    let effects = op.next(row(Some(existing_pointer.to_bytes().unwrap().into())));
     assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Write(rows))) if rows[0].0 == BLOB_VERSIONS_KEYSPACE
     ));
 }
 
@@ -2256,15 +2214,11 @@ fn lower_ulid_skips() {
     start_apply_transaction(&mut op);
     let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(existing_pointer.to_bytes().unwrap().into()),
-    }));
+    let effects = op.next(row(Some(existing_pointer.to_bytes().unwrap().into())));
     assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Write(rows))) if rows[0].0 == BLOB_VERSIONS_KEYSPACE
     ));
 }
 
@@ -2309,20 +2263,16 @@ fn mismatch_requests_transfer() {
     let effects = advance_blob_lookup(&mut op);
     assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_LOCATIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_LOCATIONS_KEYSPACE
     ));
 
     let mut mismatched_location = make_location();
     mismatched_location.blob_size += 1;
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(mismatched_location.to_bytes().unwrap().into()),
-    }));
+    let effects = op.next(row(Some(mismatched_location.to_bytes().unwrap().into())));
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
-        message_from_effect(&effects[0]),
+        message_from_effect(asked(&effects)),
         VersionReplicationMessage::VersionNegotiationResponse(
             aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion
         )
@@ -2344,9 +2294,8 @@ fn missing_blob_location() {
 
     assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_LOCATIONS_KEYSPACE
+        &effects,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_LOCATIONS_KEYSPACE
     ));
 }
 
@@ -2355,7 +2304,7 @@ fn missing_blob_location() {
 fn probe_backend(
     rules: Vec<StorageRoutingRule>,
     inputs: GroupRoutingInputs,
-) -> (IncomingVersionOperation, aruna_core::types::Effects) {
+) -> (IncomingVersionOperation, Turn) {
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(57, 57),
         iroh::SecretKey::from_bytes(&[96; 32]).public(),
@@ -2367,9 +2316,10 @@ fn probe_backend(
     op.manifest_policy = Some(op.target_authorization_path(bucket_info.group_id));
     op.writer_policy = Some(op.target_authorization_path(bucket_info.group_id));
 
-    op.start();
-    op.step(bucket_read(Some(bucket_info.to_bytes().unwrap().into())));
-    load_routing(&mut op, inputs);
+    op.first().unwrap();
+    op.next(bucket_read(Some(bucket_info.to_bytes().unwrap().into())))
+        .unwrap();
+    load_routing(&mut op, inputs).unwrap();
     let effects = advance_blob_lookup(&mut op);
     (op, effects)
 }
@@ -2381,35 +2331,29 @@ fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
 #[test]
 fn metadata_waits_approval() {
     let (mut op, _) = probe_backend(Vec::new(), GroupRoutingInputs::default());
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: make_location().location_key().unwrap().to_bytes().into(),
-        value: Some(make_location().to_bytes().unwrap().into()),
-    }));
+    op.next(row(Some(make_location().to_bytes().unwrap().into())))
+        .unwrap();
     let stream_id = op.stream_id;
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+        asked(&effects),
+        Effect::Blob(BlobEffect::ReadMessage { .. })
     ));
-    let effects = op.step(Event::Blob(BlobEvent::MessageReceived {
+    let effects = op.next(blob(BlobEvent::MessageReceived {
         stream_id,
         payload: VersionReplicationMessage::VersionApplyApproved
             .to_bytes()
             .unwrap(),
     }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
+    assert_eq!(op.state, IncomingVersionState::Apply);
+    assert!(matches!(&effects, Ok(Next::Call(IoCall::Child(_)))));
 }
 
-fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
-    let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+fn probed_key(effects: &Turn) -> Vec<u8> {
+    let Ok(Next::Call(IoCall::Read(reads))) = effects else {
         panic!("expected one location read, got {effects:?}")
     };
-    key.to_vec()
+    reads[0].1.to_vec()
 }
 
 #[test]
@@ -2422,28 +2366,22 @@ fn refuses_vanished_copy() {
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     );
-    let txn_id = Ulid::from_parts(59, 59);
-    op.txn_id = Some(txn_id);
     op.destination_group_id = Some(test_group_id());
     op.existing_blob_location = Some(make_location());
 
     let effects = op.begin_blob_location();
     assert_eq!(op.state, IncomingVersionState::VerifyExistingBlob);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn, .. })]
-            if key_space == BLOB_LOCATIONS_KEYSPACE && *read_txn == Some(txn_id)
+        &effects,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == BLOB_LOCATIONS_KEYSPACE
     ));
 
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: None,
-    }));
+    let effects = op.next(row(None));
 
-    assert_eq!(
-        op.output,
-        Some(Err(IncomingVersionError::ExistingBlobChanged))
-    );
+    assert!(matches!(
+        effects,
+        Err(IncomingVersionError::ExistingBlobChanged)
+    ));
 }
 
 #[test]
@@ -2500,10 +2438,8 @@ fn keeps_loaded_inputs() {
     let mut location = make_location();
     location.backend = BackendRef::Group(backend_id);
 
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: group_backend_key(backend_id).into(),
-        value: Some(location.to_bytes().unwrap().into()),
-    }));
+    op.next(row(Some(location.to_bytes().unwrap().into())))
+        .unwrap();
 
     assert_eq!(
         op.negotiation_result,
@@ -2531,22 +2467,17 @@ fn rejects_mismatched_blob() {
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::ReceiveBlob;
 
-    let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
+    let effects = op.next(blob(BlobEvent::ReplicationFinished {
         location: mismatched_location.clone(),
     }));
-    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
-    assert!(matches!(
-        message_from_effect(&effects[0]),
-        VersionReplicationMessage::VersionApplyRejected(_)
-    ));
-
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
+    let reason = effects.unwrap_err().to_string();
     assert_eq!(
-        effects[0],
-        Effect::Blob(BlobEffect::Delete {
-            location: mismatched_location
-        })
+        tail(&op.abort()),
+        [
+            Tail::Reject(reason),
+            Tail::Delete(mismatched_location),
+            Tail::Close
+        ]
     );
 }
 
@@ -2564,7 +2495,7 @@ fn write_cleanup_rejects() {
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::ReceiveBlob;
 
-    let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
+    let effects = op.next(blob(BlobEvent::Error(BlobError::WriteCleanup {
         location: received.clone(),
         message: "marker write failed".to_string(),
     })));
@@ -2573,17 +2504,10 @@ fn write_cleanup_rejects() {
         Some(received.clone())
     );
     assert!(op.received_blob.as_ref().unwrap().cleanup_on_abort);
-    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
-    assert!(matches!(
-        message_from_effect(&effects[0]),
-        VersionReplicationMessage::VersionApplyRejected(_)
-    ));
-
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
+    let reason = effects.unwrap_err().to_string();
     assert_eq!(
-        effects[0],
-        Effect::Blob(BlobEffect::Delete { location: received })
+        tail(&op.abort()),
+        [Tail::Reject(reason), Tail::Delete(received), Tail::Close]
     );
 }
 
@@ -2601,26 +2525,29 @@ fn unbuildable_bucket_rejects() {
     op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
     op.writer_policy = Some(op.target_authorization_path(test_group_id()));
 
-    op.start();
-    op.step(bucket_read(None));
+    op.first().unwrap();
+    op.next(bucket_read(None)).unwrap();
     assert_eq!(op.state, IncomingVersionState::CreateDestinationBucket);
-    op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
-        result: Err("boom".to_string()),
-    }));
+    op.next(event_result(Event::SubOperation(
+        SubOperationEvent::BucketCreated {
+            result: Err("boom".to_string()),
+        },
+    )))
+    .unwrap();
 
-    let effects = op.step(bucket_read(None));
+    let effects = op.next(bucket_read(None));
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::DestinationNotFound
             .to_string()
             .as_str(),
     );
 
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
-        effects[0],
+        asked(&effects),
         Effect::Blob(BlobEffect::CloseConnection { .. })
     ));
 }
@@ -2642,23 +2569,24 @@ fn rejects_denied_writer() {
     .with_writer_policy(None);
     op.manifest_policy = Some(op.target_authorization_path(group_id));
 
-    op.start();
-    op.step(bucket_read(Some(
+    op.first().unwrap();
+    op.next(bucket_read(Some(
         make_bucket_info(group_id).to_bytes().unwrap().into(),
-    )));
+    )))
+    .unwrap();
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
     );
 
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
-        effects[0],
+        asked(&effects),
         Effect::Blob(BlobEffect::CloseConnection { .. })
     ));
 }
@@ -2676,14 +2604,15 @@ fn rejects_missing_policy() {
     );
     op.manifest_policy = Some(op.target_authorization_path(group_id));
 
-    op.start();
-    op.step(bucket_read(Some(
+    op.first().unwrap();
+    op.next(bucket_read(Some(
         make_bucket_info(group_id).to_bytes().unwrap().into(),
-    )));
+    )))
+    .unwrap();
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
@@ -2700,13 +2629,14 @@ fn rejects_manifest_policy() {
     )
     .with_manifest_policy(None);
     let group_id = Ulid::from_parts(68, 68);
-    op.start();
-    op.step(bucket_read(Some(
+    op.first().unwrap();
+    op.next(bucket_read(Some(
         make_bucket_info(group_id).to_bytes().unwrap().into(),
-    )));
+    )))
+    .unwrap();
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::ManifestPermissionDenied
             .to_string()
             .as_str(),
@@ -2725,11 +2655,11 @@ fn rejects_missing_writer() {
         manifest,
     );
 
-    let effects = op.start();
+    let effects = op.first();
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
@@ -2751,11 +2681,11 @@ fn rejects_relationship_writer() {
         manifest,
     );
 
-    let effects = op.start();
+    let effects = op.first();
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
-        &effects[0],
+        asked(&effects),
         IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
@@ -2793,14 +2723,11 @@ fn delete_marker_only() {
     );
 
     let _effects = advance_version_lookup(&mut op, Ulid::from_parts(75, 75));
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: None,
-    }));
+    let effects = op.next(row(None));
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
-        message_from_effect(&effects[0]),
+        message_from_effect(asked(&effects)),
         VersionReplicationMessage::VersionNegotiationResponse(
             aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedVersionOnly
         )
@@ -2820,18 +2747,12 @@ fn missing_blob_transfer() {
     let _effects = advance_version_lookup(&mut op, Ulid::from_parts(77, 77));
     let effects = advance_blob_lookup(&mut op);
     assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
-    assert!(matches!(
-        effects[0],
-        Effect::Storage(StorageEffect::Read { .. })
-    ));
+    assert!(matches!(&effects, Ok(Next::Call(IoCall::Read(_)))));
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: None,
-    }));
+    let effects = op.next(row(None));
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
-        message_from_effect(&effects[0]),
+        message_from_effect(asked(&effects)),
         VersionReplicationMessage::VersionNegotiationResponse(
             aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion
         )
@@ -2840,120 +2761,48 @@ fn missing_blob_transfer() {
 
 #[test]
 fn failure_rejects_first() {
-    let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let stream_id = Ulid::from_parts(78, 78);
-    let txn_id = Ulid::from_parts(79, 79);
-    let mut op = IncomingVersionOperation::new(
-        stream_id,
-        iroh::SecretKey::from_bytes(&[109; 32]).public(),
-        RealmId::from_bytes([7u8; 32]),
-        manifest,
-    );
+    let negotiated = Some(ReplicationNegotiationResult::NeedVersionOnly);
+    let mut op = applying(ReplicationItemKind::DeleteMarker, 109, negotiated, None);
+    let error = IncomingVersionError::RealmMismatch;
+    let reason = error.to_string();
 
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
-    op.state = IncomingVersionState::ApplyHeadTransition;
-    op.txn_id = Some(txn_id);
+    let effects = op.next(apply_failed(error));
 
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
-    assert!(matches!(
-        message_from_effect(&effects[0]),
-        VersionReplicationMessage::VersionApplyRejected(_)
-    ));
-
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
-    assert_eq!(
-        effects[0],
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id })
-    );
-
-    let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(op.state, IncomingVersionState::CloseConnection);
-    assert!(matches!(
-        effects[0],
-        Effect::Blob(BlobEffect::CloseConnection { .. })
-    ));
+    assert!(matches!(effects, Err(IncomingVersionError::RealmMismatch)));
+    assert_eq!(tail(&op.abort()), [Tail::Reject(reason), Tail::Close]);
 }
 
 #[test]
 fn failure_deletes_blobs() {
-    let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let stream_id = Ulid::from_parts(80, 80);
     let received = make_location();
-    let txn_id = Ulid::from_parts(81, 81);
-    let mut op = IncomingVersionOperation::new(
-        stream_id,
-        iroh::SecretKey::from_bytes(&[110; 32]).public(),
-        RealmId::from_bytes([7u8; 32]),
-        manifest,
-    );
-    op.negotiation_result = Some(
-        aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion,
-    );
-    op.state = IncomingVersionState::WriteBlobLocation;
-    op.txn_id = Some(txn_id);
-    op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
+    let negotiated = Some(ReplicationNegotiationResult::NeedBlobVersion);
+    let kind = ReplicationItemKind::Materialized;
+    let mut op = applying(kind, 110, negotiated, Some(received.clone()));
+    let error = IncomingVersionError::StalePlan;
+    let reason = error.to_string();
 
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
-    assert!(matches!(
-        message_from_effect(&effects[0]),
-        VersionReplicationMessage::VersionApplyRejected(_)
-    ));
+    assert!(op.next(apply_failed(error)).is_err());
 
-    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
     assert_eq!(
-        effects[0],
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        tail(&op.abort()),
+        [Tail::Reject(reason), Tail::Delete(received), Tail::Close]
     );
-
-    let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
-    assert_eq!(
-        effects[0],
-        Effect::Blob(BlobEffect::Delete { location: received })
-    );
-
-    let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-    assert_eq!(op.state, IncomingVersionState::CloseConnection);
-    assert!(matches!(
-        effects[0],
-        Effect::Blob(BlobEffect::CloseConnection { .. })
-    ));
 }
 
 #[test]
 fn unknown_commit_preserves() {
-    let manifest = make_manifest(ReplicationItemKind::Materialized);
+    // The apply queues its reconciliation row, and a commit of unknown outcome keeps the copy.
     let received = make_location();
-    let txn_id = Ulid::from_parts(82, 82);
-    let mut op = IncomingVersionOperation::new(
-        Ulid::from_parts(83, 83),
-        iroh::SecretKey::from_bytes(&[111; 32]).public(),
-        test_realm_id(),
-        manifest,
-    );
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
-    op.txn_id = Some(txn_id);
-    op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
+    let negotiated = Some(ReplicationNegotiationResult::NeedBlobVersion);
+    let kind = ReplicationItemKind::Materialized;
+    let mut op = applying(kind, 111, negotiated, Some(received.clone()));
     let release_id = received.ulid;
+    let reconcile_key: Key = received.ulid.to_bytes().to_vec().into();
 
-    let effects = op.commit_or_cleanup();
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key,
-            value,
-            txn_id: write_txn,
-            ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected transactional reconciliation row, got {effects:?}")
-    };
-    assert_eq!(*write_txn, Some(txn_id));
-    assert_eq!(key.as_ref(), received.ulid.to_bytes().as_slice());
+    let mut child = op.apply_child();
+    let effects = child.commit_or_cleanup();
+    let (_, key, value) = &written(&effects)[0];
+    assert_eq!(key, &reconcile_key);
     assert!(matches!(
         BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
         BlobCleanupWork::ReconcileWrite {
@@ -2965,20 +2814,12 @@ fn unknown_commit_preserves() {
             ..
         } if blake3 == [1u8; 32] && realm_id == test_realm_id()
     ));
+    assert!(matches!(child.next(IoResult::Done), Ok(Next::Done(_))));
 
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"cleanup".to_vec().into(),
-    }));
-    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
-    ));
-    let effects = op.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::CommitFailed,
-    }));
-    assert_eq!(op.state, IncomingVersionState::ReleaseReservation);
-    assert_eq!(op.txn_id, None);
+    let error = IncomingVersionError::StorageError(StorageError::CommitFailed);
+    let reason = error.to_string();
+    assert!(op.next(apply_failed(error)).is_err());
+
     assert!(!op.received_blob.as_ref().unwrap().cleanup_on_abort);
     assert_eq!(
         effects.as_slice(),
