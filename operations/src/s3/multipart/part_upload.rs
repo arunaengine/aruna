@@ -2,32 +2,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::placement::policy::PolicyGateError;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
+use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
+use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
-    ABE_PENDING_KEYSPACE, NODE_SUBJECT_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, NODE_SUBJECT_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::storage::abe::ObjectEnvelope;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
+    BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, PartPiece, content_offset,
 };
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Key, Value};
 use bytes::Bytes;
-use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::warn;
@@ -37,27 +40,14 @@ use ulid::Ulid;
 /// transaction is contention, not a failed request.
 const CONFLICT_RETRIES: u8 = 4;
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum UploadPartState {
-    Init,
-    CheckPurgeWrite,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartStep {
+    CheckFence,
     ReadUpload,
-    ReadSavedParts,
+    ReadSaved,
     WritePart,
-    CleanupFailedWrite,
-    QueueCleanupRow,
-    WriteCleanupRow,
-    StartTransaction,
-    CheckPurgeFence,
-    FenceBackend,
-    ReReadUpload,
-    ReadExistingPart,
-    WritePartRecord,
-    WriteReplacedRow,
-    CommitTransaction,
-    ReleaseReservation,
-    Finish,
-    Error,
+    Publish,
+    Release,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -70,8 +60,6 @@ pub enum UploadPartError {
     BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("The specified upload does not exist.")]
     NoSuchUpload,
     #[error("The specified multipart upload does not match the target object.")]
@@ -96,10 +84,12 @@ pub enum UploadPartError {
     PolicyGateError(#[from] PolicyGateError),
     #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
-    #[error("UploadPart failed")]
-    UploadPartFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+}
+
+impl From<IoError> for UploadPartError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
 }
 
 impl From<UploadTargetError> for UploadPartError {
@@ -130,11 +120,20 @@ pub struct UploadPartResult {
     pub location: BackendLocation,
 }
 
+type PartTurn = Result<Next<UploadPartResult>, UploadPartError>;
+
+fn part_key(upload_id: Ulid, part_number: u16) -> Result<Key, ConversionError> {
+    Ok(MultipartPartKey::new(upload_id, part_number)
+        .to_bytes()?
+        .into())
+}
+
+/// Writes the part's bytes, then records them in a transaction of their own. Bytes no record
+/// owns are rolled back by `abort`; bytes a commit may own go to reconciliation.
 #[derive(Debug, PartialEq)]
 pub struct UploadPartOperation {
-    state: UploadPartState,
+    step: PartStep,
     input: UploadPartInput,
-    txn_id: Option<TxnId>,
     conflicts: u8,
     written_location: Option<BackendLocation>,
     /// The provider's ETag of a part written into its multipart upload.
@@ -145,146 +144,91 @@ pub struct UploadPartOperation {
     piece: Option<PartPiece>,
     /// The object public key of the upload's pending envelope, granted every piece.
     object: Option<[u8; 32]>,
-    replaced_location: Option<BackendLocation>,
-    rollback_location: Option<BackendLocation>,
-    cleanup: WriteCleanup<UploadPartError>,
-    output: Option<Result<UploadPartResult, UploadPartError>>,
+    /// Bytes a commit of unknown outcome may own, and their reservation.
+    reconcile: Option<BackendLocation>,
+    release: Option<Ulid>,
+    finished: Option<UploadPartResult>,
 }
 
 impl UploadPartOperation {
     pub fn new(input: UploadPartInput) -> Self {
         Self {
-            state: UploadPartState::Init,
+            step: PartStep::CheckFence,
             input,
-            txn_id: None,
             conflicts: 0,
             written_location: None,
             backend_etag: None,
             sealing: None,
             piece: None,
             object: None,
-            replaced_location: None,
-            rollback_location: None,
-            cleanup: WriteCleanup::default(),
-            output: None,
+            reconcile: None,
+            release: None,
+            finished: None,
         }
     }
 
-    /// The terminal state is complete, so the driver never calls `abort` for us;
-    /// rolling back here is what keeps an open transaction from outliving the
-    /// operation. `abort` takes what it releases, so it cannot run twice.
-    fn emit_error(&mut self, error: UploadPartError) -> Effects {
-        self.state = UploadPartState::Error;
-        self.output = Some(Err(error));
-        self.abort()
+    fn call(&mut self, step: PartStep, call: IoCall) -> PartTurn {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
-    /// Reject an already-fenced destination before accepting the part body.
-    /// The commit transaction rechecks the same row after the bytes move.
-    fn handle_init(&mut self) -> Effects {
-        self.state = UploadPartState::CheckPurgeWrite;
-        smallvec![write_fence_read(&self.input.bucket, None)]
+    /// Rejects an already-fenced destination before accepting the part body. The commit
+    /// transaction rechecks the same row after the bytes move. One round trip then answers
+    /// "does this upload exist", "does the subject that admitted it still hold" and "is this
+    /// part number already acknowledged".
+    fn fence_checked(&mut self, value: Option<Value>) -> PartTurn {
+        let input = &self.input;
+        check_fence_row(value.as_deref(), &input.bucket, &input.key)?;
+        let id: Key = input.upload_id.to_bytes().to_vec().into();
+        let reads = vec![
+            (UPLOAD_KEYSPACE.to_string(), id.clone()),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+            (
+                UPLOAD_PART_KEYSPACE.to_string(),
+                part_key(input.upload_id, input.part_number)?,
+            ),
+            (ABE_PENDING_KEYSPACE.to_string(), id),
+        ];
+        self.call(PartStep::ReadUpload, IoCall::Read(reads))
     }
 
-    fn check_write_fence(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
-            return self.emit_error(error.into());
-        }
-        // One round trip answers "does this upload exist", "does the subject that
-        // admitted it still hold" and "is this part number already acknowledged".
-        let part_key =
-            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
-                Ok(key) => key,
-                Err(err) => return self.emit_error(err.into()),
-            };
-        self.state = UploadPartState::ReadUpload;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    UPLOAD_KEYSPACE.to_string(),
-                    self.input.upload_id.to_bytes().to_vec().into(),
-                ),
-                (
-                    NODE_SUBJECT_KEYSPACE.to_string(),
-                    Key::from(NODE_SUBJECT_KEY.to_vec()),
-                ),
-                (UPLOAD_PART_KEYSPACE.to_string(), part_key.into()),
-                (
-                    ABE_PENDING_KEYSPACE.to_string(),
-                    self.input.upload_id.to_bytes().to_vec().into(),
-                ),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn handle_upload_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        let mut values = values.into_iter();
-        let Some((_, value)) = values.next() else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        let subject = match values.next() {
-            Some((_, Some(value))) => match NodeSubjectRecord::from_bytes(value.as_ref()) {
-                Ok(record) => Some(record),
-                Err(err) => return self.emit_error(err.into()),
-            },
-            Some((_, None)) => None,
-            None => return self.emit_error(UploadPartError::InvalidOperationState),
-        };
-        let Some((_, acknowledged)) = values.next() else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        let Some((_, pending)) = values.next() else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-
-        let Some(value) = value else {
-            return self.emit_error(UploadPartError::NoSuchUpload);
-        };
-        let record = match MultipartUpload::from_bytes(value.as_ref()) {
-            Ok(record) => record,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        if let Err(err) = validate_upload(
-            &record,
-            &self.input.bucket,
-            &self.input.key,
-            StatusCheck::Open,
-        ) {
-            return self.emit_error(err.into());
-        }
+    fn upload_read(
+        &mut self,
+        [value, subject, acknowledged, pending]: [Option<Value>; 4],
+    ) -> PartTurn {
+        let subject = (subject.as_deref())
+            .map(NodeSubjectRecord::from_bytes)
+            .transpose()?;
+        let value = value.ok_or(UploadPartError::NoSuchUpload)?;
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        let input = &self.input;
+        validate_upload(&record, &input.bucket, &input.key, StatusCheck::Open)?;
         // Cheap re-check of the create-time refs: no ref is resolved again, but
         // a subject that moved since then stops the part before any byte moves.
         if !record.admits_part(subject.as_ref()) {
-            return self.emit_error(PolicyGateError::Drift.into());
+            return Err(PolicyGateError::Drift.into());
         }
-
         // A provider upload takes the part size before the first byte.
-        if record.backend_upload.is_some() && self.input.content_length.is_none() {
-            return self.emit_error(UploadPartError::MissingContentLength);
+        if record.backend_upload.is_some() && input.content_length.is_none() {
+            return Err(UploadPartError::MissingContentLength);
         }
-        let Some(blob) = self.input.body.take() else {
-            return self.emit_error(UploadPartError::MissingBody);
-        };
+        let blob = self.input.body.take().ok_or(UploadPartError::MissingBody)?;
         if let Some(encryption) = record.encryption {
             // Without a pending envelope the piece goes to the bucket key only.
-            match pending.map(|value| ObjectEnvelope::from_bytes(value.as_ref())) {
-                Some(Ok(envelope)) => self.object = Some(envelope.context.public_key),
-                Some(Err(error)) => {
-                    return self.emit_error(UploadPartError::BlobWriteFailed(error.to_string()));
-                }
-                None => {}
+            if let Some(pending) = pending {
+                let envelope = ObjectEnvelope::from_bytes(pending.as_ref())
+                    .map_err(|error| UploadPartError::BlobWriteFailed(error.to_string()))?;
+                self.object = Some(envelope.context.public_key);
             }
             let resolved = ResolvedBackend::new(record.backend, record.storage_class)
                 .with_compression(encryption.compression)
                 .with_encryption(Some(encryption.plan));
             return self.read_saved_parts(resolved, blob);
         }
-        self.state = UploadPartState::WritePart;
-        smallvec![Effect::Blob(BlobEffect::WritePart {
+        let write = Effect::Blob(BlobEffect::WritePart {
             upload_id: self.input.upload_id,
             part_number: self.input.part_number,
             resolved: ResolvedBackend::new(record.backend, record.storage_class),
@@ -297,7 +241,8 @@ impl UploadPartOperation {
                 .map(Box::new),
             size: self.input.content_length,
             blob,
-        })]
+        });
+        self.call(PartStep::WritePart, write.into())
     }
 
     /// The content offset of a sealed part comes from the parts saved before its bytes arrive.
@@ -305,41 +250,30 @@ impl UploadPartOperation {
         &mut self,
         resolved: ResolvedBackend,
         blob: BackendStream<Result<Bytes, StreamError>>,
-    ) -> Effects {
-        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
+    ) -> PartTurn {
+        let prefix = MultipartPartKey::prefix(self.input.upload_id)?;
         self.sealing = Some((resolved, blob));
-        self.state = UploadPartState::ReadSavedParts;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_PART_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        let page = IoCall::Page {
+            space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: 10_000,
-            txn_id: None,
-        })]
+        };
+        self.call(PartStep::ReadSaved, page)
     }
 
-    fn write_piece(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        let saved: Result<Vec<_>, _> = values
+    fn write_piece(&mut self, rows: Vec<(Key, Value)>) -> PartTurn {
+        let saved = rows
             .iter()
             .map(|(_, value)| MultipartPart::from_bytes(value.as_ref()))
             .map(|part| part.map(|part| (part.part_number, part.location.blob_size)))
-            .collect();
-        let saved = match saved {
-            Ok(saved) => saved,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let Some((resolved, blob)) = self.sealing.take() else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
+            .collect::<Result<Vec<_>, _>>()?;
+        let (resolved, blob) = self.sealing.take().ok_or(IoError::Unexpected {
+            expected: "a sealed part body",
+            got: "none",
+        })?;
         let number = self.input.part_number;
-        self.state = UploadPartState::WritePart;
-        smallvec![Effect::Blob(BlobEffect::WritePiece {
+        let write = Effect::Blob(BlobEffect::WritePiece {
             upload_id: self.input.upload_id,
             part_number: number,
             resolved,
@@ -347,10 +281,11 @@ impl UploadPartOperation {
             content_offset: content_offset(number, &saved, self.input.content_length),
             object: self.object,
             blob,
-        })]
+        });
+        self.call(PartStep::WritePart, write.into())
     }
 
-    fn handle_write_finished(&mut self, event: Event) -> Effects {
+    fn write_finished(&mut self, event: Event) -> PartTurn {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
             Event::Blob(BlobEvent::PieceWritten { location, piece }) => {
@@ -367,77 +302,83 @@ impl UploadPartOperation {
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
-                return self.cleanup_failed_write(UploadPartError::WriteFailed(message));
+                return Err(UploadPartError::WriteFailed(message));
             }
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, message })) => {
                 self.written_location = Some(location);
-                return self.cleanup_failed_write(UploadPartError::BlobWriteFailed(message));
+                return Err(UploadPartError::BlobWriteFailed(message));
             }
             Event::Blob(BlobEvent::Error(error)) => {
-                return self
-                    .cleanup_failed_write(UploadPartError::BlobWriteFailed(error.to_string()));
+                return Err(UploadPartError::BlobWriteFailed(error.to_string()));
             }
-            _ => return self.emit_error(UploadPartError::InvalidOperationState),
+            other => {
+                return Err(IoError::Unexpected {
+                    expected: "the written part",
+                    got: other.label(),
+                }
+                .into());
+            }
         };
         self.written_location = Some(location.clone());
-
-        if self
-            .input
-            .content_length
-            .is_some_and(|expected| location.blob_size != expected)
-        {
-            return self.cleanup_failed_write(UploadPartError::IncompleteBody);
+        let expected = self.input.content_length;
+        if expected.is_some_and(|expected| location.blob_size != expected) {
+            return Err(UploadPartError::IncompleteBody);
         }
-
         for expected in &self.input.expected_checksums {
-            let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
-                return self.cleanup_failed_write(UploadPartError::MissingExpectedChecksum(
-                    expected.algorithm.s3_name(),
-                ));
-            };
+            let name = expected.algorithm.s3_name();
+            let actual = location.hashes.get(expected.algorithm.hash_key());
+            let actual = actual.ok_or(UploadPartError::MissingExpectedChecksum(name))?;
             if actual != &expected.digest {
-                return self.cleanup_failed_write(UploadPartError::ChecksumMismatch(
-                    expected.algorithm.s3_name(),
-                ));
+                return Err(UploadPartError::ChecksumMismatch(name));
             }
         }
-
-        self.state = UploadPartState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+        self.publish()
     }
 
-    /// Takes the location: once its delete is queued the rollback in `abort`
-    /// must not queue a second one. A copy stays behind so a delete that fails
-    /// can still be handed to the durable cleanup queue.
-    fn cleanup_failed_write(&mut self, error: UploadPartError) -> Effects {
-        self.cleanup.set_error(error);
-        self.state = UploadPartState::CleanupFailedWrite;
-        if let Some(location) = self.written_location.take() {
-            self.rollback_location = Some(location.clone());
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.emit_pending_error()
+    /// A refused commit discarded its writes, so only the record transaction runs again: the
+    /// part bytes are already on the backend and are not streamed twice.
+    fn publish(&mut self) -> PartTurn {
+        let location = self.written_location.clone().ok_or(IoError::Unexpected {
+            expected: "the written part",
+            got: "none",
+        })?;
+        let input = &self.input;
+        let record = PartRecordWrite {
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            upload_id: input.upload_id,
+            part_number: input.part_number,
+            location,
+            backend_etag: self.backend_etag.clone(),
+            piece: self.piece.clone(),
+            step: RecordStep::Fence,
+        };
+        self.call(PartStep::Publish, IoCall::child(record))
+    }
+
+    fn published(&mut self, published: Result<(), UploadPartError>) -> PartTurn {
+        let error = match published {
+            Ok(()) => return self.committed(),
+            Err(error) => error,
+        };
+        let UploadPartError::StorageError(storage) = &error else {
+            return Err(error);
+        };
+        if *storage == StorageError::TransactionConflict && self.conflicts < CONFLICT_RETRIES {
+            self.conflicts += 1;
+            return self.publish();
         }
-    }
-
-    fn write_cleanup_failed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) => {
-                self.rollback_location = None;
-                self.emit_pending_error()
-            }
-            // The part bytes are still on the backend, and this operation is
-            // over; only a queued delete can still reach them.
-            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
-            _ => self.emit_error(UploadPartError::InvalidOperationState),
+        // Only a proven refusal rolls the part back; any other failure may already own it.
+        if !storage.proves_no_commit() {
+            self.keep_written(storage);
         }
+        Err(error)
     }
 
-    fn queue_rollback_delete(&mut self) -> Effects {
-        let Some(location) = self.rollback_location.clone() else {
-            return self.emit_pending_error();
+    /// The bytes go to the reconciliation queue: the committed part record decides their fate.
+    fn keep_written(&mut self, error: &StorageError) {
+        let Some(location) = self.written_location.take() else {
+            return;
         };
         let Some(effect) = self.cleanup.queue(BlobCleanupWork::DeleteBlob {
             location: location.clone(),
