@@ -3,10 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 
@@ -55,12 +58,6 @@ impl FencedWrite {
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
-    }
-
-    /// Whether the transaction has not started yet.
-    #[cfg(test)]
-    pub(crate) fn starting(&self) -> bool {
-        self.step == Step::Start
     }
 
     /// How the write ended, once it did.
@@ -147,6 +144,41 @@ impl FencedWrite {
         self.outcome = Some(outcome);
         self.step = Step::Done;
         smallvec![]
+    }
+}
+
+/// Run as a child: the rule read and the writes share the child's transaction. A refused read,
+/// write or commit fails the child with its storage error.
+impl Operation for FencedWrite {
+    type Output = Fenced;
+    type Error = StorageError;
+
+    fn first(&mut self) -> Result<Next<Fenced>, StorageError> {
+        self.step = Step::Read;
+        Ok(Next::Call(read_row(
+            BACKEND_IMPORT_KEYSPACE,
+            self.rule.clone(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Fenced>, StorageError> {
+        match self.step {
+            Step::Read => match result.value()? {
+                Some(_) => {
+                    self.step = Step::Write;
+                    Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+                }
+                None => Ok(Next::Done(Fenced::RuleGone)),
+            },
+            _ => {
+                result.done()?;
+                Ok(Next::Done(Fenced::Written))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -238,5 +270,29 @@ mod tests {
         }));
         let conflict = Fenced::Failed(Some(StorageError::TransactionConflict));
         assert_eq!(fence.outcome(), Some(&conflict));
+    }
+
+    #[test]
+    fn calls_write_with_rule() {
+        let row = (
+            "intents".to_string(),
+            Key::from(vec![2]),
+            Value::from(vec![3]),
+        );
+        let mut fence = FencedWrite::new(Key::from(vec![1]), vec![row.clone()]);
+        assert_eq!(fence.transaction(), TransactionMode::Write);
+        let Ok(Next::Call(IoCall::Read(reads))) = fence.first() else {
+            panic!("expected the rule read")
+        };
+        assert_eq!(reads[0].0, BACKEND_IMPORT_KEYSPACE);
+        let turn = fence.next(IoResult::Values(vec![Some(vec![1].into())]));
+        assert_eq!(turn, Ok(Next::Call(IoCall::Write(vec![row]))));
+        assert_eq!(fence.next(IoResult::Done), Ok(Next::Done(Fenced::Written)));
+
+        // A removed rule gets nothing written.
+        let mut fence = FencedWrite::new(Key::from(vec![1]), Vec::new());
+        fence.first().unwrap();
+        let turn = fence.next(IoResult::Values(vec![None]));
+        assert_eq!(turn, Ok(Next::Done(Fenced::RuleGone)));
     }
 }

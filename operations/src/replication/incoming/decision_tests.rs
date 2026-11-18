@@ -71,17 +71,23 @@ fn denies_incoming_replica() {
     // would invite bytes is refused instead.
     let rule = policy("us-east");
     let mut operation = governed(&rule).with_gate(gate("eu-west"));
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let mut effects = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let Some(Effect::SubOperation(mut gate)) = effects.pop() else {
+        panic!("expected the gate child")
+    };
 
     let document = crate::tests::policy::signed_document(realm(), &rule, 9);
     let cached = PolicyCacheEntry::verified(&document, 10)
         .to_bytes()
         .expect("entry encodes");
-    operation.step(Event::Storage(StorageEvent::ReadResult {
+    gate.start();
+    gate.step(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
         value: Some(cached.into()),
     }));
-    operation.step(crate::tests::policy::authority(realm()));
+    gate.step(crate::tests::policy::authority(realm()));
+    assert!(gate.is_complete());
+    operation.step(gate.finalize());
 
     assert!(rejected(&operation));
 }

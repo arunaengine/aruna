@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_operations::jobs::lifecycle::report::{
-    AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
-};
+use aruna_operations::jobs::lifecycle::report::{AuditPaging, AuditRange};
+use aruna_operations::jobs::lifecycle::routing::{audit_endpoints, family_audit, family_report};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

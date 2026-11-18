@@ -17,7 +17,7 @@ use aruna_core::repository::{
     PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
     RepositoryRecord, connector_link_key, link_key,
 };
-use aruna_core::rows::values;
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -498,6 +498,85 @@ fn secret_row(
         id_key(link_id),
         ByteView::from(postcard::to_allocvec(secret)?),
     ))
+}
+
+/// The push-check row of `link_id`.
+pub(super) fn queue_row(
+    link_id: Ulid,
+    entry: &LinkQueueEntry,
+) -> Result<(String, Key, Value), ConversionError> {
+    Ok((
+        LINK_QUEUE_KEYSPACE.to_string(),
+        id_key(link_id),
+        ByteView::from(postcard::to_allocvec(entry)?),
+    ))
+}
+
+/// Deletes the queued push check of `link_id`, or with `retry_at` moves it there, in one write
+/// transaction. A change written since `queued` was read stays, due no later than `retry_at`;
+/// a removed check stays removed.
+#[derive(Debug, PartialEq)]
+pub(super) struct SettleCheckOperation {
+    link_id: Ulid,
+    queued: Value,
+    retry_at: Option<u64>,
+    written: bool,
+}
+
+impl SettleCheckOperation {
+    pub(super) fn new(link_id: Ulid, queued: Value, retry_at: Option<u64>) -> Self {
+        Self {
+            link_id,
+            queued,
+            retry_at,
+            written: false,
+        }
+    }
+
+    fn settle(&mut self, current: Option<Value>) -> Result<Next<()>, LinkError> {
+        let unchanged = current.as_ref() == Some(&self.queued);
+        let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
+        let call = match (current.as_ref(), self.retry_at) {
+            (Some(_), None) if unchanged => {
+                let row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
+                IoCall::Delete(vec![row])
+            }
+            (Some(current), Some(retry_at)) => {
+                let base = if unchanged { None } else { entry(current) };
+                let Some(mut next) = base.clone().or_else(|| entry(&self.queued)) else {
+                    return Err(LinkError::Unexpected("unreadable link queue entry".into()));
+                };
+                next.due_at_ms = base.map_or(retry_at, |base| base.due_at_ms.min(retry_at));
+                IoCall::Write(vec![queue_row(self.link_id, &next)?])
+            }
+            _ => return Ok(Next::Done(())),
+        };
+        self.written = true;
+        Ok(Next::Call(call))
+    }
+}
+
+impl Operation for SettleCheckOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, LinkError> {
+        let row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, LinkError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(()));
+        }
+        let [current] = values::<1>(result)?;
+        self.settle(current)
+    }
 }
 
 #[cfg(test)]

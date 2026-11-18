@@ -30,18 +30,14 @@ use aruna_core::structs::storage::release::{
     CrateBytes, CrateRead, CrateReadError, HolderAnswer, HolderAsk, HolderRequest, ReleaseEffect,
     ReleaseEvent, ValidRelease,
 };
-use aruna_core::structs::storage::release::{
-    MembershipQuery, RangeFiles, RangeMembers, ReleaseFile, ReleaseMembers,
-};
+use aruna_core::structs::storage::release::{MembershipQuery, ReleaseMembers};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::Key;
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
-use crate::driver::{DriverContext, drive};
 
 /// Rows read per storage page while looking for a bucket's releases.
 const ROW_PAGE: usize = 256;

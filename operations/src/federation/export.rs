@@ -284,7 +284,7 @@ mod tests {
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::operation::Operation;
-    use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError, selection_digest};
+    use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
 

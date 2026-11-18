@@ -18,12 +18,11 @@ use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
-use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::metadata::{
-    ReferenceRefresh, ReferenceRefreshError, ReferenceRefreshRecord, due_key, job_entries, job_key,
+    ReferenceRefresh, ReferenceRefreshError, ReferenceRefreshRecord, due_key, job_entries,
     split_due,
 };
 use crate::driver::{DriverContext, drive};

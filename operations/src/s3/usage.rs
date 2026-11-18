@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -704,8 +704,11 @@ impl QuotaGate {
     /// Returns `Ok(Some(effects))` while more storage work is needed and
     /// `Ok(None)` once the group's realm-wide usage has been summed.
     pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
+        // The gate's reads go out as batch reads, so a single read is answered as a batch.
         let result = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => IoResult::Values(vec![value]),
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+            }
             Event::Storage(StorageEvent::IterResult {
                 values,
                 next_start_after,
@@ -1162,37 +1165,86 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
+    }
+
     // A rebuild refuses quota writes only while no earlier rebuild completed the counters.
     #[test]
     fn rebuild_keeps_counters() {
         let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
-        let txn_id = Ulid::from_bytes([1; 16]);
-        let marker = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Key::from(b"marker".to_vec()),
-                value: value.map(Into::into),
-            })
-        };
         let mut fresh = QuotaGate::new(10, 1, Ulid::from_bytes([2; 16]), node_id);
-        fresh.start(txn_id);
-        assert!(
-            fresh
-                .step(marker(Some(Vec::new())), txn_id)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(fresh.step(marker(None), txn_id).unwrap(), None);
+        fresh.start_calls();
+        assert!(fresh.step_calls(row(Some(Vec::new()))).unwrap().is_some());
+        assert_eq!(fresh.step_calls(row(None)).unwrap(), None);
         assert!(fresh.is_rebuilding() && fresh.is_exceeded());
 
         let mut complete = QuotaGate::new(10, 1, Ulid::from_bytes([2; 16]), node_id);
-        complete.start(txn_id);
-        complete.step(marker(Some(Vec::new())), txn_id).unwrap();
-        let next = complete.step(marker(Some(Vec::new())), txn_id).unwrap();
+        complete.start_calls();
+        complete.step_calls(row(Some(Vec::new()))).unwrap();
+        let next = complete.step_calls(row(Some(Vec::new()))).unwrap();
         assert!(matches!(
-            next.as_deref(),
-            Some([Effect::Storage(StorageEffect::Read { key, .. })]) if key.as_ref() != USAGE_COMPLETE_KEY
+            next,
+            Some(IoCall::Read(ref reads)) if reads[0].1.as_ref() != USAGE_COMPLETE_KEY
         ));
         assert!(!complete.is_rebuilding());
+    }
+
+    // The event path answers the gate's batch reads: every read of the gate goes out as a batch
+    // read of one row in the host's transaction, and its answer moves the gate on.
+    #[test]
+    fn gate_reads_batches() {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let group_id = Ulid::from_bytes([2; 16]);
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let batch = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![(Key::from(b"row".to_vec()), value.map(Into::into))],
+            })
+        };
+        let read_in_txn = |effects: &[Effect]| {
+            matches!(
+                effects,
+                [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(read) })]
+                    if reads.len() == 1 && *read == txn_id
+            )
+        };
+        let mut gate = QuotaGate::new(10, 4, group_id, node_id);
+        assert!(read_in_txn(&gate.start(txn_id)));
+        // No rebuild runs, so the gate reads the group's counters next.
+        let next = gate.step(batch(None), txn_id).unwrap().unwrap();
+        assert!(read_in_txn(&next));
+        let next = gate.step(batch(Some(logical(3).to_bytes().unwrap())), txn_id);
+        assert!(matches!(
+            next.unwrap().as_deref(),
+            Some([Effect::Storage(StorageEffect::Iter { .. })])
+        ));
+        let scanned = Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        });
+        assert_eq!(gate.step(scanned, txn_id).unwrap(), None);
+        assert_eq!(gate.projected_usage(), 7);
+        assert!(!gate.is_exceeded());
+
+        // The same reads in call form.
+        let mut gate = QuotaGate::new(10, 8, group_id, node_id);
+        assert!(matches!(gate.start_calls(), IoCall::Read(_)));
+        assert!(matches!(
+            gate.step_calls(row(None)),
+            Ok(Some(IoCall::Read(_)))
+        ));
+        let counters = row(Some(logical(3).to_bytes().unwrap()));
+        assert!(matches!(
+            gate.step_calls(counters),
+            Ok(Some(IoCall::Page { .. }))
+        ));
+        let scanned = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(gate.step_calls(scanned), Ok(None));
+        assert!(gate.is_exceeded());
     }
 
     async fn realm_usage(
@@ -2033,13 +2085,6 @@ mod tests {
         let nodes = [node(1), node(2)];
         let group_id = Ulid::from_bytes([2; 16]);
         let realm_id = RealmId([4; 32]);
-        let txn_id = Ulid::from_bytes([1; 16]);
-        let read = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Key::from(b"row".to_vec()),
-                value: value.map(Into::into),
-            })
-        };
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.nodes = nodes
             .map(|node_id| RealmNode {
@@ -2049,11 +2094,11 @@ mod tests {
             .to_vec();
         config.replica_quota.count = count_replicas;
         let mut gate = QuotaGate::new_for_realm(ceiling, delta, group_id, nodes[0], realm_id);
-        gate.start(txn_id);
-        gate.step(read(None), txn_id).unwrap();
-        gate.step(read(Some(postcard::to_allocvec(&config).unwrap())), txn_id)
+        gate.start_calls();
+        gate.step_calls(row(None)).unwrap();
+        gate.step_calls(row(Some(postcard::to_allocvec(&config).unwrap())))
             .unwrap();
-        gate.step(read(Some(logical(live).to_bytes().unwrap())), txn_id)
+        gate.step_calls(row(Some(logical(live).to_bytes().unwrap())))
             .unwrap();
         let set_id = Ulid::from_bytes([3; 16]);
         let values = (nodes.into_iter().zip(shares).zip(numbers))
@@ -2068,21 +2113,21 @@ mod tests {
                 (key, Value::from(snapshot.to_bytes().unwrap()))
             })
             .collect();
-        let scanned = Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        });
-        if let Some(effects) = gate.step(scanned, txn_id).unwrap() {
-            let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
-                panic!("the gate reads one marker: {effects:?}");
+        let scanned = IoResult::Page {
+            rows: values,
+            next: None,
+        };
+        if let Some(call) = gate.step_calls(scanned).unwrap() {
+            let IoCall::Read(reads) = &call else {
+                panic!("the gate reads one marker: {call:?}");
             };
             assert_eq!(
-                key.as_ref(),
+                reads[0].1.as_ref(),
                 dirty_share_key(group_id),
                 "the share marker, not the group's"
             );
             let marker = dirty.then(|| vec![1]);
-            assert_eq!(gate.step(read(marker), txn_id).unwrap(), None);
+            assert_eq!(gate.step_calls(row(marker)).unwrap(), None);
         }
         gate
     }
@@ -3059,16 +3104,18 @@ mod state_machine_tests {
 
     #[test]
     fn marker_marks_incomplete() {
-        let marker_read = Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-            txn_id: None,
-        });
+        let marker_read = || {
+            Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+                txn_id: None,
+            })
+        };
         for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
             let mut operation = UsageCompleteOperation::new();
             check_trace(
                 &mut operation,
-                &[marker_read.clone()],
+                &[marker_read()],
                 vec![(read(value), vec![])],
             );
             assert_eq!(operation.finalize(), Ok(complete));

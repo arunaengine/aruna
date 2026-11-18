@@ -8,6 +8,7 @@ use aruna_core::effects::JobRecordFrame;
 use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSelection, JobAdmissionRecord, JobFamilyId,
@@ -17,10 +18,12 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{
-    BucketInfo, bucket_permission_path, group_permission_path,
+    BlobVersion, BlobVersionState, BucketInfo, VersionKey, bucket_permission_path,
+    group_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::{
     GrantScope, HEAD_OPERATION, READ_OPERATION, ReadGrant,
@@ -28,6 +31,7 @@ use aruna_core::structs::storage::read_grant::{
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -296,7 +300,7 @@ pub async fn submit_external_job(
     }
     if !labels.is_empty() {
         // Only a complete read of the advertisements proves that no executor carries a label.
-        let (documents, unread) = super::plan::advertisements(context, &config).await;
+        let (documents, unread) = advertisements(context, &config).await;
         if let Some(label) = super::plan::missing_label(&documents, &labels).filter(|_| !unread) {
             return Err(SubmitJobError::InvalidWorkspace(format!(
                 "no executor in the realm carries the label `{}={}`",
@@ -897,7 +901,7 @@ async fn capture_inputs(
             .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
         let blake3 = match blake3 {
             Some(hash) => Some(hash),
-            None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version).await,
+            None => version_hash(context, bucket, key, version).await,
         };
         let (content, source_pin) = match blake3 {
             Some(hash) => (InputContent::Blake3(hash), None),
@@ -1674,6 +1678,64 @@ async fn authorize_group(
         PolicyRequestExtras::rest(),
     )
     .await
+}
+
+/// Node-info documents of every sync-eligible realm member that has one, and
+/// whether a read failed. An unread advertisement may hold the only legal
+/// target, so the round is a continuation rather than a conclusive refusal.
+pub(super) async fn advertisements(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
+    let mut documents = BTreeMap::new();
+    let Ok(members) = config.sync_eligible_nodes() else {
+        return (documents, true);
+    };
+    let mut unread = false;
+    for node_id in members {
+        let read = drive(ReadInfoOperation::new(vec![node_id]), context).await;
+        match read.map(|mut documents| documents.remove(&node_id)) {
+            Ok(Some(document)) => {
+                documents.insert(node_id, document);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(node = %node_id, error = %error, "Node info advertisement stayed unread");
+                unread = true;
+            }
+        }
+    }
+    (documents, unread)
+}
+
+/// The blake3 of a version this node does not hold locally, read from the
+/// replicated version record.
+async fn version_hash(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version: Ulid,
+) -> Option<[u8; 32]> {
+    let version_key = VersionKey::new(bucket, key, version).to_bytes().ok()?;
+    let event = context
+        .storage_handle
+        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
+            key_space: aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version_key.into(),
+            txn_id: None,
+        })
+        .await;
+    let aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+        value: Some(bytes),
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    match postcard::from_bytes::<BlobVersion>(&bytes).ok()?.state {
+        BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

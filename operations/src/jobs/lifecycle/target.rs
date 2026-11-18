@@ -6,25 +6,18 @@
 use std::sync::Arc;
 
 use aruna_compute::ExecutorRegistry;
-use aruna_core::compute::{ExecutorCapability, ExecutorKind, NetworkAccess, ResourceEnvelope};
+use aruna_core::compute::{ExecutorCapability, ExecutorKind, ResourceEnvelope};
 use aruna_core::effects::{JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS, ReceiptFrame};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{DeclinedPolicy, LaunchDecline};
+use aruna_core::events::LaunchDecline;
 use aruna_core::id::NodeId;
-use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
-    JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, WorkspaceMode,
+    ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload, JobRecord,
+    JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
+    WorkspaceMode,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::policy::{
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
-};
-use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -33,11 +26,9 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::cancel_local_run;
 use super::fetch::FetchFamilyOperation;
-use super::ids::{self, workspace_of};
-use super::plan::{REALM_STAGING, network_access};
+use super::ids::workspace_of;
+use super::launch_checks::{LaunchCheck, LaunchChecksOperation};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -46,10 +37,7 @@ use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
-use crate::placement::policy::GateOperation;
-use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::realm::load_config::load_realm_config;
-use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::resolve_shard_holders;
 
@@ -117,36 +105,18 @@ pub async fn admit_launch(
     if already_running(family, &records, local) {
         return Some(Err(LaunchDecline::AlreadyRunning));
     }
-    let capability = match local_capability(context.as_ref(), &config, local, &planned, &spec).await
-    {
-        Ok(capability) => capability,
-        Err(decline) => return Some(Err(decline)),
+    let check = LaunchCheck {
+        config,
+        local,
+        planned: planned.clone(),
+        spec: spec.clone(),
+        now_ms: unix_timestamp_millis(),
     };
-    // A node that stopped admitting governed data declines every new execution
-    // target categorically, whatever the offered work references.
-    match drive(
-        GateOperation::new(realm_id, unix_timestamp_millis()),
-        context.as_ref(),
-    )
-    .await
-    {
-        Ok(Some(gate)) if !gate.admitting => return Some(Err(LaunchDecline::Draining)),
+    let capability = match drive(LaunchChecksOperation::new(check), context.as_ref()).await {
+        Ok(Ok(capability)) => capability,
+        Ok(Err(decline)) => return Some(Err(decline)),
         Err(_) => return None,
-        Ok(_) => {}
-    }
-    if let Err(decline) = authorize_submitter(context.as_ref(), &spec, local).await {
-        return Some(Err(decline));
-    }
-    match placement_verdict(context.as_ref(), &spec, &planned, &capability.subject).await {
-        Ok(Some(decision)) => {
-            return Some(Err(match DeclinedPolicy::new(decision) {
-                Ok(policy) => LaunchDecline::Policy(policy),
-                Err(_) => LaunchDecline::Unauthorized,
-            }));
-        }
-        Ok(None) => {}
-        Err(decline) => return Some(Err(decline)),
-    }
+    };
     let limits = match backend_limits(context.as_ref(), &intent) {
         Some(limits) => limits,
         None => return Some(Err(LaunchDecline::Draining)),
@@ -572,6 +542,8 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 }
 
 /// This node's own advertisement for the offered executor kind.
+/// This node's executor capability that runs `intent`; see [`LocalCapabilityOperation`].
+#[cfg(test)]
 pub(crate) async fn local_capability(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -579,220 +551,21 @@ pub(crate) async fn local_capability(
     intent: &LaunchIntent,
     spec: &LogicalJobSpec,
 ) -> Result<ExecutorCapability, LaunchDecline> {
-    let document = drive(ReadInfoOperation::new(vec![local]), context)
+    let operation = super::launch_checks::LocalCapabilityOperation::new(
+        config.clone(),
+        local,
+        intent.clone(),
+        spec.clone(),
+    );
+    drive(operation, context)
         .await
-        .map_err(|_| LaunchDecline::Draining)?
-        .remove(&local)
-        .ok_or(LaunchDecline::Draining)?;
-    if !config
-        .sync_eligible_nodes()
-        .is_ok_and(|members| members.contains(&local))
-    {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    let kind = config
-        .nodes
-        .iter()
-        .find(|node| node.node_id == local.to_string())
-        .map(|node| &node.kind)
-        .ok_or(LaunchDecline::Unauthorized)?;
-    if !kind.is_sync_eligible() {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    // The durable operator flag is checked directly: a stale heartbeat document
-    // must never re-enable offers this node was drained out of.
-    if document.leaving
-        || document.compute_draining
-        || drive(DrainStateOperation::new(), context)
-            .await
-            .map_or(true, |drain| drain.operator_draining)
-        || config
-            .placement_entry(local)
-            .is_some_and(|entry| entry.draining)
-    {
-        return Err(LaunchDecline::Draining);
-    }
-    let capability = document
-        .executors
-        .iter()
-        .find(|capability| capability.kind == intent.target.executor_kind)
-        .cloned()
-        .ok_or(LaunchDecline::Unauthorized)?;
-    if capability.policy_draining {
-        return Err(LaunchDecline::Draining);
-    }
-    if capability.validate(local).is_err()
-        || spec
-            .payload
-            .executor_constraint
-            .as_deref()
-            .is_some_and(|kind| kind.trim() != capability.kind.trim())
-        || !capability.supports(REALM_STAGING)
-        || (ids::session_of(&spec.payload).is_some()
-            && network_access(spec) != NetworkAccess::Open
-            && !capability.session)
-        || !capability.limits.fits(&spec.resources)
-    {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    let labels = ids::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
-    if !labels.iter().all(|label| {
-        capability
-            .subject
-            .labels
-            .get(label.key.trim())
-            .map(|value| value.trim())
-            == Some(label.value.trim())
-    }) {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    let protected = !intent.output_policies.is_empty()
-        || intent.inputs.iter().any(|input| !input.policies.is_empty());
-    if protected && network_access(spec) == NetworkAccess::Open && !capability.network_policy {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    Ok(capability)
+        .unwrap_or(Err(LaunchDecline::Draining))
 }
 
 fn backend_limits(context: &DriverContext, intent: &LaunchIntent) -> Option<ResourceEnvelope> {
     let registry: &ExecutorRegistry = context.compute_handle.as_ref()?;
     let backend = registry.get(&ExecutorKind::from_wire(&intent.target.executor_kind))?;
     Some(backend.capabilities().limits)
-}
-
-/// The stored submitter must still hold WRITE on the group here. No bearer
-/// token replicates: the check runs against this node's replicated permissions.
-async fn authorize_submitter(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-    local: NodeId,
-) -> Result<(), LaunchDecline> {
-    let auth = AuthContext {
-        user_id: spec.created_by,
-        realm_id: spec.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    authorize(
-        context,
-        spec.realm_id,
-        &auth,
-        &group_permission_path(spec.realm_id, spec.group_id, local),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
-    .await
-    .map_err(|_| LaunchDecline::Unauthorized)
-}
-
-/// Whether one pinned input still describes the captured input it names, resolved at
-/// `source`. Any node may be the pinned holder, because a registered copy serves the read;
-/// version, content and size bind the bytes, and the local target is not a remote read.
-pub(crate) fn pin_matches(
-    captured: &CapturedInput,
-    pin: &PlannedInput,
-    source: NodeId,
-    local: NodeId,
-) -> bool {
-    captured.source_node_id == source
-        && captured.version_id == pin.version_id
-        && captured.content == pin.content
-        && captured.bytes == pin.bytes
-        && pin.source_node_id != Some(local)
-}
-
-/// Re-evaluates the placement refs this target can resolve against its own
-/// execution subject. Refs of an input it cannot resolve yet are enforced again
-/// by the materialization gate when the bytes are staged.
-async fn placement_verdict(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-    intent: &LaunchIntent,
-    subject: &PlacementSubject,
-) -> Result<Option<PlacementDecision>, LaunchDecline> {
-    if intent.inputs.len() != spec.payload.inputs.len() {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    if spec.captured_inputs.len() != spec.payload.inputs.len() {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
-    for input in &spec.payload.inputs {
-        let InputSource::S3 { version_id, .. } = &input.source;
-        let pin = intent
-            .inputs
-            .iter()
-            .find(|pin| pin.destination_key == input.dest_key)
-            .ok_or(LaunchDecline::Unauthorized)?;
-        let requested = version_id
-            .as_deref()
-            .map(Ulid::from_string)
-            .transpose()
-            .map_err(|_| LaunchDecline::Unauthorized)?;
-        if requested.is_some_and(|requested| requested != pin.version_id) {
-            return Err(LaunchDecline::Unauthorized);
-        }
-        let captured = spec
-            .captured_inputs
-            .iter()
-            .find(|captured| captured.destination_key == input.dest_key)
-            .ok_or(LaunchDecline::Unauthorized)?;
-        let source = input.source_node_id.unwrap_or(spec.ingress_node_id);
-        if !pin_matches(captured, pin, source, subject.node_id) {
-            return Err(LaunchDecline::Unauthorized);
-        }
-        let version = Some(captured.version_id);
-        let mut policies = captured.policies.clone();
-        policies.sort_unstable();
-        policies.dedup();
-        if version != Some(pin.version_id)
-            || captured.content != pin.content
-            || policies != pin.policies
-        {
-            return Err(LaunchDecline::Unauthorized);
-        }
-        inputs.push(policies);
-    }
-    let mut output_policies = inputs.iter().flatten().copied().collect::<Vec<_>>();
-    output_policies.extend(spec.output_policies.clone());
-    output_policies.sort_unstable();
-    output_policies.dedup();
-    if output_policies != intent.output_policies {
-        return Err(LaunchDecline::Unauthorized);
-    }
-    let mut refs = output_policies.clone();
-    refs.extend(inputs.iter().flatten().copied());
-    refs.sort_unstable();
-    refs.dedup();
-    let mut policies: BTreeMap<Ulid, PolicyResolution> = BTreeMap::new();
-    for policy_ref in &refs {
-        let resolution = drive(
-            ResolvePolicyOperation::new(ResolvePolicyConfig {
-                realm_id: spec.realm_id,
-                policy_ref: *policy_ref,
-                local_node_id: subject.node_id,
-                now_ms: unix_timestamp_millis(),
-            }),
-            context,
-        )
-        .await;
-        policies.insert(
-            policy_ref.policy_id,
-            match resolution {
-                Ok(resolved) => PolicyResolution::Known(resolved.policy),
-                Err(_) => PolicyResolution::Unresolved,
-            },
-        );
-    }
-    for policy_set in
-        std::iter::once(output_policies.as_slice()).chain(inputs.iter().map(Vec::as_slice))
-    {
-        match evaluate_placement(policy_set, &policies, subject) {
-            PlacementDecision::Allowed => {}
-            decision => return Ok(Some(decision)),
-        }
-    }
-    Ok(None)
 }
 
 async fn append_record(
@@ -864,6 +637,7 @@ async fn fetch_family(
 
 #[cfg(test)]
 mod pure_tests {
+    use crate::jobs::lifecycle::ids;
     use aruna_core::scheduling::PlannedInput;
     use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
 

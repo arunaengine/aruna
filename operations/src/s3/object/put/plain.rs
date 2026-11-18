@@ -5,6 +5,7 @@
 use super::fenced::{Fenced, FencedWrite};
 use super::*;
 use aruna_core::calls::IoCall;
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
@@ -19,7 +20,7 @@ use aruna_core::structs::storage::routing::PlainTarget;
 use aruna_core::types::{Key, Value};
 
 /// The path a write takes, the backend it resolved to and the backend version it got.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct PlainWrite {
     pub(super) target: PlainTarget,
     resolved: ResolvedBackend,
@@ -30,7 +31,7 @@ pub(super) struct PlainWrite {
 }
 
 /// Rows an import commits with its version; the rule must still exist in that transaction.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ImportRows {
     import_id: Ulid,
     writes: Vec<(String, Key, Value)>,
@@ -67,14 +68,10 @@ impl PutObjectOperation {
 
     /// Nothing at a tenant path is ever deleted, so the write counts as adopted from here on.
     /// A same-name write first looks at the path; no lock is held.
-    pub(super) fn start_plain(
-        &mut self,
-        target: PlainTarget,
-        resolved: ResolvedBackend,
-    ) -> Effects {
+    pub(super) fn start_plain(&mut self, target: PlainTarget, resolved: ResolvedBackend) -> Turn {
         self.adopted = true;
         let (same_name, path) = (target.same_name, target.path.clone());
-        let owner = owner_read(&target);
+        let owner = owner_call(&target);
         self.plain = Some(PlainWrite {
             // Only a record proves a mapped path the key's own.
             owned: owner.is_none() && !target.mapped,
@@ -87,41 +84,32 @@ impl PutObjectOperation {
             return self.write_plain(path, false);
         }
         match owner {
-            Some(read) => {
-                self.state = PutObjectState::ReadPlainOwner;
-                smallvec![read]
-            }
+            Some(read) => self.call(PutObjectState::ReadPlainOwner, read),
             None => self.stat_plain(),
         }
     }
 
-    fn stat_plain(&mut self) -> Effects {
-        let Some(plain) = self.plain.as_ref() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
+    fn stat_plain(&mut self) -> Turn {
+        let plain = self.plain.as_ref();
+        let plain = plain.ok_or(PutObjectError::InvalidOperationState)?;
         let stat = BlobEffect::StatPlain {
             backend: plain.target.backend.clone(),
             path: plain.target.path.clone(),
         };
-        self.state = PutObjectState::StatPlain;
-        smallvec![Effect::Blob(stat)]
+        self.effect(PutObjectState::StatPlain, Effect::Blob(stat))
     }
 
-    pub(super) fn plain_owner(&mut self, event: Event) -> Effects {
-        let owned = owns_path(event, &self.config.request.key);
-        match (owned, self.plain.as_mut()) {
-            (Ok(owned), Some(plain)) => {
-                plain.owned = owned;
-                self.stat_plain()
-            }
-            (Err(error), _) => self.emit_error(PutObjectError::BlobWriteFailed(error)),
-            (_, None) => self.emit_error(PutObjectError::InvalidOperationState),
-        }
+    pub(super) fn plain_owner(&mut self, value: Option<Value>) -> Turn {
+        let owned = path_owned(value.as_deref(), &self.config.request.key);
+        let owned = owned.map_err(PutObjectError::BlobWriteFailed)?;
+        let plain = self.plain.as_mut();
+        plain.ok_or(PutObjectError::InvalidOperationState)?.owned = owned;
+        self.stat_plain()
     }
 
-    pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
+    pub(super) fn plain_stat(&mut self, event: Event) -> Turn {
         let (Some(plain), Some(id)) = (self.plain.as_ref(), self.version_id) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
         match event {
             Event::Blob(BlobEvent::PlainStat { exists, version }) => {
@@ -129,20 +117,17 @@ impl PutObjectOperation {
                 let (path, if_not_exists) = same_name_path(path, id, exists, replaces);
                 self.write_plain(path, if_not_exists)
             }
-            Event::Blob(BlobEvent::Error(error)) => {
-                self.emit_error(PutObjectError::BlobWriteFailed(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+            Event::Blob(BlobEvent::Error(error)) => Err(PutObjectError::BlobWriteFailed(error)),
+            _ => Err(PutObjectError::InvalidOperationState),
         }
     }
 
-    fn write_plain(&mut self, path: String, if_not_exists: bool) -> Effects {
+    fn write_plain(&mut self, path: String, if_not_exists: bool) -> Turn {
         let (Some(plain), Some(ulid)) = (self.plain.as_ref(), self.version_id) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
-        let Some(blob) = self.config.request.body.take() else {
-            return self.emit_error(PutObjectError::MissingBody);
-        };
+        let blob = self.config.request.body.take();
+        let blob = blob.ok_or(PutObjectError::MissingBody)?;
         let intent = self.plain_intent();
         let import_id = plain.target.import_id;
         let keys = intent_keys(import_id, &path, ulid, if_not_exists);
@@ -158,23 +143,16 @@ impl PutObjectOperation {
             created_by: self.config.user_id,
             blob,
         });
-        self.state = PutObjectState::WriteBlob;
         let Some(intent) = intent else {
-            return smallvec![write];
+            return self.effect(PutObjectState::WriteBlob, write);
         };
-        let (rows, Some(rule)) = (intent_rows(&keys, &intent), self.rule_fence()) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        match rows {
-            Ok(rows) => {
-                self.written_intent = keys;
-                self.pending_write = Some(smallvec![write]);
-                self.state = PutObjectState::WriteIntent;
-                let fence = self.fence.insert(FencedWrite::new(rule, rows));
-                fence.start()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+        let rule = self.rule_fence();
+        let rule = rule.ok_or(PutObjectError::InvalidOperationState)?;
+        let rows = intent_rows(&keys, &intent)?;
+        self.written_intent = keys;
+        self.pending_write = Some(write.into());
+        let fence = IoCall::child(FencedWrite::new(rule, rows));
+        self.call(PutObjectState::WriteIntent, fence)
     }
 
     /// Whether this is a plain write to the folder of an import rule.
@@ -197,7 +175,7 @@ impl PutObjectOperation {
 
     /// Records the hash of the written bytes in the intent of the path they reached. A lost
     /// record leaves the intent unproven, which an import reports instead of trusting.
-    pub(super) fn write_evidence(&mut self) -> Option<Effects> {
+    pub(super) fn write_evidence(&mut self) -> Option<Turn> {
         let mut intent = self
             .plain_intent()
             .filter(|_| !self.written_intent.is_empty())?;
@@ -211,90 +189,57 @@ impl PutObjectOperation {
         let (rows, rule) = (intent_rows(&[key], &intent), self.rule_fence()?);
         let rows = match rows {
             Ok(rows) => rows,
-            Err(error) => return Some(self.emit_error(error.into())),
+            Err(error) => return Some(Err(error.into())),
         };
-        self.state = PutObjectState::WriteEvidence;
-        Some(self.fence.insert(FencedWrite::new(rule, rows)).start())
+        let fence = IoCall::child(FencedWrite::new(rule, rows));
+        Some(self.call(PutObjectState::WriteEvidence, fence))
     }
 
     /// The hash is stored with a read of the rule; a removed rule gets none, and the write
     /// goes on as one without its rule.
-    pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
-        let Some(fence) = self.fence.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let effects = fence.step(event);
-        match fence.outcome().cloned() {
-            None => effects,
-            Some(Fenced::Written | Fenced::RuleGone) => self.start_transaction(),
-            Some(Fenced::Failed(Some(error))) => {
-                self.cleanup_failed_write(PutObjectError::StorageError(error))
+    pub(super) fn evidence_written(&mut self, result: IoResult) -> Turn {
+        match result.child::<Fenced, StorageError>()? {
+            Ok(Fenced::Written | Fenced::RuleGone) => self.start_publish(),
+            Ok(Fenced::Failed(error)) => {
+                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
             }
-            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
+            Err(error) => Err(error.into()),
         }
     }
 
     /// Bytes move only once their identity is stored with a read of the rule and synced to
     /// disk; a removed rule stores nothing and refuses the write.
-    pub(super) fn intent_written(&mut self, event: Event) -> Effects {
-        if self.state == PutObjectState::SyncIntent {
-            return match (event, self.pending_write.take()) {
-                (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
-                    self.state = PutObjectState::WriteBlob;
-                    write
-                }
-                (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
-                _ => self.emit_error(PutObjectError::InvalidOperationState),
-            };
-        }
-        let Some(fence) = self.fence.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let effects = fence.step(event);
-        match fence.outcome().cloned() {
-            None => effects,
-            Some(Fenced::Written) => {
-                self.state = PutObjectState::SyncIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
-            Some(Fenced::RuleGone) => {
+    pub(super) fn intent_written(&mut self, result: IoResult) -> Turn {
+        match result.child::<Fenced, StorageError>()? {
+            Ok(Fenced::Written) => self.call(PutObjectState::SyncIntent, IoCall::Sync),
+            Ok(Fenced::RuleGone) => {
                 self.written_intent.clear();
-                self.emit_error(PutObjectError::ImportRemoved)
+                Err(PutObjectError::ImportRemoved)
             }
-            Some(Fenced::Failed(Some(error))) => self.emit_error(error.into()),
-            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
+            Ok(Fenced::Failed(error)) => {
+                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
-    /// A refused conditional write moved no byte, so its intent must not claim the path.
-    pub(super) fn drop_intent(&mut self) -> Effects {
-        let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+    pub(super) fn intent_synced(&mut self, result: IoResult) -> Turn {
+        result.done()?;
+        let write = self.pending_write.take();
+        let write = write.ok_or(PutObjectError::InvalidOperationState)?;
+        self.call(PutObjectState::WriteBlob, write)
+    }
+
+    /// A refused conditional write moved no byte, so its intent must not claim the path; the
+    /// write fails as taken once the intents are gone for good.
+    pub(super) fn drop_intent(&mut self) -> Turn {
         if self.written_intent.is_empty() {
-            return self.cleanup_failed_write(taken);
+            return Err(PutObjectError::BlobWriteFailed(BlobError::PathTaken));
         }
-        self.state = PutObjectState::DropIntent;
-        smallvec![intent_deletes(&self.written_intent)]
-    }
-
-    /// The write fails as taken only once its intents are gone for good; a failed delete or
-    /// sync keeps them and fails the write with that error instead.
-    pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
-        let syncing = self.state == PutObjectState::SyncDroppedIntent;
-        match event {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if !syncing => {
-                self.state = PutObjectState::SyncDroppedIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
-            Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
-                self.written_intent.clear();
-                let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
-                self.cleanup_failed_write(taken)
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.cleanup_failed_write(PutObjectError::StorageError(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
+        let space = IMPORT_INTENT_KEYSPACE.to_string();
+        let deletes = (self.written_intent.iter()).map(|key| (space.clone(), key.clone()));
+        let call = IoCall::Delete(deletes.collect());
+        self.call(PutObjectState::DropIntent, call)
     }
 
     /// Rows committed with the version only while the import rule `import_id` exists.
@@ -329,28 +274,12 @@ impl PutObjectOperation {
     }
 
     /// The import rows are written; the obsolete intents go in the same transaction.
-    pub(super) fn plain_written(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let retiring = self.state == PutObjectState::RetireIntents;
-        let deletes = match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) if !retiring => {
-                self.retired_intents()
-            }
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if retiring => Vec::new(),
-            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
-            _ => return self.emit_error(PutObjectError::InvalidOperationState),
-        };
-        if !deletes.is_empty() {
-            self.state = PutObjectState::RetireIntents;
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })];
+    pub(super) fn plain_written(&mut self) -> Turn {
+        let deletes = self.retired_intents();
+        if deletes.is_empty() {
+            return self.finish_publish();
         }
-        self.state = PutObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.call(PutObjectState::RetireIntents, IoCall::Delete(deletes))
     }
 
     /// Refuses the version while the delete trail shows `version_id`, or the key without a
@@ -396,39 +325,26 @@ impl PutObjectOperation {
         Some(import_key(self.config.group_id, import_id))
     }
 
-    pub(super) fn plain_records(&mut self, txn_id: Ulid) -> Option<Effects> {
+    pub(super) fn plain_records(&mut self) -> Option<Turn> {
         // Which other rules read the written path is read in this transaction.
         if self.listed_write() && self.rule_exists.is_none() && !self.readers.done() {
-            self.state = PutObjectState::ReadReaders;
-            let page = self.readers.page(self.config.group_id, Some(txn_id));
-            return Some(smallvec![page]);
+            let page = self.readers.page_call(self.config.group_id);
+            return Some(self.call(PutObjectState::ReadReaders, page));
         }
         if self.rule_exists.is_none()
             && let Some(key) = self.rule_fence()
         {
-            self.state = PutObjectState::ReadImportRule;
+            let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
             let guards = self.fence_guards();
-            if !guards.is_empty() {
-                let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
-                let reads = guards
-                    .iter()
-                    .map(|(space, key, _)| (space.clone(), key.clone()));
-                return Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: std::iter::once(rule).chain(reads).collect(),
-                    txn_id: Some(txn_id),
-                })]);
-            }
-            return Some(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })]);
+            let guards = guards.into_iter().map(|(space, key, _)| (space, key));
+            let reads = std::iter::once(rule).chain(guards).collect();
+            return Some(self.call(PutObjectState::ReadImportRule, IoCall::Read(reads)));
         }
         if self.import_rows.is_some()
             && self.rule_exists == Some(true)
-            && let Some(effects) = self.trail_page(txn_id).or_else(|| self.rule_page(txn_id))
+            && let Some(turn) = self.trail_page().or_else(|| self.rule_page())
         {
-            return Some(effects);
+            return Some(turn);
         }
         let mut writes = Vec::new();
         // A deduplicated version reads the older location, so it needs no version row.
@@ -438,7 +354,7 @@ impl PutObjectOperation {
             .is_some_and(|(output, written)| output.ulid == written.ulid);
         if let Some(rows) = self.import_rows.as_ref() {
             if self.rule_exists != Some(true) {
-                return Some(self.emit_error(PutObjectError::ImportRemoved));
+                return Some(Err(PutObjectError::ImportRemoved));
             }
             let rows = rows.writes.iter();
             writes.extend(
@@ -461,11 +377,11 @@ impl PutObjectOperation {
             };
             match record.writes(self.rule_exists == Some(true)) {
                 Ok(rows) => writes.extend(rows),
-                Err(error) => return Some(self.emit_error(error.into())),
+                Err(error) => return Some(Err(error.into())),
             }
             match self.dedup_release().transpose() {
                 Ok(release) => writes.extend(release),
-                Err(error) => return Some(self.emit_error(error.into())),
+                Err(error) => return Some(Err(error.into())),
             }
         }
         if writes.is_empty() {
@@ -474,70 +390,45 @@ impl PutObjectOperation {
             if self.plain.is_none() || deletes.is_empty() {
                 return None;
             }
-            self.state = PutObjectState::RetireIntents;
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })]);
+            return Some(self.call(PutObjectState::RetireIntents, IoCall::Delete(deletes)));
         }
-        self.state = PutObjectState::WritePlainRecords;
-        Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        Some(self.call(PutObjectState::WritePlainRecords, IoCall::Write(writes)))
     }
 
-    pub(super) fn readers_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let path = self
-            .get_written_location()
-            .map(|written| written.backend_path.clone());
+    pub(super) fn readers_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> Turn {
+        let path = (self.get_written_location()).map(|written| written.backend_path.clone());
         let (Some(plain), Some(path)) = (self.plain.as_mut(), path) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
         let target = (plain.target.import_id, &plain.target.backend, path.as_str());
-        match self.readers.read(event, target) {
-            Ok(Some(readers)) => {
+        let read = self.readers.read_page(page, target);
+        match read.map_err(|_| PutObjectError::InvalidOperationState)? {
+            Some(readers) => {
                 plain.target.shared = readers;
-                self.write_cleanup_row(txn_id)
+                self.write_cleanup_row()
             }
-            Ok(None) => smallvec![self.readers.page(self.config.group_id, Some(txn_id))],
-            Err(_) => self.emit_error(PutObjectError::InvalidOperationState),
+            None => {
+                let page = self.readers.page_call(self.config.group_id);
+                Ok(Next::Call(page))
+            }
         }
     }
 
-    pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        // Only the answer to the read that was sent counts.
+    pub(super) fn import_rule_read(&mut self, values: Vec<Option<Value>>) -> Turn {
         let guards = self.fence_guards();
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if guards.is_empty() => {
-                self.rule_exists = Some(value.is_some());
-                self.write_cleanup_row(txn_id)
-            }
-            Event::Storage(StorageEvent::BatchReadResult { values }) if !guards.is_empty() => {
-                let Some(((_, rule), seen)) = values.split_first() else {
-                    return self.emit_error(PutObjectError::InvalidOperationState);
-                };
-                let expected = guards.iter().map(|(_, _, value)| value);
-                if seen.len() != guards.len() || !seen.iter().map(|(_, v)| v).eq(expected) {
-                    // Another rule recorded the written path, so the file there is its own.
-                    let error = match self.import_rows.is_some() {
-                        true => PutObjectError::HeadChanged,
-                        false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
-                    };
-                    return self.emit_error(error);
-                }
-                self.rule_exists = Some(rule.is_some());
-                self.write_cleanup_row(txn_id)
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        let Some((rule, seen)) = values.split_first() else {
+            return Err(PutObjectError::InvalidOperationState);
+        };
+        let expected = guards.iter().map(|(_, _, value)| value);
+        if seen.len() != guards.len() || !seen.iter().eq(expected) {
+            // Another rule recorded the written path, so the file there is its own.
+            return Err(match self.import_rows.is_some() {
+                true => PutObjectError::HeadChanged,
+                false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
+            });
         }
+        self.rule_exists = Some(rule.is_some());
+        self.write_cleanup_row()
     }
 }
 
@@ -686,9 +577,9 @@ pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::fence_done;
-    use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
-    use aruna_core::stream::BackendStream;
+    use crate::s3::object::put::test::{asked, event, read_spaces, values, written};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE};
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
     use aruna_core::structs::storage::blob::BackendRef;
@@ -703,14 +594,14 @@ mod tests {
         Ulid::from_bytes([5u8; 16])
     }
 
-    fn operation(pattern: &str) -> PutObjectOperation {
-        let rule = BackendImport {
-            import_id: Ulid::from_bytes([4u8; 16]),
+    fn rule(import_id: Ulid, bucket: &str, key_prefix: &str, pattern: &str) -> BackendImport {
+        BackendImport {
+            import_id,
             group_id: Ulid::from_parts(2, 2),
             backend_id: backend_id(),
             backend_prefix: "raw/".to_string(),
-            bucket: "bucket".to_string(),
-            key_prefix: "in/".to_string(),
+            bucket: bucket.to_string(),
+            key_prefix: key_prefix.to_string(),
             schedule: None,
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -720,7 +611,11 @@ mod tests {
             write_backend_id: None,
             write_prefix: None,
             write_pattern: pattern.to_string(),
-        };
+        }
+    }
+
+    fn operation(pattern: &str) -> PutObjectOperation {
+        let rule = rule(Ulid::from_bytes([4u8; 16]), "bucket", "in/", pattern);
         let catalog = BackendCatalog::new("default").with_backend("default", None);
         let routing = RoutingSnapshot::new(Ulid::from_parts(2, 2), catalog).with_group_inputs(
             GroupRoutingInputs {
@@ -754,39 +649,31 @@ mod tests {
         })
     }
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        values(vec![value.map(Into::into)])
+    }
+
+    fn fenced(result: Result<Fenced, StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
     /// Runs the gate reads of a bucket without policies, fence or encryption.
-    /// Starts the write up to the intent rows its transaction writes after reading the rule.
-    fn begin(operation: &mut PutObjectOperation) -> Effects {
-        operation.start();
-        operation.step(read(None));
-        operation.step(read(None));
-        let effects = operation.step(read(None));
-        past_fence(operation, effects)
+    fn begin(operation: &mut PutObjectOperation) -> Turn {
+        operation.first().unwrap();
+        operation.next(row(None)).unwrap();
+        operation.next(row(None)).unwrap();
+        operation.next(row(None))
     }
 
-    /// Answers the transaction and rule read of a fenced intent write, up to its rows.
-    fn past_fence(operation: &mut PutObjectOperation, effects: Effects) -> Effects {
-        let [Effect::Storage(StorageEffect::StartTransaction { .. })] = effects.as_slice() else {
-            return effects;
-        };
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_parts(77, 7),
-        }));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the rule read, got {effects:?}")
-        };
-        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-        operation.step(read(Some(vec![1])))
+    /// Answers the stored intent and its sync; the write waits for both.
+    fn past_intent(operation: &mut PutObjectOperation) -> Turn {
+        assert_eq!(operation.state, PutObjectState::WriteIntent);
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))), "{turn:?}");
+        operation.next(IoResult::Done)
     }
 
-    fn written(path: String, ulid: Ulid) -> BackendLocation {
+    fn written_at(path: String, ulid: Ulid) -> BackendLocation {
         BackendLocation {
             backend: BackendRef::Group(backend_id()),
             storage_class: None,
@@ -800,10 +687,14 @@ mod tests {
             staging: false,
             partial: false,
             blob_size: 3,
-            hashes: HashMap::from([(
-                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-                vec![7u8; 32],
-            )]),
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![7u8; 32])]),
+        }
+    }
+
+    fn plain_write(turn: &Turn) -> &PlainPath {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::WritePlain { plain, .. }) => plain,
+            other => panic!("expected a plain write, got {other:?}"),
         }
     }
 
@@ -811,217 +702,116 @@ mod tests {
     fn mapped_needs_path() {
         let mapped = |key: &str| {
             let mut operation = operation("{dir}{name}");
-            let rule = &mut operation.config.routing.imports[0];
-            rule.key_prefix = String::new();
+            operation.config.routing.imports[0].key_prefix = String::new();
             operation.config.request.key = key.to_string();
-            let effects = begin(&mut operation);
-            (operation, effects)
+            let turn = begin(&mut operation);
+            (operation, turn)
         };
         let (mut operation, _) = mapped("data/a.csv");
         // The same-name write first looks at the exact key in the provider bucket.
-        let effects = operation.step(read(None));
-        let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
-            panic!("expected a plain path, got {effects:?}")
+        let turn = operation.next(row(None));
+        let Effect::Blob(BlobEffect::StatPlain { path, .. }) = asked(&turn) else {
+            panic!("expected a plain path, got {turn:?}")
         };
         assert_eq!(path, "raw/data/a.csv");
         // A folder key is written at its exact key, without looking first.
         let (mut operation, _) = mapped("reports/");
-        let effects = past_intent(&mut operation);
-        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
-            panic!("expected a folder write, got {effects:?}")
-        };
-        assert_eq!(plain.path, "raw/reports/");
+        let turn = past_intent(&mut operation);
+        assert_eq!(plain_write(&turn).path, "raw/reports/");
         // Keys without a plain path are refused before any byte is written.
         for key in ["reports//a.csv", "reports//"] {
-            let (operation, effects) = mapped(key);
-            assert!(effects.is_empty(), "{key}: {effects:?}");
-            assert!(
-                matches!(operation.finalize(), Err(PutObjectError::Unmapped)),
-                "{key}"
-            );
+            let (_, turn) = mapped(key);
+            assert_eq!(turn.err(), Some(PutObjectError::Unmapped), "{key}");
         }
-    }
-
-    /// Answers the intent write and its sync; the write waits for both.
-    fn past_intent(operation: &mut PutObjectOperation) -> Effects {
-        if operation.fence.as_ref().is_some_and(FencedWrite::starting) {
-            let effects = smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
-            past_fence(operation, effects);
-        }
-        let effects = fence_done(operation);
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::SyncAll)]
-            ),
-            "expected the intent sync, got {effects:?}"
-        );
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished))
     }
 
     /// The version transaction's records, after the scan of the rules that read the path
     /// finds `readers`.
-    fn records(operation: &mut PutObjectOperation, readers: &[BackendImport]) -> Option<Effects> {
-        let effects = operation.plain_records(Ulid::nil())?;
-        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
-            return Some(effects);
+    fn records(operation: &mut PutObjectOperation, readers: &[BackendImport]) -> Option<Turn> {
+        let turn = operation.plain_records()?;
+        let Ok(Next::Call(IoCall::Page { space, .. })) = &turn else {
+            return Some(turn);
         };
-        if key_space != BACKEND_IMPORT_KEYSPACE {
-            return Some(effects);
+        if space != BACKEND_IMPORT_KEYSPACE {
+            return Some(turn);
         }
-        operation.txn_id = Some(Ulid::nil());
-        let values = readers
+        let rows = readers
             .iter()
             .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
             .collect();
-        Some(operation.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        })))
+        Some(operation.next(IoResult::Page { rows, next: None }))
     }
 
     /// Another rule that reads the folder, created after the write was routed.
     fn reader() -> BackendImport {
-        BackendImport {
-            import_id: Ulid::from_parts(9, 9),
-            group_id: Ulid::from_parts(2, 2),
-            backend_id: backend_id(),
-            backend_prefix: "raw/".to_string(),
-            bucket: "other".to_string(),
-            key_prefix: String::new(),
-            schedule: None,
-            created_by: UserId::default(),
-            created_at: SystemTime::UNIX_EPOCH,
-            updated_at: SystemTime::UNIX_EPOCH,
-            last_job: None,
-            last_started_ms: None,
-            write_backend_id: None,
-            write_prefix: None,
-            write_pattern: DEFAULT_PATTERN.to_string(),
-        }
+        rule(Ulid::from_parts(9, 9), "other", "", DEFAULT_PATTERN)
     }
 
     #[test]
     fn keeps_shared_path() {
         // Another rule of the folder recorded the written path: the version is refused.
         let mut put = operation(DEFAULT_PATTERN);
-        begin(&mut put);
+        begin(&mut put).unwrap();
         let id = put.version_id.unwrap();
         // The rule that reads the folder is found in the version transaction.
         let other = reader().import_id;
         let path = format!("raw/x/one.csv~{id}");
-        put.written_location = Some(written(path.clone(), id));
-        put.output = Some(Ok(written(path.clone(), id)));
-        let effects = records(&mut put, &[reader()]).unwrap();
-        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-            panic!("expected the fence read, got {effects:?}")
+        put.written_location = Some(written_at(path.clone(), id));
+        put.output = Some(written_at(path.clone(), id));
+        let turn = records(&mut put, &[reader()]).unwrap();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the fence read, got {turn:?}")
         };
         assert_eq!(reads[1].1, object_key(other, &path));
-        put.txn_id = Some(Ulid::nil());
-        let rows = vec![
-            (Key::from(Vec::new()), Some(Value::from(vec![1]))),
-            (Key::from(Vec::new()), Some(Value::from(vec![1]))),
-        ];
-        put.import_rule_read(Event::Storage(StorageEvent::BatchReadResult {
-            values: rows,
-        }));
-        let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
-        assert!(matches!(&put.output, Some(Err(error)) if *error == taken));
-
-        // A single read answer does not count for the batch that was sent.
-        let mut early = operation(DEFAULT_PATTERN);
-        begin(&mut early);
-        if let Some(plain) = early.plain.as_mut() {
-            plain.target.shared = vec![other];
-        }
-        early.written_location = Some(written(path, id));
-        early.txn_id = Some(Ulid::nil());
-        early.import_rule_read(read(None));
-        let invalid = PutObjectError::InvalidOperationState;
-        assert!(matches!(&early.output, Some(Err(error)) if *error == invalid));
+        let turn = put.import_rule_read(vec![Some(vec![1].into()), Some(vec![1].into())]);
+        assert_eq!(
+            turn.err(),
+            Some(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+        );
     }
 
     #[test]
     fn orders_intent_acks() {
-        // A sync answer before the intent write, or a second write answer, is refused.
-        let aborted = || {
-            Event::Storage(StorageEvent::TransactionAborted {
-                txn_id: Ulid::from_parts(77, 7),
-            })
-        };
-        let mut early = operation(DEFAULT_PATTERN);
-        begin(&mut early);
-        early.step(Event::Storage(StorageEvent::SyncAllFinished));
-        early.step(aborted());
-        let error = early.finalize().unwrap_err();
-        assert_eq!(error, PutObjectError::InvalidOperationState);
-        let mut twice = operation(DEFAULT_PATTERN);
-        begin(&mut twice);
-        let ack = || {
-            Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            })
-        };
-        twice.step(ack());
-        let effects = twice.step(ack());
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Blob(_)))
-        );
-        twice.step(aborted());
-        let error = twice.finalize().unwrap_err();
-        assert_eq!(error, PutObjectError::InvalidOperationState);
+        // The write waits for the stored intent and then its sync, each answered once.
+        let mut operation = operation(DEFAULT_PATTERN);
+        begin(&mut operation).unwrap();
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        assert_eq!(operation.state, PutObjectState::SyncIntent);
+        let turn = operation.next(IoResult::Done);
+        plain_write(&turn);
+        assert_eq!(operation.state, PutObjectState::WriteBlob);
     }
 
     #[test]
     fn writes_unique_path() {
         let mut operation = operation(DEFAULT_PATTERN);
-        let effects = begin(&mut operation);
+        let turn = begin(&mut operation);
 
         // The identity of the write is stored before any byte moves.
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let id = operation.version_id.expect("the path names the version");
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
-        else {
-            panic!("expected the write intent, got {effects:?}")
-        };
-        let [(key_space, key, value)] = writes.as_slice() else {
-            panic!("a unique path gets one intent, got {writes:?}")
-        };
         let path = format!("raw/x/one.csv~{id}");
-        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
-        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
-        // The rows go in the transaction that read the rule.
-        assert!(txn_id.is_some());
-        let intent = WriteIntent::from_bytes(value).unwrap();
         assert_eq!(
-            (intent.key.as_str(), intent.version_id),
-            ("in/x/one.csv", id)
+            operation.written_intent,
+            [intent_key(Ulid::from_bytes([4u8; 16]), &path, id)],
+            "a unique path gets one intent"
         );
-        assert_eq!(intent.backend, BackendRef::Group(backend_id()));
-        let effects = past_intent(&mut operation);
-        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
-            panic!("expected a plain write, got {effects:?}")
-        };
+        let turn = past_intent(&mut operation);
+        let plain = plain_write(&turn);
         assert_eq!(plain.path, path);
         assert_eq!(plain.ulid, id);
         assert!(!plain.if_not_exists);
 
         // A failed write leaves the tenant path alone.
-        operation.step(Event::Blob(BlobEvent::PlainWritten {
-            location: written(plain.path.clone(), id),
+        let written = BlobEvent::PlainWritten {
+            location: written_at(plain.path.clone(), id),
             version: None,
             etag: None,
-        }));
-        let effects = operation.abort();
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Delete { .. }))),
-            "{effects:?}"
-        );
+        };
+        operation.next(event(Event::Blob(written))).unwrap();
+        operation.state = PutObjectState::Error;
+        assert!(operation.abort().is_empty());
     }
 
     #[test]
@@ -1034,79 +824,46 @@ mod tests {
                     Key::from(vec![1u8]),
                     Some(Value::from(vec![2u8])),
                 )]);
-            operation.txn_id = Some(Ulid::nil());
-            let Some(effects) = records(&mut operation, &[]) else {
-                panic!("expected the guarded rule read")
-            };
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
-                panic!("expected one batch read, got {effects:?}")
-            };
-            assert_eq!(reads.len(), 2);
-            operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (Key::from(vec![0u8]), Some(Value::from(vec![0u8]))),
-                    (Key::from(vec![1u8]), found.map(Value::from)),
-                ],
-            }));
-            operation
+            let turn = records(&mut operation, &[]).expect("the guarded rule read");
+            assert_eq!(read_spaces(&turn).len(), 2);
+            let turn = operation
+                .import_rule_read(vec![Some(Value::from(vec![0u8])), found.map(Value::from)]);
+            (operation, turn)
         };
         // A row that changed since the import read it refuses the write.
-        let changed = guarded(Some(vec![3u8]));
-        assert!(matches!(
-            changed.output,
-            Some(Err(PutObjectError::HeadChanged))
-        ));
-        assert!(matches!(
-            guarded(None).output,
-            Some(Err(PutObjectError::HeadChanged))
-        ));
-        let kept = guarded(Some(vec![2u8]));
+        let (_, turn) = guarded(Some(vec![3u8]));
+        assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
+        let (_, turn) = guarded(None);
+        assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
+        let (kept, turn) = guarded(Some(vec![2u8]));
         assert_eq!(kept.rule_exists, Some(true));
-        assert!(!matches!(
-            kept.output,
-            Some(Err(PutObjectError::HeadChanged))
-        ));
+        assert_ne!(turn.err(), Some(PutObjectError::HeadChanged));
     }
 
     #[test]
     fn checks_delete_trail() {
-        use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
         use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
         let id = Ulid::from_parts(1_000, 1);
         let checked = |kind: BlobAuditKind, head: bool| {
             let mut operation = operation(DEFAULT_PATTERN)
                 .with_import_rows(Ulid::from_bytes([4u8; 16]), Vec::new())
                 .with_trail_check(id);
-            operation.txn_id = Some(Ulid::nil());
             operation.rule_exists = Some(true);
             if head {
                 operation.existing_pointer = Some(CurrentVersionPointer::new(Ulid::nil()));
             }
-            // The trail is read in the version transaction, so a later delete conflicts.
-            let Some(effects) = records(&mut operation, &[]) else {
-                panic!("expected the trail read")
+            // The trail is read in the version transaction, so a later delete conflicts. The
+            // bucket's creation row comes first and names the incarnation.
+            let turn = records(&mut operation, &[]).expect("the trail read");
+            assert_eq!(
+                read_spaces(&turn),
+                [aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE]
+            );
+            let turn = operation.next(row(None));
+            let Ok(Next::Call(IoCall::Page { space, .. })) = turn else {
+                panic!("expected one trail page, got {turn:?}")
             };
-            // The bucket's creation row comes first and names the incarnation.
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the creation read, got {effects:?}")
-            };
-            assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
-            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::new().into(),
-                value: None,
-            }));
-            let [
-                Effect::Storage(StorageEffect::Iter {
-                    key_space, txn_id, ..
-                }),
-            ] = effects.as_slice()
-            else {
-                panic!("expected one trail page, got {effects:?}")
-            };
-            assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
-            assert_eq!(*txn_id, Some(Ulid::nil()));
+            assert_eq!(space, DELETE_TRAIL_KEYSPACE);
             let record = BlobAuditRecord {
                 realm_id: RealmId::from_bytes([1; 32]),
                 group_id: operation.config.group_id,
@@ -1118,27 +875,24 @@ mod tests {
                 version_id: Some(Ulid::nil()),
                 occurred_at_ms: 2_000,
             };
-            let value = Value::from(record.to_bytes().unwrap());
-            let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![(Key::from(vec![1u8]), value)],
-                next_start_after: None,
-            }));
+            let rows = vec![(
+                Key::from(vec![1u8]),
+                Value::from(record.to_bytes().unwrap()),
+            )];
+            let turn = operation.next(IoResult::Page { rows, next: None });
             // The purges of the group are the second range, read in the same transaction.
-            let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
-                panic!("expected the purge range, got {effects:?}")
+            let Ok(Next::Call(IoCall::Page { prefix, .. })) = turn else {
+                panic!("expected the purge range, got {turn:?}")
             };
             let purges = aruna_core::structs::storage::delete_audit::purge_prefix;
             let group = operation.config.group_id;
-            assert_eq!(*prefix, Some(purges(group, "bucket", 0).into()));
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            }));
-            operation.output
+            assert_eq!(prefix, Key::from(purges(group, "bucket", 0)));
+            operation.next(IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            })
         };
-        let deleted = |output: &Option<Result<_, PutObjectError>>| {
-            matches!(output, Some(Err(PutObjectError::HistoryDeleted)))
-        };
+        let deleted = |turn: &Turn| matches!(turn, Err(PutObjectError::HistoryDeleted));
         // A key whose head was deleted on purpose gets no version back.
         assert!(deleted(&checked(BlobAuditKind::DeleteMarker, false)));
         // Below a current head older history may join.
@@ -1149,34 +903,23 @@ mod tests {
     fn records_own_write() {
         let records = |rule: bool, deduplicated: bool| {
             let mut operation = operation("{dir}{name}");
-            begin(&mut operation);
+            begin(&mut operation).unwrap();
             let id = operation.version_id.unwrap();
-            let location = written("raw/x/one.csv".to_string(), id);
+            let location = written_at("raw/x/one.csv".to_string(), id);
             operation.written_location = Some(location.clone());
-            let output = match deduplicated {
+            operation.output = Some(match deduplicated {
                 // An identical earlier upload to the same name keeps its own location.
-                true => written("raw/x/one.csv".to_string(), Ulid::from_parts(3, 3)),
+                true => written_at("raw/x/one.csv".to_string(), Ulid::from_parts(3, 3)),
                 false => location,
-            };
-            operation.output = Some(Ok(output));
+            });
             let plain = operation.plain.as_mut().unwrap();
             (plain.version, plain.etag) = (Some("v1".to_string()), Some("\"e1\"".to_string()));
-            operation.txn_id = Some(Ulid::nil());
 
             // The import row needs the rule, read in the version transaction.
-            let Some(effects) = records(&mut operation, &[]) else {
-                panic!("expected the rule read")
-            };
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BACKEND_IMPORT_KEYSPACE
-            ));
-            let effects = operation.step(read(rule.then(|| vec![0u8])));
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected one batch write, got {effects:?}")
-            };
-            (id, writes.clone())
+            let turn = records(&mut operation, &[]).expect("the rule read");
+            assert_eq!(read_spaces(&turn), [BACKEND_IMPORT_KEYSPACE]);
+            let turn = operation.next(row(rule.then(|| vec![0u8])));
+            (id, written(&turn).to_vec())
         };
 
         let (id, writes) = records(true, false);
@@ -1222,132 +965,79 @@ mod tests {
     #[test]
     fn retires_own_intent() {
         let mut put = operation("{dir}{name}");
-        begin(&mut put);
+        begin(&mut put).unwrap();
         let id = put.version_id.unwrap();
-        let location = written("raw/x/one.csv".to_string(), id);
+        let location = written_at("raw/x/one.csv".to_string(), id);
         put.written_location = Some(location.clone());
-        put.output = Some(Ok(location));
-        put.txn_id = Some(Ulid::nil());
+        put.output = Some(location);
         let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
         put.written_intent = keys.clone();
-        records(&mut put, &[]);
-        put.step(read(Some(vec![0u8])));
+        records(&mut put, &[]).unwrap().unwrap();
+        put.next(row(Some(vec![0u8]))).unwrap();
 
         // The committed version makes its intent obsolete in the same transaction.
-        let effects = put.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
-        else {
-            panic!("expected the intent delete, got {effects:?}")
+        let turn = put.next(IoResult::Done);
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
         };
         // Both paths the write could have taken lose their intent.
         let space = IMPORT_INTENT_KEYSPACE.to_string();
         let expected: Vec<_> = keys.into_iter().map(|key| (space.clone(), key)).collect();
-        assert_eq!(*deletes, expected);
-        assert_eq!(*txn_id, Some(Ulid::nil()));
-        // A second write answer is not what the delete waits for.
-        let mut stray = operation(DEFAULT_PATTERN);
-        stray.state = PutObjectState::RetireIntents;
-        stray.txn_id = Some(Ulid::nil());
-        stray.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            stray.output,
-            Some(Err(PutObjectError::InvalidOperationState))
-        ));
-        let effects = put.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
+        assert_eq!(deletes, expected);
+        let turn = put.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Then { .. })), "{turn:?}");
     }
 
     #[test]
     fn fences_import_rows() {
         let import_id = Ulid::from_bytes([4u8; 16]);
-        let row = (
+        let row_written = (
             IMPORTED_OBJECT_KEYSPACE.to_string(),
             Key::from(vec![1u8]),
             Value::from(vec![2u8]),
         );
         let fenced = |exists: bool| {
             let mut operation =
-                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![row.clone()]);
-            operation.txn_id = Some(Ulid::nil());
-            let effects = records(&mut operation, &[]).expect("a rule read");
-            let [
-                Effect::Storage(StorageEffect::Read {
-                    key_space,
-                    key,
-                    txn_id,
-                    ..
-                }),
-            ] = effects.as_slice()
-            else {
-                panic!("expected the rule read, got {effects:?}")
+                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![row_written.clone()]);
+            let turn = records(&mut operation, &[]).expect("a rule read");
+            let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+                panic!("expected the rule read, got {turn:?}")
             };
-            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-            assert_eq!(*key, import_key(Ulid::from_parts(2, 2), import_id));
-            assert_eq!(*txn_id, Some(Ulid::nil()));
-            let value = exists.then(|| vec![0u8]);
-            let effects = operation.step(read(value));
-            (operation, effects)
+            assert_eq!(reads[0].0, BACKEND_IMPORT_KEYSPACE);
+            assert_eq!(reads[0].1, import_key(Ulid::from_parts(2, 2), import_id));
+            operation.next(row(exists.then(|| vec![0u8])))
         };
 
-        let (_, effects) = fenced(true);
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the rows, got {effects:?}")
-        };
-        assert_eq!(writes, &vec![row.clone()]);
-
+        let turn = fenced(true);
+        assert_eq!(written(&turn), [row_written.clone()]);
         // A removed rule refuses the version, so no row outlives it.
-        let (operation, effects) = fenced(false);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(
-            operation.finalize().unwrap_err(),
-            PutObjectError::ImportRemoved
-        );
+        assert_eq!(fenced(false).err(), Some(PutObjectError::ImportRemoved));
     }
 
     #[test]
     fn drops_deduplicated_version() {
-        let version_row = (
+        let version_written = (
             BACKEND_VERSION_KEYSPACE.to_string(),
             version_key(Ulid::from_parts(5, 5)),
             Value::from(b"v1".to_vec()),
         );
         let rows = |committed: Ulid| {
             let import_id = Ulid::from_bytes([4u8; 16]);
-            let mut operation =
-                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![version_row.clone()]);
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(import_id, vec![version_written.clone()]);
             operation.written_location =
-                Some(written("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
-            operation.output = Some(Ok(written("raw/a.csv".to_string(), committed)));
-            operation.txn_id = Some(Ulid::nil());
-            records(&mut operation, &[]).expect("a rule read");
-            operation.step(read(Some(vec![0u8])))
+                Some(written_at("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
+            operation.output = Some(written_at("raw/a.csv".to_string(), committed));
+            records(&mut operation, &[]).expect("a rule read").unwrap();
+            operation.next(row(Some(vec![0u8])))
         };
 
-        let effects = rows(Ulid::from_parts(5, 5));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the version row, got {effects:?}")
-        };
-        assert_eq!(writes, &vec![version_row.clone()]);
+        let turn = rows(Ulid::from_parts(5, 5));
+        assert_eq!(written(&turn), [version_written.clone()]);
         // Dedup keeps an older location, so the new one gets no version row.
-        let effects = rows(Ulid::from_parts(6, 6));
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::BatchWrite { .. }))),
-            "{effects:?}"
-        );
+        let turn = rows(Ulid::from_parts(6, 6));
+        let mut versions = written(&turn).iter();
+        assert!(versions.all(|(space, ..)| space != BACKEND_VERSION_KEYSPACE));
     }
 
     #[test]
@@ -1362,21 +1052,18 @@ mod tests {
         };
         let lookup = |expected: Option<Ulid>, found: Option<Vec<u8>>| {
             let mut operation = operation(DEFAULT_PATTERN).with_expected_head(expected);
-            operation.txn_id = Some(Ulid::nil());
+            operation.output = Some(written_at("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
             operation.state = PutObjectState::ReadObjectLookup;
-            let effects = operation.step(read(found));
-            (operation, effects)
+            operation.next(row(found))
         };
 
-        let (_, effects) = lookup(Some(head), pointer(head));
+        assert_eq!(
+            read_spaces(&lookup(Some(head), pointer(head))),
+            [BLOB_VERSIONS_KEYSPACE]
+        );
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
-        let (_, effects) = lookup(None, None);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
+            lookup(None, None),
+            Ok(Next::Call(IoCall::Write(_)))
         ));
 
         // A write or a delete marker since the caller looked keeps the key.
@@ -1385,15 +1072,8 @@ mod tests {
             (None, pointer(head)),
             (Some(head), None),
         ] {
-            let (operation, effects) = lookup(expected, found);
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert_eq!(
-                operation.finalize().unwrap_err(),
-                PutObjectError::HeadChanged
-            );
+            let turn = lookup(expected, found);
+            assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
         }
     }
 
@@ -1422,20 +1102,21 @@ mod tests {
     }
 
     /// Runs the gates and the read of the rule's record at the path, answered with `row`.
-    fn owner_answered(operation: &mut PutObjectOperation, row: Option<&str>) -> Effects {
-        let effects = begin(operation);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == IMPORTED_OBJECT_KEYSPACE
-        ));
-        let row = row.map(|key| {
+    fn owner_answered(operation: &mut PutObjectOperation, owner: Option<&str>) -> Turn {
+        let turn = begin(operation);
+        assert_eq!(read_spaces(&turn), [IMPORTED_OBJECT_KEYSPACE]);
+        let owner = owner.map(|key| {
             let id = Ulid::from_parts(8, 8);
             ImportedObject::written(id, key.to_string(), 3, None)
                 .to_bytes()
                 .unwrap()
         });
-        operation.step(read(row))
+        operation.next(row(owner))
+    }
+
+    fn stat(exists: bool, version: Option<&str>) -> IoResult {
+        let version = version.map(str::to_string);
+        event(Event::Blob(BlobEvent::PlainStat { exists, version }))
     }
 
     #[test]
@@ -1449,8 +1130,8 @@ mod tests {
         };
         let row = ImportedObject::new(Ulid::from_parts(8, 8), &listed);
         assert_eq!(row.key, None);
-        let event = read(Some(row.to_bytes().unwrap()));
-        assert_eq!(owns_path(event, "in/x/a.csv"), Ok(false));
+        let row = row.to_bytes().unwrap();
+        assert_eq!(path_owned(Some(&row), "in/x/a.csv"), Ok(false));
     }
 
     #[test]
@@ -1461,18 +1142,13 @@ mod tests {
             (Some("other/one.csv"), true),
             (None, true),
         ];
-        for (row, tagged) in cases {
+        for (owner, tagged) in cases {
             let mut operation = operation("{dir}{name}");
-            owner_answered(&mut operation, row);
+            owner_answered(&mut operation, owner).unwrap();
             let id = operation.version_id.unwrap();
-            operation.step(Event::Blob(BlobEvent::PlainStat {
-                exists: true,
-                version: Some("v1".to_string()),
-            }));
-            let effects = past_intent(&mut operation);
-            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
-                panic!("expected a plain write, got {effects:?}")
-            };
+            operation.next(stat(true, Some("v1"))).unwrap();
+            let turn = past_intent(&mut operation);
+            let plain = plain_write(&turn);
             let expected = match tagged {
                 true => (format!("raw/x/one.csv~{id}"), true),
                 false => ("raw/x/one.csv".to_string(), false),
@@ -1480,7 +1156,7 @@ mod tests {
             assert_eq!(
                 (plain.path.clone(), plain.if_not_exists),
                 expected,
-                "{row:?}"
+                "{owner:?}"
             );
         }
     }
@@ -1488,21 +1164,16 @@ mod tests {
     #[test]
     fn stats_same_name() {
         let mut operation = operation("{dir}{name}");
-        let effects = owner_answered(&mut operation, None);
+        let turn = owner_answered(&mut operation, None);
         let id = operation.version_id.unwrap();
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/x/one.csv"
+            asked(&turn),
+            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/x/one.csv"
         ));
 
-        operation.step(Event::Blob(BlobEvent::PlainStat {
-            exists: true,
-            version: None,
-        }));
-        let effects = past_intent(&mut operation);
-        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
-            panic!("expected a plain write, got {effects:?}")
-        };
+        operation.next(stat(true, None)).unwrap();
+        let turn = past_intent(&mut operation);
+        let plain = plain_write(&turn);
         assert_eq!(plain.path, format!("raw/x/one.csv~{id}"));
         assert!(plain.if_not_exists);
     }
@@ -1511,206 +1182,112 @@ mod tests {
     fn adopts_registered_version() {
         let found = |stored: Option<[u8; 32]>| {
             let mut put = operation("{dir}{name}");
-            begin(&mut put);
+            begin(&mut put).unwrap();
             let id = put.version_id.unwrap();
-            put.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
-            put.txn_id = Some(Ulid::nil());
+            put.output = Some(written_at("raw/x/one.csv".to_string(), id));
             // The version is read in the transaction before the head moves.
-            let effects = put.write_current_lookup(None);
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the version read, got {effects:?}")
-            };
-            assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+            let turn = put.write_current_lookup(None);
+            assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
             let version = stored.map(|hash| {
                 let version = BlobVersion::materialized(
                     hash,
                     BackendRef::Group(backend_id()),
-                    aruna_core::structs::storage::format::EncodingClass::Raw,
+                    EncodingClass::Raw,
                     SystemTime::UNIX_EPOCH,
                     UserId::default(),
                     None,
                 );
                 version.to_bytes().unwrap()
             });
-            let effects = put.step(read(version));
-            (put, effects)
+            let turn = put.next(row(version));
+            (put, turn)
         };
         // Nothing registered yet: the delete trail is read, then the head moves as usual.
         let (mut put, _) = found(None);
-        let effects = put.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
+        let turn = put.next(row(None));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE
+            turn,
+            Ok(Next::Call(IoCall::Page { ref space, .. })) if space == DELETE_TRAIL_KEYSPACE
         ));
-        let page = || {
-            Event::Storage(StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            })
+        let page = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
         };
-        put.step(page());
-        let effects = put.step(page());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, .. })] if key_space == BLOB_HEAD_KEYSPACE
-        ));
+        put.next(page()).unwrap();
+        let turn = put.next(page());
+        assert_eq!(written(&turn)[1].0, BLOB_HEAD_KEYSPACE);
         // An import registered the same bytes first: no head move and no second charge.
-        let (mut put, effects) = found(Some([7u8; 32]));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        let effects = put.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::nil(),
-        }));
-        assert!(!effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Storage(StorageEffect::Write { .. } | StorageEffect::AddUsage { .. })
-        )));
-        assert!(put.output.as_ref().is_some_and(Result::is_ok));
+        let (_, turn) = found(Some([7u8; 32]));
+        assert!(matches!(turn, Ok(Next::Then { .. })), "{turn:?}");
         // Other bytes under the same version id are a conflict.
-        let (put, _) = found(Some([8u8; 32]));
-        assert!(matches!(
-            put.output,
-            Some(Err(PutObjectError::VersionExists))
-        ));
+        let (_, turn) = found(Some([8u8; 32]));
+        assert_eq!(turn.err(), Some(PutObjectError::VersionExists));
     }
 
     #[test]
     fn records_written_hash() {
         let mut operation = operation("{dir}{name}");
-        owner_answered(&mut operation, None);
-        operation.step(Event::Blob(BlobEvent::PlainStat {
-            exists: false,
-            version: None,
-        }));
-        past_intent(&mut operation);
+        owner_answered(&mut operation, None).unwrap();
+        operation.next(stat(false, None)).unwrap();
+        past_intent(&mut operation).unwrap();
         // A backend without conditional writes put the bytes at the tagged path instead.
         let id = operation.version_id.unwrap();
         let tagged = format!("raw/x/one.csv~{id}");
-        let effects = operation.step(Event::Blob(BlobEvent::PlainWritten {
-            location: written(tagged.clone(), id),
+        let written = BlobEvent::PlainWritten {
+            location: written_at(tagged.clone(), id),
             version: None,
             etag: None,
-        }));
-        let effects = past_fence(&mut operation, effects);
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
-        else {
-            panic!("expected the written hash, got {effects:?}")
         };
-        let [(space, key, value)] = writes.as_slice() else {
-            panic!("only the reached path gets the hash, got {writes:?}")
-        };
-        assert_eq!(space.as_str(), IMPORT_INTENT_KEYSPACE);
-        assert!(txn_id.is_some());
-        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &tagged, id));
-        let intent = WriteIntent::from_bytes(value).unwrap();
-        assert_eq!(intent.written, Some([7u8; 32]));
-        // The version transaction starts only after the hash is stored with the rule read.
-        let effects = fence_done(&mut operation);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
+        let turn = operation.next(event(Event::Blob(written)));
+        // The hash is stored with a read of the rule before the version transaction starts.
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::WriteEvidence);
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::Publish);
     }
 
     #[test]
     fn stores_with_rule() {
-        // A removed rule gets no intent: the transaction that read it writes nothing.
+        // A removed rule gets no intent: the fenced write stores nothing and fails the write.
         let mut operation = operation(DEFAULT_PATTERN);
-        operation.start();
-        operation.step(read(None));
-        operation.step(read(None));
-        operation.step(read(None));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_parts(77, 7),
-        }));
-        let effects = operation.step(read(None));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_parts(77, 7),
-        }));
+        begin(&mut operation).unwrap();
+        let turn = operation.next(fenced(Ok(Fenced::RuleGone)));
         assert!(operation.written_intent.is_empty());
-        assert_eq!(
-            operation.finalize().unwrap_err(),
-            PutObjectError::ImportRemoved
-        );
-    }
-
-    #[test]
-    fn keeps_failed_drop() {
-        let mut operation = operation("{dir}{name}");
-        owner_answered(&mut operation, None);
-        operation.step(Event::Blob(BlobEvent::PlainStat {
-            exists: false,
-            version: None,
-        }));
-        past_intent(&mut operation);
-        operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
-        // An intent that could not be deleted stays unresolved; the write reports why.
-        let error = aruna_core::errors::StorageError::WriteError("disk".to_string());
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: error.clone(),
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize().unwrap_err(),
-            PutObjectError::StorageError(error)
-        );
+        assert_eq!(turn.err(), Some(PutObjectError::ImportRemoved));
     }
 
     #[test]
     fn taken_path_fails() {
         let mut operation = operation("{dir}{name}");
-        owner_answered(&mut operation, None);
-        operation.step(Event::Blob(BlobEvent::PlainStat {
-            exists: false,
-            version: None,
-        }));
-        past_intent(&mut operation);
+        owner_answered(&mut operation, None).unwrap();
+        operation.next(stat(false, None)).unwrap();
+        past_intent(&mut operation).unwrap();
 
         // Another upload took the free path first; nothing at the path is deleted.
-        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+        let taken = Event::Blob(BlobEvent::Error(BlobError::PathTaken));
+        let turn = operation.next(event(taken));
         // The refused write moved no byte, so its intent goes first.
         let id = operation.version_id.unwrap();
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
-        else {
-            panic!("expected the intent delete, got {effects:?}")
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
         };
         // A free path may go to its tagged path on a backend without conditional writes.
         let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
         assert_eq!(keys.len(), 2);
         let found: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
-        assert_eq!((found, *txn_id), (keys, None));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
+        assert_eq!(found, keys);
         // The write fails as taken only once the delete is on disk.
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::SyncAll)]
-        ));
-        assert!(!operation.is_complete());
-        let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Delete { .. }))),
-            "{effects:?}"
-        );
-        assert!(operation.is_complete());
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        let turn = operation.next(IoResult::Done);
         assert_eq!(
-            operation.finalize().unwrap_err(),
-            PutObjectError::BlobWriteFailed(BlobError::PathTaken)
+            turn.err(),
+            Some(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
         );
+        // The tenant path is never rolled back.
+        operation.state = PutObjectState::Error;
+        assert!(operation.abort().is_empty());
     }
 
     /// A write whose provider version is known, at its tagged path, before its transaction.
@@ -1726,22 +1303,18 @@ mod tests {
             etag: None,
             owned: true,
         });
-        let mut new = written("raw/x/one.csv~new".to_string(), Ulid::from_parts(5, 5));
+        let mut new = written_at("raw/x/one.csv~new".to_string(), Ulid::from_parts(5, 5));
         new.hashes.insert(HASH_BLAKE3.to_string(), vec![hash; 32]);
         operation.written_location = Some(new);
-        operation.txn_id = Some(Ulid::nil());
         operation
     }
 
     /// Answers the reads of the current version, whose file holds bytes with hash 7.
-    fn current(operation: &mut PutObjectOperation, old: &BackendLocation) -> Effects {
-        let effects = operation.start_hash_lookup();
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the head read, got {effects:?}")
-        };
-        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+    fn current(operation: &mut PutObjectOperation, old: &BackendLocation) -> Turn {
+        let turn = operation.start_hash_lookup();
+        assert_eq!(read_spaces(&turn), [BLOB_HEAD_KEYSPACE]);
         let head = CurrentVersionPointer::new(Ulid::from_parts(8, 1));
-        operation.step(read(Some(head.to_bytes().unwrap())));
+        operation.next(row(Some(head.to_bytes().unwrap()))).unwrap();
         let version = BlobVersion::materialized(
             [7; 32],
             BackendRef::Group(backend_id()),
@@ -1750,26 +1323,23 @@ mod tests {
             UserId::default(),
             None,
         );
-        operation.step(read(Some(version.to_bytes().unwrap())))
+        operation.next(row(Some(version.to_bytes().unwrap())))
     }
 
     #[test]
     fn reuses_same_file() {
-        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
         old.format.layout = StoredLayout::Plain(old.ulid);
         let mut operation = rewritten(7);
-        let effects = current(&mut operation, &old);
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the location read, got {effects:?}")
-        };
-        assert_eq!(key_space, BLOB_LOCATIONS_KEYSPACE);
-        operation.step(read(Some(old.to_bytes().unwrap())));
-        operation.step(read(Some(b"v1".to_vec())));
+        let turn = current(&mut operation, &old);
+        assert_eq!(read_spaces(&turn), [BLOB_LOCATIONS_KEYSPACE]);
+        operation.next(row(Some(old.to_bytes().unwrap()))).unwrap();
+        operation.next(row(Some(b"v1".to_vec()))).unwrap();
         // The older file's version is not being deleted, so it takes the new version.
         assert_eq!(operation.state, PutObjectState::ReadDedupClaim);
-        operation.step(read(None));
+        operation.next(row(None)).unwrap();
         // The version reads the older file; the written one is released after the commit.
-        assert_eq!(operation.output, Some(Ok(old.clone())));
+        assert_eq!(operation.output, Some(old.clone()));
         let (space, _, value) = operation.dedup_release().unwrap().unwrap();
         assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
         let work = BlobCleanupWork::from_bytes(&value).unwrap();
@@ -1791,23 +1361,19 @@ mod tests {
 
     #[test]
     fn keeps_other_bytes() {
-        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
         old.format.layout = StoredLayout::Plain(old.ulid);
         // Other bytes than the current version's go the usual way and release nothing.
         let mut operation = rewritten(8);
-        let effects = current(&mut operation, &old);
-        assert_eq!(
-            operation.state,
-            PutObjectState::CheckHashLookup,
-            "{effects:?}"
-        );
+        let turn = current(&mut operation, &old);
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup, "{turn:?}");
         assert!(operation.dedup_release().is_none());
         // Without a backend version the written file cannot go, so it is kept as well.
         let mut operation = rewritten(7);
         if let Some(plain) = operation.plain.as_mut() {
             plain.version = None;
         }
-        operation.start_hash_lookup();
+        operation.start_hash_lookup().unwrap();
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
     }
 
@@ -1815,24 +1381,20 @@ mod tests {
     fn reuses_older_version() {
         // A same-name re-upload on a versioned storage gives way to the older backend version.
         let reuse = |stored: &[u8]| {
-            let mut old = written("raw/x/one.csv~new".to_string(), Ulid::from_parts(4, 4));
+            let mut old = written_at("raw/x/one.csv~new".to_string(), Ulid::from_parts(4, 4));
             old.format.layout = StoredLayout::Plain(old.ulid);
             let mut operation = rewritten(7);
-            current(&mut operation, &old);
-            let effects = operation.step(read(Some(old.to_bytes().unwrap())));
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the backend version read, got {effects:?}")
-            };
-            assert_eq!(key_space, BACKEND_VERSION_KEYSPACE);
-            operation.step(read(Some(stored.to_vec())));
+            current(&mut operation, &old).unwrap();
+            let turn = operation.next(row(Some(old.to_bytes().unwrap())));
+            assert_eq!(read_spaces(&turn), [BACKEND_VERSION_KEYSPACE]);
+            operation.next(row(Some(stored.to_vec()))).unwrap();
             if operation.state == PutObjectState::ReadDedupClaim {
-                operation.step(read(None));
+                operation.next(row(None)).unwrap();
             }
             (operation, old)
         };
         let (operation, old) = reuse(b"v1");
-        assert_eq!(operation.output, Some(Ok(old)));
+        assert_eq!(operation.output, Some(old));
         assert!(operation.dedup_release().is_some());
         // The same backend version is the same file; nothing is released.
         let (operation, _) = reuse(b"v2");
@@ -1843,13 +1405,13 @@ mod tests {
     #[test]
     fn skips_claimed_file() {
         // A backend version a release is deleting takes no new reader.
-        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
         old.format.layout = StoredLayout::Plain(old.ulid);
         let mut operation = rewritten(7);
-        current(&mut operation, &old);
-        operation.step(read(Some(old.to_bytes().unwrap())));
-        operation.step(read(Some(b"v1".to_vec())));
-        operation.step(read(Some(Vec::new())));
+        current(&mut operation, &old).unwrap();
+        operation.next(row(Some(old.to_bytes().unwrap()))).unwrap();
+        operation.next(row(Some(b"v1".to_vec()))).unwrap();
+        operation.next(row(Some(Vec::new()))).unwrap();
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
         assert!(operation.dedup_release().is_none());
     }

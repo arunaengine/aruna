@@ -72,20 +72,20 @@ pub struct BlobDrainResult {
 }
 
 pub(super) struct BlobJobScan {
-    jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    pub(super) jobs: Vec<(Vec<u8>, BlobJobRecord)>,
     /// The generation the scan started in.
     generation: u64,
-    has_more_due: bool,
+    pub(super) has_more_due: bool,
     next_due_ms: Option<u64>,
-    next_cursor: ReplicationScanCursor,
+    pub(super) next_cursor: ReplicationScanCursor,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ReplicationScanCursor {
-    generation: u64,
-    after: Option<Vec<u8>>,
+    pub(super) generation: u64,
+    pub(super) after: Option<Vec<u8>>,
     #[serde(rename = "next_due_at_ms")]
-    next_due_ms: Option<u64>,
+    pub(super) next_due_ms: Option<u64>,
 }
 
 pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandle) {

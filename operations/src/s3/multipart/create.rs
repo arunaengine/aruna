@@ -762,7 +762,7 @@ mod pure_tests {
     use aruna_core::keyspaces::{
         ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, PURGE_FENCE_KEYSPACE,
     };
-    use aruna_core::operation::{Operation, SubOperation};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_core::structs::storage::abe::ObjectEnvelope;
     use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path};

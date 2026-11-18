@@ -8,6 +8,7 @@ pub mod finalize;
 pub mod input_view;
 pub mod prepare;
 pub mod purge;
+mod purge_audit;
 pub mod reconcile;
 pub mod recovery;
 pub mod run_crate;

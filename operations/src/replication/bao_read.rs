@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -48,7 +48,7 @@ use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
 use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
 };
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::ensure_realm_peer;
@@ -377,7 +377,6 @@ pub struct IncomingBaoOperation {
     version_key: Option<VersionKey>,
     version_refs: Vec<PlacementPolicyRef>,
     pending_location: Option<BackendLocation>,
-    gate: Option<PolicyGateOperation>,
     /// The requesting peer's placement as this realm records it. The challenge
     /// is decided against it, never against the subject the peer asserts.
     peer_placement: Option<NodePlacementEntry>,
@@ -439,7 +438,6 @@ impl IncomingBaoOperation {
             version_key: None,
             version_refs: Vec::new(),
             pending_location: None,
-            gate: None,
             peer_placement: None,
             local_owner: None,
             peer_is_infra: false,
@@ -1412,26 +1410,24 @@ impl IncomingBaoOperation {
         // can check who owns it; here the subject decides.
         match write_gate(Some(&context), &self.version_refs, None) {
             Ok(None) => self.send_accepted(location),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
+            Ok(Some(gate)) => {
                 self.state = IncomingBaoState::PolicyChallenge;
-                match complete {
-                    true => self.finish_challenge(),
-                    false => effects,
-                }
+                let child =
+                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
+                smallvec![Effect::SubOperation(child)]
             }
             Err(_) => self.send_denied(Vec::new()),
         }
     }
 
-    fn finish_challenge(&mut self) -> Effects {
-        let (Some(gate), Some(location)) = (self.gate.take(), self.pending_location.clone()) else {
+    fn finish_challenge(&mut self, outcome: ChildOutcome) -> Effects {
+        let Some(location) = self.pending_location.clone() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
-        let decision = gate
-            .finalize()
+        let Some(outcome) = outcome.take::<PolicyGateOutcome, ReadPolicyError>() else {
+            return self.send_denied(Vec::new());
+        };
+        let decision = outcome
             .map_err(PolicyGateError::from)
             .and_then(gate_decision);
         match decision {
@@ -1527,16 +1523,10 @@ impl EffectOperation for IncomingBaoOperation {
             IncomingBaoState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoState::ReadLocation => self.handle_location(event),
             IncomingBaoState::CheckManagedCopy => self.handle_managed_copy(event),
-            IncomingBaoState::PolicyChallenge => {
-                let Some(gate) = self.gate.as_mut() else {
-                    return self.unexpected(event);
-                };
-                let effects = gate.step(event);
-                match gate.is_complete() {
-                    true => self.finish_challenge(),
-                    false => effects,
-                }
-            }
+            IncomingBaoState::PolicyChallenge => match event {
+                Event::Child(outcome) => self.finish_challenge(outcome),
+                other => self.unexpected(other),
+            },
             IncomingBaoState::ReadContentSettings => self.content_settings_read(event),
             IncomingBaoState::AdmitSealed => self.handle_admission(event),
             IncomingBaoState::SendAccepted => {
@@ -2179,10 +2169,7 @@ mod pure_tests {
         // The honest claim resolves the rule instead of being refused outright.
         operation.request.destination = Some(storage_subject(&entry, 4));
         let effects = operation.challenge_destination(location);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 
     fn device_realm_value(peer: aruna_core::NodeId, owner: UserId) -> byteview::ByteView {

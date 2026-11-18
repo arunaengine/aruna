@@ -385,6 +385,7 @@ impl EffectOperation for InstallKeyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverContext;
     use crate::s3::bucket::key::wake::activate_and_wake;
     use aruna_core::compute::SecretBytes;
     use aruna_core::structs::execution::job::RoCrateLimits;
@@ -627,7 +628,7 @@ mod tests {
         DriverContext,
         crate::s3::bucket::encryption::EnableResult,
     ) {
-        use crate::driver::{DriverContext, drive};
+        use crate::driver::drive;
         use crate::s3::bucket::create::CreateBucketOperation;
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
