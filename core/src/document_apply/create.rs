@@ -37,7 +37,7 @@ pub struct PendingCreateApply {
 }
 
 /// Stores one create event unless a delete or graph tombstone fences it out.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateEventPlan {
     pub event: MetadataEventRecord,
     pub target: DocumentTarget,
@@ -78,7 +78,7 @@ pub struct CreateBatchOutcome {
     pub notes: Vec<CreateNote>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Candidate {
     apply: PendingCreateApply,
     revision: Vec<Row>,
@@ -87,7 +87,7 @@ struct Candidate {
 
 /// Admits the pending creates of a reconcile pass and writes the cursors that waited for them,
 /// with the evidence of everything rejected, in one transaction.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateBatchPlan {
     candidates: Vec<Candidate>,
     cursor_writes: Vec<(irokle::TopicId, Row)>,

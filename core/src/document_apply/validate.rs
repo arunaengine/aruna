@@ -59,7 +59,7 @@ fn config_snapshot(
 }
 
 /// Decides one replicated admin event; the snapshot serves the next event of the batch.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ValidateAdminPlan {
     pub topic_id: irokle::TopicId,
     pub actor_id: irokle::ActorId,

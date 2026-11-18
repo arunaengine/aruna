@@ -48,7 +48,7 @@ use crate::sync_checks::{
 pub enum ApplyOutcome {
     Applied {
         target: DocumentTarget,
-        tombstone: Option<GraphLifecycleRecord>,
+        tombstone: Option<Box<GraphLifecycleRecord>>,
         /// The document whose Git history gained a record.
         git_document: Option<Ulid>,
     },
@@ -69,7 +69,7 @@ impl ApplyOutcome {
 }
 
 /// Applies one replicated event that is not an admin operation.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApplyEventPlan {
     pub topic_id: irokle::TopicId,
     pub actor_id: irokle::ActorId,
@@ -357,7 +357,7 @@ impl ApplyEventPlan {
                     true => Planned::changes(
                         ApplyOutcome::Applied {
                             target: target.clone(),
-                            tombstone: tombstone.is_deleted().then_some(tombstone),
+                            tombstone: tombstone.is_deleted().then_some(Box::new(tombstone)),
                             git_document: None,
                         },
                         deletes,
@@ -408,7 +408,7 @@ impl ApplyEventPlan {
             true => Planned::changes(
                 ApplyOutcome::Applied {
                     target: target.clone(),
-                    tombstone: record.is_deleted().then_some(record),
+                    tombstone: record.is_deleted().then_some(Box::new(record)),
                     git_document: None,
                 },
                 deletes,
@@ -773,42 +773,8 @@ impl RowPlan for ApplyEventPlan {
     }
 }
 
-/// Applies one upsert or delete directly, outside the checks of the reconcile loop.
-#[derive(Debug, PartialEq)]
-pub struct DocumentChangePlan {
-    pub realm_id: RealmId,
-    pub event: DocumentEvent,
-}
-
-impl RowPlan for DocumentChangePlan {
-    type Output = ();
-    type Error = ApplyError;
-
-    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
-        match &self.event {
-            DocumentEvent::Upsert {
-                target,
-                bytes,
-                change,
-                ..
-            } => upsert_changes(rows, self.realm_id, target, bytes, change),
-            DocumentEvent::Delete { target, change, .. } => {
-                delete_changes(rows, self.realm_id, target, change)
-            }
-            DocumentEvent::AdminOperation { .. } => Err(ApplyError::Invalid(
-                "admin operations apply through their own plan".to_string(),
-            )
-            .into()),
-        }
-    }
-
-    fn transaction(&self) -> TransactionMode {
-        event_mode(self.event.target())
-    }
-}
-
 /// Applies one watch or setting change unless the stored revision wins.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WatchChangePlan {
     pub target: DocumentTarget,
     pub bytes: Option<Vec<u8>>,
@@ -829,7 +795,7 @@ impl RowPlan for WatchChangePlan {
 }
 
 /// Stores a placement policy document under this realm's publication authority.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolicyChangePlan {
     pub realm_id: RealmId,
     pub document: PlacementPolicyDocument,
@@ -843,6 +809,22 @@ impl RowPlan for PolicyChangePlan {
     fn plan(&self, rows: &mut PlanRows) -> Step<Planned<PlacementOutcome<bool>>> {
         policy_change(rows, self.realm_id, &self.document, self.placement)
     }
+}
+
+/// Targets whose own family decides every event kind, so an admin event there is refused by that
+/// family and never reaches the admin checks.
+pub(super) fn family_target(target: &DocumentTarget) -> bool {
+    matches!(
+        target,
+        DocumentTarget::NodeUsage { .. }
+            | DocumentTarget::WatchInterest { .. }
+            | DocumentTarget::NodeInfo { .. }
+            | DocumentTarget::RepositoryLink { .. }
+            | DocumentTarget::VaultRevision { .. }
+            | DocumentTarget::UserKey { .. }
+            | DocumentTarget::PersistentIdMapping { .. }
+            | DocumentTarget::PlacementPolicy { .. }
+    )
 }
 
 /// Documents written as they arrive need no transaction; every other family fences its write.
@@ -867,13 +849,16 @@ fn register_target(target: &DocumentTarget) -> bool {
         || matches!(target, DocumentTarget::OwnerSecret { .. })
 }
 
+/// The rows a change deletes and writes.
+type RowChanges = (Vec<(String, ByteView)>, Vec<Row>);
+
 /// The rows of a watch or setting change, or `None` when the stored revision wins.
 fn watch_rows(
     rows: &mut PlanRows,
     target: &DocumentTarget,
     bytes: Option<&Vec<u8>>,
     change: &DocumentChange,
-) -> Step<Option<(Vec<(String, ByteView)>, Vec<Row>)>> {
+) -> Step<Option<RowChanges>> {
     let current = rows
         .read(SYNC_REVISION_KEYSPACE, sync_revision_key(target))?
         .map(|value| postcard::from_bytes::<DocumentChange>(value.as_ref()))

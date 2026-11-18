@@ -61,7 +61,7 @@ fn wrong(reason: impl Into<String>) -> ApplyError {
 }
 
 /// Applies one admin operation to the document it targets.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AdminOperationPlan {
     pub target: DocumentTarget,
     pub event: AdminDocumentEvent,
@@ -100,7 +100,7 @@ impl RowPlan for AdminOperationPlan {
 /// Applies a run of coalescible realm-config events at once. A transition replicates hundreds of
 /// values, so paying for state, document, materialization and commit once avoids quadratic
 /// reducer rewrites.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConfigRunPlan {
     pub target: DocumentTarget,
     pub events: Vec<AdminDocumentEvent>,

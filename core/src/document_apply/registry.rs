@@ -61,7 +61,7 @@ pub fn group_fence(rows: &mut PlanRows, group_id: Ulid) -> Step<()> {
 }
 
 /// Stores one replicated registry record, or repairs its sidecars when the stored row wins.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RegistryUpsertPlan {
     pub record: MetadataRegistryRecord,
     pub primary_bytes: Vec<u8>,
@@ -125,7 +125,7 @@ impl RowPlan for RegistryUpsertPlan {
 }
 
 /// Stores a graph tombstone that a stored document delete covers; the output tells if it landed.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GraphLifecyclePlan {
     pub record: GraphLifecycleRecord,
     pub primary_bytes: Vec<u8>,
@@ -158,7 +158,7 @@ impl RowPlan for GraphLifecyclePlan {
 }
 
 /// Stores one replicated document lifecycle record; the output tells if anything changed.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DocumentLifecyclePlan {
     pub record: MetadataLifecycleRecord,
     pub change: DocumentChange,
@@ -201,7 +201,7 @@ impl RowPlan for DocumentLifecyclePlan {
 
 /// Folds a replicated PID mapping, its sidecar and manifest entry into one monotonic change that
 /// never lets an Active row overwrite a Withdrawn tombstone and fences the stamped placement.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PidMappingPlan {
     pub realm_id: RealmId,
     pub incoming: PersistentIdMapping,
@@ -245,7 +245,7 @@ impl RowPlan for PidMappingPlan {
 
 /// Stores one replicated policy document. The bucket is derived again from the policy id, and a
 /// known id whose definition differs is rejected: one id resolves to exactly one rule.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolicyDocumentPlan {
     pub realm_id: RealmId,
     pub incoming: PlacementPolicyDocument,
@@ -288,7 +288,7 @@ impl RowPlan for PolicyDocumentPlan {
 }
 
 /// Removes the registry row of a document whose stored delete covers it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeleteRegistryPlan {
     pub group_id: Ulid,
     pub document_id: Ulid,

@@ -1,10 +1,10 @@
-//! Admits and stores distribution snapshots: only the set's bound publisher publishes them, every
-//! embedded statement carries its member's own signature, and the signed form is kept. Snapshots
-//! whose publisher the realm config does not know yet wait parked.
+//! Admits and stores signed distribution snapshots of a set's bound publisher. Snapshots whose
+//! publisher the realm config does not know yet wait parked.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use byteview::ByteView;
 use tracing::warn;
@@ -135,17 +135,14 @@ impl SetFolds {
         let Some(first) = events.first() else {
             return Ok(());
         };
-        if !self.sets.contains_key(&set_id) {
+        if let Entry::Vacant(entry) = self.sets.entry(set_id) {
             let state = reducer_state(rows, &first.target)?
                 .unwrap_or_else(|| AdminDocumentState::new(first.target.clone()));
-            self.sets.insert(
-                set_id,
-                SetFold {
-                    state,
-                    applied: false,
-                    last_event: first.event_id,
-                },
-            );
+            entry.insert(SetFold {
+                state,
+                applied: false,
+                last_event: first.event_id,
+            });
         }
         let Some(fold) = self.sets.get_mut(&set_id) else {
             return Ok(());
@@ -265,7 +262,7 @@ fn parked_keys(rows: &mut PlanRows) -> Step<Vec<ByteView>> {
 
 /// Reduces a snapshot into its set's state and stores the signed view every node reads. Parked
 /// evidence of the same publisher and set installs first, so a newer head cannot hide it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DistributionPlan {
     pub target: DocumentTarget,
     pub event: AdminDocumentEvent,
@@ -375,7 +372,7 @@ impl RowPlan for DistributionPlan {
 }
 
 /// Retries every parked entry of the realm against one read of the realm config.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RetryParkedPlan {
     pub realm_id: RealmId,
 }
@@ -457,7 +454,7 @@ impl RowPlan for RetryParkedPlan {
 
 /// Installs a replayed snapshot together with the last replayed one of its set when the two prove
 /// equivocation, so a newer head cannot hide the fork. The output tells whether it did.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplayForkPlan {
     pub earlier: AdminDocumentEvent,
     pub event: AdminDocumentEvent,

@@ -13,7 +13,7 @@ use crate::structs::identity::realm::RealmId;
 use crate::types::Value;
 
 /// Folds one link change, its sidecar and manifest entry into one transaction.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinkPlan {
     pub realm_id: RealmId,
     pub target: DocumentTarget,

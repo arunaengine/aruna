@@ -4,15 +4,14 @@
 
 use std::str::FromStr;
 
-use super::{ApplyError, Step, invalid};
+use super::{Step, invalid};
 use crate::NodeId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::DocumentTarget;
 use crate::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use crate::operation::TransactionMode;
 use crate::reducer::{AdminDocumentState, decode_reducer_state};
-use crate::row_plan::{PlanRows, Planned, RowPlan};
+use crate::row_plan::PlanRows;
 use crate::storage_entries::reducer_state_key;
 use crate::structs::identity::group::GroupAuthorizationDocument;
 use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument, RealmId};
@@ -87,35 +86,20 @@ pub fn relay_allowed(
 }
 
 /// Whether the state a deferred topic waits for has replicated.
-#[derive(Debug, PartialEq)]
-pub struct DependencyPlan(pub DocumentSyncDependency);
-
-impl RowPlan for DependencyPlan {
-    type Output = bool;
-    type Error = ApplyError;
-
-    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<bool>> {
-        let available = match self.0 {
-            DocumentSyncDependency::RealmConfig(realm_id) => {
-                realm_config(rows, realm_id)?.is_some()
-            }
-            DocumentSyncDependency::RealmAuthorization(realm_id) => {
-                realm_authorization(rows, realm_id)?.is_some()
-            }
-            DocumentSyncDependency::PlacementStrategy {
-                realm_id,
-                strategy_id,
-            } => realm_config(rows, realm_id)?.is_some_and(|config| {
-                config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
-            }),
-            DocumentSyncDependency::GroupAuthorization(group_id) => {
-                group_authorization(rows, group_id)?.is_some()
-            }
-        };
-        Ok(Planned::output(available))
-    }
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::None
-    }
+pub fn dependency_available(rows: &mut PlanRows, dependency: DocumentSyncDependency) -> Step<bool> {
+    Ok(match dependency {
+        DocumentSyncDependency::RealmConfig(realm_id) => realm_config(rows, realm_id)?.is_some(),
+        DocumentSyncDependency::RealmAuthorization(realm_id) => {
+            realm_authorization(rows, realm_id)?.is_some()
+        }
+        DocumentSyncDependency::PlacementStrategy {
+            realm_id,
+            strategy_id,
+        } => realm_config(rows, realm_id)?.is_some_and(|config| {
+            config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
+        }),
+        DocumentSyncDependency::GroupAuthorization(group_id) => {
+            group_authorization(rows, group_id)?.is_some()
+        }
+    })
 }

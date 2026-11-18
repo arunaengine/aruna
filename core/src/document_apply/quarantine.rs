@@ -100,7 +100,7 @@ pub fn quarantine_entries(
 
 /// Writes rejection evidence and the topic cursor together, so the cursor never moves past
 /// evidence that is not durable. `false` means the store is full and nothing was written.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CursorEvidencePlan {
     pub rejections: Vec<SyncRejection>,
     pub cursor: Row,
