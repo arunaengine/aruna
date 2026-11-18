@@ -1024,7 +1024,8 @@ impl Event {
                 OutboundEvent {
                     Posted,
                     MailSent,
-                    Backoff
+                    Backoff,
+                    Answered
                 }
             ),
         }

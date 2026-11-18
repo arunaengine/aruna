@@ -16,7 +16,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::blob::migration::misplaced::count_misplaced;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
@@ -43,9 +43,12 @@ async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     let mut backends = BTreeMap::new();
     let hot = NodeBackend::new(filesystem(format!("{root}/hot"), "hot-"), None);
     let cold = NodeBackend::new(

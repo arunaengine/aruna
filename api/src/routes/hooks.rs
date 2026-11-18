@@ -7,11 +7,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::node_info::node_urls;
 use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::dispatch::{HookAuthorization, VerifyHook};
 use aruna_operations::plugins::hooks::{AdmitHook, HookError};
@@ -251,7 +251,12 @@ async fn relay(
     let Some(keep) = keep else {
         return unavailable();
     };
-    let Some(base) = node_urls(&ctx, receiver).await.and_then(|urls| urls.api) else {
+    let Some(base) = drive(NodeUrlsOperation::new(receiver), ctx.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|urls| urls.api)
+    else {
         return unavailable();
     };
     let mut sent = relayed(headers, keep);

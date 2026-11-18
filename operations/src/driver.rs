@@ -1427,6 +1427,7 @@ mod test {
         TransactionTracker, dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until,
         extend_unblocked, run_all, run_window,
     };
+    use crate::tests::incoming::freeze_clock;
     use aruna_core::calls::{IoError, IoResult, Next};
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
@@ -1752,27 +1753,6 @@ mod test {
         (directory, context)
     }
 
-    /// A net without relays or discovery: a relay connection's timers read the real clock, so
-    /// they spin forever once paused time passes their deadline.
-    fn local_net() -> aruna_net::NetConfig {
-        aruna_net::NetConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            discovery_method: aruna_net::DiscoveryMethod::None,
-            relay_method: aruna_net::RelayMethod::None,
-            ..aruna_net::NetConfig::default()
-        }
-    }
-
-    /// Holds paused time still until dropped, so only `advance` moves it: a running blocking task
-    /// stops auto-advance, which would pass deadlines while storage threads answer.
-    fn manual_clock() -> std::sync::mpsc::Sender<()> {
-        let (hold, release) = std::sync::mpsc::channel::<()>();
-        tokio::task::spawn_blocking(move || {
-            let _ = release.recv();
-        });
-        hold
-    }
-
     /// Storage, a file system blob backend and a net handle in one temporary folder.
     async fn net_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
@@ -1780,9 +1760,10 @@ mod test {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&root).unwrap();
-        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -2077,9 +2058,10 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -2108,7 +2090,7 @@ mod test {
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
         tokio::time::pause();
-        let _clock = manual_clock();
+        let _clock = freeze_clock();
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = DeadlineOperation {
             state: 0,
@@ -2501,7 +2483,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
-        let _clock = manual_clock();
+        let _clock = freeze_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2546,7 +2528,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
-        let _clock = manual_clock();
+        let _clock = freeze_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2845,9 +2827,10 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,

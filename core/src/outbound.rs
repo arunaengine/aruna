@@ -22,6 +22,8 @@ pub enum OutboundEffect {
     Mail(Box<MailRequest>),
     /// Reads or changes the in-memory delay of the deliveries to one owner and channel.
     Backoff(BackoffRequest),
+    /// Sends one request through the egress screen and answers with its status.
+    Request(Box<HttpRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +64,10 @@ pub enum OutboundEvent {
     Backoff {
         stored: Option<StoredBackoff>,
     },
+    /// The status the receiver of an [`OutboundEffect::Request`] answered with.
+    Answered {
+        result: Result<u16, OutboundError>,
+    },
 }
 
 /// A failure of one outbound call; its text never holds an address, a body or a credential.
@@ -89,6 +95,36 @@ pub struct HttpPost {
 impl std::fmt::Debug for HttpPost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpPost")
+            .field("body_len", &self.body.len())
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Head,
+    Post,
+    Put,
+    Delete,
+}
+
+/// One HTTP call whose answer only matters by its status.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Bytes,
+    /// Total time the call may take.
+    pub deadline: Duration,
+}
+
+/// Shows neither the target path, the headers nor the body.
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
             .field("body_len", &self.body.len())
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
