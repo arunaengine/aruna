@@ -3015,13 +3015,12 @@ mod tests {
             let version = raw_version();
             let at_target = || {
                 let mut moved = operation("in/x/one.csv", vec![rule(), other.clone()]);
-                copied(&mut moved, &version, false);
+                copied(&mut moved, &version, false).unwrap();
                 let default = Some(RoutingTarget::Backend(storage()));
-                rules_read(&mut moved, default, [rule(), other.clone()]);
-                moved.step(storage_record(false));
-                let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
-                let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-                else {
+                rules_read(&mut moved, default, [rule(), other.clone()]).unwrap();
+                moved.next(storage_record(false)).unwrap();
+                let effects = moved.next(read_result(Some(version.to_bytes().unwrap())));
+                let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                     panic!("expected the target and shared reads, got {effects:?}")
                 };
                 let path = moved.new.as_ref().unwrap().backend_path.clone();
@@ -3030,36 +3029,19 @@ mod tests {
                 assert_eq!(reads[2].1, object_key(other.import_id, &path));
                 (moved, path)
             };
-            let row = |other: Option<Value>| {
-                let values = vec![
-                    (Key::from(Vec::new()), None),
-                    (Key::from(Vec::new()), None),
-                    (Key::from(Vec::new()), other),
-                ];
-                Event::Storage(StorageEvent::BatchReadResult { values })
-            };
-            let taken = || Some(Err(MigrateVersionError::Blob(BlobError::PathTaken)));
+            let row = |other: Option<Value>| IoResult::Values(vec![None, None, other]);
+            let taken = || Err(MigrateVersionError::Blob(BlobError::PathTaken));
             let (mut moved, _) = at_target();
-            moved.step(row(Some(vec![1].into())));
-            assert_eq!(moved.output, taken());
+            assert_eq!(moved.next(row(Some(vec![1].into()))), taken());
             // Nor while the other rule has an unfinished write of the path.
             let (mut moved, path) = at_target();
-            let effects = moved.step(row(None));
-            let [
-                Effect::Storage(StorageEffect::Iter {
-                    prefix: Some(prefix),
-                    ..
-                }),
-            ] = effects.as_slice()
-            else {
-                panic!("expected the peer intents, got {effects:?}")
+            let turn = moved.next(row(None));
+            let Ok(Next::Call(IoCall::Page { prefix, .. })) = &turn else {
+                panic!("expected the peer intents, got {turn:?}")
             };
             assert_eq!(*prefix, intent_prefix(other.import_id, &path));
-            moved.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![(Key::from(vec![1]), Value::from(vec![1]))],
-                next_start_after: None,
-            }));
-            assert_eq!(moved.output, taken());
+            let rows = vec![(Key::from(vec![1]), Value::from(vec![1]))];
+            assert_eq!(moved.next(IoResult::Page { rows, next: None }), taken());
         }
 
         #[test]
@@ -3068,33 +3050,25 @@ mod tests {
             // equal bytes; the move does not take that file over.
             let mut moved = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
-            copied(&mut moved, &version, false);
+            copied(&mut moved, &version, false).unwrap();
             published(&mut moved, Some(rule()));
-            let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
+            let effects = moved.next(read_result(Some(version.to_bytes().unwrap())));
+            let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                 panic!("expected the target and own record reads, got {effects:?}")
             };
             assert_eq!(reads.len(), 2);
             let other =
                 ImportedObject::written(Ulid::from_parts(8, 8), "in/y/one.csv".into(), 40, None);
-            let values = vec![
-                (Key::from(Vec::new()), None),
-                (
-                    Key::from(Vec::new()),
-                    Some(other.to_bytes().unwrap().into()),
-                ),
-            ];
-            moved.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            let taken = MigrateVersionError::Blob(BlobError::PathTaken);
-            assert_eq!(moved.output, Some(Err(taken)));
+            let values = vec![None, Some(other.to_bytes().unwrap().into())];
+            let turn = moved.next(IoResult::Values(values));
+            assert_eq!(turn, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
         }
 
         #[test]
         fn never_overwrites_path() {
             // A file an earlier attempt or a user left at the path is never overwritten.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
-            copied(&mut operation, &raw_version(), true);
+            copied(&mut operation, &raw_version(), true).unwrap();
 
             let plain = operation.plain_path.clone().unwrap();
             let path = format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]));
@@ -3107,23 +3081,23 @@ mod tests {
         fn new_rule_discards() {
             // A linked rule created during an ordinary move is read in the publication.
             let mut operation = operation("in/x/one.csv", Vec::new());
-            copied(&mut operation, &raw_version(), false);
+            copied(&mut operation, &raw_version(), false).unwrap();
             let default = Some(RoutingTarget::Backend(storage()));
 
             let effects = rules_read(&mut operation, default, Some(rule()));
 
-            assert!(aborted(&effects));
+            leaves_copy(&skipped_calls(effects), true);
         }
 
         #[test]
         fn removed_rule_discards() {
             let mut operation = operation("in/x/one.csv", vec![rule()]);
-            copied(&mut operation, &raw_version(), false);
+            copied(&mut operation, &raw_version(), false).unwrap();
             let default = Some(RoutingTarget::Backend(storage()));
 
             let effects = rules_read(&mut operation, default, None);
 
-            assert!(aborted(&effects));
+            leaves_copy(&skipped_calls(effects), true);
         }
 
         /// A version whose copy is in Aruna's layout on the rule's storage.
@@ -3141,36 +3115,38 @@ mod tests {
             // and the version keeps the copy it names.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             let (version, old) = in_place();
-            operation.start();
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.first().unwrap();
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, Some(old.to_bytes().unwrap()));
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
+            let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                 panic!("expected the import row read, got {effects:?}")
             };
-            assert_eq!(key_space, IMPORTED_OBJECT_KEYSPACE);
-            operation.step(read_result(None));
-            operation.step(read_result(Some(old.to_bytes().unwrap())));
-            let effects = operation.step(read_result(None));
+            assert_eq!(reads[0].0, IMPORTED_OBJECT_KEYSPACE);
+            operation.next(read_result(None)).unwrap();
+            operation
+                .next(read_result(Some(old.to_bytes().unwrap())))
+                .unwrap();
+            let effects = operation.next(read_result(None));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::StatPlain { .. })]
+                asked(&effects),
+                Effect::Blob(BlobEffect::StatPlain { .. })
             ));
-            operation.step(Event::Blob(BlobEvent::PlainStat {
-                exists: false,
-                version: None,
-            }));
-            let effects = operation.step(empty_blob());
+            operation
+                .next(blob_event(BlobEvent::PlainStat {
+                    exists: false,
+                    version: None,
+                }))
+                .unwrap();
+            let effects = operation.next(empty_blob());
             let effects = past_intent(&mut operation, effects);
-            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+            let Effect::Blob(BlobEffect::WritePlain { plain, .. }) = asked(&effects) else {
                 panic!("expected the file write, got {effects:?}")
             };
-            after_write(&mut operation, plain_written(plain));
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: TxnId::default(),
-            }));
+            let written = plain_written(plain);
+            operation.next(written).unwrap();
+            enter_publish(&mut operation).unwrap();
             published(&mut operation, Some(rule()));
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, Some(old.to_bytes().unwrap()));
 
             let spaces: Vec<&str> = batch(&effects).iter().map(|(s, ..)| s.as_str()).collect();
@@ -3182,16 +3158,19 @@ mod tests {
             // Once the version's file is recorded, a later move leaves it alone.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             let (version, old) = in_place();
-            operation.start();
-            operation.step(read_result(Some(version.to_bytes().unwrap())));
-            operation.step(read_result(Some(old.to_bytes().unwrap())));
+            operation.first().unwrap();
+            operation
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            operation
+                .next(read_result(Some(old.to_bytes().unwrap())))
+                .unwrap();
             let row =
                 ImportedObject::written(Ulid::from_bytes([2; 16]), "in/x/one.csv".into(), 40, None);
 
-            let effects = operation.step(read_result(Some(row.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(row.to_bytes().unwrap())));
 
-            assert!(effects.is_empty());
-            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+            assert_eq!(effects, Ok(Next::Done(MigrateOutcome::Skipped)));
         }
 
         #[test]
@@ -3205,13 +3184,12 @@ mod tests {
             }
             let mut external = on_storage(location(false));
             external.storage_bucket = String::new();
-            operation.start();
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.first().unwrap();
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects =
                 answer_target(&mut operation, effects, Some(external.to_bytes().unwrap()));
 
-            assert!(effects.is_empty());
-            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+            assert_eq!(effects, Ok(Next::Done(MigrateOutcome::Skipped)));
         }
 
         /// A version whose own linked file has the name of the earlier prefix pattern.
@@ -3240,27 +3218,26 @@ mod tests {
         ) -> MigrateVersionOperation {
             let earlier = Earlier::from([(IMPORT, vec!["{dir}{id}_{name}".to_string()])]);
             let mut operation = operation("in/x/one.csv", vec![rule()]).with_earlier(earlier);
-            operation.start();
-            operation.step(read_result(Some(version.to_bytes().unwrap())));
-            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+            operation.first().unwrap();
+            operation
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            let effects = operation.next(read_result(Some(old.to_bytes().unwrap())));
             // The old file's backend version binds a later delete to the renamed bytes, and the
             // rule's record of the file names the ETag an unversioned copy needs.
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
+            let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                 panic!("expected the reads of the old file, got {effects:?}")
             };
             let id = operation.version_key.version_id;
             let etag = etag.map(str::to_string);
             let row = ImportedObject::written(id, "in/x/one.csv".to_string(), 4, etag);
+            assert_eq!(reads.len(), 2);
             let values = vec![
-                (
-                    reads[0].1.clone(),
-                    source.map(|source| source.to_vec().into()),
-                ),
-                (reads[1].1.clone(), Some(row.to_bytes().unwrap().into())),
+                source.map(|source| source.to_vec().into()),
+                Some(row.to_bytes().unwrap().into()),
             ];
-            operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            operation.step(read_result(None));
+            operation.next(IoResult::Values(values)).unwrap();
+            operation.next(read_result(None)).unwrap();
             operation
         }
 
@@ -3272,16 +3249,14 @@ mod tests {
         ) -> (MigrateVersionOperation, PlainPath) {
             let mut operation = named(version, old, (source, recorded));
             // Nothing records the new name for another key, and no provider is asked first.
-            let effects = operation.step(read_result(None));
+            let effects = operation.next(read_result(None));
             let effects = past_intent(&mut operation, effects);
-            let [
-                Effect::Blob(BlobEffect::CopyPlain {
-                    plain,
-                    source: copied,
-                    etag,
-                    ..
-                }),
-            ] = effects.as_slice()
+            let Effect::Blob(BlobEffect::CopyPlain {
+                plain,
+                source: copied,
+                etag,
+                ..
+            }) = asked(&effects)
             else {
                 panic!("expected the copy to the new name, got {effects:?}")
             };
@@ -3301,10 +3276,11 @@ mod tests {
             let mut operation = named(&version, &old, (Some(b"v1"), Some("e1")));
             let id = Ulid::from_bytes([9; 16]);
             let other = ImportedObject::written(id, "in/x/other.csv".to_string(), 4, None);
-            let effects = operation.step(read_result(Some(other.to_bytes().unwrap())));
-            assert!(effects.is_empty());
-            let error = MigrateVersionError::Blob(BlobError::PathTaken);
-            assert_eq!(operation.finalize(), Err(error));
+            let effects = operation.next(read_result(Some(other.to_bytes().unwrap())));
+            assert_eq!(
+                effects,
+                Err(MigrateVersionError::Blob(BlobError::PathTaken))
+            );
         }
 
         #[test]
@@ -3313,30 +3289,22 @@ mod tests {
             let (version, old) = prefixed();
             let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             let refused = || BlobError::ConditionalUnsupported;
-            let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
+            let effects = operation.next(blob_event(BlobEvent::Error(refused())));
             // Such a storage may hold an earlier attempt at the tagged name.
-            let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
+            let Effect::Blob(BlobEffect::StatExternal { path, .. }) = asked(&effects) else {
                 panic!("expected the stat of the tagged name, got {effects:?}")
             };
             assert_eq!(path, &tagged_path(&plain.path, plain.ulid));
-            let effects = operation.step(Event::Blob(BlobEvent::ExternalStat {
+            let turn = operation.next(blob_event(BlobEvent::ExternalStat {
                 location: None,
                 version: None,
                 etag: None,
             }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchDelete { .. })]
-            ));
-            operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
-            operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+            operation.next(IoResult::Done).unwrap();
+            let turn = operation.next(IoResult::Done);
             assert!(operation.written_intent.is_empty());
-            assert_eq!(
-                operation.output,
-                Some(Err(MigrateVersionError::Blob(refused())))
-            );
+            assert_eq!(turn, Err(MigrateVersionError::Blob(refused())));
         }
 
         /// Drives a rename to its publication rows.
@@ -3345,12 +3313,10 @@ mod tests {
         ) -> (Vec<(String, Key, Value)>, PlainPath, BackendLocation) {
             let (version, old) = prefixed();
             let (mut operation, plain) = renaming(&version, &old, source);
-            after_write(&mut operation, plain_written(&plain));
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: TxnId::default(),
-            }));
+            operation.next(plain_written(&plain)).unwrap();
+            enter_publish(&mut operation).unwrap();
             published(&mut operation, Some(rule()));
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, None);
             (batch(&effects).clone(), plain, old)
         }
@@ -3413,12 +3379,7 @@ mod tests {
         fn taken_name(
             (old_size, size): (Option<u64>, u64),
             etag: &str,
-        ) -> (
-            MigrateVersionOperation,
-            BlobVersion,
-            BackendLocation,
-            Effects,
-        ) {
+        ) -> (MigrateVersionOperation, BlobVersion, BackendLocation, Turn) {
             let (version, mut old) = prefixed();
             old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
             if let Some(old_size) = old_size {
@@ -3427,15 +3388,15 @@ mod tests {
                 old.hashes.insert(HASH_MD5.to_string(), md5);
             }
             let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
-            let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
-            let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
+            let effects = operation.next(blob_event(BlobEvent::Error(BlobError::PathTaken)));
+            let Effect::Blob(BlobEffect::StatExternal { path, .. }) = asked(&effects) else {
                 panic!("expected the stat of the taken name, got {effects:?}")
             };
             assert_eq!(path, &plain.path);
             let mut found = on_storage(location(false));
             (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
             (found.blob_size, found.hashes) = (size, HashMap::new());
-            let effects = operation.step(Event::Blob(BlobEvent::ExternalStat {
+            let effects = operation.next(blob_event(BlobEvent::ExternalStat {
                 location: Some(found),
                 version: None,
                 etag: Some(format!("\"{etag}\"")),
@@ -3466,18 +3427,13 @@ mod tests {
                 if adopted {
                     // The upload the earlier attempt recorded is settled before the adoption.
                     let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
-                    assert_eq!(
-                        effects.as_slice(),
-                        [Effect::Blob(BlobEffect::SettleCopy {
-                            attempt,
-                            upload: None
-                        })]
-                    );
-                    let effects = operation.step(Event::Blob(BlobEvent::UploadAborted));
-                    assert!(matches!(
-                        effects.as_slice(),
-                        [Effect::Storage(StorageEffect::StartTransaction { .. })]
-                    ));
+                    let settle = BlobEffect::SettleCopy {
+                        attempt,
+                        upload: None,
+                    };
+                    assert_eq!(asked(&effects), &Effect::Blob(settle));
+                    let turn = operation.next(blob_event(BlobEvent::UploadAborted));
+                    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
                     // The intents the earlier attempt stored go with the publication.
                     assert_eq!(operation.written_intent, operation.intent_keys(attempt));
                     assert_eq!(operation.written_intent.len(), 2);
@@ -3486,16 +3442,10 @@ mod tests {
                     continue;
                 }
                 // Another file at the new name keeps it; the intents go before the move fails.
-                assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::BatchDelete { .. })]
-                ));
-                operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                    entries: Vec::new(),
-                }));
-                operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+                assert!(matches!(effects, Ok(Next::Call(IoCall::Delete(_)))));
+                operation.next(IoResult::Done).unwrap();
                 let error = MigrateVersionError::Blob(BlobError::PathTaken);
-                assert_eq!(operation.finalize(), Err(error));
+                assert_eq!(operation.next(IoResult::Done), Err(error));
             }
         }
 
@@ -3505,36 +3455,33 @@ mod tests {
             let (version, mut old) = prefixed();
             old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
             let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
-            operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+            operation
+                .next(blob_event(BlobEvent::Error(BlobError::PathTaken)))
+                .unwrap();
             let mut found = on_storage(location(false));
             (found.storage_bucket, found.backend_path) = (String::new(), plain.path.clone());
             found.blob_size = old.blob_size;
-            operation.step(Event::Blob(BlobEvent::ExternalStat {
-                location: Some(found),
-                version: Some("p9".to_string()),
-                etag: Some(hex::encode([7; 16])),
-            }));
-            operation.step(Event::Blob(BlobEvent::UploadAborted));
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: TxnId::default(),
-            }));
+            operation
+                .next(blob_event(BlobEvent::ExternalStat {
+                    location: Some(found),
+                    version: Some("p9".to_string()),
+                    etag: Some(hex::encode([7; 16])),
+                }))
+                .unwrap();
+            operation
+                .next(blob_event(BlobEvent::UploadAborted))
+                .unwrap();
+            enter_publish(&mut operation).unwrap();
             published(&mut operation, Some(rule()));
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
+            let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                 panic!("expected the target reads, got {effects:?}")
             };
             assert_eq!(reads.last().unwrap().0, DELETE_CLAIM_KEYSPACE);
-            let mut values: Vec<(Key, Option<Value>)> =
-                reads.iter().map(|(_, key)| (key.clone(), None)).collect();
-            values.last_mut().unwrap().1 = Some(Vec::new().into());
-            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            assert!(aborted(&effects), "{effects:?}");
-            let error = MigrateVersionError::Blob(BlobError::PathTaken);
-            operation.step(Event::Storage(StorageEvent::TransactionAborted {
-                txn_id: TxnId::default(),
-            }));
-            assert_eq!(operation.output, Some(Err(error)));
+            let mut values = vec![None; reads.len()];
+            *values.last_mut().unwrap() = Some(Vec::new().into());
+            let turn = operation.next(IoResult::Values(values));
+            assert_eq!(turn, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
         }
 
         #[test]
@@ -3542,11 +3489,10 @@ mod tests {
             // Without the earlier pattern the name tells no version, so the file stays.
             let (version, old) = prefixed();
             let mut operation = operation("in/x/one.csv", vec![rule()]);
-            operation.start();
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.first().unwrap();
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, Some(old.to_bytes().unwrap()));
-            assert!(effects.is_empty());
-            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+            assert_eq!(effects, Ok(Next::Done(MigrateOutcome::Skipped)));
         }
     }
 }
