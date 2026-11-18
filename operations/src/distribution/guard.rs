@@ -6,6 +6,7 @@
 // Every other member forwards or refuses the write with the coordinator named; nothing waits.
 
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -39,6 +40,12 @@ pub enum GuardError {
     Conversion(#[from] ConversionError),
     #[error("the record read failed: {0}")]
     Unreadable(String),
+}
+
+impl From<IoError> for GuardError {
+    fn from(error: IoError) -> Self {
+        Self::Unreadable(error.to_string())
+    }
 }
 
 impl GuardError {
@@ -106,7 +113,7 @@ pub fn authority_rows(event: Event) -> Result<(Option<Value>, Option<Value>), Gu
 }
 
 /// The record of the bound set, while this bucket is still its admitted member.
-fn bound_record(
+pub(crate) fn bound_record(
     binding: &DistributionBinding,
     record: Option<&[u8]>,
 ) -> Result<DistributionView, GuardError> {
