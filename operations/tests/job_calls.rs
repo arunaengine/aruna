@@ -2,6 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::execution::job::AttemptControl;
+use aruna_core::structs::execution::job::AttemptIntent;
+use aruna_core::structs::execution::job::JobError;
+use aruna_core::structs::execution::job::JobProgress;
+use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::LaunchRecord;
+use aruna_core::structs::storage::distribution::hint::SetHint;
+use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
+use aruna_core::types::TxnId;
+use aruna_core::types::Value;
+use aruna_operations::jobs::store::JobMutationError;
+use aruna_operations::jobs::store::attempt_intent::AttemptCommit;
+use aruna_operations::jobs::store::job_calls;
+use aruna_operations::jobs::store::job_calls::CancelRequestOutcome;
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_operations::jobs::store::job_calls::ReleaseOutcome;
+use aruna_operations::jobs::store::row_calls;
+use std::collections::BTreeMap;
+use ulid::Ulid;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
@@ -200,4 +219,201 @@ pub async fn read_artifact_range(
     drive(ArtifactRangeOperation::new(artifact, range), context)
         .await
         .map_err(|error| error.0)
+}
+
+pub async fn claim_job(
+    context: &DriverContext,
+    job_id: JobId,
+    holder_node_id: NodeId,
+    now_ms: u64,
+) -> Result<ClaimOutcome, JobMutationError> {
+    drive(
+        job_calls::claim_job(job_id, holder_node_id, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn complete_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::complete_job(job_id, token, result, final_progress, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn fail_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(job_calls::fail_job(job_id, token, error, now_ms), context).await
+}
+
+pub async fn find_dedup_job(
+    context: &DriverContext,
+    created_by: UserId,
+    dedup_key: &[u8],
+    _txn_id: Option<TxnId>,
+) -> Result<Option<JobId>, String> {
+    drive(row_calls::find_dedup_job(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn find_dedup_plan(
+    context: &DriverContext,
+    created_by: UserId,
+    dedup_key: &[u8],
+    _txn_id: Option<TxnId>,
+) -> Result<Option<(JobId, [u8; 32])>, String> {
+    drive(row_calls::find_dedup_plan(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
+    drive(row_calls::insert_job(record), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn list_job_entries(
+    context: &DriverContext,
+    job_id: JobId,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
+    drive(
+        row_calls::list_job_entries(job_id, last_key, limit),
+        context,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub async fn put_crate_status(
+    context: &DriverContext,
+    job_id: JobId,
+    status: &aruna_core::structs::execution::job::RunCrateStatus,
+) -> Result<(), String> {
+    drive(row_calls::put_crate_status(job_id, status), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn put_purge_checkpoint(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    checkpoint: &StoragePurgeCheckpoint,
+) -> Result<(), JobMutationError> {
+    drive(
+        job_calls::put_purge_checkpoint(job_id, token, checkpoint),
+        context,
+    )
+    .await
+}
+
+pub async fn read_crate_status(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
+    drive(row_calls::read_crate_status(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_job_record(
+    context: &DriverContext,
+    job_id: JobId,
+    _txn_id: Option<TxnId>,
+) -> Result<Option<JobRecord>, String> {
+    drive(row_calls::read_job_record(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_run_link(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
+    drive(row_calls::read_run_link(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn record_attempt_intent(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    draft: AttemptIntent,
+    execution_id: Option<Ulid>,
+    launch: Option<&LaunchRecord>,
+    now_ms: u64,
+) -> Result<AttemptCommit, JobMutationError> {
+    drive(
+        job_calls::record_attempt_intent(
+            job_id,
+            token,
+            draft,
+            execution_id,
+            launch.cloned(),
+            now_ms,
+        ),
+        context,
+    )
+    .await
+}
+
+pub async fn release_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    drive(job_calls::release_job(job_id, token, now_ms), context).await
+}
+
+pub async fn reserve_output_commits(
+    context: &DriverContext,
+    job_id: JobId,
+    destinations: &[(NodeId, String, String)],
+    hints: &BTreeMap<(NodeId, String), SetHint>,
+) -> Result<AttemptControl, JobMutationError> {
+    drive(
+        job_calls::reserve_output_commits(job_id, destinations.to_vec(), hints.clone()),
+        context,
+    )
+    .await
+}
+
+pub async fn set_cancel_requested(
+    context: &DriverContext,
+    job_id: JobId,
+    now_ms: u64,
+) -> Result<CancelRequestOutcome, JobMutationError> {
+    drive(job_calls::set_cancel_requested(job_id, now_ms), context).await
+}
+
+pub async fn transition_to_running(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::transition_to_running(job_id, token, now_ms),
+        context,
+    )
+    .await
 }

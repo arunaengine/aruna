@@ -50,10 +50,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::export::run_export_job;
 use aruna_operations::jobs::import::run_rocrate_import;
-use aruna_operations::jobs::store::query::{insert_job, list_job_entries};
-use aruna_operations::jobs::store::state::{
-    ClaimOutcome, claim_job, release_job, transition_to_running,
-};
+use crate::job_calls::{insert_job, list_job_entries};
+use aruna_operations::jobs::store::state::ClaimOutcome;
+use crate::job_calls::{claim_job, release_job, transition_to_running};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
@@ -1819,7 +1818,7 @@ async fn claim_context(
     job_id: JobId,
     payload: JobPayload,
 ) -> Result<JobContext, Box<dyn std::error::Error>> {
-    if aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+    if crate::job_calls::read_job_record(&fixture.context, job_id, None)
         .await?
         .is_none()
     {
