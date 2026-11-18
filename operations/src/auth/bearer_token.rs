@@ -3,20 +3,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::error::ArunaBearerError;
+use crate::document_repository::read_row;
 use aruna_core::UserId;
-use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
+use aruna_core::auth::{
+    REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime,
+};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+use aruna_core::keyspaces::{API_STATE_KEYSPACE, FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
+use aruna_core::operation::Operation;
+use aruna_core::rows::value;
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::backend_import::TokenGrant;
-use aruna_core::time::unix_timestamp_secs;
-use aruna_storage::StorageHandle;
-use async_trait::async_trait;
+use aruna_core::types::Value;
 use base64::Engine;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -24,273 +26,466 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use lru::LruCache;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tracing::warn;
 
-#[async_trait]
-pub trait ArunaValidationState: Sync {
-    /// Revocation is owned by the realm that issued the token, never by the
-    /// serving node's realm, so `realm_id` comes from the verified claims.
-    async fn is_token_revoked(
-        &self,
-        realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError>;
-    /// Unix seconds before which the issuing realm denies every token of this user.
-    async fn user_cutoff(
-        &self,
-        realm_id: &RealmId,
-        user_id: &UserId,
-    ) -> Result<Option<u64>, ArunaBearerError>;
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
-    /// The local account a linked login of another realm resolves to in `realm_id`, if any.
-    async fn linked_owner(
-        &self,
-        _realm_id: &RealmId,
-        _via: &UserId,
-    ) -> Result<Option<UserId>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    /// The wall clock claim validation judges against, injectable so a test can
-    /// decide expiry and issuance skew without waiting on real time.
-    fn now_secs(&self) -> u64 {
-        unix_timestamp_secs()
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        bearer_decoding_key(issuer_pubkey)
+impl From<IoError> for ArunaBearerError {
+    fn from(_: IoError) -> Self {
+        Self::RevocationUnavailable
     }
 }
 
-/// Whether the realm's replicated revocation set denies this token hash. This
-/// is the realm-wide authority; a node-local list is only a fast path. A realm
-/// without a config document denies; a failed read is reported as unavailable.
-pub async fn realm_token_revoked(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    token_hash: &str,
-) -> Result<bool, ArunaBearerError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
+fn config_call(realm_id: RealmId) -> IoCall {
+    IoCall::Read(vec![read_row(&DocumentTarget::RealmConfig { realm_id })])
+}
+
+/// The realm config of a read; `None` when the realm has none here.
+fn read_config(value: Option<Value>) -> Result<Option<RealmConfigDocument>, ArunaBearerError> {
+    value
+        .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+        .transpose()
+        .map_err(|error| {
+            warn!(error = %error, "Failed to decode realm config for token checks");
+            ArunaBearerError::RevocationUnavailable
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => Ok(config.token_revoked(token_hash, unix_timestamp_secs())),
-            Err(error) => {
-                warn!(error = %error, "Failed to decode realm config for token revocation");
-                Err(ArunaBearerError::RevocationUnavailable)
-            }
-        },
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(true),
-        other => {
-            warn!(event = ?other, "Failed to read realm config for token revocation");
-            Err(ArunaBearerError::RevocationUnavailable)
+}
+
+fn now_secs(now_ms: u64) -> u64 {
+    now_ms / 1000
+}
+
+/// Whether the realm's replicated revocation set denies this token hash. This is the realm-wide
+/// authority; a realm without a config document denies, a failed read is unavailable.
+#[derive(Debug, PartialEq)]
+pub struct TokenRevokedOperation {
+    realm_id: RealmId,
+    token_hash: String,
+    now_ms: u64,
+}
+
+impl TokenRevokedOperation {
+    pub fn new(realm_id: RealmId, token_hash: &str) -> Self {
+        Self {
+            realm_id,
+            token_hash: token_hash.to_string(),
+            now_ms: 0,
         }
     }
 }
 
-/// Whether a token still authorizes `user_id`, as the request checks did: not expired, not
-/// revoked, issued after any cutoff of the user or of the linked login, and that link still
-/// resolving to the user. A failed read is reported as unavailable, never as a verdict.
-pub async fn grant_valid(
-    storage: &StorageHandle,
-    grant: &TokenGrant,
-    user_id: &UserId,
-) -> Result<bool, ArunaBearerError> {
-    if unix_timestamp_secs() > grant.expires_at_secs
-        || realm_token_revoked(storage, grant.issuer, &grant.token_hash).await?
-    {
-        return Ok(false);
+impl Operation for TokenRevokedOperation {
+    type Output = bool;
+    type Error = ArunaBearerError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
-    let cut = |cutoff: Option<u64>| cutoff.is_some_and(|cutoff| grant.issued_at_secs < cutoff);
-    if cut(realm_user_cutoff(storage, grant.issuer, user_id).await?) {
-        return Ok(false);
+
+    fn first(&mut self) -> Result<Next<bool>, ArunaBearerError> {
+        Ok(Next::Call(config_call(self.realm_id)))
     }
-    let Some(via) = grant.via.as_ref() else {
-        return Ok(true);
-    };
-    let linked = realm_linked_owner(storage, via).await? == Some(*user_id);
-    Ok(linked && !cut(realm_user_cutoff(storage, grant.issuer, via).await?))
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
+        let revoked = read_config(value(result)?)?
+            .is_none_or(|config| config.token_revoked(&self.token_hash, now_secs(self.now_ms)));
+        Ok(Next::Done(revoked))
+    }
 }
 
-/// The user's cutoff in the realm's replicated revocation set, read like the token revocation.
-/// The local account `via` is linked to: exactly one claim, by an active account that still
-/// lists the link without a second login of that realm.
-pub async fn realm_linked_owner(
-    storage: &StorageHandle,
-    via: &UserId,
-) -> Result<Option<UserId>, ArunaBearerError> {
-    let read = |key_space: &str, key: Vec<u8>| {
-        storage.send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-    };
-    let value = |event: Event| match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        _ => Err(ArunaBearerError::RevocationUnavailable),
-    };
-    let claims = value(read(FEDERATION_KEYSPACE, alias_claims_key(via)).await)?
-        .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
-        .transpose()
-        .map_err(|_| ArunaBearerError::RevocationUnavailable)?
-        .unwrap_or_default();
-    let Some(owner) = alias_owner(&claims) else {
-        return Ok(None);
-    };
-    let user = value(read(USER_KEYSPACE, owner.to_bytes()).await)?
-        .map(|bytes| User::from_bytes(&bytes))
-        .transpose()
-        .map_err(|_| ArunaBearerError::RevocationUnavailable)?;
-    Ok(user
-        .filter(|user| !user.is_deactivated() && user.linked_login(via))
-        .map(|_| owner))
-}
-
-pub async fn realm_user_cutoff(
-    storage: &StorageHandle,
+/// The user's cutoff in the realm's replicated revocation set, in Unix seconds.
+#[derive(Debug, PartialEq)]
+pub struct UserCutoffOperation {
     realm_id: RealmId,
-    user_id: &UserId,
-) -> Result<Option<u64>, ArunaBearerError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => Ok(config.user_cutoff(user_id, unix_timestamp_secs())),
-            Err(error) => {
-                warn!(error = %error, "Failed to decode realm config for user cutoff");
-                Err(ArunaBearerError::RevocationUnavailable)
-            }
-        },
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        other => {
-            warn!(event = ?other, "Failed to read realm config for user cutoff");
-            Err(ArunaBearerError::RevocationUnavailable)
+    user_id: UserId,
+    now_ms: u64,
+}
+
+impl UserCutoffOperation {
+    pub fn new(realm_id: RealmId, user_id: &UserId) -> Self {
+        Self {
+            realm_id,
+            user_id: *user_id,
+            now_ms: 0,
         }
+    }
+}
+
+impl Operation for UserCutoffOperation {
+    type Output = Option<u64>;
+    type Error = ArunaBearerError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<Option<u64>>, ArunaBearerError> {
+        Ok(Next::Call(config_call(self.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<u64>>, ArunaBearerError> {
+        let cutoff = read_config(value(result)?)?
+            .and_then(|config| config.user_cutoff(&self.user_id, now_secs(self.now_ms)));
+        Ok(Next::Done(cutoff))
     }
 }
 
 /// Whether this realm's replicated record of the account marks it deactivated; an account
 /// without a record here, such as a federated one, is not.
-pub async fn account_deactivated(
-    storage: &StorageHandle,
-    user_id: &UserId,
-) -> Result<bool, ArunaBearerError> {
-    let read = StorageEffect::Read {
-        key_space: USER_KEYSPACE.to_string(),
-        key: user_id.to_bytes().into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+#[derive(Debug, PartialEq)]
+pub struct AccountDeactivatedOperation {
+    user_id: UserId,
+}
+
+impl AccountDeactivatedOperation {
+    pub fn new(user_id: &UserId) -> Self {
+        Self { user_id: *user_id }
+    }
+}
+
+impl Operation for AccountDeactivatedOperation {
+    type Output = bool;
+    type Error = ArunaBearerError;
+
+    fn first(&mut self) -> Result<Next<bool>, ArunaBearerError> {
+        Ok(Next::Call(aruna_core::rows::read_row(
+            USER_KEYSPACE,
+            self.user_id.to_bytes(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
+        let user = value(result)?
             .map(|bytes| User::from_bytes(&bytes))
             .transpose()
-            .map(|user| user.is_some_and(|user| user.is_deactivated()))
-            .map_err(|_| ArunaBearerError::RevocationUnavailable),
-        _ => Err(ArunaBearerError::RevocationUnavailable),
+            .map_err(|_| ArunaBearerError::RevocationUnavailable)?;
+        Ok(Next::Done(user.is_some_and(|user| user.is_deactivated())))
     }
 }
 
-pub async fn validate_bearer_token<S>(
-    state: &S,
-    token: &str,
-) -> Result<AuthContext, ArunaBearerError>
-where
-    S: ArunaValidationState + ?Sized,
-{
-    let claims = decode_bearer_token(state, token).await?;
-    Ok(claims.try_into()?)
+/// The local account `via` is linked to: exactly one claim, by an active account that still
+/// lists the link without a second login of that realm.
+#[derive(Debug, PartialEq)]
+struct LinkedOwnerOperation {
+    via: UserId,
+    owner: Option<UserId>,
 }
 
-pub async fn decode_bearer_token<S>(state: &S, token: &str) -> Result<TokenClaims, ArunaBearerError>
-where
-    S: ArunaValidationState + ?Sized,
-{
-    let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-
-    let issuer = match (
-        unvalidated_claims.claims.issuer_pubkey.as_deref(),
-        unvalidated_claims.claims.delegation_signature.is_some(),
-    ) {
-        (Some(issuer_pubkey), true) => issuer_pubkey,
-        _ => &unvalidated_claims.claims.iss,
-    };
-    // Only trusted realm or delegated issuers may populate the bounded cache;
-    // untrusted issuers are verified with an ephemeral key that is discarded.
-    let decoding_key = if validate_issuer_trust(state, &unvalidated_claims.claims)
-        .await
-        .is_ok()
-    {
-        state.issuer_decoding_key(issuer).await?
-    } else {
-        bearer_decoding_key(issuer)?
-    };
-    let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::new(Algorithm::EdDSA))?;
-
-    validate_bearer_claims(state, &claims.claims).await?;
-
-    // The issuing realm from the verified claims, so a foreign token is judged
-    // by its origin realm's revocation set and not by the serving node's.
-    let issuer_realm =
-        RealmId::from_base64(&claims.claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
-    let token_hash = bearer_token_hash(token);
-    if state.is_token_revoked(&issuer_realm, &token_hash).await? {
-        return Err(ArunaBearerError::TokenRevoked);
+impl LinkedOwnerOperation {
+    fn new(via: UserId) -> Self {
+        Self { via, owner: None }
     }
-    let user_id = UserId::from_string(&claims.claims.sub)?;
-    if state
-        .user_cutoff(&issuer_realm, &user_id)
-        .await?
-        .is_some_and(|cutoff| claims.claims.iat < cutoff)
-    {
-        return Err(ArunaBearerError::TokenRevoked);
+}
+
+impl Operation for LinkedOwnerOperation {
+    type Output = Option<UserId>;
+    type Error = ArunaBearerError;
+
+    fn first(&mut self) -> Result<Next<Option<UserId>>, ArunaBearerError> {
+        Ok(Next::Call(aruna_core::rows::read_row(
+            FEDERATION_KEYSPACE,
+            alias_claims_key(&self.via),
+        )))
     }
-    // A linked login is cut off with either id and lives only while its link still resolves.
-    if let Some(via) = claims.claims.via.as_deref() {
-        let via = UserId::from_string(via)?;
-        let cut_off = state
-            .user_cutoff(&issuer_realm, &via)
-            .await?
-            .is_some_and(|cutoff| claims.claims.iat < cutoff);
-        if cut_off || state.linked_owner(&issuer_realm, &via).await? != Some(user_id) {
-            return Err(ArunaBearerError::TokenRevoked);
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<UserId>>, ArunaBearerError> {
+        let row = value(result)?;
+        let unreadable = |_| ArunaBearerError::RevocationUnavailable;
+        let Some(owner) = self.owner else {
+            let claims = row
+                .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
+                .transpose()
+                .map_err(|_| ArunaBearerError::RevocationUnavailable)?
+                .unwrap_or_default();
+            let Some(owner) = alias_owner(&claims) else {
+                return Ok(Next::Done(None));
+            };
+            self.owner = Some(owner);
+            return Ok(Next::Call(aruna_core::rows::read_row(
+                USER_KEYSPACE,
+                owner.to_bytes(),
+            )));
+        };
+        let user = row
+            .map(|bytes| User::from_bytes(&bytes))
+            .transpose()
+            .map_err(unreadable)?;
+        let active = user.is_some_and(|user| !user.is_deactivated() && user.linked_login(&self.via));
+        Ok(Next::Done(active.then_some(owner)))
+    }
+}
+
+fn linked_owner(result: IoResult) -> Result<Option<UserId>, ArunaBearerError> {
+    result.child::<Option<UserId>, ArunaBearerError>()?
+}
+
+/// Whether a token still authorizes `user_id`, as the request checks did: not expired, not
+/// revoked, issued after any cutoff of the user or of the linked login, and that link still
+/// resolving to the user. A failed read is reported as unavailable, never as a verdict.
+#[derive(Debug, PartialEq)]
+pub struct GrantValidOperation {
+    grant: TokenGrant,
+    user_id: UserId,
+    now_ms: u64,
+    via_valid: bool,
+}
+
+impl GrantValidOperation {
+    pub fn new(grant: &TokenGrant, user_id: &UserId) -> Self {
+        Self {
+            grant: grant.clone(),
+            user_id: *user_id,
+            now_ms: 0,
+            via_valid: false,
+        }
+    }
+}
+
+impl Operation for GrantValidOperation {
+    type Output = bool;
+    type Error = ArunaBearerError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, ArunaBearerError> {
+        if now_secs(self.now_ms) > self.grant.expires_at_secs {
+            return Ok(Next::Done(false));
+        }
+        Ok(Next::Call(config_call(self.grant.issuer)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
+        if self.via_valid {
+            let owner = linked_owner(result)?;
+            return Ok(Next::Done(owner == Some(self.user_id)));
+        }
+        let Some(config) = read_config(value(result)?)? else {
+            return Ok(Next::Done(false));
+        };
+        let now = now_secs(self.now_ms);
+        let issued = self.grant.issued_at_secs;
+        let cut = |user: &UserId| config.user_cutoff(user, now).is_some_and(|at| issued < at);
+        if config.token_revoked(&self.grant.token_hash, now) || cut(&self.user_id) {
+            return Ok(Next::Done(false));
+        }
+        let Some(via) = self.grant.via else {
+            return Ok(Next::Done(true));
+        };
+        if cut(&via) {
+            return Ok(Next::Done(false));
+        }
+        self.via_valid = true;
+        Ok(Next::Call(IoCall::child(LinkedOwnerOperation::new(via))))
+    }
+}
+
+/// Which realms' tokens this node accepts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IssuerTrust {
+    Listed(HashSet<RealmId>),
+    /// The trusted realm list stored on this node; an unreadable list trusts no realm.
+    Stored,
+}
+
+/// How a token's revocation state is judged.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RevocationCheck {
+    /// The issuing realm's replicated config decides, with its user cutoffs.
+    Realm,
+    /// These token hashes are revoked; no cutoffs apply.
+    Listed(BTreeSet<String>),
+    /// Nothing counts as revoked, so a revocation can still read the token's claims.
+    Skipped,
+}
+
+/// What a node checks a bearer token against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenChecks {
+    pub trust: IssuerTrust,
+    pub revocation: RevocationCheck,
+    /// The realm whose linked logins this node can resolve.
+    pub linked_realm: Option<RealmId>,
+    pub keys: Option<Arc<IssuerKeyCache>>,
+}
+
+#[derive(PartialEq)]
+enum DecodeStage {
+    Trust,
+    Config,
+    Link,
+}
+
+/// Verifies a bearer token and answers its claims when it is still valid. The operation never
+/// prints the token.
+#[derive(PartialEq)]
+pub struct DecodeTokenOperation {
+    token: String,
+    checks: TokenChecks,
+    now_ms: u64,
+    stage: DecodeStage,
+    claims: Option<TokenClaims>,
+}
+
+impl std::fmt::Debug for DecodeTokenOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeTokenOperation").finish_non_exhaustive()
+    }
+}
+
+type DecodeTurn = Result<Next<TokenClaims>, ArunaBearerError>;
+
+impl DecodeTokenOperation {
+    pub fn new(token: &str, checks: TokenChecks) -> Self {
+        Self {
+            token: token.to_string(),
+            checks,
+            now_ms: 0,
+            stage: DecodeStage::Trust,
+            claims: None,
         }
     }
 
-    Ok(claims.claims)
+    /// Checks the signature and the claims, then the revocation state.
+    fn verify(&mut self, trusted: &HashSet<RealmId>) -> DecodeTurn {
+        let unverified = insecure_decode::<TokenClaims>(&self.token)?.claims;
+        let issuer = match (
+            unverified.issuer_pubkey.as_deref(),
+            unverified.delegation_signature.is_some(),
+        ) {
+            (Some(issuer_pubkey), true) => issuer_pubkey,
+            _ => &unverified.iss,
+        };
+        // Only trusted realm or delegated issuers may populate the bounded cache;
+        // untrusted issuers are verified with an ephemeral key that is discarded.
+        let key = match (&self.checks.keys, issuer_trusted(trusted, &unverified)) {
+            (Some(keys), Ok(())) => keys.get_or_insert(issuer)?,
+            _ => bearer_decoding_key(issuer)?,
+        };
+        let validation = Validation::new(Algorithm::EdDSA);
+        let claims = decode::<TokenClaims>(&self.token, &key, &validation)?.claims;
+        validate_bearer_claims(trusted, now_secs(self.now_ms), &claims)?;
+        // The issuing realm from the verified claims, so a foreign token is judged
+        // by its origin realm's revocation set and not by the serving node's.
+        let issuer_realm = issuer_realm(&claims)?;
+        let turn = match &self.checks.revocation {
+            RevocationCheck::Realm => {
+                self.claims = Some(claims);
+                self.stage = DecodeStage::Config;
+                return Ok(Next::Call(config_call(issuer_realm)));
+            }
+            RevocationCheck::Listed(hashes) if hashes.contains(&bearer_token_hash(&self.token)) => {
+                Err(ArunaBearerError::TokenRevoked)
+            }
+            _ => self.check_link(claims),
+        };
+        turn
+    }
+
+    /// Applies the issuing realm's revocations and the cutoffs of both ids.
+    fn config_read(&mut self, config: Option<RealmConfigDocument>) -> DecodeTurn {
+        let claims = self.claims.take().ok_or(ArunaBearerError::RevocationUnavailable)?;
+        let config = config.ok_or(ArunaBearerError::TokenRevoked)?;
+        let now = now_secs(self.now_ms);
+        if config.token_revoked(&bearer_token_hash(&self.token), now) {
+            return Err(ArunaBearerError::TokenRevoked);
+        }
+        let cut = |user: &UserId| {
+            (config.user_cutoff(user, now)).is_some_and(|cutoff| claims.iat < cutoff)
+        };
+        let via = claims.via.as_deref().map(UserId::from_string).transpose()?;
+        if cut(&UserId::from_string(&claims.sub)?) || via.as_ref().is_some_and(cut) {
+            return Err(ArunaBearerError::TokenRevoked);
+        }
+        self.check_link(claims)
+    }
+
+    /// A linked login lives only while its link still resolves to the token's user.
+    fn check_link(&mut self, claims: TokenClaims) -> DecodeTurn {
+        UserId::from_string(&claims.sub)?;
+        let Some(via) = claims.via.as_deref() else {
+            return Ok(Next::Done(claims));
+        };
+        let via = UserId::from_string(via)?;
+        if self.checks.linked_realm != Some(issuer_realm(&claims)?) {
+            return Err(ArunaBearerError::TokenRevoked);
+        }
+        self.claims = Some(claims);
+        self.stage = DecodeStage::Link;
+        Ok(Next::Call(IoCall::child(LinkedOwnerOperation::new(via))))
+    }
 }
 
-async fn validate_issuer_trust<S>(state: &S, claims: &TokenClaims) -> Result<(), ArunaBearerError>
-where
-    S: ArunaValidationState + ?Sized,
-{
-    let realm_id =
-        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
-    if !state.is_trusted_realm(&realm_id).await {
+impl Operation for DecodeTokenOperation {
+    type Output = TokenClaims;
+    type Error = ArunaBearerError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> DecodeTurn {
+        match self.checks.trust.clone() {
+            IssuerTrust::Listed(trusted) => self.verify(&trusted),
+            IssuerTrust::Stored => Ok(Next::Call(aruna_core::rows::read_row(
+                API_STATE_KEYSPACE,
+                REALMS_LIST_KEY,
+            ))),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> DecodeTurn {
+        match self.stage {
+            DecodeStage::Trust => {
+                let trusted = stored_realms(value(result));
+                self.verify(&trusted)
+            }
+            DecodeStage::Config => self.config_read(read_config(value(result)?)?),
+            DecodeStage::Link => {
+                let owner = linked_owner(result)?;
+                let claims = self.claims.take().ok_or(ArunaBearerError::TokenRevoked)?;
+                match owner == Some(UserId::from_string(&claims.sub)?) {
+                    true => Ok(Next::Done(claims)),
+                    false => Err(ArunaBearerError::TokenRevoked),
+                }
+            }
+        }
+    }
+}
+
+/// The stored trusted realm list; a failed read or an undecodable list trusts no realm.
+fn stored_realms(row: Result<Option<Value>, IoError>) -> HashSet<RealmId> {
+    let realms = row.map_err(|error| error.to_string()).and_then(|row| {
+        row.map(|bytes| postcard::from_bytes(&bytes).map_err(|error| error.to_string()))
+            .transpose()
+    });
+    match realms {
+        Ok(realms) => realms.unwrap_or_default(),
+        Err(error) => {
+            warn!(error = %error, "Failed to read metadata trusted realms state");
+            HashSet::new()
+        }
+    }
+}
+
+fn issuer_realm(claims: &TokenClaims) -> Result<RealmId, ArunaBearerError> {
+    RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)
+}
+
+/// The auth context of validated claims.
+pub fn claims_auth(claims: TokenClaims) -> Result<AuthContext, ArunaBearerError> {
+    Ok(claims.try_into()?)
+}
+
+fn issuer_trusted(
+    trusted: &HashSet<RealmId>,
+    claims: &TokenClaims,
+) -> Result<(), ArunaBearerError> {
+    if !trusted.contains(&issuer_realm(claims)?) {
         return Err(ArunaBearerError::RealmNotTrusted);
     }
     match (&claims.delegation_signature, &claims.issuer_pubkey) {
@@ -302,14 +497,12 @@ where
     }
 }
 
-pub async fn validate_bearer_claims<S>(
-    state: &S,
+/// Judges verified claims at `now`: their lifetime, and that a trusted realm issued them.
+pub fn validate_bearer_claims(
+    trusted: &HashSet<RealmId>,
+    now: u64,
     claims: &TokenClaims,
-) -> Result<(), ArunaBearerError>
-where
-    S: ArunaValidationState + ?Sized,
-{
-    let now = state.now_secs();
+) -> Result<(), ArunaBearerError> {
     if now > claims.exp {
         return Err(ArunaBearerError::Expired);
     }
@@ -319,8 +512,7 @@ where
     {
         return Err(ArunaBearerError::LifetimeTooLong);
     }
-
-    validate_issuer_trust(state, claims).await
+    issuer_trusted(trusted, claims)
 }
 
 fn verify_realm_delegation(
@@ -368,6 +560,13 @@ impl std::fmt::Debug for IssuerKeyCache {
     }
 }
 
+/// Two caches are the same only when they are one cache.
+impl PartialEq for IssuerKeyCache {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
 impl Default for IssuerKeyCache {
     fn default() -> Self {
         Self::new()
@@ -387,11 +586,12 @@ impl IssuerKeyCache {
         }
     }
 
-    pub async fn get_or_insert(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        let mut entries = self.entries.lock().await;
+    fn entries(&self) -> std::sync::MutexGuard<'_, LruCache<String, CachedIssuerKey>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn get_or_insert(&self, issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerError> {
+        let mut entries = self.entries();
         if let Some(entry) = entries.get(issuer_pubkey).cloned() {
             if entry.inserted_at.elapsed() < self.ttl {
                 return Ok(entry.key);
@@ -409,369 +609,15 @@ impl IssuerKeyCache {
         Ok(key)
     }
 
-    pub async fn len(&self) -> usize {
-        self.entries.lock().await.len()
+    pub fn len(&self) -> usize {
+        self.entries().len()
     }
 
-    pub async fn is_empty(&self) -> bool {
-        self.entries.lock().await.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.entries().is_empty()
     }
 }
 
 #[cfg(test)]
-mod tests {
-
-    #[tokio::test]
-    async fn checks_saved_grant() {
-        // A realm without its config denies, like a revoked token; an expired grant too.
-        let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let realm = RealmId::from_bytes([1; 32]);
-        let user = UserId::local(ulid::Ulid::from_parts(5, 5), realm);
-        let grant = TokenGrant {
-            token_hash: "hash".to_string(),
-            issuer: realm,
-            issued_at_secs: 1,
-            expires_at_secs: u64::MAX,
-            via: None,
-        };
-        assert!(!grant_valid(&storage, &grant, &user).await.unwrap());
-        let expired = TokenGrant {
-            expires_at_secs: 1,
-            ..grant
-        };
-        assert!(!grant_valid(&storage, &expired, &user).await.unwrap());
-    }
-    use super::*;
-    use aruna_core::UserId;
-    use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::identity::auth::Actor;
-    use base64::Engine;
-    use ed25519_dalek::SigningKey;
-
-    fn pubkey_b64(key: &SigningKey) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
-    }
-
-    #[tokio::test]
-    async fn evicts_beyond_capacity() {
-        let cache = IssuerKeyCache::with_limits(2, KEY_CACHE_TTL);
-        for _ in 0..5 {
-            let key = generate_signing_key();
-            cache.get_or_insert(&pubkey_b64(&key)).await.unwrap();
-        }
-        assert_eq!(cache.len().await, 2);
-    }
-
-    async fn backdate_entry(cache: &IssuerKeyCache, pubkey: &str, age: Duration) -> Instant {
-        let inserted_at = Instant::now().checked_sub(age).unwrap();
-        cache
-            .entries
-            .lock()
-            .await
-            .peek_mut(pubkey)
-            .unwrap()
-            .inserted_at = inserted_at;
-        inserted_at
-    }
-
-    async fn entry_inserted_at(cache: &IssuerKeyCache, pubkey: &str) -> Instant {
-        cache.entries.lock().await.peek(pubkey).unwrap().inserted_at
-    }
-
-    #[tokio::test]
-    async fn refreshes_expired_entries() {
-        let ttl = Duration::from_secs(3600);
-        let cache = IssuerKeyCache::with_limits(4, ttl);
-        let key = generate_signing_key();
-        let pubkey = pubkey_b64(&key);
-        cache.get_or_insert(&pubkey).await.unwrap();
-
-        // Just inside the TTL: served from cache, entry untouched.
-        let inside = backdate_entry(&cache, &pubkey, ttl - Duration::from_secs(60)).await;
-        cache.get_or_insert(&pubkey).await.unwrap();
-        assert_eq!(entry_inserted_at(&cache, &pubkey).await, inside);
-
-        // Just past the TTL: refreshed in place without accumulating.
-        let expired = backdate_entry(&cache, &pubkey, ttl + Duration::from_secs(1)).await;
-        cache.get_or_insert(&pubkey).await.unwrap();
-        assert!(entry_inserted_at(&cache, &pubkey).await > expired);
-        assert_eq!(cache.len().await, 1);
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_pubkey() {
-        let cache = IssuerKeyCache::new();
-        assert!(cache.get_or_insert("not-base64!!").await.is_err());
-        assert!(cache.is_empty().await);
-    }
-
-    #[tokio::test]
-    async fn missing_config_denies() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(
-            directory.path().to_str().expect("valid storage path"),
-        )
-        .unwrap();
-        let realm_id = RealmId::from_bytes([7; 32]);
-
-        assert!(
-            realm_token_revoked(&storage, realm_id, "token-hash")
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn unreadable_config_errors() {
-        // An undecodable document is a failed read, not an absent one: it must
-        // surface as unavailable instead of silently meaning "revoked".
-        let directory = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(
-            directory.path().to_str().expect("valid storage path"),
-        )
-        .unwrap();
-        let realm_id = RealmId::from_bytes([11; 32]);
-        let target = DocumentTarget::RealmConfig { realm_id };
-        storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: vec![0xff; 8].into(),
-                txn_id: None,
-            })
-            .await;
-
-        assert!(matches!(
-            realm_token_revoked(&storage, realm_id, "token-hash").await,
-            Err(ArunaBearerError::RevocationUnavailable)
-        ));
-    }
-
-    /// Judges claims against a fixed instant, so lifetime and skew bounds are
-    /// decided by the fixture rather than by when the test happens to run.
-    struct SkewState {
-        now: u64,
-    }
-
-    const FIXED_NOW: u64 = 1_800_000_000;
-
-    #[async_trait]
-    impl ArunaValidationState for SkewState {
-        async fn is_token_revoked(
-            &self,
-            _realm_id: &RealmId,
-            _token_hash: &str,
-        ) -> Result<bool, ArunaBearerError> {
-            Ok(false)
-        }
-
-        async fn user_cutoff(
-            &self,
-            _realm_id: &RealmId,
-            _user_id: &aruna_core::UserId,
-        ) -> Result<Option<u64>, ArunaBearerError> {
-            Ok(None)
-        }
-
-        async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {
-            true
-        }
-
-        fn now_secs(&self) -> u64 {
-            self.now
-        }
-    }
-
-    fn lifetime_claims(iat: u64, exp: u64) -> TokenClaims {
-        TokenClaims {
-            sub: UserId::nil(RealmId::from_bytes([12; 32])).to_string(),
-            iss: RealmId::from_bytes([12; 32]).to_base64(),
-            iat,
-            exp,
-            jti: "token-id".to_string(),
-            sid: None,
-            session_kind: None,
-            restrictions: None,
-            issuer_pubkey: None,
-            delegation_signature: None,
-            name: None,
-            via: None,
-            auth_time: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_aged_token() {
-        // An overlong token must stay rejected as it ages: the bound is the
-        // signed lifetime, not the validity still remaining.
-        let state = SkewState { now: FIXED_NOW };
-        let max = aruna_core::auth::MAX_TOKEN_LIFETIME;
-        let claims = lifetime_claims(FIXED_NOW - max, FIXED_NOW + 600);
-
-        assert!(matches!(
-            validate_bearer_claims(&state, &claims).await,
-            Err(ArunaBearerError::LifetimeTooLong)
-        ));
-        // A token signed within the bound still validates.
-        validate_bearer_claims(&state, &lifetime_claims(FIXED_NOW, FIXED_NOW + 600))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn rejects_future_issuance() {
-        let state = SkewState { now: FIXED_NOW };
-        let skewed = FIXED_NOW + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
-
-        assert!(matches!(
-            validate_bearer_claims(&state, &lifetime_claims(skewed, skewed + 600)).await,
-            Err(ArunaBearerError::LifetimeTooLong)
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_expired_claims() {
-        // Expiry is decided by the injected clock, not by real time passing.
-        let state = SkewState { now: FIXED_NOW };
-        let claims = lifetime_claims(FIXED_NOW - 1200, FIXED_NOW - 600);
-
-        assert!(matches!(
-            validate_bearer_claims(&state, &claims).await,
-            Err(ArunaBearerError::Expired)
-        ));
-    }
-
-    #[tokio::test]
-    async fn config_recovery_allows() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(
-            directory.path().to_str().expect("valid storage path"),
-        )
-        .unwrap();
-        let realm_id = RealmId::from_bytes([8; 32]);
-        assert!(
-            realm_token_revoked(&storage, realm_id, "token-hash")
-                .await
-                .unwrap()
-        );
-
-        let target = DocumentTarget::RealmConfig { realm_id };
-        let signing_key = SigningKey::from_bytes(&[9; 32]);
-        let actor = Actor {
-            node_id: iroh::PublicKey::from_bytes(signing_key.verifying_key().as_bytes()).unwrap(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let value = RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-            .to_bytes(&actor)
-            .unwrap();
-        assert!(matches!(
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: target.storage_keyspace().to_string(),
-                    key: target.storage_key(),
-                    value: value.into(),
-                    txn_id: None,
-                })
-                .await,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-
-        assert!(
-            !realm_token_revoked(&storage, realm_id, "token-hash")
-                .await
-                .unwrap()
-        );
-    }
-
-    /// Answers a fixed link owner and an optional cutoff for one user.
-    struct LinkedState {
-        owner: Option<UserId>,
-        cutoff: Option<(UserId, u64)>,
-    }
-
-    #[async_trait]
-    impl ArunaValidationState for LinkedState {
-        async fn is_token_revoked(
-            &self,
-            _realm_id: &RealmId,
-            _token_hash: &str,
-        ) -> Result<bool, ArunaBearerError> {
-            Ok(false)
-        }
-
-        async fn user_cutoff(
-            &self,
-            _realm_id: &RealmId,
-            user_id: &UserId,
-        ) -> Result<Option<u64>, ArunaBearerError> {
-            Ok(self
-                .cutoff
-                .filter(|(cut, _)| cut == user_id)
-                .map(|(_, cutoff)| cutoff))
-        }
-
-        async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {
-            true
-        }
-
-        async fn linked_owner(
-            &self,
-            _realm_id: &RealmId,
-            _via: &UserId,
-        ) -> Result<Option<UserId>, ArunaBearerError> {
-            Ok(self.owner)
-        }
-    }
-
-    #[tokio::test]
-    async fn linked_login_checked() {
-        // A linked session lives only while its link resolves and neither id is cut off.
-        use crate::auth::create_token::{CreateTokenConfig, mint_token};
-        use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
-        let key = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
-        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
-        let local = UserId::local(ulid::Ulid::from_bytes([1; 16]), realm_id);
-        let via = UserId::new(
-            ulid::Ulid::from_bytes([2; 16]),
-            RealmId::from_bytes([14; 32]),
-        );
-        let now = unix_timestamp_secs();
-        let token = mint_token(&CreateTokenConfig {
-            time: now,
-            expiry: Some(now + 600),
-            user_id: local,
-            realm_id,
-            node_capabilities: NodeCapabilities::management_node(key).unwrap(),
-            session: Some(SessionRef {
-                sid: ulid::Ulid::from_bytes([3; 16]).to_string(),
-                kind: SessionKind::Federated,
-                name: None,
-                via: Some(via),
-            }),
-            restrictions: None,
-        })
-        .unwrap();
-        let linked = LinkedState {
-            owner: Some(local),
-            cutoff: None,
-        };
-        let claims = decode_bearer_token(&linked, &token).await.unwrap();
-        assert_eq!(claims.via, Some(via.to_string()));
-        let unlinked = LinkedState {
-            owner: None,
-            cutoff: None,
-        };
-        let refused = decode_bearer_token(&unlinked, &token).await;
-        assert!(matches!(refused, Err(ArunaBearerError::TokenRevoked)));
-        for cut in [via, local] {
-            let state = LinkedState {
-                owner: Some(local),
-                cutoff: Some((cut, now + 1)),
-            };
-            let refused = decode_bearer_token(&state, &token).await;
-            assert!(matches!(refused, Err(ArunaBearerError::TokenRevoked)));
-        }
-    }
-}
+#[path = "bearer_token_tests.rs"]
+mod tests;
