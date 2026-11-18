@@ -47,7 +47,7 @@ use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::state::ClaimOutcome;
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{

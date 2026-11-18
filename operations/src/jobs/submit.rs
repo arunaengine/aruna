@@ -1123,7 +1123,7 @@ mod tests {
             Err(SubmitJobError::ActiveJobLimit { limit: 1 })
         );
 
-        let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
+        let crate::jobs::store::job_calls::ClaimOutcome::Claimed(claimed) =
             crate::jobs::store::test_calls::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.job_id, first.job_id);
 
-        let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
+        let crate::jobs::store::job_calls::ClaimOutcome::Claimed(claimed) =
             crate::jobs::store::test_calls::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()

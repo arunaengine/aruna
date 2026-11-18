@@ -50,7 +50,7 @@ use aruna_operations::connectors::create_connector::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::state::ClaimOutcome;
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;

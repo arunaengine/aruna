@@ -180,13 +180,12 @@ impl Operation for WakeUnlockedOperation {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
-    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::park_job;
     use crate::jobs::store::test_calls::{claim_job, read_job_record};

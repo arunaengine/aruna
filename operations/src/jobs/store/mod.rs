@@ -40,12 +40,10 @@ use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
-pub mod attempt;
 pub mod attempt_intent;
 pub mod control_mutation;
 pub mod job_calls;
 pub mod job_rows;
-pub mod key_wait;
 pub mod list_jobs;
 pub mod mark_start;
 pub mod mutation;
@@ -53,7 +51,6 @@ pub mod park_wake;
 pub mod remote_wait;
 pub mod row_calls;
 pub mod run_delete;
-pub mod state;
 pub mod store_call;
 
 use mutation::{MutateJobOperation, NoGuard};
@@ -136,6 +133,8 @@ fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
+#[cfg(test)]
+mod key_wait_tests;
 #[cfg(test)]
 pub(crate) mod test_calls;
 #[cfg(test)]

@@ -972,7 +972,7 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::driven::{current_event, start_push};
-    use aruna_operations::jobs::store::attempt::CancelRequestOutcome;
+    use aruna_operations::jobs::store::job_calls::CancelRequestOutcome;
     use crate::job_calls::set_cancel_requested;
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;
