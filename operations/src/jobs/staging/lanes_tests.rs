@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::jobs::executor::JobContext;
-use crate::jobs::host::run_staging_job;
+use crate::tasks::job_host::run_staging_job;
 use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_connector, test_run};
 use aruna_core::events::GroupResult;
