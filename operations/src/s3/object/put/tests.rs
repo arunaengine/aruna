@@ -496,3 +496,455 @@ fn cut_publish_reconciles() {
     assert_eq!(calls.len(), 1);
 }
 
+#[tokio::test]
+pub async fn test_put_object() {
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root.clone(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+
+    let data = b"hello, world!";
+    let stream = tokio_util::io::ReaderStream::new(&data[..]);
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = net_handle.node_id();
+    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let preassigned_version_id = Ulid::generate();
+    let put_config = PutObjectConfig {
+        user_id,
+        group_id,
+        realm_id,
+        node_id,
+        request: PutObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "some-file.txt".to_string(),
+            content_length: Some(data.len() as u64),
+            body: Some(BackendStream::new(stream)),
+        },
+        expected_checksums: vec![],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: Some(preassigned_version_id),
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(group_id),
+    };
+    let put_operation = PutObjectOperation::new(put_config);
+
+    let context = DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+    // Jesus, Take the Wheel!
+    let result = drive(put_operation, &context).await.unwrap();
+
+    assert!(exists(result.location.get_full_path().unwrap()).unwrap());
+    assert_eq!(
+        read_to_string(result.location.get_full_path().unwrap()).unwrap(),
+        String::from_utf8_lossy(&data[..]).to_string()
+    );
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(blob_location_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: BlobLocationKey::from_blake3(
+                result.location.get_blake3().unwrap(),
+                EncodingClass::Raw,
+                result.location.backend.clone(),
+            )
+            .unwrap()
+            .to_bytes()
+            .into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing blob location entry");
+    };
+    assert_eq!(
+        BackendLocation::from_bytes(blob_location_value.as_ref()).unwrap(),
+        result.location.clone()
+    );
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(blob_head_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: BlobHeadKey::new("mybucket", "some-file.txt")
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing blob head entry");
+    };
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(result.version_id, 1)
+    );
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(blob_version_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: VersionKey::new("mybucket", "some-file.txt", result.version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing blob version entry");
+    };
+    let blob_version = BlobVersion::from_bytes(blob_version_value.as_ref()).unwrap();
+    assert!(blob_version.is_materialized());
+    assert_eq!(
+        blob_version.blob_hash(),
+        Some(&result.location.get_blake3().unwrap().try_into().unwrap())
+    );
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(hash_path_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: PATHS_INDEX_KEYSPACE.to_string(),
+            key: HashIndex::new(
+                result.location.get_blake3().unwrap().try_into().unwrap(),
+                result.version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "mybucket",
+                "some-file.txt",
+            )
+            .to_bytes()
+            .unwrap()
+            .into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing hash path index entry");
+    };
+    assert!(hash_path_value.is_empty());
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(dht_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DHT_KEYSPACE.to_string(),
+            key: result.location.get_blake3().unwrap().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing DHT blob registration");
+    };
+    let entries = decode_entries(dht_value.as_ref()).expect("decode DHT entries");
+    assert!(entries.iter().any(|entry| {
+        entry.realm_id == realm_id
+            && entry.publisher == context.net_handle.as_ref().unwrap().node_id()
+            && entry.value.is_empty()
+    }));
+
+    let retry_data = b"different content";
+    let retry = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: Some(retry_data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &retry_data[..],
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: Some(preassigned_version_id),
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.location, result.location);
+    assert_eq!(retry.version_id, result.version_id);
+    // Only the first put committed; the retry hands the same version back.
+    assert!(!result.replayed && retry.replayed);
+    assert_eq!(
+        read_to_string(retry.location.get_full_path().unwrap()).unwrap(),
+        String::from_utf8_lossy(&data[..]).to_string()
+    );
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(blob_head_value),
+        ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: BlobHeadKey::new("mybucket", "some-file.txt")
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing blob head entry");
+    };
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(result.version_id, 1)
+    );
+
+    // A create-only write replays its own version but never replaces a live head.
+    let create = |version_id| {
+        let body = tokio_util::io::ReaderStream::new(&retry_data[..]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: Some(retry_data.len() as u64),
+                body: Some(BackendStream::new(body)),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: Some(version_id),
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .create_only()
+    };
+    let replay = drive(create(preassigned_version_id), &context)
+        .await
+        .unwrap();
+    assert_eq!(replay.location, result.location);
+    assert_eq!(replay.version_id, result.version_id);
+    assert!(replay.replayed);
+    let other = drive(create(Ulid::generate()), &context).await;
+    assert!(matches!(other, Err(PutObjectError::ObjectExists)));
+}
+
+#[tokio::test]
+pub async fn deduplicates_blob() {
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root.clone(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+
+    let context = DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+
+    let data = b"hello, world!";
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+
+    let first = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "first.txt".to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &data[..],
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let second = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "second.txt".to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &data[..],
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.location, second.location);
+    assert_eq!(count_files(Path::new(&blob_root)), 1);
+    let blob_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
+
+    let location_key = BlobLocationKey::new(
+        blob_hash,
+        EncodingClass::Raw,
+        first.location.backend.clone(),
+    )
+    .to_bytes();
+    let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, location_key)
+        .await
+        .expect("missing blob location entry");
+    assert_eq!(
+        BackendLocation::from_bytes(blob_location_value.as_ref()).unwrap(),
+        first.location.clone()
+    );
+
+    for key in ["first.txt", "second.txt"] {
+        let expected_version_id = if key == "first.txt" {
+            first.version_id
+        } else {
+            second.version_id
+        };
+
+        let blob_head_value = read_value(
+            &context,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("mybucket", key).to_bytes().unwrap(),
+        )
+        .await
+        .expect("missing blob head entry");
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(expected_version_id, 1)
+        );
+
+        let blob_version_value = read_value(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("mybucket", key, expected_version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .expect("missing blob version entry");
+        let blob_version = BlobVersion::from_bytes(blob_version_value.as_ref()).unwrap();
+        assert!(blob_version.is_materialized());
+        assert_eq!(blob_version.blob_hash(), Some(&blob_hash));
+
+        let hash_path_value = read_value(
+            &context,
+            PATHS_INDEX_KEYSPACE,
+            HashIndex::new(
+                blob_hash,
+                expected_version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "mybucket",
+                key,
+            )
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .expect("missing hash path index entry");
+        assert!(hash_path_value.is_empty());
+    }
+}
+
