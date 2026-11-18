@@ -330,29 +330,197 @@ impl<T: PageTransport> DeliverPageOperation<T> {
             node,
             jobs,
             paged: Vec::new(),
+            retire: Vec::new(),
+            count: 0,
+            calls: VecDeque::new(),
+            report: PageReport::default(),
+            now_ms: 0,
+            step: PageStep::Build,
+        }
+    }
+
+    fn next_store(&mut self) -> Turn<PageReport> {
+        self.step = PageStep::Stored;
+        match self.calls.pop_front() {
+            Some(call) => Ok(Next::Call(call)),
+            None => Ok(Next::Done(std::mem::take(&mut self.report))),
+        }
+    }
+
+    fn queue_delete(&mut self) {
+        self.calls
+            .extend(delete_call(std::mem::take(&mut self.retire)));
+    }
+
+    /// The page could not go out or was not acknowledged: its jobs retry after a backoff.
+    fn retry(&mut self, jobs: Vec<Job>, reason: &str) -> Result<(), BlobQueueError> {
+        let (write, due) = reschedule_call(jobs, Some(reason), self.now_ms)?;
+        self.calls.extend(write);
+        self.report.note_due(due);
+        Ok(())
+    }
+
+    fn built(&mut self, built: Result<Vec<Built>, BuildError>) -> Turn<PageReport> {
+        let jobs = std::mem::take(&mut self.jobs);
+        let built = match built {
+            Ok(built) => built,
+            Err(error) => {
+                self.report.failed += jobs.len();
+                self.retry(jobs, &error.to_string())?;
+                return self.next_store();
+            }
+        };
+        let mut manifests = Vec::new();
+        for ((key, job), built) in jobs.into_iter().zip(built) {
+            match built {
+                Built::Record(manifest) => {
+                    manifests.push(*manifest);
+                    self.paged.push((key, job));
+                }
+                Built::Gone => self.retire.push(key),
+                Built::Single => self.report.single.push((key, job)),
+                // Still due; a later drain pages it.
+                Built::Later => self.report.later += 1,
+            }
+        }
+        self.report.delivered += self.retire.len();
+        let publication = self.publication.take();
+        let (true, Some(publication)) = (!manifests.is_empty(), publication) else {
+            self.queue_delete();
+            return self.next_store();
+        };
+        self.count = manifests.len();
+        let page = ReferencePage {
+            bucket: self.bucket.clone(),
+            publication,
+            manifests,
+        };
+        match self.transport.request(self.node, page) {
+            Ok(call) => {
+                self.step = PageStep::Sent;
+                Ok(Next::Call(call))
+            }
+            Err(error) => self.answered(Err(error)),
+        }
+    }
+
+    fn answered(&mut self, answer: Result<PageAnswer, String>) -> Turn<PageReport> {
+        let (bucket, node, count) = (&self.bucket, self.node, self.count);
+        let (single, retry) = match answer {
+            Ok(PageAnswer::Applied { applied, single }) => {
+                let left = single.len();
+                info!(%bucket, %node, records = count, applied, single = left, "Delivered a reference page");
+                (single, None)
+            }
+            Ok(PageAnswer::Refused {
+                reason,
+                retry: false,
+            }) => {
+                warn!(%bucket, %node, %reason, "A member refused a reference page; sending its records singly");
+                let all = self.paged.iter().filter_map(|(_, job)| version_of(job));
+                (all.collect(), None)
+            }
+            Ok(PageAnswer::Refused {
+                reason,
+                retry: true,
+            }) => (Vec::new(), Some(reason)),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let paged = std::mem::take(&mut self.paged);
+        if let Some(reason) = retry {
+            warn!(%bucket, %node, %reason, "A reference page was not acknowledged; retrying later");
+            self.report.failed += paged.len();
+            self.retry(paged, &reason)?;
+            self.queue_delete();
+            return self.next_store();
+        }
+        let (left, taken): (Vec<_>, Vec<_>) = (paged.into_iter())
+            .partition(|(_, job)| version_of(job).is_some_and(|id| single.contains(&id)));
+        self.report.delivered += taken.len();
+        self.retire.extend(taken.into_iter().map(|(key, _)| key));
+        // The acknowledged page's jobs go in one batch, never one delete per record.
+        self.queue_delete();
+        let (write, _) = reschedule_call(left, None, self.now_ms)?;
+        self.calls.extend(write);
+        self.next_store()
+    }
+}
+
+impl<T: PageTransport> Operation for DeliverPageOperation<T> {
+    type Output = PageReport;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<PageReport> {
+        let publication = self.publication.clone();
+        let publication =
+            publication.ok_or(BlobQueueError::Io(aruna_core::calls::IoError::Unfinished))?;
+        let input = BuildInput {
+            bucket: self.bucket.clone(),
+            publication,
+            jobs: self.jobs.iter().map(|(_, job)| job.clone()).collect(),
+        };
+        Ok(Next::Call(IoCall::child(PageBuildOperation::new(input))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<PageReport> {
+        match self.step {
+            PageStep::Build => self.built(result.child()?),
+            PageStep::Sent => {
+                let answer = self.transport.answer(result);
+                self.answered(answer)
+            }
+            PageStep::Stored => {
+                result.done()?;
+                self.next_store()
+            }
+        }
     }
 }
 
 /// The member's side of a page: applied under the authenticated sender.
-pub(crate) async fn serve_page(
-    context: &DriverContext,
-    peer: NodeId,
-    page: ReferencePage,
-) -> PageAnswer {
-    let Some(net) = context.net_handle.as_ref() else {
-        let reason = "the member's network is not ready".to_string();
-        return PageAnswer::Refused {
-            reason,
-            retry: true,
-        };
-    };
-    let input = ApplyInput {
-        page,
-        publisher: peer,
-        realm_id: *net.realm_id(),
-        local: net.node_id(),
-    };
-    page_answer(drive(PageApplyOperation::new(input), context).await)
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServePageOperation {
+    input: Option<ApplyInput>,
+}
+
+impl ServePageOperation {
+    pub(crate) fn new(
+        serving: Option<(NodeId, RealmId)>,
+        peer: NodeId,
+        page: ReferencePage,
+    ) -> Self {
+        let input = serving.map(|(local, realm_id)| ApplyInput {
+            page,
+            publisher: peer,
+            realm_id,
+            local,
+        });
+        Self { input }
+    }
+}
+
+impl Operation for ServePageOperation {
+    type Output = PageAnswer;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<PageAnswer> {
+        match self.input.take() {
+            Some(input) => Ok(Next::Call(IoCall::child(PageApplyOperation::new(input)))),
+            None => Ok(Next::Done(PageAnswer::Refused {
+                reason: "the member's network is not ready".to_string(),
+                retry: true,
+            })),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<PageAnswer> {
+        let applied = result.child::<PageAnswer, PageError>()?;
+        Ok(Next::Done(page_answer(applied)))
+    }
 }
 
 #[cfg(test)]
