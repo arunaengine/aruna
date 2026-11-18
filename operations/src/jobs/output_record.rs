@@ -344,11 +344,11 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
+    use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::read_output_record as read_stored;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::test_calls::read_output_record as read_stored;
     use aruna_core::structs::execution::job::JobId;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
@@ -456,7 +456,7 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        super::super::store::state::record_attempt_intent(
+        crate::jobs::store::test_calls::record_attempt_intent(
             &context,
             record.job_id,
             TOKEN,

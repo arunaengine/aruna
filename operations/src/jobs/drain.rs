@@ -521,8 +521,8 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::reconcile::ExternalReconciler;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::read_job_record;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::test_calls::read_job_record;
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;

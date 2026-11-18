@@ -22,8 +22,8 @@ use crate::jobs::output_record::StoreOutputsOperation;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::store::attempt::reserve_output_commits;
-use crate::jobs::store::state::record_attempt_intent;
+use crate::jobs::store::test_calls::reserve_output_commits;
+use crate::jobs::store::test_calls::record_attempt_intent;
 use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
 

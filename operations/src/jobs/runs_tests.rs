@@ -14,7 +14,7 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConf
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::attempt::put_crate_outcome;
+use crate::jobs::store::test_calls::put_crate_outcome;
 
 async fn read_run(
     context: &DriverContext,
