@@ -18,9 +18,9 @@ use aruna_core::structs::identity::user::vault::{
     MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultRecordError, VaultRecords, VaultRevision,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_operations::users::vault_route::{VaultRouteError, append_vault_routed};
+use aruna_operations::users::vault_route::{AppendRoutedOperation, VaultRouteError};
 use aruna_operations::users::vault_write::VaultRefusal;
 use aruna_operations::users::vault_write::{
     AppendVaultConfig, AppendVaultError, VaultAppended, VaultChange,
@@ -115,8 +115,8 @@ fn map_route_error(error: VaultRouteError) -> ServerError {
         VaultRouteError::Append(AppendVaultError::Storage(StorageError::TransactionConflict)) => {
             ServerError::Conflict("the vault is being written concurrently; retry".to_string())
         }
-        VaultRouteError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
-        VaultRouteError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
+        VaultRouteError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+        VaultRouteError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
         VaultRouteError::Forward(_)
         | VaultRouteError::Append(
             AppendVaultError::PlacementResolve(_)
@@ -154,8 +154,11 @@ pub(super) async fn append(
         change,
         now_ms: aruna_core::time::unix_timestamp_millis(),
     };
-    append_vault_routed(&state.get_ctx(), config, auth_token)
-        .await
+    drive(
+        AppendRoutedOperation::new(config, auth_token),
+        &state.get_ctx(),
+    )
+    .await
         .map_err(map_route_error)
 }
 

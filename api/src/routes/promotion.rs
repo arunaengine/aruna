@@ -9,7 +9,9 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_operations::realm::ensure_config::EnsureConfigError;
-use aruna_operations::realm::promote_node::{PromoteNodeConfig, PromoteNodeError, promote_node};
+use aruna_operations::realm::promote_node::{
+    PromoteNodeConfig, PromoteNodeError, PromoteNodeOperation,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -19,6 +21,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::driver::drive;
 
 /// Whether the promoted node may be restarted now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -95,7 +98,7 @@ pub async fn promote_server_node(
         node_id,
         realm_signing_key: realm_signing_key.clone(),
     };
-    let ready = promote_node(&state.get_ctx(), config)
+    let ready = drive(PromoteNodeOperation::new(config), &state.get_ctx())
         .await
         .map_err(map_promote_error)?;
     let status = match ready {

@@ -40,7 +40,7 @@ use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, create_making_room};
+use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateMakingRoomOperation};
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -316,7 +316,10 @@ async fn issue_user_session(
         auth_time,
         cutoff: None,
     };
-    let created = create_making_room(&state.get_ctx(), state.get_node_id(), config)
+    let created = drive(
+        CreateMakingRoomOperation::new(state.get_node_id(), config),
+        &state.get_ctx(),
+    )
         .await
         .map_err(|err| match err {
             CreateSessionError::LimitReached { .. } => {
