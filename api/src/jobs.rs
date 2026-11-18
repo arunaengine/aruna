@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::{
-    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
 };
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
@@ -345,19 +345,17 @@ async fn local_submit(
     workspace_mode: WorkspaceMode,
 ) -> Result<AcceptedExecution, JobRequestError> {
     let context = state.get_ctx();
-    let result = submit_local_execution(
-        &context,
-        LocalExecutionConfig {
-            spec,
-            owner: auth.user_id,
-            node_id: state.get_node_id(),
-            idempotency_key,
-            workspace_mode,
-            retention_ms: state.rocrate_limits().artifact_retention_ms,
-        },
-    )
-    .await
-    .map_err(JobRequestError::from_local)?;
+    let config = LocalExecutionConfig {
+        spec,
+        owner: auth.user_id,
+        node_id: state.get_node_id(),
+        idempotency_key,
+        workspace_mode,
+        retention_ms: state.rocrate_limits().artifact_retention_ms,
+    };
+    let result = drive(LocalRunOperation::on_node(config, &context), context.as_ref())
+        .await
+        .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await
