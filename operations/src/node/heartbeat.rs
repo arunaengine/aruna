@@ -349,7 +349,8 @@ mod tests {
             operation.first(),
             heartbeat_call(HeartbeatEffect::Record(Box::new(sent.clone())))
         );
-        let pushes = [node(3), node(1), node(2)]
+        // Sequence 4 over three peers starts at the second one.
+        let pushes = [node(2), node(3), node(1)]
             .into_iter()
             .map(|peer| {
                 let push = HeartbeatEffect::Push {
