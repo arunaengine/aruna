@@ -184,7 +184,10 @@ async fn resume(
             Effect::SubOperation(child) => outside(handle, child).await,
             effect => send(handle, effect).await,
         };
-        queue.extend(operation.step(event));
+        // The abort of a failed run is answered by nobody: the run is over.
+        if !operation.is_complete() {
+            queue.extend(operation.step(event));
+        }
     }
 }
 
