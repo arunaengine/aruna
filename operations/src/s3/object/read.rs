@@ -343,135 +343,378 @@ impl Operation for KeepReadOperation {
     }
 }
 
-/// Keeps a reference's bytes; `true` once they are kept before the read is served.
-async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
-    match drive(KeepFirstOperation::new(keep), context).await {
-        Ok(KeepStart::Settled(kept)) => kept,
-        Ok(KeepStart::Background(source)) => {
-            if let Some(slot) = fill_slot() {
-                let context = context.clone();
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    let _ = drive(source, &context).await;
-                });
-            }
-            false
+/// Reads through the holders and starts the fill the read asks for beside it.
+#[derive(Debug, PartialEq)]
+struct PullReadOperation {
+    request: Option<PullRequest>,
+    read: Option<GetObjectResult>,
+}
+
+impl PullReadOperation {
+    fn new(request: PullRequest) -> Self {
+        Self {
+            request: Some(request),
+            read: None,
         }
-        Err(_) => false,
     }
+}
+
+impl Operation for PullReadOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(PullThroughOperation::new(
+            request,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        if let Some(read) = self.read.take() {
+            result.event()?;
+            return Ok(Next::Done(read));
+        }
+        let pulled = result.child::<Pulled, GetObjectError>()??;
+        let Some(fill) = pulled.fill else {
+            return Ok(Next::Done(pulled.result));
+        };
+        self.read = Some(pulled.result);
+        Ok(Next::Call(background(fill)))
+    }
+}
+
+/// Reads a copy source like [`ReadLocalOperation`]; a record-only version of a distributed
+/// bucket is read through a holder of its range under the caller's authority.
+#[derive(Debug, PartialEq)]
+pub struct ReadSourceOperation {
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<TokenRead>,
+    pulling: bool,
+}
+
+impl ReadSourceOperation {
+    pub fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        token: Option<TokenRead>,
+    ) -> Self {
+        Self {
+            input,
+            restrictions,
+            token,
+            pulling: false,
+        }
+    }
+}
+
+impl Operation for ReadSourceOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        Ok(Next::Call(IoCall::child(ReadLocalOperation::new(
+            self.input.clone(),
+            self.restrictions.clone(),
+            self.token.take(),
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        let read = result.child::<GetObjectResult, GetObjectError>()?;
+        if self.pulling {
+            return Ok(Next::Done(read?));
+        }
+        match read {
+            Err(GetObjectError::HeldElsewhere(held)) => {
+                let request = pull_request(&self.input, self.restrictions.take(), *held);
+                self.pulling = true;
+                Ok(Next::Call(IoCall::child(PullReadOperation::new(request))))
+            }
+            read => Ok(Next::Done(read?)),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum LocalStep {
+    Get,
+    Object,
+    Read,
 }
 
 /// Reads the local copy; with a token, a locked or pending version is read with the object key
 /// that a grant of the credential opens.
-pub(crate) async fn read_local(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReadLocalOperation {
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let operation = GetObjectOperation::new(input.clone())
-        .with_restrictions(restrictions.clone())
-        .with_token(token.is_some());
-    let result = drive(operation, context).await;
-    let Some(token) = token else {
-        return result;
-    };
-    match result {
-        Err(GetObjectError::PendingContent(_)) => {}
-        Err(GetObjectError::ConversionError(ConversionError::BucketKey(
-            BucketKeyError::Locked(_),
-        ))) => {}
-        result => return result,
-    }
-    let (input, private) = token_object(context, input, &token.credential).await?;
-    read_object(context, input, restrictions, private, &token.limits).await
+    token: Option<TokenRead>,
+    step: LocalStep,
 }
 
-/// Reads a version with the object key of a request header; without a version id, the
-/// current version is pinned first.
-pub async fn get_object_keyed(
-    context: &DriverContext,
-    mut input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    private: SharedSecret,
-    limits: &RoCrateLimits,
-) -> Result<GetObjectResult, GetObjectError> {
-    pin_version(context, &mut input).await?;
-    read_object(context, input, restrictions, private, limits).await
+impl ReadLocalOperation {
+    pub(crate) fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        token: Option<TokenRead>,
+    ) -> Self {
+        Self {
+            input,
+            restrictions,
+            token,
+            step: LocalStep::Get,
+        }
+    }
 }
 
-/// Sets the version id of `input` to the current version when none was named.
-async fn pin_version(
-    context: &DriverContext,
-    input: &mut GetObjectInput,
-) -> Result<Ulid, GetObjectError> {
-    if let Some(version) = input.version_id {
-        return Ok(version);
+impl Operation for ReadLocalOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        let get = GetObjectOperation::new(self.input.clone())
+            .with_restrictions(self.restrictions.clone())
+            .with_token(self.token.is_some());
+        Ok(Next::Call(IoCall::child(get)))
     }
-    let head = HeadObjectOperation::new(HeadObjectInput {
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        match self.step {
+            LocalStep::Get => {
+                let read = result.child::<GetObjectResult, GetObjectError>()?;
+                let Some(token) = self.token.as_ref() else {
+                    return Ok(Next::Done(read?));
+                };
+                match read {
+                    Err(GetObjectError::PendingContent(_))
+                    | Err(GetObjectError::ConversionError(ConversionError::BucketKey(
+                        BucketKeyError::Locked(_),
+                    ))) => {}
+                    read => return Ok(Next::Done(read?)),
+                }
+                let open = TokenObjectOperation::new(self.input.clone(), &token.credential);
+                self.step = LocalStep::Object;
+                Ok(Next::Call(IoCall::child(open)))
+            }
+            LocalStep::Object => {
+                let (input, private) =
+                    result.child::<(GetObjectInput, SharedSecret), GetObjectError>()??;
+                let limits = self
+                    .token
+                    .as_ref()
+                    .ok_or(IoError::Unfinished)?
+                    .limits
+                    .clone();
+                let read =
+                    ReadObjectOperation::new(input, self.restrictions.take(), private, &limits);
+                self.step = LocalStep::Read;
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            LocalStep::Read => Ok(Next::Done(
+                result.child::<GetObjectResult, GetObjectError>()??,
+            )),
+        }
+    }
+}
+
+fn head_call(input: &GetObjectInput) -> IoCall {
+    IoCall::child(HeadObjectOperation::new(HeadObjectInput {
         bucket: input.bucket.clone(),
         key: input.key.clone(),
         version_id: None,
-    });
-    let head = drive(head, context)
-        .await
-        .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let version = head
-        .resolved_version_id
-        .or(head.version_id)
-        .ok_or(GetObjectError::NoSuchKey)?;
-    input.version_id = Some(version);
-    Ok(version)
+    }))
 }
 
-/// Pins the version and opens its object key with a grant of `credential` that covers it.
-async fn token_object(
-    context: &DriverContext,
-    mut input: GetObjectInput,
-    credential: &TokenCredential,
-) -> Result<(GetObjectInput, SharedSecret), GetObjectError> {
-    let version = pin_version(context, &mut input).await?;
-    let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
-    let (envelope, _) = drive(read, context).await?;
-    let key = envelope.context.parameters.key;
-    let user = input.user_identity.to_storage_key();
-    let scan = StorageEffect::Iter {
-        key_space: ABE_GRANT_KEYSPACE.to_string(),
-        prefix: Some([&key.bucket_id.to_bytes()[..], &user].concat().into()),
-        start: None,
-        limit: MAX_REQUESTS + 1,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(scan).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(GetObjectError::GetObjectFailed),
-    };
-    let mut error = locked(BucketKeyError::Locked(key.bucket_id));
-    for (_, value) in values {
-        let Ok(grant) = KeyGrant::from_bytes(&value) else {
-            continue;
-        };
-        let request = &grant.context.request;
-        if request.credential_id.as_deref() != Some(credential.access_key.as_str())
-            || request.parameters != envelope.context.parameters
-            || !request.epochs.contains(&envelope.context.epoch)
-            || !request.covers(&input.key)
-        {
-            continue;
-        }
-        match grant.open_object(credential.token.bytes(), &envelope) {
-            Ok(private) => return Ok((input, private)),
-            Err(AbeError::WrongKey) => error = locked(BucketKeyError::InvalidToken),
-            Err(other) => error = other.into(),
+/// The current version a head names.
+fn head_version(result: IoResult) -> Result<Ulid, GetObjectError> {
+    let head = (result.child::<HeadObjectResult, HeadObjectError>()?)
+        .map_err(|_| GetObjectError::GetObjectFailed)?;
+    (head.resolved_version_id.or(head.version_id)).ok_or(GetObjectError::NoSuchKey)
+}
+
+/// Reads a version with the object key of a request header; without a version id, the current
+/// version is pinned first.
+#[derive(Debug, PartialEq)]
+pub struct KeyedReadOperation {
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    private: Option<SharedSecret>,
+    limits: RoCrateLimits,
+    reading: bool,
+}
+
+impl KeyedReadOperation {
+    pub fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        private: SharedSecret,
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            input,
+            restrictions,
+            private: Some(private),
+            limits: limits.clone(),
+            reading: false,
         }
     }
-    Err(error)
+
+    fn read(&mut self) -> Turn<GetObjectResult> {
+        let private = self.private.take().ok_or(IoError::Unfinished)?;
+        self.reading = true;
+        Ok(Next::Call(IoCall::child(ReadObjectOperation::new(
+            self.input.clone(),
+            self.restrictions.take(),
+            private,
+            &self.limits,
+        ))))
+    }
+}
+
+impl Operation for KeyedReadOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        match self.input.version_id {
+            Some(_) => self.read(),
+            None => Ok(Next::Call(head_call(&self.input))),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        if self.reading {
+            return Ok(Next::Done(
+                result.child::<GetObjectResult, GetObjectError>()??,
+            ));
+        }
+        self.input.version_id = Some(head_version(result)?);
+        self.read()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TokenStep {
+    Head,
+    Envelope,
+    Grants(Box<ObjectEnvelope>),
+}
+
+/// Pins the version and opens its object key with a grant of the credential that covers it.
+#[derive(Debug, PartialEq)]
+struct TokenObjectOperation {
+    input: Option<GetObjectInput>,
+    credential: TokenCredential,
+    step: TokenStep,
+}
+
+impl TokenObjectOperation {
+    fn new(input: GetObjectInput, credential: &TokenCredential) -> Self {
+        Self {
+            input: Some(input),
+            credential: credential.clone(),
+            step: TokenStep::Head,
+        }
+    }
+
+    fn input(&self) -> Result<&GetObjectInput, IoError> {
+        self.input.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn read_envelope(&mut self, version: Ulid) -> Turn<(GetObjectInput, SharedSecret)> {
+        let input = self.input()?;
+        let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
+        self.step = TokenStep::Envelope;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn read_grants(&mut self, envelope: ObjectEnvelope) -> Turn<(GetObjectInput, SharedSecret)> {
+        let key = envelope.context.parameters.key;
+        let user = self.input()?.user_identity.to_storage_key();
+        let page = IoCall::Page {
+            space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: [&key.bucket_id.to_bytes()[..], &user].concat().into(),
+            after: None,
+            limit: MAX_REQUESTS + 1,
+        };
+        self.step = TokenStep::Grants(Box::new(envelope));
+        Ok(Next::Call(page))
+    }
+
+    fn open(
+        &mut self,
+        envelope: &ObjectEnvelope,
+        rows: Vec<(Key, Value)>,
+    ) -> Turn<(GetObjectInput, SharedSecret)> {
+        let input = self.input.take().ok_or(IoError::Unfinished)?;
+        let credential = &self.credential;
+        let mut error = locked(BucketKeyError::Locked(
+            envelope.context.parameters.key.bucket_id,
+        ));
+        for (_, value) in rows {
+            let Ok(grant) = KeyGrant::from_bytes(&value) else {
+                continue;
+            };
+            let request = &grant.context.request;
+            if request.credential_id.as_deref() != Some(credential.access_key.as_str())
+                || request.parameters != envelope.context.parameters
+                || !request.epochs.contains(&envelope.context.epoch)
+                || !request.covers(&input.key)
+            {
+                continue;
+            }
+            match grant.open_object(credential.token.bytes(), envelope) {
+                Ok(private) => return Ok(Next::Done((input, private))),
+                Err(AbeError::WrongKey) => error = locked(BucketKeyError::InvalidToken),
+                Err(other) => error = other.into(),
+            }
+        }
+        Err(error)
+    }
+}
+
+impl Operation for TokenObjectOperation {
+    type Output = (GetObjectInput, SharedSecret);
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<(GetObjectInput, SharedSecret)> {
+        match self.input()?.version_id {
+            Some(version) => self.read_envelope(version),
+            None => Ok(Next::Call(head_call(self.input()?))),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<(GetObjectInput, SharedSecret)> {
+        match std::mem::replace(&mut self.step, TokenStep::Head) {
+            TokenStep::Head => {
+                let version = head_version(result)?;
+                if let Some(input) = self.input.as_mut() {
+                    input.version_id = Some(version);
+                }
+                self.read_envelope(version)
+            }
+            TokenStep::Envelope => {
+                let read = result.child::<(ObjectEnvelope, EnvelopeArchive), AbeError>()?;
+                self.read_grants(read?.0)
+            }
+            TokenStep::Grants(envelope) => self.open(&envelope, result.page()?.0),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ObjectStep {
+    Envelope,
+    Get(Box<ObjectEnvelope>, ArchiveKey),
+    Admit(ArchiveKey),
+    Promote,
 }
 
 /// Reads a pinned version with an object key; a pending version is promoted under that key once.
-pub async fn read_object(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ReadObjectOperation {
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
     private: SharedSecret,
