@@ -882,63 +882,130 @@ struct ResolveKeyOperation {
     info: BucketInfo,
     key: String,
     requested: Option<Ulid>,
-) -> Result<Pinned, EntryStatus> {
-    let (realm_id, node_id) = (scope.node.realm_id, scope.node.node_id);
-    let path = object_permission_path(realm_id, info.group_id, node_id, bucket, key);
-    // A denied caller learns nothing about whether the key exists.
-    authorization(scope, auth, &path).await?;
-    let (mut catching_up, mut stale) = (false, None);
-    if let Some(binding) = info.distribution.as_ref() {
-        let call = MemberCall {
-            auth,
-            bucket,
-            info,
-            key,
-            version: requested,
+    catching_up: bool,
+    stale: Option<Ulid>,
+    step: ResolveStep,
+}
+
+impl ResolveKeyOperation {
+    fn new(
+        node: PageNode,
+        (auth, expiry): Caller<'_>,
+        (bucket, info): (&str, &BucketInfo),
+        key: &str,
+        requested: Option<Ulid>,
+    ) -> Self {
+        Self {
+            node,
+            auth: auth.clone(),
+            expiry,
+            bucket: bucket.to_string(),
+            info: info.clone(),
+            key: key.to_string(),
+            requested,
+            catching_up: false,
+            stale: None,
+            step: ResolveStep::Access,
+        }
+    }
+
+    fn head(&mut self) -> ResolveTurn {
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            version_id: self.requested,
+        });
+        self.step = ResolveStep::Head;
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn member_read(&mut self) -> ResolveTurn {
+        let Some(binding) = self.info.distribution.clone() else {
+            return self.head();
         };
-        match scope.reader.member_read(call).await? {
-            MemberRead::Remote {
-                version,
-                blob,
-                stale,
-            } => {
-                let blob = Some(blob);
-                return Ok(Pinned {
+        let caller = MemberCaller {
+            auth: self.auth.clone(),
+            group_id: self.info.group_id,
+            credential_expiry: self.expiry,
+        };
+        let object = MemberKey {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            version: self.requested,
+        };
+        let read = MemberReadOperation::new(self.node.ids, caller, binding, object);
+        self.step = ResolveStep::Member;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn pinned(&self, head: Result<HeadObjectResult, HeadObjectError>) -> ResolveTurn {
+        let version = match head {
+            Ok(head) => (head.resolved_version_id.or(head.version_id)).ok_or(EntryStatus::Missing),
+            Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) if !self.catching_up => Err(EntryStatus::Missing),
+            Err(HeadObjectError::ConversionError(error)) if locked(&error) => {
+                Err(EntryStatus::Locked)
+            }
+            Err(_) => Err(EntryStatus::Unavailable),
+        }?;
+        Ok(Next::Done(Pinned {
+            version,
+            blob: None,
+            stale: self.stale,
+        }))
+    }
+}
+
+impl Operation for ResolveKeyOperation {
+    type Output = Pinned;
+    type Error = EntryStatus;
+
+    /// A denied caller learns nothing about whether the key exists.
+    fn first(&mut self) -> ResolveTurn {
+        let (realm_id, node_id) = (self.node.realm_id, self.node.node_id);
+        let group_id = self.info.group_id;
+        let path = object_permission_path(realm_id, group_id, node_id, &self.bucket, &self.key);
+        Ok(Next::Call(read_check(realm_id, &self.auth, &path)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ResolveTurn {
+        match self.step {
+            ResolveStep::Access => {
+                access_status(result.child::<(), AuthorizeError>()?)?;
+                self.member_read()
+            }
+            ResolveStep::Member => match result.child::<MemberRead, EntryStatus>()?? {
+                MemberRead::Remote {
                     version,
                     blob,
                     stale,
-                });
-            }
-            MemberRead::Local(range_id) => stale = range_id,
-        }
-        // Without records of the key's range here, a miss would prove nothing.
-        match drive(route_read(binding, key, false), scope.context).await {
-            Ok(ReadRoute::Local {
-                catching_up: behind,
-            }) => catching_up = behind,
-            Ok(ReadRoute::Holder { .. }) | Err(_) => return Err(EntryStatus::Unavailable),
+                } => Ok(Next::Done(Pinned {
+                    version,
+                    blob: Some(blob),
+                    stale,
+                })),
+                MemberRead::Local(range_id) => {
+                    self.stale = range_id;
+                    let binding = (self.info.distribution.as_ref()).ok_or(IoError::Unfinished)?;
+                    let route = route_read(binding, &self.key, false);
+                    self.step = ResolveStep::Route;
+                    Ok(Next::Call(IoCall::child(route)))
+                }
+            },
+            // Without records of the key's range here, a miss would prove nothing.
+            ResolveStep::Route => match result.child::<ReadRoute, GuardError>()? {
+                Ok(ReadRoute::Local { catching_up }) => {
+                    self.catching_up = catching_up;
+                    self.head()
+                }
+                Ok(ReadRoute::Holder { .. }) | Err(_) => Err(EntryStatus::Unavailable),
+            },
+            ResolveStep::Head => self.pinned(result.child()?),
         }
     }
-    let head = HeadObjectOperation::new(HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: requested,
-    });
-    let version = match drive(head, scope.context).await {
-        Ok(head) => (head.resolved_version_id.or(head.version_id)).ok_or(EntryStatus::Missing),
-        Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) if !catching_up => Err(EntryStatus::Missing),
-        Err(HeadObjectError::ConversionError(error)) if locked(&error) => Err(EntryStatus::Locked),
-        Err(_) => Err(EntryStatus::Unavailable),
-    }?;
-    Ok(Pinned {
-        version,
-        blob: None,
-        stale,
-    })
 }
 
 fn locked(error: &ConversionError) -> bool {
