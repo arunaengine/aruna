@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 use ulid::Ulid;
 
 use super::account::RepairAccount;
-use super::artifacts::ArtifactError;
+use super::artifacts::{ArtifactError, FetchArtifact};
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding};
 use super::check::RunScope;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
@@ -57,9 +57,8 @@ use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
 use super::work_calls::{JobOutputs, JobRow};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-pub(crate) use crate::plugin_host::read_config;
-use crate::plugin_host::ready_artifact;
 use crate::realm::mutate_placement::node_kind;
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {
@@ -367,7 +366,13 @@ pub(crate) async fn fetch_artifact(
     config: &RealmConfigDocument,
     digest: &str,
 ) -> Result<Assembled, ArtifactError> {
-    ready_artifact(ctx, config, digest, local_of(ctx)).await
+    let fetched = drive(FetchArtifact::new(config, digest, local_of(ctx))?, ctx).await?;
+    if fetched.fresh {
+        let bytes = &fetched.copy.bytes;
+        let store = StoreCopy::new(config, digest, bytes, unix_timestamp_millis());
+        drive(store, ctx).await?;
+    }
+    Ok(fetched.copy)
 }
 
 pub(crate) async fn publish_plugin(
@@ -586,4 +591,11 @@ pub(crate) async fn run_replays(
     pages: (usize, usize),
 ) -> Result<usize, StoreError> {
     drive(RunReplays::new(now_ms, pages), ctx).await
+}
+
+pub(crate) async fn read_config(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+) -> Result<RealmConfigDocument, InstallError> {
+    Ok(drive(GetConfigOperation::new(realm_id), ctx).await?)
 }

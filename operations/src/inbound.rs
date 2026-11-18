@@ -20,7 +20,7 @@ use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
-use crate::plugin_host::peer::serve_peer;
+use crate::plugins::peer::AnswerPeer;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::sync::evicted::ReemitEvictedOperation;
@@ -197,8 +197,13 @@ async fn peer_request(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
-    let message = match Box::pin(serve_peer(context, peer, message)).await {
-        Ok(answer) => return Ok(answer),
+    let node = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let message = match AnswerPeer::new(node, peer, message, unix_timestamp_millis()) {
+        Ok(answer) => {
+            let kind = answer.answer();
+            let served = Box::pin(drive(answer, context)).await;
+            return Ok(served.unwrap_or_else(|_| kind.unavailable()));
+        }
         Err(message) => message,
     };
     match message {

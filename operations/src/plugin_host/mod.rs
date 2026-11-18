@@ -15,7 +15,6 @@ use crate::plugins::copy_rows::StoreCopy;
 use crate::plugins::install::InstallError;
 
 pub mod broker;
-pub(crate) mod peer;
 pub mod plugin_work;
 pub mod repair;
 mod transfers;
