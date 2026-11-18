@@ -1,38 +1,47 @@
 //! Lists a bucket's objects a caller may see, page by page; a distributed bucket is merged across
-//! its key ranges in key order, each range listed here or by a holder through a relay (D12).
+//! its key ranges in key order, each range listed here or by a holder (D12).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
+use aruna_core::operation::Operation;
+use aruna_core::outbound::{RangeEntry, RangePage, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, KeyRange,
+    DistributionBinding, DistributionMember, DistributionView, KeyRange,
 };
-use aruna_core::structs::storage::link::LinkTarget;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::BucketAccess;
-use crate::auth::request_authorization::BucketAccessOperation;
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use crate::distribution::guard::GuardError;
-use crate::distribution::routing::bound_view;
-use crate::distribution::routing::local_fence;
-use crate::driver::{DriverContext, drive};
-use crate::s3::object::link::{LinkCaller, LinkNode, TargetVisibleOperation};
+use crate::distribution::routing::{bound_view, local_fence};
+use crate::s3::object::link::{LinkCaller, LinkError, LinkNode};
 use crate::s3::object::list::{
-    ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+    ListedObject,
+};
+use crate::s3::object::range_list::{
+    MemberAccess, RangeListError, RangeListOperation, RangeQuery, RangeTarget,
 };
 use crate::s3::object::visible::{
-    HiddenCursor, Listed, Lister, NextPage, VisibleError, after_entry, is_sealed, open_cursor,
-    visible_from, visible_page,
+    HiddenCursor, LinkShows, ListFailure, ListSource, Listed, ListingKeys, NextPage, RecordSource,
+    ShowRule, Shown, VisibleError, VisiblePage, VisiblePageOperation, after_entry, is_sealed,
+    open_cursor,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -41,7 +50,7 @@ const MAX_PAGE_RANGES: usize = 64;
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// One listing request as the merge needs it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ListRequest {
     pub bucket: String,
     pub prefix: Option<String>,
@@ -54,7 +63,7 @@ pub struct ListRequest {
 }
 
 /// One page of shown objects in key order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObjectPage<O> {
     pub objects: Vec<O>,
     pub prefixes: Vec<String>,
@@ -78,52 +87,35 @@ impl<O> Default for ObjectPage<O> {
 }
 
 /// A listed object as the transport shows it.
-pub trait PageObject: for<'a> From<&'a ListedObject> + Send {
+pub trait PageObject:
+    for<'a> From<&'a ListedObject> + From<RangeEntry> + Send + Debug + PartialEq + 'static
+{
     fn key(&self) -> &str;
 }
 
-/// The listing of one range by one holder.
-pub struct RangeCall<'a> {
-    pub set_id: Ulid,
-    pub node_id: NodeId,
-    pub range: &'a KeyRange,
-    pub request: &'a ListRequest,
-    pub cursor: Option<&'a str>,
-    /// Lists that member's copy while the coordinator cannot.
-    pub copy: bool,
-}
-
-/// Asks another member for one range's page with the caller's credential.
-pub trait RangeRelay: Sync {
-    type Object: PageObject;
-    type Error: Send;
-    /// The holder's page, or `None` when it did not answer, so another holder may be asked.
-    fn list_range(
-        &self,
-        call: RangeCall<'_>,
-    ) -> impl Future<Output = Result<Option<ObjectPage<Self::Object>>, Self::Error>> + Send;
-    /// Whether a holder's refusal is its own fault, so a copy may list instead.
-    fn is_fault(error: &Self::Error) -> bool;
-    /// Whether this node also checks the caller on each entry other members list, as for a
-    /// share visit, whose downloads this node authorizes on its own path.
-    fn checks_here(&self) -> bool {
-        false
-    }
-}
-
-/// What a listing runs with: this node, its records and the relay to other members.
-pub struct PageScope<'a, R> {
-    pub context: &'a DriverContext,
+/// This node as a listing needs it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageNode {
     pub realm_id: RealmId,
     pub node_id: NodeId,
-    pub relay: &'a R,
+    /// The ids delegations are signed under.
+    pub ids: Option<(NodeId, RealmId)>,
+}
+
+impl PageNode {
+    fn local(&self) -> (NodeId, RealmId) {
+        (self.node_id, self.realm_id)
+    }
 }
 
 /// A caller and the expiry of its bearer, which bounds delegated reads on its behalf.
 pub type Caller<'a> = (&'a AuthContext, u64);
 
-#[derive(Debug, Error)]
-pub enum PageError<E> {
+/// A caller an operation keeps.
+type OwnedCaller = (AuthContext, u64);
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PageError {
     #[error("the cursor is not a next_cursor of this listing")]
     Cursor,
     #[error(
@@ -136,16 +128,42 @@ pub enum PageError<E> {
     #[error("{0}")]
     Internal(String),
     #[error("a holder refused the listing")]
-    Relay(E),
+    Relay(RangeRefusal),
 }
 
-impl<E> PageError<E> {
+impl PageError {
     fn internal(error: impl std::fmt::Display) -> Self {
         Self::Internal(error.to_string())
     }
+
+    /// Whether a failed range listing is the holders' fault, so a copy may list instead.
+    fn holder_fault(&self) -> bool {
+        match self {
+            Self::Unanswered { .. } => true,
+            Self::Relay(refusal) => refusal.status >= 500,
+            _ => false,
+        }
+    }
 }
 
-type PageResult<O, E> = Result<ObjectPage<O>, PageError<E>>;
+impl From<IoError> for PageError {
+    fn from(error: IoError) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<RangeListError> for PageError {
+    fn from(error: RangeListError) -> Self {
+        match error {
+            RangeListError::Refused(refusal) => Self::Relay(refusal),
+            RangeListError::Cursor => Self::Cursor,
+            RangeListError::Failed(reason) => Self::Internal(reason),
+        }
+    }
+}
+
+type PageResult<O> = Result<ObjectPage<O>, PageError>;
+type PageTurn<O> = Result<Next<ObjectPage<O>>, PageError>;
 
 /// Where a merged page continues: after a listed key or common prefix, at the first key of a
 /// range when a page visited its bound of ranges before any entry, or inside the range at
@@ -166,20 +184,20 @@ pub enum Resume {
     },
 }
 
-pub fn encode_resume<E>(resume: &Resume) -> Result<String, PageError<E>> {
+pub fn encode_resume(resume: &Resume) -> Result<String, PageError> {
     cursor::encode_value(resume).map_err(PageError::internal)
 }
 
-pub fn decode_resume<E>(cursor: &str) -> Result<Resume, PageError<E>> {
+pub fn decode_resume(cursor: &str) -> Result<Resume, PageError> {
     cursor::decode_value(cursor).map_err(|_| PageError::Cursor)
 }
 
 /// The token that resumes a local listing after `key`, or past the whole `group`.
-pub fn resume_token<E>(
+pub fn resume_token(
     bucket: &str,
     key: &str,
     group: Option<&str>,
-) -> Result<ListContinuationToken, PageError<E>> {
+) -> Result<ListContinuationToken, PageError> {
     let last_key =
         BlobHeadKey::object_prefix(bucket, group.unwrap_or(key)).map_err(PageError::internal)?;
     Ok(ListContinuationToken {
@@ -200,56 +218,32 @@ pub fn listing_path(
     }
 }
 
-/// One page of `info`'s objects on this node: local for an ordinary bucket, merged across the
-/// key ranges of a distributed one. With a caller, only what that caller may read shows.
-pub async fn object_page<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    info: &BucketInfo,
-    caller: Option<Caller<'_>>,
-    request: ListRequest,
-) -> PageResult<R::Object, R::Error> {
-    match info.distribution.as_ref() {
-        Some(binding) => merged_page(scope, (info, caller), binding, request).await,
-        None => {
-            let (token, hidden) = local_token(&request)?;
-            local_part(scope, (info, caller), &request, (token, None, hidden), None).await
-        }
-    }
-}
-
-/// One page of the range `bounds` names, for a listing another member relays here.
-pub async fn range_page<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, caller): (&BucketInfo, Option<Caller<'_>>),
-    request: &ListRequest,
-    start_after: Option<String>,
-    bounds: (String, Option<String>),
-) -> PageResult<R::Object, R::Error> {
-    let (token, hidden) = local_token(request)?;
-    let position = (token, start_after, hidden);
-    local_part(scope, (info, caller), request, position, Some(bounds)).await
-}
-
 /// The local listing position a cursor of an unmerged listing names.
-fn local_token<E>(
+fn local_token(
     request: &ListRequest,
-) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError<E>> {
-    if let Some(cursor) = request.cursor.as_deref().filter(|cursor| is_sealed(cursor)) {
+) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+    position_of(&request.bucket, request.cursor.as_deref())
+}
+
+fn position_of(
+    bucket: &str,
+    cursor: Option<&str>,
+) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+    if let Some(cursor) = cursor.filter(|cursor| is_sealed(cursor)) {
         let hidden = open_cursor(cursor).ok_or(PageError::Cursor)?;
         return Ok((None, Some(hidden)));
     }
-    match request.cursor.as_deref().map(decode_resume).transpose()? {
-        Some(Resume::After { key, group }) => Ok((
-            Some(resume_token(&request.bucket, &key, group.as_deref())?),
-            None,
-        )),
+    match cursor.map(decode_resume).transpose()? {
+        Some(Resume::After { key, group }) => {
+            Ok((Some(resume_token(bucket, &key, group.as_deref())?), None))
+        }
         Some(Resume::From(_) | Resume::Hidden { .. }) => Err(PageError::Cursor),
         None => Ok((None, None)),
     }
 }
 
 /// The cursor of a local listing that stopped after `token`.
-pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
+pub fn after_cursor(token: ListContinuationToken) -> Result<String, PageError> {
     let key = BlobHeadKey::from_bytes(&token.last_key)
         .map_err(PageError::internal)?
         .key;
@@ -257,131 +251,68 @@ pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError
     encode_resume(&Resume::After { key, group })
 }
 
-/// One page of `info`'s objects from this node's records, inside `bounds` when given. For a
-/// caller, a key or prefix shows only when the caller may read it, a link only with its
-/// target, and a prefix only once an entry below it shows.
-async fn local_part<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, caller): (&BucketInfo, Option<Caller<'_>>),
+fn list_input(
     request: &ListRequest,
-    (token, start_after, hidden): (
-        Option<ListContinuationToken>,
-        Option<String>,
-        Option<HiddenCursor>,
-    ),
-    bounds: Option<(String, Option<String>)>,
-) -> PageResult<R::Object, R::Error> {
-    let input = ListBucketInput {
+    group_id: Ulid,
+    token: Option<ListContinuationToken>,
+    start_after: Option<String>,
+) -> ListBucketInput {
+    ListBucketInput {
         bucket: request.bucket.clone(),
-        group_id: info.group_id,
+        group_id,
         continuation_token: token,
         max_keys: Some(request.limit),
         prefix: request.prefix.clone().filter(|prefix| !prefix.is_empty()),
-        delimiter: request
-            .delimiter
-            .clone()
-            .filter(|delimiter| !delimiter.is_empty()),
+        delimiter: (request.delimiter.clone()).filter(|delimiter| !delimiter.is_empty()),
         start_after,
-    };
-    if let Some(caller) = caller {
-        return shown_part(scope, (info, caller), (input, hidden), bounds).await;
     }
-    let operation = match bounds {
-        Some((lower, upper)) => ListBucketOperation::new(input).with_bounds(lower, upper),
-        None => ListBucketOperation::new(input),
-    };
-    let result = drive(operation, scope.context)
-        .await
-        .map_err(PageError::internal)?;
-    Ok(ObjectPage {
-        objects: result.objects.iter().map(R::Object::from).collect(),
-        prefixes: result.common_prefixes,
-        next_cursor: result.continuation_token.map(after_cursor).transpose()?,
-        ..ObjectPage::default()
-    })
 }
 
-/// The page of a local listing a caller may see; a page that stopped among hidden entries
-/// carries a sealed cursor.
-async fn shown_part<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, (auth, expiry)): (&BucketInfo, Caller<'_>),
-    (input, hidden): (ListBucketInput, Option<HiddenCursor>),
-    bounds: Option<(String, Option<String>)>,
-) -> PageResult<R::Object, R::Error> {
-    let (realm_id, node_id, context) = (scope.realm_id, scope.node_id, scope.context);
-    let ids = (realm_id, info.group_id, node_id);
-    let access = drive(
-        BucketAccessOperation::new(auth, ids, &input.bucket),
-        context,
-    )
-    .await
-    .map_err(PageError::internal)?;
-    // The bearer's expiry bounds a delegated HEAD of a target on another node.
-    let caller = LinkCaller {
-        auth: auth.clone(),
-        credential: (String::new(), info.group_id, expiry),
-    };
-    let link_node = LinkNode {
-        local: node_id,
-        ids: context.node_and_realm(),
-    };
-    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
-    let page = visible_page(
-        context,
-        input,
-        (hidden, bounds),
-        |object: &ListedObject| {
-            let object = object.clone();
-            let (access, caller) = (&access, &caller);
-            Box::pin(async move {
-                if !access.allows(Some(&object.head.key), &Permission::READ) {
-                    return Ok(false);
-                }
-                match object
-                    .link
-                    .as_ref()
-                    .map(|link| LinkTarget::of(link, realm_id))
-                {
-                    None => Ok(true),
-                    Some(Some(target)) => {
-                        let visible = TargetVisibleOperation::new(caller, &target, link_node);
-                        drive(visible, context).await
-                    }
-                    Some(None) => Ok(false),
-                }
-            })
-        },
-        readable,
-    );
-    let page = page.await.map_err(|error| match error {
+fn visible_failure<E: std::fmt::Display, L: std::fmt::Display>(
+    error: VisibleError<E, L>,
+) -> PageError {
+    match error {
         VisibleError::List(error) => PageError::internal(error),
         VisibleError::Shows(error) => PageError::internal(error),
         VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
-    })?;
+        VisibleError::Io(error) => PageError::internal(error),
+    }
+}
+
+fn shown_page<O, T>(page: VisiblePage<T>, map: impl Fn(T) -> O) -> PageResult<O> {
     let next_cursor = match page.next {
         Some(NextPage::After(token)) => Some(after_cursor(token)?),
         Some(NextPage::Sealed(sealed)) => Some(sealed),
         None => None,
     };
     Ok(ObjectPage {
-        objects: page.objects.iter().map(R::Object::from).collect(),
+        objects: page.objects.into_iter().map(map).collect(),
         prefixes: page.prefixes,
         next_cursor,
         ..ObjectPage::default()
     })
 }
 
-/// One range at one member, listed through the relay for a page this node checks again.
-struct MemberRange<'a, R> {
-    relay: &'a R,
-    call: (Ulid, NodeId, bool),
-    range: &'a KeyRange,
+/// The keys a caller's loaded rules allow.
+#[derive(Debug, PartialEq)]
+struct AccessKeys(Arc<BucketAccess>);
+
+impl ListingKeys for AccessKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.0.allows(Some(key), &Permission::READ)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        self.allows(prefix)
+    }
 }
 
-impl<R: RangeRelay> Lister for MemberRange<'_, R> {
-    type Object = R::Object;
-    type Error = PageError<R::Error>;
+#[derive(Debug, PartialEq)]
+enum LocalStep {
+    Access,
+    Listed,
+    Visible,
+}
 
     async fn list(&self, input: &ListBucketInput) -> Result<Listed<R::Object>, Self::Error> {
         let (set_id, node_id, copy) = self.call;
