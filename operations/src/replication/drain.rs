@@ -1166,127 +1166,147 @@ impl ProcessJobOperation {
             return self.finish(Err(error));
         };
         mark_failure(relationship, &error);
-        let stored = store_relationship(context, relationship.clone()).await?;
-        cache_relationship(relationships, job, relationship, stored);
-        if stored && let Some(group_id) = watch_group_id {
-            emit_sync_watch(context, relationship, group_id, 0, Some(&error)).await;
-        }
-    }
-    if failure.is_some_and(ReplicationFailure::is_denied) {
-        return Ok(BlobJobOutcome::Failed);
-    }
-    if let Some(relationship) = relationship.as_mut() {
-        mark_failure(relationship, &error);
-        let stored = store_relationship(context, relationship.clone()).await?;
-        cache_relationship(relationships, job, relationship, stored);
-        if stored && let Some(group_id) = watch_group_id {
-            emit_sync_watch(context, relationship, group_id, 0, Some(&error)).await;
-        }
-    }
-    Err(error)
-}
-
-fn cache_relationship(
-    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-    job: &BlobJobRecord,
-    relationship: &SyncRelationship,
-    stored: bool,
-) {
-    let Some(relationship_id) = job.relationship_id else {
-        return;
-    };
-    let key = (job.input.bucket.clone(), relationship_id);
-    if stored {
-        relationships.insert(key, relationship.clone());
-    } else {
-        relationships.remove(&key);
+        let watch = Some((0, Some(error.clone())));
+        self.store(watch, AfterStore::Finish(Err(error)))
     }
 }
 
-pub(super) async fn read_job_relationships(
-    storage: &StorageHandle,
-    jobs: &[(Vec<u8>, BlobJobRecord)],
-) -> Result<HashMap<(String, Ulid), SyncRelationship>, BlobQueueError> {
-    let mut requested = HashSet::new();
-    let mut keys = Vec::new();
-    for (_, job) in jobs {
-        let Some(relationship_id) = job.relationship_id else {
-            continue;
-        };
-        let identity = (job.input.bucket.clone(), relationship_id);
-        if requested.insert(identity.clone()) {
-            keys.push(identity);
-        }
-    }
-    if keys.is_empty() {
-        return Ok(HashMap::new());
+impl Operation for ProcessJobOperation {
+    type Output = JobRun;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
-    let reads = keys
-        .iter()
-        .map(|(bucket, relationship_id)| {
-            (
-                RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                sync_relationship_key(bucket, *relationship_id).into(),
-            )
-        })
-        .collect();
-    let values = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
+    fn first(&mut self) -> JobTurn {
+        if self.job.reference_advance.is_some() && self.job.relationship_id.is_none() {
+            return self.finish(Ok(BlobJobOutcome::Failed));
         }
-    };
-    if values.len() != keys.len() {
-        return Err(BlobQueueError::UnexpectedEvent(
-            "blob replication relationship read count mismatch".to_string(),
-        ));
+        let quota = QuotaOperation::new(self.routing.clone());
+        Ok(Next::Call(IoCall::child(quota)))
     }
 
-    let mut relationships = HashMap::with_capacity(keys.len());
-    for ((bucket, relationship_id), (key, value)) in keys.into_iter().zip(values) {
-        let Some(value) = value else {
-            continue;
-        };
-        let relationship = SyncRelationship::from_bytes(&value)?;
-        validate_sync_key(&bucket, &key, &relationship)?;
-        if relationship.id != relationship_id {
-            return Err(ConversionError::FromStrError(
-                "sync relationship id does not match requested id".to_string(),
-            )
-            .into());
+    fn next(&mut self, result: IoResult) -> JobTurn {
+        match std::mem::replace(&mut self.step, JobStep::Scope) {
+            JobStep::Quota => match result.child::<NodeRouting, RoutingInputsError>()? {
+                Ok(routing) => {
+                    self.node_routing = Some(routing);
+                    // Reference materialization writes real bytes on this node, so the job
+                    // carries this node's destination details; a node mid-transition refuses.
+                    let realm_id = self.job.input.auth_context.realm_id;
+                    let gate = GateOperation::new(realm_id, self.now_ms);
+                    self.call(JobStep::Gate, IoCall::child(gate))
+                }
+                // Retrying a record that will never decode only pins the queue at its backoff
+                // ceiling; the drain repair re-enqueues once it is repaired.
+                Err(error) if error.storage().is_none() => {
+                    error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
+                    self.finish(Ok(BlobJobOutcome::Failed))
+                }
+                Err(error) => self.finish(Err(error.to_string())),
+            },
+            JobStep::Gate => match result.child::<Option<GateContext>, GateContextError>()? {
+                Ok(gate) => self.gated(gate),
+                Err(error) => self.finish(Err(error.to_string())),
+            },
+            JobStep::Member => match result.child::<Option<BoundRecord>, RecordError>()? {
+                Ok(record) => self.record_read(record),
+                Err(error) => self.finish(Err(error.to_string())),
+            },
+            JobStep::RelationAuth => {
+                let loaded = result
+                    .child::<Result<SourceAuthorization, SourceRefusal>, BlobQueueError>()??;
+                self.relation_auth(loaded)
+            }
+            JobStep::WriterAuth => {
+                let loaded = result
+                    .child::<Result<SourceAuthorization, SourceRefusal>, BlobQueueError>()??;
+                self.writer_auth(loaded)
+            }
+            JobStep::Plaintext(authorization) => match result.child::<bool, PlaintextError>()? {
+                Ok(plaintext) => self.plaintext_known(*authorization, plaintext),
+                Err(error) => self.finish(Err(error.to_string())),
+            },
+            JobStep::Scope => self.scope_done(result.child()?),
+            JobStep::Store(watch, after) => {
+                let stored = result.child::<Result<bool, String>, BlobQueueError>()??;
+                self.stored(watch, *after, stored)
+            }
+            JobStep::Emit(after) => {
+                result.child::<(), IoError>()?.ok();
+                self.after_store(*after)
+            }
         }
-        relationships.insert((bucket, relationship_id), relationship);
     }
-    Ok(relationships)
 }
 
-pub(super) async fn read_replication_cursor(
-    storage: &StorageHandle,
-) -> Result<ReplicationScanCursor, BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Ok(ReplicationScanCursor::default())
+/// Reads the relationships the jobs name, each once.
+#[derive(Debug, PartialEq)]
+pub(super) struct JobRelationshipsOperation {
+    keys: Vec<(String, Ulid)>,
+}
+
+impl JobRelationshipsOperation {
+    pub(super) fn new(jobs: &[Job]) -> Self {
+        let mut requested = HashSet::new();
+        let mut keys = Vec::new();
+        for (_, job) in jobs {
+            let Some(relationship_id) = job.relationship_id else {
+                continue;
+            };
+            let identity = (job.input.bucket.clone(), relationship_id);
+            if requested.insert(identity.clone()) {
+                keys.push(identity);
+            }
         }
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(postcard::from_bytes(value.as_ref()).unwrap_or_default()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+        Self { keys }
+    }
+}
+
+impl Operation for JobRelationshipsOperation {
+    type Output = Relationships;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Relationships> {
+        if self.keys.is_empty() {
+            return Ok(Next::Done(HashMap::new()));
+        }
+        let reads = (self.keys.iter())
+            .map(|(bucket, relationship_id)| {
+                let key = sync_relationship_key(bucket, *relationship_id).into();
+                (RELATIONSHIP_OUT_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Relationships> {
+        let values = result.values()?;
+        if values.len() != self.keys.len() {
+            return Err(BlobQueueError::UnexpectedEvent(
+                "blob replication relationship read count mismatch".to_string(),
+            ));
+        }
+        let mut relationships = HashMap::with_capacity(self.keys.len());
+        for ((bucket, relationship_id), value) in
+            std::mem::take(&mut self.keys).into_iter().zip(values)
+        {
+            let Some(value) = value else {
+                continue;
+            };
+            let key = sync_relationship_key(&bucket, relationship_id);
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            validate_sync_key(&bucket, &key, &relationship)?;
+            if relationship.id != relationship_id {
+                return Err(ConversionError::FromStrError(
+                    "sync relationship id does not match requested id".to_string(),
+                )
+                .into());
+            }
+            relationships.insert((bucket, relationship_id), relationship);
+        }
+        Ok(Next::Done(relationships))
     }
 }
 
@@ -1321,128 +1341,96 @@ fn cursor_merge(
     }
 }
 
-pub(super) async fn abort_cursor(storage: &StorageHandle, txn_id: Ulid) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
+/// Moves the stored scan cursor forward; an older candidate only lowers its next due time.
+#[derive(Debug, PartialEq)]
+pub(super) struct AdvanceCursorOperation {
+    candidate: ReplicationScanCursor,
+    writing: bool,
 }
 
-pub(super) async fn advance_replication_cursor(
-    storage: &StorageHandle,
-    candidate: ReplicationScanCursor,
-) -> Result<(), BlobQueueError> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let (current, valid) = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            (ReplicationScanCursor::default(), true)
-        }
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => match postcard::from_bytes(value.as_ref()) {
-            Ok(cursor) => (cursor, true),
-            Err(_) => (ReplicationScanCursor::default(), false),
-        },
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_cursor(storage, txn_id).await;
-            return Err(error.into());
-        }
-        other => {
-            abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let merged = cursor_merge(candidate, current.clone());
-    if valid && merged == current {
-        match storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-        }
-    } else {
-        let value = postcard::to_allocvec(&merged).map_err(ConversionError::from)?;
-        match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: NODE_STATE_KEYSPACE.to_string(),
-                key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
-                value: ByteView::from(value),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                abort_cursor(storage, txn_id).await;
-                return Err(error.into());
-            }
-            other => {
-                abort_cursor(storage, txn_id).await;
-                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-            }
-        }
-        match storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+impl AdvanceCursorOperation {
+    pub(super) fn new(candidate: ReplicationScanCursor) -> Self {
+        Self {
+            candidate,
+            writing: false,
         }
     }
 }
 
-pub(super) async fn scan_due_jobs(
-    storage: &StorageHandle,
+impl Operation for AdvanceCursorOperation {
+    type Output = ();
+    type Error = BlobQueueError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(cursor_read()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let (current, valid) = match result.value()? {
+            None => (ReplicationScanCursor::default(), true),
+            Some(value) => match postcard::from_bytes(value.as_ref()) {
+                Ok(cursor) => (cursor, true),
+                Err(_) => (ReplicationScanCursor::default(), false),
+            },
+        };
+        let merged = cursor_merge(std::mem::take(&mut self.candidate), current.clone());
+        if valid && merged == current {
+            return Ok(Next::Done(()));
+        }
+        let value = postcard::to_allocvec(&merged).map_err(ConversionError::from)?;
+        self.writing = true;
+        let row = (NODE_STATE_KEYSPACE.to_string(), cursor_key(), value.into());
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+/// A job found under a key that is not its own, while its canonical row is looked at.
+#[derive(Debug, PartialEq)]
+struct RepairRow {
+    key: Vec<u8>,
+    job: BlobJobRecord,
+    canonical: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ScanStep {
+    Cursor,
+    Page,
+    Dropped,
+    Canonical(Box<RepairRow>),
+    /// The repaired row is written; the old key goes next.
+    Written(Box<RepairRow>),
+    /// The old key is gone; the job goes on under its canonical key.
+    Moved(Box<(Vec<u8>, BlobJobRecord)>),
+    Refreshed(Box<(Vec<u8>, BlobJobRecord)>),
+}
+
+/// Reads one page of the job queue after the stored cursor, repairs rows under foreign keys and
+/// collects the jobs due now.
+#[derive(Debug, PartialEq)]
+pub(super) struct ScanJobsOperation {
     now_ms: u64,
     limit: usize,
-) -> Result<BlobJobScan, BlobQueueError> {
-    let cursor = read_replication_cursor(storage).await?;
-    let start_after = cursor.after.clone();
-    let mut jobs = Vec::new();
-    // A pass from the start drops the last pass's due time, which may already be past.
-    let mut next_due_ms = cursor.next_due_ms.filter(|_| start_after.is_some());
-    let mut canonical_changed = false;
-    let event = storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(|key| IterStart::After(ByteView::from(key))),
-            limit: PAGE_RECORDS,
-            txn_id: None,
-        })
-        .await;
-    let (values, next_start_after) = match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => (values, next_start_after),
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let mut last_key;
-    let page_empty = values.is_empty();
-    // The scan meets each key once; only after a key repair may a job already be taken.
-    let mut repaired = false;
+    step: ScanStep,
+    cursor: ReplicationScanCursor,
+    rows: VecDeque<(Key, Value)>,
+    next_start: Option<Key>,
+    page_empty: bool,
+    last_key: Option<Vec<u8>>,
+    jobs: Vec<Job>,
+    next_due_ms: Option<u64>,
+    canonical_changed: bool,
+    /// The scan meets each key once; only after a key repair may a job already be taken.
+    repaired: bool,
+}
 
     for (key, value) in values {
         let mut key = key.to_vec();
