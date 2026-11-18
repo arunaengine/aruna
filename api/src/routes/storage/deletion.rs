@@ -17,7 +17,7 @@ use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};
+use aruna_operations::s3::object::delete::pinned::{PinnedError, RefuseScopeOperation};
 use aruna_operations::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
@@ -591,7 +591,12 @@ async fn refuse_released(
         bucket: scope.bucket(),
         info,
     };
-    match refuse_scope(state.get_ctx().as_ref(), place, auth, scope).await {
+    match drive(
+        RefuseScopeOperation::new(place, auth, scope),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error @ PinnedError::Unchecked(_)) => {
             Err(ServerError::ServiceUnavailableReason(error.to_string()))
@@ -931,14 +936,10 @@ pub async fn control_purge(
     use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(
-        &context,
-        job_id,
-        None,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?
-    .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1000,14 +1001,10 @@ async fn purge_job(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
-    let record = aruna_operations::jobs::store::state::read_job_record(
-        &context,
-        job_id,
-        None,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?
-    .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let paused = aruna_operations::blob::pause::PausedOperation::new(job_id.as_ulid());
     let paused = drive(paused, &context)
         .await
@@ -1050,10 +1047,11 @@ pub async fn get_purge(
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
-    let record = aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .ok_or(ServerError::NotFound)?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?
+            .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1068,9 +1066,10 @@ async fn purge_ended(
     state: &ServerState,
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
-    let record = aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&state.get_ctx(), job_id, None)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
 }
 

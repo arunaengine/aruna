@@ -34,8 +34,8 @@ use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
-use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins};
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation};
+use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::structs::storage::release::MembershipQuery;
@@ -334,9 +334,8 @@ async fn delete_versions(
             false => Vec::new(),
         };
         let batch_len = entries.len() as u64;
-        let outcomes = delete_objects(
-            &ctx.driver,
-            BulkDeleteInput {
+        let outcomes = drive(
+            BulkDeleteOperation::new(BulkDeleteInput {
                 bucket: spec.scope.bucket().to_string(),
                 entries,
                 group_id: spec.group_id,
@@ -345,9 +344,11 @@ async fn delete_versions(
                 deleted_by: spec.auth_context.user_id,
                 restrictions: spec.auth_context.path_restrictions.clone(),
                 guards: guards.clone(),
-            },
+            }),
+            &ctx.driver,
         )
-        .await;
+        .await
+        .map_err(|error| JobError::retryable(format!("versioned purge delete failed: {error}")))?;
         if let Some(error) = outcomes
             .into_iter()
             .find_map(|outcome| match outcome.result {
@@ -402,7 +403,12 @@ async fn release_guards(
                 },
             })
             .collect();
-        match version_pins(&ctx.driver, scope, &spec.auth_context, &queries).await {
+        match drive(
+            VersionPinsOperation::new(scope, &spec.auth_context, queries.to_vec()),
+            &ctx.driver,
+        )
+        .await
+        {
             Ok((pins, _)) if pins.contains(&true) => {
                 return Err(JobError::permanent(PinnedError::Scope.to_string()).into());
             }

@@ -66,7 +66,7 @@ use aruna_operations::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::object::delete::bulk::{
-    BulkDeleteEntry, BulkDeleteInput, delete_objects,
+    BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
 use aruna_operations::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
@@ -399,9 +399,8 @@ async fn scoped_fence_isolates() {
         .await,
         Err(DeleteObjectError::PurgeFence(PurgeFenceError::Suspended))
     ));
-    let batch = delete_objects(
-        &context.driver,
-        BulkDeleteInput {
+    let batch = drive(
+        BulkDeleteOperation::new(BulkDeleteInput {
             bucket: "bucket".to_string(),
             entries: vec![BulkDeleteEntry {
                 key: "blocked/batch-delete.txt".to_string(),
@@ -413,9 +412,11 @@ async fn scoped_fence_isolates() {
             deleted_by: context.user_id,
             restrictions: None,
             guards: Vec::new(),
-        },
+        }),
+        &context.driver,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(matches!(
         batch[0].result,
         Err(DeleteObjectError::PurgeFence(PurgeFenceError::Suspended))
