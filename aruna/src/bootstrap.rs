@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::auth::ONBOARDING_SECRET_KEY;
-use aruna_core::document::{DocumentNetEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{
@@ -13,13 +13,14 @@ use aruna_core::onboarding::{
 };
 use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
-use aruna_core::{DocumentEffect, NodeId, UserId};
+use aruna_core::{NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation};
 use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -207,9 +208,6 @@ pub async fn fetch_core_documents(
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingTicket::decode(onboarding_sync_ticket)?;
-    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
-        return Err("net handle unavailable".into());
-    };
     let realm_id = *realm_id;
 
     // Shared documents include the config needed to route user documents to shard topics.
@@ -223,7 +221,7 @@ pub async fn fetch_core_documents(
             realm_id,
             &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
-        sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+        sync_with_retry(driver_ctx, topic, bootstrap_peer, &document, timeout).await?;
     }
 
     if !user_documents.is_empty() {
@@ -246,7 +244,7 @@ pub async fn fetch_core_documents(
             // The peer serves shard topics only to members. Placement expansion admits the
             // joiner after any transition already in flight.
             if let Err(error) =
-                sync_peer_topic(net_handle, topic, bootstrap_peer, &document, timeout).await
+                sync_peer_topic(driver_ctx, topic, bootstrap_peer, &document, timeout).await
             {
                 warn!(error = %error, document = ?document, "Leaving an onboarding user document to placement sync");
             }
@@ -323,10 +321,7 @@ pub async fn wait_for_placement(
                 None
             }
             None => sync_peer_topic(
-                driver_ctx
-                    .net_handle
-                    .as_ref()
-                    .ok_or("net handle unavailable")?,
+                driver_ctx,
                 target.sync_topic_id(
                     realm_id,
                     &aruna_core::structs::placement::record::PlacementRef::NIL,
@@ -447,41 +442,34 @@ fn retry_deadline(
 }
 
 async fn sync_peer_topic(
-    net_handle: &aruna_net::NetHandle,
+    context: &DriverContext,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document_for_error: &DocumentTarget,
     timeout: Duration,
 ) -> Result<(), SyncFailure> {
     let document_for_error = document_for_error.clone();
-    let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
-        DocumentEffect::SyncDocument {
-            topic,
-            peers: vec![bootstrap_peer],
-        },
-    )));
-    let event = tokio::time::timeout(timeout, sync).await.map_err(|_| {
-        SyncFailure::Unreachable(format!(
-            "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
-        ))
-    })?;
-
-    match event {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-            Err(SyncFailure::Refused(error.to_string()))
-        }
-        Event::Net(NetEvent::Error(error)) => Err(SyncFailure::Refused(format!("{error:?}"))),
-        other => Err(SyncFailure::Refused(format!(
-            "unexpected document sync result: {other:?}"
-        ))),
-    }
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| SyncFailure::Refused("net handle unavailable".to_string()))?;
+    let sync = SyncTopicsOperation::single(*net_handle.realm_id(), topic, vec![bootstrap_peer]);
+    let synced = tokio::time::timeout(timeout, drive(sync, context))
+        .await
+        .map_err(|_| {
+            SyncFailure::Unreachable(format!(
+                "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
+            ))
+        })?;
+    synced
+        .map(|_| ())
+        .map_err(|error| SyncFailure::Refused(error.to_string()))
 }
 
 /// The bootstrap peer may refuse a fresh joiner until the config update that
 /// admits it reaches the peer, so failures retry within the same time budget.
 async fn sync_with_retry(
-    net_handle: &aruna_net::NetHandle,
+    context: &DriverContext,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document: &DocumentTarget,
@@ -490,11 +478,10 @@ async fn sync_with_retry(
     let mut deadline = tokio::time::Instant::now() + timeout;
     let mut attempt = 0;
     loop {
-        let error =
-            match sync_peer_topic(net_handle, topic, bootstrap_peer, document, timeout).await {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
-            };
+        let error = match sync_peer_topic(context, topic, bootstrap_peer, document, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
         let now = tokio::time::Instant::now();
         let Some(next) = retry_deadline(deadline, &error, now, timeout) else {
             return Err(error.into());
