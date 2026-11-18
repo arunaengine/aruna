@@ -985,26 +985,10 @@ pub async fn move_routing(
     context: &crate::driver::DriverContext,
     bucket: &str,
 ) -> Result<Option<RoutingSnapshot>, String> {
-    let read = StorageEffect::Read {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let info = crate::groups::backends::parse_read(event, BucketInfo::from_bytes);
-    let Some(info) = info.map_err(|error| error.to_string())? else {
-        return Ok(None);
-    };
-    let snapshot = crate::driver::drive(
-        crate::groups::routing::SnapshotOperation::new(
-            &crate::driver::node_routing(context),
-            info.group_id,
-            crate::groups::routing::BucketRules::of(&info),
-        ),
-        context,
-    )
-    .await;
-    snapshot.map(Some).map_err(|error| error.to_string())
+    let routing = crate::driver::node_routing(context);
+    let operation = crate::blob::import_rows::BucketRoutingOperation::new(routing, bucket);
+    let snapshot = crate::driver::drive(operation, context).await;
+    snapshot.map_err(|error| error.to_string())
 }
 
 /// Stores the progress, with the rows a run finished `ahead` of its cursor where given.

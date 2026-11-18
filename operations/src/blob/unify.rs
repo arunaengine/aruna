@@ -5,6 +5,7 @@
 
 use crate::auth::request_authorization::BucketAccess;
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
+use crate::blob::import_rows::{BackendRulesOperation, SecondCopiesOperation};
 use crate::blob::migration::drain::move_routing;
 use crate::driver::DriverContext;
 use crate::s3::bucket::job_progress::JobStep;
@@ -334,48 +335,10 @@ pub(crate) async fn second_copies(
     (bucket, key): (&str, &str),
     versions: &[Ulid],
 ) -> Result<Vec<(BackendLocation, Key, Ulid)>, String> {
-    let error = |error: aruna_core::errors::ConversionError| error.to_string();
-    let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
-    let prefix = VersionKey::object_prefix(bucket, key).map_err(error)?;
-    let mut found = Vec::new();
-    for rule in rules.iter().filter(|rule| rule.bucket == bucket) {
-        let import = rule.import_id.to_bytes();
-        let scan = [&import[..], &prefix[..]].concat();
-        let mut after = None;
-        loop {
-            let page = iter_prefix_page(
-                &context.storage_handle,
-                RENAMED_ROW_KEYSPACE,
-                Some(scan.clone().into()),
-                after.take(),
-                RULE_PAGE,
-                None,
-            );
-            let (rows, next) = page.await?;
-            for (index, value) in rows {
-                // A renamed row names no file of its own.
-                if value.is_empty() {
-                    continue;
-                }
-                let path = index.get(scan.len()..).unwrap_or_default();
-                let row_key: Key = [&import[..], path].concat().into();
-                let Some(row) = read(context, IMPORTED_OBJECT_KEYSPACE, row_key).await? else {
-                    continue;
-                };
-                let row = ImportedObject::from_bytes(&row).map_err(error)?;
-                if row.key.as_deref() != Some(key) || !versions.contains(&row.version_id) {
-                    continue;
-                }
-                let file = BackendLocation::from_bytes(&value).map_err(error)?;
-                found.push((file, index, row.version_id));
-            }
-            match next {
-                Some(next) => after = Some(next),
-                None => break,
-            }
-        }
-    }
-    Ok(found)
+    let operation = SecondCopiesOperation::new(routing, (bucket, key), versions);
+    let operation = operation.map_err(|error| error.to_string())?;
+    let found = crate::driver::drive(operation, context).await;
+    found.map_err(|error| error.to_string())
 }
 
 /// One preview page of the keys under `prefix` after `after` with copies, as far as the
@@ -993,31 +956,9 @@ pub(crate) async fn rules_on(
     group_id: GroupId,
     backend: &BackendRef,
 ) -> Result<Vec<BackendImport>, String> {
-    let mut rules = Vec::new();
-    let mut after = None;
-    loop {
-        let prefix = Some(group_id.to_bytes().to_vec().into());
-        let page = iter_prefix_page(
-            &context.storage_handle,
-            BACKEND_IMPORT_KEYSPACE,
-            prefix,
-            after.take(),
-            RULE_PAGE,
-            None,
-        );
-        let (rows, next) = page.await?;
-        for (_, value) in rows {
-            let rule = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;
-            let on = |id: Ulid| BackendRef::Group(id) == *backend;
-            if on(rule.backend_id) || on(rule.write_backend()) {
-                rules.push(rule);
-            }
-        }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(rules),
-        }
-    }
+    let operation = BackendRulesOperation::new(group_id, backend.clone());
+    let rules = crate::driver::drive(operation, context).await;
+    rules.map_err(|error| error.to_string())
 }
 
 async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<Vec<u8>>, String> {
