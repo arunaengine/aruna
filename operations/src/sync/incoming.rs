@@ -188,26 +188,30 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let answer = Box::pin(async {
-                crate::jobs::lifecycle::ingress::serve_submission(
-                    context,
-                    peer,
-                    auth_token,
-                    submission_id,
-                    *request,
-                )
-                .await
-            });
-            Ok(answer.await)
+            let node = crate::jobs::lifecycle::ingress::ingress_node(context);
+            let admit = crate::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
+                peer,
+                auth_token,
+                submission_id,
+                *request,
+                node,
+            );
+            let result = Box::pin(crate::driver::drive(admit, context.as_ref())).await;
+            Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
         }
         MetadataTransportMessage::ResolveJobInputs {
             auth_token,
             request,
         } => {
-            let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
-                context, peer, auth_token, *request,
-            );
-            let result = Box::pin(resolved).await;
+            let result = match crate::jobs::lifecycle::ingress::ingress_node(context) {
+                Some(node) => {
+                    let serve = crate::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
+                        peer, auth_token, &node, *request,
+                    );
+                    Box::pin(crate::driver::drive(serve, context.as_ref())).await
+                }
+                None => Err(aruna_core::jobs::SubmissionRefusal::Unavailable),
+            };
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {

@@ -33,11 +33,11 @@ use crate::jobs::submit_execution::validate_execution;
 
 /// This node as a submission sees it: its identity, its clock and its fresh heartbeats.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct IngressNode {
-    pub(super) local: NodeId,
-    pub(super) realm_id: RealmId,
-    pub(super) now_ms: u64,
-    pub(super) fresh: BTreeMap<NodeId, HeldHeartbeat>,
+pub struct IngressNode {
+    pub local: NodeId,
+    pub realm_id: RealmId,
+    pub now_ms: u64,
+    pub fresh: BTreeMap<NodeId, HeldHeartbeat>,
 }
 
 impl IngressNode {
@@ -127,7 +127,7 @@ fn unavailable(reason: &str) -> SubmitJobError {
 
 impl SubmitExternalOperation {
     /// `node` is `None` on a node without a network, which cannot admit anything.
-    pub(super) fn new(submission: ExternalSubmission, node: Option<IngressNode>) -> Self {
+    pub fn new(submission: ExternalSubmission, node: Option<IngressNode>) -> Self {
         Self {
             submission,
             node,

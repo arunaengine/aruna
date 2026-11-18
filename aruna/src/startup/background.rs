@@ -6,10 +6,15 @@ use std::sync::Arc;
 
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
+use aruna_core::events::Event;
+use aruna_core::handle::Handle;
+use aruna_core::task::TaskEvent;
 use aruna_operations::distribution::index_feed::spawn_index_feed;
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::drain::restore_drain_timer;
-use aruna_operations::jobs::lifecycle::outbox::timers::restore_lifecycle_timers;
+use aruna_operations::jobs::lifecycle::outbox::timers::{
+    LifecycleTimersOperation, lifecycle_timers,
+};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::warmup::spawn_metadata_warmup;
 use aruna_operations::plugin_host::repair::spawn_repair;
@@ -196,7 +201,16 @@ pub(crate) async fn start(
                 restore_drain_timer(&driver_ctx, &task_handle).await;
             }
             StartupPhase::RestoreLifecycleTimers => {
-                restore_lifecycle_timers(&driver_ctx, &task_handle).await;
+                let timers = drive(LifecycleTimersOperation, &driver_ctx)
+                    .await
+                    .unwrap_or_else(|_| lifecycle_timers(false));
+                for timer in timers {
+                    if let Event::Task(TaskEvent::Error { message, .. }) =
+                        task_handle.send_effect(timer).await
+                    {
+                        warn!(message = %message, "Failed to restore a job lifecycle timer");
+                    }
+                }
             }
             StartupPhase::WarmMetadata => spawn_metadata_warmup(driver_ctx.clone(), &shutdown),
             StartupPhase::SweepSessions => spawn_session_sweep(driver_ctx.clone(), &shutdown),

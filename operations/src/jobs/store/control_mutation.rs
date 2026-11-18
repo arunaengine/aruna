@@ -27,7 +27,7 @@ pub(crate) struct MutateControlOperation<F> {
     mutate: F,
     record: Option<JobRecord>,
     epoch: u64,
-    changed: Option<(JobRecord, AttemptControl)>,
+    changed: Option<ControlChange>,
     deletes: JobDeletes,
     step: ControlStep,
 }
@@ -54,7 +54,15 @@ impl<F> PartialEq for MutateControlOperation<F> {
     }
 }
 
-type ControlNext = Result<Next<(JobRecord, AttemptControl)>, JobMutationError>;
+/// The job and control rows after a change, and whether the change was written.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ControlChange {
+    pub(crate) record: JobRecord,
+    pub(crate) control: AttemptControl,
+    pub(crate) persisted: bool,
+}
+
+type ControlNext = Result<Next<ControlChange>, JobMutationError>;
 
 impl<F> MutateControlOperation<F>
 where
@@ -102,7 +110,11 @@ where
             .ok_or_else(|| JobMutationError::Storage("control change lost its job".into()))?;
         let old = record.clone();
         if matches!((self.mutate)(&mut record, &mut control)?, JobMutation::Skip) {
-            return Ok(Next::Done((old, control)));
+            return Ok(Next::Done(ControlChange {
+                record: old,
+                control,
+                persisted: false,
+            }));
         }
         if old.state != record.state {
             validate_transition(old.execution_class, old.state, record.state)?;
@@ -119,7 +131,11 @@ where
         ));
         writes.extend(std::mem::take(&mut self.extra));
         self.deletes = deletes;
-        self.changed = Some((record, control));
+        self.changed = Some(ControlChange {
+            record,
+            control,
+            persisted: true,
+        });
         self.step = ControlStep::Write;
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -129,7 +145,7 @@ impl<F> Operation for MutateControlOperation<F>
 where
     F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
 {
-    type Output = (JobRecord, AttemptControl);
+    type Output = ControlChange;
     type Error = JobMutationError;
 
     fn transaction(&self) -> TransactionMode {

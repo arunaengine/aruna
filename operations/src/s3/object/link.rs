@@ -23,7 +23,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::read_access::SourceReadError;
-use crate::jobs::source_read::authorize_read;
+use crate::jobs::read_access::SourceReadOperation;
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -258,12 +258,9 @@ async fn local_target(
     source: &LinkSource,
 ) -> Result<(LinkTarget, SourceMetadata), LinkError> {
     let object = (source.bucket.as_str(), source.key.as_str());
-    let group_id = authorize_read(
+    let group_id = drive(
+        SourceReadOperation::of_object(&caller.auth, source.node_id, object, HEAD_OPERATION),
         context,
-        &caller.auth,
-        source.node_id,
-        object,
-        HEAD_OPERATION,
     )
     .await
     .map_err(|error| match error {

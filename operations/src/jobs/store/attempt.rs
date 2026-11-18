@@ -2,34 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::control_mutation::MutateControlOperation;
-use super::mark_start::MarkStartOperation;
-use super::settle_attempt;
+pub use super::job_calls::{AdoptOutcome, CancelRequestOutcome, ParkOutcome};
 use super::*;
+use super::{job_calls, row_calls};
 use crate::driver::drive;
-use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use std::collections::BTreeMap;
 
 pub async fn read_attempt_control(
     context: &DriverContext,
     job_id: JobId,
     attempt_epoch: u64,
-    txn_id: Option<TxnId>,
+    _txn_id: Option<TxnId>,
 ) -> Result<Option<AttemptControl>, JobMutationError> {
-    let value = read_raw(
+    drive(
+        row_calls::read_attempt_control(job_id, attempt_epoch),
         context,
-        ATTEMPT_CONTROL_KEYSPACE,
-        ByteView::from(attempt_control_key(job_id, attempt_epoch)),
-        txn_id,
     )
     .await
-    .map_err(JobMutationError::Storage)?;
-    value
-        .map(|bytes| {
-            AttemptControl::from_bytes(bytes.as_ref())
-                .map_err(|error| JobMutationError::Storage(error.to_string()))
-        })
-        .transpose()
 }
 
 /// Write-ahead one VersionId per output destination in the attempt-control transaction that
@@ -41,64 +31,11 @@ pub async fn reserve_output_commits(
     destinations: &[(NodeId, String, String)],
     hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
-    let mint = |(node_id, bucket, _): &(NodeId, String, String)| {
-        mint_version(hints.get(&(*node_id, bucket.clone())).copied())
-    };
-    let (_, control) = mutate_attempt_control(context, job_id, |_, control| {
-        match control.reserve_outputs(destinations, mint) {
-            true => Ok(JobMutation::Persist),
-            false => Ok(JobMutation::Skip),
-        }
-    })
-    .await?;
-    Ok(control)
-}
-
-pub(super) async fn mutate_attempt_control<F>(
-    context: &DriverContext,
-    job_id: JobId,
-    mutate: F,
-) -> Result<(JobRecord, AttemptControl), JobMutationError>
-where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
-{
-    mutate_control_with(context, job_id, Vec::new(), mutate).await
-}
-
-/// Same transaction as [`mutate_attempt_control`], plus writes that must land
-/// atomically with the control row; see [`MutateControlOperation`].
-pub(super) async fn mutate_control_with<F>(
-    context: &DriverContext,
-    job_id: JobId,
-    extra: JobWrites,
-    mut mutate: F,
-) -> Result<(JobRecord, AttemptControl), JobMutationError>
-where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
-{
-    let mut attempt = 0;
-    loop {
-        let operation = MutateControlOperation::new(job_id, extra.clone(), &mut mutate);
-        let result = drive(operation, context).await;
-        match settle_attempt(
-            result,
-            attempt,
-            "attempt mutation exhausted conflict retries",
-        )
-        .await
-        {
-            Some(result) => return result,
-            None => attempt += 1,
-        }
-    }
-}
-
-pub(super) fn bump_generation(control: &mut AttemptControl) -> Result<(), JobMutationError> {
-    control.controller_generation = control
-        .controller_generation
-        .checked_add(1)
-        .ok_or(JobMutationError::GenerationExhausted)?;
-    Ok(())
+    drive(
+        job_calls::reserve_output_commits(job_id, destinations.to_vec(), hints.clone()),
+        context,
+    )
+    .await
 }
 
 pub async fn authorize_cleanup(
@@ -107,24 +44,11 @@ pub async fn authorize_cleanup(
     intent: &AttemptIntent,
     token: Ulid,
 ) -> Result<FenceContext, JobMutationError> {
-    let (_, control) = mutate_attempt_control(context, job_id, |record, control| {
-        if record
-            .attempt_intent
-            .as_ref()
-            .is_none_or(|stored| stored.attempt_epoch != intent.attempt_epoch)
-        {
-            return Err(JobMutationError::EpochMismatch);
-        }
-        bump_generation(control)?;
-        control.bound_token = Some(token);
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-    Ok(FenceContext {
-        attempt: AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no),
-        attempt_epoch: intent.attempt_epoch,
-        controller_generation: control.controller_generation,
-    })
+    drive(
+        job_calls::authorize_cleanup(job_id, intent.clone(), token),
+        context,
+    )
+    .await
 }
 
 pub async fn record_attempt_tombstone(
@@ -134,18 +58,11 @@ pub async fn record_attempt_tombstone(
     attempt_epoch: u64,
     tombstone_ref: String,
 ) -> Result<AttemptControl, JobMutationError> {
-    let (_, control) = mutate_attempt_control(context, job_id, |_, control| {
-        if control.attempt_epoch != attempt_epoch {
-            return Err(JobMutationError::EpochMismatch);
-        }
-        if control.bound_token != Some(token) {
-            return Err(JobMutationError::TokenMismatch);
-        }
-        control.tombstone_ref = Some(tombstone_ref.clone());
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-    Ok(control)
+    drive(
+        job_calls::record_attempt_tombstone(job_id, token, attempt_epoch, tombstone_ref),
+        context,
+    )
+    .await
 }
 
 /// Advance a claimed execution job to `Preparing`, renewing the lease. The
@@ -156,15 +73,10 @@ pub async fn transition_to_preparing(
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Preparing;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::transition_to_preparing(job_id, token, now_ms),
+        context,
+    )
     .await
 }
 
@@ -175,15 +87,10 @@ pub async fn transition_to_ready(
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Ready;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::transition_to_ready(job_id, token, now_ms),
+        context,
+    )
     .await
 }
 
@@ -197,24 +104,10 @@ pub async fn begin_external_running(
     started_at_ms: Option<u64>,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    let attempt_started = started_at_ms.unwrap_or(now_ms);
-    mutate_marking_start(context, job_id, attempt_started, |record| {
-        guard_token(record, token)?;
-        if record.cancel_requested {
-            return Ok(JobMutation::Skip);
-        }
-        // Running must always carry a start: it anchors the walltime cap, and a
-        // backend that reports none still started when the controller saw it.
-        record
-            .started_at_ms
-            .get_or_insert(started_at_ms.unwrap_or(now_ms));
-        record.state = JobState::Running;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::begin_external_running(job_id, token, started_at_ms, now_ms),
+        context,
+    )
     .await
 }
 
@@ -225,40 +118,11 @@ pub async fn record_attempt_started(
     token: Ulid,
     started_at_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        if record.started_at_ms.is_some() {
-            return Ok(JobMutation::Skip);
-        }
-        record.started_at_ms = Some(started_at_ms);
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::record_attempt_started(job_id, token, started_at_ms),
+        context,
+    )
     .await
-}
-
-/// `mutate_job`, then in the same transaction marks the launch record of the current attempt
-/// as executed; see [`MarkStartOperation`].
-async fn mutate_marking_start<F>(
-    context: &DriverContext,
-    job_id: JobId,
-    started_at_ms: u64,
-    mut mutate: F,
-) -> Result<JobRecord, JobMutationError>
-where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
-{
-    let mut attempt = 0;
-    loop {
-        let result = drive(
-            MarkStartOperation::new(job_id, &mut mutate, started_at_ms),
-            context,
-        )
-        .await;
-        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
-            Some(result) => return result,
-            None => attempt += 1,
-        }
-    }
 }
 
 /// The executed launch record of the record's final attempt, if any.
@@ -266,15 +130,9 @@ pub async fn read_launch_record(
     context: &DriverContext,
     record: &JobRecord,
 ) -> Result<Option<LaunchRecord>, String> {
-    let Some(intent) = &record.attempt_intent else {
-        return Ok(None);
-    };
-    let key = ByteView::from(attempt_control_key(record.job_id, intent.attempt_epoch));
-    let Some(value) = read_raw(context, LAUNCH_RECORD_KEYSPACE, key, None).await? else {
-        return Ok(None);
-    };
-    let launch = LaunchRecord::from_bytes(value.as_ref()).map_err(|error| error.to_string())?;
-    Ok(launch.started_at_ms.is_some().then_some(launch))
+    drive(row_calls::read_launch_record(record), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// `Running/Indeterminate -> Cancelling`: a durable cancel intent precedes the
@@ -285,23 +143,11 @@ pub async fn transition_to_cancelling(
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Cancelling;
-        record.updated_at_ms = now_ms;
-        if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::transition_to_cancelling(job_id, token, now_ms),
+        context,
+    )
     .await
-}
-
-#[derive(Debug)]
-pub enum ParkOutcome {
-    Parked(JobRecord),
-    /// The park spent the last attempt, so no further attempt runs on this node.
-    Exhausted(JobRecord),
 }
 
 /// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
@@ -314,28 +160,11 @@ pub async fn mark_indeterminate(
     error: JobError,
     now_ms: u64,
 ) -> Result<ParkOutcome, JobMutationError> {
-    let mut capped = false;
-    let record = mutate_job(context, job_id, |record| {
-        capped = false;
-        guard_token(record, token)?;
-        record.last_error = Some(error.clone());
-        record.attempts = record.attempts.saturating_add(1);
-        record.updated_at_ms = now_ms;
-        if record.attempts >= JOB_MAX_ATTEMPTS {
-            exhaust_attempts(record, now_ms);
-            capped = true;
-        } else {
-            record.state = JobState::Indeterminate;
-        }
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if capped {
-        ParkOutcome::Exhausted(record)
-    } else {
-        ParkOutcome::Parked(record)
-    })
+    drive(
+        job_calls::mark_indeterminate(job_id, token, error, now_ms),
+        context,
+    )
+    .await
 }
 
 /// Terminal `Failed` for an execution job, capturing the exit evidence in the
@@ -348,16 +177,10 @@ pub async fn fail_execution(
     result: JobResultPayload,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Failed;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.last_error = Some(error.clone());
-        record.result = Some(result.clone());
-        record.claim = None;
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::fail_execution(job_id, token, error, result, now_ms),
+        context,
+    )
     .await
 }
 
@@ -370,23 +193,11 @@ pub async fn cancel_execution(
     result: JobResultPayload,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.state = JobState::Cancelled;
-        record.finished_at_ms = Some(now_ms);
-        record.updated_at_ms = now_ms;
-        record.result = Some(result.clone());
-        record.claim = None;
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::cancel_execution(job_id, token, result, now_ms),
+        context,
+    )
     .await
-}
-
-#[derive(Debug)]
-pub enum AdoptOutcome {
-    Adopted(JobRecord, AttemptControl),
-    /// Terminal, or the lease is still live: leave the current holder alone.
-    Skipped,
 }
 
 /// Take over a lost external attempt with a fresh claim token so the reconciler
@@ -398,38 +209,11 @@ pub async fn adopt_external_attempt(
     holder_node_id: NodeId,
     now_ms: u64,
 ) -> Result<AdoptOutcome, JobMutationError> {
-    let mut adopted = false;
-    let (record, control) = mutate_attempt_control(context, job_id, |record, control| {
-        adopted = false;
-        if record.state.is_terminal() {
-            return Ok(JobMutation::Skip);
-        }
-        // Re-check the lease inside the transaction: a holder that renewed since the
-        // sweep's read is alive, and stealing its claim would double-run the container.
-        if let Some(claim) = &record.claim
-            && claim.lease_expires_ms > now_ms
-        {
-            return Ok(JobMutation::Skip);
-        }
-        record.updated_at_ms = now_ms;
-        let claim_token = Ulid::generate();
-        record.claim = Some(JobClaim {
-            holder_node_id,
-            claim_token,
-            lease_expires_ms: now_ms.saturating_add(JOB_LEASE_MS),
-        });
-        bump_generation(control)?;
-        control.bound_token = Some(claim_token);
-        adopted = true;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if adopted {
-        AdoptOutcome::Adopted(record, control)
-    } else {
-        AdoptOutcome::Skipped
-    })
+    drive(
+        job_calls::adopt_external_attempt(job_id, holder_node_id, now_ms),
+        context,
+    )
+    .await
 }
 
 /// Requeue an execution job that failed BEFORE its attempt was submitted (image
@@ -442,21 +226,10 @@ pub async fn requeue_before_attempt(
     now_ms: u64,
     error: JobError,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(context, job_id, |record| {
-        guard_token(record, token)?;
-        record.last_error = Some(error.clone());
-        record.attempts = record.attempts.saturating_add(1);
-        record.updated_at_ms = now_ms;
-        record.claim = None;
-        record.attempt_intent = None;
-        if record.attempts >= JOB_MAX_ATTEMPTS {
-            exhaust_attempts(record, now_ms);
-        } else {
-            record.state = JobState::Queued;
-            record.due_at_ms = now_ms.saturating_add(retry_delay_ms(record.attempts));
-        }
-        Ok(JobMutation::Persist)
-    })
+    drive(
+        job_calls::requeue_before_attempt(job_id, token, now_ms, error),
+        context,
+    )
     .await
 }
 
@@ -467,17 +240,9 @@ pub async fn put_crate_status(
     job_id: JobId,
     status: &aruna_core::structs::execution::job::RunCrateStatus,
 ) -> Result<(), String> {
-    let bytes = status.to_bytes().map_err(|error| error.to_string())?;
-    batch_write(
-        context,
-        vec![(
-            RUN_CRATE_KEYSPACE.to_string(),
-            aruna_core::structs::execution::job::run_crate_key(job_id),
-            ByteView::from(bytes),
-        )],
-        None,
-    )
-    .await
+    drive(row_calls::put_crate_status(job_id, status), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Records the crate outcome and the run link in one batch, so a run whose crate status is
@@ -488,26 +253,9 @@ pub async fn put_crate_outcome(
     status: &aruna_core::structs::execution::job::RunCrateStatus,
     link: &aruna_core::structs::execution::job::RunLink,
 ) -> Result<(), String> {
-    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
-    let status = status.to_bytes().map_err(|error| error.to_string())?;
-    let link = link.to_bytes().map_err(|error| error.to_string())?;
-    batch_write(
-        context,
-        vec![
-            (
-                RUN_CRATE_KEYSPACE.to_string(),
-                key.clone(),
-                ByteView::from(status),
-            ),
-            (
-                aruna_core::keyspaces::RUN_LINK_KEYSPACE.to_string(),
-                key,
-                ByteView::from(link),
-            ),
-        ],
-        None,
-    )
-    .await
+    drive(row_calls::put_crate_outcome(job_id, status, link), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Stores the crate of an unpublished local run with its `Local` status in one batch.
@@ -516,27 +264,9 @@ pub async fn put_local_crate(
     job_id: JobId,
     local: &aruna_core::structs::execution::job::LocalCrate,
 ) -> Result<(), String> {
-    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
-    let status = RunCrateStatus::Local
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    batch_write(
-        context,
-        vec![
-            (
-                RUN_CRATE_KEYSPACE.to_string(),
-                key.clone(),
-                ByteView::from(status),
-            ),
-            (
-                aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE.to_string(),
-                key,
-                ByteView::from(local.to_bytes().map_err(|error| error.to_string())?),
-            ),
-        ],
-        None,
-    )
-    .await
+    drive(row_calls::put_local_crate(job_id, local), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The crate of a local run and its owner, while this device keeps one.
@@ -544,17 +274,9 @@ pub async fn read_local_crate(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<aruna_core::structs::execution::job::LocalCrate>, String> {
-    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
-    read_raw(
-        context,
-        aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE,
-        key,
-        None,
-    )
-    .await?
-    .map(|value| aruna_core::structs::execution::job::LocalCrate::from_bytes(value.as_ref()))
-    .transpose()
-    .map_err(|error| error.to_string())
+    drive(row_calls::read_local_crate(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Read the run link of a physical job id, if recorded.
@@ -562,11 +284,8 @@ pub async fn read_run_link(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
-    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
-    read_raw(context, aruna_core::keyspaces::RUN_LINK_KEYSPACE, key, None)
-        .await?
-        .map(|value| aruna_core::structs::execution::job::RunLink::from_bytes(value.as_ref()))
-        .transpose()
+    drive(row_calls::read_run_link(job_id), context)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -575,94 +294,16 @@ pub async fn read_crate_status(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
-    match read_raw(
-        context,
-        RUN_CRATE_KEYSPACE,
-        aruna_core::structs::execution::job::run_crate_key(job_id),
-        None,
-    )
-    .await?
-    {
-        Some(value) => {
-            aruna_core::structs::execution::job::RunCrateStatus::from_bytes(value.as_ref())
-                .map(Some)
-                .map_err(|error| error.to_string())
-        }
-        None => Ok(None),
-    }
+    drive(row_calls::read_crate_status(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-pub enum CancelRequestOutcome {
-    Cancelled(JobRecord),
-    Flagged(JobRecord),
-    AlreadyTerminal(JobRecord),
-}
-
-/// Idempotently set `cancel_requested`; a terminal job is a no-op. A queued job that never
-/// ran is terminalized right here: it owns no side effects to clean up, and leaving it for
-/// the drain would strand it `Queued` for as long as the executor stays at capacity.
+/// See [`job_calls::set_cancel_requested`].
 pub async fn set_cancel_requested(
     context: &DriverContext,
     job_id: JobId,
     now_ms: u64,
 ) -> Result<CancelRequestOutcome, JobMutationError> {
-    let mut cancelled_now = false;
-    let record = mutate_job(context, job_id, |record| {
-        cancelled_now = false;
-        // A locally exhausted job runs nowhere on this node; a container it may have left is
-        // removed by the cleanup queued when it was exhausted, so cancelling settles it.
-        if record.state == JobState::Indeterminate && record.locally_exhausted {
-            record.cancel_requested = true;
-            record.state = JobState::Cancelled;
-            record.locally_exhausted = false;
-            record.finished_at_ms = Some(now_ms);
-            record.updated_at_ms = now_ms;
-            record.claim = None;
-            cancelled_now = true;
-            return Ok(JobMutation::Persist);
-        }
-        if record.is_settled() {
-            return Ok(JobMutation::Skip);
-        }
-        // `has_run`, not `attempts == 0`: a job interrupted by a shutdown hands its lease
-        // back without spending an attempt, so attempts alone cannot prove it never ran.
-        if record.state == JobState::Queued && !record.has_run && record.attempt_intent.is_none() {
-            record.cancel_requested = true;
-            record.state = JobState::Cancelled;
-            record.finished_at_ms = Some(now_ms);
-            record.updated_at_ms = now_ms;
-            record.claim = None;
-            cancelled_now = true;
-            return Ok(JobMutation::Persist);
-        }
-        // A parked job holds no claim, so its cancellation runs through the queue at once.
-        if record.state == JobState::AwaitingKey {
-            record.cancel_requested = true;
-            record.updated_at_ms = now_ms;
-            if !record.has_run {
-                record.state = JobState::Cancelled;
-                record.finished_at_ms = Some(now_ms);
-                cancelled_now = true;
-            } else {
-                record.state = JobState::Queued;
-                record.due_at_ms = now_ms;
-            }
-            return Ok(JobMutation::Persist);
-        }
-        if record.cancel_requested {
-            return Ok(JobMutation::Skip);
-        }
-        record.cancel_requested = true;
-        record.updated_at_ms = now_ms;
-        Ok(JobMutation::Persist)
-    })
-    .await?;
-
-    Ok(if cancelled_now {
-        CancelRequestOutcome::Cancelled(record)
-    } else if record.is_settled() {
-        CancelRequestOutcome::AlreadyTerminal(record)
-    } else {
-        CancelRequestOutcome::Flagged(record)
-    })
+    drive(job_calls::set_cancel_requested(job_id, now_ms), context).await
 }

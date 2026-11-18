@@ -119,7 +119,7 @@ async fn reads_kind_only() {
 
 #[tokio::test]
 async fn resolves_session_alias() {
-    use crate::jobs::lifecycle::routing::session_job;
+    use super::session_job;
     use crate::jobs::route::JobRouteError;
     use crate::jobs::service::read_owned_job;
 
