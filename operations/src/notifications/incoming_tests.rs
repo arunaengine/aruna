@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::drive;
 use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::checks::{
@@ -20,6 +21,7 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
+use crate::realm::load_config::config_unavailable;
 use crate::sync::incoming::initialize_incoming_fixture;
 use crate::tests::notifications::create_local_watch;
 use aruna_core::UserId;
@@ -52,8 +54,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use ulid::Ulid;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 struct Node {
     _dir: TempDir,
@@ -326,7 +326,10 @@ async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
 /// The stored realm config gives `b` no job control yet.
 async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocument) {
     let (a, b, recipient) = delivery_pair(realm_seed).await;
-    let config = drive(GetConfigOperation::new(recipient.realm_id), &b.context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(recipient.realm_id), &b.context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .expect("realm config");
     (a, b, recipient, config)
 }

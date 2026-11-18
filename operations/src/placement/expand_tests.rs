@@ -80,7 +80,7 @@ fn published_map_initializes() {
 }
 
 #[test]
-fn lost_start_race_continues() {
+fn lost_race_continues() {
     let mut operation = ExpandPlacementOperation::new(&actor());
     operation.config = Some(config());
     let lost = Ulid::from_bytes([3; 16]);

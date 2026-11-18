@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyLoadOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::DriverContext;
 use crate::driver::drive;
@@ -30,8 +32,6 @@ use crate::metadata::repository::StorageReadError;
 use crate::metadata::timestamp_index::delete_index_keys;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation};
 use crate::storage_read::parse_storage_scan;
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::auth::enforcement::PolicyLoadOperation;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
 const BUILD_BATCH: usize = 256;
@@ -250,9 +250,14 @@ async fn load_evaluators(
     context: &DriverContext,
     records: &[MetadataRegistryRecord],
 ) -> Result<Evaluators, VisibilityError> {
-    drive(PolicyBulkOperation::new(records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id))), context)
+    drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
+        context,
+    )
     .await
     .map_err(|_| VisibilityError::Unavailable)
 }
@@ -287,7 +292,9 @@ async fn build_evaluators(
     scopes.dedup();
     let mut evaluators = Evaluators::new();
     for (realm_id, group_id) in scopes {
-        if let Ok(evaluator) = drive(PolicyLoadOperation::new(realm_id, Some(group_id)), context).await {
+        if let Ok(evaluator) =
+            drive(PolicyLoadOperation::new(realm_id, Some(group_id)), context).await
+        {
             evaluators.insert((realm_id, group_id), evaluator);
         }
     }

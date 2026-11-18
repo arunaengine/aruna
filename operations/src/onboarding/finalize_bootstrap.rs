@@ -371,8 +371,7 @@ impl Operation for FinalizeBootstrapOperation {
                     return self.output();
                 }
                 self.stage = FinalizeStage::Notify;
-                let notice =
-                    OnboardedNoticeOperation::new(self.input.realm_id, self.input.node_id);
+                let notice = OnboardedNoticeOperation::new(self.input.realm_id, self.input.node_id);
                 Ok(Next::Call(IoCall::child(notice)))
             }
             FinalizeStage::Notify => {
@@ -541,7 +540,9 @@ impl SyncTopicsOperation {
                 return Err(BootstrapFinalizeError::UserPlacementUnavailable(*user_id));
             }
             if holds_placement(config, &placement, self.joiner_node_id) {
-                topics.shard.push(document.sync_topic_id(realm_id, &placement));
+                topics
+                    .shard
+                    .push(document.sync_topic_id(realm_id, &placement));
             }
         }
         Ok(topics)
@@ -891,7 +892,10 @@ mod tests {
     async fn failure_marks_finalizing() {
         let fixture = setup_finalize_fixture().await;
 
-        let result = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let result = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(result, Err(BootstrapFinalizeError::NetHandleUnavailable));
         assert_realm_node(
@@ -923,12 +927,22 @@ mod tests {
     async fn finalizing_retry_completes() {
         let fixture = setup_finalize_fixture().await;
 
-        let first = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let first = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
-        let retry = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1)), &retry_context)
+        let retry = drive(
+            FinalizeBootstrapOperation::new(finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                SECRET_EXPIRES_AT + 1,
+            )),
+            &retry_context,
+        )
         .await
         .unwrap();
         assert_eq!(retry.mode, OnboardingMode::Server);
@@ -947,7 +961,10 @@ mod tests {
         let fixture = setup_finalize_fixture().await;
         let (context, net_handle) = context_with_net(&fixture).await;
 
-        let result = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &context)
+        let result = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &context,
+        )
         .await
         .unwrap();
         let target = DocumentTarget::NodeInfo {
@@ -1000,9 +1017,12 @@ mod tests {
         let mut device_input = finalize_input(&fixture, fixture.joiner_node_id, 10);
         device_input.enrollment_id = device_enrollment;
         device_input.secret_hash = "device".to_string();
-        let device = drive(FinalizeBootstrapOperation::new(device_input), &context.clone())
-            .await
-            .unwrap();
+        let device = drive(
+            FinalizeBootstrapOperation::new(device_input),
+            &context.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(device.mode, OnboardingMode::User { owner });
 
         let shared_topic = DocumentTarget::NodeInfo {
@@ -1017,10 +1037,12 @@ mod tests {
         assert!(storage.topic_state(&shared_topic).unwrap().is_none());
 
         let server_node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let server =
-            drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, server_node_id, 10)), &context)
-                .await
-                .unwrap();
+        let server = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, server_node_id, 10)),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(server.mode, OnboardingMode::Server);
         let state = storage
             .topic_state(&shared_topic)
@@ -1068,7 +1090,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            drive(SyncTopicsOperation::new(missing_realm_id, fixture.joiner_node_id, &missing_ticket), &fixture.context)
+            drive(
+                SyncTopicsOperation::new(missing_realm_id, fixture.joiner_node_id, &missing_ticket),
+                &fixture.context
+            )
             .await,
             Err(BootstrapFinalizeError::GetRealmConfig(
                 GetConfigError::DocumentNotFound
@@ -1158,7 +1183,10 @@ mod tests {
         )
         .unwrap();
 
-        let topics = drive(SyncTopicsOperation::new(fixture.realm_id, fixture.joiner_node_id, &ticket), &fixture.context)
+        let topics = drive(
+            SyncTopicsOperation::new(fixture.realm_id, fixture.joiner_node_id, &ticket),
+            &fixture.context,
+        )
         .await
         .unwrap();
 
@@ -1172,12 +1200,22 @@ mod tests {
     async fn other_node_rejected() {
         let fixture = setup_finalize_fixture().await;
 
-        let first = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let first = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let other_node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
-        let rejected = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, other_node_id, SECRET_EXPIRES_AT + 1)), &fixture.context.clone())
+        let rejected = drive(
+            FinalizeBootstrapOperation::new(finalize_input(
+                &fixture,
+                other_node_id,
+                SECRET_EXPIRES_AT + 1,
+            )),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(
             rejected,
@@ -1194,12 +1232,22 @@ mod tests {
         let admin_two = UserId::new(Ulid::from_bytes([41u8; 16]), fixture.realm_id);
         write_realm_admins(&fixture, &[admin_one, admin_two]).await;
 
-        let first = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let first = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
-        let retry = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1)), &retry_context)
+        let retry = drive(
+            FinalizeBootstrapOperation::new(finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                SECRET_EXPIRES_AT + 1,
+            )),
+            &retry_context,
+        )
         .await
         .unwrap();
         assert_eq!(retry.mode, OnboardingMode::Server);
@@ -1231,10 +1279,20 @@ mod tests {
         write_realm_admins(&fixture, &[admin_one, admin_two]).await;
 
         let (context, net_handle) = context_with_net(&fixture).await;
-        drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &context.clone())
+        drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &context.clone(),
+        )
         .await
         .unwrap();
-        drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1)), &context)
+        drive(
+            FinalizeBootstrapOperation::new(finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                SECRET_EXPIRES_AT + 1,
+            )),
+            &context,
+        )
         .await
         .unwrap();
 
@@ -1266,7 +1324,9 @@ mod tests {
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
 
-        drive(OnboardedNoticeOperation::new(realm_id, node_id), &context).await.unwrap();
+        drive(OnboardedNoticeOperation::new(realm_id, node_id), &context)
+            .await
+            .unwrap();
 
         assert!(read_outbox_rows(&storage_handle).await.is_empty());
     }
@@ -1275,12 +1335,22 @@ mod tests {
     async fn onboarding_without_admin() {
         let fixture = setup_finalize_fixture().await;
 
-        let first = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let first = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
-        let retry = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1)), &retry_context)
+        let retry = drive(
+            FinalizeBootstrapOperation::new(finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                SECRET_EXPIRES_AT + 1,
+            )),
+            &retry_context,
+        )
         .await
         .unwrap();
         assert_eq!(retry.mode, OnboardingMode::Server);
@@ -1293,7 +1363,10 @@ mod tests {
     async fn failed_finalize_silent() {
         let fixture = setup_finalize_fixture().await;
 
-        let result = drive(FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)), &fixture.context.clone())
+        let result = drive(
+            FinalizeBootstrapOperation::new(finalize_input(&fixture, fixture.joiner_node_id, 10)),
+            &fixture.context.clone(),
+        )
         .await;
         assert_eq!(result, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
@@ -1308,7 +1381,11 @@ mod tests {
             .node_labels
             .insert(KIND_LABEL_KEY.to_string(), "Server".to_string());
 
-        let result = drive(FinalizeBootstrapOperation::new(input), &fixture.context.clone()).await;
+        let result = drive(
+            FinalizeBootstrapOperation::new(input),
+            &fixture.context.clone(),
+        )
+        .await;
         assert_eq!(
             result,
             Err(BootstrapFinalizeError::ReservedNodeLabel(
@@ -1333,7 +1410,11 @@ mod tests {
         let mut input = finalize_input(&fixture, fixture.joiner_node_id, 10);
         input.node_location = Some("x".repeat(65));
 
-        let result = drive(FinalizeBootstrapOperation::new(input), &fixture.context.clone()).await;
+        let result = drive(
+            FinalizeBootstrapOperation::new(input),
+            &fixture.context.clone(),
+        )
+        .await;
         assert_eq!(result, Err(BootstrapFinalizeError::LongNodeLocation));
         assert_eq!(
             read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,

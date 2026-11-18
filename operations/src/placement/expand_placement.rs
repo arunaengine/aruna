@@ -190,7 +190,10 @@ impl ExpandPlacementOperation {
     }
 
     fn next_strategy(&mut self) -> ExpandTurn {
-        let config = self.config.as_ref().ok_or(MutatePlacementError::ConfigMissing)?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or(MutatePlacementError::ConfigMissing)?;
         while let Some(strategy_id) = self.strategies.pop() {
             let in_flight = config.placement_transitions.iter().find(|transition| {
                 transition.plan.strategy_id == strategy_id && !transition.is_terminal()

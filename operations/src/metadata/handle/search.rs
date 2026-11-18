@@ -22,13 +22,13 @@ use super::{
     LifecycleVisibilityRefresh, MetadataInner, MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT,
     handles,
 };
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::GroupRulesOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::query_cache::ScopeDigest;
 use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits, tie_order};
-use crate::auth::request_authorization::GroupRulesOperation;
-use crate::auth::enforcement::PolicyBulkOperation;
 
 #[tracing::instrument(
     name = "metadata.search.local",
@@ -609,15 +609,27 @@ pub(super) async fn resolve_visibility_scope(
         compute_handle: None,
         outbound_handle: None,
     };
-    let permissions = drive(GroupRulesOperation::new(auth_context.as_ref(), records
-            .iter()
-            .filter(|record| Some(record.realm_id) == auth_realm)
-            .map(|record| record.group_id)), &context)
-    .await;
+    let permissions = drive(
+        GroupRulesOperation::new(
+            auth_context.as_ref(),
+            records
+                .iter()
+                .filter(|record| Some(record.realm_id) == auth_realm)
+                .map(|record| record.group_id),
+        ),
+        &context,
+    )
+    .await
+    .unwrap_or_default();
     // Request policy removes denied records from both eager and SPARQL paths.
-    let evaluators = drive(PolicyBulkOperation::new(records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id))), &context)
+    let evaluators = drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
+        &context,
+    )
     .await
     .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let policy_auth = auth_context.as_ref();

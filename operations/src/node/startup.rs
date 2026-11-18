@@ -257,7 +257,18 @@ async fn reconcile_phase(
         return PhaseOutcome::default();
     }
     // Placement transitions run on their timer so cluster-wide draining cannot block readiness.
-    let placements = crate::driver::drive(crate::placement::process_placements::ReconcilePlacementsOperation::new(config.realm_id, config.node_id, false), context).await.unwrap_or_else(|_| crate::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+    let placements = crate::driver::drive(
+        crate::placement::process_placements::ReconcilePlacementsOperation::new(
+            config.realm_id,
+            config.node_id,
+            false,
+        ),
+        context,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        crate::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+    });
     let outcome = match placements.status {
         crate::placement::process_placements::PlacementReconcileStatus::Clean => {
             *pending = false;
@@ -454,7 +465,9 @@ pub async fn restore_shard_pass(
 
     // Former-holder history cutoffs are frozen only for shards a prior run
     // durably verified; join verification below happens after this restore.
-    let verified = drive(VerifiedTopicsOperation::new(realm_id), context).await.unwrap_or_default();
+    let verified = drive(VerifiedTopicsOperation::new(realm_id), context)
+        .await
+        .unwrap_or_default();
 
     let range = restore_range(*cursor, units_total);
     let start = range.start;
@@ -488,7 +501,9 @@ pub async fn restore_shard_pass(
     if batch.wrapped {
         // New-holder verification: reconcile each held shard against a co-holder
         // and persist a marker so a restart resumes only unverified shards.
-        drive(VerifyHeldOperation::new(node_id, realm_id), context).await.unwrap_or_default();
+        drive(VerifyHeldOperation::new(node_id, realm_id), context)
+            .await
+            .unwrap_or_default();
     }
 
     ShardRestorePass {
@@ -585,7 +600,9 @@ pub async fn prepare_shard_policy(
         return RestoreShardSummary::default();
     };
     let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
-    let verified = drive(VerifiedTopicsOperation::new(realm_id), context).await.unwrap_or_default();
+    let verified = drive(VerifiedTopicsOperation::new(realm_id), context)
+        .await
+        .unwrap_or_default();
 
     let mut prepared = 0usize;
     for ((co_members, publishers, retained), topics) in
@@ -644,7 +661,20 @@ async fn restore_shared(
     let mut outcome = RestoreUnitOutcome::default();
     // An unreachable or refusing peer may hold the genesis, so minting would fork it.
     // Keep withheld topics unresolved for recovery to retry.
-    let (to_ensure, withheld) = match drive(ResolveTopicsOperation::new(unit.peers.to_vec(), unit.topics.clone(), may_mint, BTreeSet::new()), context).await { Ok(resolved) => (resolved.to_ensure, resolved.withheld), Err(_) => (Vec::new(), true) };
+    let (to_ensure, withheld) = match drive(
+        ResolveTopicsOperation::new(
+            unit.peers.to_vec(),
+            unit.topics.clone(),
+            may_mint,
+            BTreeSet::new(),
+        ),
+        context,
+    )
+    .await
+    {
+        Ok(resolved) => (resolved.to_ensure, resolved.withheld),
+        Err(_) => (Vec::new(), true),
+    };
     if withheld {
         outcome.fail_topics(
             unit.topics
@@ -690,7 +720,21 @@ async fn restore_rank0(
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
     // An unreachable co-holder might hold the genesis; never fork a second one.
-    let group_withheld = drive(EnsureGenesisOperation::new(node_id, unit.peers.clone(), unit.publishers.clone(), unit.topics.clone(), unit.retained.clone(), verified.clone(), BTreeSet::new()), context).await.map(|(withheld, _)| withheld).unwrap_or(true);
+    let group_withheld = drive(
+        EnsureGenesisOperation::new(
+            node_id,
+            unit.peers.clone(),
+            unit.publishers.clone(),
+            unit.topics.clone(),
+            unit.retained.clone(),
+            verified.clone(),
+            BTreeSet::new(),
+        ),
+        context,
+    )
+    .await
+    .map(|(withheld, _)| withheld)
+    .unwrap_or(true);
     let present: Vec<::irokle::TopicId> = unit
         .topics
         .iter()
@@ -1517,7 +1561,18 @@ mod tests {
         mesh_nodes(&local, &blocked).await;
         // Every configured peer restores because only the designated minter creates shared topics.
         restore_shard_subscriptions(&blocked.context, blocked.net.node_id(), realm_id).await;
-        crate::driver::drive(crate::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, blocked.net.node_id(), true), &blocked.context).await.unwrap_or_else(|_| crate::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        crate::driver::drive(
+            crate::placement::process_placements::ReconcilePlacementsOperation::new(
+                realm_id,
+                blocked.net.node_id(),
+                true,
+            ),
+            &blocked.context,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            crate::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+        });
         wait_state(&status, RecoveryState::Converged).await;
         assert_eq!(status.snapshot().state, RecoveryState::Converged);
         assert_eq!(status.snapshot().topics_remaining, 0);
