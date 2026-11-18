@@ -385,82 +385,137 @@ type JobTurn = Result<Next<JobStep>, RenameError>;
 /// Re-maps the next keys after the job's cursor; keys changed after the start or with a reason
 /// stay, and a reason for the whole bucket makes the page wait. The keys move with the job's
 /// progress, and only while the job is stored as `job`, so a paused or aborted job stops.
-pub async fn job_page(
-    context: &DriverContext,
-    plan: &RemapPlan,
-    scope: &RemapScope<'_>,
-    job: &LinkedJob,
-) -> Result<JobStep, RenameError> {
-    let read = |error: String| RenameError::Authorization(error);
-    let (cursor, started_ms) = (job.cursor.clone(), job.started_at_ms);
-    let mut step = JobStep {
-        cursor: cursor.clone(),
-        ..JobStep::default()
-    };
-    let (mut keys, mut scanned) = (Vec::new(), 0usize);
-    'scan: loop {
-        let (page, last) = head_page(context, scope.bucket, &plan.from, step.cursor.as_deref())
-            .await
-            .map_err(read)?;
-        for (key, head) in &page {
-            if keys.len() == JOB_KEYS || scanned == JOB_SCAN {
-                break 'scan;
+#[derive(Debug, PartialEq)]
+pub struct RemapJobOperation {
+    plan: RemapPlan,
+    scope: RemapScope,
+    job: LinkedJob,
+    step: JobPageStep,
+    progress: JobStep,
+    keys: Vec<String>,
+    scanned: usize,
+}
+
+impl RemapJobOperation {
+    pub fn new(plan: &RemapPlan, scope: &RemapScope, job: &LinkedJob) -> Self {
+        Self {
+            plan: plan.clone(),
+            scope: scope.clone(),
+            job: job.clone(),
+            step: JobPageStep::Scan,
+            progress: JobStep {
+                cursor: job.cursor.clone(),
+                ..JobStep::default()
+            },
+            keys: Vec::new(),
+            scanned: 0,
+        }
+    }
+
+    fn call(&mut self, step: JobPageStep, call: IoCall) -> JobTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn scan(&mut self) -> JobTurn {
+        let after = self.progress.cursor.as_deref();
+        let call = head_call(&self.scope.bucket, &self.plan.from, after)?;
+        self.call(JobPageStep::Scan, call)
+    }
+
+    fn check(&mut self) -> JobTurn {
+        let keys = std::mem::take(&mut self.keys);
+        let check = CheckKeys::new(&self.plan, &self.scope, keys);
+        self.call(JobPageStep::Check, IoCall::child(check))
+    }
+
+    fn scanned(&mut self, result: IoResult) -> JobTurn {
+        let (keys, last) = head_rows(result)?;
+        let empty = keys.is_empty();
+        for (key, head) in keys {
+            if self.keys.len() == JOB_KEYS || self.scanned == JOB_SCAN {
+                return self.check();
             }
-            scanned += 1;
-            step.cursor = Some(key.clone());
-            if !plan.selects(key) {
+            self.scanned += 1;
+            self.progress.cursor = Some(key.clone());
+            if !self.plan.selects(&key) {
                 continue;
             }
-            let pointer = CurrentVersionPointer::from_bytes(head)?;
-            match pointer.version_id.timestamp_ms() <= started_ms {
-                true => keys.push(key.clone()),
-                false => step.skipped += 1,
+            let pointer = CurrentVersionPointer::from_bytes(&head)?;
+            match pointer.version_id.timestamp_ms() <= self.job.started_at_ms {
+                true => self.keys.push(key),
+                false => self.progress.skipped += 1,
             }
         }
-        if last || page.is_empty() {
-            step.finished = true;
-            break;
+        if last || empty {
+            self.progress.finished = true;
+            return self.check();
+        }
+        self.scan()
+    }
+
+    /// A page that moved nothing keeps the cursor it started from.
+    fn unchanged(&self, waiting: Option<String>) -> JobTurn {
+        Ok(Next::Done(JobStep {
+            cursor: self.job.cursor.clone(),
+            waiting,
+            ..JobStep::default()
+        }))
+    }
+
+    fn checked(&mut self, (entries, blocked): CheckedKeys) -> JobTurn {
+        if let Some(reason) = blocked {
+            return self.unchanged(Some(reason));
+        }
+        let pairs = free_pairs(&entries);
+        self.progress.skipped += (entries.len() - pairs.len()) as u64;
+        if pairs.is_empty() {
+            return Ok(Next::Done(std::mem::take(&mut self.progress)));
+        }
+        let job = &self.job;
+        let mut next = job.clone();
+        next.cursor = self.progress.cursor.clone();
+        next.done = job.done + pairs.len() as u64;
+        next.skipped = job.skipped + self.progress.skipped;
+        next.waiting = None;
+        let fence = (job.to_bytes()?.into(), next.to_bytes()?.into());
+        let mut apply = input(&self.scope, pairs, true);
+        (apply.cutoff_ms, apply.job) = (Some(job.started_at_ms), Some(fence));
+        let rename = RenameKeysOperation::new(apply);
+        self.call(JobPageStep::Apply, IoCall::child(rename))
+    }
+
+    fn applied(&mut self, applied: Result<RenamePlan, RenameError>) -> JobTurn {
+        match applied {
+            // The progress is stored with the keys.
+            Ok(_) => Ok(Next::Done(JobStep {
+                done: 0,
+                skipped: 0,
+                ..std::mem::take(&mut self.progress)
+            })),
+            Err(RenameError::Conflict(reason)) if reason == JOB_CHANGED => self.unchanged(None),
+            // Something changed between the check and the move; the page runs again.
+            Err(RenameError::Conflict(reason)) => self.unchanged(Some(reason)),
+            Err(RenameError::Storage(StorageError::TransactionConflict)) => self.unchanged(None),
+            Err(error) => Err(error),
         }
     }
-    let (entries, blocked) = check_keys(context, plan, scope, keys).await?;
-    let unchanged = |waiting| JobStep {
-        cursor: cursor.clone(),
-        waiting,
-        ..JobStep::default()
-    };
-    if let Some(reason) = blocked {
-        return Ok(unchanged(Some(reason)));
+}
+
+impl Operation for RemapJobOperation {
+    type Output = JobStep;
+    type Error = RenameError;
+
+    fn first(&mut self) -> JobTurn {
+        self.scan()
     }
-    let pairs: Vec<_> = entries
-        .iter()
-        .filter(|entry| entry.conflict.is_none())
-        .map(|entry| (entry.from.clone(), entry.to.clone()))
-        .collect();
-    step.skipped += (entries.len() - pairs.len()) as u64;
-    if pairs.is_empty() {
-        return Ok(step);
-    }
-    let mut next = job.clone();
-    next.cursor = step.cursor.clone();
-    (next.done, next.skipped) = (job.done + pairs.len() as u64, job.skipped + step.skipped);
-    next.waiting = None;
-    let fence = (job.to_bytes()?.into(), next.to_bytes()?.into());
-    let mut apply = input(scope, pairs, true);
-    (apply.cutoff_ms, apply.job) = (Some(started_ms), Some(fence));
-    match drive(RenameKeysOperation::new(apply), context).await {
-        // The progress is stored with the keys.
-        Ok(_) => Ok(JobStep {
-            done: 0,
-            skipped: 0,
-            ..step
-        }),
-        Err(RenameError::Conflict(reason)) if reason == JOB_CHANGED => Ok(unchanged(None)),
-        // Something changed between the check and the move; the page runs again.
-        Err(RenameError::Conflict(reason)) => Ok(unchanged(Some(reason))),
-        Err(RenameError::Storage(aruna_core::errors::StorageError::TransactionConflict)) => {
-            Ok(unchanged(None))
+
+    fn next(&mut self, result: IoResult) -> JobTurn {
+        match self.step {
+            JobPageStep::Scan => self.scanned(result),
+            JobPageStep::Check => self.checked(result.child::<CheckedKeys, RenameError>()??),
+            JobPageStep::Apply => self.applied(result.child::<RenamePlan, RenameError>()?),
         }
-        Err(error) => Err(error),
     }
 }
 
