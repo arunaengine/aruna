@@ -24,6 +24,7 @@ mod forward;
 pub mod held;
 pub mod ids;
 pub mod ingress;
+mod input_walk;
 pub(crate) mod launch_checks;
 pub mod offer;
 pub mod outbox;
