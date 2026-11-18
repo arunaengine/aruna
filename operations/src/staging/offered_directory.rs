@@ -6,7 +6,7 @@
 use crate::s3::bucket::create::CreateBucketError;
 use crate::s3::usage::UsageUpdateError;
 use crate::staging::bucket_guard::BucketGuardError;
-use crate::staging::list_offers::ListOffersError;
+use crate::staging::offer::list::ListOffersError;
 use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
@@ -16,8 +16,8 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub(crate) use super::offer_run::{CheckRootOperation, check_root};
-pub use super::offer_run::{
+pub(crate) use super::offer::run::{CheckRootOperation, check_root};
+pub use super::offer::run::{
     OfferDirectoryOperation, WithdrawOfferOperation, offer_directory, withdraw_offer,
 };
 
@@ -143,7 +143,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::staging::bucket_guard::BucketGuardOperation;
-    use crate::staging::list_offers::ListOffersOperation;
+    use crate::staging::offer::list::ListOffersOperation;
     use crate::tests::staging::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

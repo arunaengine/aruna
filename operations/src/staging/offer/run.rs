@@ -25,11 +25,11 @@ use ulid::Ulid;
 
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 
-use super::offer_observe::{ObserveFileOperation, TombstoneOperation, entry_fingerprint};
-use super::offered_directory::{
+use super::super::offered_directory::{
     ObservationScope, ObservedFile, OfferDirectoryInput, OfferDirectoryResult,
     OfferedDirectoryError, WithdrawOfferInput,
 };
+use super::observe::{ObserveFileOperation, TombstoneOperation, entry_fingerprint};
 
 type OfferError = OfferedDirectoryError;
 
@@ -495,5 +495,5 @@ impl Operation for WithdrawOfferOperation {
 }
 
 #[cfg(test)]
-#[path = "offer_run_tests.rs"]
+#[path = "run_tests.rs"]
 mod tests;

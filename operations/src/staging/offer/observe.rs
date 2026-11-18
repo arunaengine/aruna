@@ -33,7 +33,7 @@ use ulid::Ulid;
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 
-use super::offered_directory::{ObservationScope, OfferedDirectoryError};
+use super::super::offered_directory::{ObservationScope, OfferedDirectoryError};
 
 type OfferError = OfferedDirectoryError;
 
@@ -62,7 +62,7 @@ fn offered_binding(bucket: &str, path: &str, node_id: NodeId) -> VersionSourceBi
 
 /// The weak identity one listed file carries. A source that reports the full stat is
 /// fingerprinted by it; size and mtime alone never stand in for reading the bytes.
-pub(super) fn entry_fingerprint(entry: &SourceEntry) -> String {
+pub(in crate::staging) fn entry_fingerprint(entry: &SourceEntry) -> String {
     let size = entry.size.unwrap_or_default();
     let stat = (entry.stat).unwrap_or_else(|| FileStat::partial(size, entry.modified));
     weak_fingerprint(&stat)
@@ -180,7 +180,7 @@ impl CurrentRows {
 /// Records one file. An unchanged file keeps its version, so offering a directory again does
 /// not churn the identities realm nodes already reference. Outputs the file's version.
 #[derive(Debug, PartialEq)]
-pub(super) struct ObserveFileOperation {
+pub(in crate::staging) struct ObserveFileOperation {
     scope: ObservationScope,
     path: String,
     binding: VersionSourceBinding,
@@ -193,7 +193,7 @@ pub(super) struct ObserveFileOperation {
 type ObserveTurn = Result<Next<Ulid>, OfferError>;
 
 impl ObserveFileOperation {
-    pub(super) fn new(scope: ObservationScope, entry: &SourceEntry) -> Self {
+    pub(in crate::staging) fn new(scope: ObservationScope, entry: &SourceEntry) -> Self {
         Self {
             binding: offered_binding(&scope.bucket, &entry.path, scope.node_id),
             metadata: entry_metadata(entry),
@@ -294,7 +294,7 @@ impl Operation for ObserveFileOperation {
 
 /// Writes a delete marker over one observation; `true` when it removed a live object.
 #[derive(Debug, PartialEq)]
-pub(super) struct TombstoneOperation {
+pub(in crate::staging) struct TombstoneOperation {
     scope: ObservationScope,
     key: String,
     rows: CurrentRows,
@@ -304,7 +304,7 @@ pub(super) struct TombstoneOperation {
 type TombstoneTurn = Result<Next<bool>, OfferError>;
 
 impl TombstoneOperation {
-    pub(super) fn new(scope: ObservationScope, key: String) -> Self {
+    pub(in crate::staging) fn new(scope: ObservationScope, key: String) -> Self {
         Self {
             scope,
             key,
@@ -370,5 +370,5 @@ impl Operation for TombstoneOperation {
 }
 
 #[cfg(test)]
-#[path = "offer_observe_tests.rs"]
+#[path = "observe_tests.rs"]
 mod tests;
