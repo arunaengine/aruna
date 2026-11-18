@@ -602,93 +602,118 @@ impl Operation for ReleaseClaimedOperation {
                 result.done()?;
                 self.call(ClaimedStep::DeletingSynced, IoCall::Sync)
             }
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => break,
-        }
-    }
-    let owners = storage(owners_scan_effect(&ArchiveKey::of(location), None))?;
-    match send(context, owners).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {}
-        Event::Storage(StorageEvent::IterResult { .. }) => return Ok(true),
-        other => return Err(format!("could not read archive owners: {}", other.label())),
-    }
-    other_rows(context, location, import_id).await
-}
-
-/// Whether the storage confirmed that every committed transaction is on disk.
-async fn synced(context: &DriverContext) -> bool {
-    match send(context, StorageEffect::SyncAll).await {
-        Event::Storage(StorageEvent::SyncAllFinished) => true,
-        event => {
-            warn!(
-                ?event,
-                "Storage did not sync before a renamed file is deleted"
-            );
-            false
-        }
-    }
-}
-
-/// Drops the old location row of the rename in a reclaim transaction that proves no version
-/// reads it, and debits its bytes; `false` while something still reads it.
-async fn retire_source(context: &DriverContext, location: &BackendLocation) -> bool {
-    let Ok(key) = location.location_key() else {
-        return false;
-    };
-    let candidate = ReclaimCandidateKey::new(key.backend, key.encoding, key.blake3_hash);
-    let now = std::time::SystemTime::now();
-    let operation = ReclaimBlobOperation::new(candidate, now, now).forced();
-    match drive(operation, context).await {
-        Ok(ReclaimVerdict::Freed { .. } | ReclaimVerdict::Dropped) => true,
-        Ok(ReclaimVerdict::Pinned | ReclaimVerdict::NotDue) => false,
-        Err(error) => {
-            warn!(%error, "Old location of a renamed file could not be retired");
-            false
-        }
-    }
-}
-
-/// `None` while another location row of these bytes on the same storage reads the same file:
-/// reclaim drops such rows without touching the file, so the release waits for them. Else
-/// whether a row reads another backend version at the same path, which keeps the path in use.
-async fn pinned(
-    context: &DriverContext,
-    location: &BackendLocation,
-    version: &str,
-) -> Result<Option<bool>, String> {
-    let mut shared = false;
-    let wanted = location.location_key().map_err(|error| error.to_string())?;
-    let mut start = None;
-    loop {
-        let effect = StorageEffect::Iter {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            prefix: Some(wanted.blake3_hash.to_vec().into()),
-            start: start.take().map(IterStart::After),
-            limit: RULE_PAGE,
-            txn_id: None,
-        };
-        let (rows, next) = match send(context, effect).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            other => return Err(format!("could not read locations: {}", other.label())),
-        };
-        for (key, value) in rows {
-            let row = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-            let own = key.as_ref() == wanted.to_bytes().as_slice();
-            if !own && row.backend == location.backend && same_path(&row, location) {
-                match other_version(context, &row, version).await? {
-                    true => shared = true,
-                    false => return Ok(None),
-                }
+            ClaimedStep::DeletingSynced => {
+                result.done()?;
+                let etag = self.etag.take().filter(|_| self.file.version.is_empty());
+                let delete = self.file.delete_call(etag);
+                self.call(ClaimedStep::Delete, delete)
+            }
+            ClaimedStep::Delete => self.deleted(result.event()?),
+            ClaimedStep::Tombstone => {
+                result.done()?;
+                self.call(ClaimedStep::TombstoneSynced, IoCall::Sync)
+            }
+            ClaimedStep::TombstoneSynced => {
+                result.done()?;
+                self.drop_row()
+            }
+            ClaimedStep::Dropped => match result.child::<bool, MigrationError>()?? {
+                true => self.clear_claim(),
+                false => Ok(Next::Done(Released::Retry)),
+            },
+            ClaimedStep::Cleared => {
+                result.done()?;
+                Ok(Next::Done(Released::Deleted))
             }
         }
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(Some(shared)),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DropStep {
+    Page,
+    Claims(Vec<(Key, Key)>),
+    Deleted,
+}
+
+/// Drops a page of the claims and tombstones of a removed rule; a claim whose delete was sent
+/// stays until its release settles it. Outputs `true` once none is left.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DropClaimsOperation {
+    pages: PrefixPages,
+    read: usize,
+    seen: bool,
+    step: DropStep,
+}
+
+impl DropClaimsOperation {
+    pub(crate) fn new(import_id: Ulid) -> Self {
+        let prefix = import_id.to_bytes().to_vec();
+        Self {
+            pages: PrefixPages::new(CLAIM_INDEX_KEYSPACE, prefix, RULE_PAGE),
+            read: 0,
+            seen: false,
+            step: DropStep::Page,
+        }
+    }
+
+    fn next_page(&mut self) -> Turn<bool> {
+        if self.pages.done() || self.read == DROP_PAGES {
+            return Ok(Next::Done(!self.seen));
+        }
+        self.read += 1;
+        self.step = DropStep::Page;
+        Ok(Next::Call(self.pages.call()))
+    }
+}
+
+impl Operation for DropClaimsOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        self.next_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, DropStep::Deleted) {
+            DropStep::Page => {
+                let rows = self.pages.take(result)?;
+                self.seen |= !rows.is_empty();
+                if rows.is_empty() {
+                    return self.next_page();
+                }
+                let keys: Vec<(Key, Key)> = (rows.into_iter())
+                    .map(|(key, _)| {
+                        let claim: Key = key.get(16..).unwrap_or_default().to_vec().into();
+                        (key, claim)
+                    })
+                    .collect();
+                let reads = (keys.iter())
+                    .map(|(_, claim)| (DELETE_CLAIM_KEYSPACE.to_string(), claim.clone()))
+                    .collect();
+                self.step = DropStep::Claims(keys);
+                Ok(Next::Call(IoCall::Read(reads)))
+            }
+            DropStep::Claims(keys) => {
+                let mut deletes = Vec::with_capacity(keys.len() * 2);
+                for ((key, claim), value) in keys.into_iter().zip(result.values()?) {
+                    if value.as_deref() == Some(DELETING) {
+                        continue;
+                    }
+                    deletes.push((DELETE_CLAIM_KEYSPACE.to_string(), claim));
+                    deletes.push((CLAIM_INDEX_KEYSPACE.to_string(), key));
+                }
+                if deletes.is_empty() {
+                    return self.next_page();
+                }
+                self.step = DropStep::Deleted;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            DropStep::Deleted => {
+                result.done()?;
+                Ok(Next::Done(false))
+            }
         }
     }
 }
@@ -698,43 +723,149 @@ fn same_path(left: &BackendLocation, right: &BackendLocation) -> bool {
         == (&right.root, &right.storage_bucket, &right.backend_path)
 }
 
-/// Whether another copy of the same bytes, such as a literal-name import, reads the same file:
-/// the same path and no other known backend version.
-async fn same_file(
-    context: &DriverContext,
-    key: &BlobLocationKey,
-    (location, version): (&BackendLocation, &str),
-) -> Result<bool, String> {
-    let Some(value) = read_value(context, BLOB_LOCATIONS_KEYSPACE, key.to_bytes().into()).await?
-    else {
-        return Ok(false);
-    };
-    let other = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-    Ok(same_path(&other, location) && !other_version(context, &other, version).await?)
+fn version_read(location: &BackendLocation) -> IoCall {
+    read_row(BACKEND_VERSION_KEYSPACE, version_key(location.ulid))
 }
 
-/// Whether another rule on the same storage, such as one sharing the folder, has a row there.
-async fn other_rows(
-    context: &DriverContext,
-    location: &BackendLocation,
+/// Whether a backend version row names other bytes than `version`.
+fn other_version(value: Option<Value>, version: &str) -> Result<bool, MigrationError> {
+    let found = value
+        .map(|value| String::from_utf8(value.to_vec()))
+        .transpose()
+        .map_err(MigrationError::failed)?;
+    Ok(found.is_some_and(|found| found != version))
+}
+
+fn iter_rows(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), MigrationError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => Ok((values, next_start_after)),
+        other => Err(MigrationError::Failed(format!(
+            "could not read rows: {}",
+            other.label()
+        ))),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReferenceStep {
+    Aliases,
+    Version,
+    Location,
+    Provider,
+    Owners,
+    Rules,
+    RuleRow,
+}
+
+/// Whether a version, an archive owner or another rule's row still names the copy.
+#[derive(Debug, PartialEq)]
+struct ReferencedOperation {
+    location: BackendLocation,
     import_id: Ulid,
-) -> Result<bool, String> {
-    let mut after = None;
-    loop {
-        let storage = &context.storage_handle;
-        let page = iter_prefix_page(
-            storage,
-            BACKEND_IMPORT_KEYSPACE,
-            None,
-            after,
-            RULE_PAGE,
-            None,
-        );
-        let (rules, next) = page.await?;
-        for (_, value) in rules {
-            let rule = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;
-            let on = |backend: Ulid| BackendRef::Group(backend) == location.backend;
-            if rule.import_id == import_id || !(on(rule.backend_id) || on(rule.write_backend())) {
+    version: String,
+    wanted: Option<BlobLocationKey>,
+    step: ReferenceStep,
+    start: Option<Key>,
+    more: Option<Key>,
+    aliases: VecDeque<HashIndex>,
+    rules: PrefixPages,
+    found_rules: VecDeque<Value>,
+}
+
+impl ReferencedOperation {
+    fn new(file: &ReleaseFile) -> Self {
+        Self {
+            location: file.location.clone(),
+            import_id: file.import_id,
+            version: file.version.clone(),
+            wanted: None,
+            step: ReferenceStep::Aliases,
+            start: None,
+            more: None,
+            aliases: VecDeque::new(),
+            rules: PrefixPages::new(BACKEND_IMPORT_KEYSPACE, Key::from(Vec::new()), RULE_PAGE),
+            found_rules: VecDeque::new(),
+        }
+    }
+
+    fn call(&mut self, step: ReferenceStep, call: IoCall) -> Turn<bool> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn wanted(&self) -> Result<&BlobLocationKey, MigrationError> {
+        (self.wanted.as_ref()).ok_or_else(|| MigrationError::Failed("no location".to_string()))
+    }
+
+    fn read_aliases(&mut self) -> Turn<bool> {
+        let hash = self.wanted()?.blake3_hash;
+        let aliases = iter_index_effect(&hash, self.start.take(), None)?;
+        self.call(ReferenceStep::Aliases, aliases.into())
+    }
+
+    fn next_alias(&mut self) -> Turn<bool> {
+        let Some(alias) = self.aliases.pop_front() else {
+            return match self.more.take() {
+                Some(next) => {
+                    self.start = Some(next);
+                    self.read_aliases()
+                }
+                None => {
+                    let owners = owners_scan_effect(&ArchiveKey::of(&self.location), None);
+                    self.call(ReferenceStep::Owners, owners.into())
+                }
+            };
+        };
+        let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, version.to_bytes()?);
+        self.call(ReferenceStep::Version, read)
+    }
+
+    fn version_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        // A missing indexed version proves nothing, so the copy stays.
+        let Some(value) = value else {
+            return Ok(Next::Done(true));
+        };
+        let Some(other) = BlobVersion::from_bytes(&value)?.location_key() else {
+            return self.next_alias();
+        };
+        let wanted = self.wanted()?;
+        if other == *wanted {
+            return Ok(Next::Done(true));
+        }
+        if other.backend != wanted.backend {
+            return self.next_alias();
+        }
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, other.to_bytes());
+        self.call(ReferenceStep::Location, read)
+    }
+
+    /// Another copy of the same bytes, such as a literal-name import, may read the same file:
+    /// the same path and no other known backend version.
+    fn location_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        let Some(value) = value else {
+            return self.next_alias();
+        };
+        let other = BackendLocation::from_bytes(&value)?;
+        if !same_path(&other, &self.location) {
+            return self.next_alias();
+        }
+        let read = version_read(&other);
+        self.call(ReferenceStep::Provider, read)
+    }
+
+    /// Another rule on the same storage, such as one sharing the folder, may have a row there.
+    fn next_rule(&mut self) -> Turn<bool> {
+        while let Some(value) = self.found_rules.pop_front() {
+            let rule = BackendImport::from_bytes(&value)?;
+            let backend = &self.location.backend;
+            let on = |id: Ulid| BackendRef::Group(id) == *backend;
+            if rule.import_id == self.import_id
+                || !(on(rule.backend_id) || on(rule.write_backend()))
+            {
                 continue;
             }
             let key = object_key(rule.import_id, &location.backend_path);
