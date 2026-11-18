@@ -789,6 +789,15 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Checks a forwarded caller's credential and that the sending peer is a realm member;
+    /// answers `NetEvent::WritePeerChecked`.
+    AuthorizeWritePeer {
+        peer: NodeId,
+        auth_token: Option<Box<crate::metadata::AuthToken>>,
+    },
+    /// Verifies a token that may already be revoked and reads its claims; answers
+    /// `NetEvent::RevocationClaims`.
+    RevocationClaims(Box<crate::metadata::AuthToken>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
@@ -817,11 +826,22 @@ pub enum NetEffect {
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
 /// sends it to `peer`, waits at most `timeout`, and never routes or retries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
     pub timeout: Duration,
+}
+
+/// Shows the frame size only: a frame can carry credentials or the realm key.
+impl std::fmt::Debug for MetadataRequestEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataRequestEffect")
+            .field("peer", &self.peer)
+            .field("frame_bytes", &self.frame.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

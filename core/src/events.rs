@@ -504,8 +504,19 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// The caller a forwarded credential names, or why the peer may not act for it.
+    WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
+    /// The verified claims of a token named for revocation, or why it is invalid.
+    RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
+}
+
+/// Why a forwarded credential was not accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePeerRefusal {
+    Unauthorized,
+    Unavailable(String),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -923,6 +934,8 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    WritePeerChecked,
+                    RevocationClaims,
                     Notification,
                     InboxWoken,
                     Heartbeat,
