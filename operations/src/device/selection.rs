@@ -16,7 +16,7 @@ use super::replica::{
     TrackCreatedOperation, cache_budget,
 };
 use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
-use crate::distribution::here::NodeRealm;
+use aruna_core::structs::identity::realm::NodeRealm;
 use crate::driver::DriverContext;
 
 fn refresh_call(ids: NodeRealm, document_id: Ulid) -> IoCall {

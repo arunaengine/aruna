@@ -977,7 +977,7 @@ impl OperationsTaskHandler {
                         let (after, imports) = pass.finish();
                         for start in imports {
                             let started =
-                                crate::distribution::import_start::start_kept(context, start);
+                                crate::jobs::handed_imports::start_kept(context, start);
                             if let Err(error) = started.await {
                                 warn!(%error, "Handed over imports could not start");
                             }

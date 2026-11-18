@@ -6,6 +6,7 @@
 // Budgets are bounded; an exhausted budget or a silent range is "not resolvable now", never
 // absence.
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{HashMap, VecDeque};
 
 use aruna_core::NodeId;
@@ -28,8 +29,7 @@ use thiserror::Error;
 use tokio::time::Instant;
 use ulid::Ulid;
 
-use super::here::NodeRealm;
-use super::inventory::{StagedCall, outside_answer};
+use aruna_core::structs::identity::realm::NodeRealm;
 use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyError, VersionKeyOperation};
 use crate::driver::DriverContext;
@@ -136,7 +136,7 @@ impl Operation for KeyHoldersOperation {
 
     fn first(&mut self) -> Result<Next<Vec<NodeId>>, IoError> {
         let read = read_row(DISTRIBUTION_KEYSPACE, self.set_id.to_bytes().to_vec());
-        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+        Ok(Next::Call(outside_call(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<NodeId>>, IoError> {

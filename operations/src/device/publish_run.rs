@@ -326,7 +326,7 @@ async fn pull_output(
     };
     let auth_token = AuthToken::internal(auth.clone());
     let forward = ForwardPullOperation::new(target.node_id, auth_token, pull);
-    match drive(forward, context).await.map_err(|refused| refused.0) {
+    match drive(forward, context).await {
         Ok(ack) => Ok(OutputObject {
             node_id: target.node_id,
             bucket: target.bucket.clone(),

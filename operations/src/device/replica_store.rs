@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::DEVICE_REPLICA_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -12,7 +13,6 @@ use ulid::Ulid;
 use super::replica::{
     CacheUsageOperation, ListReplicasOperation, ReplicaRecord, replica_entry, replica_key,
 };
-use crate::distribution::inventory::{StagedCall, outside_answer};
 
 /// One replica, or `None` for both an absent row and an unreadable one: every caller treats an
 /// unreadable row as a document this device does not hold.
@@ -35,7 +35,7 @@ impl Operation for ReadReplicaOperation {
             DEVICE_REPLICA_KEYSPACE,
             replica_key(self.document_id).to_vec(),
         );
-        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+        Ok(Next::Call(outside_call(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<ReplicaRecord>>, IoError> {

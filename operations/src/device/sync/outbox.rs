@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -34,9 +35,8 @@ use crate::device::backlog::{
 use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
 use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
-use crate::distribution::forward::{config_of, realm_config};
-use crate::distribution::here::NodeRealm;
-use crate::distribution::inventory::{StagedCall, outside_answer};
+use crate::document_repository::{config_of, realm_config};
+use aruna_core::structs::identity::realm::NodeRealm;
 use crate::driver::DriverContext;
 
 use super::folders::FolderError;
@@ -227,7 +227,7 @@ impl ForwardUploadOperation {
     fn drop_row(&mut self) -> Forwarding {
         self.step = UploadStep::Drop;
         let delete = IoCall::Delete(vec![upload_row(&self.upload)]);
-        Ok(Next::Call(StagedCall::Outside(delete).into_call()))
+        Ok(Next::Call(outside_call(delete)))
     }
 
     fn park(&mut self, reason: String) -> Forwarding {
@@ -339,7 +339,7 @@ impl Operation for ForwardUploadOperation {
     fn first(&mut self) -> Forwarding {
         let key = folder_key(self.upload.folder_id).to_vec();
         let read = read_row(SYNCED_FOLDER_KEYSPACE, key);
-        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+        Ok(Next::Call(outside_call(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Forwarding {

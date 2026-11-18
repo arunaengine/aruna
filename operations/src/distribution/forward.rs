@@ -15,7 +15,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
@@ -30,13 +30,13 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
-use super::here::{NodeRealm, here};
+use super::here::here;
 use super::publish::PublishError;
 use super::submit::PublishLocalOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{config_of, realm_config};
 use crate::driver::DriverContext;
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::pull_refusal;
@@ -83,31 +83,6 @@ impl From<PublishError> for PublishRefusal {
     }
 }
 
-/// A member node's refusal, as the error of its operations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberRefusal(pub SyncRefusal);
-
-impl From<IoError> for MemberRefusal {
-    fn from(_: IoError) -> Self {
-        Self(SyncRefusal::Unavailable)
-    }
-}
-
-impl From<SyncRefusal> for MemberRefusal {
-    fn from(refusal: SyncRefusal) -> Self {
-        Self(refusal)
-    }
-}
-
-pub(crate) fn realm_config(realm_id: RealmId) -> IoCall {
-    IoCall::child(GetConfigOperation::new(realm_id))
-}
-
-/// The realm configuration a config read found; an unreadable one counts as none.
-pub(crate) fn config_of(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {
-    Ok(result.child::<RealmConfigDocument, GetConfigError>()?.ok())
-}
-
 fn bearer_only(auth_token: &AuthToken) -> bool {
     matches!(auth_token, AuthToken::Bearer(_))
 }
@@ -133,18 +108,18 @@ impl PeerCallerOperation {
 
 impl Operation for PeerCallerOperation {
     type Output = AuthContext;
-    type Error = MemberRefusal;
+    type Error = SyncRefusal;
 
-    fn first(&mut self) -> Result<Next<AuthContext>, MemberRefusal> {
+    fn first(&mut self) -> Result<Next<AuthContext>, SyncRefusal> {
         let token = self.token.take().ok_or(IoError::Unfinished)?;
         if !bearer_only(&token) {
-            return Err(SyncRefusal::Unauthorized.into());
+            return Err(SyncRefusal::Unauthorized);
         }
         let check = WritePeerOperation::new(self.peer, token);
         Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, MemberRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, SyncRefusal> {
         let Some(auth) = self.auth.take() else {
             let auth =
                 (result.child::<AuthContext, PeerAuthRefusal>()?).map_err(|error| match error {
@@ -158,7 +133,7 @@ impl Operation for PeerCallerOperation {
         let config = config_of(result)?.ok_or(SyncRefusal::Unavailable)?;
         match peer_acts_for(&config, self.peer, auth.user_id) {
             true => Ok(Next::Done(auth)),
-            false => Err(SyncRefusal::Unauthorized.into()),
+            false => Err(SyncRefusal::Unauthorized),
         }
     }
 }
@@ -294,11 +269,11 @@ impl ServePublishOperation {
         Ok(Next::Call(IoCall::child(publish)))
     }
 
-    fn caller_known(&mut self, caller: Result<AuthContext, MemberRefusal>) -> Served {
+    fn caller_known(&mut self, caller: Result<AuthContext, SyncRefusal>) -> Served {
         let waiting = self.waiting.as_mut().ok_or(IoError::Unfinished)?;
         let auth = match caller {
             Ok(auth) => auth,
-            Err(MemberRefusal(SyncRefusal::Unavailable)) => {
+            Err(SyncRefusal::Unavailable) => {
                 return accepted(Err(PublishRefusal::Unavailable(
                     "the caller could not be checked".to_string(),
                 )));
@@ -362,7 +337,7 @@ impl Operation for ServePublishOperation {
 
     fn next(&mut self, result: IoResult) -> Served {
         match self.step {
-            ServeStep::Caller => self.caller_known(result.child::<AuthContext, MemberRefusal>()?),
+            ServeStep::Caller => self.caller_known(result.child::<AuthContext, SyncRefusal>()?),
             ServeStep::Link => match result.child::<(), PublishRefusal>()? {
                 Ok(()) => self.publish(),
                 Err(refusal) => accepted(Err(refusal)),
@@ -439,18 +414,18 @@ impl Operation for ServeAdmissionOperation {
 
     fn next(&mut self, result: IoResult) -> Served {
         let Some((snapshot, member_id, sizes)) = self.admission.take() else {
-            let admitted = result.child::<SignedStatement, MemberRefusal>()?;
+            let admitted = result.child::<SignedStatement, SyncRefusal>()?;
             return Ok(Next::Done(
-                self.answer(admitted.map_err(|refused| refused.0)),
+                self.answer(admitted),
             ));
         };
-        match result.child::<AuthContext, MemberRefusal>()? {
+        match result.child::<AuthContext, SyncRefusal>()? {
             Ok(auth) => {
                 let here = (self.ids, self.capacity);
                 let admit = AdmitMemberOperation::new(here, auth, *snapshot, member_id, sizes);
                 Ok(Next::Call(IoCall::child(admit)))
             }
-            Err(refused) => Ok(Next::Done(self.answer(Err(refused.0)))),
+            Err(refused) => Ok(Next::Done(self.answer(Err(refused)))),
         }
     }
 }
@@ -481,7 +456,7 @@ pub(crate) struct AdmitMemberOperation {
     refused: Option<SyncRefusal>,
 }
 
-type Admitting = Result<Next<SignedStatement>, MemberRefusal>;
+type Admitting = Result<Next<SignedStatement>, SyncRefusal>;
 
 impl AdmitMemberOperation {
     pub(crate) fn new(
@@ -521,13 +496,12 @@ impl AdmitMemberOperation {
         {
             return Err(SyncRefusal::Invalid(
                 "publisher and members must be realm infrastructure nodes".to_string(),
-            )
-            .into());
+            ));
         }
         if self.member()?.node_id != node_id {
-            return Err(
-                SyncRefusal::Invalid("the member belongs to another node".to_string()).into(),
-            );
+            return Err(SyncRefusal::Invalid(
+                "the member belongs to another node".to_string(),
+            ));
         }
         let group_id = snapshot.config.owner_group;
         let path = bucket_permission_path(realm_id, group_id, node_id, &snapshot.config.bucket);
@@ -613,7 +587,7 @@ impl AdmitMemberOperation {
             _ => SyncRefusal::Unavailable,
         };
         if !capacity_refused || self.member()?.incarnation.is_some() {
-            return Err(refusal.into());
+            return Err(refusal);
         }
         // A member never admitted holds nothing, so its bucket goes and a new create may use
         // the name.
@@ -628,12 +602,12 @@ impl AdmitMemberOperation {
 
 impl Operation for AdmitMemberOperation {
     type Output = SignedStatement;
-    type Error = MemberRefusal;
+    type Error = SyncRefusal;
 
     fn first(&mut self) -> Admitting {
         let (_, realm_id) = self.node()?;
         if self.auth.realm_id != realm_id {
-            return Err(SyncRefusal::Unauthorized.into());
+            return Err(SyncRefusal::Unauthorized);
         }
         (self.signed.verify(realm_id)).map_err(|error| SyncRefusal::Invalid(error.to_string()))?;
         Ok(Next::Call(realm_config(realm_id)))
@@ -652,14 +626,14 @@ impl Operation for AdmitMemberOperation {
             AdmitStep::Create => match result.child::<BucketInfo, CreateBucketError>()? {
                 Ok(_) => self.admit(),
                 Err(error @ CreateBucketError::ProviderBucket(_)) => {
-                    Err(SyncRefusal::Invalid(error.to_string()).into())
+                    Err(SyncRefusal::Invalid(error.to_string()))
                 }
                 Err(CreateBucketError::BucketAlreadyExists) => {
                     let bucket = self.signed.snapshot.config.bucket.clone();
                     self.step = AdmitStep::Existing;
                     Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))))
                 }
-                Err(_) => Err(SyncRefusal::Unavailable.into()),
+                Err(_) => Err(SyncRefusal::Unavailable),
             },
             AdmitStep::Existing => {
                 let info = (result.child::<BucketInfo, GetBucketError>()?)
@@ -671,7 +645,7 @@ impl Operation for AdmitMemberOperation {
             AdmitStep::Admit => self.admitted(result.child::<SignedStatement, AdmitError>()?),
             AdmitStep::Remove => {
                 result.child::<(), StorageError>()?.ok();
-                Err(self.refused.take().ok_or(IoError::Unfinished)?.into())
+                Err(self.refused.take().ok_or(IoError::Unfinished)?)
             }
         }
     }

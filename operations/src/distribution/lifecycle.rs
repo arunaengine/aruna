@@ -6,6 +6,7 @@
 // A transfer away drains its uploads before its fence is stated; a deletion purges the member
 // bucket once it commits. Every pass is bounded and resumes from durable state.
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -41,7 +42,6 @@ use super::fence_row::{FenceChange, FenceError, UpdateFenceOperation};
 use super::imports::{
     FencedImportsOperation, FetchImportsOperation, ImportError, KeepResumeOperation,
 };
-use super::inventory::{StagedCall, outside_answer};
 use super::purge_steps::{
     ClearSetOperation, DeleteRowsOperation, DropResumeOperation, PurgeError, PurgeRangeOperation,
     PurgeRestOperation, PurgeTarget, Purged, RangeUploadsOperation, ReadRowOperation,
@@ -253,7 +253,7 @@ impl Operation for TendLifecycleOperation {
             after: self.cursors.marker.clone().map(Key::from),
             limit: SET_BATCH,
         };
-        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+        Ok(Next::Call(outside_call(page)))
     }
 
     fn next(&mut self, result: IoResult) -> Passing {

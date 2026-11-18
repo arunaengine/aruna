@@ -18,7 +18,6 @@ pub mod guard;
 pub mod handoff;
 pub mod held;
 pub mod here;
-pub(crate) mod import_start;
 pub(crate) mod imports;
 #[cfg(test)]
 mod index_feed_tests;
@@ -26,7 +25,6 @@ pub mod inventory;
 pub mod keep;
 pub mod lifecycle;
 pub mod nonce;
-pub(crate) mod peer_call;
 pub mod publish;
 pub mod pull;
 pub(crate) mod purge_steps;

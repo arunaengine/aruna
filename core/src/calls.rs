@@ -283,6 +283,13 @@ pub enum IoError {
     Codec(String),
 }
 
+/// A runner failure says nothing about the request, so the node counts as unavailable.
+impl From<IoError> for crate::structs::SyncRefusal {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
 impl From<IoError> for StorageError {
     /// A storage failure as itself, a conflict as the transaction conflict, any other as a read
     /// error naming it.

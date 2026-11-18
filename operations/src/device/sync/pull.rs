@@ -12,9 +12,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
 use tracing::warn;
 
-use crate::distribution::forward::MemberRefusal;
-use crate::distribution::peer_call::{peer_answer, peer_call};
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::forward::transport::{peer_answer, peer_call};
 use crate::metadata::transport_message_kind;
 
 /// Delay before the first poll; it doubles up to [`PULL_POLL_AFTER`], so a small file settles
@@ -187,7 +186,7 @@ impl ForwardPullOperation {
         }
     }
 
-    fn follow(&mut self, step: PullStep) -> Result<Next<SyncPullAck>, MemberRefusal> {
+    fn follow(&mut self, step: PullStep) -> Result<Next<SyncPullAck>, SyncRefusal> {
         match step {
             PullStep::Ask(call) => {
                 self.step = ForwardStep::Answer;
@@ -208,14 +207,14 @@ impl ForwardPullOperation {
 
 impl Operation for ForwardPullOperation {
     type Output = SyncPullAck;
-    type Error = MemberRefusal;
+    type Error = SyncRefusal;
 
-    fn first(&mut self) -> Result<Next<SyncPullAck>, MemberRefusal> {
+    fn first(&mut self) -> Result<Next<SyncPullAck>, SyncRefusal> {
         let step = self.walk.request();
         self.follow(step)
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<SyncPullAck>, MemberRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<SyncPullAck>, SyncRefusal> {
         let step = match self.step {
             ForwardStep::Answer => self.walk.answered(result)?,
             ForwardStep::Delay => self.walk.poll(),
