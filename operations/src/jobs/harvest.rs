@@ -20,19 +20,20 @@ use aruna_core::structs::execution::harvest::{
     provenance_decision,
 };
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::repository::access::{AccessCheckOperation, AccessError};
 use super::repository::link_store::time_of;
 use super::repository::{JobScope, NodeScope, remote_answer, remote_call};
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
     OaiPage, OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
@@ -622,12 +623,30 @@ impl ApplyRecordOperation {
     /// Checks the source owner as a direct metadata create of the record's document path would.
     fn access(&self, document_id: Ulid) -> Result<IoCall, HarvestFailure> {
         let path = self.path()?;
-        Ok(IoCall::child(HarvestAccessOperation::new(
-            self.owner(),
+        Ok(IoCall::child(AuthorizeCreateOperation::new(
+            self.actor.realm_id,
+            &self.owner(),
+            PolicyRequestExtras::default(),
             self.source.group_id,
-            path,
+            &path,
             document_id,
+            CreateScope::Group,
         )))
+    }
+
+    /// The end of an [`Self::access`] check; a refusal names the record's path.
+    fn access_result(&self, result: IoResult) -> Result<(), HarvestFailure> {
+        match result.child::<(), AuthorizeError>()? {
+            Ok(()) => Ok(()),
+            Err(
+                AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+            ) => Err(permanent(format!(
+                "harvest write to [{}] is not permitted",
+                self.path()?
+            ))),
+            Err(error) => Err(retryable(format!("harvest permission check: {error}"))),
+        }
     }
 
     fn create_access(&mut self, document_id: Ulid) -> ApplyTurn {
@@ -802,7 +821,7 @@ impl Operation for ApplyRecordOperation {
                 self.create_access(document_id)
             }
             ApplyStep::CreateAccess(document_id) => {
-                access_result(result)?;
+                self.access_result(result)?;
                 let write = HarvestWrite::Create {
                     actor: self.actor.clone(),
                     owner: self.owner(),
@@ -837,7 +856,7 @@ impl Operation for ApplyRecordOperation {
                 self.finish_live(document_id, RecordApplied::Minted)
             }
             ApplyStep::UpdateAccess(document_id) => {
-                access_result(result)?;
+                self.access_result(result)?;
                 self.step = ApplyStep::UpdateStored(document_id);
                 Ok(Next::Call(Self::registry_call(document_id)))
             }
@@ -872,7 +891,7 @@ impl Operation for ApplyRecordOperation {
             // empty local read is not evidence of absence, since the create may still be queued
             // here; only a routed delete that succeeds or an all-absent answer retires it.
             ApplyStep::TombstoneAccess(document_id) => {
-                access_result(result)?;
+                self.access_result(result)?;
                 self.step = ApplyStep::TombstoneStored(document_id);
                 Ok(Next::Call(Self::registry_call(document_id)))
             }
@@ -910,84 +929,6 @@ impl Operation for ApplyRecordOperation {
                 Ok(Next::Done(applied))
             }
         }
-    }
-}
-
-fn access_result(result: IoResult) -> Result<(), HarvestFailure> {
-    result.child::<(), HarvestFailure>()?
-}
-
-/// Checks the source owner on the group's metadata and on the document's own path.
-#[derive(Debug, PartialEq)]
-struct HarvestAccessOperation {
-    owner: AuthContext,
-    group_id: aruna_core::types::GroupId,
-    record_path: String,
-    permission_path: String,
-    second: bool,
-}
-
-impl HarvestAccessOperation {
-    fn new(
-        owner: AuthContext,
-        group_id: aruna_core::types::GroupId,
-        record_path: String,
-        document_id: Ulid,
-    ) -> Self {
-        let permission_path = MetadataRegistryRecord::permission_path_for(
-            &owner.realm_id,
-            group_id,
-            &record_path,
-            document_id,
-        );
-        Self {
-            owner,
-            group_id,
-            record_path,
-            permission_path,
-            second: false,
-        }
-    }
-
-    fn check(&self, path: String) -> IoCall {
-        IoCall::child(AccessCheckOperation::new(
-            self.owner.realm_id,
-            &self.owner,
-            path,
-            Permission::WRITE,
-            PolicyRequestExtras::default(),
-        ))
-    }
-}
-
-impl Operation for HarvestAccessOperation {
-    type Output = ();
-    type Error = HarvestFailure;
-
-    fn first(&mut self) -> Turn<()> {
-        let realm_id: RealmId = self.owner.realm_id;
-        Ok(Next::Call(
-            self.check(format!("/{realm_id}/g/{}/meta/**", self.group_id)),
-        ))
-    }
-
-    fn next(&mut self, result: IoResult) -> Turn<()> {
-        result
-            .child::<(), AccessError>()?
-            .map_err(|error| match error {
-                AccessError::Denied(_) => permanent(format!(
-                    "harvest write to [{}] is not permitted",
-                    self.record_path
-                )),
-                AccessError::Unavailable(message) => {
-                    retryable(format!("harvest permission check: {message}"))
-                }
-            })?;
-        if self.second {
-            return Ok(Next::Done(()));
-        }
-        self.second = true;
-        Ok(Next::Call(self.check(self.permission_path.clone())))
     }
 }
 

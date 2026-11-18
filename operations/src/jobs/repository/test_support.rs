@@ -79,7 +79,7 @@ pub(crate) fn job_id(nonce: u64) -> JobId {
 }
 
 pub(crate) fn stop() -> JobStop {
-    JobStop::new(CancellationToken::new(), CancellationToken::new())
+    aruna_blob::remote::job_stop(CancellationToken::new(), CancellationToken::new())
 }
 
 pub(crate) fn job_scope() -> JobScope {

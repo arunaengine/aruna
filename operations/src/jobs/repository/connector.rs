@@ -11,9 +11,10 @@ use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
 
-use super::access::{AccessCheckOperation, AccessError};
 use super::invenio::Session;
 use super::{NodeScope, TransferError};
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
@@ -62,6 +63,18 @@ fn connector_failure(error: ReadConnectorError) -> TransferError {
         ReadConnectorError::Storage(_) | ReadConnectorError::Unexpected => {
             TransferError::Retryable("repository connector storage unavailable".into())
         }
+    }
+}
+
+/// A fault while deciding can pass; a refusal stays.
+fn access_failure(error: AuthorizeError) -> TransferError {
+    match error {
+        AuthorizeError::Storage(_)
+        | AuthorizeError::CheckFailed(_)
+        | AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_)) => {
+            TransferError::Retryable(error.to_string())
+        }
+        _ => TransferError::Permanent(error.to_string()),
     }
 }
 
@@ -123,11 +136,11 @@ impl Operation for ConnectOperation {
     fn first(&mut self) -> Result<Next<Session>, TransferError> {
         let auth = &self.request.auth;
         let path = format!("/{}/g/{}/meta/**", auth.realm_id, self.request.group_id);
-        Ok(Next::Call(IoCall::child(AccessCheckOperation::new(
+        Ok(Next::Call(IoCall::child(AuthorizeOperation::new(
             auth.realm_id,
             auth,
-            path,
-            self.request.permission.clone(),
+            &path,
+            &self.request.permission,
             PolicyRequestExtras::operation("metadata.repository"),
         ))))
     }
@@ -136,11 +149,8 @@ impl Operation for ConnectOperation {
         match std::mem::replace(&mut self.step, ConnectStep::Connector) {
             ConnectStep::Access => {
                 result
-                    .child::<(), AccessError>()?
-                    .map_err(|error| match error {
-                        AccessError::Denied(message) => TransferError::Permanent(message),
-                        AccessError::Unavailable(message) => TransferError::Retryable(message),
-                    })?;
+                    .child::<(), AuthorizeError>()?
+                    .map_err(access_failure)?;
                 Ok(Next::Call(IoCall::child(ConnectorViewOperation::new(
                     self.request.group_id,
                     self.request.connector_id,
