@@ -62,7 +62,10 @@ pub async fn apply_local_edit(
     let authored = authored_source(mutation).ok_or_else(|| {
         DeviceEditError::Invalid("this mutation is not authored on a device".to_string())
     })?;
-    let _guard = crate::metadata::update_entry::document_lock(record.document_id).await;
+    let _guard = match context.graph_handle.as_ref() {
+        Some(graph) => Some(graph.hold_document(record.document_id).await),
+        None => None,
+    };
     let current = read_actor(context, record.document_id).await?;
     let mut draft_id = Ulid::generate();
     if let Some(current) = &current
@@ -105,7 +108,7 @@ pub async fn apply_local_edit(
     edited.dataset_digest = craqle::canonicalize_jsonld(&edited.displayed_jsonld)
         .ok()
         .map(|canonical| canonical.digest);
-    store_replica(context, &edited).await;
+    drive(store_replica(&edited), context).await.ok();
     arm_drain(context).await;
     Ok(record)
 }
@@ -134,7 +137,10 @@ pub(super) async fn reject_edit(
     document_id: Ulid,
     dot: ([u8; 32], u64),
 ) -> bool {
-    let _guard = crate::metadata::update_entry::document_lock(document_id).await;
+    let _guard = match context.graph_handle.as_ref() {
+        Some(graph) => Some(graph.hold_document(document_id).await),
+        None => None,
+    };
     let Ok(Some(mut current)) = read_actor(context, document_id).await else {
         return false;
     };
@@ -318,7 +324,10 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         return 0;
     };
     let mut replayed = 0usize;
-    for entry in read_publish_entries(context).await {
+    for entry in drive(read_publish_entries(), context)
+        .await
+        .unwrap_or_default()
+    {
         let PublishKind::Edit { batch, .. } = &entry.kind else {
             continue;
         };
@@ -363,6 +372,7 @@ mod tests {
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
+    use crate::driver::drive;
     use crate::metadata::MetadataHandle;
     use crate::tests::device::record;
     use aruna_core::UserId;
@@ -536,7 +546,11 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(crate::device::replica_store::store_replica(&context, &read).await);
+        assert!(
+            drive(crate::device::replica_store::store_replica(&read), &context)
+                .await
+                .is_ok()
+        );
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,
@@ -553,14 +567,16 @@ mod tests {
 
         assert!(update(Some(false)).await.is_err());
         assert!(
-            crate::device::sync_status::read_publish_entries(&context)
+            drive(crate::device::sync_status::read_publish_entries(), &context)
                 .await
+                .unwrap_or_default()
                 .is_empty()
         );
         update(None).await.expect("a plain edit queues locally");
         assert_eq!(
-            crate::device::sync_status::read_publish_entries(&context)
+            drive(crate::device::sync_status::read_publish_entries(), &context)
                 .await
+                .unwrap_or_default()
                 .len(),
             1
         );
@@ -584,8 +600,9 @@ mod tests {
             .expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
-            crate::device::sync_status::read_publish_entries(&context)
+            drive(crate::device::sync_status::read_publish_entries(), &context)
                 .await
+                .unwrap_or_default()
                 .into_iter()
                 .filter_map(|entry| match entry.kind {
                     PublishKind::Edit { batch, .. } => Some(*batch),

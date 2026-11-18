@@ -400,7 +400,17 @@ impl MetadataHandle {
         let message = decode_message(frame)
             .map_err(|error| MetadataError::InvalidInput(error.to_string()))
             .map_err(MetadataRequestError::definitely_not_sent)?;
-        let answer = self.request_forwarded_write(node_id, message).await?;
+        let answer = match message {
+            // An export answers with a header and a separate body, read here as one answer.
+            MetadataTransportMessage::ForwardExportDocument { .. }
+            | MetadataTransportMessage::ForwardExportProfile { .. } => {
+                let result = send_export_request(&self.inner, node_id, message).await?;
+                MetadataTransportMessage::ExportAnswer {
+                    result: result.map(Box::new),
+                }
+            }
+            message => self.request_forwarded_write(node_id, message).await?,
+        };
         #[cfg(feature = "test-hooks")]
         if matches!(answer, MetadataTransportMessage::SyncMirrorCreated) && self.take_dropped_ack()
         {
@@ -576,21 +586,11 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
+        MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
     }
 }
 
 impl MetadataHandle {
-    pub(crate) async fn request_export(
-        &self,
-        node_id: NodeId,
-        message: MetadataTransportMessage,
-    ) -> Result<
-        Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
-        MetadataRequestError,
-    > {
-        send_export_request(&self.inner, node_id, message).await
-    }
-
     #[tracing::instrument(
         name = "metadata.query.remote",
         level = "debug",
@@ -742,25 +742,6 @@ impl MetadataHandle {
         }
     }
 
-    pub(crate) async fn request_staging_spec(
-        &self,
-        node_id: NodeId,
-        transfer_id: Ulid,
-        job_id: aruna_core::structs::execution::job::JobId,
-    ) -> Result<crate::distribution::imports::HandedImport, MetadataReadError> {
-        let request = MetadataTransportMessage::StagingSpec {
-            transfer_id,
-            job_id,
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
     pub(crate) async fn request_store_artifact(
@@ -775,82 +756,6 @@ impl MetadataHandle {
         {
             MetadataTransportMessage::ArtifactStored { result } => result,
             _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
-    pub(crate) async fn request_artifact(
-        &self,
-        node_id: NodeId,
-        digest: String,
-        index: u32,
-    ) -> Result<aruna_core::plugins::Chunk, MetadataReadError> {
-        let request = MetadataTransportMessage::FetchArtifact { digest, index };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::FetchedArtifact { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// The clock of the infrastructure node `node_id`, in Unix milliseconds.
-    pub(crate) async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
-        let request = MetadataTransportMessage::ProbeClock;
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::ClockProbed { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// Hands matched plugin events to the install's receiver `node_id` and returns its decisions.
-    pub(crate) async fn request_forward(
-        &self,
-        node_id: NodeId,
-        batch: aruna_core::plugin_runs::EventBatch,
-    ) -> Result<aruna_core::plugin_runs::Decisions, MetadataReadError> {
-        let request = MetadataTransportMessage::ForwardEvents { batch };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::EventsDecided { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// Whether the node `node_id` holds the node secret `name` with `kind`, and the header the
-    /// secret checks.
-    pub(crate) async fn request_node_check(
-        &self,
-        node_id: NodeId,
-        name: aruna_core::secrets::SecretName,
-        kind: aruna_core::secrets::SecretKind,
-    ) -> Result<Option<String>, aruna_core::plugins::NodeCheckError> {
-        use aruna_core::plugins::NodeCheckError;
-        let request = MetadataTransportMessage::CheckNodeSecret { name, kind };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::NodeSecretChecked { result }) => result,
-            _ => Err(NodeCheckError::Unavailable),
-        }
-    }
-
-    /// The secret bound to a plugin install's slot, released by the management node `node_id`.
-    pub(crate) async fn request_release(
-        &self,
-        node_id: NodeId,
-        request: aruna_core::plugins::ReleaseRequest,
-    ) -> Result<aruna_core::plugins::Released, aruna_core::plugins::ReleaseError> {
-        use aruna_core::plugins::ReleaseError;
-        let request = MetadataTransportMessage::ReleaseSecret { request };
-        let unavailable = || ReleaseError::Unavailable(format!("node {node_id} did not answer"));
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::SecretReleased { result }) => result,
-            _ => Err(unavailable()),
         }
     }
 

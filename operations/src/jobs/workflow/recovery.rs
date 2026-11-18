@@ -13,15 +13,13 @@ use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::super::store::attempt::{
-    CancelRequestOutcome, ParkOutcome, begin_external_running, mark_indeterminate,
-    record_attempt_tombstone, requeue_before_attempt, set_cancel_requested,
-};
+use super::super::store::attempt::{begin_external_running, record_attempt_tombstone};
 use super::super::store::state::read_job_record;
 use super::compute::{RecoveryAction, recovery_action};
-use super::finalize::{cleanup_and_crate, fail_and_crate, finalize_attempt, finalize_cancel};
+use super::finalize::{finalize_attempt, finalize_cancel, settle_scope};
 use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
-use crate::driver::DriverContext;
+use super::settle::{ParkAttemptOperation, SubmitFailureOperation};
+use crate::driver::{DriverContext, drive};
 
 /// A submit error after the write-ahead intent is ambiguous: the container may
 /// already exist or run. Requeueing would erase the intent and launch a second
@@ -306,34 +304,20 @@ async fn park_failed_submit(
     .await;
 }
 
-/// Park an ambiguous attempt for a later reconcile pass. The park charges an
-/// attempt, so a failure that repeats on every pass terminalizes at the cap
-/// instead of re-driving the job forever.
+/// Parks an ambiguous attempt for a later reconcile pass; see [`ParkAttemptOperation`].
 pub(super) async fn park_attempt(
     context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     error: JobError,
 ) {
-    match mark_indeterminate(context, job_id, token, error, unix_timestamp_millis()).await {
-        Ok(ParkOutcome::Parked(_)) => {}
-        Ok(ParkOutcome::Exhausted(record)) => {
-            warn!(job_id = %job_id, "Local attempts exhausted; parking job");
-            // A cancelled run settles as cancelled, so the family does not run it elsewhere.
-            let record = match record.cancel_requested {
-                true => {
-                    match set_cancel_requested(context, job_id, unix_timestamp_millis()).await {
-                        Ok(CancelRequestOutcome::Cancelled(cancelled)) => cancelled,
-                        _ => record,
-                    }
-                }
-                false => record,
-            };
-            Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
-        }
-        Err(error) => warn!(job_id = %job_id, error = %error, "Attempt park write failed"),
+    let park = ParkAttemptOperation::new(job_id, token, error, settle_scope(context));
+    if let Err(failure) = Box::pin(drive(park, context)).await {
+        warn!(job_id = %job_id, error = %failure, "Attempt park failed");
     }
 }
+
+/// Settles a failure before any attempt was submitted; see [`SubmitFailureOperation`].
 pub(super) async fn pre_submit_failure(
     context: &DriverContext,
     job_id: JobId,
@@ -342,18 +326,9 @@ pub(super) async fn pre_submit_failure(
     error: JobError,
     error_logged: bool,
 ) {
-    if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent {
-        if !error_logged {
-            warn!(job_id = %job_id, error = ?error, "Permanent pre-submit failure");
-        }
-        Box::pin(fail_and_crate(context, job_id, token, record, error)).await;
-        return;
-    }
-    match requeue_before_attempt(context, job_id, token, unix_timestamp_millis(), error).await {
-        Ok(record) if record.is_settled() => {
-            Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
-        }
-        Ok(_) => {}
-        Err(error) => warn!(job_id = %job_id, error = %error, "Pre-submit requeue failed"),
+    let scope = settle_scope(context);
+    let failure = SubmitFailureOperation::new(record, token, error, error_logged, scope);
+    if let Err(failure) = Box::pin(drive(failure, context)).await {
+        warn!(job_id = %job_id, error = %failure, "Pre-submit failure was not settled");
     }
 }

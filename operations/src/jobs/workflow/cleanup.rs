@@ -2,99 +2,257 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::{BackendError, ExecutorKind, FenceContext, TombstoneSpec};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
 };
+use aruna_core::structs::storage::blob::UserAccess;
+use ulid::Ulid;
 
-use super::super::executor::{JobContext, JobRunOutcome};
+use super::super::executor::JobRunOutcome;
 use super::super::store::JobMutationError;
-use super::super::store::attempt::{authorize_cleanup, record_attempt_tombstone};
-use crate::driver::drive;
+use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
-pub async fn run_terminal_cleanup(
-    ctx: &JobContext,
-    for_job: JobId,
-    intent: Option<&AttemptIntent>,
-    access_key: &str,
-) -> JobRunOutcome {
-    let backend_error = cleanup_attempt(ctx, for_job, intent).await.err();
-    let revoke_error = revoke_credential(ctx, access_key).await.err();
-    match cleanup_error([revoke_error, backend_error]) {
-        Some(error) => JobRunOutcome::Failed(error),
-        None => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
-    }
+#[derive(Debug, PartialEq)]
+enum CleanupStep {
+    Authorize,
+    Fence(FenceContext),
+    Cleanup(FenceContext),
+    Tombstone(FenceContext),
+    Record,
+    Revoke,
 }
 
-async fn revoke_credential(ctx: &JobContext, access_key: &str) -> Result<(), JobError> {
-    match drive(
-        RevokeUserOperation::new(access_key.to_string()),
-        &ctx.driver,
-    )
-    .await
-    {
-        Ok(_) | Err(RevokeUserError::NotFound) => Ok(()),
-        Err(error) => Err(revoke_error(error)),
-    }
+/// Removes a finished attempt from its backend and revokes the run's credential. The revoke runs
+/// even when the backend work failed, so one failure cannot strand a live workspace key.
+#[derive(Debug, PartialEq)]
+pub struct TerminalCleanupOperation {
+    for_job: JobId,
+    token: Ulid,
+    intent: Option<AttemptIntent>,
+    access_key: String,
+    backend_error: Option<JobError>,
+    step: CleanupStep,
 }
 
-async fn cleanup_attempt(
-    ctx: &JobContext,
-    for_job: JobId,
-    intent: Option<&AttemptIntent>,
-) -> Result<(), JobError> {
-    let Some(intent) = intent else {
-        return Ok(());
-    };
-    let fence = authorize_cleanup(&ctx.driver, for_job, intent, ctx.claim_token)
-        .await
-        .map_err(|error| match error {
-            JobMutationError::NotFound => JobError::permanent("cleanup parent no longer exists"),
-            error => JobError::retryable(format!("cleanup fence claim failed: {error}")),
-        })?;
-    if fence.attempt.external_name() != intent.external_name {
-        return Err(JobError::permanent("cleanup attempt identity mismatch"));
-    }
-    let Some(registry) = ctx.driver.compute_handle.as_ref() else {
-        return Err(JobError::retryable("cleanup needs a compute backend"));
-    };
-    let kind = ExecutorKind::from_wire(&intent.executor_kind);
-    let Some(backend) = registry.get(&kind) else {
-        return Err(JobError::retryable(format!(
-            "cleanup backend {} is unavailable",
-            intent.executor_kind
-        )));
-    };
-    backend
-        .fence(&fence)
-        .await
-        .map_err(|error| JobError::retryable(format!("backend fence failed: {error}")))?;
-    match backend.cleanup(&fence).await {
-        Ok(()) | Err(BackendError::NotFound(_)) => {
-            let tombstone = backend
-                .tombstone(&fence, &TombstoneSpec { terminal_ref: None })
-                .await
-                .map_err(|error| {
-                    JobError::retryable(format!("backend tombstone failed: {error}"))
-                })?;
-            record_attempt_tombstone(
-                &ctx.driver,
-                for_job,
-                ctx.claim_token,
-                intent.attempt_epoch,
-                tombstone.backend_ref,
-            )
-            .await
-            .map_err(|error| JobError::retryable(format!("tombstone record failed: {error}")))?;
-            Ok(())
+impl TerminalCleanupOperation {
+    pub fn new(
+        for_job: JobId,
+        token: Ulid,
+        intent: Option<AttemptIntent>,
+        access_key: &str,
+    ) -> Self {
+        Self {
+            for_job,
+            token,
+            intent,
+            access_key: access_key.to_string(),
+            backend_error: None,
+            step: CleanupStep::Authorize,
         }
-        Err(error) if error.retryable() => Err(JobError::retryable(format!(
-            "backend cleanup failed: {error}"
+    }
+
+    fn revoke(&mut self) -> Next<()> {
+        self.step = CleanupStep::Revoke;
+        let revoke = RevokeUserOperation::new(self.access_key.clone());
+        Next::Call(IoCall::child(revoke))
+    }
+
+    /// Keeps the failure of the backend work and goes on to the revoke.
+    fn failed(&mut self, error: JobError) -> Next<()> {
+        self.backend_error = Some(error);
+        self.revoke()
+    }
+
+    fn backend_call(&self, fence: &FenceContext, request: ComputeRequest) -> Next<()> {
+        let kind = self.intent.as_ref().map_or_else(
+            || ExecutorKind::from_wire(""),
+            |intent| ExecutorKind::from_wire(&intent.executor_kind),
+        );
+        let effect = ComputeEffect {
+            kind,
+            fence: fence.clone(),
+            request,
+        };
+        Next::Call(IoCall::Effect(Box::new(Effect::Compute(Box::new(effect)))))
+    }
+
+    /// The error of an answer that names no usable backend.
+    fn no_backend(&self, answer: &ComputeAnswer) -> Option<JobError> {
+        let kind = self
+            .intent
+            .as_ref()
+            .map_or("", |intent| &intent.executor_kind);
+        match answer {
+            ComputeAnswer::NoCompute => {
+                Some(JobError::retryable("cleanup needs a compute backend"))
+            }
+            ComputeAnswer::NoBackend => Some(JobError::retryable(format!(
+                "cleanup backend {kind} is unavailable"
+            ))),
+            _ => None,
+        }
+    }
+
+    fn authorized(&mut self, fence: Result<FenceContext, JobMutationError>) -> Next<()> {
+        let fence = match fence {
+            Ok(fence) => fence,
+            Err(JobMutationError::NotFound) => {
+                return self.failed(JobError::permanent("cleanup parent no longer exists"));
+            }
+            Err(error) => {
+                let message = format!("cleanup fence claim failed: {error}");
+                return self.failed(JobError::retryable(message));
+            }
+        };
+        let expected = self
+            .intent
+            .as_ref()
+            .map(|intent| intent.external_name.as_str());
+        if expected != Some(fence.attempt.external_name().as_str()) {
+            return self.failed(JobError::permanent("cleanup attempt identity mismatch"));
+        }
+        let call = self.backend_call(&fence, ComputeRequest::Fence);
+        self.step = CleanupStep::Fence(fence);
+        call
+    }
+
+    fn fenced(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Done(Ok(())) => {
+                let call = self.backend_call(&fence, ComputeRequest::Cleanup);
+                self.step = CleanupStep::Cleanup(fence);
+                call
+            }
+            ComputeAnswer::Done(Err(error)) => self.failed(JobError::retryable(format!(
+                "backend fence failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+
+    fn cleaned(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Done(Ok(())) | ComputeAnswer::Done(Err(BackendError::NotFound(_))) => {
+                let spec = TombstoneSpec { terminal_ref: None };
+                let call = self.backend_call(&fence, ComputeRequest::Tombstone(spec));
+                self.step = CleanupStep::Tombstone(fence);
+                call
+            }
+            ComputeAnswer::Done(Err(error)) if error.retryable() => self.failed(
+                JobError::retryable(format!("backend cleanup failed: {error}")),
+            ),
+            ComputeAnswer::Done(Err(error)) => self.failed(JobError::permanent(format!(
+                "backend cleanup failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+
+    fn tombstoned(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Tombstone(Ok(tombstone)) => {
+                self.step = CleanupStep::Record;
+                Next::Call(IoCall::child(record_attempt_tombstone(
+                    self.for_job,
+                    self.token,
+                    fence.attempt_epoch,
+                    tombstone.backend_ref,
+                )))
+            }
+            ComputeAnswer::Tombstone(Err(error)) => self.failed(JobError::retryable(format!(
+                "backend tombstone failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+}
+
+fn unexpected_answer() -> JobError {
+    JobError::retryable("the compute backend gave an unexpected answer")
+}
+
+/// The answer of the compute call that `result` belongs to.
+fn compute_answer(result: IoResult) -> Result<ComputeAnswer, JobError> {
+    match result.event()? {
+        Event::Compute(answer) => Ok(*answer),
+        other => Err(JobError::retryable(format!(
+            "unexpected compute result: {}",
+            other.label()
         ))),
-        Err(error) => Err(JobError::permanent(format!(
-            "backend cleanup failed: {error}"
-        ))),
+    }
+}
+
+impl Operation for TerminalCleanupOperation {
+    type Output = ();
+    type Error = JobError;
+
+    fn first(&mut self) -> Result<Next<()>, JobError> {
+        let Some(intent) = self.intent.clone() else {
+            return Ok(self.revoke());
+        };
+        let authorize = authorize_cleanup(self.for_job, intent, self.token);
+        Ok(Next::Call(IoCall::child(authorize)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobError> {
+        match std::mem::replace(&mut self.step, CleanupStep::Revoke) {
+            CleanupStep::Authorize => {
+                let fence = result.child::<FenceContext, JobMutationError>()?;
+                Ok(self.authorized(fence))
+            }
+            CleanupStep::Fence(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.fenced(fence, answer))
+            }
+            CleanupStep::Cleanup(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.cleaned(fence, answer))
+            }
+            CleanupStep::Tombstone(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.tombstoned(fence, answer))
+            }
+            CleanupStep::Record => match result.child::<AttemptControl, JobMutationError>()? {
+                Ok(_) => Ok(self.revoke()),
+                Err(error) => Ok(self.failed(JobError::retryable(format!(
+                    "tombstone record failed: {error}"
+                )))),
+            },
+            CleanupStep::Revoke => {
+                let revoke_error = match result.child::<UserAccess, RevokeUserError>()? {
+                    Ok(_) | Err(RevokeUserError::NotFound) => None,
+                    Err(error) => Some(revoke_error(error)),
+                };
+                match cleanup_error([revoke_error, self.backend_error.take()]) {
+                    Some(error) => Err(error),
+                    None => Ok(Next::Done(())),
+                }
+            }
+        }
+    }
+}
+
+/// How the job runtime takes the end of a cleanup run.
+pub(crate) fn cleanup_outcome(result: Result<(), JobError>) -> JobRunOutcome {
+    match result {
+        Ok(()) => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
+        Err(error) => JobRunOutcome::Failed(error),
     }
 }
 
@@ -123,6 +281,10 @@ fn cleanup_error(errors: [Option<JobError>; 2]) -> Option<JobError> {
         JobError::permanent(message)
     })
 }
+
+#[cfg(test)]
+#[path = "cleanup_tests.rs"]
+mod call_tests;
 
 #[cfg(test)]
 mod tests {
@@ -155,13 +317,24 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::DriverContext;
-    use crate::jobs::executor::ProgressReporter;
+    use crate::driver::{DriverContext, drive};
+    use crate::jobs::executor::{JobContext, ProgressReporter};
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::record_attempt_intent;
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
+
+    async fn run_terminal_cleanup(
+        ctx: &JobContext,
+        for_job: JobId,
+        intent: Option<&AttemptIntent>,
+        access_key: &str,
+    ) -> JobRunOutcome {
+        let cleanup =
+            TerminalCleanupOperation::new(for_job, ctx.claim_token, intent.cloned(), access_key);
+        cleanup_outcome(drive(cleanup, &ctx.driver).await)
+    }
 
     struct StubBackend {
         kind: ExecutorKind,

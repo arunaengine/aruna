@@ -4,13 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod backlog;
-pub mod compute;
 pub mod delete_draft;
 pub mod drain;
 pub mod edit;
 pub mod enqueue_draft;
 pub mod forward;
-mod local_run;
 pub mod inspect_draft;
 pub mod install_graph;
 pub mod list_drafts;

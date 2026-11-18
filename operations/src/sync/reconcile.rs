@@ -1,153 +1,141 @@
-//! Applies the stored events of inbound document sync topics and returns what changed.
+//! Syncs document topics with their peers and reconciles what arrived.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document_apply::ApplyError;
+use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
-use thiserror::Error;
+use aruna_core::rows::event;
+use aruna_core::structs::identity::realm::RealmId;
 
-#[derive(Debug, PartialEq, Error)]
-pub enum ReconcileError {
-    #[error("document reconcile failed: {0}")]
-    Net(String),
-    #[error(transparent)]
-    Io(#[from] IoError),
-}
-
-/// Reconciles the topics a peer stream touched. Net applies the events it holds; the
-/// result names the changed targets for the follow-up work of the peer trigger.
+/// Pulls `topics` from `peers` through net, then runs one reconcile pass over them.
 #[derive(Debug, PartialEq)]
-pub struct ReconcileTopicsOperation {
-    topics: Vec<irokle::TopicId>,
+pub struct SyncTopicsOperation {
+    realm_id: RealmId,
+    effect: Option<DocumentEffect>,
+    reconciling: bool,
 }
 
-impl ReconcileTopicsOperation {
-    pub fn new(topics: Vec<irokle::TopicId>) -> Self {
-        Self { topics }
-    }
-}
-
-impl Operation for ReconcileTopicsOperation {
-    type Output = DocumentReconcileResult;
-    type Error = ReconcileError;
-
-    fn first(&mut self) -> Result<Next<DocumentReconcileResult>, ReconcileError> {
-        let topics = std::mem::take(&mut self.topics);
-        let effect = Effect::Net(NetEffect::DocumentSync(DocumentEffect::ReconcileTopics {
-            topics,
-        }));
-        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+impl SyncTopicsOperation {
+    /// Syncs the topics this node holds or can join; an unknown one without a peer is skipped.
+    pub fn new(realm_id: RealmId, topics: Vec<irokle::TopicId>, peers: Vec<NodeId>) -> Self {
+        Self::with(realm_id, DocumentEffect::SyncDocuments { topics, peers })
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<DocumentReconcileResult>, ReconcileError> {
-        let IoResult::Event(event) = result else {
-            return Err(unexpected(result.label()));
-        };
-        match *event {
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
-                targets,
-                metadata_create_events,
-                metadata_graph_tombstones,
-                ..
-            })) => Ok(Next::Done(DocumentReconcileResult {
-                targets,
-                metadata_create_events,
-                metadata_graph_tombstones,
-            })),
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-                Err(ReconcileError::Net(error))
-            }
-            Event::Net(NetEvent::Error(error)) => Err(ReconcileError::Net(format!("{error:?}"))),
-            other => Err(unexpected(other.label())),
+    /// Syncs one topic and fails when it cannot be fetched.
+    pub fn single(realm_id: RealmId, topic: irokle::TopicId, peers: Vec<NodeId>) -> Self {
+        Self::with(realm_id, DocumentEffect::SyncDocument { topic, peers })
+    }
+
+    fn with(realm_id: RealmId, effect: DocumentEffect) -> Self {
+        Self {
+            realm_id,
+            effect: Some(effect),
+            reconciling: false,
         }
     }
 }
 
-fn unexpected(got: &'static str) -> ReconcileError {
-    ReconcileError::Io(IoError::Unexpected {
-        expected: "DocumentNetEvent::DocumentsReconciled",
-        got,
-    })
+impl Operation for SyncTopicsOperation {
+    type Output = DocumentReconcileResult;
+    type Error = ApplyError;
+
+    fn first(&mut self) -> Result<Next<DocumentReconcileResult>, ApplyError> {
+        let effect = self.effect.take().ok_or(IoError::Unfinished)?;
+        let effect = Effect::Net(NetEffect::DocumentSync(effect));
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<DocumentReconcileResult>, ApplyError> {
+        if self.reconciling {
+            let reconciled = result.child::<DocumentReconcileResult, ApplyError>()??;
+            return Ok(Next::Done(reconciled));
+        }
+        match event(result)? {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsSynced { topics })) => {
+                self.reconciling = true;
+                let reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                Ok(Next::Call(IoCall::child(reconcile)))
+            }
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
+                Err(ApplyError::Failed(error))
+            }
+            Event::Net(NetEvent::Error(error)) => Err(ApplyError::Failed(format!("{error:?}"))),
+            other => Err(IoError::Unexpected {
+                expected: "DocumentNetEvent::DocumentsSynced",
+                got: other.label(),
+            }
+            .into()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::document::DocumentTarget;
-    use aruna_core::events::NetError;
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::calls::ChildOutcome;
 
-    fn topics() -> Vec<irokle::TopicId> {
-        vec![irokle::TopicId::from_bytes([3; 32])]
+    fn realm() -> RealmId {
+        RealmId::from_bytes([1; 32])
+    }
+
+    fn topic() -> irokle::TopicId {
+        irokle::TopicId::from_bytes([3; 32])
     }
 
     fn net(event: DocumentNetEvent) -> IoResult {
         IoResult::Event(Box::new(Event::Net(NetEvent::DocumentSync(event))))
     }
 
-    fn reconciled(targets: Vec<DocumentTarget>) -> IoResult {
-        net(DocumentNetEvent::DocumentsReconciled {
-            applied: targets.len(),
-            targets,
-            metadata_create_events: Vec::new(),
-            metadata_graph_tombstones: Vec::new(),
-        })
-    }
-
     #[test]
-    fn returns_reconciled_targets() {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: RealmId::from_bytes([1; 32]),
-        };
-        let mut operation = ReconcileTopicsOperation::new(topics());
-        let effect = Effect::Net(NetEffect::DocumentSync(DocumentEffect::ReconcileTopics {
-            topics: topics(),
+    fn syncs_then_reconciles() {
+        let mut operation = SyncTopicsOperation::new(realm(), vec![topic()], Vec::new());
+        let effect = Effect::Net(NetEffect::DocumentSync(DocumentEffect::SyncDocuments {
+            topics: vec![topic()],
+            peers: Vec::new(),
         }));
         assert_eq!(
             operation.first(),
             Ok(Next::Call(IoCall::Effect(Box::new(effect))))
         );
-        let Ok(Next::Done(result)) = operation.next(reconciled(vec![target.clone()])) else {
-            panic!("reconcile finishes");
-        };
-        assert_eq!(result.targets, vec![target]);
-        assert_eq!(result.applied(), 1);
+        let synced = net(DocumentNetEvent::DocumentsSynced {
+            topics: vec![topic()],
+        });
+        assert!(matches!(
+            operation.next(synced),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let done = DocumentReconcileResult::default();
+        let answer = IoResult::Child(ChildOutcome::new(Ok::<_, ApplyError>(done.clone())));
+        assert_eq!(operation.next(answer), Ok(Next::Done(done)));
     }
 
     #[test]
-    fn net_errors_fail() {
-        let mut operation = ReconcileTopicsOperation::new(topics());
+    fn reports_sync_failure() {
+        let mut operation = SyncTopicsOperation::single(realm(), topic(), Vec::new());
+        operation.first().unwrap();
         let failed = net(DocumentNetEvent::Error {
             target: None,
-            error: "topic missing".to_string(),
+            error: "no peer".to_string(),
         });
         assert_eq!(
             operation.next(failed),
-            Err(ReconcileError::Net("topic missing".to_string()))
+            Err(ApplyError::Failed("no peer".to_string()))
         );
-        let closed = IoResult::Event(Box::new(Event::Net(NetEvent::Error(
-            NetError::ChannelClosed,
-        ))));
-        assert!(matches!(
-            operation.next(closed),
-            Err(ReconcileError::Net(_))
-        ));
     }
 
     #[test]
     fn refuses_other_results() {
-        let mut operation = ReconcileTopicsOperation::new(topics());
+        let mut operation = SyncTopicsOperation::single(realm(), topic(), Vec::new());
+        operation.first().unwrap();
         assert!(matches!(
             operation.next(IoResult::Done),
-            Err(ReconcileError::Io(IoError::Unexpected { .. }))
-        ));
-        let other = IoResult::Event(Box::new(Event::Delayed));
-        assert!(matches!(
-            operation.next(other),
-            Err(ReconcileError::Io(IoError::Unexpected { .. }))
+            Err(ApplyError::Failed(_))
         ));
     }
 }

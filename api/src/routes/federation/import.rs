@@ -22,7 +22,8 @@ use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    self, ImportError, authorize_import, reusable_upload, write_import,
+    AuthorizeImportOperation, GRANT_HEADER, ImportError, ReusableUploadOperation,
+    WriteImportOperation, answer_error, header_value,
 };
 use aruna_operations::federation::records::ImportRecord;
 use aruna_operations::federation::transfer::{
@@ -30,7 +31,6 @@ use aruna_operations::federation::transfer::{
     TransferAdmitError,
 };
 use aruna_operations::jobs::import::upload::{CreateRoCrateConfig, CreateRoCrateOperation};
-use aruna_operations::jobs::import::upload_store::{load_rocrate_upload, write_rocrate_upload};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -153,15 +153,15 @@ async fn admit(
     let context = state.get_ctx();
     let key = drive(admit, &context).await.map_err(admission_refused)?;
     let (payload, source) = (&intent.payload, Some(grant.payload.source));
-    authorize_import(
-        &context,
-        &principal(state, payload),
-        &payload.destination,
+    let authorize = AuthorizeImportOperation::new(
+        principal(state, payload),
+        payload.destination.clone(),
         source,
         state.get_node_id(),
-    )
-    .await
-    .map_err(import_refused)?;
+    );
+    drive(authorize, context.as_ref())
+        .await
+        .map_err(import_refused)?;
     Ok(key)
 }
 
@@ -190,7 +190,8 @@ pub(crate) async fn pushed_upload(
 ) -> ServerResult<Option<UploadRoCrateResponse>> {
     let context = state.get_ctx();
     let (intent, grant) = (&push.intent.payload, &push.grant.payload);
-    let Some(upload_id) = reusable_upload(&context, intent, grant, &push.key)
+    let reuse = ReusableUploadOperation::new(intent.clone(), grant.clone(), &push.key);
+    let Some(upload_id) = drive(reuse, context.as_ref())
         .await
         .map_err(import_refused)?
     else {
@@ -198,9 +199,13 @@ pub(crate) async fn pushed_upload(
     };
     // The source's push confirms its grant again; a paused import resumes with this consent.
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
-    let record = load_rocrate_upload(&context, upload_id)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let record = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
@@ -240,7 +245,8 @@ pub(crate) async fn bind_upload(
         confirmed: true,
     };
     let context = state.get_ctx();
-    let bound = write_import(&context, key, record.upload_id, &binding).await;
+    let write = WriteImportOperation::new(key, record.upload_id, binding);
+    let bound = drive(write, context.as_ref()).await;
     if bound == Ok(record.upload_id) {
         return Ok(record.clone());
     }
@@ -249,14 +255,22 @@ pub(crate) async fn bind_upload(
         expires_at_ms: 0,
         ..record.clone()
     };
-    write_rocrate_upload(&context, &losing)
-        .await
-        .map_err(ServerError::ServiceUnavailableReason)?;
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(losing.clone()),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(ServerError::ServiceUnavailableReason)?;
     let bound = bound.map_err(import_refused)?;
-    load_rocrate_upload(&context, bound)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .ok_or(ServerError::NotFound)
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(bound),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or(ServerError::NotFound)
 }
 
 /// Replaces the intent and grant of a bound upload with a fresh consent to the same transfer.
@@ -273,7 +287,8 @@ async fn rebind(
         grant: grant.clone(),
         confirmed: true,
     };
-    let bound = write_import(&state.get_ctx(), key, upload_id, &binding)
+    let write = WriteImportOperation::new(key, upload_id, binding);
+    let bound = drive(write, state.get_ctx().as_ref())
         .await
         .map_err(import_refused)?;
     if bound != upload_id {
@@ -289,8 +304,24 @@ async fn source_request(
     grant: &Signed<ExportGrant>,
 ) -> ServerResult<reqwest::Response> {
     let context = state.get_ctx();
-    let request = import::source_request(&context, method, grant, PULL_TIMEOUT);
-    request.await.map_err(import_refused)
+    let unreachable = |error: String| import_refused(ImportError::Unreachable(error));
+    let blob = context.blob_handle.as_ref().ok_or_else(|| {
+        import_refused(ImportError::Storage("blob handle unavailable".to_string()))
+    })?;
+    let header = header_value(grant)
+        .map_err(|error| import_refused(ImportError::Storage(error.to_string())))?;
+    let response = blob
+        .repository_request(method, grant.payload.artifact_url.clone())
+        .map_err(|error| unreachable(error.to_string()))?
+        .header(GRANT_HEADER, header)
+        .timeout(PULL_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| unreachable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(import_refused(answer_error(response.status())));
+    }
+    Ok(response)
 }
 
 /// A `Sync` byte stream over a response body, as the upload writer needs.
@@ -387,7 +418,9 @@ pub async fn create_intent(
         metadata_path: metadata.path,
     };
     let context = state.get_ctx();
-    authorize_import(&context, &auth, &destination, None, state.get_node_id())
+    let authorize =
+        AuthorizeImportOperation::new(auth.clone(), destination.clone(), None, state.get_node_id());
+    drive(authorize, context.as_ref())
         .await
         .map_err(import_refused)?;
     let limit = limits.direct_upload_bytes;
@@ -459,7 +492,8 @@ pub async fn create_import(
         .ok_or_else(|| ServerError::BadRequestReason("secret must be 32 hex bytes".into()))?;
     let key = admit(&state, &intent, &grant, Some(&secret)).await?;
     let (payload, granted) = (&intent.payload, &grant.payload);
-    let bound = reusable_upload(&state.get_ctx(), payload, granted, &key)
+    let reuse = ReusableUploadOperation::new(payload.clone(), granted.clone(), &key);
+    let bound = drive(reuse, state.get_ctx().as_ref())
         .await
         .map_err(import_refused)?;
     let upload_id = match bound {

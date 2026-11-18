@@ -29,19 +29,20 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::harvest::repository::{
     connector_writes, parse_provenance_read, parse_source_read, read_provenance_effect,
     read_source_effect, write_source_effect,
 };
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::harvest::run_harvest_job;
+use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
+use aruna_operations::jobs::repository::{JobScope, NodeScope};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::forward::write::route_metadata_delete;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::testing::replay_event_log;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;
@@ -459,7 +460,7 @@ async fn restore_config(fixture: &Fixture, saved: Vec<u8>) -> Result<(), BoxErro
 }
 
 async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, BoxError> {
-    Ok(load_document_record(&fixture.context, document_id)
+    Ok(drive(DocumentRecordOperation::new(document_id), &fixture.context)
         .await
         .map_err(|error| format!("{error:?}"))?
         .is_some())
@@ -468,7 +469,7 @@ async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, Bo
 /// Withdraw the document the way an owner would, straight through the metadata
 /// delete path, leaving the harvest provenance behind untouched.
 async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), BoxError> {
-    let record = load_document_record(&fixture.context, document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), &fixture.context)
         .await
         .map_err(|error| format!("{error:?}"))?
         .ok_or("document missing before the delete")?;
@@ -487,6 +488,12 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
     .await
     .map_err(|error| format!("{error:?}"))?;
     Ok(())
+}
+
+async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
+    let operation =
+        HarvestJobOperation::new(NodeScope::of(&ctx.driver), JobScope::of(ctx), spec.clone());
+    harvest_outcome(drive(operation, &ctx.driver).await)
 }
 
 async fn run(fixture: &Fixture, source: &HarvestSource) -> JobRunOutcome {
@@ -646,7 +653,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
 
     // Run 3: alpha changes upstream, beta is withdrawn.
     assert!(
-        load_document_record(&fixture.context, beta_id)
+        drive(DocumentRecordOperation::new(beta_id), &fixture.context)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_some(),
@@ -673,7 +680,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
         .ok_or("beta provenance missing")?;
     assert_eq!(beta.state, HarvestRecordState::Tombstoned);
     assert!(
-        load_document_record(&fixture.context, beta_id)
+        drive(DocumentRecordOperation::new(beta_id), &fixture.context)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_none(),
@@ -699,7 +706,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
     assert_ne!(revived.meta_resource_id, beta_id);
     assert_eq!(revived.predecessors, vec![beta_id]);
     assert!(
-        load_document_record(&fixture.context, beta_id)
+        drive(DocumentRecordOperation::new(beta_id), &fixture.context)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_none(),
@@ -718,7 +725,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
 
     // One current document per source generation.
     for id in [alpha.meta_resource_id, revived.meta_resource_id] {
-        let record = load_document_record(&fixture.context, id)
+        let record = drive(DocumentRecordOperation::new(id), &fixture.context)
             .await
             .map_err(|error| format!("{error:?}"))?
             .ok_or("current document missing")?;

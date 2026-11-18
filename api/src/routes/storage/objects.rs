@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -218,9 +219,9 @@ async fn relayed_bounds(
     }
     let upper = query.upper.clone();
     let context = state.get_ctx();
-    let held = match lists_interval(context.as_ref(), binding, &lower, upper.as_deref()).await {
+    let held = match drive(lists_interval(binding, &lower, upper.as_deref()), context.as_ref()).await {
         Ok(false) if query.copy == Some(true) => {
-            copies_interval(context.as_ref(), binding, &lower, upper.as_deref()).await
+            drive(copies_interval(binding, &lower, upper.as_deref()), context.as_ref()).await
         }
         held => held,
     };

@@ -6,6 +6,7 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
+use aruna_operations::driver::drive_until;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -21,7 +22,7 @@ use aruna_core::structs::storage::release::{
     CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
+use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved};
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
@@ -506,7 +507,7 @@ async fn release_crate(
             version_id,
         })) if realm_id == state.get_realm_id() => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
-            match resolve_version(context.as_ref(), version_id, deadline).await {
+            match resolved(drive_until(resolve_version(context.as_ref(), version_id, deadline), context.as_ref(), deadline).await) {
                 GlobalResolution::Found(found) => {
                     // Holders come coordinator first.
                     let holder = match found.local {

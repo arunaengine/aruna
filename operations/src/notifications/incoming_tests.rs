@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::*;
-use crate::driver::drive;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
+use crate::inbound::initialize_incoming_fixture;
 use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,
@@ -20,9 +21,9 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
-use crate::realm::load_config::load_realm_config;
-use crate::sync::incoming::initialize_incoming_fixture;
+use crate::realm::load_config::config_unavailable;
 use crate::tests::notifications::create_local_watch;
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -33,7 +34,7 @@ use aruna_core::keyspaces::{
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord,
+    NotificationClass, NotificationKind, NotificationRecord, NotificationTransportMessage,
 };
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
@@ -45,6 +46,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
@@ -325,8 +327,10 @@ async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
 /// The stored realm config gives `b` no job control yet.
 async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocument) {
     let (a, b, recipient) = delivery_pair(realm_seed).await;
-    let config = load_realm_config(&b.context, recipient.realm_id)
+    let config = drive(GetConfigOperation::new(recipient.realm_id), &b.context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .expect("realm config");
     (a, b, recipient, config)
 }

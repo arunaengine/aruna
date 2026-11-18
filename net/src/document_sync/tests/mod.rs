@@ -2,57 +2,83 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::storage::*;
 use super::*;
 use crate::test_support::test_endpoint;
 use ::irokle::sync::SyncData;
-use aruna_core::admin_checks::revocation_origin_known;
+use aruna_core::admin_checks::{has_write_permission, revocation_origin_known};
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::alpn::Alpn;
-use aruna_core::auth::valid_revocation_expiry;
-use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
-use aruna_core::deferred_topics::TOPICS_PER_DEPENDENCY;
-use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
+use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS, valid_revocation_expiry};
+use aruna_core::config_authority::{AdminEventValidation, validate_config_authority};
+use aruna_core::deferred_topics::{
+    DeferredRegistrationOutcome, DocumentSyncDependency, TOPICS_PER_DEPENDENCY,
+    register_deferred_topic,
+};
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
+};
+use aruna_core::document_apply::admin::AdminOperationPlan;
+use aruna_core::document_apply::{deferred_topics_key, topic_cursor_key};
+use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
-    USER_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, OWNER_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE,
 };
-use aruna_core::metadata::MetadataEventPayload;
+use aruna_core::metadata::{
+    GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventPayload,
+    MetadataEventRecord, MetadataLifecycleRecord,
+};
 use aruna_core::reducer::{
-    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
-    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, group_user_path, realm_user_path, user_attribute_path,
+    AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
+    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, config_node_path, decode_reducer_state,
+    group_user_path, materialize_user_operation, needs_revocation_index, overlay_realm_config,
+    realm_user_path, user_attribute_path,
 };
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
-    reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
+    reducer_conflict_key, reducer_state_entry, reducer_state_key, registry_write_entries,
+    subject_index_key, subject_index_value,
 };
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::notification_watch::WatchInterestDigest;
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
 use aruna_core::structs::identity::realm::{
     GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmAuthorizationDocument,
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
     UserCapOverride,
 };
+use aruna_core::structs::identity::user::User;
+use aruna_core::structs::placement::policy::document::{
+    PlacementPolicyDocument, placement_policy_target,
+};
 use aruna_core::structs::placement::record::{
     BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
     HandleRange, METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementRef, PlacementStrategy, StrategyBinding, band_start,
+    PlacementRef, PlacementScope, PlacementStrategy, StrategyBinding, band_start,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::usage::NodeUsageSnapshot;
-use aruna_core::structs::{QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
+use aruna_core::structs::{
+    PersistentIdMapping, QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord,
+    SyncQuarantineUsage, persistent_id_change, persistent_id_key, persistent_id_target,
+};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::sync_checks::{
-    validate_register_upsert, validate_setting_upsert, validate_watch_upsert,
+    validate_policy_document, validate_register_upsert, validate_setting_upsert,
+    validate_watch_upsert,
 };
+use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use tempfile::TempDir;
+use ulid::Ulid;
 
 mod admin_validation;
 mod distribution;
@@ -68,11 +94,44 @@ mod realm_config;
 mod reconcile;
 mod restart;
 mod role_assignments;
+pub(crate) mod runner;
 mod shard;
 mod validation;
 mod vault;
 
 use crate::tests::document_sync_support::*;
+use aruna_core::document_apply::quarantine::quarantine_entries;
+use aruna_core::document_apply::registry::{document_delete_entries, record_fenced};
+use aruna_core::document_apply::{ApplyError, PlacementOutcome, Step};
+use aruna_core::row_plan::{PlanRows, Planned, RowPlan};
+use runner::*;
+
+/// Asks whether a stored delete or graph tombstone fences a registry record out.
+#[derive(Debug, PartialEq)]
+struct FencePlan(MetadataRegistryRecord);
+
+impl RowPlan for FencePlan {
+    type Output = bool;
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<bool>> {
+        Ok(Planned::output(record_fenced(rows, &self.0)?))
+    }
+}
+
+/// Stores the evidence of these rejections.
+#[derive(Debug, PartialEq)]
+struct EvidencePlan(Vec<SyncRejection>);
+
+impl RowPlan for EvidencePlan {
+    type Output = ();
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
+        let entries = quarantine_entries(rows, &self.0)?.expect("capacity is available");
+        Ok(Planned::changes((), Vec::new(), entries))
+    }
+}
 
 // Two services fork one admin topic. The tie-break resets the losing side, whose
 // evicted event decodes back to an outbox publish with its original event id.

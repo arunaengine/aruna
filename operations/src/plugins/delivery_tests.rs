@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::plugins::calls::*;
 use crate::plugins::host_calls::call_intent;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceKind};
@@ -19,18 +20,17 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::query::insert_job;
 use crate::jobs::store::state::read_job_record;
+use crate::plugin_host::jobs::settle_work;
+use crate::plugin_host::plugin_work::run_plugin_work;
+use crate::plugin_host::plugin_work::tests::job_context;
+use crate::plugin_host::worker::tests::{install_artifact, job_guest, worker_on};
+use crate::plugin_host::worker::{Worker, notify_work};
 use crate::plugins::finished::{drop_completion, retry_run, waits_for};
-use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::settle_work;
-use crate::plugins::plugin_work::run_plugin_work;
-use crate::plugins::plugin_work::tests::job_context;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, read_run};
 use crate::plugins::state::{MAX_STATE_BYTES, MAX_STATE_VALUE, put_state, remove_state};
 use crate::plugins::work::list_work;
-use crate::plugins::worker::tests::{install_artifact, job_guest, worker_on};
-use crate::plugins::worker::{Worker, notify_work};
 use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
 use crate::s3::object::put::PutObjectOperation;
 

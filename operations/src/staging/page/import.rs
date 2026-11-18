@@ -4,39 +4,57 @@
 
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
+use crate::distribution::guard::{authority_reads, write_epochs};
+use crate::metadata::call_results::page_rows as range_rows;
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, PreparedRows, check_guards, decode_heads, guard_reads,
     head_range, head_reads, interval_heads, page_rows, version_reads,
 };
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::sync_relationship_prefix;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
 pub use crate::staging::page::rows::{
-    PageEntry, PageImportError, PageImportInput, PageImportResult, PageImportState,
+    PageEntry, PageImportError, PageImportInput, PageImportResult,
 };
+
+/// What the pending call of a page answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageStep {
+    Guards,
+    /// The heads in the key interval of the page, which proves absent keys absent.
+    Heads,
+    /// The heads key by key, when the interval holds too many other keys.
+    HeadKeys,
+    /// A distributed bucket's record: every entry's key must be coordinated here.
+    Record,
+    /// Whether an ordinary bucket has a sync relationship that replicates its versions.
+    Relationships,
+    Secret,
+    Versions,
+    WriteRows,
+    DeleteRows,
+    Usage,
+}
+
+type PageNext = Result<Next<PageImportResult>, PageImportError>;
 
 #[derive(Debug, PartialEq)]
 pub struct PageImportOperation {
     input: PageImportInput,
-    state: PageImportState,
-    txn_id: Option<TxnId>,
+    step: PageStep,
     guards: Option<PageGuards>,
     usage: Option<UsageCounterUpdate>,
     result: Option<PageImportResult>,
-    output: Option<Result<PageImportResult, PageImportError>>,
     /// Only builds the rows, in a read snapshot, and keeps them in `prepared`.
     prepare: bool,
     prepared: Option<PreparedRows>,
@@ -46,12 +64,10 @@ impl PageImportOperation {
     pub fn new(input: PageImportInput) -> Self {
         Self {
             input,
-            state: PageImportState::Init,
-            txn_id: None,
+            step: PageStep::Guards,
             guards: None,
             usage: None,
             result: None,
-            output: None,
             prepare: false,
             prepared: None,
         }
@@ -63,85 +79,71 @@ impl PageImportOperation {
         self
     }
 
-    fn fail(&mut self, error: PageImportError) -> Effects {
-        self.output = Some(Err(error));
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PageImportState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = PageImportState::Error;
-                smallvec![]
-            }
-        }
+    fn call(&mut self, step: PageStep, call: IoCall) -> PageNext {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
-    fn read_secret(&mut self) -> Result<Effects, PageImportError> {
-        self.state = PageImportState::ReadSecret;
+    fn guards_mut(&mut self) -> Result<&mut PageGuards, PageImportError> {
+        self.guards.as_mut().ok_or(PageImportError::NotFinished)
+    }
+
+    fn read_secret(&mut self) -> PageNext {
         let connector_id = self.input.connector.connector_id;
-        Ok(smallvec![read_secret_effect(
-            connector_id,
-            Some(self.txn()?)
-        )])
+        let read = IoCall::from(read_secret_effect(connector_id, None));
+        self.call(PageStep::Secret, read)
     }
 
     /// One relationship row is enough; read in the transaction, it conflicts with a
     /// relationship created before the page commits.
-    fn read_relationships(&mut self) -> Result<Effects, PageImportError> {
-        self.state = PageImportState::ReadRelationships;
-        let prefix = sync_relationship_prefix(&self.input.bucket);
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+    fn read_relationships(&mut self) -> PageNext {
+        let read = IoCall::Page {
+            space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            prefix: sync_relationship_prefix(&self.input.bucket).into(),
+            after: None,
             limit: 1,
-            txn_id: Some(self.txn()?),
-        })])
+        };
+        self.call(PageStep::Relationships, read)
     }
 
     /// Takes the page's heads and reads what replicates the bucket's versions.
-    fn take_heads(
-        &mut self,
-        heads: Vec<Option<CurrentVersionPointer>>,
-    ) -> Result<Effects, PageImportError> {
-        let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+    fn take_heads(&mut self, heads: Vec<Option<CurrentVersionPointer>>) -> PageNext {
+        let guards = self.guards_mut()?;
         guards.heads = heads;
         // Read in the page transaction, so a fence or record set meanwhile conflicts.
-        let txn_id = self.txn_id;
-        let record =
-            (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
+        let record = (guards.binding.as_ref()).map(|binding| authority_reads(binding.set_id));
         match record {
-            Some(read) => {
-                self.state = PageImportState::ReadRecord;
-                Ok(smallvec![read])
-            }
+            Some(reads) => self.call(PageStep::Record, IoCall::Read(reads)),
             None => self.read_relationships(),
         }
     }
 
-    fn txn(&self) -> Result<TxnId, PageImportError> {
-        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
+    /// Every key of the page must lie in a range this member coordinates.
+    fn check_record(&mut self, result: IoResult) -> PageNext {
+        let [record, fence] = values::<2>(result)?;
+        let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+        let binding = (guards.binding.as_ref()).ok_or(PageImportError::NotFinished)?;
+        let keys = (self.input.entries.iter()).map(|entry| entry.target_key.as_str());
+        let (routes, search) = write_epochs(binding, keys, record.as_deref(), fence.as_deref())?;
+        let resolved: BTreeSet<Ulid> = routes.iter().map(|(range, _)| *range).collect();
+        if (self.input.ranges.as_ref()).is_some_and(|held| *held != resolved) {
+            return Err(PageImportError::RangesMoved(resolved));
+        }
+        guards.epochs = routes.into_iter().map(|(_, epoch)| epoch).collect();
+        guards.search = search;
+        self.read_secret()
     }
 
-    fn read_versions(&mut self, txn_id: TxnId) -> Result<Effects, PageImportError> {
+    fn read_versions(&mut self) -> PageNext {
         let heads = self.guards.as_ref().map(|guards| guards.heads.as_slice());
         let reads = version_reads(&self.input, heads.unwrap_or_default())?;
         if reads.is_empty() {
-            return self.write_rows(txn_id, Vec::new());
+            return self.write_rows(Vec::new());
         }
-        self.state = PageImportState::ReadVersions;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })])
+        self.call(PageStep::Versions, IoCall::Read(reads))
     }
 
-    fn write_rows(
-        &mut self,
-        txn_id: TxnId,
-        versions: Vec<Option<BlobVersion>>,
-    ) -> Result<Effects, PageImportError> {
+    fn write_rows(&mut self, versions: Vec<Option<BlobVersion>>) -> PageNext {
         let guards = self.guards.as_ref().ok_or(PageImportError::NotFinished)?;
         let rows = match self.prepared.take() {
             Some(prepared) if prepared.guards == *guards && prepared.versions == versions => {
@@ -149,7 +151,7 @@ impl PageImportOperation {
             }
             _ if self.prepare => {
                 let rows = page_rows(&self.input, guards, versions.clone())?;
-                self.result = Some(rows.result.clone());
+                let result = rows.result.clone();
                 let guards = guards.clone();
                 self.prepared = Some(PreparedRows {
                     guards,
@@ -157,7 +159,7 @@ impl PageImportOperation {
                     rows,
                 });
                 // The read snapshot ends without writes.
-                return Ok(self.commit(txn_id));
+                return Ok(Next::Done(result));
             }
             _ => page_rows(&self.input, guards, versions)?,
         };
@@ -168,268 +170,118 @@ impl PageImportOperation {
             self.usage = Some(usage.with_inventories(rows.inventory));
         }
         self.result = Some(rows.result);
-        self.state = PageImportState::WriteRows;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: rows.writes,
-            txn_id: Some(txn_id),
-        })])
+        self.call(PageStep::WriteRows, IoCall::Write(rows.writes))
     }
 
-    fn delete_rows(&mut self, txn_id: TxnId) -> Effects {
-        if self.input.deletes.is_empty() {
-            return self.update_usage(txn_id);
-        }
-        self.state = PageImportState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: self.input.deletes.clone(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn update_usage(&mut self, txn_id: TxnId) -> Effects {
+    fn update_usage(&mut self) -> PageNext {
         match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
             Some(usage) => {
-                self.state = PageImportState::UpdateUsage;
-                usage.start(txn_id)
+                let call = usage.start_calls().into_call();
+                self.call(PageStep::Usage, call)
             }
-            None => self.commit(txn_id),
+            None => self.finish(),
         }
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = PageImportState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    fn step_usage(&mut self, result: IoResult) -> PageNext {
+        let usage = self.usage.as_mut().ok_or(PageImportError::NotFinished)?;
+        match usage.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.finish(),
+        }
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = PageImportState::Finish;
-        self.output = Some(self.result.take().ok_or(PageImportError::NotFinished));
-        smallvec![]
+    /// Ends the page; the dirty markers and obligations it commits are the durable work, so
+    /// the timers that pick them up are only woken after the commit.
+    fn finish(&mut self) -> PageNext {
+        let output = self.result.take().ok_or(PageImportError::NotFinished)?;
+        if self.usage.is_none() {
+            return Ok(Next::Done(output));
+        }
+        let wake = |effect: Effect| IoCall::Effect(Box::new(effect));
+        Ok(Next::Then {
+            output,
+            calls: vec![
+                wake(schedule_snapshot_publish()),
+                wake(schedule_blob_drain()),
+            ],
+        })
+    }
+}
+
+impl Operation for PageImportOperation {
+    type Output = PageImportResult;
+    type Error = PageImportError;
+
+    fn first(&mut self) -> PageNext {
+        let entries = self.input.entries.len();
+        if entries > MAX_PAGE_ENTRIES {
+            return Err(PageImportError::TooManyEntries(entries));
+        }
+        Ok(Next::Call(IoCall::Read(guard_reads(&self.input)?)))
     }
 
-    fn step_inner(&mut self, event: Event) -> Result<Effects, PageImportError> {
-        match (self.state, event) {
-            (
-                PageImportState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = PageImportState::ReadGuards;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: guard_reads(&self.input)?,
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (
-                PageImportState::ReadGuards,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                self.guards = Some(check_guards(&self.input, values)?);
-                match head_range(&self.input, self.txn()?)? {
+    fn next(&mut self, result: IoResult) -> PageNext {
+        match self.step {
+            PageStep::Guards => {
+                self.guards = Some(check_guards(&self.input, result.values()?)?);
+                match head_range(&self.input)? {
                     Some(read) => {
-                        self.state = PageImportState::ReadHeads;
-                        Ok(smallvec![Effect::Storage(read)])
+                        let read = IoCall::Effect(Box::new(Effect::Storage(read)));
+                        self.call(PageStep::Heads, read)
                     }
                     None => self.take_heads(Vec::new()),
                 }
             }
-            (
-                PageImportState::ReadHeads,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => match next_start_after {
-                Some(_) => {
-                    self.state = PageImportState::ReadHeadKeys;
-                    Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: head_reads(&self.input)?,
-                        txn_id: Some(self.txn()?),
-                    })])
+            PageStep::Heads => match range_rows(result)? {
+                (_, Some(_)) => {
+                    let reads = head_reads(&self.input)?;
+                    self.call(PageStep::HeadKeys, IoCall::Read(reads))
                 }
-                None => self.take_heads(interval_heads(&self.input, values)?),
+                (rows, None) => self.take_heads(interval_heads(&self.input, rows)?),
             },
-            (
-                PageImportState::ReadHeadKeys,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.take_heads(decode_heads(values.into_iter().map(|(_, value)| value))?),
-            (
-                PageImportState::ReadRecord,
-                event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
-            ) => {
-                let (record, fence) = authority_rows(event)?;
-                let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
-                let binding = guards
-                    .binding
-                    .as_ref()
-                    .ok_or(PageImportError::NotFinished)?;
-                // Every key of the page must lie in a range this member coordinates.
-                let keys = self
-                    .input
-                    .entries
-                    .iter()
-                    .map(|entry| entry.target_key.as_str());
-                let (routes, search) =
-                    write_epochs(binding, keys, record.as_deref(), fence.as_deref())?;
-                let resolved: BTreeSet<Ulid> = routes.iter().map(|(range, _)| *range).collect();
-                if self
-                    .input
-                    .ranges
-                    .as_ref()
-                    .is_some_and(|held| *held != resolved)
-                {
-                    return Err(PageImportError::RangesMoved(resolved));
-                }
-                guards.epochs = routes.into_iter().map(|(_, epoch)| epoch).collect();
-                guards.search = search;
+            PageStep::HeadKeys => self.take_heads(decode_heads(result.values()?)?),
+            PageStep::Record => self.check_record(result),
+            PageStep::Relationships => {
+                let (rows, _) = result.page()?;
+                self.guards_mut()?.downstream = !rows.is_empty();
                 self.read_secret()
             }
-            (
-                PageImportState::ReadRelationships,
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => {
-                let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
-                guards.downstream = !values.is_empty();
-                self.read_secret()
-            }
-            (
-                PageImportState::ReadSecret,
-                event @ Event::Storage(StorageEvent::VaultResult { .. }),
-            ) => {
-                let secret = parse_secret_read(event, self.input.connector.connector_id)?;
+            PageStep::Secret => {
+                let connector_id = self.input.connector.connector_id;
+                let secret = parse_secret_read(result.event()?, connector_id)?;
                 if secret.as_ref().map(secret_fingerprint) != self.input.secret_fingerprint {
                     return Err(PageImportError::ConnectorChanged);
                 }
-                self.read_versions(self.txn()?)
+                self.read_versions()
             }
-            (
-                PageImportState::ReadVersions,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let versions = values
-                    .into_iter()
-                    .map(|(_, value)| {
+            PageStep::Versions => {
+                let versions = (result.values()?.into_iter())
+                    .map(|value| {
                         value
                             .map(|value| BlobVersion::from_bytes(value.as_ref()))
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                self.write_rows(self.txn()?, versions)
+                self.write_rows(versions)
             }
-            (PageImportState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.delete_rows(self.txn()?))
+            PageStep::WriteRows => {
+                done(result)?;
+                let deletes = self.input.deletes.clone();
+                self.call(PageStep::DeleteRows, IoCall::Delete(deletes))
             }
-            (
-                PageImportState::DeleteRows,
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => Ok(self.update_usage(self.txn()?)),
-            (PageImportState::UpdateUsage, event @ Event::Storage(_)) => {
-                let txn_id = self.txn()?;
-                let usage = self.usage.as_mut().ok_or(PageImportError::NotFinished)?;
-                match usage.step(event, txn_id)? {
-                    Some(effects) => Ok(effects),
-                    None => Ok(self.commit(txn_id)),
-                }
+            PageStep::DeleteRows => {
+                done(result)?;
+                self.update_usage()
             }
-            (
-                PageImportState::Commit,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.txn_id = None;
-                if self.usage.is_none() {
-                    return Ok(self.finish());
-                }
-                // The dirty markers and obligations committed above are the durable work.
-                self.state = PageImportState::Schedule;
-                Ok(smallvec![schedule_snapshot_publish()])
-            }
-            (PageImportState::Schedule, Event::Task(_)) => {
-                self.state = PageImportState::ScheduleDrain;
-                Ok(smallvec![schedule_blob_drain()])
-            }
-            (PageImportState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                // A failed commit leaves no transaction to abort.
-                self.txn_id = None;
-                Err(error.into())
-            }
-            (PageImportState::ScheduleDrain, Event::Task(_)) => Ok(self.finish()),
-            (PageImportState::Abort, Event::Storage(_)) => {
-                self.state = PageImportState::Error;
-                Ok(smallvec![])
-            }
-            (state, Event::Storage(StorageEvent::Error { error }))
-                if state != PageImportState::Abort =>
-            {
-                Err(error.into())
-            }
-            (state, event) => Err(PageImportError::UnexpectedEvent {
-                state,
-                expected: expected_event(state),
-                received: event.label().to_string(),
-            }),
-        }
-    }
-}
-
-fn expected_event(state: PageImportState) -> &'static str {
-    match state {
-        PageImportState::StartTransaction => "TransactionStarted",
-        PageImportState::ReadGuards
-        | PageImportState::ReadHeadKeys
-        | PageImportState::ReadVersions => "BatchReadResult",
-        PageImportState::ReadHeads => "IterResult",
-        PageImportState::ReadSecret => "VaultResult",
-        PageImportState::ReadRecord => "ReadResult",
-        PageImportState::ReadRelationships => "IterResult",
-        PageImportState::WriteRows | PageImportState::UpdateUsage => "BatchWriteResult",
-        PageImportState::DeleteRows => "BatchDeleteResult",
-        PageImportState::Commit => "TransactionCommitted",
-        PageImportState::Schedule | PageImportState::ScheduleDrain => "Task",
-        PageImportState::Abort => "TransactionAborted",
-        PageImportState::Init | PageImportState::Finish | PageImportState::Error => "no event",
-    }
-}
-
-impl EffectOperation for PageImportOperation {
-    type Output = PageImportResult;
-    type Error = PageImportError;
-
-    fn start(&mut self) -> Effects {
-        let entries = self.input.entries.len();
-        if entries > MAX_PAGE_ENTRIES {
-            return self.fail(PageImportError::TooManyEntries(entries));
-        }
-        self.state = PageImportState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: self.prepare
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if matches!(self.state, PageImportState::Finish | PageImportState::Error) {
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+            PageStep::Usage => self.step_usage(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PageImportState::Finish | PageImportState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PageImportError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PageImportState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
+    fn transaction(&self) -> TransactionMode {
+        match self.prepare {
+            true => TransactionMode::ReadSnapshot,
+            false => TransactionMode::Write,
         }
     }
 }
@@ -445,32 +297,35 @@ impl PreparePageOperation {
         page.prepare = true;
         Self(page)
     }
+
+    fn prepared(&mut self, next: Next<PageImportResult>) -> Result<Next<PreparedRows>, PageImportError> {
+        match next {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Wait => Ok(Next::Wait),
+            Next::Done(_) | Next::Then { .. } => {
+                let prepared = self.0.prepared.take();
+                prepared.map(Next::Done).ok_or(PageImportError::NotFinished)
+            }
+        }
+    }
 }
 
-impl EffectOperation for PreparePageOperation {
+impl Operation for PreparePageOperation {
     type Output = PreparedRows;
     type Error = PageImportError;
 
-    fn start(&mut self) -> Effects {
-        self.0.start()
+    fn first(&mut self) -> Result<Next<PreparedRows>, PageImportError> {
+        let next = self.0.first()?;
+        self.prepared(next)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.0.step(event)
+    fn next(&mut self, result: IoResult) -> Result<Next<PreparedRows>, PageImportError> {
+        let next = self.0.next(result)?;
+        self.prepared(next)
     }
 
-    fn is_complete(&self) -> bool {
-        self.0.is_complete()
-    }
-
-    fn finalize(mut self) -> Result<Self::Output, Self::Error> {
-        let prepared = self.0.prepared.take();
-        self.0.finalize()?;
-        prepared.ok_or(PageImportError::NotFinished)
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.0.abort()
+    fn transaction(&self) -> TransactionMode {
+        self.0.transaction()
     }
 }
 

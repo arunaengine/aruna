@@ -4,10 +4,13 @@
 
 use std::str::FromStr;
 
+use crate::job_service::read_owned_job;
+use aruna_core::UserId;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::compute::session::{SessionAnswer, SessionError, SessionRequest};
 use aruna_core::id::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
     InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
@@ -15,19 +18,24 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::{
-    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
-};
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
     WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
-use aruna_operations::jobs::lifecycle::routing::session_job;
+use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use aruna_operations::jobs::lifecycle::family_reads::{FamilyReportOperation, SessionJobOperation};
+use aruna_operations::jobs::lifecycle::ids::SubmissionScope;
+use aruna_operations::jobs::lifecycle::ingress::ingress_node;
+use aruna_operations::jobs::lifecycle::submit_external::{
+    ExternalSubmission, SubmitExternalOperation,
+};
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::service::read_owned_job;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -39,7 +47,7 @@ use crate::error::ServerResult;
 use crate::server::state::ServerState;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::structs::execution::job::KeyWait;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use serde::Deserialize;
 use serde::Serialize;
@@ -345,16 +353,17 @@ async fn local_submit(
     workspace_mode: WorkspaceMode,
 ) -> Result<AcceptedExecution, JobRequestError> {
     let context = state.get_ctx();
-    let result = submit_local_execution(
-        &context,
-        LocalExecutionConfig {
-            spec,
-            owner: auth.user_id,
-            node_id: state.get_node_id(),
-            idempotency_key,
-            workspace_mode,
-            retention_ms: state.rocrate_limits().artifact_retention_ms,
-        },
+    let config = LocalExecutionConfig {
+        spec,
+        owner: auth.user_id,
+        node_id: state.get_node_id(),
+        idempotency_key,
+        workspace_mode,
+        retention_ms: state.rocrate_limits().artifact_retention_ms,
+    };
+    let result = drive(
+        LocalRunOperation::on_node(config, &context),
+        context.as_ref(),
     )
     .await
     .map_err(JobRequestError::from_local)?;
@@ -380,9 +389,51 @@ pub(crate) async fn owned_session_job(
     auth: &AuthContext,
     raw_job_id: &str,
 ) -> Result<(JobRecord, Option<JobId>), JobRequestError> {
-    session_job(&state.get_ctx(), auth.user_id, parse_job_id(raw_job_id)?)
+    let job_id = parse_job_id(raw_job_id)?;
+    let read = SessionJobOperation::new(auth.user_id, job_id, unix_timestamp_millis());
+    drive(read, state.get_ctx().as_ref())
         .await
         .map_err(JobRequestError::from_route)
+}
+
+/// The family report of one alias; `None` when the alias names no family on this node.
+pub(crate) async fn family_report(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Option<Result<FamilyReport, JobRouteError>> {
+    let node = context.node_and_realm();
+    let read = FamilyReportOperation::new(auth, job_id, node, unix_timestamp_millis());
+    drive(read, context).await.transpose()
+}
+
+/// Normalizes, authorizes and admits one external execution request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_external_job(
+    context: &DriverContext,
+    spec: ExecutionSpec,
+    created_by: UserId,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+    auth_token: Option<AuthToken>,
+) -> Result<AcceptedSubmission, SubmitJobError> {
+    let scope = match idempotency_key {
+        Some(key) => SubmissionScope::Keyed(key),
+        None => SubmissionScope::Unkeyed(Ulid::generate()),
+    };
+    let submission = ExternalSubmission {
+        spec,
+        created_by,
+        scope,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        auth_token,
+    };
+    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
+    drive(submit, context).await.map_err(placement_failure)
 }
 
 /// The answer of the caller's live session on this node, for callers that have no coded

@@ -30,9 +30,8 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::transfer::{MAX_TRANSFER_SECS, import_key, intent_digest};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::federation::import::{bound_upload, read_import};
-use aruna_operations::jobs::import::upload_store::{
-    claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, write_rocrate_upload,
+use aruna_operations::federation::import::{
+    BoundUploadOperation, ReadImportOperation, WriteImportOperation,
 };
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
@@ -309,13 +308,21 @@ async fn push_binds_principal() {
     let first = push(&fixture, &intent, &grant).await.unwrap();
     let upload_id = Ulid::from_string(&first.upload_id).unwrap();
     let context = fixture.state.get_ctx();
-    let record = load_rocrate_upload(&context, upload_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let record = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     assert_eq!(record.owner, fixture.user);
     let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
-    let bound = bound_upload(&context, fixture.user, &key).await;
+    let bound = drive(
+        BoundUploadOperation::new(fixture.user, &key),
+        context.as_ref(),
+    )
+    .await;
     assert_eq!(bound, Ok(Some(upload_id)));
     let again = push(&fixture, &intent, &grant).await.unwrap();
     assert_eq!(again.upload_id, first.upload_id);
@@ -324,7 +331,10 @@ async fn push_binds_principal() {
     let renewed = self::grant(&fresh, BODY);
     let resumed = push(&fixture, &fresh, &renewed).await.unwrap();
     assert_eq!(resumed.upload_id, first.upload_id);
-    let stored = read_import(&context, upload_id).await.unwrap().unwrap();
+    let stored = drive(ReadImportOperation::new(upload_id), context.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.intent, fresh);
     // Another artifact under the same import key is never handed the bound upload.
     let other = self::grant(&intent, b"another export body");
@@ -347,7 +357,11 @@ async fn push_checks_artifact() {
         ServerError::Refused(_, "artifact_mismatch", _)
     ));
     let key = import_key(&mismatch.payload, &intent.payload.destination).unwrap();
-    let bound = bound_upload(&fixture.state.get_ctx(), fixture.user, &key).await;
+    let bound = drive(
+        BoundUploadOperation::new(fixture.user, &key),
+        fixture.state.get_ctx().as_ref(),
+    )
+    .await;
     assert_eq!(bound, Ok(None));
     // A body above the granted size is cut off as too large.
     let small = grant(&intent, &BODY[..4]);
@@ -402,7 +416,13 @@ async fn seed_upload(fixture: &Fixture, upload_id: Ulid) {
         expires_at_ms: unix_timestamp_millis() + 60_000,
         claimed_by: None,
     };
-    write_rocrate_upload(&fixture.state.get_ctx(), &record).await.unwrap();
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap();
 }
 
 async fn import(
@@ -482,7 +502,12 @@ async fn bound_upload_confirmed() {
     let (first, second) = (Ulid::generate(), Ulid::generate());
     seed_upload(&fixture, first).await;
     let context = fixture.state.get_ctx();
-    write_import(&context, &key, first, &binding).await.unwrap();
+    drive(
+        WriteImportOperation::new(&key, first, binding.clone()),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
     let user = fixture.user;
     let error = import(&fixture, user, &intent, &grant, SECRET).await;
     assert!(matches!(
@@ -490,7 +515,11 @@ async fn bound_upload_confirmed() {
         Err(ServerError::ServiceUnavailableReason(_))
     ));
     seed_upload(&fixture, second).await;
-    let bound = write_import(&context, &key, second, &binding).await;
+    let bound = drive(
+        WriteImportOperation::new(&key, second, binding.clone()),
+        context.as_ref(),
+    )
+    .await;
     assert_eq!(bound, Ok(first));
 }
 
@@ -527,19 +556,32 @@ async fn losing_spool_discarded() {
         grant: grant.clone(),
         confirmed: false,
     };
-    write_import(&context, &key, first, &binding).await.unwrap();
-    let losing = load_rocrate_upload(&context, second)
-        .await
-        .unwrap()
-        .unwrap();
+    drive(
+        WriteImportOperation::new(&key, first, binding.clone()),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
+    let losing = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(second),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     let bound = bind_upload(&fixture.state, &intent, &grant, &key, &losing)
         .await
         .unwrap();
     assert_eq!(bound.upload_id, first);
-    let discarded = load_rocrate_upload(&context, second)
-        .await
-        .unwrap()
-        .unwrap();
+    let discarded = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(second),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     assert_eq!(discarded.expires_at_ms, 0);
 }
 
@@ -560,18 +602,31 @@ async fn conflicting_winner_refused() {
         grant: other,
         confirmed: false,
     };
-    write_import(&context, &key, first, &winner).await.unwrap();
-    let losing = load_rocrate_upload(&context, second)
-        .await
-        .unwrap()
-        .unwrap();
+    drive(
+        WriteImportOperation::new(&key, first, winner.clone()),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
+    let losing = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(second),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     let refused = bind_upload(&fixture.state, &intent, &grant, &key, &losing).await;
     let status = axum::response::IntoResponse::into_response(refused.unwrap_err()).status();
     assert_eq!(status, StatusCode::CONFLICT);
-    let discarded = load_rocrate_upload(&context, second)
-        .await
-        .unwrap()
-        .unwrap();
+    let discarded = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(second),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     assert_eq!(discarded.expires_at_ms, 0);
 }
 
@@ -590,9 +645,12 @@ async fn retry_keeps_plan() {
     let upload_id = Ulid::generate();
     seed_upload(&fixture, upload_id).await;
     let context = fixture.state.get_ctx();
-    write_import(&context, &key, upload_id, &binding)
-        .await
-        .unwrap();
+    drive(
+        WriteImportOperation::new(&key, upload_id, binding.clone()),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
     let first = submit(&fixture, upload_id, &key, "first").await.unwrap();
     let second = submit(&fixture, upload_id, &key, "second").await.unwrap();
     assert!(first.created && !second.created);
@@ -613,12 +671,27 @@ async fn push_after_import() {
     // The import job claims the upload and deletes it when it ends.
     let job_id = JobId::from_str(&job.job_id).unwrap();
     let now = unix_timestamp_millis();
-    claim_rocrate_upload(&fixture.state.get_ctx(), upload_id, fixture.user, job_id, now)
-        .await
-        .unwrap();
-    delete_rocrate_upload(&fixture.state.get_ctx(), upload_id, job_id)
-        .await
-        .unwrap();
+    aruna_operations::driver::drive_retry(
+        || {
+            aruna_operations::jobs::import::upload::ClaimUploadOperation::new(
+                upload_id,
+                fixture.user,
+                job_id,
+                now,
+            )
+        },
+        &fixture.state.get_ctx(),
+        &upload_id.to_bytes(),
+    )
+    .await
+    .unwrap();
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap();
     let again = push(&fixture, &intent, &grant).await.unwrap();
     assert_eq!(again.upload_id, first.upload_id);
     let retry = submit(&fixture, upload_id, &key, "second").await.unwrap();
@@ -637,17 +710,31 @@ async fn push_replaces_expired() {
     let context = fixture.state.get_ctx();
     let first = push(&fixture, &intent, &grant).await.unwrap();
     let first_id = Ulid::from_string(&first.upload_id).unwrap();
-    let mut record = load_rocrate_upload(&context, first_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut record = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(first_id),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap()
+    .unwrap();
     record.expires_at_ms = 0;
     let storage = &context.storage_handle;
-    write_rocrate_upload(&context, &record).await.unwrap();
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap();
     let second = push(&fixture, &intent, &grant).await.unwrap();
     let second_id = Ulid::from_string(&second.upload_id).unwrap();
     assert_ne!(second_id, first_id);
-    let bound = bound_upload(&context, fixture.user, &key).await;
+    let bound = drive(
+        BoundUploadOperation::new(fixture.user, &key),
+        context.as_ref(),
+    )
+    .await;
     assert_eq!(bound, Ok(Some(second_id)));
     // The sweep removes the second upload unused as well.
     let swept = storage

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::record_reads::DocumentRecordOperation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyLoadOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::DriverContext;
 use crate::driver::drive;
@@ -248,11 +251,13 @@ async fn load_evaluators(
     context: &DriverContext,
     records: &[MetadataRegistryRecord],
 ) -> Result<Evaluators, VisibilityError> {
-    PolicyEvaluator::load_bulk(
+    drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
         context,
-        records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id)),
     )
     .await
     .map_err(|_| VisibilityError::Unavailable)
@@ -288,7 +293,9 @@ async fn build_evaluators(
     scopes.dedup();
     let mut evaluators = Evaluators::new();
     for (realm_id, group_id) in scopes {
-        if let Ok(evaluator) = PolicyEvaluator::load(context, realm_id, Some(group_id)).await {
+        if let Ok(evaluator) =
+            drive(PolicyLoadOperation::new(realm_id, Some(group_id)), context).await
+        {
             evaluators.insert((realm_id, group_id), evaluator);
         }
     }
@@ -421,8 +428,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::record_reads::load_document_record(context, document_id)
-                        .await?
+                    drive(DocumentRecordOperation::new(document_id), context).await?
                 && record.updated_at_ms == updated_at_ms
             {
                 let mut record = record;

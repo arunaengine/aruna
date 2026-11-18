@@ -12,6 +12,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use aruna_operations::s3::access::get::GetAccessOperation;
 use aruna_operations::s3::access::revoke::RevokeUserOperation;
+use aruna_operations::testing::sync_topics;
 use ulid::Ulid;
 
 #[tokio::test]
@@ -53,10 +54,12 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
             realm_id,
             &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
-    nodes[1]
-        .net
-        .sync_document_topics(vec![topic], vec![nodes[0].net.node_id()])
-        .await;
+    sync_topics(
+        nodes[1].context.as_ref(),
+        vec![topic],
+        vec![nodes[0].net.node_id()],
+    )
+    .await?;
 
     let remote = drive(
         GetAccessOperation::new(access_key.clone()),

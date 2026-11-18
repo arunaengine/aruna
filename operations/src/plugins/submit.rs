@@ -1,6 +1,5 @@
-//! Prepares native work for a run on the receiver: the per call checks and the work row that
-//! names it across calls. The job is submitted afterwards, only while the row's dispatch is
-//! unresolved.
+//! Prepares native work for a run on the receiver: the per call checks and the work row naming
+//! it across calls. The job is submitted afterwards, only while its dispatch is unresolved.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

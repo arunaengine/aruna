@@ -7,12 +7,14 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::plugin_runs::HookRequest;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::node::node_info::node_urls;
-use aruna_operations::plugins::dispatch::{admit_hook, checks_authorization};
-use aruna_operations::plugins::hooks::HookError;
-use aruna_operations::plugins::install::read_config;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::plugin_host::read_config;
+use aruna_operations::plugins::dispatch::{HookAuthorization, VerifyHook};
+use aruna_operations::plugins::hooks::{AdmitHook, HookError};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -129,9 +131,8 @@ pub async fn receive(
             .collect(),
         body: body.to_vec(),
     };
-    let ids = (state.get_realm_id(), install_id);
-    let local = state.get_node_id();
-    match admit_hook(&ctx, local, ids, request, unix_timestamp_millis()).await {
+    let node = (state.get_realm_id(), state.get_node_id());
+    match admit_request(&ctx, node, install_id, request).await {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(HookError::Elsewhere(receiver)) => {
             let path = match query {
@@ -142,6 +143,20 @@ pub async fn receive(
         }
         Err(error) => hook_error(install_id, error),
     }
+}
+
+/// Checks one webhook request and queues its run. Answers `false` for a delivery id the
+/// receiver already admitted, which starts nothing.
+async fn admit_request(
+    ctx: &DriverContext,
+    node: (RealmId, NodeId),
+    install_id: Ulid,
+    request: HookRequest,
+) -> Result<bool, HookError> {
+    let now_ms = unix_timestamp_millis();
+    let hook = drive(VerifyHook::new(node, install_id, request, now_ms), ctx).await?;
+    let admit = AdmitHook::new(hook.run, (hook.install_id, hook.delivery_id), now_ms)?;
+    Ok(drive(admit, ctx).await?)
 }
 
 /// A refusal of a request over its bounds, before anything is read or relayed.
@@ -228,14 +243,20 @@ async fn relay(
     let keep = match read_config(&ctx, state.get_realm_id()).await {
         Ok(config) => {
             let place = (state.get_node_id(), install_id);
-            checks_authorization(&ctx, &config, place).await
+            let check = HookAuthorization::new(config, place);
+            drive(check, &ctx).await.ok().flatten()
         }
         Err(_) => None,
     };
     let Some(keep) = keep else {
         return unavailable();
     };
-    let Some(base) = node_urls(&ctx, receiver).await.and_then(|urls| urls.api) else {
+    let Some(base) = drive(NodeUrlsOperation::new(receiver), ctx.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|urls| urls.api)
+    else {
         return unavailable();
     };
     let mut sent = relayed(headers, keep);

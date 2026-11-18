@@ -151,6 +151,13 @@ impl Operation for JobRouteOperation {
     }
 }
 
+/// A job's status, with the run crate when its owner has one.
+#[derive(Debug, PartialEq)]
+pub struct RoutedJobStatus {
+    pub job: aruna_core::jobs::JobStatusView,
+    pub run_crate: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JobRouteError {
     #[error("job request is unauthorized")]

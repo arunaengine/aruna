@@ -612,10 +612,12 @@ async fn sync_skips_scan() {
     .await
     .unwrap();
     assert_eq!(view.counters.observed, 0);
-    let offers =
-        aruna_operations::staging::offered_directory::list_offers(&fixture.state.get_ctx())
-            .await
-            .unwrap();
+    let offers = aruna_operations::driver::drive(
+        aruna_operations::staging::offer::list::ListOffersOperation::new(),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(offers.is_empty(), "the request must not walk the folder");
     let woken = tokio::time::timeout(std::time::Duration::from_secs(300), async {
         while let Some(key) = fired.recv().await {

@@ -366,7 +366,10 @@ mod call_tests {
         let old_key = graph_prune_key(&failed).to_vec();
         let mut operation =
             RescheduleOperation::new(&[old_key.clone()], &failed, "down".into(), NOW_MS).unwrap();
-        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let next_job = GraphPruneRecord {
             due_at_ms: NOW_MS + retry_delay_ms(1),
             attempts: 1,

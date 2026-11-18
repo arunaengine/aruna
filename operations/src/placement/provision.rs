@@ -2,117 +2,208 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::OnceLock;
-
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementBinding, PlacementScope};
-use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use super::allocate_handle::{AllocateHandleOperation, AllocatedHandle, HandleAllocationError};
-use crate::driver::DriverContext;
-use crate::placement::mutation::drive_placement_mutation;
-use crate::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::placement::mutation::PlacementMutationOperation;
+use crate::realm::mutate_placement::{
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
+};
 
-/// Draws the next handle for `node_id` from its granted (non-conflicted) ranges,
-/// advancing and durably persisting the cursor before returning. Returns
-/// `placement_handle_exhausted` once the node's ranges are spent.
-pub async fn allocate_handle(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> Result<AllocatedHandle, HandleAllocationError> {
-    let _guard = allocation_lock().lock().await;
-    let config = crate::driver::drive(
-        crate::document_repository::GetConfigOperation::new(realm_id),
-        context,
-    )
-    .await?;
-    let ranges = config.handle_range_directory().granted_to(&node_id);
-    crate::driver::drive(
-        AllocateHandleOperation::new(realm_id, node_id, ranges, unix_timestamp_millis()),
-        context,
-    )
-    .await
+fn config_call(realm_id: RealmId) -> IoCall {
+    IoCall::child(GetConfigOperation::new(realm_id))
 }
 
-fn allocation_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+fn read_config(result: IoResult) -> Result<RealmConfigDocument, HandleAllocationError> {
+    Ok(result.child::<RealmConfigDocument, GetConfigError>()??)
+}
+
+/// Draws the next handle for `node_id` from its granted (non-conflicted) ranges,
+/// advancing and durably persisting the cursor before returning. Fails with
+/// `placement_handle_exhausted` once the node's ranges are spent.
+#[derive(Debug, PartialEq)]
+pub struct DrawHandleOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    now_ms: u64,
+    drawing: bool,
+}
+
+impl DrawHandleOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            now_ms: 0,
+            drawing: false,
+        }
+    }
+}
+
+impl Operation for DrawHandleOperation {
+    type Output = AllocatedHandle;
+    type Error = HandleAllocationError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PlacementHandles)
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<AllocatedHandle>, HandleAllocationError> {
+        Ok(Next::Call(config_call(self.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<AllocatedHandle>, HandleAllocationError> {
+        if self.drawing {
+            let drawn = result.child::<AllocatedHandle, HandleAllocationError>()??;
+            return Ok(Next::Done(drawn));
+        }
+        let config = read_config(result)?;
+        let ranges = config.handle_range_directory().granted_to(&self.node_id);
+        self.drawing = true;
+        let draw = AllocateHandleOperation::new(self.realm_id, self.node_id, ranges, self.now_ms);
+        Ok(Next::Call(IoCall::child(draw)))
+    }
 }
 
 /// Allocates a fresh handle for a `(scope, class, strategy)` and appends its
 /// immutable Placement Binding with the three provenance fields set. This is the
 /// production path new-scope provisioning uses.
-pub async fn allocate_placement_binding(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct AllocateBindingOperation {
     actor: Actor,
     scope: PlacementScope,
     document_class: DocumentClass,
     strategy_id: Ulid,
-) -> Result<PlacementBinding, HandleAllocationError> {
-    let allocated = allocate_handle(context, actor.realm_id, actor.node_id).await?;
-    let binding = PlacementBinding {
-        handle: allocated.handle,
-        scope,
-        document_class,
-        strategy_id,
-        allocator_range_id: Some(allocated.allocator_range_id),
-        allocated_by: Some(allocated.allocated_by),
-        allocated_at_ms: Some(allocated.allocated_at_ms),
-    };
-    drive_placement_mutation(
-        MutatePlacementConfig {
+    binding: Option<PlacementBinding>,
+}
+
+impl AllocateBindingOperation {
+    pub fn new(
+        actor: Actor,
+        scope: PlacementScope,
+        document_class: DocumentClass,
+        strategy_id: Ulid,
+    ) -> Self {
+        Self {
             actor,
+            scope,
+            document_class,
+            strategy_id,
+            binding: None,
+        }
+    }
+}
+
+impl Operation for AllocateBindingOperation {
+    type Output = PlacementBinding;
+    type Error = HandleAllocationError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PlacementHandles)
+    }
+
+    fn first(&mut self) -> Result<Next<PlacementBinding>, HandleAllocationError> {
+        let draw = DrawHandleOperation::new(self.actor.realm_id, self.actor.node_id);
+        Ok(Next::Call(IoCall::child(draw)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PlacementBinding>, HandleAllocationError> {
+        if let Some(binding) = self.binding.take() {
+            result.child::<RealmConfigDocument, MutatePlacementError>()??;
+            return Ok(Next::Done(binding));
+        }
+        let allocated = result.child::<AllocatedHandle, HandleAllocationError>()??;
+        let binding = PlacementBinding {
+            handle: allocated.handle,
+            scope: self.scope,
+            document_class: self.document_class,
+            strategy_id: self.strategy_id,
+            allocator_range_id: Some(allocated.allocator_range_id),
+            allocated_by: Some(allocated.allocated_by),
+            allocated_at_ms: Some(allocated.allocated_at_ms),
+        };
+        let config = MutatePlacementConfig {
+            actor: self.actor.clone(),
             mutation: RealmPlacementMutation::AppendPlacementBinding(binding.clone()),
-        },
-        None,
-        context,
-    )
-    .await?;
-    Ok(binding)
+        };
+        self.binding = Some(binding);
+        let append = PlacementMutationOperation::new(config, None, None);
+        Ok(Next::Call(IoCall::child(append)))
+    }
 }
 
 /// Idempotently provisions the immutable metadata binding required before a
 /// placement strategy can become active.
-pub async fn provision_metadata_binding(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ProvisionBindingOperation {
     actor: Actor,
     scope: PlacementScope,
     strategy_id: Ulid,
-) -> Result<PlacementBinding, HandleAllocationError> {
-    let _guard = provision_lock().lock().await;
-    let config = crate::driver::drive(
-        crate::document_repository::GetConfigOperation::new(actor.realm_id),
-        context,
-    )
-    .await?;
-    if config.strategy(&strategy_id).is_none() {
-        return Err(HandleAllocationError::StrategyNotFound(strategy_id));
-    }
-    if let Some(handle) =
-        config
-            .binding_directory()
-            .handle_for(scope, DocumentClass::Metadata, strategy_id)
-    {
-        return config
-            .placement_bindings
-            .into_iter()
-            .find(|binding| binding.handle == handle)
-            .ok_or_else(|| {
-                HandleAllocationError::UnexpectedStorageEvent(
-                    "binding directory returned a missing placement binding".to_string(),
-                )
-            });
-    }
-    allocate_placement_binding(context, actor, scope, DocumentClass::Metadata, strategy_id).await
+    allocating: bool,
 }
 
-fn provision_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+impl ProvisionBindingOperation {
+    pub fn new(actor: Actor, scope: PlacementScope, strategy_id: Ulid) -> Self {
+        Self {
+            actor,
+            scope,
+            strategy_id,
+            allocating: false,
+        }
+    }
+}
+
+impl Operation for ProvisionBindingOperation {
+    type Output = PlacementBinding;
+    type Error = HandleAllocationError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PlacementHandles)
+    }
+
+    fn first(&mut self) -> Result<Next<PlacementBinding>, HandleAllocationError> {
+        Ok(Next::Call(config_call(self.actor.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PlacementBinding>, HandleAllocationError> {
+        if self.allocating {
+            let binding = result.child::<PlacementBinding, HandleAllocationError>()??;
+            return Ok(Next::Done(binding));
+        }
+        let config = read_config(result)?;
+        let strategy_id = self.strategy_id;
+        if config.strategy(&strategy_id).is_none() {
+            return Err(HandleAllocationError::StrategyNotFound(strategy_id));
+        }
+        let directory = config.binding_directory();
+        let class = DocumentClass::Metadata;
+        if let Some(handle) = directory.handle_for(self.scope, class, strategy_id) {
+            return (config.placement_bindings.iter())
+                .find(|binding| binding.handle == handle)
+                .cloned()
+                .map(Next::Done)
+                .ok_or_else(|| {
+                    HandleAllocationError::UnexpectedStorageEvent(
+                        "binding directory returned a missing placement binding".to_string(),
+                    )
+                });
+        }
+        self.allocating = true;
+        let actor = self.actor.clone();
+        let allocate = AllocateBindingOperation::new(actor, self.scope, class, strategy_id);
+        Ok(Next::Call(IoCall::child(allocate)))
+    }
 }
 
 #[cfg(test)]

@@ -4,14 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::calls::ChildOutcome;
-use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, value};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -21,9 +22,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::distribution::on_use::{KeptKind, PullPlan};
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView};
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::types::{Effects, GroupId, Value};
+use aruna_core::types::{GroupId, Value};
 use bytes::Bytes;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -47,7 +47,7 @@ pub struct SourceKeep {
 
 /// What a keeping member keeps of one reference version.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Plan {
+pub struct Plan {
     pub(super) kind: KeptKind,
     pub(super) pull: PullPlan,
     pub(super) set_id: Ulid,
@@ -58,18 +58,28 @@ pub(super) struct Plan {
 
 #[derive(Debug, Error, PartialEq)]
 #[error("the keep plan could not be read: {0}")]
-pub(super) struct PlanError(String);
+pub struct PlanError(String);
 
+impl From<IoError> for PlanError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+fn plan_fault(error: impl std::fmt::Display) -> PlanError {
+    PlanError(error.to_string())
+}
+
+/// The row the pending read asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlanState {
-    Init,
     Version,
     Bucket,
     Encryption,
     Record,
-    Finish,
-    Error,
 }
+
+type PlanNext = Result<Next<Option<Plan>>, PlanError>;
 
 /// Reads the version and this member's strategy; outputs `None` when nothing is to be kept.
 #[derive(Debug, PartialEq)]
@@ -78,103 +88,89 @@ pub(super) struct KeepPlanOperation {
     state: PlanState,
     version: Option<(BlobVersion, [u8; 32])>,
     binding: Option<DistributionBinding>,
-    output: Option<Result<Option<Plan>, PlanError>>,
 }
 
 impl KeepPlanOperation {
     pub(super) fn new(keep: SourceKeep) -> Self {
         Self {
             keep,
-            state: PlanState::Init,
+            state: PlanState::Version,
             version: None,
             binding: None,
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<Option<Plan>, PlanError>) -> Effects {
-        self.state = match output {
-            Ok(_) => PlanState::Finish,
-            Err(_) => PlanState::Error,
-        };
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn read(&mut self, state: PlanState, key_space: &str, key: Vec<u8>) -> Effects {
+    fn read(&mut self, state: PlanState, key_space: &str, key: Vec<u8>) -> PlanNext {
         self.state = state;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        Ok(Next::Call(read_row(key_space, key)))
     }
 
-    /// The next read, `Ok(None)` when nothing is kept, or the plan.
-    fn decide(&mut self, value: Option<Value>) -> Result<Result<Effects, Option<Plan>>, String> {
-        let fault = |error: &dyn std::fmt::Display| error.to_string();
+    /// The next read, or the plan; `None` when nothing is kept.
+    fn decide(&mut self, value: Option<Value>) -> PlanNext {
+        let nothing = Ok(Next::Done(None));
         match self.state {
             PlanState::Version => {
                 let Some(value) = value else {
-                    return Ok(Err(None));
+                    return nothing;
                 };
-                let version = BlobVersion::from_bytes(&value).map_err(|error| fault(&error))?;
+                let version = BlobVersion::from_bytes(&value).map_err(plan_fault)?;
                 let BlobVersionState::Reference { source, .. } = &version.state else {
-                    return Ok(Err(None));
+                    return nothing;
                 };
                 // Governed versions are served only from registered copies, never kept ones.
                 if !version.placement_policies.is_empty() {
-                    return Ok(Err(None));
+                    return nothing;
                 }
                 let identity = version
                     .identity
                     .filter(|_| HeldElsewhere::of(source, version.identity).is_none());
                 let Some(identity) = identity else {
-                    return Ok(Err(None));
+                    return nothing;
                 };
                 self.version = Some((version, identity));
                 let bucket = self.keep.bucket.as_bytes().to_vec();
-                Ok(Ok(self.read(PlanState::Bucket, S3_BUCKET_KEYSPACE, bucket)))
+                self.read(PlanState::Bucket, S3_BUCKET_KEYSPACE, bucket)
             }
             PlanState::Bucket => {
                 let binding = (value.as_deref())
                     .and_then(|bucket| BucketInfo::from_bytes(bucket).ok())
                     .and_then(|bucket| bucket.distribution);
                 let Some(binding) = binding else {
-                    return Ok(Err(None));
+                    return nothing;
                 };
                 self.binding = Some(binding);
                 let bucket = self.keep.bucket.as_bytes().to_vec();
-                Ok(Ok(self.read(
-                    PlanState::Encryption,
-                    BUCKET_ENCRYPTION_KEYSPACE,
-                    bucket,
-                )))
+                self.read(PlanState::Encryption, BUCKET_ENCRYPTION_KEYSPACE, bucket)
             }
             PlanState::Encryption => {
                 let encryption =
-                    BucketEncryption::from_row(value.as_deref()).map_err(|error| fault(&error))?;
-                let set_id = self.binding.as_ref().ok_or("no binding was read")?.set_id;
+                    BucketEncryption::from_row(value.as_deref()).map_err(plan_fault)?;
+                let binding = self.binding.as_ref();
+                let set_id = binding.ok_or(plan_fault("no binding was read"))?.set_id;
                 if encryption.active_key().is_some() {
-                    return Ok(Err(None));
+                    return nothing;
                 }
                 let record = set_id.to_bytes().to_vec();
-                Ok(Ok(self.read(
-                    PlanState::Record,
-                    DISTRIBUTION_KEYSPACE,
-                    record,
-                )))
+                self.read(PlanState::Record, DISTRIBUTION_KEYSPACE, record)
             }
             PlanState::Record => {
                 let Some(value) = value else {
-                    return Ok(Err(None));
+                    return nothing;
                 };
-                let view = DistributionView::from_bytes(&value).map_err(|error| fault(&error))?;
-                let binding = self.binding.take().ok_or("no binding was read")?;
-                let (version, identity) = self.version.take().ok_or("no version was read")?;
-                Ok(Err(plan(&self.keep, &view, &binding, version, identity)))
+                let view = DistributionView::from_bytes(&value).map_err(plan_fault)?;
+                let binding = self
+                    .binding
+                    .take()
+                    .ok_or(plan_fault("no binding was read"))?;
+                let version = self
+                    .version
+                    .take()
+                    .ok_or(plan_fault("no version was read"))?;
+                let (version, identity) = version;
+                Ok(Next::Done(plan(
+                    &self.keep, &view, &binding, version, identity,
+                )))
             }
-            _ => Err("no read was asked".to_string()),
         }
     }
 }
@@ -214,60 +210,34 @@ fn plan(
     })
 }
 
-impl EffectOperation for KeepPlanOperation {
+impl Operation for KeepPlanOperation {
     type Output = Option<Plan>;
     type Error = PlanError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> PlanNext {
         let keep = &self.keep;
-        match VersionKey::new(&keep.bucket, &keep.key, keep.version_id).to_bytes() {
-            Ok(key) => self.read(PlanState::Version, BLOB_VERSIONS_KEYSPACE, key),
-            Err(error) => self.finish(Err(PlanError(error.to_string()))),
-        }
+        let key = VersionKey::new(&keep.bucket, &keep.key, keep.version_id).to_bytes();
+        self.read(
+            PlanState::Version,
+            BLOB_VERSIONS_KEYSPACE,
+            key.map_err(plan_fault)?,
+        )
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let value = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. })
-                if !matches!(
-                    self.state,
-                    PlanState::Init | PlanState::Finish | PlanState::Error
-                ) =>
-            {
-                value
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return self.finish(Err(PlanError(error.to_string())));
-            }
-            event => {
-                let reason = format!("unexpected {} while planning a keep", event.label());
-                return self.finish(Err(PlanError(reason)));
-            }
-        };
-        match self.decide(value) {
-            Ok(Ok(effects)) => effects,
-            Ok(Err(plan)) => self.finish(Ok(plan)),
-            Err(reason) => self.finish(Err(PlanError(reason))),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PlanState::Finish | PlanState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(PlanError("the keep plan did not finish".to_string())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> PlanNext {
+        self.decide(value(result)?)
     }
 }
 
 #[derive(Debug, Error, PartialEq)]
 #[error("{0}")]
 pub(super) struct SpoolError(String);
+
+impl From<IoError> for SpoolError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
 
 fn spool_error(reason: impl Into<String>) -> SpoolError {
     SpoolError(reason.into())
@@ -276,16 +246,19 @@ fn spool_error(reason: impl Into<String>) -> SpoolError {
 /// A verified hidden copy: its location, BLAKE3 digest and size.
 pub(super) type SpooledCopy = (BackendLocation, [u8; 32], u64);
 
-#[derive(Debug, PartialEq)]
+/// What the pending call of a source copy answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SpoolStep {
-    Init,
-    /// The binding resolves as a child; its result comes back as a child event.
     Resolve,
     Read,
     Spool,
     Drop,
-    Finish,
 }
+
+type SpoolNext = Result<Next<SpooledCopy>, SpoolError>;
+
+const MISMATCH: &str = "the source bytes do not match the record";
+const NO_REFERENCE: &str = "the version is no reference";
 
 /// Reads the whole source object into a hidden copy and checks it against the record: the
 /// recorded ETag binds the read, or the recorded digests must match the copy. A copy that does
@@ -296,7 +269,6 @@ pub(super) struct SpoolSourceOperation {
     plan: Plan,
     step: SpoolStep,
     enforced: Vec<ExpectedChecksum>,
-    output: Option<Result<SpooledCopy, SpoolError>>,
 }
 
 impl SpoolSourceOperation {
@@ -304,175 +276,131 @@ impl SpoolSourceOperation {
         Self {
             keep,
             plan,
-            step: SpoolStep::Init,
+            step: SpoolStep::Resolve,
             enforced: Vec::new(),
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<SpooledCopy, SpoolError>) -> Effects {
-        self.step = SpoolStep::Finish;
-        self.output = Some(output);
-        smallvec![]
+    fn call(&mut self, step: SpoolStep, effect: Effect) -> SpoolNext {
+        self.step = step;
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
     /// The recorded source metadata of the reference.
-    fn cached(&self) -> Option<&SourceMetadata> {
+    fn cached(&self) -> Result<&SourceMetadata, SpoolError> {
         match &self.plan.version.state {
             BlobVersionState::Reference {
                 cached_metadata, ..
-            } => Some(cached_metadata),
-            _ => None,
+            } => Ok(cached_metadata),
+            _ => Err(spool_error(NO_REFERENCE)),
         }
     }
 
-    fn read(&mut self, access: ResolvedSourceAccess) -> Effects {
-        let Some(cached) = self.cached().cloned() else {
-            return self.finish(Err(spool_error("the version is no reference")));
-        };
+    fn read(&mut self, access: ResolvedSourceAccess) -> SpoolNext {
+        let cached = self.cached()?.clone();
         let ResolvedSourceAccess::OpenDal { kind, .. } = &access;
         let bound = kind.enforces_if_match() && strong_validator(cached.etag.as_deref());
         self.enforced = cached.enforced_checksums();
         if !bound && self.enforced.is_empty() {
-            return self.finish(Err(spool_error("the source allows no verified read")));
+            return Err(spool_error("the source allows no verified read"));
         }
-        self.step = SpoolStep::Read;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+        let read = StagingSourceEffect::Read {
             access,
             range: None,
             expected: bound.then_some(cached),
-        })]
+        };
+        self.call(SpoolStep::Read, Effect::StagingSource(read))
     }
 
     fn spool(
         &mut self,
         metadata: SourceMetadata,
         stream: BackendStream<Result<Bytes, StreamError>>,
-    ) -> Effects {
-        let Some(length) = self.cached().map(|cached| cached.content_length) else {
-            return self.finish(Err(spool_error("the version is no reference")));
-        };
+    ) -> SpoolNext {
+        let length = self.cached()?.content_length;
         if metadata.content_length != length {
-            return self.finish(Err(spool_error("the source object changed its length")));
+            return Err(spool_error("the source object changed its length"));
         }
         let name = match self.plan.kind {
             KeptKind::Attachment => format!("{}-{}", self.plan.set_id, self.keep.version_id),
             KeptKind::Cache => hex::encode(self.plan.identity),
         };
-        self.step = SpoolStep::Spool;
-        smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+        let spool = BlobEffect::SpoolHidden {
             namespace: self.plan.kind.namespace(),
             name,
             created_by: self.keep.user_id,
             max_bytes: Some(length),
             deadline: None,
             blob: stream,
-        })]
+        };
+        self.call(SpoolStep::Spool, Effect::Blob(spool))
     }
 
-    fn check(&mut self, copy: SpooledCopy) -> Effects {
-        let length = self.cached().map(|cached| cached.content_length);
+    fn check(&mut self, copy: SpooledCopy) -> SpoolNext {
+        let length = self.cached()?.content_length;
         let (location, _, size) = &copy;
-        if Some(*size) == length && unmatched_checksum(&self.enforced, &location.hashes).is_none() {
-            return self.finish(Ok(copy));
+        if *size == length && unmatched_checksum(&self.enforced, &location.hashes).is_none() {
+            return Ok(Next::Done(copy));
         }
-        let Ok(key) = HiddenBlobKey::try_from(location) else {
-            return self.finish(Err(spool_error(MISMATCH)));
-        };
-        self.step = SpoolStep::Drop;
-        smallvec![Effect::Blob(BlobEffect::DeleteHidden { key })]
+        let key = HiddenBlobKey::try_from(location).map_err(|_| spool_error(MISMATCH))?;
+        let drop = BlobEffect::DeleteHidden { key };
+        self.call(SpoolStep::Drop, Effect::Blob(drop))
     }
 }
 
-const MISMATCH: &str = "the source bytes do not match the record";
-
-impl EffectOperation for SpoolSourceOperation {
+impl Operation for SpoolSourceOperation {
     type Output = SpooledCopy;
     type Error = SpoolError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> SpoolNext {
         let BlobVersionState::Reference { source, .. } = &self.plan.version.state else {
-            return self.finish(Err(spool_error("the version is no reference")));
+            return Err(spool_error(NO_REFERENCE));
         };
         let resolve = ResolveBindingOperation::new(ResolveBindingInput {
             source: source.clone(),
             group_id: Some(self.keep.group_id),
         });
-        self.step = SpoolStep::Resolve;
-        let child = boxed_suboperation(resolve, |result| Event::Child(ChildOutcome::new(result)));
-        smallvec![Effect::SubOperation(child)]
+        Ok(Next::Call(IoCall::child(resolve)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.step, SpoolStep::Finish), event) {
-            (SpoolStep::Resolve, Event::Child(outcome)) => {
-                match outcome.take::<ResolvedSourceAccess, SourceResolutionError>() {
-                    Some(Ok(access)) => self.read(access),
-                    Some(Err(error)) => self.finish(Err(spool_error(error.to_string()))),
-                    None => self.finish(Err(spool_error("unexpected answer to the resolve"))),
+    fn next(&mut self, result: IoResult) -> SpoolNext {
+        match self.step {
+            SpoolStep::Resolve => {
+                let resolved = result.child::<ResolvedSourceAccess, SourceResolutionError>()?;
+                self.read(resolved.map_err(|error| spool_error(error.to_string()))?)
+            }
+            SpoolStep::Read => match result.event()? {
+                Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                    self.spool(metadata, stream)
                 }
-            }
-            (SpoolStep::Resolve, _) => {
-                self.finish(Err(spool_error("unexpected answer to the resolve")))
-            }
-            (
-                SpoolStep::Read,
-                Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }),
-            ) => self.spool(metadata, stream),
-            (SpoolStep::Read, Event::StagingSource(StagingSourceEvent::Error { error })) => {
-                self.finish(Err(spool_error(error.to_string())))
-            }
-            (SpoolStep::Read, _) => {
-                self.finish(Err(spool_error("unexpected answer to the source read")))
-            }
-            (
-                SpoolStep::Spool,
+                Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                    Err(spool_error(error.to_string()))
+                }
+                _ => Err(spool_error("unexpected answer to the source read")),
+            },
+            SpoolStep::Spool => match result.event()? {
                 Event::Blob(BlobEvent::HiddenSpooled {
                     location,
                     blake3,
                     size,
-                }),
-            ) => self.check((location, blake3, size)),
-            (SpoolStep::Spool, Event::Blob(BlobEvent::Error(error))) => {
-                self.finish(Err(spool_error(error.to_string())))
-            }
-            (SpoolStep::Spool, _) => {
-                self.finish(Err(spool_error("unexpected answer to the copy write")))
-            }
-            (SpoolStep::Drop, event) => {
-                if let Event::Blob(BlobEvent::Error(error)) = event {
+                }) => self.check((location, blake3, size)),
+                Event::Blob(BlobEvent::Error(error)) => Err(spool_error(error.to_string())),
+                _ => Err(spool_error("unexpected answer to the copy write")),
+            },
+            SpoolStep::Drop => {
+                if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
                     warn!(%error, "A dropped kept copy is left to the hidden sweep");
                 }
-                self.finish(Err(spool_error(MISMATCH)))
-            }
-            (SpoolStep::Init | SpoolStep::Finish, event) => {
-                let label = event.label();
-                self.finish(Err(spool_error(format!("unexpected {label}"))))
+                Err(spool_error(MISMATCH))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let unfinished = spool_error("the source copy did not finish");
-        self.output.unwrap_or(Err(unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmId;
 
     fn keep() -> SourceKeep {
@@ -487,60 +415,30 @@ mod tests {
         }
     }
 
-    fn version_read() -> Effect {
+    fn version_read() -> IoCall {
         let key = VersionKey::new("spire", "a", Ulid::from_bytes([2; 16]));
-        Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.to_bytes().unwrap().into(),
-            txn_id: None,
-        })
-    }
-
-    fn missing() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        })
+        read_row(BLOB_VERSIONS_KEYSPACE, key.to_bytes().unwrap())
     }
 
     // A version this node lacks keeps nothing.
     #[test]
     fn missing_version_ignored() {
         let mut operation = KeepPlanOperation::new(keep());
-        check_trace(
-            &mut operation,
-            &[version_read()],
-            vec![(missing(), Vec::new())],
-        );
-        assert_eq!(operation.finalize(), Ok(None));
+        assert_eq!(operation.first(), Ok(Next::Call(version_read())));
+        let missing = IoResult::Values(vec![None]);
+        assert_eq!(operation.next(missing), Ok(Next::Done(None)));
     }
 
-    // A failed read or an undecodable version fails the plan.
+    // An undecodable version or an answer of another kind fails the plan.
     #[test]
     fn failures_fail() {
         let mut operation = KeepPlanOperation::new(keep());
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert!(operation.finalize().is_err());
+        operation.first().unwrap();
+        assert!(operation.next(IoResult::Done).is_err());
         let mut operation = KeepPlanOperation::new(keep());
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(vec![0xFF].into()),
-        }));
-        assert!(operation.finalize().is_err());
-    }
-
-    // Unstarted plans refuse every event, abort nothing and never finish early.
-    #[test]
-    fn rejects_unexpected() {
-        let fresh = || KeepPlanOperation::new(keep());
-        let all = sample_events().len();
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
+        operation.first().unwrap();
+        let garbage = IoResult::Values(vec![Some(vec![0xFF].into())]);
+        assert!(operation.next(garbage).is_err());
     }
 
     fn metadata(length: u64) -> SourceMetadata {
@@ -617,13 +515,33 @@ mod tests {
         (location, [9; 32], size)
     }
 
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn at(step: SpoolStep) -> SpoolSourceOperation {
+        let mut spool = spool_plan(true);
+        spool.step = step;
+        spool
+    }
+
     // A version that is no reference has no source to read.
     #[test]
     fn non_reference_refused() {
-        let mut spool = spool_plan(false);
-        assert!(spool.start().is_empty());
-        let refused = Err(spool_error("the version is no reference"));
-        assert_eq!(spool.finalize(), refused);
+        let refused = Err(spool_error(NO_REFERENCE));
+        assert_eq!(spool_plan(false).first(), refused);
+    }
+
+    // The source binding resolves as a child; a failed resolution ends the copy.
+    #[test]
+    fn resolves_binding_first() {
+        let mut spool = spool_plan(true);
+        assert!(matches!(spool.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let failed: Result<ResolvedSourceAccess, SourceResolutionError> =
+            Err(SourceResolutionError::NotFound);
+        let error = SourceResolutionError::NotFound.to_string();
+        let failed = IoResult::Child(ChildOutcome::new(failed));
+        assert_eq!(spool.next(failed), Err(spool_error(error)));
     }
 
     // A source read of the recorded length is spooled; another length is refused.
@@ -631,60 +549,55 @@ mod tests {
     fn source_read_spooled() {
         let read = |length: u64| {
             let stream = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
-            Event::StagingSource(StagingSourceEvent::ReadResult {
+            event(Event::StagingSource(StagingSourceEvent::ReadResult {
                 metadata: metadata(length),
                 stream: BackendStream::new(stream),
-            })
+            }))
         };
-        let mut spool = spool_plan(true);
-        spool.step = SpoolStep::Read;
-        let effects = spool.step(read(4));
+        let Ok(Next::Call(IoCall::Effect(spool))) = at(SpoolStep::Read).next(read(4)) else {
+            panic!("expected the spool");
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::SpoolHidden {
+            *spool,
+            Effect::Blob(BlobEffect::SpoolHidden {
                 max_bytes: Some(4),
                 ..
-            })]
+            })
         ));
-        let mut spool = spool_plan(true);
-        spool.step = SpoolStep::Read;
-        assert!(spool.step(read(5)).is_empty());
         let changed = Err(spool_error("the source object changed its length"));
-        assert_eq!(spool.finalize(), changed);
+        assert_eq!(at(SpoolStep::Read).next(read(5)), changed);
     }
 
     // A copy of the recorded size is kept; another copy is deleted and refused.
     #[test]
     fn mismatched_copy_dropped() {
-        let event = |size: u64| {
+        let spooled_event = |size: u64| {
             let (location, blake3, size) = spooled(size);
-            Event::Blob(BlobEvent::HiddenSpooled {
+            event(Event::Blob(BlobEvent::HiddenSpooled {
                 location,
                 blake3,
                 size,
-            })
+            }))
         };
-        let mut spool = spool_plan(true);
-        spool.step = SpoolStep::Spool;
-        assert!(spool.step(event(4)).is_empty());
-        assert_eq!(spool.finalize(), Ok(spooled(4)));
+        let kept = at(SpoolStep::Spool).next(spooled_event(4));
+        assert_eq!(kept, Ok(Next::Done(spooled(4))));
 
-        let mut spool = spool_plan(true);
-        spool.step = SpoolStep::Spool;
+        let mut spool = at(SpoolStep::Spool);
         let key = HiddenBlobKey::try_from(&spooled(3).0).unwrap();
-        let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
-        assert_eq!(spool.step(event(3)).into_vec(), vec![delete]);
-        assert!(spool.step(Event::Blob(BlobEvent::HiddenDeleted)).is_empty());
-        assert_eq!(spool.finalize(), Err(spool_error(MISMATCH)));
+        let delete = IoCall::Effect(Box::new(Effect::Blob(BlobEffect::DeleteHidden { key })));
+        assert_eq!(spool.next(spooled_event(3)), Ok(Next::Call(delete)));
+        let deleted = event(Event::Blob(BlobEvent::HiddenDeleted));
+        assert_eq!(spool.next(deleted), Err(spool_error(MISMATCH)));
     }
 
-    // An unstarted copy refuses every event, aborts nothing and never finishes early.
+    // An answer of another family than the pending call fails the copy.
     #[test]
     fn spool_rejects_unexpected() {
-        let fresh = || spool_plan(true);
-        let all = sample_events().len();
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
+        let refused = at(SpoolStep::Read).next(event(Event::Search()));
+        assert_eq!(
+            refused,
+            Err(spool_error("unexpected answer to the source read"))
+        );
+        assert!(at(SpoolStep::Resolve).next(IoResult::Done).is_err());
     }
 }

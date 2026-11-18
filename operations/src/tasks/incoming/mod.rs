@@ -57,19 +57,25 @@ use crate::device::drain::{
 };
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
-    UPLOAD_DEFER_AFTER, restore_sync_timers,
+    UPLOAD_DEFER_AFTER,
 };
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::groups::backends::drain::remove_drained_backends;
-use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
+use crate::forward::realm::RelayAdminOperation;
+use crate::jobs::JOB_PRUNE_PAGE;
+use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
+use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use crate::jobs::lifecycle::publish::settle_terminals;
+use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
-use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
+use crate::jobs::lifecycle::witness::{
+    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
+};
+use crate::jobs::prune::{
+    JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
+};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::state::release_job;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
@@ -78,32 +84,82 @@ use crate::metadata::materialization_queue::{
     materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
     restore_materialization_timer,
 };
-use crate::metadata::projector::{
-    PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events, project_logged_events,
-    replay_event_log, restore_projection_timer,
+use crate::metadata::projection::{
+    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
+    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
 };
+
+/// Replays the whole event log into the registry projection, one page at a time.
+async fn replay_event_log(
+    context: &crate::driver::DriverContext,
+) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    loop {
+        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let (count, next) = crate::driver::drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(projected),
+        }
+    }
+}
 use crate::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
+    PruneTimerOperation as GraphPruneTimerOperation, TombstonesOperation, jobs_queued,
 };
-use crate::node::node_info::observe_placement;
-use crate::node::usage_publish::restore_usage_timer;
+
+/// Arms the graph prune drain for its next due job at start.
+async fn restore_graph_prune(
+    context: &crate::driver::DriverContext,
+    task_handle: &aruna_tasks::TaskHandle,
+) {
+    match crate::driver::drive(GraphPruneTimerOperation::new(), context).await {
+        Ok(None) => {}
+        Ok(Some(after)) => {
+            let wake =
+                aruna_core::effects::Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
+                    key: TaskKey::DrainPruneQueue,
+                    after,
+                });
+            if let aruna_core::events::Event::Task(aruna_core::task::TaskEvent::Error {
+                message,
+                ..
+            }) = task_handle.send_effect(wake).await
+            {
+                warn!(message = %message, "Failed to restore metadata graph prune timer");
+            }
+        }
+        Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
+    }
+}
+use crate::node::info::facts::NodeFacts;
+use crate::node::info::flows::ObservePlacementOperation;
+use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::notifications::watch::table::RebuildTableOperation;
-use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
+use crate::placement::process_placements::PlacementReconcileOutcome;
+use crate::placement::process_placements::PlacementReconcileStatus;
+use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
-use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};
+use crate::sync::document_outbox::{
+    DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
+};
 use crate::sync::mirror_repair::{
     DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
 };
 use crate::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
@@ -112,9 +168,14 @@ use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
 use crate::triggers::{TimerInput, timer_operation};
+use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use folder_pass::restore_sync_timers;
 
+mod drained;
+pub mod folder_pass;
 mod outbox;
+pub(crate) use drained::remove_drained_backends;
 mod restore;
 
 pub use outbox::drive_sync_drain;
@@ -505,13 +566,16 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::forward::entry::relay_admin_event(
+        match drive(
+            RelayAdminOperation::new(
+                self.context.node_and_realm().map(|(node_id, _)| node_id),
+                &holders,
+                record.target.clone(),
+                event.clone(),
+                record.placement,
+                origin_signature,
+            ),
             &self.context,
-            &holders,
-            record.target.clone(),
-            event.clone(),
-            record.placement,
-            origin_signature,
         )
         .await
         {
@@ -657,7 +721,7 @@ impl OperationsTaskHandler {
     }
 
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
-    // from the realm config at startup by `restore_shard_subscriptions`).
+    // from the realm config at startup by `RestoreTopicsOperation`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
         let task_id = TaskKey::SyncPlacements { realm_id, node_id };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
@@ -688,11 +752,15 @@ impl OperationsTaskHandler {
                 return;
             }
         }
-        let fetched = crate::device::realm_documents::fetch_realm_documents(
+        let fetched = drive(
+            crate::device::realm_documents::fetch_realm_documents(
+                &self.context,
+                REALM_DOCUMENTS_BUDGET,
+            ),
             &self.context,
-            REALM_DOCUMENTS_BUDGET,
         )
-        .await;
+        .await
+        .unwrap_or(false);
         let note = match fetched {
             true => SyncNote::Contact,
             false => SyncNote::Failure,
@@ -719,7 +787,8 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
+        let pass = crate::device::refresh::refresh_replicas(&self.context);
+        if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
                 warn!(%error, "Failed to note the device sync state");
@@ -787,13 +856,21 @@ impl OperationsTaskHandler {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
                 // The same observation that reconciles shards reconciles this node's placement subject: a moved,
                 // draining or removed node stops admitting governed data and revalidates its inventory.
-                if let Err(error) =
-                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
-                        .await
-                {
+                let observe = ObservePlacementOperation::new(
+                    realm_id,
+                    node_id,
+                    unix_timestamp_millis(),
+                    NodeFacts::gather(&self.context),
+                );
+                if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
-                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                let outcome = drive(
+                    ReconcilePlacementsOperation::new(realm_id, node_id, true),
+                    &self.context,
+                )
+                .await
+                .unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
                     PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
@@ -929,8 +1006,11 @@ impl OperationsTaskHandler {
                 let start = (self.wake_cursor.lock())
                     .expect("wake cursor mutex poisoned")
                     .clone();
-                let delivery =
-                    crate::jobs::remote_key::deliver_owed_wakes(&self.context, start).await;
+                let serving = self.context.node_and_realm();
+                let deliver = crate::jobs::remote_key::DeliverWakesOperation::new(start, serving);
+                let delivery = drive(deliver, self.context.as_ref())
+                    .await
+                    .unwrap_or_else(|_| crate::jobs::remote_key::Delivery::unread());
                 *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
                     delivery.next.clone();
                 if delivery.owed {
@@ -961,7 +1041,31 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::MaintainRanges => Box::pin(async move {
-                let after = crate::distribution::sharding::maintain_ranges(&self.context).await;
+                use crate::distribution::sharding::{maintain_ranges, maintain_retry};
+                let context = &self.context;
+                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                {
+                    Ok(pass) => {
+                        let (after, imports) = pass.finish();
+                        for start in imports {
+                            let started = crate::jobs::handed_imports::start_kept(context, start);
+                            if let Err(error) = started.await {
+                                warn!(%error, "Handed over imports could not start");
+                            }
+                        }
+                        after
+                    }
+                    Err(error) => {
+                        warn!(%error, "Range maintenance could not finish a pass");
+                        maintain_retry()
+                    }
+                };
+                // Version links metadata could not verify in a set are retried a page per pass.
+                match crate::metadata::data_links::retry_unverified(context).await {
+                    Ok(true) => after = std::time::Duration::ZERO,
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "Unverified data links could not be retried"),
+                }
                 self.reschedule_timer(TaskKey::MaintainRanges, after).await;
             }),
             TaskKey::RunBackendImports => Box::pin(async move {
@@ -995,7 +1099,7 @@ impl OperationsTaskHandler {
                 self.drain_link_queue().await;
             }),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
-                let after = match crate::device::sync::reconcile_folders(&self.context).await {
+                let after = match folder_pass::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
                     DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
                     DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
@@ -1008,7 +1112,9 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                let drain = crate::device::sync::drain_sync_outbox(&self.context);
+                let outcome = drive(drain, &self.context).await;
+                let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

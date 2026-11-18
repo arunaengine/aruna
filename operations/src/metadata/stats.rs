@@ -1,14 +1,10 @@
-//! Counts realm documents and groups and classifies documents by purpose.
+//! Counts a group's documents by their purpose.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use futures_util::{StreamExt, stream};
@@ -21,10 +17,9 @@ use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::profile::rules::{
     PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
 };
-use crate::metadata::record_reads::record_materialized_read;
+use crate::metadata::record_reads::RecordMaterializedOperation;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
-const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,113 +27,6 @@ pub struct GroupDocumentCounts {
     pub dataset_count: u64,
     pub profile_count: u64,
     pub process_run_count: u64,
-}
-
-/// Realm-wide count of live metadata documents, unfiltered by readability and
-/// excluding lifecycle-deleted ones. `None` without a metadata subsystem. Only
-/// document volume is disclosed, never a per-caller glob evaluation.
-pub async fn count_realm_documents(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<Option<u64>, MetadataApiError> {
-    if context.metadata_handle.is_none() {
-        return Ok(None);
-    }
-    let records = crate::metadata::list_cached_records(context)
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context).await?;
-    Ok(Some(
-        records
-            .iter()
-            .filter(|record| record.realm_id == realm_id)
-            .count() as u64,
-    ))
-}
-
-/// Number of stored groups belonging to one realm. Bounded pages under one
-/// read transaction yield a consistent snapshot, not the default page
-/// `ListGroupOperation` exposes.
-pub async fn count_realm_groups(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<u64, MetadataApiError> {
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(MetadataApiError::Internal(error.to_string()));
-        }
-        other => return Err(MetadataApiError::Internal(other.label().to_string())),
-    };
-
-    let mut count = 0_u64;
-    let mut start_after = None;
-    let scan = 'scan: loop {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: GROUP_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.map(IterStart::After),
-                limit: COUNT_PAGE_SIZE,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                for (_, value) in values {
-                    let group = match Group::from_bytes(value.as_ref()) {
-                        Ok(group) => group,
-                        Err(error) => {
-                            break 'scan Err(MetadataApiError::Internal(error.to_string()));
-                        }
-                    };
-                    if group.realm_id == realm_id {
-                        count = match count.checked_add(1) {
-                            Some(count) => count,
-                            None => {
-                                break 'scan Err(MetadataApiError::Internal(
-                                    "realm group count overflow".to_string(),
-                                ));
-                            }
-                        };
-                    }
-                }
-                match next_start_after {
-                    Some(next) => start_after = Some(next),
-                    None => break Ok(count),
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                break Err(MetadataApiError::Internal(error.to_string()));
-            }
-            other => break Err(MetadataApiError::Internal(other.label().to_string())),
-        }
-    };
-
-    let completion = if scan.is_ok() {
-        StorageEffect::CommitTransaction { txn_id }
-    } else {
-        StorageEffect::AbortTransaction { txn_id }
-    };
-    let completion_event = context.storage_handle.send_storage_effect(completion).await;
-    match scan {
-        Err(error) => Err(error),
-        Ok(count) => match completion_event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(count),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(MetadataApiError::Internal(error.to_string()))
-            }
-            other => Err(MetadataApiError::Internal(other.label().to_string())),
-        },
-    }
 }
 
 /// Exact lifecycle-live metadata-document counts for one group, classified
@@ -162,7 +50,7 @@ pub async fn count_group_purpose(
         .collect::<Vec<_>>();
 
     let classifications = stream::iter(records.into_iter().map(|record| async move {
-        if !record_materialized_read(context, &record)
+        if !drive(RecordMaterializedOperation::new(&record), context)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => MetadataApiError::Internal(error.to_string()),
@@ -241,6 +129,7 @@ mod tests {
     use std::sync::Arc;
 
     use aruna_core::events::Event;
+    use aruna_core::keyspaces::GROUP_KEYSPACE;
     use aruna_core::metadata::{
         ApplyRoCrateRequest, GraphLifecycleRecord, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
@@ -258,6 +147,7 @@ mod tests {
 
     use super::*;
     use crate::metadata::MetadataHandle;
+    use crate::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 
     const REALM_SEED: [u8; 32] = [7u8; 32];
 
@@ -429,9 +319,12 @@ mod tests {
         }
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(3)
         );
     }
@@ -448,9 +341,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(1)
         );
     }
@@ -479,9 +375,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(1)
         );
     }
@@ -528,9 +427,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_groups(&fixture.context, fixture.realm_id)
-                .await
-                .expect("group count succeeds"),
+            drive(
+                RealmGroupsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("group count succeeds"),
             1
         );
     }
@@ -600,9 +502,12 @@ mod tests {
         };
 
         assert_eq!(
-            count_realm_documents(&context, RealmId::from_bytes(REALM_SEED))
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(RealmId::from_bytes(REALM_SEED)),
+                &context
+            )
+            .await
+            .expect("count succeeds"),
             None
         );
         assert_eq!(

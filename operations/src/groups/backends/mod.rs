@@ -4,7 +4,6 @@
 
 pub mod create;
 pub mod disable;
-pub mod drain;
 pub mod query;
 pub mod remove;
 pub mod replace;
@@ -164,3 +163,7 @@ pub fn parse_iter<T>(
         _ => Err(RecordReadError::Unexpected),
     }
 }
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod drain_tests;

@@ -12,28 +12,16 @@ use crate::blob::migration::queue::ResumeTransitionsOperation;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::runtime::key_unlocked;
+use crate::jobs::key_locks::{KeyCheckError, ParkLockedOperation, VersionWaitOperation};
+use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
-use crate::jobs::store::key_wait::{park_job, satisfy_key_wait, wake_key_waits};
-use crate::jobs::store::park_wake::AwaitOutcome;
-use crate::storage_read::iter_prefix_page;
+use crate::jobs::store::key_wait::wake_key_waits;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
-};
-use aruna_core::structs::execution::job::{CapturedInput, JobError, JobRecord, KeyWait};
-use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobVersion, BlobVersionState, HashIndex, VersionKey,
-};
-use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::execution::job::{JobError, JobRecord, KeyWait};
+use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::time::unix_timestamp_millis;
-use tracing::warn;
 use ulid::Ulid;
-
-/// Aliases of one content checked on this node; a content beyond them stays unknown.
-pub(crate) const ALIAS_PAGE: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum KeyWakeError {
@@ -60,8 +48,7 @@ pub async fn wake_unlocked(
 ) -> Result<(usize, usize), KeyWakeError> {
     let woken = wake_key_waits(context, key, now_ms).await;
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
-    let queued = super::remote_key::queue_wakes(context, key).await;
-    super::remote_key::arm_delivery(context).await;
+    let queued = drive(RemoteWakesOperation::new(key), context).await;
     let resume = async || {
         let resume = ResumeTransitionsOperation::new(key);
         drive(resume, context)
@@ -78,153 +65,11 @@ pub async fn wake_unlocked(
     let copies = drive(wake, context).await;
     let walk = crate::s3::abe_copies::CompleteCopiesOperation::new(key, origin);
     let envelopes = drive(walk, context).await;
-    queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    queued?;
     resumed.map_err(KeyWakeError::Transition)?;
     copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;
     envelopes.map_err(|error| KeyWakeError::Envelopes(error.to_string()))?;
     Ok((woken?, promoted?))
-}
-
-/// Local inputs whose exact source version needs a key that is locked here. Remote inputs are
-/// left to their source node; a version without a local alias is left to staging.
-async fn locked_inputs(
-    context: &DriverContext,
-    inputs: &[CapturedInput],
-    node_id: NodeId,
-) -> Result<Vec<KeyWait>, String> {
-    let mut waits = Vec::new();
-    for input in inputs
-        .iter()
-        .filter(|input| input.source_node_id == node_id)
-    {
-        // A reference has no stored bytes here, so no local key can lock it.
-        let Some(blake3) = input.content.blake3() else {
-            continue;
-        };
-        let alias = find_alias(context, &blake3, input.version_id, node_id).await?;
-        if let Some(alias) = alias
-            && let Some(wait) = alias_wait(context, &alias).await?
-            && !waits.contains(&wait)
-        {
-            waits.push(wait);
-        }
-    }
-    Ok(waits)
-}
-
-/// The alias of exactly `version_id` among a content's aliases on this node, paging through
-/// every alias page until it is found or the aliases end.
-pub(crate) async fn find_alias(
-    context: &DriverContext,
-    content: &[u8; 32],
-    version_id: Ulid,
-    node_id: NodeId,
-) -> Result<Option<HashIndex>, String> {
-    let mut start_after = None;
-    loop {
-        let (aliases, next) = alias_page(context, content, node_id, start_after).await?;
-        if let Some(alias) = aliases
-            .into_iter()
-            .find(|alias| alias.version_id == version_id)
-        {
-            return Ok(Some(alias));
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => return Ok(None),
-        }
-    }
-}
-
-/// One page of a content's aliases on this node, and the cursor of the next page.
-pub(crate) async fn alias_page(
-    context: &DriverContext,
-    content: &[u8; 32],
-    node_id: NodeId,
-    start_after: Option<aruna_core::types::Key>,
-) -> Result<(Vec<HashIndex>, Option<aruna_core::types::Key>), String> {
-    let prefix = HashIndex::hash_prefix(content).map_err(|error| error.to_string())?;
-    let (rows, _) = iter_prefix_page(
-        &context.storage_handle,
-        PATHS_INDEX_KEYSPACE,
-        Some(prefix.into()),
-        start_after,
-        ALIAS_PAGE,
-        None,
-    )
-    .await?;
-    let next = (rows.len() == ALIAS_PAGE)
-        .then(|| rows.last().map(|(row, _)| row.clone()))
-        .flatten();
-    let aliases = rows
-        .iter()
-        .filter_map(|(row, _)| HashIndex::from_bytes(row).ok())
-        .filter(|alias| alias.node_id == node_id)
-        .collect();
-    Ok((aliases, next))
-}
-
-/// The locked key a read of the version an alias names would need.
-pub(crate) async fn alias_wait(
-    context: &DriverContext,
-    alias: &HashIndex,
-) -> Result<Option<KeyWait>, String> {
-    let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
-    version_wait(context, (alias.node_id, alias.group_id), &version).await
-}
-
-/// The locked key a read of exactly this version would need, following read admission: a
-/// sealed copy needs its own key; a plain copy or a reference of an encrypting bucket needs
-/// the bucket's active key.
-pub(crate) async fn version_wait(
-    context: &DriverContext,
-    (node_id, group_id): (NodeId, Ulid),
-    version: &VersionKey,
-) -> Result<Option<KeyWait>, String> {
-    let row_key = version.to_bytes().map_err(|error| error.to_string())?;
-    let Some(row) = read_row(context, BLOB_VERSIONS_KEYSPACE, row_key).await? else {
-        return Ok(None);
-    };
-    let state = BlobVersion::from_bytes(&row)
-        .map_err(|error| error.to_string())?
-        .state;
-    let location = match (&state.location_key(), state.pending_archive(), &state) {
-        (Some(key), _, _) => read_row(context, BLOB_LOCATIONS_KEYSPACE, key.to_bytes()).await?,
-        (None, Some(archive), _) => {
-            read_row(context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await?
-        }
-        (None, None, BlobVersionState::Reference { .. }) => None,
-        (None, None, _) => return Ok(None),
-    };
-    let sealed = match location {
-        Some(location) => BackendLocation::from_bytes(&location)
-            .map_err(|error| error.to_string())?
-            .format
-            .bucket_key(),
-        None => None,
-    };
-    let key = match sealed {
-        Some(key) => Some(key),
-        None => {
-            let bucket = version.bucket.as_bytes().to_vec();
-            let settings = read_row(context, BUCKET_ENCRYPTION_KEYSPACE, bucket).await?;
-            BucketEncryption::from_row(settings.as_deref())
-                .map_err(|error| error.to_string())?
-                .active_key()
-        }
-    };
-    let Some(key) = key else {
-        return Ok(None);
-    };
-    if key_unlocked(context, key).await {
-        return Ok(None);
-    }
-    Ok(Some(KeyWait {
-        node_id,
-        bucket: version.bucket.clone(),
-        group_id: Some(group_id),
-        key,
-    }))
 }
 
 pub(crate) async fn read_row(
@@ -246,8 +91,20 @@ pub(crate) async fn read_row(
     }
 }
 
-/// Parks a job whose preparation hit a key locked after the precheck, before any attempt
-/// intent exists. True when the job no longer runs here; any other error is left to the caller.
+fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
+    result.map_err(|error| error.0)
+}
+
+/// See [`VersionWaitOperation`].
+pub(crate) async fn version_wait(
+    context: &DriverContext,
+    place: (NodeId, Ulid),
+    version: &VersionKey,
+) -> Result<Option<KeyWait>, String> {
+    lookup(drive(VersionWaitOperation::new(place, version.clone()), context).await)
+}
+
+/// See [`ParkLockedOperation::on_error`].
 pub(crate) async fn park_on_lock(
     context: &DriverContext,
     record: &JobRecord,
@@ -255,61 +112,40 @@ pub(crate) async fn park_on_lock(
     node_id: NodeId,
     error: &JobError,
 ) -> bool {
-    error.locked && Box::pin(park_locked(context, record, token, node_id)).await
+    let node = (node_id, context.node_and_realm());
+    let now_ms = unix_timestamp_millis();
+    let park = ParkLockedOperation::on_error(record, token, node, error, now_ms);
+    drive(park, context).await.unwrap_or(false)
 }
 
-/// Parks a claimed job whose local inputs need locked keys. True when the job no longer runs
-/// here: it is parked, or its claim is gone. A cancel request or a failed check continues.
+/// See [`ParkLockedOperation`].
 pub(crate) async fn park_locked(
     context: &DriverContext,
     record: &JobRecord,
     token: Ulid,
     node_id: NodeId,
 ) -> bool {
-    let job_id = record.job_id;
-    let waits = match locked_inputs(context, &record.captured_inputs, node_id).await {
-        Ok(mut waits) => {
-            waits.extend(super::remote_key::remote_waits(context, record, node_id).await);
-            if waits.is_empty() {
-                return false;
-            }
-            waits
-        }
-        Err(error) => {
-            warn!(job_id = %job_id, %error, "Input key check failed; staging decides");
-            return false;
-        }
-    };
-    let keys: Vec<_> = waits.iter().map(|wait| wait.key).collect();
-    match park_job(context, job_id, token, unix_timestamp_millis(), waits).await {
-        Ok(AwaitOutcome::Parked(_)) => {}
-        Ok(AwaitOutcome::Skipped) => return false,
-        Err(JobMutationError::TokenMismatch) => return true,
-        Err(error) => {
-            warn!(job_id = %job_id, %error, "Failed to park job for a bucket key");
-            return false;
-        }
-    }
-    // A key unlocked while the job parked wakes it here; no unlock call would.
-    for key in keys {
-        if key_unlocked(context, key).await
-            && let Err(error) =
-                satisfy_key_wait(context, job_id, key, unix_timestamp_millis()).await
-        {
-            warn!(job_id = %job_id, %error, "Failed to wake parked job");
-        }
-    }
-    true
+    let node = (node_id, context.node_and_realm());
+    let park = ParkLockedOperation::new(record, token, node, unix_timestamp_millis());
+    drive(park, context).await.unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::key_locks::LockedInputsOperation;
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
     use aruna_core::UserId;
+    use aruna_core::keyspaces::{
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
+    };
+    use aruna_core::structs::execution::job::CapturedInput;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
+    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion};
+    use aruna_core::structs::storage::encryption::BucketEncryption;
     use byteview::ByteView;
 
     #[tokio::test]
@@ -421,6 +257,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.state, JobState::Queued);
+    }
+
+    async fn locked_inputs(
+        context: &DriverContext,
+        inputs: &[CapturedInput],
+        node_id: NodeId,
+    ) -> Result<Vec<KeyWait>, KeyCheckError> {
+        drive(LockedInputsOperation::new(inputs, node_id), context).await
     }
 
     /// A node holding one copy of content `[9; 32]`, sealed with a locked key of bucket "sealed".

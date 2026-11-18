@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
@@ -24,7 +24,7 @@ use super::runs::{Admission, RunError, audit_rows, event_run, read_run};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
 
 /// Marks a settled work notified, with the `job_finished` run it starts admitted in the same
-/// transaction; `false` when the work is gone or notified already. The caller holds `ADMISSIONS`.
+/// transaction; `false` when the work is gone or notified already.
 #[derive(Debug, PartialEq)]
 pub struct NotifyWork {
     work_id: Ulid,
@@ -61,6 +61,10 @@ impl NotifyWork {
 impl Operation for NotifyWork {
     type Output = bool;
     type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -125,8 +129,8 @@ pub fn waits_for(row: &WorkRow, run: Option<RunState>) -> Option<Ulid> {
 
 /// Queues a failed or cancelled run again with its intents kept, so its calls reach the same
 /// ordinals and its jobs the same ids; a call resolved as not done is made again. The audit row
-/// commits with it. The caller holds `ADMISSIONS`.
-pub(crate) fn retry_run(
+/// commits with it.
+pub fn retry_run(
     (install_id, run_id): (Ulid, Ulid),
     audit: &AdminAuditRecord,
     now_ms: u64,
@@ -159,6 +163,10 @@ enum RetryPhase {
 impl Operation for RetryRun {
     type Output = PluginRun;
     type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

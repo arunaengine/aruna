@@ -2,16 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_blob::native::{body_stream, send_request};
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{
     Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
     SnapshotSignEvent, StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use aruna_core::native_reference::{
+    DelegatedBody, DelegatedReadEffect, GrantedBody, GrantedReadEffect, NativeAuthority,
+    NativeReferenceRequest, NativeReferenceResponse,
+};
+use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
+use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
 use tokio::io::AsyncWriteExt;
@@ -19,6 +27,7 @@ use tokio::time::timeout;
 use tracing::warn;
 
 use crate::driver::DriverContext;
+use aruna_core::events::TopicPeerError;
 
 /// Why signing fails on a node without a net handle, which holds the node key.
 const UNAVAILABLE: &str = "net transport unavailable";
@@ -42,6 +51,10 @@ pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &Driver
         }
         HeartbeatEffect::Store { peer, heartbeat } => {
             HeartbeatEvent::Stored(net_handle.record_heartbeat(peer, *heartbeat))
+        }
+        HeartbeatEffect::Avoid { holder, now_ms } => {
+            net_handle.avoided_holders().avoid(holder, now_ms);
+            HeartbeatEvent::Avoided
         }
         HeartbeatEffect::Holders { holders, now_ms } => {
             let avoid_list = net_handle.avoided_holders();
@@ -76,8 +89,8 @@ async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Resul
     stream.0.finish().map_err(|error| error.to_string())
 }
 
-/// Carries out a change of this node's watch metrics or watch interest; without a net handle
-/// only the suppression is logged.
+/// Carries out a change of this node's watch metrics or watch interest, or reads the holders it
+/// matches; without a net handle only the suppression is logged.
 fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Event, NetEffect> {
     match effect {
         NetEffect::RecordSuppression(reason) => {
@@ -116,9 +129,113 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
                 net_handle.update_realm_interest(realm_id, nodes);
             }
         }
+        NetEffect::WatchHolders {
+            realm_id,
+            path,
+            kind,
+        } => {
+            let holders = net_handle.map(|net_handle| {
+                let interest = net_handle.watch_interest_snapshot();
+                let holders = interest.matching_nodes(realm_id, &path, kind);
+                (net_handle.node_id(), holders)
+            });
+            return Ok(Event::Net(NetEvent::WatchHolders(holders)));
+        }
         other => return Err(other),
     }
     Ok(Event::Net(NetEvent::Recorded))
+}
+
+/// Runs the topic peer effects through the handle; hands any other effect back.
+async fn set_topic_peers(effect: NetEffect, context: &DriverContext) -> Result<Event, NetEffect> {
+    let (topics, peers, create) = match effect {
+        NetEffect::EnsureTopics { topics, peers } => (topics, peers, true),
+        NetEffect::AllowTopicPeers { topics, peers } => (topics, peers, false),
+        other => return Err(other),
+    };
+    let result = match &context.net_handle {
+        None => Err(TopicPeerError::NoNetwork),
+        Some(net) => match create {
+            true => net.ensure_sync_topics(&topics, peers).await,
+            false => net.allow_topic_peers(&topics, peers).await,
+        }
+        .map_err(|error| TopicPeerError::Failed(error.to_string())),
+    };
+    Ok(Event::Net(NetEvent::TopicPeers(result)))
+}
+
+/// Signs a granted read with this node's key, sends it and opens the holder's answer.
+async fn granted_read(
+    read: GrantedReadEffect,
+    context: &DriverContext,
+) -> Result<Box<GrantedBody>, StagingSourceError> {
+    let net = (context.net_handle.as_ref()).ok_or(StagingSourceError::HandleMissing)?;
+    if read.request.issuer != net.node_id() {
+        return Err(StagingSourceError::AccessDenied);
+    }
+    let bytes = (read.request.signing_bytes())
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let holder = read.request.target;
+    let signed = SignedRequest {
+        signature: net.sign(&bytes),
+        request: read.request,
+    };
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Granted(Box::new(signed)),
+        bucket: read.bucket,
+        key: read.key,
+        version_id: read.version_id,
+        head: read.head,
+        range: read.range,
+    };
+    let (response, stream) = send_request(net, holder, request).await?;
+    match response {
+        NativeReferenceResponse::Content(metadata)
+        | NativeReferenceResponse::Described { metadata, .. } => Ok(Box::new(GrantedBody {
+            metadata,
+            blob: body_stream(stream),
+        })),
+        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
+    }
+}
+
+/// Signs a delegation with this node's key, sends it and opens the holder's answer.
+async fn delegated_read(
+    read: DelegatedReadEffect,
+    context: &DriverContext,
+) -> Result<Box<DelegatedBody>, StagingSourceError> {
+    let net = (context.net_handle.as_ref()).ok_or(StagingSourceError::HandleMissing)?;
+    let delegation = read.delegation;
+    if delegation.issuer != net.node_id() {
+        return Err(StagingSourceError::AccessDenied);
+    }
+    let bytes = (delegation.signing_bytes())
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let holder = delegation.target;
+    let (bucket, key) = (delegation.bucket.clone(), delegation.key.clone());
+    let signed = SignedDelegation {
+        signature: net.sign(&bytes),
+        delegation,
+    };
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Delegated(Box::new(signed)),
+        bucket,
+        key,
+        version_id: read.version_id,
+        head: read.head,
+        range: read.range,
+    };
+    let (response, stream) = send_request(net, holder, request).await?;
+    let (metadata, group_id) = match response {
+        NativeReferenceResponse::Content(metadata) => (metadata, None),
+        NativeReferenceResponse::Described { metadata, group_id } => (metadata, Some(group_id)),
+        NativeReferenceResponse::Rejected(reject) => return Err(reject.into()),
+    };
+    Ok(Box::new(DelegatedBody {
+        metadata,
+        group_id,
+        blob: body_stream(stream),
+    }))
 }
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
@@ -126,10 +243,28 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
         Ok(recorded) => return recorded,
         Err(effect) => effect,
     };
-    if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
-        return Event::Net(NetEvent::DocumentSync(
-            reconcile_topics(context, topics).await,
-        ));
+    let effect = match set_topic_peers(effect, context).await {
+        Ok(answered) => return answered,
+        Err(effect) => effect,
+    };
+    if let NetEffect::GrantedRead(read) = effect {
+        return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
+    }
+    if let NetEffect::DelegatedRead(read) = effect {
+        let answer = delegated_read(*read, context).await;
+        return Event::Net(NetEvent::DelegatedRead(answer));
+    }
+    if let NetEffect::DocumentSync(DocumentEffect::ReloadRealmPeers) = effect {
+        return Event::Net(NetEvent::DocumentSync(reload_peers(context).await));
+    }
+    if let NetEffect::RefreshDocumentPeers(config) = effect {
+        let refreshed = match &context.net_handle {
+            Some(net_handle) => (net_handle.refresh_document_peers(&config).await)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err(UNAVAILABLE.to_string()),
+        };
+        return Event::Net(NetEvent::DocumentPeers(refreshed));
     }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
@@ -149,6 +284,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
                 VaultSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
+            NetEffect::SignDeletePlan(_) => {
+                Event::Net(NetEvent::DeletePlanSigned(Err(UNAVAILABLE.to_string())))
+            }
             NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
                 SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
@@ -169,24 +307,16 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     }
 }
 
-/// Reconciles through the handle, which also reloads realm peers after a realm config change.
-async fn reconcile_topics(
-    context: &DriverContext,
-    topics: Vec<irokle::TopicId>,
-) -> DocumentNetEvent {
+/// Rebuilds the peer set from the realm config a reconcile just applied.
+async fn reload_peers(context: &DriverContext) -> DocumentNetEvent {
     let Some(net_handle) = &context.net_handle else {
         return DocumentNetEvent::Error {
             target: None,
             error: "net handle unavailable".to_string(),
         };
     };
-    match Box::pin(net_handle.reconcile_sync_topics(topics)).await {
-        Ok(result) => DocumentNetEvent::DocumentsReconciled {
-            applied: result.applied(),
-            targets: result.targets,
-            metadata_create_events: result.metadata_create_events,
-            metadata_graph_tombstones: result.metadata_graph_tombstones,
-        },
+    match Box::pin(net_handle.reload_realm_peers()).await {
+        Ok(_) => DocumentNetEvent::RealmPeersReloaded,
         Err(error) => DocumentNetEvent::Error {
             target: None,
             error: error.to_string(),

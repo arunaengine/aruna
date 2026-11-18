@@ -4,19 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugin_host::worker::match_journal;
+use crate::plugin_host::worker::tests::{
+    created, echoed_sync, install_artifact, installed, scoped, synced,
+};
+use crate::plugin_host::worker::{plan_replays, run_replays};
+use crate::plugins::calls::*;
 use crate::plugins::clock::ClockReading;
 use crate::plugins::journal::JOURNAL_PAGE;
-use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::decode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::store::Txn;
-use crate::plugins::worker::match_journal;
-use crate::plugins::worker::tests::{
-    created, echoed_sync, install_artifact, installed, scoped, synced,
-};
-use crate::plugins::worker::{plan_replays, run_replays};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
@@ -330,7 +330,7 @@ fn first_coverage_starts() {
 }
 
 #[test]
-fn moved_record_updates_row() {
+fn moved_record_updates() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let mut newer = install.clone();
     newer.revision = 2;

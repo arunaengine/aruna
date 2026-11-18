@@ -806,7 +806,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!crate::jobs::runtime::key_unlocked(&context, key.key).await);
+        assert!(
+            !crate::driver::drive(
+                crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(
             read_job_record(&context, job_id, None)
                 .await

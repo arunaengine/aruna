@@ -13,19 +13,17 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 
-use super::admission_race::{config, envelope, rows, seed};
+use super::admission_race::{commit_receipt, commit_with, config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
+use super::{admit_launch, cancel_family};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::cancel::cancel_family;
-use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::store::state::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::records::{Family, REALM, user};
+use crate::tests::records::{Family, REALM, serve_job_record, user};
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext {
@@ -353,8 +351,8 @@ async fn remote_run_untouched() {
 #[tokio::test]
 async fn deletion_hides_family() {
     // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
-    use crate::jobs::lifecycle::cancel::publish_deletion;
-    use crate::jobs::lifecycle::routing::family_report;
+    use super::family_report;
+    use super::publish_deletion;
     use crate::jobs::route::JobRouteError;
     let family = Family::new([43u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.holder).await;
@@ -378,7 +376,7 @@ async fn deletion_hides_family() {
 async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
-    use crate::jobs::service::delete_owned_run;
+    use crate::jobs::job_reads::tests::delete_owned_run;
     use crate::jobs::store::RunDelete;
     use crate::jobs::store::query::insert_job;
     use crate::tests::records::secret;

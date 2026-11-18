@@ -4,12 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::store::query::find_dedup_plan;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
+use crate::notifications::opt_in::{EmailOptIn, SetEmailOperation};
 use crate::notifications::setting_rows::SettingError;
 use crate::tests::notifications::managers;
 use crate::tests::staging::setup_driver_context;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::handle::Handle;
@@ -18,6 +22,7 @@ use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::outbound::{
     MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail,
 };
+use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::notification::NotificationRecord;
@@ -25,6 +30,7 @@ use aruna_core::structs::execution::notification::{NotificationClass, Notificati
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_outbound::{MailBuilder, MailSender, OutboundHandle};
 use ed25519_dalek::SigningKey;
@@ -32,6 +38,155 @@ use std::sync::{Arc, Mutex};
 use ulid::Ulid;
 
 const ADDRESS: &str = "ada@example.org";
+
+async fn read_email(
+    context: &DriverContext,
+    owner: UserId,
+) -> Result<Option<EmailPreference>, EmailError> {
+    drive(ReadEmailOperation::new(owner), context).await
+}
+
+async fn set_email(
+    context: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+    address: String,
+    categories: BTreeSet<String>,
+) -> Result<EmailPreference, EmailError> {
+    let opt_in = EmailOptIn::new(owner, local, address, categories, unix_timestamp_millis());
+    drive(SetEmailOperation::new(opt_in), context).await
+}
+
+async fn remove_email(
+    context: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+) -> Result<(), EmailError> {
+    let remove = RemoveEmailOperation::new(owner, local, unix_timestamp_millis());
+    drive(remove, context).await
+}
+
+async fn refresh_mail(context: &DriverContext, realm_id: RealmId) {
+    drive(RefreshMailOperation::new(realm_id), context)
+        .await
+        .expect("the refresh runs");
+}
+
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+fn mail_refreshed() -> IoResult {
+    IoResult::Event(Box::new(Event::Outbound(OutboundEvent::MailRefreshed)))
+}
+
+/// The refresh names the profile revision to the sender, then prunes the cached secrets.
+#[test]
+fn refresh_follows_config() {
+    let realm_id = user().realm_id;
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.email = Some(profile(7, false));
+    let mut refresh = RefreshMailOperation::new(realm_id);
+    assert!(matches!(refresh.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let revision = config.email.as_ref().map(|profile| profile.revision);
+    assert_eq!(
+        refresh.next(child::<_, GetConfigError>(Ok(config))),
+        Ok(Next::Call(IoCall::from(Effect::Outbound(
+            OutboundEffect::RefreshMail(revision)
+        ))))
+    );
+    assert!(matches!(
+        refresh.next(mail_refreshed()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let failed = child::<usize, _>(Err(RealmSecretError::NotReplicated));
+    assert_eq!(refresh.next(failed), Ok(Next::Done(())));
+}
+
+/// A config read error keeps the cache, and only a realm config change starts a refresh.
+#[test]
+fn refresh_keeps_cache() {
+    let mut refresh = RefreshMailOperation::new(user().realm_id);
+    refresh.first().unwrap();
+    let missing = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+    assert_eq!(refresh.next(missing), Ok(Next::Done(())));
+
+    let mut other = RefreshMailOperation::applied(&[]);
+    assert_eq!(other.first(), Ok(Next::Done(())));
+    let target = DocumentTarget::RealmConfig {
+        realm_id: user().realm_id,
+    };
+    assert_eq!(
+        RefreshMailOperation::applied(&[target]),
+        RefreshMailOperation::new(user().realm_id)
+    );
+}
+
+fn stored_email(categories: &[&str]) -> EmailPreference {
+    let id = Ulid::from_parts(6, 6);
+    EmailPreference {
+        preference_id: id,
+        user_id: user(),
+        stamp: RegisterStamp {
+            counter: 1,
+            node_id: node(),
+            write_id: id,
+        },
+        categories: categories.iter().map(|name| name.to_string()).collect(),
+        sealed: (!categories.is_empty()).then(|| vec![1]),
+        created_at_ms: 1,
+    }
+}
+
+#[test]
+fn read_decodes_preference() {
+    let mut read = ReadEmailOperation::new(user());
+    assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let stored = stored_email(&["share.upload"]);
+    let bytes = stored.to_bytes().unwrap();
+    let found = child::<_, SettingError>(Ok(Some(bytes)));
+    assert_eq!(read.next(found), Ok(Next::Done(Some(stored))));
+    let mut off = ReadEmailOperation::new(user());
+    off.first().unwrap();
+    let none = child::<Option<Vec<u8>>, SettingError>(Ok(None));
+    assert_eq!(off.next(none), Ok(Next::Done(None)));
+}
+
+#[test]
+fn remove_writes_off() {
+    let mut remove = RemoveEmailOperation::new(user(), node(), 5);
+    let off = SettingValue::Email {
+        categories: BTreeSet::new(),
+        address: None,
+    };
+    assert_eq!(remove.write.value, off);
+    assert!(matches!(remove.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let bytes = stored_email(&[]).to_bytes().unwrap();
+    let written = child::<_, SettingError>(Ok(bytes));
+    assert_eq!(remove.next(written), Ok(Next::Done(())));
+    let mut refused = RemoveEmailOperation::new(user(), node(), 5);
+    refused.first().unwrap();
+    let error = || SettingError::Build("sealing failed".to_string());
+    let failed = child::<Vec<u8>, _>(Err(error()));
+    assert_eq!(refused.next(failed), Err(EmailError::Setting(error())));
+}
+
+/// The address is trimmed and checked once, and each opt-in gets its own ids.
+#[test]
+fn opt_in_trimmed() {
+    let categories = BTreeSet::from(["share.upload".to_string()]);
+    let opt_in =
+        |address: &str| EmailOptIn::new(user(), node(), address.to_string(), categories.clone(), 5);
+    let valid = opt_in(" ada@example.org ");
+    assert_eq!(valid.address, ADDRESS);
+    assert!(valid.address_valid);
+    assert_ne!(valid.write_id, opt_in(ADDRESS).write_id);
+    assert!(!opt_in("not an address").address_valid);
+}
 
 /// A user of a realm whose id is a realm key, so addresses can be sealed to it.
 fn user() -> UserId {
@@ -375,7 +530,9 @@ async fn restore_prunes_password() {
         metadata_create_events: Vec::new(),
         metadata_graph_tombstones: Vec::new(),
     };
-    assert!(crate::node::startup::apply_restored_reconcile(&context, node(), applied).await);
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let apply = crate::shard::pull::ApplyPulledOperation::new(node(), realm_id, applied);
+    assert!(crate::driver::drive(apply, &context).await.unwrap());
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
         .storage_handle

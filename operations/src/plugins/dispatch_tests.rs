@@ -5,12 +5,13 @@
 
 use super::*;
 use crate::driver::drive;
+use crate::plugin_host::worker::tests::installed;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::event_trigger;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::rows::{StoreError, decode, read_call, values};
 use crate::plugins::runs::{TimerRow, list_runs, read_run};
-use crate::plugins::worker::tests::installed;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -210,5 +211,173 @@ impl Operation for ReadTimer {
     fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         let [found] = values::<1>(answer)?;
         Ok(Next::Done(found.map(|bytes| decode(&bytes)).transpose()?))
+    }
+}
+
+mod operations {
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::plugins::bound::NodeCheckFailure;
+    use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rows::tests::child_result;
+    use crate::users::service_account::check::ServiceCheckError;
+    use aruna_core::plugin_installs::SecretBinding;
+    use aruna_core::plugins::ReleaseError;
+    use aruna_core::structs::identity::user::User;
+
+    fn manual() -> Value {
+        json!({ "triggers": { "manual": {} } })
+    }
+
+    fn webhook(kind: &str) -> Value {
+        json!({
+            "secrets": { "hook_key": { "title": "Hook key", "kind": kind } },
+            "triggers": { "webhook": { "verify": "hook_key", "delivery_id": "x-delivery" } }
+        })
+    }
+
+    fn start(input: &str, local: u8) -> StartRun {
+        let place = (fixtures::realm(), fixtures::node(local));
+        let id = fixtures::install().install_id;
+        StartRun::new(&fixtures::caller().auth, place, id, input, 5_000)
+    }
+
+    fn admin_ok() -> IoResult {
+        child_result(Ok::<Option<User>, ServiceCheckError>(None))
+    }
+
+    fn checked(start: &mut StartRun) -> Result<Next<PluginRun>, StartError> {
+        assert!(is_child(&start.first()));
+        let config = fixtures::config(&fixtures::install(), manual());
+        assert!(is_child(&start.next(config_result(config))));
+        start.next(admin_ok())
+    }
+
+    #[test]
+    fn start_queues_run() {
+        let mut run = start("{}", 3);
+        assert_eq!(run.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert!(is_child(&checked(&mut run)));
+        let Ok(Next::Done(queued)) = run.next(child_result(Ok::<(), RunError>(()))) else {
+            panic!("the admission ends the start");
+        };
+        assert_eq!(queued.install_id, fixtures::install().install_id);
+    }
+
+    #[test]
+    fn start_refuses_requests() {
+        let receiver = fixtures::node(3);
+        let elsewhere = checked(&mut start("{}", 4));
+        assert_eq!(elsewhere.unwrap_err(), StartError::Elsewhere(receiver));
+        let invalid = checked(&mut start("[]", 3));
+        assert_eq!(invalid.unwrap_err(), StartError::Input);
+    }
+
+    #[test]
+    fn timers_queue_due() {
+        let every = json!({ "triggers": { "every": { "interval": "1h" } } });
+        let config = fixtures::config(&fixtures::install(), every);
+        let mut timers = EnqueueTimers::new(&config, fixtures::node(3), 5_000);
+        assert_eq!(timers.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert!(is_child(&timers.first()));
+        let queued = child_result(Ok::<bool, StoreError>(true));
+        assert_eq!(timers.next(queued), Ok(Next::Done(1)));
+        let mut elsewhere = EnqueueTimers::new(&config, fixtures::node(4), 5_000);
+        assert_eq!(elsewhere.first(), Ok(Next::Done(0)));
+    }
+
+    fn hook_request() -> HookRequest {
+        HookRequest {
+            delivery_id: None,
+            method: "POST".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn verify(
+        local: u8,
+        install: &PluginInstall,
+        extra: Value,
+    ) -> Result<Next<VerifiedHook>, HookError> {
+        let place = (fixtures::realm(), fixtures::node(local));
+        let mut hook = VerifyHook::new(place, install.install_id, hook_request(), 5_000);
+        assert!(is_child(&hook.first()));
+        hook.next(config_result(fixtures::config(install, extra)))
+    }
+
+    #[test]
+    fn hook_checks_install() {
+        let install = fixtures::install();
+        let elsewhere = verify(4, &install, webhook("header"));
+        assert_eq!(
+            elsewhere.unwrap_err(),
+            HookError::Elsewhere(fixtures::node(3))
+        );
+        assert_eq!(
+            verify(3, &install, json!({})).unwrap_err(),
+            HookError::NotFound
+        );
+        let mut paused = install;
+        paused.state = InstallState::Paused;
+        let answer = verify(3, &paused, webhook("header"));
+        assert!(matches!(answer, Err(HookError::Paused(_))));
+    }
+
+    #[test]
+    fn hook_needs_secret() {
+        let mut install = fixtures::install();
+        install.install_id = Ulid::from_parts(7, 7);
+        let place = (fixtures::realm(), fixtures::node(3));
+        let mut hook = VerifyHook::new(place, install.install_id, hook_request(), 5_000);
+        hook.first().unwrap();
+        let config = fixtures::config(&install, webhook("header"));
+        assert!(is_child(&hook.next(config_result(config))));
+        let gone = ReleaseFailure(ReleaseError::Unavailable("no".into()));
+        let answer = hook.next(child_result(Err::<Released, _>(gone)));
+        assert!(matches!(answer, Err(HookError::Unavailable(_))));
+    }
+
+    fn authorization(
+        scope: &str,
+        kind: &str,
+    ) -> (HookAuthorization, Result<Next<Option<bool>>, IoError>) {
+        let mut install = fixtures::install();
+        let binding = SecretBinding::parse(&format!("{scope}:key")).unwrap();
+        install.secrets.insert("hook_key".into(), binding);
+        let config = fixtures::config(&install, webhook(kind));
+        let place = (fixtures::node(3), install.install_id);
+        let mut check = HookAuthorization::new(config, place);
+        let first = check.first();
+        (check, first)
+    }
+
+    #[test]
+    fn relay_reads_secret() {
+        let (_, bearer) = authorization("group", "bearer");
+        assert_eq!(bearer, Ok(Next::Done(Some(true))));
+        let (mut node, first) = authorization("node", "header");
+        assert!(is_child(&first));
+        let header = Ok::<_, NodeCheckFailure>(Some("Authorization".to_string()));
+        assert_eq!(node.next(child_result(header)), Ok(Next::Done(Some(true))));
+        let (mut group, first) = authorization("group", "header");
+        assert!(is_child(&first));
+        let gone = ReleaseFailure(ReleaseError::Unavailable("no".into()));
+        let failed = child_result(Err::<Option<Selected>, _>(gone));
+        assert_eq!(group.next(failed), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn relay_without_check() {
+        let install = fixtures::install();
+        let place = (fixtures::node(3), install.install_id);
+        let plain = fixtures::config(&install, json!({}));
+        let mut check = HookAuthorization::new(plain.clone(), place);
+        assert_eq!(check.first(), Ok(Next::Done(Some(false))));
+        let unknown = (fixtures::node(3), Ulid::from_parts(9, 9));
+        let mut check = HookAuthorization::new(plain, unknown);
+        assert_eq!(check.first(), Ok(Next::Done(None)));
     }
 }

@@ -36,7 +36,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurg
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
-use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::purge::{StorageFilesOperation, scope_totals};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
@@ -44,8 +44,8 @@ use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::host::run_backend_import;
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, transition_to_running,
@@ -643,9 +643,12 @@ async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
 /// The duplicates preview of the whole bucket.
 async fn duplicates(context: &TestContext) -> aruna_operations::blob::unify::UnifyPage {
     let scope = (context.auth.realm_id, context.group_id, context.node_id);
-    let access = BucketAccess::load(&context.driver, &context.auth, scope, BUCKET)
-        .await
-        .unwrap();
+    let access = drive(
+        BucketAccessOperation::new(&context.auth, scope, BUCKET),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
         .await
         .unwrap()

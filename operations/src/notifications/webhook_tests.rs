@@ -4,11 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::staging::setup_driver_context;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
+use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use aruna_core::structs::execution::notification::NotificationClass;
@@ -47,6 +51,113 @@ fn upload(recipient: UserId) -> NotificationRecord {
 }
 
 const HOOK: &str = "https://hooks.example.org/aruna";
+
+async fn read_webhook(
+    context: &DriverContext,
+    owner: UserId,
+) -> Result<Option<WebhookSubscription>, WebhookError> {
+    drive(ReadWebhookOperation::new(owner), context).await
+}
+
+async fn set_webhook(
+    context: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+    url: String,
+) -> Result<WebhookOutcome, WebhookError> {
+    let now_ms = unix_timestamp_millis();
+    drive(SetWebhookOperation::new(owner, local, url, now_ms), context).await
+}
+
+async fn remove_webhook(
+    context: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+) -> Result<(), WebhookError> {
+    let now_ms = unix_timestamp_millis();
+    drive(RemoveWebhookOperation::new(owner, local, now_ms), context).await
+}
+
+fn stored(url: Option<&str>) -> WebhookSubscription {
+    let id = Ulid::from_parts(6, 6);
+    WebhookSubscription {
+        subscription_id: id,
+        user_id: user(),
+        stamp: RegisterStamp {
+            counter: 1,
+            node_id: iroh::SecretKey::from_bytes(&[8; 32]).public(),
+            write_id: id,
+        },
+        url: url.map(str::to_string),
+        sealed: url.map(|_| vec![1]),
+        created_at_ms: 1,
+    }
+}
+
+fn answer<T>(result: Result<T, SettingError>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+#[test]
+fn read_decodes_setting() {
+    let mut read = ReadWebhookOperation::new(user());
+    assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let bytes = stored(Some(HOOK)).to_bytes().unwrap();
+    assert_eq!(
+        read.next(answer(Ok(Some(bytes)))),
+        Ok(Next::Done(Some(stored(Some(HOOK)))))
+    );
+    let mut off = ReadWebhookOperation::new(user());
+    off.first().unwrap();
+    assert_eq!(
+        off.next(answer::<Option<Vec<u8>>>(Ok(None))),
+        Ok(Next::Done(None))
+    );
+    let mut broken = ReadWebhookOperation::new(user());
+    broken.first().unwrap();
+    assert!(matches!(
+        broken.next(answer(Ok(Some(vec![0xff])))),
+        Err(WebhookError::Conversion(_))
+    ));
+}
+
+#[test]
+fn set_returns_secret() {
+    let node = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    let secret = SecretBytes::new(vec![0xab; 32]);
+    let mut set = SetWebhookOperation::with_secret(user(), node, HOOK.to_string(), secret, 5);
+    assert!(matches!(set.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let bytes = stored(Some(HOOK)).to_bytes().unwrap();
+    assert_eq!(
+        set.next(answer(Ok(bytes))),
+        Ok(Next::Done(WebhookOutcome {
+            subscription: stored(Some(HOOK)),
+            secret: "ab".repeat(32),
+        }))
+    );
+    let mut invalid = SetWebhookOperation::new(user(), node, "not a url".to_string(), 5);
+    assert_eq!(invalid.first(), Err(WebhookError::InvalidUrl));
+}
+
+#[test]
+fn remove_writes_off() {
+    let node = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    let mut remove = RemoveWebhookOperation::new(user(), node, 5);
+    assert_eq!(remove.write.value, SettingValue::Webhook { target: None });
+    assert!(matches!(remove.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let bytes = stored(None).to_bytes().unwrap();
+    assert_eq!(remove.next(answer(Ok(bytes))), Ok(Next::Done(())));
+    let mut refused = RemoveWebhookOperation::new(user(), node, 5);
+    refused.first().unwrap();
+    let error = || SettingError::Build("sealing failed".to_string());
+    assert_eq!(
+        refused.next(answer::<Vec<u8>>(Err(error()))),
+        Err(WebhookError::Setting(error()))
+    );
+}
 
 #[tokio::test]
 async fn refuses_unusable_urls() {

@@ -8,7 +8,6 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
-use aruna_operations::auth::request_authorization::permission_rules;
 use aruna_operations::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };
@@ -29,6 +28,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_operations::auth::request_authorization::rules_operation;
 
 /// Version rows one call reads; `next` continues after them.
 const PAGE: usize = 1000;
@@ -256,7 +256,7 @@ pub async fn add_sources(
         state.get_realm_id(),
         state.get_node_id()
     );
-    let rules = permission_rules(&state.get_ctx(), &auth, &read_root)
+    let rules = drive(rules_operation(&auth, &read_root), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let change = SourceChange::Add {

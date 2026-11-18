@@ -21,6 +21,8 @@ pub const TOTALS_DOMAIN: &str = "aruna-registry-totals-v1";
 /// Delay of the first registry publication after a settings change, so renames reach the
 /// registry at once.
 pub const PUBLISH_SOON: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the reporting node renews its registration.
+pub const PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Longest realm name a descriptor carries.
 pub const MAX_NAME_LEN: usize = 128;

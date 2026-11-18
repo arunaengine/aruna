@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GitError, records};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
-use crate::realm::load_config::load_realm_config;
+use crate::driver::drive;
+use crate::realm::load_config::config_unavailable;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -30,8 +32,10 @@ pub async fn holders(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
-    let config = load_realm_config(context, document.realm_id)
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     holders_in(&config, node, document)
 }
@@ -59,8 +63,10 @@ pub async fn publish_pack(
     if stored(context, &pack).await? {
         return Ok(());
     }
-    let config = load_realm_config(context, document.realm_id)
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     let node_id = context
         .net_handle
@@ -159,8 +165,10 @@ pub async fn publish_with(
     change: GitChange,
     (pack, extra): (Option<bytes::Bytes>, Vec<Row>),
 ) -> Result<GitRecord, GitError> {
-    let config = load_realm_config(context, document.realm_id)
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     let node_id = context
         .net_handle

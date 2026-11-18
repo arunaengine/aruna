@@ -1054,8 +1054,8 @@ async fn list_linked(context: &TestContext) -> Vec<(String, Ulid)> {
 async fn cancelled_queue_releases() {
     // A purge cancelled while queued ends at once; the files it planned before are released
     // by the cleanup queue, because the job ended.
+    use crate::job_calls::cancel_owned_job;
     use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::service::cancel_owned_job;
     let context = setup_context().await;
     seed_linked(&context, "linked/a.txt", Ulid::generate()).await;
     let spec = files_spec(&context);

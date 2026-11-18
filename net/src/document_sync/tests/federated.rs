@@ -472,9 +472,6 @@ async fn local_change_kept() {
         },
     );
     let target = DocumentTarget::User { user_id: owner };
-    let txn_id = start_storage_transaction(&storage).await.unwrap();
-    let batch = user_batch(&storage, txn_id, &target, &renamed, None, None).await;
-    let (deletes, writes) = batch.unwrap().unwrap();
     // The local unlink commits while the replicated rename is still open.
     let unlinked = realm.event(
         &realm.owner,
@@ -482,10 +479,16 @@ async fn local_change_kept() {
         user,
         AdminDocumentOperation::UserAliasRemoved { alias: foreign },
     );
-    apply_admin_operation(&storage, target.clone(), unlinked)
-        .await
-        .unwrap();
-    let stale = replace_batch_in(&storage, txn_id, deletes, writes).await;
+    let plan = AdminOperationPlan {
+        target: target.clone(),
+        event: renamed.clone(),
+    };
+    let local = async {
+        apply_admin_operation(&storage, target.clone(), unlinked)
+            .await
+            .unwrap();
+    };
+    let stale = run_plan_around(&storage, plan, local).await;
     assert!(matches!(
         stale,
         Err(NetError::Storage(StorageError::TransactionConflict))

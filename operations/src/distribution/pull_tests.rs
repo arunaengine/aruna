@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
+use aruna_core::effects::StorageEffect;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::distribution::held::{kept_location, kept_reads, kept_source_location};
 use crate::distribution::test_record::{binding, replicated, secret, store_record};
@@ -218,7 +220,7 @@ async fn asks_range_holders() {
         },
     };
 
-    let member = member_of(&context(&handle), &request).await.unwrap();
+    let member = drive(PullMemberOperation::new(request.clone()), &context(&handle)).await.unwrap();
 
     assert_eq!(member.holders, vec![secret(2).public()]);
     assert_eq!(member.strategy, DataStrategy::Copy);
@@ -234,7 +236,7 @@ async fn asks_range_holders() {
         ..request.clone()
     };
     assert!(
-        !member_of(&context(&handle), &governed)
+        !drive(PullMemberOperation::new(governed), &context(&handle))
             .await
             .unwrap()
             .keeping
@@ -244,7 +246,81 @@ async fn asks_range_holders() {
         ..request
     };
     assert_eq!(
-        member_of(&context(&handle), &stranger).await,
+        drive(PullMemberOperation::new(stranger), &context(&handle)).await,
         Err(GetObjectError::HoldersUnavailable)
     );
+}
+
+fn pull_request(size: u64) -> PullRequest {
+    let realm_id = RealmId::from_bytes([9; 32]);
+    PullRequest {
+        bucket: "spire".to_string(),
+        key: "x".to_string(),
+        range: None,
+        auth: AuthContext {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        held: held(size),
+    }
+}
+
+fn member() -> Member {
+    Member {
+        member_id: Ulid::from_bytes([1; 16]),
+        strategy: DataStrategy::CacheOnUse,
+        behaviour: RangeBehaviour::default(),
+        keeping: true,
+        holders: vec![secret(2).public()],
+    }
+}
+
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+}
+
+// A copy the cache can never hold is not fetched, and a running fill is left alone.
+#[test]
+fn fill_skips_unfit() {
+    let huge = pull_request(CACHE_CAPACITY_BYTES + 1);
+    let mut skipped = FillOperation::new(huge, KeptKind::Cache, member());
+    assert_eq!(skipped.first(), Ok(Next::Done(None)));
+    let mut busy = FillOperation::new(pull_request(9), KeptKind::Cache, member());
+    assert!(matches!(busy.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let answer = child(Ok::<_, KeepError>(Claimed::Busy));
+    assert_eq!(busy.next(answer), Ok(Next::Done(None)));
+}
+
+// With no holder left the collected failures decide the error.
+#[test]
+fn holders_exhausted_fail() {
+    let mut read = FromHoldersOperation::new(&pull_request(9), &[], None);
+    assert!(read.first().is_err());
+}
+
+// A failed holder is avoided before the next one is asked.
+#[test]
+fn avoids_failed_holder() {
+    let holders = [secret(2).public(), secret(3).public()];
+    let mut read = FromHoldersOperation::new(&pull_request(9), &holders, None);
+    read.first().unwrap();
+    let refused = BaoReadError::Refused(BaoReadRefusal::BackendFailure);
+    let answer = child(Err::<BaoReadOutput, _>(refused));
+    assert!(matches!(read.next(answer), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(read.avoiding);
+}
+
+// A claim is deleted outside any transaction, and a failure leaves it to go stale.
+#[test]
+fn release_tolerates_failure() {
+    let mut release = ReleaseClaimOperation::new(vec![1]);
+    assert!(matches!(release.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let failed = child(Err::<IoResult, _>(IoError::Unfinished));
+    assert_eq!(release.next(failed), Ok(Next::Done(())));
 }

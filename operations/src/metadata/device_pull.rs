@@ -29,17 +29,18 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::peer_acts_for;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -275,7 +276,7 @@ async fn coordinates(
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(());
     };
-    match route_write(context, binding, key).await {
+    match drive(route_write(binding, key), context).await {
         Ok(WriteRoute::Local { .. }) => Ok(()),
         Ok(WriteRoute::Forward { node_id, .. }) => Err(SyncRefusal::Coordinator(node_id)),
         Err(
@@ -341,8 +342,10 @@ pub(crate) async fn authorize_peer(
             WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
             WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
-    let config = load_realm_config(context, auth.realm_id)
+    let config = drive(GetConfigOperation::new(auth.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     match peer_acts_for(&config, peer, auth.user_id) {
         true => Ok(auth),
@@ -421,13 +424,15 @@ pub(crate) async fn authorize_pull(
     permission: Permission,
     operation: &'static str,
 ) -> Result<(), SyncRefusal> {
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &permission,
+            PolicyRequestExtras::operation(operation),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &permission,
-        PolicyRequestExtras::operation(operation),
     )
     .await
     .map_err(pull_refusal)
@@ -435,7 +440,7 @@ pub(crate) async fn authorize_pull(
 
 /// Only a real denial refuses the caller; an unreadable policy state or a
 /// failed check is this node's problem and stays retryable.
-fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
+pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
     match error {
         AuthorizeError::PermissionDenied
         | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
@@ -538,8 +543,10 @@ async fn commit_pull(
     )
     .await
     .map_err(|_| SyncRefusal::Unavailable)?;
-    let quota = load_realm_config(context, auth.realm_id)
+    let quota = drive(GetConfigOperation::new(auth.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .and_then(|config| config.quota.effective_group_ceiling(&bucket.group_id));
     let operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
@@ -791,11 +798,11 @@ async fn set_heads(
     binding: &DistributionBinding,
     listing: SetListing,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let view = bound_view(context, binding)
+    let view = drive(bound_view(binding), context)
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let snapshot = view.snapshot();
-    let fence = local_fence(context, binding.set_id)
+    let fence = drive(local_fence(binding.set_id), context)
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
@@ -866,8 +873,10 @@ async fn holder_heads(
     (snapshot, range): (&DistributionSnapshot, &KeyRange),
     listing: SetListing,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let config = load_realm_config(context, auth.realm_id)
+    let config = drive(GetConfigOperation::new(auth.realm_id), context)
         .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
     let local = local_node(context)?;
@@ -1174,11 +1183,12 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::{finish_unbind, store_folder};
+        use crate::device::sync::folders::finish_unbind;
         use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };
+        use crate::tests::device::store_folder;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
         let fixture = crate::tests::staging::setup_driver_context().await;
@@ -1198,7 +1208,9 @@ mod tests {
             node_id,
             user_id,
         };
-        offer_directory(&context, offer.clone()).await.unwrap();
+        drive(offer_directory(offer.clone()), &context)
+            .await
+            .unwrap();
         assert_eq!(
             guard_target(&context, &bucket).await,
             Err(SyncRefusal::Forbidden)
@@ -1232,13 +1244,16 @@ mod tests {
             node_id,
             user_id,
         };
-        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        assert_eq!(drive(withdraw_offer(withdrawal), &context).await, Ok(1));
         assert_eq!(
             guard_target(&context, &bucket).await,
             Err(SyncRefusal::Forbidden)
         );
 
-        assert_eq!(finish_unbind(&context, folder_id, node_id).await, Ok(()));
+        assert_eq!(
+            drive(finish_unbind(&context, folder_id, node_id), &context).await,
+            Ok(())
+        );
         assert!(matches!(
             read_bucket(&context, &bucket).await,
             Err(SyncRefusal::NotFound)

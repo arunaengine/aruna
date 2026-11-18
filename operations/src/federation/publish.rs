@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -23,8 +22,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-/// How often the reporting node renews its registration.
-pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";

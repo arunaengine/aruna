@@ -4,22 +4,21 @@
 
 use std::collections::BTreeMap;
 
+use aruna_compute::registry::ExecutorOffer;
 use aruna_core::NodeId;
-use aruna_core::compute::ExecutorCapability;
 use aruna_core::download_slots::DownloadSlots;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::CLASS_LABEL_PREFIX;
 use aruna_core::structs::storage::routing::BackendCatalog;
 use tracing::warn;
 
-use super::inputs::SubjectRecordOperation;
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::driver::{DriverContext, node_routing};
 
 /// What only this node's handles and host know, read once before a flow starts.
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::node) struct NodeFacts {
-    /// The executors offered under the stored placement subject, without availability.
-    pub executors: Result<Vec<ExecutorCapability>, String>,
+pub struct NodeFacts {
+    /// What each enabled executor backend offers, before a placement subject is applied.
+    pub offers: Vec<ExecutorOffer>,
     pub class_labels: BTreeMap<String, String>,
     pub load_permille: Option<u32>,
     pub storage_capacity: Option<u64>,
@@ -29,9 +28,11 @@ pub(in crate::node) struct NodeFacts {
 }
 
 impl NodeFacts {
-    pub(in crate::node) async fn gather(ctx: &DriverContext) -> Self {
+    pub fn gather(ctx: &DriverContext) -> Self {
         Self {
-            executors: offered_executors(ctx).await,
+            offers: (ctx.compute_handle.as_ref())
+                .map(|registry| registry.offers())
+                .unwrap_or_default(),
             class_labels: (ctx.blob_handle.as_ref())
                 .map(|blob| class_labels(&blob.routing().catalog))
                 .unwrap_or_default(),
@@ -43,20 +44,8 @@ impl NodeFacts {
     }
 }
 
-/// Every enabled backend at the stored placement subject; none without a subject.
-async fn offered_executors(ctx: &DriverContext) -> Result<Vec<ExecutorCapability>, String> {
-    let Some(registry) = ctx.compute_handle.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let record = (drive(SubjectRecordOperation, ctx).await).map_err(|error| error.to_string())?;
-    let Some(record) = record else {
-        return Ok(Vec::new());
-    };
-    registry
-        .capabilities(&record.subject, record.policy_draining)
-        .map_err(|error| format!("failed to build executor advertisements: {error}"))
-}
-
+/// Derived from the node's own registry, so a class disappears from the labels as soon as the
+/// operator stops offering it.
 pub(in crate::node) fn class_labels(catalog: &BackendCatalog) -> BTreeMap<String, String> {
     catalog
         .classes()

@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobState};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use crate::job_calls::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::attempt::set_cancel_requested;
 use aruna_operations::jobs::store::query::insert_job;

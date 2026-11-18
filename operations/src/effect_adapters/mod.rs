@@ -4,16 +4,19 @@
 
 mod audit;
 mod blob;
+mod compute;
+pub(crate) mod job;
 mod metadata;
 mod net;
 mod session;
+pub(crate) mod shard;
 mod storage;
 mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
-use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::outbound::{ConnectionError, OutboundEffect, OutboundError, OutboundEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -108,6 +111,20 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::DatasetSummary(request)) => {
             metadata::dispatch_summary(*request, context).await
         }
+        Effect::Net(NetEffect::Shard(effect)) => {
+            Box::pin(shard::dispatch_shard(*effect, context)).await
+        }
+        Effect::Net(NetEffect::AuthorizeWritePeer { peer, auth_token }) => {
+            let auth_token = auth_token.map(|token| *token);
+            Box::pin(metadata::dispatch_peer_check(peer, auth_token, context)).await
+        }
+        Effect::Net(NetEffect::RevocationClaims(token)) => {
+            Box::pin(metadata::dispatch_revocation_claims(*token, context)).await
+        }
+        // A routed harvest write drives metadata operations through the handles the runner holds.
+        Effect::Net(NetEffect::HarvestWrite(write)) => {
+            metadata::dispatch_harvest_write(*write, context).await
+        }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
             Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
@@ -133,18 +150,6 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::LocalNode) => {
             let node = context.net_handle.as_ref().map(|net| net.node_id());
             Event::Net(NetEvent::LocalNode(node))
-        }
-        Effect::Net(NetEffect::WatchHolders {
-            realm_id,
-            path,
-            kind,
-        }) => {
-            let holders = context.net_handle.as_ref().map(|net| {
-                let interest = net.watch_interest_snapshot();
-                let holders = interest.matching_nodes(realm_id, &path, kind);
-                (net.node_id(), holders)
-            });
-            Event::Net(NetEvent::WatchHolders(holders))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
@@ -198,6 +203,10 @@ async fn dispatch_unboxed(
         Effect::Session(effect) => {
             Event::Session(Box::new(session::dispatch_session(*effect, context).await))
         }
+        Effect::Compute(effect) => {
+            Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
+        }
+        Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
     trace!(
@@ -233,8 +242,10 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 
@@ -245,5 +256,12 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
+        OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
+        OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
+        OutboundEffect::Connection(_) => OutboundEvent::ConnectionAnswered {
+            result: Err(ConnectionError::NotSent(
+                "this node sends no connection requests".to_string(),
+            )),
+        },
     }
 }

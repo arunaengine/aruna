@@ -1464,9 +1464,13 @@ async fn offered_history(
         user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
     };
     std::fs::write(&file, b"one").unwrap();
-    let first = offer_directory(context, offer.clone()).await.unwrap();
+    let first = drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     if withdraw {
         let input = WithdrawOfferInput {
             bucket: offer.bucket.clone(),
@@ -1474,7 +1478,7 @@ async fn offered_history(
             node_id: offer.node_id,
             user_id: offer.user_id,
         };
-        withdraw_offer(context, input).await.unwrap();
+        drive(withdraw_offer(input), context).await.unwrap();
     }
     (offer, first.observed[0].version_id)
 }

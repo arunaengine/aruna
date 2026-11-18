@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
@@ -18,15 +18,16 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_operations::auth::bearer_token::{
-    ArunaValidationState, decode_bearer_token, realm_token_revoked, realm_user_cutoff,
+    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, TokenRevokedOperation,
+    UserCutoffOperation,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::testing::sync_topics;
 use aruna_storage::StorageHandle;
-use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -36,7 +37,6 @@ use ulid::Ulid;
 use crate::convergence::wait_for_convergence;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replicas};
-
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Mirrors how production wires revocation: enforcement reads the replicated
@@ -46,26 +46,16 @@ struct PeerAuthState {
     realm_id: RealmId,
 }
 
-#[async_trait]
-impl ArunaValidationState for PeerAuthState {
-    async fn is_token_revoked(
-        &self,
-        realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        realm_token_revoked(&self.storage, *realm_id, token_hash).await
-    }
-
-    async fn user_cutoff(
-        &self,
-        realm_id: &RealmId,
-        user_id: &aruna_core::UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        realm_user_cutoff(&self.storage, *realm_id, user_id).await
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        *realm_id == self.realm_id
+impl PeerAuthState {
+    async fn decode(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = TokenChecks {
+            trust: IssuerTrust::Listed(HashSet::from([self.realm_id])),
+            revocation: RevocationCheck::Realm,
+            linked_realm: None,
+            keys: None,
+        };
+        let context = DriverContext::storage_only(self.storage.clone());
+        drive(DecodeTokenOperation::new(token, checks), &context).await
     }
 }
 
@@ -81,7 +71,7 @@ async fn peer_denies_token() -> TestResult<()> {
     let token_hash = bearer_token_hash(&token);
 
     let peer = peer_auth(&nodes[1], realm_id);
-    decode_bearer_token(&peer, &token)
+    peer.decode(&token)
         .await
         .expect("peer accepts the token before it is revoked");
 
@@ -106,14 +96,18 @@ async fn peer_denies_token() -> TestResult<()> {
         "the revocation never reached the peer node",
         || async {
             Ok(usize::from(
-                !realm_token_revoked(&nodes[1].context.storage_handle, realm_id, &token_hash)
-                    .await?,
+                !drive(
+                    TokenRevokedOperation::new(realm_id, &token_hash),
+                    &nodes[1].context,
+                )
+                .await?,
             ))
         },
     )
     .await?;
 
-    let error = decode_bearer_token(&peer, &token)
+    let error = peer
+        .decode(&token)
         .await
         .expect_err("peer rejects the revoked token");
     assert!(matches!(error, ArunaBearerError::TokenRevoked));
@@ -122,13 +116,13 @@ async fn peer_denies_token() -> TestResult<()> {
     // state built fresh over the same storage still denies the token.
     let restarted = peer_auth(&nodes[1], realm_id);
     assert!(matches!(
-        decode_bearer_token(&restarted, &token).await,
+        restarted.decode(&token).await,
         Err(ArunaBearerError::TokenRevoked)
     ));
 
     // Only the revoked token is denied; the realm stays usable.
     let (other, _) = mint_token(&signing_key, realm_id, user_id);
-    decode_bearer_token(&peer, &other)
+    peer.decode(&other)
         .await
         .expect("peer still accepts a token that was never revoked");
 
@@ -171,9 +165,12 @@ async fn peer_applies_cutoff() -> TestResult<()> {
         "the user cutoff never reached the peer node",
         || async {
             Ok(usize::from(
-                realm_user_cutoff(&nodes[1].context.storage_handle, realm_id, &user_id)
-                    .await?
-                    .is_none(),
+                drive(
+                    UserCutoffOperation::new(realm_id, &user_id),
+                    &nodes[1].context,
+                )
+                .await?
+                .is_none(),
             ))
         },
     )
@@ -181,13 +178,13 @@ async fn peer_applies_cutoff() -> TestResult<()> {
 
     let peer = peer_auth(&nodes[1], realm_id);
     assert!(matches!(
-        decode_bearer_token(&peer, &older).await,
+        peer.decode(&older).await,
         Err(ArunaBearerError::TokenRevoked)
     ));
-    decode_bearer_token(&peer, &newer)
+    peer.decode(&newer)
         .await
         .expect("a token issued at the cutoff stays valid");
-    decode_bearer_token(&peer, &other)
+    peer.decode(&other)
         .await
         .expect("another user's token stays valid");
 
@@ -273,12 +270,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }
@@ -331,19 +323,8 @@ async fn seed_sync_topic(
         other => return Err(format!("unexpected config seed publish event: {other:?}").into()),
     }
 
-    match nodes[0]
-        .net
-        .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentEffect::SyncDocuments {
-                topics: vec![topic],
-                peers: Vec::new(),
-            },
-        )))
-        .await
-    {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        other => Err(format!("unexpected config seed sync event: {other:?}").into()),
-    }
+    sync_topics(nodes[0].context.as_ref(), vec![topic], Vec::new()).await?;
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

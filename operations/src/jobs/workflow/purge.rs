@@ -23,7 +23,7 @@ use super::super::store::{put_purge_checkpoint, read_purge_checkpoint};
 use super::purge_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFilesOperation};
 use crate::driver::drive_retry;
@@ -439,13 +439,15 @@ async fn authorize_object(
         spec.scope.bucket(),
         key,
     );
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            spec.auth_context.realm_id,
+            &spec.auth_context,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
         &ctx.driver,
-        spec.auth_context.realm_id,
-        &spec.auth_context,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
     )
     .await
     .map_err(|error| match error {

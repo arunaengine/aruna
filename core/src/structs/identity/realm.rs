@@ -40,6 +40,9 @@ use ulid::Ulid;
 
 pub const ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
 
+/// This node's id and realm, while it has a realm transport.
+pub type NodeRealm = Option<(crate::NodeId, RealmId)>;
+
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
 

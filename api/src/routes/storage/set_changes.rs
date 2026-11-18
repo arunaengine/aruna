@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::AuthContext;
@@ -225,7 +226,7 @@ pub async fn join_distributed(
             .collect::<ServerResult<_>>()?,
         sizes,
     };
-    let report = join_member(&state.get_ctx(), (&auth, bearer), set_id, input)
+    let report = drive(join_member(&state.get_ctx(), (&auth, bearer), set_id, input), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
@@ -266,7 +267,7 @@ pub async fn leave_distributed(
     Path((group_id, set_id, member_id)): Path<(Ulid, Ulid, Ulid)>,
 ) -> ServerResult<Json<ChangeResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
-    let revision = leave_member(&state.get_ctx(), (&auth, bearer), set_id, member_id)
+    let revision = drive(leave_member(&state.get_ctx(), (&auth, bearer), set_id, member_id), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok(Json(change_response(set_id, revision)))
@@ -327,7 +328,7 @@ pub async fn copy_distributed(
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let sizes = range_sizes(&state, relay.as_ref(), set_id).await?;
     let copy = (id(&request.range_id)?, id(&request.member_id)?, &sizes[..]);
-    let report = add_copy(&state.get_ctx(), (&auth, bearer), set_id, copy)
+    let report = drive(add_copy(&state.get_ctx(), (&auth, bearer), set_id, copy), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok((StatusCode::ACCEPTED, Json(admission_response(report))))
@@ -390,7 +391,7 @@ pub async fn split_distributed(
 ) -> ServerResult<Json<SplitResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let split = (id(&request.range_id)?, request.split_key, request.dry_run);
-    let (plan, revision) = split_range(&state.get_ctx(), (&auth, bearer), set_id, split)
+    let (plan, revision) = drive(split_range(&state.get_ctx(), (&auth, bearer), set_id, split), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok(Json(SplitResponse {
@@ -462,7 +463,7 @@ pub async fn transfer_distributed(
         RoleName::Leave => TransferRole::Leave,
     };
     let plan = (id(&request.range_id)?, id(&request.to)?, role);
-    let revision = transfer_range(&state.get_ctx(), (&auth, bearer), set_id, plan)
+    let revision = drive(transfer_range(&state.get_ctx(), (&auth, bearer), set_id, plan), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok((
@@ -513,7 +514,7 @@ pub async fn settings_distributed(
 ) -> ServerResult<Json<ChangeResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let settings = settings_of(&request);
-    let revision = change_settings(&state.get_ctx(), (&auth, bearer), set_id, settings)
+    let revision = drive(change_settings(&state.get_ctx(), (&auth, bearer), set_id, settings), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok(Json(change_response(set_id, revision)))
@@ -556,7 +557,7 @@ pub async fn delete_distributed(
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<(StatusCode, Json<ChangeResponse>)> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
-    let revision = delete_set(&state.get_ctx(), (&auth, bearer), set_id)
+    let revision = drive(delete_set(&state.get_ctx(), (&auth, bearer), set_id), &state.get_ctx())
         .await
         .map_err(map_create_error)?;
     Ok((

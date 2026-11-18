@@ -6,7 +6,7 @@ use super::objects::{self, Blob};
 use super::project::author;
 use super::snapshot::execute;
 use super::{GitError, lfs, location, publish};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
@@ -157,13 +157,9 @@ impl PushTarget {
             .ok_or(GitError::Unavailable)?;
         let target = object_permission_path(auth.realm_id, bucket.group_id, node, name, &key);
         let extras = PolicyRequestExtras::operation("s3.PutObject");
-        authorize(
+        drive(
+            AuthorizeOperation::new(auth.realm_id, &auth, &target, &Permission::WRITE, extras),
             context,
-            auth.realm_id,
-            &auth,
-            &target,
-            &Permission::WRITE,
-            extras,
         )
         .await?;
         let content = match LfsObject::from_pointer(&bytes) {
@@ -261,13 +257,9 @@ async fn copied(
         &source.key,
     );
     let extras = PolicyRequestExtras::operation("s3.GetObject");
-    authorize(
+    drive(
+        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::READ,
-        extras,
     )
     .await?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), context)

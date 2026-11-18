@@ -7,10 +7,9 @@ use std::sync::Arc;
 use aruna_core::structs::execution::job::{JobId, RunCrateStatus};
 use ulid::Ulid;
 
-use super::admission_race::{config, envelope, seed};
-use crate::jobs::lifecycle::target::commit_receipt;
+use super::admission_race::{commit_receipt, config, envelope, seed};
 use crate::jobs::store::attempt::{put_crate_outcome, read_crate_status, read_run_link};
-use crate::jobs::store::query::batch_delete;
+use crate::jobs::store::row_calls::delete_rows;
 use crate::jobs::store::state::read_job_record;
 use crate::tests::records::{Family, context};
 use aruna_core::structs::execution::job::prune_delete_entries;
@@ -55,7 +54,7 @@ async fn run_link_lasts() {
         .await
         .unwrap()
         .unwrap();
-    batch_delete(&ctx, prune_delete_entries(&record), None)
+    crate::driver::drive(delete_rows(prune_delete_entries(&record)), &ctx)
         .await
         .unwrap();
     assert!(

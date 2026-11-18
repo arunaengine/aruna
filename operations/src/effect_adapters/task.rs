@@ -37,6 +37,7 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     match effect {
         TaskEffect::ResetTimer { key, .. }
         | TaskEffect::ShortenTimer { key, .. }
+        | TaskEffect::ScheduleIdleTimer { key, .. }
         | TaskEffect::CancelTimer { key }
         | TaskEffect::AbortRunningHandlers { key } => Some(key.clone()),
     }

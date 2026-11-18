@@ -15,8 +15,8 @@ use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::types::GroupId;
 
 use super::{MirrorPeer, SyncMirrorError, create_peer};
-use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::mirror_request::MirrorRequestOperation;
 use crate::sync::sync_relationship::{
@@ -95,7 +95,7 @@ impl EnsureMirrorOperation {
             session: None,
         };
         let extras = PolicyRequestExtras::operation(operation);
-        let check = AuthorizeOperation::new(realm_id, auth, path, permission, extras);
+        let check = AuthorizeOperation::new(realm_id, &auth, &path, &permission, extras);
         Next::Call(IoCall::child(check))
     }
 

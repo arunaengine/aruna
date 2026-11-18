@@ -46,7 +46,9 @@ type Turn = Result<Next<()>, RefreshUsageError>;
 
 /// A storage step whose failure the refresh logs and skips, so it sees the error event itself.
 fn best_effort(effect: StorageEffect) -> Turn {
-    Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(effect)))))
+    Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+        effect,
+    )))))
 }
 
 /// The realm summary sum's outcome as the event its parent receives.
@@ -249,7 +251,9 @@ impl Operation for RefreshUsageOperation {
             (Stage::BucketScan(groups), Event::Storage(event)) => self.scan_buckets(groups, event),
             (Stage::MarkWrite, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.stage = Stage::Wake;
-                Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))))
+                Ok(Next::Call(IoCall::Effect(Box::new(
+                    schedule_snapshot_publish(),
+                ))))
             }
             (Stage::MarkWrite, Event::Storage(StorageEvent::Error { error })) => {
                 self.mark_failed(&error)
@@ -391,7 +395,9 @@ mod state_machine_tests {
             RefreshUsageOperation::bucket_page(None)
         );
         assert_eq!(operation.next(page(buckets, None)), marks);
-        let wake = Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))));
+        let wake = Ok(Next::Call(IoCall::Effect(Box::new(
+            schedule_snapshot_publish(),
+        ))));
         assert_eq!(operation.next(written()), wake);
         let scheduled = TaskEvent::TimerScheduled {
             key: TaskKey::PublishUsageSnapshots,

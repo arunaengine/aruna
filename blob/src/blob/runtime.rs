@@ -87,6 +87,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
         BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
         BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
+        // Its streams and spool take their own slots through nested effects.
+        BlobEffect::Remote(_) => (EffectClass::Control, "remote"),
         BlobEffect::SpoolLocal { .. } => (EffectClass::Spool, "spool_local"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
@@ -821,6 +823,12 @@ impl BlobHandler {
             BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
                 Box::pin(self.read_blob_range(location, range)).await
+            }
+            BlobEffect::Remote(request) => {
+                let handle = BlobHandle {
+                    handler: self.clone(),
+                };
+                BlobEvent::Remote(Box::pin(handle.run_remote(*request)).await)
             }
             BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
             BlobEffect::ReleaseReservation { id } => {

@@ -4,18 +4,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
+use aruna_core::events::{Event, LocalFileEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::done;
 use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
     SyncedFolder, WriteGuard, decide,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -75,27 +76,53 @@ pub enum ReconcileError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("reconciling the folder page did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
+    #[error("unexpected answer to a file hash: {0}")]
+    UnexpectedEvent(&'static str),
 }
 
+impl From<IoError> for ReconcileError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type ReconcileNext = Result<Next<ReconcilePlan>, ReconcileError>;
+
+/// What the pending call of a page answers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ReconcileState {
-    Init,
     ReadBases,
     HashEntry { index: usize },
-    StartTransaction,
-    WriteRows { txn_id: TxnId },
-    DeleteRows { txn_id: TxnId },
-    Commit,
-    Finish,
-    Error,
+    CommitRows,
+}
+
+/// Commits the rows one page decided, together.
+#[derive(Debug, PartialEq)]
+struct CommitRowsOperation {
+    writes: Vec<(String, Key, Value)>,
+    deletes: Option<Vec<(String, Key)>>,
+}
+
+impl Operation for CommitRowsOperation {
+    type Output = ();
+    type Error = ReconcileError;
+
+    fn first(&mut self) -> Result<Next<()>, ReconcileError> {
+        let writes = std::mem::take(&mut self.writes);
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ReconcileError> {
+        done(result)?;
+        Ok(match self.deletes.take() {
+            Some(deletes) => Next::Call(IoCall::Delete(deletes)),
+            None => Next::Done(()),
+        })
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -119,7 +146,6 @@ pub struct ReconcileFolderOperation {
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     plan: ReconcilePlan,
-    output: Option<Result<ReconcilePlan, ReconcileError>>,
 }
 
 impl ReconcileFolderOperation {
@@ -127,7 +153,7 @@ impl ReconcileFolderOperation {
         Self {
             fine_timestamps: input.local.values().any(fine_stat),
             input,
-            state: ReconcileState::Init,
+            state: ReconcileState::ReadBases,
             paths: Vec::new(),
             bases: Vec::new(),
             queued: Vec::new(),
@@ -136,26 +162,25 @@ impl ReconcileFolderOperation {
             writes: Vec::new(),
             deletes: Vec::new(),
             plan: ReconcilePlan::default(),
-            output: None,
         }
     }
 
-    /// Emits the next strong hash, or moves on to the decisions when the batch
-    /// is done.
-    fn next_hash(&mut self, index: usize) -> Effects {
+    /// Asks for the next strong hash, or moves on to the decisions when the batch is done.
+    fn next_hash(&mut self, index: usize) -> ReconcileNext {
         let Some(position) = self.hashing.get(index) else {
             return self.settle();
         };
         let relative = self.paths[*position].clone();
         self.state = ReconcileState::HashEntry { index };
-        smallvec![Effect::LocalFile(LocalFileEffect::Hash {
+        let hash = LocalFileEffect::Hash {
             root: self.input.folder.root.clone(),
             relative,
-        })]
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::LocalFile(hash)))))
     }
 
     /// Turns every decision of the page into rows and downloads.
-    fn settle(&mut self) -> Effects {
+    fn settle(&mut self) -> ReconcileNext {
         let policy = self.input.folder.policy();
         let paths = self.paths.clone();
         for (index, relative) in paths.iter().enumerate() {
@@ -189,26 +214,72 @@ impl ReconcileFolderOperation {
                 continue;
             }
             let action = decide(policy, local.as_ref(), base.as_ref(), remote.as_ref());
-            if let Err(error) = self.record(
+            self.record(
                 index,
                 relative,
                 action,
                 local.as_ref(),
                 base,
                 remote.as_ref(),
-            ) {
-                return fail(self, error);
-            }
+            )?;
         }
         if self.writes.is_empty() && self.deletes.is_empty() {
-            self.state = ReconcileState::Finish;
-            self.output = Some(Ok(std::mem::take(&mut self.plan)));
-            return smallvec![];
+            return Ok(Next::Done(std::mem::take(&mut self.plan)));
         }
-        self.state = ReconcileState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = ReconcileState::CommitRows;
+        // The rows commit on their own: the reads and hashes before them hold no transaction.
+        Ok(Next::Call(IoCall::child(CommitRowsOperation {
+            writes: std::mem::take(&mut self.writes),
+            deletes: Some(std::mem::take(&mut self.deletes)),
+        })))
+    }
+
+    fn read_bases(&mut self, values: Vec<Option<Value>>) -> ReconcileNext {
+        let (bases, queued) = values.split_at(self.paths.len().min(values.len()));
+        self.bases = (bases.iter())
+            .map(|value| {
+                value
+                    .as_ref()
+                    .and_then(|bytes| SyncBase::from_bytes(bytes.as_ref()).ok())
+            })
+            .collect();
+        self.queued = (queued.iter())
+            .map(|value| {
+                value
+                    .as_ref()
+                    .and_then(|bytes| SyncUpload::from_bytes(bytes.as_ref()).ok())
+            })
+            .collect();
+        let eligible = self.hash_batch();
+        // A page that cannot hash every moved file decides only what it read:
+        // the rest waits for the next pass, which is asked for promptly.
+        self.plan.truncated |= eligible.len() > MAX_HASH_BATCH;
+        self.deferred = eligible.iter().copied().skip(MAX_HASH_BATCH).collect();
+        self.hashing = eligible.into_iter().take(MAX_HASH_BATCH).collect();
+        self.next_hash(0)
+    }
+
+    fn hashed(&mut self, index: usize, event: Event) -> ReconcileNext {
+        let Some(position) = self.hashing.get(index).copied() else {
+            return self.settle();
+        };
+        let Event::LocalFile(event) = event else {
+            return Err(ReconcileError::UnexpectedEvent(event.label()));
+        };
+        // A refusal or an error simply leaves the strong hash unknown,
+        // which every later decision already treats as changed bytes.
+        if let LocalFileEvent::Hashed {
+            fingerprint,
+            blake3,
+            size,
+        } = event
+            && let Some(local) = self.input.local.get_mut(&self.paths[position])
+            && local.fingerprint == fingerprint
+        {
+            local.blake3 = Some(blake3);
+            local.size = size;
+        }
+        self.next_hash(index + 1)
     }
 
     /// One decision, as the rows and downloads it implies.
@@ -511,11 +582,11 @@ fn upload_entry_state(deleted: bool, had_base: bool) -> EntryState {
     }
 }
 
-impl EffectOperation for ReconcileFolderOperation {
+impl Operation for ReconcileFolderOperation {
     type Output = ReconcilePlan;
     type Error = ReconcileError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ReconcileNext {
         let mut paths: Vec<String> = self
             .input
             .local
@@ -526,9 +597,7 @@ impl EffectOperation for ReconcileFolderOperation {
         paths.sort();
         paths.dedup();
         if paths.is_empty() {
-            self.state = ReconcileState::Finish;
-            self.output = Some(Ok(ReconcilePlan::default()));
-            return smallvec![];
+            return Ok(Next::Done(ReconcilePlan::default()));
         }
         let folder_id = self.input.folder.folder_id;
         // Both rows of every path in one read: the base decides, and the outbox
@@ -549,135 +618,17 @@ impl EffectOperation for ReconcileFolderOperation {
             }))
             .collect();
         self.paths = paths;
-        self.state = ReconcileState::ReadBases;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, ReconcileError::Storage(error));
-            }
-            other => other,
-        };
-
+    fn next(&mut self, result: IoResult) -> ReconcileNext {
         match self.state {
-            ReconcileState::ReadBases => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return unexpected(self, "batch read result", got);
-                };
-                let split = self.paths.len();
-                if values.len() != split * 2 {
-                    return unexpected(self, "one base and one outbox row per path", got);
-                }
-                let (bases, queued) = values.split_at(split);
-                self.bases = bases
-                    .iter()
-                    .map(|(_, value)| {
-                        value
-                            .as_ref()
-                            .and_then(|bytes| SyncBase::from_bytes(bytes.as_ref()).ok())
-                    })
-                    .collect();
-                self.queued = queued
-                    .iter()
-                    .map(|(_, value)| {
-                        value
-                            .as_ref()
-                            .and_then(|bytes| SyncUpload::from_bytes(bytes.as_ref()).ok())
-                    })
-                    .collect();
-                let eligible = self.hash_batch();
-                // A page that cannot hash every moved file decides only what it read:
-                // the rest waits for the next pass, which is asked for promptly.
-                self.plan.truncated |= eligible.len() > MAX_HASH_BATCH;
-                self.deferred = eligible.iter().copied().skip(MAX_HASH_BATCH).collect();
-                self.hashing = eligible.into_iter().take(MAX_HASH_BATCH).collect();
-                self.next_hash(0)
+            ReconcileState::ReadBases => self.read_bases(result.values()?),
+            ReconcileState::HashEntry { index } => self.hashed(index, result.event()?),
+            ReconcileState::CommitRows => {
+                result.child::<(), ReconcileError>()??;
+                Ok(Next::Done(std::mem::take(&mut self.plan)))
             }
-            ReconcileState::HashEntry { index } => {
-                let Some(position) = self.hashing.get(index).copied() else {
-                    return self.settle();
-                };
-                let got = event.label();
-                let Event::LocalFile(event) = event else {
-                    return unexpected(self, "local file result", got);
-                };
-                // A refusal or an error simply leaves the strong hash unknown,
-                // which every later decision already treats as changed bytes.
-                if let LocalFileEvent::Hashed {
-                    fingerprint,
-                    blake3,
-                    size,
-                } = event
-                    && let Some(local) = self.input.local.get_mut(&self.paths[position])
-                    && local.fingerprint == fingerprint
-                {
-                    local.blake3 = Some(blake3);
-                    local.size = size;
-                }
-                self.next_hash(index + 1)
-            }
-            ReconcileState::StartTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return unexpected(self, "transaction started", got);
-                };
-                if self.writes.is_empty() {
-                    return self.emit_deletes(txn_id);
-                }
-                self.state = ReconcileState::WriteRows { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: std::mem::take(&mut self.writes),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            ReconcileState::WriteRows { txn_id } => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return unexpected(self, "batch write result", got);
-                };
-                self.emit_deletes(txn_id)
-            }
-            ReconcileState::DeleteRows { txn_id } => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-                    return unexpected(self, "batch delete result", got);
-                };
-                self.state = ReconcileState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            ReconcileState::Commit => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return unexpected(self, "transaction committed", got);
-                };
-                self.state = ReconcileState::Finish;
-                self.output = Some(Ok(std::mem::take(&mut self.plan)));
-                smallvec![]
-            }
-            ReconcileState::Init | ReconcileState::Finish | ReconcileState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReconcileState::Finish | ReconcileState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ReconcileError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            ReconcileState::WriteRows { txn_id } | ReconcileState::DeleteRows { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
         }
     }
 }
@@ -744,47 +695,13 @@ impl ReconcileFolderOperation {
             && self.fine_timestamps
             && stat_settled(local, self.input.now_ms)
     }
-
-    fn emit_deletes(&mut self, txn_id: TxnId) -> Effects {
-        if self.deletes.is_empty() {
-            self.state = ReconcileState::Commit;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        self.state = ReconcileState::DeleteRows { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: Some(txn_id),
-        })]
-    }
-}
-
-fn unexpected(
-    operation: &mut ReconcileFolderOperation,
-    expected: &'static str,
-    got: &'static str,
-) -> Effects {
-    let state = format!("{:?}", operation.state);
-    fail(
-        operation,
-        ReconcileError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        },
-    )
-}
-
-fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = ReconcileState::Error;
-    operation.output = Some(Err(error));
-    cleanup
 }
 
 #[cfg(test)]
 pub(super) mod pure_tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::offered_directory::FileStat;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
@@ -902,73 +819,75 @@ pub(super) mod pure_tests {
         run_queued(operation, base, None)
     }
 
+    fn stored_rows(base: Option<SyncBase>, queued: Option<SyncUpload>) -> IoResult {
+        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
+        let queued = queued.map(|row| ByteView::from(row.to_bytes().expect("row encodes")));
+        IoResult::Values(vec![value, queued])
+    }
+
     /// The same, with an upload row already waiting for this path.
     fn run_queued(
         mut operation: ReconcileFolderOperation,
         base: Option<SyncBase>,
         queued: Option<SyncUpload>,
     ) -> ReconcilePlan {
-        let effects = operation.start();
         assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::BatchRead { .. }))
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(_)))
         ));
-        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
-        let queued = queued.map(|row| ByteView::from(row.to_bytes().expect("row encodes")));
-        let mut effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (ByteView::from(vec![0u8]), value),
-                (ByteView::from(vec![1u8]), queued),
-            ],
-        }));
-        while !operation.is_complete() {
-            let effect = effects.first().expect("the operation must ask for more");
-            let event = match effect {
-                Effect::LocalFile(LocalFileEffect::Hash { .. }) => {
-                    Event::LocalFile(LocalFileEvent::Hashed {
+        let mut next = operation.next(stored_rows(base, queued));
+        loop {
+            match next.expect("the page must decide") {
+                Next::Done(plan) => return plan,
+                Next::Call(IoCall::Effect(effect)) => {
+                    assert!(matches!(
+                        *effect,
+                        Effect::LocalFile(LocalFileEffect::Hash { .. })
+                    ));
+                    let hashed = Event::LocalFile(LocalFileEvent::Hashed {
                         fingerprint: "5-2-2-2".to_string(),
                         blake3: [5u8; 32],
                         size: 5,
-                    })
+                    });
+                    next = operation.next(IoResult::Event(Box::new(hashed)));
                 }
-                Effect::Storage(StorageEffect::StartTransaction { .. }) => {
-                    Event::Storage(StorageEvent::TransactionStarted {
-                        txn_id: Ulid::from_bytes([2u8; 16]),
-                    })
+                Next::Call(IoCall::Child(_)) => {
+                    let committed: Result<(), ReconcileError> = Ok(());
+                    next = operation.next(IoResult::Child(ChildOutcome::new(committed)));
                 }
-                Effect::Storage(StorageEffect::BatchWrite { .. }) => {
-                    Event::Storage(StorageEvent::BatchWriteResult {
-                        entries: Vec::new(),
-                    })
-                }
-                Effect::Storage(StorageEffect::BatchDelete { .. }) => {
-                    Event::Storage(StorageEvent::BatchDeleteResult {
-                        entries: Vec::new(),
-                    })
-                }
-                Effect::Storage(StorageEffect::CommitTransaction { txn_id }) => {
-                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: *txn_id })
-                }
-                other => panic!("unexpected effect {other:?}"),
-            };
-            effects = operation.step(event);
+                other => panic!("unexpected step {other:?}"),
+            }
         }
-        operation.finalize().expect("the page must decide")
     }
 
     #[test]
-    fn rejects_wrong_event() {
-        // An event the state cannot explain must fail loudly, not be ignored.
+    fn rejects_wrong_result() {
+        // A result the state cannot explain must fail loudly, not be ignored.
         let (mut operation, _) = operation(Some(observed("5-1-1-1")), None, None);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([2u8; 16]),
-        }));
-        assert!(operation.is_complete());
+        operation.first().unwrap();
         assert!(matches!(
-            operation.finalize(),
-            Err(ReconcileError::UnexpectedEvent { .. })
+            operation.next(IoResult::Done),
+            Err(ReconcileError::Storage(_))
         ));
+    }
+
+    // The decided rows commit together in their own transaction.
+    #[test]
+    fn commits_rows_together() {
+        let key = ByteView::from(vec![1u8]);
+        let row = ("space".to_string(), key.clone(), ByteView::from(vec![2u8]));
+        let delete = ("space".to_string(), key);
+        let mut commit = CommitRowsOperation {
+            writes: vec![row.clone()],
+            deletes: Some(vec![delete.clone()]),
+        };
+        assert_eq!(commit.transaction(), TransactionMode::Write);
+        assert_eq!(commit.first(), Ok(Next::Call(IoCall::Write(vec![row]))));
+        assert_eq!(
+            commit.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(vec![delete])))
+        );
+        assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
     }
 
     #[test]
@@ -988,11 +907,9 @@ pub(super) mod pure_tests {
             remote: BTreeMap::new(),
             now_ms: 10,
         });
-        operation.start();
-        let values = (0..paths.len() * 2)
-            .map(|index| (ByteView::from(vec![index as u8]), None))
-            .collect();
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        operation.first().unwrap();
+        let values = vec![None; paths.len() * 2];
+        operation.next(IoResult::Values(values)).unwrap();
 
         assert_eq!(operation.deferred.len(), 2);
         assert!(operation.plan.truncated, "the folder must be passed again");
@@ -1106,18 +1023,15 @@ pub(super) mod pure_tests {
     /// Whether the first thing this pass asks for is a hash of the file.
     fn hashes_first(local: Observed, base: Option<SyncBase>) -> bool {
         let (mut operation, base) = operation(Some(local), base, None);
-        operation.start();
-        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (ByteView::from(vec![0u8]), value),
-                (ByteView::from(vec![1u8]), None),
-            ],
-        }));
-        matches!(
-            effects.first(),
-            Some(Effect::LocalFile(LocalFileEffect::Hash { .. }))
-        )
+        asks_hash(&mut operation, base)
+    }
+
+    fn asks_hash(operation: &mut ReconcileFolderOperation, base: Option<SyncBase>) -> bool {
+        operation.first().unwrap();
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(stored_rows(base, None)) else {
+            return false;
+        };
+        matches!(*effect, Effect::LocalFile(LocalFileEffect::Hash { .. }))
     }
 
     #[test]
@@ -1160,18 +1074,7 @@ pub(super) mod pure_tests {
             Some(base("5-1", Some(Ulid::from_bytes([4u8; 16])))),
             Some(head(Ulid::from_bytes([5u8; 16]), false)),
         );
-        operation.start();
-        let value = base.map(|base| ByteView::from(base.to_bytes().expect("base encodes")));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (ByteView::from(vec![0u8]), value),
-                (ByteView::from(vec![1u8]), None),
-            ],
-        }));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::LocalFile(LocalFileEffect::Hash { .. }))
-        ));
+        assert!(asks_hash(&mut operation, base));
     }
 
     #[test]

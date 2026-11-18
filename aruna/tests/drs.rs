@@ -9,7 +9,8 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::node::node_info::publish_node_info;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
@@ -412,17 +413,19 @@ async fn remote_version_downloads() -> TestResult<()> {
             .await?;
 
         // The fixture only seeds the joiner's document locally; the seed needs its published url.
-        publish_node_info(
-            joiner.context.as_ref(),
-            joiner.config.node_id,
+        let publish = SeedInfoOperation::new(
             joiner.config.realm_id,
+            joiner.config.node_id,
             NodeUrls {
                 api: joiner.config.api_public_url.clone(),
                 s3: joiner.config.s3_public_url.clone(),
             },
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+            NodeFacts::gather(joiner.context.as_ref()),
+            true,
+        );
+        aruna_operations::driver::drive(publish, joiner.context.as_ref())
+            .await
+            .map_err(std::io::Error::other)?;
 
         let object_id = VersionedObjectArn::new(
             seed.realm_id,

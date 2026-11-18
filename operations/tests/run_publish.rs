@@ -24,7 +24,7 @@ use aruna_operations::device::publish_run::{
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::prune::prune_job_batch;
+use crate::job_calls::prune_job_batch;
 use aruna_operations::jobs::store::attempt::{put_crate_status, read_crate_status, read_run_link};
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::read_job_record;
@@ -201,7 +201,7 @@ async fn publishes_local_run() -> TestResult<()> {
     let server = realm.node(0);
     // A node lists a new group a little later, so a fetch can miss it; the device must hold it.
     wait_until("the group on the device", device.node_id(), || async {
-        fetch_realm_documents(&device.context, FETCH_BUDGET).await
+        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false)
             && matches!(read_group_auth(device, group_id).await, Ok(Some(_)))
     })
     .await?;
@@ -366,7 +366,7 @@ async fn checks_empty_target() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
     let server = realm.node(0);
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let job_id = finished_run(
         (&realm, device),
         group_id,
@@ -448,7 +448,7 @@ async fn crate_redrive_links() -> TestResult<()> {
     assert_eq!((link.group_id, link.created_by), (group_id, realm.user_id));
 
     // The node prunes on its own schedule; a run inside its retention survives a pass.
-    prune_job_batch(server.context.as_ref(), &[]).await?;
+    prune_job_batch(server.context.as_ref()).await?;
     put_crate_status(
         &server.context,
         job_id,

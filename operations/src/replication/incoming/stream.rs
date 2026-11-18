@@ -25,16 +25,16 @@ use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 use super::{IncomingVersionOperation, IncomingVersionResult};
-use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::notifications::watch::emit::emit_watch_event;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::locations::LocationSummaryOperation;
@@ -275,7 +275,7 @@ async fn answer_version_key(
     set_id: Ulid,
     version_id: Ulid,
 ) {
-    let key = crate::distribution::resolve::indexed_key(context, set_id, version_id)
+    let key = drive(crate::distribution::resolve::indexed_key(set_id, version_id), context)
         .await
         .ok()
         .flatten();
@@ -302,7 +302,7 @@ async fn answer_content(
 ) {
     use crate::distribution::resolve::{MAX_CONTENT_VERSIONS, content_versions};
     let Ok((versions, more)) =
-        content_versions(context, set_id, &identity, MAX_CONTENT_VERSIONS).await
+        drive(content_versions(set_id, &identity, MAX_CONTENT_VERSIONS), context).await
     else {
         blob_handle.close_stream(stream_id).await;
         return;
@@ -507,25 +507,23 @@ async fn emit_replication_watch(
     }
     let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
     let occurred_at_ms = aruna_core::time::unix_timestamp_millis();
-    emit_watch_event(
-        context,
-        WatchEvent {
-            event_id: Ulid::generate(),
-            realm_id: manifest.auth_context.realm_id,
-            kind: WatchEventKind::DataUploaded,
-            path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
-            actor: manifest.auth_context.user_id,
-            occurred_at_ms,
-            detail: WatchEventDetail::DataUploaded {
-                group_id,
-                node_id,
-                bucket: manifest.bucket.clone(),
-                key: manifest.key.clone(),
-                size_bytes,
-            },
+    let emit = EmitEventOperation::new(WatchEvent {
+        event_id: Ulid::generate(),
+        realm_id: manifest.auth_context.realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+        actor: manifest.auth_context.user_id,
+        occurred_at_ms,
+        detail: WatchEventDetail::DataUploaded {
+            group_id,
+            node_id,
+            bucket: manifest.bucket.clone(),
+            key: manifest.key.clone(),
+            size_bytes,
         },
-    )
-    .await;
+    });
+    // Failures only warn inside the operation.
+    let _ = drive(emit, context).await;
 }
 
 async fn allow_policy(
@@ -535,13 +533,15 @@ async fn allow_policy(
     permission: &Permission,
     operation: &str,
 ) -> Result<bool, String> {
-    match authorize(
+    match drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            path,
+            permission,
+            PolicyRequestExtras::operation(operation),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        path,
-        permission,
-        PolicyRequestExtras::operation(operation),
     )
     .await
     {
@@ -692,20 +692,25 @@ async fn bao_policy(
                 unique.entry(key).or_insert(candidate);
             }
             let candidates = unique.into_values().collect::<Vec<_>>();
-            let evaluators = PolicyEvaluator::load_bulk(
+            let evaluators = drive(
+                PolicyBulkOperation::new(
+                    candidates
+                        .iter()
+                        .map(|candidate| (candidate.realm_id, candidate.group_id)),
+                ),
                 context,
-                candidates
-                    .iter()
-                    .map(|candidate| (candidate.realm_id, candidate.group_id)),
             )
             .await
             .map_err(|error| error.to_string())?;
-            let permissions = GroupPermissionRules::collect(
+            let permissions = drive(
+                GroupRulesOperation::new(
+                    Some(&request.auth_context),
+                    candidates.iter().map(|candidate| candidate.group_id),
+                ),
                 context,
-                Some(&request.auth_context),
-                candidates.iter().map(|candidate| candidate.group_id),
             )
-            .await;
+            .await
+            .unwrap_or_default();
             let mut allowed = Vec::with_capacity(candidates.len());
             let mut had_denial = false;
             for candidate in candidates {

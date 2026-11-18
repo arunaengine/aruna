@@ -236,6 +236,7 @@ async fn checks_advance_policy() {
 #[tokio::test]
 async fn denies_offered_bucket() {
     use crate::device::sync::repository::folder_bucket;
+    use crate::driver::drive;
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
     let fixture = crate::tests::staging::setup_driver_context().await;
@@ -254,7 +255,7 @@ async fn denies_offered_bucket() {
         node_id,
         user_id,
     };
-    offer_directory(context, offer).await.unwrap();
+    drive(offer_directory(offer), context).await.unwrap();
     let manifest = VersionReplicationManifest {
         bucket,
         key: "note.txt".to_string(),

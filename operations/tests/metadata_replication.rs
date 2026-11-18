@@ -42,12 +42,12 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
+use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use aruna_operations::metadata::update_entry::update_metadata_document;
+use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -55,9 +55,9 @@ use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::{read_outbox_records, reconcile_topics};
 use tokio::time::sleep;
 use ulid::Ulid;
 
@@ -850,7 +850,19 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 expected_revision: None,
             });
-            match update_metadata_document(operation, node.context.as_ref()).await {
+            match drive(
+                UpdateEntryOperation::new(
+                    operation,
+                    node.context
+                        .as_ref()
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                ),
+                node.context.as_ref(),
+            )
+            .await
+            {
                 Ok(_) => return Ok(()),
                 // Backpressure and write conflicts are both answered by retrying.
                 Err(
@@ -1140,10 +1152,11 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
             vec![nodes[0].net.node_id()],
         )
         .await?;
-    let delete_result = nodes[1]
-        .net
-        .reconcile_sync_topics(vec![shard_topic_of(&lifecycle_target)])
-        .await?;
+    let delete_result = reconcile_topics(
+        nodes[1].context.as_ref(),
+        vec![shard_topic_of(&lifecycle_target)],
+    )
+    .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
     let stale_target = DocumentTarget::MetadataCreateEvent {
@@ -1163,10 +1176,11 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         .net
         .sync_topic_peers(shard_topic_of(&stale_target), vec![nodes[0].net.node_id()])
         .await?;
-    let stale_result = nodes[1]
-        .net
-        .reconcile_sync_topics(vec![shard_topic_of(&stale_target)])
-        .await?;
+    let stale_result = reconcile_topics(
+        nodes[1].context.as_ref(),
+        vec![shard_topic_of(&stale_target)],
+    )
+    .await?;
 
     assert!(stale_result.metadata_create_events.is_empty());
     assert!(
@@ -1284,21 +1298,19 @@ async fn install_realm_config(
     // Run startup reconciliation until no missing genesis schedules another pass.
     for _ in 0..3 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::driver::drive(
+                aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    *realm_id,
+                ),
                 &node.context,
-                node.net.node_id(),
-                *realm_id,
             )
-            .await;
+            .await
+            .expect("shard topics restore");
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {

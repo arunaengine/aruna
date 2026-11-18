@@ -130,7 +130,7 @@ fn teardown_skips_absent() {
 }
 
 #[test]
-fn teardown_removes_own_role() {
+fn teardown_removes_role() {
     let (change, _) = change();
     let own = group_doc(&change, vec![role_of(&change, &[], WRITE_ROLE)]);
     let mut teardown = Teardown::new(change);
@@ -168,7 +168,7 @@ fn make_ready_order() {
 }
 
 #[test]
-fn make_ready_names_step() {
+fn ready_names_step() {
     let (change, install) = change();
     let mut ready = MakeReady::new(change, &install);
     let unnamed = Err::<String, _>(AccountError("gone".into()));
@@ -187,7 +187,7 @@ fn make_ready_names_step() {
 }
 
 #[test]
-fn repair_stops_when_ready() {
+fn repair_stops_early() {
     let (change, install) = change();
     let mut repair = RepairAccount::new(change, &install);
     assert!(is_child(repair.first().unwrap()));
@@ -234,7 +234,7 @@ fn realm_admin_smallest() {
 }
 
 #[test]
-fn no_prerequisites_read_nothing() {
+fn no_prerequisites_skip() {
     let mut install = sample_install(Ulid::from_parts(1, 1));
     install.prerequisites.clear();
     assert_eq!(
@@ -254,7 +254,7 @@ fn no_prerequisites_read_nothing() {
 }
 
 #[test]
-fn absent_user_no_plugin() {
+fn absent_not_plugin() {
     let mut account = PluginAccount(UserId::local(Ulid::from_parts(3, 3), realm()));
     account.first().unwrap();
     assert_eq!(

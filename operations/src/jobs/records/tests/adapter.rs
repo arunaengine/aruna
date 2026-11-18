@@ -16,9 +16,10 @@ use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
 use crate::driver::DriverContext;
-use crate::jobs::records::transport::{serve_job_record, serve_launch_offer};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::records::{Family, REALM, secret, user};
+use crate::tests::records::{
+    Family, REALM, secret, serve_job_record, serve_launch_offer, user,
+};
 
 async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
     let dir = tempfile::tempdir().expect("temp dir");

@@ -27,7 +27,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::live_records::LiveRecordsOperation;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 
 use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
 use super::queue_storage::{
@@ -287,7 +287,7 @@ pub(crate) async fn lookup_iri_references(
         };
         let mut records = Vec::with_capacity(page.documents.len());
         for document_id in page.documents.keys() {
-            let record = load_document_record(context, *document_id).await;
+            let record = drive(DocumentRecordOperation::new(*document_id), context).await;
             if let Some(record) = record.map_err(status_error)? {
                 records.push(record);
             }

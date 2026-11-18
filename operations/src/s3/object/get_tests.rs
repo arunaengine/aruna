@@ -2214,7 +2214,9 @@ async fn offered_drift_replaces() {
         node_id: test_node_id(),
         user_id: UserId::new(Ulid::generate(), realm_id),
     };
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
 
     let mut operation = GetObjectOperation::new(GetObjectInput {

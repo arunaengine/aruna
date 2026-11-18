@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
-use crate::plugins::copies::read_local;
+use crate::driver::{DriverContext, drive};
+use crate::plugins::calls::*;
 use crate::plugins::runs::tests::opened;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -301,4 +301,112 @@ fn copy_refuses_answers() {
     // Without peers nothing is sent and no node confirms.
     let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1]);
     assert_eq!(alone.first(), Ok(Next::Done(BTreeSet::new())));
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{config_result, is_child};
+    use crate::plugins::rows::tests::child_result;
+
+    fn managers_of(count: u8) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(actor().realm_id, Vec::new(), 3);
+        config.ensure_node(actor().node_id, RealmNodeKind::Management);
+        for seed in 0..count {
+            config.ensure_node(node(100 + seed), RealmNodeKind::Management);
+        }
+        config
+    }
+
+    fn check() -> CheckPublish {
+        let actor = actor();
+        CheckPublish::new(&actor, &auth(&actor), FIXTURE, 5).unwrap()
+    }
+
+    fn allowed() -> IoResult {
+        child_result(Ok::<bool, AuthorizationError>(true))
+    }
+
+    #[test]
+    fn check_refuses_artifacts() {
+        let actor = actor();
+        let auth = auth(&actor);
+        let large = vec![0; MAX_ARTIFACT + 1];
+        let refused = CheckPublish::new(&actor, &auth, &large, 5);
+        assert_eq!(refused.unwrap_err(), PublishError::TooLarge);
+        let invalid = CheckPublish::new(&actor, &auth, b"not wasm", 5);
+        assert!(matches!(invalid, Err(PublishError::Invalid(_))));
+    }
+
+    #[test]
+    fn check_needs_admin() {
+        let mut publish = check();
+        assert!(is_child(&publish.first()));
+        let denied = child_result(Ok::<bool, AuthorizationError>(false));
+        assert_eq!(publish.next(denied), Err(PublishError::Unauthorized));
+    }
+
+    #[test]
+    fn check_plans_store() {
+        let mut publish = check();
+        publish.first().unwrap();
+        assert!(is_child(&publish.next(allowed())));
+        let Ok(Next::Done(PublishStep::Store(plan))) = publish.next(config_result(managers_of(0)))
+        else {
+            panic!("a new version is stored");
+        };
+        assert_eq!(plan.entry.published_at_ms, 5);
+        let mut other = check();
+        other.first().unwrap();
+        other.next(allowed()).unwrap();
+        let bare = RealmConfigDocument::new(actor().realm_id, Vec::new(), 3);
+        let refused = other.next(config_result(bare));
+        assert_eq!(refused, Err(PublishError::NotManagementNode));
+    }
+
+    #[test]
+    fn check_knows_version() {
+        let mut publish = check();
+        let entry = publish.entry.clone();
+        publish.first().unwrap();
+        publish.next(allowed()).unwrap();
+        let mut config = managers_of(0);
+        config.plugins.push(entry.clone());
+        let known = publish.next(config_result(config));
+        assert_eq!(known, Ok(Next::Done(PublishStep::Known(entry))));
+    }
+
+    fn finish(managers: u8) -> FinishPublish {
+        let actor = actor();
+        let auth = auth(&actor);
+        let plan = PublishPlan {
+            config: managers_of(managers),
+            entry: entry("sha256:aa"),
+        };
+        FinishPublish::new(actor, auth, plan, FIXTURE.to_vec())
+    }
+
+    #[test]
+    fn finish_counts_copies() {
+        let mut publish = finish(2);
+        assert!(is_child(&publish.first()));
+        let none = child_result(Ok::<_, CopyError>(BTreeSet::<NodeId>::new()));
+        let short = PublishError::TooFewCopies {
+            stored: 1,
+            needed: 2,
+        };
+        assert_eq!(publish.next(none), Err(short));
+    }
+
+    #[test]
+    fn finish_writes_entry() {
+        let mut publish = finish(2);
+        publish.first().unwrap();
+        let copies = BTreeSet::from([node(100)]);
+        assert!(is_child(
+            &publish.next(child_result(Ok::<_, CopyError>(copies)))
+        ));
+        let written = entry("sha256:aa");
+        let answer = publish.next(child_result(Ok::<_, EntryError>(written.clone())));
+        assert_eq!(answer, Ok(Next::Done(written)));
+    }
 }

@@ -12,10 +12,11 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::forward::read::route_profile_status as run_profile_validation_status;
 use aruna_operations::metadata::profile::validation::{
-    SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name, preview_submission as run_preview_submission,
+    ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
 use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;
 use axum::extract::{Path, State};
@@ -208,9 +209,9 @@ pub async fn preview_profile_validation(
     }
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
     let context = state.get_ctx();
-    let preview = run_preview_submission(&context, group_id, &jsonld)
-        .await
-        .map_err(map_metadata_error)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
+    let preview = drive(preview, &context).await.map_err(map_metadata_error)?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         response.set_restricted(

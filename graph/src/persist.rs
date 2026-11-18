@@ -88,8 +88,10 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::GetGraphPolicy { .. }
         | MetadataEffect::ExportRoCrate { .. }
         | MetadataEffect::ExportRoCrateSummary { .. }
+        | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ListGraphs
+        | MetadataEffect::CachedRecords
         | MetadataEffect::ContainsGraph { .. }
         | MetadataEffect::ContainsDot { .. }
         | MetadataEffect::GraphSnapshot { .. }
@@ -99,7 +101,16 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::InstallSnapshot { .. }
         // A merged batch publishes nothing back to irokle.
         | MetadataEffect::PlanBatch { .. }
-        | MetadataEffect::MergeBatch { .. } => false,
+        | MetadataEffect::MergeBatch { .. }
+        // Checks of unsaved candidates and this node's caches change no graph.
+        | MetadataEffect::CheckStructure { .. }
+        | MetadataEffect::CheckProfile { .. }
+        | MetadataEffect::CachedShapes { .. }
+        | MetadataEffect::CacheShapes { .. }
+        | MetadataEffect::CacheGeneration
+        | MetadataEffect::CacheRecords { .. }
+        | MetadataEffect::UncacheRecord { .. }
+        | MetadataEffect::CachedGroup { .. } => false,
     }
 }
 

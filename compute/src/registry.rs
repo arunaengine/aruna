@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
+use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 use aruna_core::structs::storage::node_info::NODE_LABEL_KEY;
 
@@ -87,6 +87,14 @@ impl ExecutorRegistry {
         self.backends.insert(backend.kind().as_wire(), backend);
     }
 
+    /// What each registered backend advertises, by its wire kind.
+    pub fn limits(&self) -> BTreeMap<String, ResourceEnvelope> {
+        self.backends
+            .iter()
+            .map(|(kind, backend)| (kind.clone(), backend.capabilities().limits))
+            .collect()
+    }
+
     pub fn get(&self, kind: &ExecutorKind) -> Option<&Arc<dyn ExecutorBackend>> {
         self.backends.get(&kind.as_wire())
     }
@@ -113,21 +121,15 @@ impl ExecutorRegistry {
         subject: &PlacementSubject,
         policy_draining: bool,
     ) -> Result<Vec<ExecutorCapability>, PlacementPolicyError> {
-        self.backends
-            .values()
-            .map(|backend| {
-                let caps = backend.capabilities();
-                let mut capability =
-                    ExecutorCapability::new(backend.kind().as_wire(), site(subject, &caps))?;
-                capability.file_staging = caps.file_staging;
-                capability.direct_s3 = caps.direct_s3;
-                capability.s3_mount = caps.s3_mount;
-                capability.network_policy = caps.network_policy;
-                capability.session = caps.session;
-                capability.limits = caps.limits;
-                capability.policy_draining = policy_draining;
-                Ok(capability)
-            })
+        (self.offers().iter())
+            .map(|offer| offer.capability(subject, policy_draining))
+            .collect()
+    }
+
+    /// What every enabled backend offers, before a placement subject is known.
+    pub fn offers(&self) -> Vec<ExecutorOffer> {
+        (self.backends.values())
+            .map(|backend| ExecutorOffer::new(backend.kind().as_wire(), backend.capabilities()))
             .collect()
     }
 
@@ -190,6 +192,37 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
     site.labels
         .insert(NODE_LABEL_KEY.to_string(), subject.node_id.to_string());
     site
+}
+
+/// One enabled backend's wire kind and capabilities, as plain data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorOffer {
+    kind: String,
+    caps: BackendCaps,
+}
+
+impl ExecutorOffer {
+    pub fn new(kind: String, caps: BackendCaps) -> Self {
+        Self { kind, caps }
+    }
+
+    /// The advertisement of this backend under `subject`, at the site it actually runs on.
+    pub fn capability(
+        &self,
+        subject: &PlacementSubject,
+        policy_draining: bool,
+    ) -> Result<ExecutorCapability, PlacementPolicyError> {
+        let caps = &self.caps;
+        let mut capability = ExecutorCapability::new(self.kind.clone(), site(subject, caps))?;
+        capability.file_staging = caps.file_staging;
+        capability.direct_s3 = caps.direct_s3;
+        capability.s3_mount = caps.s3_mount;
+        capability.network_policy = caps.network_policy;
+        capability.session = caps.session;
+        capability.limits = caps.limits;
+        capability.policy_draining = policy_draining;
+        Ok(capability)
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ pub const VALIDATION_GRAPH_IRI: &str = "https://craqle.invalid/validation/docume
 pub const CRAQLE_BASE_IRI: &str = "https://craqle.invalid/";
 
 /// One Profile revision and the Turtle shapes it publishes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileShapes {
     /// Graph the shapes are installed under, unique per Profile revision.
     pub graph_iri: String,
@@ -20,14 +20,14 @@ pub struct ProfileShapes {
 }
 
 /// Structural RO-Crate findings and SHACL results for one candidate document.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProfileShaclReport {
     pub results: Vec<ShaclValidationResult>,
     pub structural: Vec<CrateViolation>,
 }
 
 /// Why a Profile check could not give a verdict.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ProfileShaclError {
     /// A permanent property of the registered Profile: fail closed.
     #[error("{message}")]

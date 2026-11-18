@@ -710,7 +710,7 @@ impl Operation for AwaitingJobsOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::runtime::key_unlocked;
+    use crate::jobs::key_locks::KeyUnlockedOperation;
     use crate::testing::test_context;
     use aruna_storage::StorageHandle;
 
@@ -1455,7 +1455,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(process_transitions(&context).await.unwrap(), None);
-        assert!(!key_unlocked(&context, old).await);
+        assert!(
+            !drive(KeyUnlockedOperation::new(old), &context)
+                .await
+                .unwrap()
+        );
         release_tx.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), None);
         actor.join().unwrap();
@@ -1669,7 +1673,11 @@ mod tests {
                 queued,
                 Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
             ));
-            assert!(!key_unlocked(&context, old).await);
+            assert!(
+                !drive(KeyUnlockedOperation::new(old), &context)
+                    .await
+                    .unwrap()
+            );
 
             let mut unavailable = interrupted.clone();
             unavailable.task_handle = Some(aruna_tasks::TaskHandle::inactive());

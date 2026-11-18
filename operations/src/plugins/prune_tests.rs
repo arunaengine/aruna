@@ -10,13 +10,13 @@ use aruna_core::secrets::{Delivery, SecretName, SecretScope};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, SecretAudit, SecretUse};
 
 use super::*;
+use crate::plugin_host::worker::prune_audit;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
-use crate::plugins::worker::prune_audit;
 
 const DAY: u64 = 24 * 3600 * 1000;
 const NOW: u64 = 100 * DAY;
@@ -86,7 +86,7 @@ async fn prunes_old_uses() {
 }
 
 async fn config(fixture: &Fixture) -> RealmConfigDocument {
-    let read = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let read = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     read.await.unwrap()
 }
 
@@ -162,7 +162,7 @@ fn old_hooks_go() {
 }
 
 #[test]
-fn audit_pages_until_done() {
+fn audit_reads_pages() {
     let mut prune = PruneAudit::new(9);
     assert!(matches!(prune.first(), Ok(Next::Call(IoCall::Child(_)))));
     let more = child_result(Ok::<_, StoreError>((2usize, true)));
