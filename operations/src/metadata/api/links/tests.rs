@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{LinkDocument, LinkHit, LinkNodePage, merge_pages};
+use super::merge_pages;
+use super::types::{LinkDocument, LinkHit, LinkNodePage};
 use ulid::Ulid;
 
 fn document(seed: u8, link: &str) -> LinkDocument {

@@ -17,14 +17,13 @@ use super::{
     BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState, DISTRIBUTED_QUERY_DEADLINE,
     GetBucketError, GetBucketOperation, GetNodesOperation, HashMap, HashSet, Key,
     MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope,
-    MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry, MetadataReferencesRequest,
-    MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult, Permission,
-    REALM_DISCOVERY_TIMEOUT, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT,
-    RealmId, RealmNodeDiscovery, ResolvePathsOperation, SearchCursor, SearchCursorError,
-    SearchWatermark, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
-    deduplicate_fanout_nodes, forwarded_bearer, map_read_error, metadata_node_call,
-    object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
-    select_fanout_nodes, warn,
+    MetadataFanoutStats, MetadataNodeCall, MetadataRegistryRecord, MetadataSearchHit, NodeId,
+    NodeSearchResult, Permission, REALM_DISCOVERY_TIMEOUT, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
+    REGISTRY_CANDIDATE_LIMIT, RealmId, RealmNodeDiscovery, ResolvePathsOperation, SearchCursor,
+    SearchCursorError, SearchWatermark, Ulid, Value, VersionKey, W3idIdentifier,
+    bucket_permission_path, deduplicate_fanout_nodes, forwarded_bearer, map_read_error,
+    metadata_node_call, object_permission_path, paginate, record_preflight_node,
+    resume_fetch_limit, select_fanout_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
 

@@ -190,10 +190,6 @@ async fn bucket_links_refused() {
     let neither = bucket(&test, &test.auth, BUCKET, bucket_params(None, None, false)).await;
     assert!(matches!(neither, Err(ServerError::BadRequestReason(_))));
     let other = stranger(&test);
-    let links_local = |auth: &AuthContext, request: LinkNodeRequest| {
-        let links = LinksLocalOperation::new(realm_id, Some(auth.clone()), request);
-        aruna_operations::driver::drive(links, context.as_ref())
-    };
     let by_key = bucket(&test, &other, BUCKET, bucket_params(Some("a"), None, false)).await;
     assert!(matches!(by_key, Err(ServerError::Forbidden)));
     let by_prefix = bucket(&test, &other, BUCKET, bucket_params(None, Some(""), false)).await;
@@ -320,6 +316,10 @@ async fn confirms_hidden_dataset() {
     let context = test.state.get_ctx();
     let realm_id = test.state.get_realm_id();
     let other = stranger(&test);
+    let links_local = |auth: &AuthContext, request: LinkNodeRequest| {
+        let links = LinksLocalOperation::new(realm_id, Some(auth.clone()), request);
+        aruna_operations::driver::drive(links, context.as_ref())
+    };
 
     let named = links_local(&other, request(Some(dataset)))
         .await

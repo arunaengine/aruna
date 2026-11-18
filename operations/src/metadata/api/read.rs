@@ -2,15 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::read_types::{
-    MetadataQueryExecution, MetadataQueryRequest, MetadataReferenceEntry,
-    MetadataReferencesExecution, MetadataReferencesRequest,
-};
+use super::read_types::{MetadataQueryExecution, MetadataQueryRequest};
 use super::{
     AuthContext, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
     DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, MetadataApiError, MetadataFanoutScope,
-    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, RealmId,
-    StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid, query_fingerprint,
+    MetadataRegistryRecord, NodeId, Permission, RealmId, StorageEffect, StorageEvent,
+    StorageReadError, TxnId, Ulid, query_fingerprint,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::DocumentRecordOperation;
@@ -19,7 +16,6 @@ use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use crate::auth::enforcement::EnforcePolicyOperation;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 
 pub async fn query_metadata(

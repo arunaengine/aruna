@@ -6,6 +6,7 @@ use super::list::summary_request;
 use super::*;
 use crate::driver::drive;
 use crate::metadata::api::export::ExportOperation;
+use crate::metadata::api::read_types::metadata_read_request;
 use aruna_core::metadata::GraphLifecycleRecord;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
