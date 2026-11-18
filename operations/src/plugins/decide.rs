@@ -5,7 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::account::{AccountError, PrerequisitesHeld};
+use super::artifacts::{ServingNode, served_config};
 use super::check::{CallError, CheckCall, RunScope};
 use super::matcher::event_trigger;
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
@@ -32,6 +33,9 @@ use super::rows::{
     read_call, row as row_of, unexpected, values,
 };
 use super::runs::{Admission, RunError, event_run};
+use crate::document_repository::GetConfigOperation;
+use crate::metadata::protocol::MetadataReadError;
+use crate::realm::mutate_placement::node_kind;
 use aruna_core::plugin_runs::Outcome;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.
@@ -729,8 +733,7 @@ impl Operation for DecideRow {
     }
 }
 
-/// Decides each event of a batch from `sender` and keeps its newest gap reports. The caller holds
-/// `ADMISSIONS` while it runs.
+/// Decides each event of a batch from `sender` and keeps its newest gap reports.
 #[derive(Debug, PartialEq)]
 pub(crate) struct DecideBatch {
     config: Arc<RealmConfigDocument>,
@@ -778,6 +781,10 @@ impl Operation for DecideBatch {
     type Output = Decisions;
     type Error = StoreError;
 
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
     fn first(&mut self) -> Result<Next<Decisions>, StoreError> {
         Ok(Next::Call(self.advance()))
     }
@@ -791,6 +798,56 @@ impl Operation for DecideBatch {
         let outcome = answer.child::<Outcome, StoreError>()??;
         self.decisions.events.push((install_id, source, outcome));
         Ok(Next::Call(self.advance()))
+    }
+}
+
+/// The receiver side of a forward from an infrastructure peer.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeEvents {
+    node: ServingNode,
+    peer: NodeId,
+    now_ms: u64,
+    batch: Option<EventBatch>,
+}
+
+impl ServeEvents {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, batch: EventBatch, now_ms: u64) -> Self {
+        Self {
+            node,
+            peer,
+            now_ms,
+            batch: Some(batch),
+        }
+    }
+}
+
+impl Operation for ServeEvents {
+    type Output = Decisions;
+    type Error = MetadataReadError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<Decisions>, MetadataReadError> {
+        let read = GetConfigOperation::new(self.node.0);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Decisions>, MetadataReadError> {
+        let Some(batch) = self.batch.take() else {
+            let decided = result.child::<Decisions, StoreError>()?;
+            return Ok(Next::Done(
+                decided.map_err(|_| MetadataReadError::Unavailable)?,
+            ));
+        };
+        let config = served_config(result)?;
+        if !node_kind(&config, self.peer).is_some_and(|kind| kind.is_sync_eligible()) {
+            return Err(MetadataReadError::Forbidden);
+        }
+        let nodes = (self.node.1, self.peer);
+        let decide = DecideBatch::new(Arc::new(config), nodes, batch, self.now_ms);
+        Ok(Next::Call(IoCall::child(decide)))
     }
 }
 

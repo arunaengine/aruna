@@ -29,11 +29,13 @@ use ulid::Ulid;
 use url::Url;
 
 use super::account::{owned, read_user_call, read_user_result};
+use super::artifacts::ServingNode;
 use super::entry::{EntryError, ReadEntry};
 use super::grants::InstallScope;
 use super::install::{pick_version, read_manifest};
 use super::rows::{Row, StoreError, read_call, values, write_rows};
 use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::sealed_value;
 
@@ -565,6 +567,48 @@ impl Operation for ReleaseSecret {
     }
 }
 
+/// The management side of a release request from an infrastructure peer.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeRelease {
+    node: ServingNode,
+    peer: NodeId,
+    request: Option<ReleaseRequest>,
+}
+
+impl ServeRelease {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, request: ReleaseRequest) -> Self {
+        Self {
+            node,
+            peer,
+            request: Some(request),
+        }
+    }
+}
+
+impl Operation for ServeRelease {
+    type Output = Released;
+    type Error = ReleaseFailure;
+
+    fn first(&mut self) -> Result<Next<Released>, ReleaseFailure> {
+        let read = GetConfigOperation::new(self.node.0);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Released>, ReleaseFailure> {
+        let Some(request) = self.request.take() else {
+            return Ok(Next::Done(result.child::<Released, ReleaseFailure>()??));
+        };
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        let config = config.map_err(|error| unavailable(format!("{error:?}")))?;
+        let nodes = (self.node.1, self.peer);
+        let release = ReleaseSecret::new(Arc::new(config), nodes, request);
+        Ok(Next::Call(IoCall::child(release)))
+    }
+}
+
+#[cfg(test)]
+#[path = "release_tests.rs"]
+mod release_tests;
 #[cfg(test)]
 #[path = "secret_use_tests.rs"]
 mod tests;

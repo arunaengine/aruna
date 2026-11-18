@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 
-use super::artifacts::local_config;
-use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataReadError;
+use super::artifacts::{ServingNode, served_config};
+use super::peer::{ask_peer, peer_answer};
+use crate::document_repository::GetConfigOperation;
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::mutate_placement::node_kind;
 
 /// Supported clock skew between nodes; a replay starts this much before its mapped boundary.
@@ -40,35 +42,95 @@ pub(crate) fn local_start(boundary_ms: u64, reading: Option<ClockReading>) -> Op
 }
 
 /// This node's clock for an infrastructure peer that maps an install's activation time.
-pub(crate) async fn serve_clock(
-    ctx: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeClock {
+    node: ServingNode,
     peer: NodeId,
-) -> Result<u64, MetadataReadError> {
-    let (config, _) = local_config(ctx).await?;
-    match node_kind(&config, peer).is_some_and(|kind| kind.is_sync_eligible()) {
-        true => Ok(unix_timestamp_millis()),
-        false => Err(MetadataReadError::Forbidden),
+    now_ms: u64,
+}
+
+impl ServeClock {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, now_ms: u64) -> Self {
+        Self { node, peer, now_ms }
     }
 }
 
-/// One reading of `node`'s clock over the metadata transport.
-pub(crate) async fn probe_clock(ctx: &DriverContext, node: NodeId) -> Option<ClockReading> {
-    let handle = ctx.metadata_handle.as_ref()?;
-    let sent_ms = unix_timestamp_millis();
-    let remote_ms = handle.request_clock(node).await.ok()?;
-    let received_ms = unix_timestamp_millis();
-    Some(ClockReading {
-        sent_ms,
-        remote_ms,
-        received_ms,
-    })
+impl Operation for ServeClock {
+    type Output = u64;
+    type Error = MetadataReadError;
+
+    fn first(&mut self) -> Result<Next<u64>, MetadataReadError> {
+        let read = GetConfigOperation::new(self.node.0);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, MetadataReadError> {
+        let config = served_config(result)?;
+        match node_kind(&config, self.peer).is_some_and(|kind| kind.is_sync_eligible()) {
+            true => Ok(Next::Done(self.now_ms)),
+            false => Err(MetadataReadError::Forbidden),
+        }
+    }
+}
+
+/// The clock of `node` over the metadata transport; `None` when it does not answer.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AskClock(pub NodeId);
+
+impl Operation for AskClock {
+    type Output = Option<u64>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<u64>>, IoError> {
+        let probe = ask_peer(self.0, &MetadataTransportMessage::ProbeClock);
+        Ok(match probe {
+            Some(call) => Next::Call(call),
+            None => Next::Done(None),
+        })
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<u64>>, IoError> {
+        Ok(Next::Done(match peer_answer(self.0, result)? {
+            Some(MetadataTransportMessage::ClockProbed { result: Ok(clock) }) => Some(clock),
+            _ => None,
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::plugins::fixtures::{
+        self, config_result, is_child, is_effect, node, peer_says, peer_silent,
+    };
+
     const MINUTE: u64 = 60 * 1000;
+
+    #[test]
+    fn serve_checks_peer() {
+        let place = (fixtures::realm(), node(1));
+        let mut serve = ServeClock::new(place, node(3), 7);
+        assert!(is_child(&serve.first()));
+        let answer = serve.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(answer, Ok(Next::Done(7)));
+        let mut device = ServeClock::new(place, node(4), 7);
+        device.first().unwrap();
+        let refused = device.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(refused, Err(MetadataReadError::Forbidden));
+    }
+
+    #[test]
+    fn ask_reads_answer() {
+        let mut ask = AskClock(node(1));
+        assert!(is_effect(&ask.first()));
+        let probed = MetadataTransportMessage::ClockProbed { result: Ok(9) };
+        assert_eq!(
+            ask.next(peer_says(node(1), &probed)),
+            Ok(Next::Done(Some(9)))
+        );
+        assert_eq!(ask.next(peer_silent(node(1))), Ok(Next::Done(None)));
+    }
 
     #[test]
     fn clock_bounds() {
