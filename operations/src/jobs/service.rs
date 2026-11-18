@@ -41,7 +41,9 @@ use super::store::state::{read_artifact_tombstone, read_job_record};
 use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec, schedule_drain_effect};
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
-use super::submit_local::{MintJobOperation, QueueJobOperation, SubmitLocalOperation};
+use super::submit_local::{
+    HandedJobOperation, MintJobOperation, QueueJobOperation, SubmitLocalOperation,
+};
 use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
@@ -126,24 +128,14 @@ pub async fn submit_staging_job(
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::Staging(spec),
-            created_by,
-            owner_node_id,
-            dedup_key: None,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+    let submit = SubmitLocalOperation::staging(
+        spec,
+        owner_node_id,
+        retention_ms,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Queues a staging job a range's former coordinator handed over, starting from `resume`.
@@ -154,31 +146,16 @@ pub(crate) async fn submit_handed_job(
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, String> {
-    let created_by = spec.auth_context.user_id;
-    let realm_id = spec.auth_context.realm_id;
-    let job_id = mint_local_job(context, realm_id, owner_node_id, None)
+    let handed = HandedJobOperation::new(
+        spec,
+        resume.cloned(),
+        owner_node_id,
+        retention_ms,
+        (context.node_and_realm(), unix_timestamp_millis()),
+    );
+    drive(handed, context)
         .await
-        .map_err(|error| error.to_string())?;
-    if let Some(resume) = resume {
-        super::staging::seed_checkpoint(context, job_id, resume).await?;
-    }
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::Staging(spec),
-            created_by,
-            owner_node_id,
-            dedup_key: None,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
-    .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())
 }
 
 /// Queues one background object copy on this node for the caller in `spec`.
@@ -188,24 +165,14 @@ pub async fn submit_copy_job(
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::CopyObject(spec),
-            created_by,
-            owner_node_id,
-            dedup_key: None,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+    let submit = SubmitLocalOperation::copy(
+        spec,
+        owner_node_id,
+        retention_ms,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Queues one run of a backend import on this node. A scheduled run passes its due
@@ -236,24 +203,15 @@ pub async fn submit_harvest_job(
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(context, realm_id, owner_node_id, dedup_key.as_deref()).await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::Harvest(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms: crate::jobs::JOB_RETENTION_MS,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+    let submit = SubmitLocalOperation::harvest(
+        spec,
+        (created_by, realm_id),
+        owner_node_id,
+        idempotency_key,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Queues a purge; with `files` it also deletes the linked-storage files of the versions.
@@ -264,34 +222,14 @@ pub async fn submit_purge_job(
     idempotency_key: Option<String>,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        spec.auth_context.realm_id,
+    let submit = SubmitLocalOperation::purge(
+        (spec, files),
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: match files {
-                true => JobPayload::StoragePurgeFiles(spec),
-                false => JobPayload::StoragePurge(spec),
-            },
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+        (idempotency_key, retention_ms),
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Register a w3id PID for a document as a fenced job on the document's PID
@@ -336,31 +274,16 @@ pub(crate) async fn submit_mint_local(
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.minted_by;
-    let dedup_key = Some(pid_dedup_key(spec.document_id));
-    let job_id = mint_local_job(
-        context,
-        context.serving_realm(created_by.realm_id),
+    let realm_id = context.serving_realm(spec.minted_by.realm_id);
+    let submit = SubmitLocalOperation::mint_pid(
+        spec,
+        realm_id,
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::MintPersistentId(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::None,
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+        retention_ms,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Queues identifier registration on this node. The key names the calling job, so a replayed
@@ -371,31 +294,14 @@ pub(crate) async fn submit_identifiers(
     owner_node_id: NodeId,
     key: String,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let dedup_key = Some(key.into_bytes());
-    let job_id = mint_local_job(
-        context,
-        spec.auth_context.realm_id,
+    let submit = SubmitLocalOperation::identifiers(
+        spec,
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::RegisterIdentifiers(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms: crate::jobs::JOB_RETENTION_MS,
-            workspace_mode: WorkspaceMode::None,
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+        key,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 pub async fn submit_rocrate_import(
@@ -404,32 +310,14 @@ pub async fn submit_rocrate_import(
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let retention_ms = spec.limits.artifact_retention_ms;
-    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        spec.auth_context.realm_id,
+    let submit = SubmitLocalOperation::rocrate_import(
+        spec,
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::ImportRoCrate(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+        idempotency_key,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// The job and plan digest a dedup key names, if that job's record still exists.
@@ -478,32 +366,14 @@ pub async fn submit_export_job(
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let retention_ms = spec.limits.artifact_retention_ms;
-    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        spec.auth_context.realm_id,
+    let submit = SubmitLocalOperation::rocrate_export(
+        spec,
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::ExportRoCrate(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            retention_ms,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+        idempotency_key,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.

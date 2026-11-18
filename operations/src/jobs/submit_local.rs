@@ -2,16 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
+use aruna_core::structs::MintPersistentSpec;
+use aruna_core::structs::execution::harvest::HarvestJobSpec;
+use aruna_core::structs::execution::job::{
+    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobPayload, StagingJobCheckpoint,
+    StagingJobSpec, WorkspaceMode, pid_dedup_key, user_dedup_key,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
+use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
+use aruna_core::{NodeId, UserId};
 use ulid::Ulid;
 
+use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
+use super::staging::{SeedCheckpointOperation, StagingStoreError};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
 };
@@ -112,6 +121,17 @@ impl Operation for QueueJobOperation {
     }
 }
 
+/// What differs between the kinds of job queued on this node.
+struct LocalJob {
+    payload: JobPayload,
+    created_by: UserId,
+    owner_node_id: NodeId,
+    dedup_key: Option<Vec<u8>>,
+    now_ms: u64,
+    retention_ms: u64,
+    workspace_mode: WorkspaceMode,
+}
+
 /// Mints an id for `spec` and queues it on this node.
 #[derive(Debug, PartialEq)]
 pub struct SubmitLocalOperation {
@@ -135,6 +155,21 @@ impl SubmitLocalOperation {
         }
     }
 
+    fn queued(job: LocalJob, realm_id: RealmId, serving: ServingNode) -> Self {
+        let spec = SubmitJobSpec {
+            payload: job.payload,
+            created_by: job.created_by,
+            owner_node_id: job.owner_node_id,
+            dedup_key: job.dedup_key,
+            now_ms: job.now_ms,
+            retention_ms: job.retention_ms,
+            workspace_mode: job.workspace_mode,
+            workspace_bucket: None,
+            active_cap: None,
+        };
+        Self::new(spec, realm_id, serving)
+    }
+
     /// One run of a backend import. A scheduled run passes its due time in `dedup`, so a
     /// repeated timer never starts the same run twice.
     pub fn backend_import(
@@ -146,7 +181,7 @@ impl SubmitLocalOperation {
     ) -> Self {
         let created_by = spec.auth_context.user_id;
         let realm_id = spec.auth_context.realm_id;
-        let spec = SubmitJobSpec {
+        let job = LocalJob {
             payload: JobPayload::BackendImport(spec),
             created_by,
             owner_node_id,
@@ -154,10 +189,180 @@ impl SubmitLocalOperation {
             now_ms,
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
         };
-        Self::new(spec, realm_id, serving)
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// One staging job for the caller in `spec`.
+    pub fn staging(
+        spec: StagingJobSpec,
+        owner_node_id: NodeId,
+        retention_ms: u64,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms,
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// One background object copy for the caller in `spec`.
+    pub fn copy(
+        spec: CopyJobSpec,
+        owner_node_id: NodeId,
+        retention_ms: u64,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            payload: JobPayload::CopyObject(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms,
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// One run of a harvest source for `created_by`; provenance keeps a rerun idempotent.
+    pub fn harvest(
+        spec: HarvestJobSpec,
+        (created_by, realm_id): (UserId, RealmId),
+        owner_node_id: NodeId,
+        idempotency_key: Option<String>,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let job = LocalJob {
+            payload: JobPayload::Harvest(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: idempotency_key.map(|key| user_dedup_key(created_by, &key)),
+            now_ms,
+            retention_ms: JOB_RETENTION_MS,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// A purge; with `files` it also deletes the linked-storage files of the versions.
+    pub fn purge(
+        (spec, files): (StoragePurgeSpec, bool),
+        owner_node_id: NodeId,
+        (idempotency_key, retention_ms): (Option<String>, u64),
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            payload: match files {
+                true => JobPayload::StoragePurgeFiles(spec),
+                false => JobPayload::StoragePurge(spec),
+            },
+            created_by,
+            owner_node_id,
+            dedup_key: idempotency_key.map(|key| user_dedup_key(created_by, &key)),
+            now_ms,
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// The PID authority's own submission: the dedup row and the execution share one owner.
+    pub fn mint_pid(
+        spec: MintPersistentSpec,
+        realm_id: RealmId,
+        owner_node_id: NodeId,
+        retention_ms: u64,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let job = LocalJob {
+            created_by: spec.minted_by,
+            dedup_key: Some(pid_dedup_key(spec.document_id)),
+            payload: JobPayload::MintPersistentId(spec),
+            owner_node_id,
+            now_ms,
+            retention_ms,
+            workspace_mode: WorkspaceMode::None,
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// Identifier registration. The key names the calling job, so a replayed step joins the job
+    /// it already queued.
+    pub fn identifiers(
+        spec: RegisterIdentifiersSpec,
+        owner_node_id: NodeId,
+        key: String,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            payload: JobPayload::RegisterIdentifiers(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: Some(key.into_bytes()),
+            now_ms,
+            retention_ms: JOB_RETENTION_MS,
+            workspace_mode: WorkspaceMode::None,
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// One RO-Crate import.
+    pub fn rocrate_import(
+        spec: ImportRoCrateSpec,
+        owner_node_id: NodeId,
+        idempotency_key: Option<String>,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            retention_ms: spec.limits.artifact_retention_ms,
+            payload: JobPayload::ImportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: idempotency_key.map(|key| user_dedup_key(created_by, &key)),
+            now_ms,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
+    }
+
+    /// One RO-Crate export.
+    pub fn rocrate_export(
+        spec: ExportRoCrateSpec,
+        owner_node_id: NodeId,
+        idempotency_key: Option<String>,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let job = LocalJob {
+            retention_ms: spec.limits.artifact_retention_ms,
+            payload: JobPayload::ExportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: idempotency_key.map(|key| user_dedup_key(created_by, &key)),
+            now_ms,
+            workspace_mode: WorkspaceMode::default(),
+        };
+        Self::queued(job, realm_id, serving)
     }
 }
 
@@ -182,6 +387,103 @@ impl Operation for SubmitLocalOperation {
         self.minted = true;
         let queue = QueueJobOperation::new(self.spec.clone(), job_id, self.serving);
         Ok(Next::Call(IoCall::child(queue)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum HandedStep {
+    Mint,
+    Seed(JobId),
+    Queue,
+}
+
+/// Queues a staging job a range's former coordinator handed over, starting from `resume`. The
+/// checkpoint is stored under the new job id before the job can run.
+#[derive(Debug, PartialEq)]
+pub struct HandedJobOperation {
+    spec: SubmitJobSpec,
+    realm_id: RealmId,
+    resume: Option<StagingJobCheckpoint>,
+    serving: ServingNode,
+    step: HandedStep,
+}
+
+impl HandedJobOperation {
+    pub fn new(
+        spec: StagingJobSpec,
+        resume: Option<StagingJobCheckpoint>,
+        owner_node_id: NodeId,
+        retention_ms: u64,
+        (serving, now_ms): (ServingNode, u64),
+    ) -> Self {
+        let (created_by, realm_id) = (spec.auth_context.user_id, spec.auth_context.realm_id);
+        let spec = SubmitJobSpec {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms,
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        };
+        Self {
+            spec,
+            realm_id,
+            resume,
+            serving,
+            step: HandedStep::Mint,
+        }
+    }
+
+    fn queue(&mut self, job_id: JobId) -> SubmitNext {
+        self.step = HandedStep::Queue;
+        let queue = QueueJobOperation::new(self.spec.clone(), job_id, self.serving);
+        Ok(Next::Call(IoCall::child(queue)))
+    }
+
+    fn minted(&mut self, job_id: JobId) -> SubmitNext {
+        let Some(resume) = self.resume.take() else {
+            return self.queue(job_id);
+        };
+        self.step = HandedStep::Seed(job_id);
+        let seed = SeedCheckpointOperation::new(job_id, resume);
+        Ok(Next::Call(IoCall::child(seed)))
+    }
+}
+
+impl Operation for HandedJobOperation {
+    type Output = SubmitJobResult;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> SubmitNext {
+        let owner = self.spec.owner_node_id;
+        let mint = MintJobOperation::new(self.realm_id, owner, None, self.serving);
+        Ok(Next::Call(IoCall::child(mint)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SubmitNext {
+        match self.step {
+            HandedStep::Mint => {
+                let job_id = result.child::<JobId, SubmitJobError>()??;
+                self.minted(job_id)
+            }
+            HandedStep::Seed(job_id) => {
+                let seeded = result.child::<(), StagingStoreError>()?;
+                seeded.map_err(|error| {
+                    SubmitJobError::UnexpectedEvent(format!(
+                        "staging checkpoint not seeded: {}",
+                        error.0
+                    ))
+                })?;
+                self.queue(job_id)
+            }
+            HandedStep::Queue => {
+                let submitted = result.child::<SubmitJobResult, SubmitJobError>()??;
+                Ok(Next::Done(submitted))
+            }
+        }
     }
 }
 
