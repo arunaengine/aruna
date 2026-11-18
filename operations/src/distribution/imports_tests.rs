@@ -144,7 +144,7 @@ fn continues_coordinated_ranges() {
     );
     let delete = state_delete(handover_key(set_id, range_id));
     assert_eq!(gone.next(none()), Ok(Next::Call(delete)));
-    assert_eq!(gone.next(IoResult::Done), Ok(Next::Done(())));
+    assert_eq!(gone.next(IoResult::Done), Ok(Next::Done(Vec::new())));
 
     let mut here = ContinueImportsOperation::new(node(1));
     here.first().unwrap();

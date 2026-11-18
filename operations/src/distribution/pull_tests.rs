@@ -4,13 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
-use aruna_core::effects::StorageEffect;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::distribution::held::{kept_location, kept_reads, kept_source_location};
 use crate::distribution::test_record::{binding, replicated, secret, store_record};
 use crate::distribution::test_store::{context, open};
+use crate::driver::drive;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::execution::staging::{PortableSourceDescriptor, StagingStrategy};
@@ -21,6 +21,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::on_use::{Attachment, CacheEntry};
 use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::types::Key;
+use aruna_core::types::Value;
 use std::time::SystemTime;
 
 fn held(size: u64) -> HeldElsewhere {
@@ -220,7 +221,9 @@ async fn asks_range_holders() {
         },
     };
 
-    let member = drive(PullMemberOperation::new(request.clone()), &context(&handle)).await.unwrap();
+    let member = drive(PullMemberOperation::new(request.clone()), &context(&handle))
+        .await
+        .unwrap();
 
     assert_eq!(member.holders, vec![secret(2).public()]);
     assert_eq!(member.strategy, DataStrategy::Copy);
@@ -271,7 +274,7 @@ fn member() -> Member {
     Member {
         member_id: Ulid::from_bytes([1; 16]),
         strategy: DataStrategy::CacheOnUse,
-        behaviour: RangeBehaviour::default(),
+        behaviour: RangeBehaviour::Passthrough,
         keeping: true,
         holders: vec![secret(2).public()],
     }
@@ -312,7 +315,10 @@ fn avoids_failed_holder() {
     read.first().unwrap();
     let refused = BaoReadError::Refused(BaoReadRefusal::BackendFailure);
     let answer = child(Err::<BaoReadOutput, _>(refused));
-    assert!(matches!(read.next(answer), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        read.next(answer),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert!(read.avoiding);
 }
 
