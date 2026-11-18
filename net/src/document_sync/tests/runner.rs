@@ -562,6 +562,58 @@ impl DocumentSyncService {
         batch_write_to(&self.storage, vec![(key_space, key, value)]).await
     }
 
+    pub(crate) fn local_node_id(&self) -> Result<NodeId> {
+        NodeId::from_bytes(self.node.peer_id().as_bytes())
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
+    }
+
+    /// Admits one peer and adds it to the fan-out set, as a realm config would.
+    pub(crate) fn add_peer_candidate(&self, node_id: NodeId) -> Result<()> {
+        let peer_id = node_to_peer(&node_id);
+        if peer_id == self.node.peer_id() {
+            return Ok(());
+        }
+        self.node
+            .add_peer_to_whitelist(peer_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.flush_database()?;
+        self.default_peers.write().insert(peer_id);
+        Ok(())
+    }
+
+    /// Signs one op carrying `payload` under the document-sync event type
+    /// without encoding an event, so tests can deliver a payload no peer can
+    /// decode. Returns the op's transport identity.
+    pub(crate) fn publish_raw_event(
+        &self,
+        topic_id: ::irokle::TopicId,
+        payload: Vec<u8>,
+    ) -> Result<SyncQuarantineIdentity> {
+        let oplog = Oplog::with_storage(self.node.storage().clone());
+        let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
+        let envelope = EventEnvelope {
+            type_id: DocumentEvent::TYPE_ID.to_string(),
+            payload: payload.into(),
+        };
+        let op = self.publish_event_op(
+            &oplog,
+            topic_id,
+            actor_id,
+            envelope,
+            &BTreeSet::new(),
+            true,
+            true,
+            &mut 0,
+            &mut 0,
+        )?;
+        self.flush_database()?;
+        Ok(SyncQuarantineIdentity {
+            topic: topic_id,
+            actor: op.signed.body.actor_id,
+            actor_seq: op.signed.body.actor_seq,
+        })
+    }
+
     pub(crate) async fn apply_policy_document(
         &self,
         document: &PlacementPolicyDocument,
