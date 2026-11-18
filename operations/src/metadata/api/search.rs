@@ -19,7 +19,7 @@ use super::{
     record_object_result, select_fanout_nodes,
 };
 use crate::driver::DriverContext;
-use crate::s3::object::search_scan::search_local_objects;
+use crate::s3::object::search_scan::SearchObjectsOperation;
 
 use super::distributed::run_search_distributed;
 use crate::distribution::feed_walks::IndexProgress;
@@ -551,19 +551,22 @@ pub(super) async fn run_object_fanout(
             start_positions.clone(),
         ),
         |(context, auth, realm_id, query, key_match, bucket, limit, as_of, starts), node_id| async move {
-            search_local_objects(
+            drive(
+                SearchObjectsOperation::new(
+                    SearchObjectsInput {
+                        auth,
+                        realm_id,
+                        node_id,
+                        query,
+                        key_match,
+                        bucket,
+                        limit,
+                        start_after: starts.get(&node_id).cloned().flatten(),
+                        as_of,
+                    },
+                    context.storage_handle.range_indexes().is_some(),
+                ),
                 &context,
-                SearchObjectsInput {
-                    auth,
-                    realm_id,
-                    node_id,
-                    query,
-                    key_match,
-                    bucket,
-                    limit,
-                    start_after: starts.get(&node_id).cloned().flatten(),
-                    as_of,
-                },
             )
             .await
             .map_err(|_| MetadataReadError::Unavailable)

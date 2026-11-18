@@ -5,6 +5,7 @@
 use crate::auth::error::PolicyEnforcementError;
 use crate::distribution::feed_walks::IndexProgress;
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -34,7 +35,7 @@ impl ObjectKeyMatch {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SearchObjectsInput {
     pub auth: AuthContext,
     pub realm_id: RealmId,
@@ -108,7 +109,7 @@ pub struct SearchNodePage {
     pub layout: Option<(ulid::Ulid, [u8; 32])>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum SearchObjectsError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -120,4 +121,10 @@ pub enum SearchObjectsError {
     Unavailable,
     #[error("the search position is no longer valid")]
     Position,
+}
+
+impl From<IoError> for SearchObjectsError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
 }

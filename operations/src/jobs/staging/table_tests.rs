@@ -21,7 +21,7 @@ use super::*;
 use crate::driver::{drive, node_routing};
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
-use crate::s3::object::search_scan::search_local_objects;
+use crate::s3::object::search_scan::SearchObjectsOperation;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::time::unix_timestamp_millis;
 
@@ -305,7 +305,9 @@ impl Fixture {
             start_after: None,
             as_of: SystemTime::now() + std::time::Duration::from_secs(3600),
         };
-        let page = search_local_objects(&self.driver, input).await.unwrap();
+        let indexed = self.driver.storage_handle.range_indexes().is_some();
+        let search = SearchObjectsOperation::new(input, indexed);
+        let page = drive(search, &self.driver).await.unwrap();
         page.hits.into_iter().map(|hit| hit.hit).collect()
     }
 

@@ -44,7 +44,7 @@ use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::SearchBucketsInput;
 use crate::s3::object::search::SearchObjectsInput;
-use crate::s3::object::search_scan::search_local_objects;
+use crate::s3::object::search_scan::SearchObjectsOperation;
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::sync_relationship::{
@@ -554,19 +554,22 @@ impl MetadataHandle {
                     .await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match search_local_objects(
+                            Some(net_handle) => match crate::driver::drive(
+                                SearchObjectsOperation::new(
+                                    SearchObjectsInput {
+                                        auth,
+                                        realm_id: *net_handle.realm_id(),
+                                        node_id: net_handle.node_id(),
+                                        query,
+                                        key_match,
+                                        bucket,
+                                        limit,
+                                        start_after,
+                                        as_of,
+                                    },
+                                    context.storage_handle.range_indexes().is_some(),
+                                ),
                                 context.as_ref(),
-                                SearchObjectsInput {
-                                    auth,
-                                    realm_id: *net_handle.realm_id(),
-                                    node_id: net_handle.node_id(),
-                                    query,
-                                    key_match,
-                                    bucket,
-                                    limit,
-                                    start_after,
-                                    as_of,
-                                },
                             )
                             .await
                             {
