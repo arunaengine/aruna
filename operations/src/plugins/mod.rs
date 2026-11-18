@@ -22,6 +22,7 @@ pub mod grants;
 pub mod held;
 pub mod hooks;
 pub(crate) mod host_calls;
+pub(crate) mod host_steps;
 pub mod install;
 pub mod intents;
 pub(crate) mod job_work;
