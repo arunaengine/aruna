@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::revision_read::RawDisplayOperation;
 use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
@@ -11,10 +10,10 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
-use tokio::time::Instant;
-use crate::driver::{DriverContext, drive_until};
 use crate::driver::drive;
+use crate::driver::{DriverContext, drive_until};
 use crate::metadata::materialization_queue::capture_pending;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -48,6 +47,7 @@ use aruna_core::telemetry::time_stage;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
+use tokio::time::Instant;
 use ulid::Ulid;
 
 /// How long other holders leave a new revision to the first holder before generating it.
