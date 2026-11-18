@@ -1138,6 +1138,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

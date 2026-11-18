@@ -369,6 +369,7 @@ enum Family {
     Index,
     Session,
     Outbound,
+    Job,
 }
 
 impl Wait {
@@ -389,6 +390,7 @@ impl Wait {
             Self::Family(Family::Index) => "an index event",
             Self::Family(Family::Session) => "a session event",
             Self::Family(Family::Outbound) => "an outbound event",
+            Self::Family(Family::Job) => "a job host event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -463,6 +465,12 @@ impl<P: Operation> CallRun<P> {
         self.state = State::Waiting(Wait::Window);
         match self.operation.next(IoResult::Group(event)) {
             Ok(Next::Wait) => smallvec![],
+            // A window group returned from a member adds all its members to the open window.
+            Ok(Next::Call(IoCall::Group(EffectGroup {
+                members,
+                form: GroupForm::Window,
+                ..
+            }))) => members.into_iter().collect(),
             Ok(Next::Call(mut call)) => {
                 let txn_id = self.txn_for(&mut call);
                 match call_effect(call, txn_id) {
@@ -840,6 +848,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::Index(_) => Ok(Family::Index),
         Effect::Session(_) => Ok(Family::Session),
         Effect::Outbound(_) => Ok(Family::Outbound),
+        Effect::Job(_) => Ok(Family::Job),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
@@ -869,6 +878,7 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Index(_) => Some(Family::Index),
         Event::Session(_) => Some(Family::Session),
         Event::Outbound(_) => Some(Family::Outbound),
+        Event::Job(_) => Some(Family::Job),
         Event::SubOperation(_)
         | Event::Search()
         | Event::Stream()

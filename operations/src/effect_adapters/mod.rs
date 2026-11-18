@@ -4,6 +4,7 @@
 
 mod audit;
 mod blob;
+pub(crate) mod job;
 mod metadata;
 mod net;
 mod session;
@@ -182,6 +183,7 @@ async fn dispatch_unboxed(
         Effect::Session(effect) => {
             Event::Session(Box::new(session::dispatch_session(*effect, context).await))
         }
+        Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
     trace!(
@@ -219,6 +221,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 
