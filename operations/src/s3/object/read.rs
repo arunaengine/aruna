@@ -37,7 +37,7 @@ use super::get::{
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
-use crate::blob::unlocked::{drop_mismatch, reject_archive};
+use crate::blob::unlocked::DropReceivedOperation;
 use crate::distribution::held::PullRequest;
 use crate::distribution::pull::{pinned_blob, pull_through};
 use crate::distribution::source_keep::keep_first;
@@ -399,7 +399,8 @@ pub(super) async fn promote_leased(
     let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
     let outcome = match drive(promote.with_lease(lease), context).await {
         Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
-            reject_archive(context, &archive, (realm_id, node_id), reason)
+            let drop = DropReceivedOperation::rejected(archive, (realm_id, node_id), reason);
+            drive(drop, context)
                 .await
                 .map_err(|_| GetObjectError::GetObjectFailed)?;
             return Err(GetObjectError::GetObjectFailed);
@@ -413,7 +414,8 @@ pub(super) async fn promote_leased(
         Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
         Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),
         Promotion::Mismatch { claimed } => {
-            drop_mismatch(context, &archive, claimed, (realm_id, node_id))
+            let drop = DropReceivedOperation::mismatched(archive, claimed, (realm_id, node_id));
+            drive(drop, context)
                 .await
                 .map_err(|_| GetObjectError::GetObjectFailed)?;
             Err(GetObjectError::GetObjectFailed)

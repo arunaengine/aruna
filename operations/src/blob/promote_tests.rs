@@ -688,7 +688,7 @@ fn claim_mismatch_unregistered() {
 
 pub(crate) mod received {
     use super::*;
-    use crate::blob::unlocked::{drop_mismatch, promote_unlocked, read_value};
+    use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
     use crate::driver::{DriverContext, drive};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::s3::object::copy::test::{full_context, seed_authority, seed_bucket};
@@ -852,8 +852,30 @@ pub(crate) mod received {
         )
     }
 
+    async fn read_value(
+        storage: &aruna_storage::StorageHandle,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> Result<Option<aruna_core::types::Value>, PromoteError> {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => panic!("unexpected answer {}", other.label()),
+        }
+    }
+
     async fn sweep(context: &DriverContext, key: BucketKeyRef) -> Result<usize, PromoteError> {
-        promote_unlocked(context, key, origin(context), &RoCrateLimits::default()).await
+        let limits = RoCrateLimits::default();
+        drive(
+            PromoteUnlockedOperation::new(key, origin(context), &limits),
+            context,
+        )
+        .await
     }
 
     async fn rejected(context: &DriverContext, archive: &ArchiveKey) {
@@ -979,9 +1001,12 @@ pub(crate) mod received {
         let owners = crate::driver::drive_retry(|| fence.clone(), &context, b"fence").await;
         assert_eq!(owners.unwrap().len(), 2);
         assert_eq!(
-            drop_mismatch(&context, &archive, [0; 32], origin(&context))
-                .await
-                .unwrap(),
+            drive(
+                DropReceivedOperation::mismatched(archive.clone(), [0; 32], origin(&context)),
+                &context
+            )
+            .await
+            .unwrap(),
             2
         );
         assert_eq!(sweep(&context, plan.key).await.unwrap(), 0);

@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::PromoteError;
-use crate::blob::unlocked::promote_unlocked;
+use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::JobMutationError;
@@ -63,7 +63,7 @@ pub async fn wake_unlocked(
     let queued = super::remote_key::queue_wakes(context, key).await;
     super::remote_key::arm_delivery(context).await;
     let mut resumed = resume_transitions(context, key).await;
-    let promoted = promote_unlocked(context, key, origin, limits).await;
+    let promoted = drive(PromoteUnlockedOperation::new(key, origin, limits), context).await;
     if !matches!(promoted, Ok(0)) {
         resumed = resumed.and(resume_transitions(context, key).await);
     }
