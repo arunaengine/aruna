@@ -31,9 +31,11 @@ fn spec() -> WebhookDeliverySpec {
         key: "a.csv".to_string(),
         size_bytes: 9,
     };
+    let mut notification = NotificationRecord::new(user(1, 2), NotificationClass::Direct, kind, 42);
+    notification.notification_id = Ulid::from_parts(7, 7);
     WebhookDeliverySpec {
         subscription_id: Ulid::nil(),
-        notification: NotificationRecord::new(user(1, 2), NotificationClass::Direct, kind, 42),
+        notification,
     }
 }
 
@@ -106,7 +108,7 @@ fn on_setting_posts() {
     let (mut job, turn) = decided(winner(Some("https://hooks.example.org/aruna")));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(
-        job.next(child::<_, SendError>(Ok(Some(204)))),
+        job.next(child::<Option<u16>, SendError>(Ok(Some(204)))),
         status_turn(Some(204))
     );
 

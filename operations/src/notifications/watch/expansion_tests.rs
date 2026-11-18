@@ -183,7 +183,8 @@ fn drain_defers_failures() {
     let config = RealmConfigDocument::new(REALM, Vec::new(), 3);
     let mut drain = RetryDrainOperation::new(REALM, config, node());
     assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Effect(_)))));
-    let (key, value) = retry_row(1, b"cursor");
+    let cursor = watch_subscription_key(user(4, 2), Ulid::nil()).to_vec();
+    let (key, value) = retry_row(1, &cursor);
     let malformed = (
         Key::from(watch_retry_key(REALM, event(2).event_id)),
         Value::from(vec![1]),
