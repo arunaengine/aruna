@@ -4,20 +4,21 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REFRESH_DUE_KEYSPACE, REFRESH_JOB_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -65,6 +66,14 @@ pub enum ReferenceRefreshError {
     #[error("unexpected event while processing reference metadata refresh queue: {0}")]
     UnexpectedEvent(String),
 }
+
+impl From<IoError> for ReferenceRefreshError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type QueueTurn = Result<Next<QueueRefreshResult>, ReferenceRefreshError>;
 
 #[derive(Serialize)]
 struct ReferenceRefreshIdentity<'a> {
@@ -134,198 +143,133 @@ pub fn schedule_drain() -> Effect {
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum QueueRefreshState {
-    Init,
-    StartTransaction,
-    ReadExisting,
-    WriteJob,
-    Commit,
-    ScheduleDrain,
-    Finish,
-    Error,
+/// Merges one refresh request into its queued job, in one transaction.
+#[derive(Debug, PartialEq)]
+struct RefreshJobWrite {
+    refresh: ReferenceRefresh,
+    writing: bool,
+}
+
+impl RefreshJobWrite {
+    /// A queued job keeps its due time and attempts; only a newer request replaces its payload.
+    fn merged(&self, existing: Option<&[u8]>) -> Option<ReferenceRefreshRecord> {
+        match existing.map(postcard::from_bytes::<ReferenceRefreshRecord>) {
+            Some(Ok(existing)) if existing.refresh.refreshed_at >= self.refresh.refreshed_at => {
+                None
+            }
+            Some(Ok(existing)) => Some(ReferenceRefreshRecord {
+                refresh: self.refresh.clone(),
+                ..existing
+            }),
+            Some(Err(_)) | None => Some(ReferenceRefreshRecord::new(
+                self.refresh.clone(),
+                unix_timestamp_millis(),
+            )),
+        }
+    }
+}
+
+impl Operation for RefreshJobWrite {
+    type Output = ();
+    type Error = ReferenceRefreshError;
+
+    fn first(&mut self) -> Result<Next<()>, ReferenceRefreshError> {
+        let key = job_key(&self.refresh)?;
+        Ok(Next::Call(read_row(REFRESH_JOB_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ReferenceRefreshError> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let existing = result.value()?;
+        let Some(record) = self.merged(existing.as_deref()) else {
+            return Ok(Next::Done(()));
+        };
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(job_entries(&record)?)))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct QueueRefreshOperation {
     refresh: ReferenceRefresh,
-    txn_id: Option<Ulid>,
     conflicts: u32,
-    state: QueueRefreshState,
-    output: Option<Result<QueueRefreshResult, ReferenceRefreshError>>,
+    scheduling: bool,
 }
 
 impl QueueRefreshOperation {
     pub fn new(refresh: ReferenceRefresh) -> Self {
         Self {
             refresh,
-            txn_id: None,
             conflicts: 0,
-            state: QueueRefreshState::Init,
-            output: None,
+            scheduling: false,
         }
     }
 
-    fn fail(&mut self, error: ReferenceRefreshError) -> Effects {
-        self.state = QueueRefreshState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn write_job(&self) -> QueueTurn {
+        Ok(Next::Call(IoCall::child(RefreshJobWrite {
+            refresh: self.refresh.clone(),
+            writing: false,
+        })))
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.state = QueueRefreshState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn read_existing(&mut self, txn_id: Ulid) -> Effects {
-        let key = match job_key(&self.refresh) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.txn_id = Some(txn_id);
-        self.state = QueueRefreshState::ReadExisting;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    /// A queued job keeps its due time and attempts; only a newer request replaces its payload.
-    fn merge_job(&mut self, existing: Option<&[u8]>) -> Effects {
-        let record = match existing.map(postcard::from_bytes::<ReferenceRefreshRecord>) {
-            Some(Ok(existing)) if existing.refresh.refreshed_at >= self.refresh.refreshed_at => {
-                return self.commit();
+    fn job_written(&mut self, written: Result<(), ReferenceRefreshError>) -> QueueTurn {
+        match written {
+            Ok(()) => {
+                self.scheduling = true;
+                Ok(Next::Call(schedule_drain().into()))
             }
-            Some(Ok(existing)) => ReferenceRefreshRecord {
-                refresh: self.refresh.clone(),
-                ..existing
-            },
-            Some(Err(_)) | None => {
-                ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis())
+            Err(ReferenceRefreshError::Storage(StorageError::TransactionConflict))
+                if self.conflicts < QUEUE_CONFLICT_RETRIES =>
+            {
+                self.conflicts += 1;
+                self.write_job()
             }
-        };
-        let writes = match job_entries(&record) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueRefreshState::WriteJob;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ReferenceRefreshError::UnexpectedEvent(
-                "refresh queue transaction is missing".to_string(),
-            ));
-        };
-        self.state = QueueRefreshState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn schedule_drain(&mut self) -> Effects {
-        self.txn_id = None;
-        self.state = QueueRefreshState::ScheduleDrain;
-        smallvec![schedule_drain()]
-    }
-
-    fn finish(&mut self, queued: bool, scheduled: bool) -> Effects {
-        self.state = QueueRefreshState::Finish;
-        self.output = Some(Ok(QueueRefreshResult { queued, scheduled }));
-        smallvec![]
+            Err(error) => Err(error),
+        }
     }
 }
 
-impl EffectOperation for QueueRefreshOperation {
+impl Operation for QueueRefreshOperation {
     type Output = QueueRefreshResult;
     type Error = ReferenceRefreshError;
 
-    fn start(&mut self) -> Effects {
-        self.start_transaction()
+    fn first(&mut self) -> QueueTurn {
+        self.write_job()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match (&self.state, event) {
-            (QueueRefreshState::Finish | QueueRefreshState::Error, _) => return smallvec![],
-            (QueueRefreshState::Init, _) => return self.start_transaction(),
-            (QueueRefreshState::ScheduleDrain, event) => {
-                return match event {
-                    Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
-                    Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
-                    other => {
-                        warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
-                        self.finish(true, false)
-                    }
-                };
-            }
-            (
-                QueueRefreshState::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) if self.conflicts < QUEUE_CONFLICT_RETRIES => {
-                self.txn_id = None;
-                self.conflicts += 1;
-                return self.start_transaction();
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
-            (_, Event::Storage(event)) => event,
-            (_, other) => {
-                return self.fail(ReferenceRefreshError::UnexpectedEvent(
-                    other.label().to_string(),
-                ));
+    fn next(&mut self, result: IoResult) -> QueueTurn {
+        if !self.scheduling {
+            return self.job_written(result.child::<(), ReferenceRefreshError>()?);
+        }
+        // The job is durable, so a drain timer that cannot be set is only reported.
+        let scheduled = match result.event() {
+            Ok(Event::Task(TaskEvent::TimerScheduled { .. })) => true,
+            Ok(Event::Task(TaskEvent::Error { .. })) => false,
+            other => {
+                warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
+                false
             }
         };
-        match (&self.state, event) {
-            (QueueRefreshState::StartTransaction, StorageEvent::TransactionStarted { txn_id }) => {
-                self.read_existing(txn_id)
-            }
-            (QueueRefreshState::ReadExisting, StorageEvent::ReadResult { value, .. }) => {
-                self.merge_job(value.as_deref())
-            }
-            (QueueRefreshState::WriteJob, StorageEvent::BatchWriteResult { .. }) => self.commit(),
-            (QueueRefreshState::Commit, StorageEvent::TransactionCommitted { .. }) => {
-                self.schedule_drain()
-            }
-            (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(
-                Event::Storage(other).label().to_string(),
-            )),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            QueueRefreshState::Finish | QueueRefreshState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(result)) => Ok(result),
-            Some(Err(error)) => Err(error),
-            None => Err(ReferenceRefreshError::UnexpectedEvent(
-                "reference metadata refresh queue operation finished without output".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        Ok(Next::Done(QueueRefreshResult {
+            queued: true,
+            scheduled,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
     use aruna_storage::StorageHandle;
 
@@ -551,6 +495,96 @@ mod tests {
             ),
         ];
         write_rows(storage, writes).await;
+    }
+
+    fn written(result: Result<(), ReferenceRefreshError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn conflict() -> Result<(), ReferenceRefreshError> {
+        Err(ReferenceRefreshError::from(IoError::Conflict))
+    }
+
+    #[test]
+    fn job_write_merges() {
+        // A newer request replaces the payload and keeps the due time; an older one writes nothing.
+        let test = setup_state();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let queued = ReferenceRefreshRecord::new(refresh(&test, source_metadata(1, "a"), at), 77);
+        let stored = postcard::to_allocvec(&queued).unwrap();
+        let later = at + Duration::from_secs(1);
+        let newer = refresh(&test, source_metadata(2, "b"), later);
+        let mut write = RefreshJobWrite {
+            refresh: newer.clone(),
+            writing: false,
+        };
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        assert_eq!(
+            write.first(),
+            Ok(Next::Call(read_row(
+                REFRESH_JOB_KEYSPACE,
+                job_key(&newer).unwrap()
+            )))
+        );
+        let expected = ReferenceRefreshRecord::new(newer, 77);
+        assert_eq!(
+            write.next(IoResult::Values(vec![Some(stored.clone().into())])),
+            Ok(Next::Call(IoCall::Write(job_entries(&expected).unwrap())))
+        );
+        assert_eq!(write.next(IoResult::Done), Ok(Next::Done(())));
+
+        let mut older = RefreshJobWrite {
+            refresh: refresh(&test, source_metadata(3, "c"), at),
+            writing: false,
+        };
+        older.first().unwrap();
+        let answer = IoResult::Values(vec![Some(stored.into())]);
+        assert_eq!(older.next(answer), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn queue_retries_conflicts() {
+        // A lost conflict rereads the job, up to the retry limit.
+        let test = setup_state();
+        let request = refresh(&test, source_metadata(1, "a"), SystemTime::UNIX_EPOCH);
+        let mut operation = QueueRefreshOperation::new(request);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        for _ in 0..QUEUE_CONFLICT_RETRIES {
+            assert!(matches!(
+                operation.next(written(conflict())),
+                Ok(Next::Call(IoCall::Child(_)))
+            ));
+        }
+        assert_eq!(
+            operation.next(written(conflict())),
+            Err(conflict().unwrap_err())
+        );
+    }
+
+    #[test]
+    fn queue_schedules_drain() {
+        let test = setup_state();
+        let request = refresh(&test, source_metadata(1, "a"), SystemTime::UNIX_EPOCH);
+        let mut operation = QueueRefreshOperation::new(request);
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(written(Ok(()))),
+            Ok(Next::Call(schedule_drain().into()))
+        );
+        let refused = IoResult::Event(Box::new(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "stopped".to_string(),
+        })));
+        assert_eq!(
+            operation.next(refused),
+            Ok(Next::Done(QueueRefreshResult {
+                queued: true,
+                scheduled: false
+            }))
+        );
     }
 
     #[tokio::test]
@@ -837,50 +871,6 @@ mod tests {
         let result = process_batch(&test.context).await.expect("drain succeeds");
         assert_eq!(result.succeeded, 1);
         assert_reference_state(&test, &original, newer).await;
-    }
-
-    // A queue write that loses to a racing commit rereads the job instead of dropping the request.
-    #[tokio::test]
-    async fn queue_conflict_retried() {
-        let test = setup_state();
-        let mut operation = QueueRefreshOperation::new(refresh(
-            &test,
-            source_metadata(1, "original"),
-            SystemTime::UNIX_EPOCH,
-        ));
-        let conflict = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            })
-        };
-        operation.start();
-        for _ in 0..=QUEUE_CONFLICT_RETRIES {
-            let txn_id = Ulid::generate();
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: ByteView::from(Vec::new()),
-                value: None,
-            }));
-            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            assert_eq!(operation.state, QueueRefreshState::Commit);
-            let effects = operation.step(conflict());
-            let retried = matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            );
-            assert_eq!(retried, !operation.is_complete());
-        }
-
-        assert_eq!(
-            operation.finalize(),
-            Err(ReferenceRefreshError::Storage(
-                StorageError::TransactionConflict
-            ))
-        );
     }
 
     // A drain that finishes a request a newer one replaced keeps the newer job queued.
