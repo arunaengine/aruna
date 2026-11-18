@@ -23,10 +23,8 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::attempt::read_crate_status;
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
-use aruna_operations::jobs::store::{JobMutation, mutate_job};
+use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
+use aruna_operations::jobs::store::{JobMutation, row_calls};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::tasks::job_reconcile::ExternalReconciler;
@@ -199,11 +197,9 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         None,
     );
     record.captured_inputs = captured_inputs;
-    insert_job(&ctx, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx, job_id, node_id, unix_timestamp_millis())
-        .await
-        .unwrap()
-    else {
+    drive(row_calls::insert_job(&record), &ctx).await.unwrap();
+    let claim = job_calls::claim_job(job_id, node_id, unix_timestamp_millis());
+    let ClaimOutcome::Claimed(claimed) = drive(claim, &ctx).await.unwrap() else {
         panic!("claim failed");
     };
     (job_id, claimed)
@@ -275,7 +271,10 @@ async fn wait_state(
     let mut progress = None;
     let mut deadline = Instant::now() + idle;
     loop {
-        let record = read_job_record(&ctx, job_id, None).await.ok().flatten();
+        let record = drive(row_calls::read_job_record(job_id), &ctx)
+            .await
+            .ok()
+            .flatten();
         if let Some(record) = &record
             && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
         {
@@ -319,7 +318,7 @@ async fn wait_run_crate(
 ) -> Option<RunCrateStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Some(status)) = read_crate_status(&ctx, job_id).await
+        if let Ok(Some(status)) = drive(row_calls::read_crate_status(job_id), &ctx).await
             && !matches!(
                 status,
                 RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
@@ -581,10 +580,9 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
         Duration::from_secs(90),
     )
     .await;
-    aruna_operations::jobs::store::attempt::set_cancel_requested(
+    drive(
+        job_calls::set_cancel_requested(job_id, unix_timestamp_millis()),
         &fixture.compute_ctx,
-        job_id,
-        unix_timestamp_millis(),
     )
     .await
     .unwrap();
@@ -645,17 +643,18 @@ async fn execution_restart_adopts() -> TestResult<()> {
 
     // Reconciliation receives only jobs with leases expired by the sweep.
     // Expire the crashed holder's lease to reproduce that admission condition.
-    mutate_job(&fixture.compute_ctx, job_id, |record| {
+    let expire = job_calls::change_job(job_id, |record| {
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_ms = 1;
         }
         Ok(JobMutation::Persist)
-    })
-    .await
-    .expect("expire crashed lease");
+    });
+    drive(expire, &fixture.compute_ctx)
+        .await
+        .expect("expire crashed lease");
 
     // The reconciler adopts the still-running container.
-    let lost = read_job_record(&fixture.compute_ctx, job_id, None)
+    let lost = drive(row_calls::read_job_record(job_id), &fixture.compute_ctx)
         .await
         .unwrap()
         .unwrap();
