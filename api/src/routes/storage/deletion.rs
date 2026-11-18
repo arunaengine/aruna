@@ -824,14 +824,17 @@ pub async fn delete_preview(
             } => (key.clone(), *version_id),
         })
         .collect();
-    let files = aruna_operations::blob::purge::storage_files(
-        &context,
-        (&bucket, info.group_id),
+    let routing = aruna_operations::driver::node_routing(&context);
+    let place = (bucket.as_str(), info.group_id);
+    let lookup = aruna_operations::blob::purge::StorageFilesOperation::new(
+        routing,
+        place,
         &versions,
         Some(&scope),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    );
+    let files = drive(lookup, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
     let unchecked = aruna_operations::blob::purge::UNCHECKED_READERS;
     let unchecked = files

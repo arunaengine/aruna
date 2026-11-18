@@ -25,6 +25,7 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFilesOperation};
 use crate::driver::drive_retry;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
@@ -684,13 +685,13 @@ async fn plan_files(
         .filter_map(|entry| Some((entry.key.clone(), entry.version_id?)))
         .collect();
     let scope = (spec.scope.bucket(), spec.group_id);
-    let failed = |error: String| JobError::retryable(format!("purge file plan failed: {error}"));
-    let found = crate::blob::purge::storage_files(&ctx.driver, scope, &versions, None)
-        .await
-        .map_err(failed)?;
-    crate::blob::purge::plan_files(&ctx.driver, ctx.job_id.as_ulid(), &found)
-        .await
-        .map_err(failed)?;
+    let failed =
+        |error: PurgeFilesError| JobError::retryable(format!("purge file plan failed: {error}"));
+    let routing = crate::driver::node_routing(&ctx.driver);
+    let lookup = StorageFilesOperation::new(routing, scope, &versions, None);
+    let found = drive(lookup, &ctx.driver).await.map_err(failed)?;
+    let plan = PlanFilesOperation::new(ctx.job_id.as_ulid(), &found);
+    drive(plan, &ctx.driver).await.map_err(failed)?;
     Ok(found.into_iter().filter_map(|file| file.index).collect())
 }
 
