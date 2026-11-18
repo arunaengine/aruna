@@ -575,3 +575,245 @@ async fn presence_values(node: &RecoveryNode, realm_id: RealmId) -> Vec<DhtEntry
         _ => Vec::new(),
     }
 }
+
+#[tokio::test]
+async fn device_skips_presence() {
+    // A User-kind node completes the presence phase without publishing; the
+    // same node publishes once the realm config makes it a Server.
+    let realm_id = RealmId([31u8; 32]);
+    let device = make_node(realm_id, 31).await;
+    let presence = || PresencePhaseOperation::new(realm_id, device.net.node_id());
+
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    config.ensure_node(
+        device.net.node_id(),
+        RealmNodeKind::User {
+            owner: UserId::nil(realm_id),
+        },
+    );
+    save_config(&device, &config).await;
+
+    let outcome = drive(presence(), &device.context)
+        .await
+        .expect("phase runs");
+    assert!(outcome.progress);
+    assert!(outcome.error.is_none());
+    assert!(presence_values(&device, realm_id).await.is_empty());
+
+    let mut promoted = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    promoted.ensure_node(device.net.node_id(), RealmNodeKind::Server);
+    save_config(&device, &promoted).await;
+
+    let outcome = drive(presence(), &device.context)
+        .await
+        .expect("phase runs");
+    assert!(outcome.progress);
+    assert!(outcome.error.is_none());
+    assert!(!presence_values(&device, realm_id).await.is_empty());
+
+    stop_node(device).await;
+}
+
+#[tokio::test]
+async fn restore_suffix() {
+    let realm_id = RealmId([10; 32]);
+    let local = make_node(realm_id, 1).await;
+    let blocked = make_node(realm_id, 2).await;
+    let healthy = make_node(realm_id, 3).await;
+    let (config, placements) = test_config(
+        realm_id,
+        local.net.node_id(),
+        &[blocked.net.node_id(), healthy.net.node_id()],
+    );
+    save_config(&local, &config).await;
+    save_config(&blocked, &config).await;
+    save_config(&healthy, &config).await;
+    mesh_nodes(&local, &healthy).await;
+
+    let blocked_topic = shard_topic_id(realm_id, &placements[0]);
+    let healthy_topic = shard_topic_id(realm_id, &placements[1]);
+    seed_topic(&blocked, blocked_topic, &[blocked.net.node_id()]).await;
+    seed_topic(&healthy, healthy_topic, &[local.net.node_id()]).await;
+    let restore = RestorePassOperation::new(
+        local.net.node_id(),
+        realm_id,
+        ShardRestoreCursor::default(),
+        RecoveryStop::default(),
+    );
+    let (pass, _) = drive(restore, &local.context).await.expect("pass runs");
+
+    assert!(pass.wrapped);
+    assert!(pass.unresolved_topics.contains(&blocked_topic));
+    assert!(!pass.unresolved_topics.contains(&healthy_topic));
+    assert!(
+        local
+            .net
+            .sync_topic_exists(healthy_topic)
+            .expect("healthy topic lookup")
+    );
+    assert!(pass.topics_completed > 0);
+
+    stop_node(local).await;
+    stop_node(blocked).await;
+    stop_node(healthy).await;
+}
+
+#[tokio::test]
+async fn heal_rotation() {
+    let realm_id = RealmId([11; 32]);
+    let local = make_node(realm_id, 4).await;
+    let blocked = make_node(realm_id, 5).await;
+    let (config, placements) = test_config(realm_id, local.net.node_id(), &[blocked.net.node_id()]);
+    save_config(&local, &config).await;
+    save_config(&blocked, &config).await;
+    let topic = shard_topic_id(realm_id, &placements[0]);
+    seed_topic(&blocked, topic, &[blocked.net.node_id()]).await;
+
+    tokio::time::pause();
+    let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
+    wait_state(&status, RecoveryState::Degraded).await;
+    assert!(status.snapshot().topics_remaining > 0);
+    assert!(
+        !local
+            .net
+            .sync_topic_exists(topic)
+            .expect("local topic lookup")
+    );
+
+    mesh_nodes(&local, &blocked).await;
+    // Every configured peer restores because only the designated minter creates shared topics.
+    let restore = RestoreTopicsOperation::new(blocked.net.node_id(), realm_id);
+    drive(restore, &blocked.context)
+        .await
+        .expect("restore runs");
+    let reconcile = ReconcilePlacementsOperation::new(realm_id, blocked.net.node_id(), true);
+    drive(reconcile, &blocked.context)
+        .await
+        .expect("reconcile runs");
+    wait_state(&status, RecoveryState::Converged).await;
+    assert_eq!(status.snapshot().state, RecoveryState::Converged);
+    assert_eq!(status.snapshot().topics_remaining, 0);
+    assert_eq!(status.snapshot().last_error, None);
+    assert!(status.pass_total(RecoveryOutcome::Success) > 0);
+    assert!(
+        local
+            .net
+            .sync_topic_exists(topic)
+            .expect("healed topic lookup")
+    );
+
+    finish_driver(cancelled, driver).await;
+    stop_node(local).await;
+    stop_node(blocked).await;
+}
+
+#[tokio::test]
+async fn shared_retry() {
+    let realm_id = RealmId([13; 32]);
+    let local = make_node(realm_id, 8).await;
+    let blocked = make_node(realm_id, 9).await;
+    let config = flat_config(realm_id, &[local.net.node_id(), blocked.net.node_id()]);
+    save_config(&local, &config).await;
+    save_config(&blocked, &config).await;
+
+    tokio::time::pause();
+    let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
+    wait_state(&status, RecoveryState::Degraded).await;
+    assert_eq!(
+        status.snapshot().last_error,
+        Some(RecoveryError::PeerUnavailable)
+    );
+    assert!(status.snapshot().topics_remaining > 0);
+    let partial = status.pass_total(RecoveryOutcome::Partial);
+
+    wait_partial(&status, partial.saturating_add(1)).await;
+    assert_eq!(status.snapshot().state, RecoveryState::Degraded);
+    assert_eq!(
+        status.snapshot().last_error,
+        Some(RecoveryError::PeerUnavailable)
+    );
+
+    finish_driver(cancelled, driver).await;
+    stop_node(local).await;
+    stop_node(blocked).await;
+}
+
+#[tokio::test]
+async fn usage_retry() {
+    let realm_id = RealmId([14; 32]);
+    let local = make_node(realm_id, 10).await;
+    let config = flat_config(realm_id, &[local.net.node_id()]);
+    save_config(&local, &config).await;
+    let group_id = ulid::Ulid::from_bytes([15; 16]);
+    let event = local
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+            key: aruna_core::structs::storage::usage::usage_group_key(group_id).into(),
+            value: vec![0xff].into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    tokio::time::pause();
+    let (status, cancelled, driver) = spawn_driver(&local, realm_id, true);
+    wait_state(&status, RecoveryState::Degraded).await;
+    assert_eq!(status.snapshot().last_error, Some(RecoveryError::Storage));
+    assert_eq!(status.snapshot().topics_remaining, 0);
+    let partial = status.pass_total(RecoveryOutcome::Partial);
+
+    wait_partial(&status, partial.saturating_add(1)).await;
+    assert_eq!(status.snapshot().state, RecoveryState::Degraded);
+    assert_eq!(status.snapshot().last_error, Some(RecoveryError::Storage));
+    assert_eq!(status.snapshot().topics_remaining, 0);
+
+    finish_driver(cancelled, driver).await;
+    stop_node(local).await;
+}
+
+#[tokio::test]
+async fn bad_config_degrades() {
+    let dir = tempdir().expect("tempdir must open");
+    let storage =
+        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
+    let realm_id = RealmId([8; 32]);
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let event = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            value: vec![0xff].into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    // A failed config read must not unbind the cursor from its plan.
+    let bound = ShardRestoreCursor {
+        next_unit: 3,
+        plan_hash: Some([7; 32]),
+    };
+    let restore = RestorePassOperation::new(node(1), realm_id, bound, RecoveryStop::default());
+    let (pass, cursor) = drive(restore, &context).await.expect("pass runs");
+    assert_eq!(pass.error, Some(RecoveryError::Storage));
+    assert!(pass.wrapped);
+    assert!(!pass.enumerated);
+    assert_eq!(cursor, bound);
+}
