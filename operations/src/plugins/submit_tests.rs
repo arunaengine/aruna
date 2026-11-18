@@ -6,7 +6,6 @@
 use aruna_core::plugin_installs::PluginInstall;
 
 use super::*;
-use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::calls::*;
@@ -15,11 +14,9 @@ pub(crate) use crate::plugins::flow_support::submit::{fetcher, send, stored_obje
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::runs::tests::queued;
-use crate::plugins::test_support::copier;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::{path, ready, request, scope};
 use crate::plugins::work::read_work;
-use crate::s3::object::copy::test::seed_bucket;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 
 #[tokio::test]

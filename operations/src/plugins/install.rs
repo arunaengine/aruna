@@ -837,7 +837,7 @@ impl Operation for CheckHolder {
 
 /// The record of a new install. The account and role ids are fresh, never taken from the
 /// caller, so no existing user or role can be adopted or replaced.
-fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginInstall {
+pub(crate) fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginInstall {
     let scope = &prepared.scope;
     PluginInstall {
         install_id: scope.install_id,

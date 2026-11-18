@@ -22,7 +22,7 @@ use super::rows::{
 };
 
 /// The row of a work under its key.
-fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
+pub(crate) fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
     Ok(row(PLUGIN_WORK_KEYSPACE, key, encode(work)?))
 }
 

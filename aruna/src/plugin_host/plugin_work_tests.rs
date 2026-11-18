@@ -3,15 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobProgress};
-use serde_json::json;
-use tokio_util::sync::CancellationToken;
+use aruna_core::structs::execution::job::JobErrorKind;
 use ulid::Ulid;
 
 use super::*;
 use aruna_core::plugin_installs::InstallState;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::executor::ProgressReporter;
 use aruna_operations::plugins::calls::*;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::edit_config;
@@ -19,7 +15,6 @@ use aruna_operations::plugins::test_support::edit_config;
 pub(crate) use aruna_operations::plugins::test_support::{
     copier, job_context, ready_copy, recorded,
 };
-use aruna_operations::plugins::work::{Identity, WorkKind, WorkRow, reserve};
 
 fn failure(outcome: JobRunOutcome) -> (JobErrorKind, String) {
     match outcome {
