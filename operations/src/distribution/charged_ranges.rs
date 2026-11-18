@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -118,10 +117,6 @@ impl ChargedRangesOperation {
         }
         Ok((std::mem::take(&mut self.accounts), counters))
     }
-}
-
-pub(super) fn unexpected(event: &Event) -> UsageError {
-    StorageError::ReadError(format!("unexpected answer {}", event.label())).into()
 }
 
 impl Operation for ChargedRangesOperation {

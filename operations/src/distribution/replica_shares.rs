@@ -5,12 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{
     CounterOverflow, RangeAccount, RangeCounters,
@@ -19,11 +19,11 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView,
 };
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use ulid::Ulid;
 
-use super::charged_ranges::{UsageError, charged_rows, sum_rows, unexpected};
+use super::charged_ranges::{UsageError, charged_rows, sum_rows};
+use crate::metadata::call_results::{page_rows, read_value, read_values};
 
 /// Rows one scan page reads.
 const SCAN_PAGE: usize = 1_000;
@@ -38,30 +38,31 @@ pub struct GroupShare {
 /// A bound bucket's share and the set and record number it was computed under.
 pub type BindingShare = (RangeCounters, Option<(Ulid, u64)>);
 
-fn scan(key_space: &str, prefix: Option<Key>, after: Option<Key>, txn_id: TxnId) -> Effects {
-    smallvec![Effect::Storage(StorageEffect::Iter {
+/// One page of a scan in the caller's transaction.
+fn scan(key_space: &str, prefix: Option<Key>, after: Option<Key>, txn_id: TxnId) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
         key_space: key_space.to_string(),
         prefix,
         start: after.map(IterStart::After),
         limit: SCAN_PAGE,
         txn_id: Some(txn_id),
-    })]
+    })))
 }
 
-fn batch_read(reads: Vec<(String, Key)>, txn_id: TxnId) -> Effects {
-    smallvec![Effect::Storage(StorageEffect::BatchRead {
+/// A read in the caller's transaction.
+fn batch_read(reads: Vec<(String, Key)>, txn_id: TxnId) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::BatchRead {
         reads,
         txn_id: Some(txn_id),
-    })]
+    })))
 }
 
+/// What the pending call of a share read answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShareState {
-    Init,
     Set,
     Accounts,
     Counters,
-    Finish,
 }
 
 /// Reads one bound bucket's share in `txn_id`: zero without a set record here.
@@ -73,7 +74,6 @@ pub struct BindingShareOperation {
     snapshot: Option<DistributionSnapshot>,
     accounts: Vec<(Ulid, RangeAccount)>,
     keys: Vec<Vec<u8>>,
-    output: Option<Result<BindingShare, UsageError>>,
 }
 
 impl BindingShareOperation {
@@ -81,29 +81,22 @@ impl BindingShareOperation {
         Self {
             binding,
             txn_id,
-            state: ShareState::Init,
+            state: ShareState::Set,
             snapshot: None,
             accounts: Vec::new(),
             keys: Vec::new(),
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<BindingShare, UsageError>) -> Effects {
-        self.state = ShareState::Finish;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn accounts_page(&mut self, after: Option<Key>) -> Effects {
+    fn accounts_page(&mut self, after: Option<Key>) -> Next<BindingShare> {
         self.state = ShareState::Accounts;
         let prefix = Some(self.binding.set_id.to_bytes().to_vec().into());
-        scan(RANGE_ACCOUNT_KEYSPACE, prefix, after, self.txn_id)
+        Next::Call(scan(RANGE_ACCOUNT_KEYSPACE, prefix, after, self.txn_id))
     }
 
-    fn read_set(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Result<Effects, UsageError> {
-        let Some((_, Some(value))) = values.pop() else {
-            return Ok(self.finish(Ok((RangeCounters::default(), None))));
+    fn read_set(&mut self, value: Option<Value>) -> Result<Next<BindingShare>, UsageError> {
+        let Some(value) = value else {
+            return Ok(Next::Done((RangeCounters::default(), None)));
         };
         self.snapshot = Some(DistributionView::from_bytes(&value)?.head.snapshot);
         Ok(self.accounts_page(None))
@@ -113,7 +106,7 @@ impl BindingShareOperation {
         &mut self,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Result<Effects, UsageError> {
+    ) -> Result<Next<BindingShare>, UsageError> {
         for (key, value) in values {
             let Some(range_id) = key.get(16..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
                 continue;
@@ -121,8 +114,8 @@ impl BindingShareOperation {
             let account = RangeAccount::from_bytes(&value)?;
             self.accounts.push((Ulid::from_bytes(range_id), account));
         }
-        if let Some(next) = next {
-            return Ok(self.accounts_page(Some(next)));
+        if next.is_some() {
+            return Ok(self.accounts_page(next));
         }
         let (held, own) = self.charged();
         let keys: BTreeSet<Vec<u8>> = held.into_iter().chain(own).collect();
@@ -131,7 +124,7 @@ impl BindingShareOperation {
             .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.clone().into()))
             .collect();
         self.state = ShareState::Counters;
-        Ok(batch_read(reads, self.txn_id))
+        Ok(Next::Call(batch_read(reads, self.txn_id)))
     }
 
     /// The charged rows of every local account, and those of the coordinated ranges. A split
@@ -156,13 +149,10 @@ impl BindingShareOperation {
         )
     }
 
-    fn read_counters(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<BindingShare, UsageError> {
+    fn read_counters(&mut self, values: Vec<Option<Value>>) -> Result<BindingShare, UsageError> {
         let (held, own) = self.charged();
         let stored: BTreeMap<_, _> = (std::mem::take(&mut self.keys).into_iter())
-            .zip(values.into_iter().map(|(_, value)| value))
+            .zip(values)
             .collect();
         let sum = |rows: &[Vec<u8>]| {
             let values: Vec<_> = rows
@@ -177,117 +167,80 @@ impl BindingShareOperation {
     }
 }
 
-impl EffectOperation for BindingShareOperation {
+impl Operation for BindingShareOperation {
     type Output = BindingShare;
     type Error = UsageError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ShareState::Set;
+    fn first(&mut self) -> Result<Next<BindingShare>, UsageError> {
         let set = self.binding.set_id.to_bytes().to_vec().into();
-        batch_read(vec![(DISTRIBUTION_KEYSPACE.to_string(), set)], self.txn_id)
+        let read = vec![(DISTRIBUTION_KEYSPACE.to_string(), set)];
+        Ok(Next::Call(batch_read(read, self.txn_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let next = match (self.state, event) {
-            (ShareState::Set, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_set(values)
+    fn next(&mut self, result: IoResult) -> Result<Next<BindingShare>, UsageError> {
+        match self.state {
+            ShareState::Set => self.read_set(read_value(result)?),
+            ShareState::Accounts => {
+                let (rows, next) = page_rows(result)?;
+                self.read_accounts(rows, next)
             }
-            (
-                ShareState::Accounts,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.read_accounts(values, next_start_after),
-            (ShareState::Counters, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let share = self.read_counters(values);
-                return self.finish(share);
-            }
-            (
-                ShareState::Set | ShareState::Accounts | ShareState::Counters,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => Err(error.into()),
-            (_, event) => Err(unexpected(&event)),
-        };
-        match next {
-            Ok(effects) => effects,
-            Err(error) => self.finish(Err(error)),
+            ShareState::Counters => Ok(Next::Done(self.read_counters(read_values(result)?)?)),
         }
     }
-
-    fn is_complete(&self) -> bool {
-        self.state == ShareState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let unfinished = aruna_core::errors::StorageError::ReadError(
-            "the binding share was not read".to_string(),
-        );
-        self.output.unwrap_or(Err(unfinished.into()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
 }
+
+type Shares = BTreeMap<GroupId, GroupShare>;
 
 /// Sums each group's replica share over its local distributed buckets, read in `txn_id`. A share
 /// that cannot be read fails the whole run, so the publish retries.
 #[derive(Debug, PartialEq)]
 pub struct ReplicaSharesOperation {
     txn_id: TxnId,
-    started: bool,
     /// Bound buckets still to read, the next one last.
     pending: Vec<(GroupId, DistributionBinding)>,
-    current: Option<(GroupId, BindingShareOperation)>,
-    shares: BTreeMap<GroupId, GroupShare>,
-    output: Option<Result<BTreeMap<GroupId, GroupShare>, UsageError>>,
+    /// The group whose share is being read.
+    current: Option<GroupId>,
+    shares: Shares,
 }
 
 impl ReplicaSharesOperation {
     pub fn new(txn_id: TxnId) -> Self {
         Self {
             txn_id,
-            started: false,
             pending: Vec::new(),
             current: None,
             shares: BTreeMap::new(),
-            output: None,
         }
-    }
-
-    fn finish(&mut self, output: Result<BTreeMap<GroupId, GroupShare>, UsageError>) -> Effects {
-        self.output = Some(output);
-        smallvec![]
     }
 
     fn read_buckets(
         &mut self,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Result<Effects, UsageError> {
+    ) -> Result<Next<Shares>, UsageError> {
         for (_, value) in values {
             let info = BucketInfo::from_bytes(value.as_ref())?;
             if let Some(binding) = info.distribution {
                 self.pending.push((info.group_id, binding));
             }
         }
-        if let Some(next) = next {
-            return Ok(scan(S3_BUCKET_KEYSPACE, None, Some(next), self.txn_id));
+        if next.is_some() {
+            let page = scan(S3_BUCKET_KEYSPACE, None, next, self.txn_id);
+            return Ok(Next::Call(page));
         }
         self.pending.reverse();
         Ok(self.next_binding())
     }
 
-    fn next_binding(&mut self) -> Effects {
+    fn next_binding(&mut self) -> Next<Shares> {
         let Some((group_id, binding)) = self.pending.pop() else {
-            let shares = std::mem::take(&mut self.shares);
-            return self.finish(Ok(shares));
+            return Next::Done(std::mem::take(&mut self.shares));
         };
-        let mut share = BindingShareOperation::new(binding, self.txn_id);
-        let effects = share.start();
-        self.current = Some((group_id, share));
-        effects
+        self.current = Some(group_id);
+        Next::Call(IoCall::child(BindingShareOperation::new(
+            binding,
+            self.txn_id,
+        )))
     }
 
     fn add_share(
@@ -311,59 +264,26 @@ impl ReplicaSharesOperation {
     }
 }
 
-impl EffectOperation for ReplicaSharesOperation {
-    type Output = BTreeMap<GroupId, GroupShare>;
+impl Operation for ReplicaSharesOperation {
+    type Output = Shares;
     type Error = UsageError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        scan(S3_BUCKET_KEYSPACE, None, None, self.txn_id)
+    fn first(&mut self) -> Result<Next<Shares>, UsageError> {
+        Ok(Next::Call(scan(S3_BUCKET_KEYSPACE, None, None, self.txn_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Some((group_id, mut share)) = self.current.take() {
-            let effects = share.step(event);
-            if !share.is_complete() {
-                self.current = Some((group_id, share));
-                return effects;
+    fn next(&mut self, result: IoResult) -> Result<Next<Shares>, UsageError> {
+        match self.current.take() {
+            Some(group_id) => {
+                let share = result.child::<BindingShare, UsageError>()??;
+                self.add_share(group_id, share)?;
+                Ok(self.next_binding())
             }
-            return match share
-                .finalize()
-                .and_then(|share| self.add_share(group_id, share))
-            {
-                Ok(()) => self.next_binding(),
-                Err(error) => self.finish(Err(error)),
-            };
-        }
-        let next = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if self.started && self.output.is_none() => {
-                self.read_buckets(values, next_start_after)
+            None => {
+                let (rows, next) = page_rows(result)?;
+                self.read_buckets(rows, next)
             }
-            Event::Storage(StorageEvent::Error { error }) if self.started => Err(error.into()),
-            event => Err(unexpected(&event)),
-        };
-        match next {
-            Ok(effects) => effects,
-            Err(error) => self.finish(Err(error)),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let unfinished = aruna_core::errors::StorageError::ReadError(
-            "the replica shares were not read".to_string(),
-        );
-        self.output.unwrap_or(Err(unfinished.into()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -371,10 +291,9 @@ impl EffectOperation for ReplicaSharesOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_record::{binding, record};
+    use aruna_core::calls::{ChildOutcome, IoError};
     use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::events::{Event, StorageEvent};
 
     const TXN: TxnId = Ulid::from_bytes([9; 16]);
 
@@ -383,18 +302,18 @@ mod tests {
         BindingShareOperation::new(binding(&snapshot, 1, 1), TXN)
     }
 
-    fn read(values: Vec<Option<Vec<u8>>>) -> Event {
+    fn read(values: Vec<Option<Vec<u8>>>) -> IoResult {
         let values = values.into_iter();
-        Event::Storage(StorageEvent::BatchReadResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::BatchReadResult {
             values: (values.map(|value| (Vec::new().into(), value.map(Into::into)))).collect(),
-        })
+        })))
     }
 
-    fn empty_page() -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
+    fn page(values: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values,
             next_start_after: None,
-        })
+        })))
     }
 
     // A set without local accounts shares nothing but names its record number.
@@ -410,34 +329,33 @@ mod tests {
             )],
             TXN,
         );
+        assert_eq!(operation.first(), Ok(Next::Call(start)));
         let prefix = Some(set_id.to_bytes().to_vec().into());
         let accounts = scan(RANGE_ACCOUNT_KEYSPACE, prefix, None, TXN);
-        check_trace(
-            &mut operation,
-            &start,
-            vec![
-                (read(vec![Some(bytes)]), accounts.into_vec()),
-                (empty_page(), batch_read(Vec::new(), TXN).into_vec()),
-                (read(Vec::new()), Vec::new()),
-            ],
+        assert_eq!(
+            operation.next(read(vec![Some(bytes)])),
+            Ok(Next::Call(accounts))
+        );
+        assert_eq!(
+            operation.next(page(Vec::new())),
+            Ok(Next::Call(batch_read(Vec::new(), TXN)))
         );
         let expected = (RangeCounters::default(), Some((set_id, snapshot.number)));
-        assert_eq!(operation.finalize(), Ok(expected));
+        assert_eq!(operation.next(read(Vec::new())), Ok(Next::Done(expected)));
     }
 
-    // A set this node has no record of shares nothing; a failed read fails.
+    // A set this node has no record of shares nothing; a result of another kind fails.
     #[test]
     fn missing_set_empty() {
         let mut operation = share();
-        operation.start();
-        assert!(operation.step(read(vec![None])).is_empty());
-        assert_eq!(operation.finalize(), Ok((RangeCounters::default(), None)));
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(read(vec![None])),
+            Ok(Next::Done((RangeCounters::default(), None)))
+        );
         let mut operation = share();
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
+        operation.first().unwrap();
+        assert!(operation.next(IoResult::Done).is_err());
     }
 
     // A node without bound buckets has no shares.
@@ -445,20 +363,60 @@ mod tests {
     fn empty_without_buckets() {
         let mut operation = ReplicaSharesOperation::new(TXN);
         let buckets = scan(S3_BUCKET_KEYSPACE, None, None, TXN);
-        check_trace(&mut operation, &buckets, vec![(empty_page(), Vec::new())]);
-        assert_eq!(operation.finalize(), Ok(BTreeMap::new()));
+        assert_eq!(operation.first(), Ok(Next::Call(buckets)));
+        assert_eq!(
+            operation.next(page(Vec::new())),
+            Ok(Next::Done(BTreeMap::new()))
+        );
     }
 
-    // Unstarted reads refuse every event, abort nothing and never finish early.
+    fn bound_bucket(group_id: GroupId) -> (Key, Value) {
+        let (snapshot, _) = record(true);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(binding(&snapshot, 1, 1)),
+        };
+        (b"bucket".to_vec().into(), info.to_bytes().unwrap().into())
+    }
+
+    // Each bound bucket's share is read by a child and added to its group; a failed child fails.
     #[test]
-    fn shares_reject_unexpected() {
-        let shares = || ReplicaSharesOperation::new(TXN);
-        let all = sample_events().len();
-        assert_eq!(rejects_events(share, sample_events, |_| false).len(), all);
-        assert_eq!(rejects_events(shares, sample_events, |_| false).len(), all);
-        rejects_finalize(share());
-        rejects_finalize(shares());
-        assert!(share().abort().is_empty());
-        assert!(shares().abort().is_empty());
+    fn sums_bound_buckets() {
+        let group_id = Ulid::from_bytes([3; 16]);
+        let at_child = || {
+            let mut operation = ReplicaSharesOperation::new(TXN);
+            operation.first().unwrap();
+            let child = operation.next(page(vec![bound_bucket(group_id)]));
+            assert!(matches!(child, Ok(Next::Call(IoCall::Child(_)))));
+            operation
+        };
+        let counted = RangeCounters {
+            objects: 2,
+            logical_bytes: 5,
+            ..RangeCounters::default()
+        };
+        let set_id = Ulid::from_bytes([4; 16]);
+        let share: Result<BindingShare, UsageError> = Ok((counted, Some((set_id, 7))));
+        let Ok(Next::Done(shares)) = at_child().next(IoResult::Child(ChildOutcome::new(share)))
+        else {
+            panic!("expected the shares");
+        };
+        let total = &shares[&group_id];
+        assert_eq!((total.replicas.objects, total.replicas.logical_bytes), (2, 5));
+        assert_eq!(total.revisions.get(&set_id), Some(&7));
+
+        let failed: Result<BindingShare, UsageError> =
+            Err(IoError::Storage(StorageError::Timeout).into());
+        assert_eq!(
+            at_child().next(IoResult::Child(ChildOutcome::new(failed))),
+            Err(StorageError::Timeout.into())
+        );
     }
 }
