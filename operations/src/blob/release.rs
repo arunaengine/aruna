@@ -868,96 +868,209 @@ impl ReferencedOperation {
             {
                 continue;
             }
-            let key = object_key(rule.import_id, &location.backend_path);
-            if read_value(context, IMPORTED_OBJECT_KEYSPACE, key)
-                .await?
-                .is_some()
-            {
-                return Ok(true);
+            let key = object_key(rule.import_id, &self.location.backend_path);
+            let read = read_row(IMPORTED_OBJECT_KEYSPACE, key);
+            return self.call(ReferenceStep::RuleRow, read);
+        }
+        if self.rules.done() {
+            return Ok(Next::Done(false));
+        }
+        let page = self.rules.call();
+        self.call(ReferenceStep::Rules, page)
+    }
+}
+
+impl Operation for ReferencedOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        self.wanted = Some(self.location.location_key()?);
+        self.read_aliases()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match self.step {
+            ReferenceStep::Aliases => {
+                let (rows, next) = iter_rows(result.event()?)?;
+                self.more = next;
+                self.aliases = (rows.iter())
+                    .map(|(key, _)| HashIndex::from_bytes(key.as_ref()))
+                    .collect::<Result<_, _>>()?;
+                self.next_alias()
+            }
+            ReferenceStep::Version => self.version_read(result.value()?),
+            ReferenceStep::Location => self.location_read(result.value()?),
+            ReferenceStep::Provider => match other_version(result.value()?, &self.version)? {
+                true => self.next_alias(),
+                false => Ok(Next::Done(true)),
+            },
+            ReferenceStep::Owners => {
+                if !iter_rows(result.event()?)?.0.is_empty() {
+                    return Ok(Next::Done(true));
+                }
+                self.next_rule()
+            }
+            ReferenceStep::Rules => {
+                let rows = self.rules.take(result)?;
+                self.found_rules = rows.into_iter().map(|(_, value)| value).collect();
+                self.next_rule()
+            }
+            ReferenceStep::RuleRow => match result.value()? {
+                Some(_) => Ok(Next::Done(true)),
+                None => self.next_rule(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PinnedStep {
+    Page,
+    Provider,
+}
+
+/// `None` while another location row of these bytes on the same storage reads the same file:
+/// reclaim drops such rows without touching the file, so the release waits for them. Else
+/// whether a row reads another backend version at the same path, which keeps the path in use.
+#[derive(Debug, PartialEq)]
+struct PinnedOperation {
+    location: BackendLocation,
+    version: String,
+    wanted: Vec<u8>,
+    start: Option<Key>,
+    more: Option<Key>,
+    rows: VecDeque<(Key, Value)>,
+    shared: bool,
+    step: PinnedStep,
+}
+
+impl PinnedOperation {
+    fn new(location: &BackendLocation, version: &str) -> Self {
+        Self {
+            location: location.clone(),
+            version: version.to_string(),
+            wanted: Vec::new(),
+            start: None,
+            more: None,
+            rows: VecDeque::new(),
+            shared: false,
+            step: PinnedStep::Page,
+        }
+    }
+
+    fn read_page(&mut self) -> Turn<Option<bool>> {
+        let key = self.location.location_key()?;
+        self.wanted = key.to_bytes();
+        self.step = PinnedStep::Page;
+        let scan = StorageEffect::Iter {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            prefix: Some(key.blake3_hash.to_vec().into()),
+            start: self.start.take().map(IterStart::After),
+            limit: RULE_PAGE,
+            txn_id: None,
+        };
+        Ok(Next::Call(Effect::Storage(scan).into()))
+    }
+
+    fn next_row(&mut self) -> Turn<Option<bool>> {
+        while let Some((key, value)) = self.rows.pop_front() {
+            let row = BackendLocation::from_bytes(&value)?;
+            let own = key.as_ref() == self.wanted.as_slice();
+            if !own && row.backend == self.location.backend && same_path(&row, &self.location) {
+                self.step = PinnedStep::Provider;
+                return Ok(Next::Call(version_read(&row)));
             }
         }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(false),
+        match self.more.take() {
+            Some(next) => {
+                self.start = Some(next);
+                self.read_page()
+            }
+            None => Ok(Next::Done(Some(self.shared))),
+        }
+    }
+}
+
+impl Operation for PinnedOperation {
+    type Output = Option<bool>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Option<bool>> {
+        self.read_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<bool>> {
+        match self.step {
+            PinnedStep::Page => {
+                let (rows, next) = iter_rows(result.event()?)?;
+                self.rows = rows.into();
+                self.more = next;
+                self.next_row()
+            }
+            PinnedStep::Provider => match other_version(result.value()?, &self.version)? {
+                true => {
+                    self.shared = true;
+                    self.next_row()
+                }
+                false => Ok(Next::Done(None)),
+            },
         }
     }
 }
 
 /// Deletes the row only if it is still the one read before the file went; an import may have
 /// committed a replacement meanwhile.
-async fn drop_row(context: &DriverContext, key: Key, observed: Vec<u8>) -> bool {
-    let txn_id = match send(context, StorageEffect::StartTransaction { read: false }).await {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        event => {
-            warn!(?event, "Renamed file row could not be locked");
-            return false;
-        }
-    };
-    let read = StorageEffect::Read {
-        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: Some(txn_id),
-    };
-    let current = match send(context, read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        event => {
-            warn!(?event, "Renamed file row could not be read again");
-            send(context, StorageEffect::AbortTransaction { txn_id }).await;
-            return false;
-        }
-    };
-    if current.as_deref() != Some(observed.as_slice()) {
-        send(context, StorageEffect::AbortTransaction { txn_id }).await;
-        return true;
-    }
-    let delete = StorageEffect::Delete {
-        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key,
-        txn_id: Some(txn_id),
-    };
-    if !matches!(
-        send(context, delete).await,
-        Event::Storage(StorageEvent::DeleteResult { .. })
-    ) {
-        send(context, StorageEffect::AbortTransaction { txn_id }).await;
-        return false;
-    }
-    let commit = StorageEffect::CommitTransaction { txn_id };
-    matches!(
-        send(context, commit).await,
-        Event::Storage(StorageEvent::TransactionCommitted { .. })
-    )
-}
-
-async fn send(context: &DriverContext, effect: StorageEffect) -> Event {
-    context.storage_handle.send_storage_effect(effect).await
-}
-
-/// The storage effect a records helper built.
-fn storage(effect: Effect) -> Result<StorageEffect, String> {
-    match effect {
-        Effect::Storage(effect) => Ok(effect),
-        _ => Err("not a storage effect".to_string()),
-    }
-}
-
-async fn read_value(
-    context: &DriverContext,
-    key_space: &str,
+#[derive(Debug, PartialEq)]
+struct DropRowOperation {
     key: Key,
-) -> Result<Option<Vec<u8>>, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key,
-        txn_id: None,
-    };
-    let event = send(context, read).await;
-    parse_read(event, |bytes| Ok(bytes.to_vec())).map_err(|error| error.to_string())
+    observed: Vec<u8>,
+    deleting: bool,
+}
+
+impl DropRowOperation {
+    fn new(key: Key, observed: Vec<u8>) -> Self {
+        Self {
+            key,
+            observed,
+            deleting: false,
+        }
+    }
+}
+
+impl Operation for DropRowOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<bool> {
+        Ok(Next::Call(read_row(
+            IMPORTED_OBJECT_KEYSPACE,
+            self.key.clone(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(true));
+        }
+        if result.value()?.as_deref() != Some(self.observed.as_slice()) {
+            return Ok(Next::Done(true));
+        }
+        self.deleting = true;
+        let row = (IMPORTED_OBJECT_KEYSPACE.to_string(), self.key.clone());
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::identity::realm::RealmId;
@@ -969,6 +1082,136 @@ mod tests {
 
     const IMPORT: Ulid = Ulid::from_parts(1, 1);
     const VERSION: Ulid = Ulid::from_parts(2, 2);
+
+    async fn release_renamed(
+        context: &DriverContext,
+        location: BackendLocation,
+        import_id: Ulid,
+        version_id: Ulid,
+        version: String,
+    ) -> bool {
+        let file = ReleaseFile {
+            location,
+            import_id,
+            version_id,
+            version,
+            has_blob: context.blob_handle.is_some(),
+        };
+        drive(ReleaseRenamedOperation::new(file), context)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Makes one storage call and waits for its answer.
+    #[derive(Debug, PartialEq)]
+    struct RunCall(Option<IoCall>);
+
+    impl Operation for RunCall {
+        type Output = ();
+        type Error = MigrationError;
+
+        fn first(&mut self) -> Turn<()> {
+            let call = self.0.take();
+            call.map(Next::Call)
+                .ok_or_else(|| MigrationError::Failed("called twice".to_string()))
+        }
+
+        fn next(&mut self, result: IoResult) -> Turn<()> {
+            result.done()?;
+            Ok(Next::Done(()))
+        }
+    }
+
+    async fn claimed(
+        context: &DriverContext,
+        (key, index): (&Key, &Key),
+        value: Option<&[u8]>,
+    ) -> bool {
+        let claim = Claim {
+            key: key.clone(),
+            index: index.clone(),
+        };
+        drive(RunCall(Some(claim_call(&claim, value))), context)
+            .await
+            .is_ok()
+    }
+
+    async fn synced(context: &DriverContext) -> bool {
+        drive(RunCall(Some(IoCall::Sync)), context).await.is_ok()
+    }
+
+    async fn pinned(
+        context: &DriverContext,
+        location: &BackendLocation,
+        version: &str,
+    ) -> Result<Option<bool>, MigrationError> {
+        drive(PinnedOperation::new(location, version), context).await
+    }
+
+    async fn drop_row(context: &DriverContext, key: Key, observed: Vec<u8>) -> bool {
+        let drop = DropRowOperation::new(key, observed);
+        drive(drop, context).await.unwrap_or(false)
+    }
+
+    async fn drop_claims(context: &DriverContext, import_id: Ulid) -> Option<bool> {
+        drive(DropClaimsOperation::new(import_id), context)
+            .await
+            .ok()
+    }
+
+    async fn read_value(
+        context: &DriverContext,
+        key_space: &str,
+        key: Key,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                Ok(value.map(|value| value.to_vec()))
+            }
+            other => Err(other.label().to_string()),
+        }
+    }
+
+    #[test]
+    fn unnamed_unversioned_stays() {
+        let file = ReleaseFile {
+            location: old(),
+            import_id: IMPORT,
+            version_id: Ulid::from_parts(9, 9),
+            version: String::new(),
+            has_blob: true,
+        };
+        let mut release = ReleaseRenamedOperation::new(file);
+        assert_eq!(release.first(), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn tombstone_ends_release() {
+        let file = ReleaseFile {
+            location: old(),
+            import_id: IMPORT,
+            version_id: VERSION,
+            version: "v1".to_string(),
+            has_blob: true,
+        };
+        let mut release = ReleaseRenamedOperation::new(file);
+        assert!(matches!(release.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = IoResult::Values(vec![Some(Value::from(TOMBSTONE.to_vec()))]);
+        assert_eq!(release.next(answer), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn changed_row_kept() {
+        let mut drop = DropRowOperation::new(Key::from(vec![1]), vec![2]);
+        drop.first().unwrap();
+        let answer = IoResult::Values(vec![Some(Value::from(vec![3]))]);
+        assert_eq!(drop.next(answer), Ok(Next::Done(true)));
+    }
 
     fn setup() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
