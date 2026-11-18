@@ -627,115 +627,68 @@ mod tests {
             disabled: false,
             cleanup: Default::default(),
         };
-        let mut operation = RemoveImportOperation::new(rule.group_id, rule.import_id);
-        operation.start();
-        operation.step(storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
-        operation.step(storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
-                (Key::from(Vec::new()), None),
-            ],
-        }));
-        operation.step(storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    Key::from(Vec::new()),
-                    Some(record.to_bytes().unwrap().into()),
-                ),
-                (Key::from(Vec::new()), Some(Value::from(vec![1]))),
-            ],
-        }));
+        let mut drop = dropping();
+        drop.next(rule_rows(&rule)).unwrap();
+        let read = IoResult::Values(vec![
+            Some(record.to_bytes().unwrap().into()),
+            Some(Value::from(vec![1])),
+        ]);
         assert_eq!(
-            operation.finalize(),
+            drop.next(read),
             Err(ImportRuleError::Conflict(ONLY_STORAGE.to_string()))
         );
     }
 
     #[test]
     fn marks_removed_rule() {
-        let (group_id, import_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
-        let mut operation = RemoveImportOperation::new(group_id, import_id);
-        let rule = crate::s3::bucket::rename::tests::rule();
-        operation.start();
-        let txn_id = TxnId::from(7);
-        operation.step(storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
-                (Key::from(Vec::new()), None),
-            ],
-        }));
+        let mut drop = dropping();
+        let turn = drop.next(rule_rows(&rule()));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, limit: 1, .. })]
-                if key_space == BLOB_VERSIONS_KEYSPACE
+            turn,
+            Ok(Next::Call(IoCall::Page { space, limit: 1, .. })) if space == BLOB_VERSIONS_KEYSPACE
         ));
-        let effects = operation.step(storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        let [
-            Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(_),
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the rule delete, got {effects:?}")
+        let Ok(Next::Call(IoCall::Delete(deletes))) = drop.next(page(0)) else {
+            panic!("expected the rule delete");
         };
         let spaces: Vec<_> = deletes.iter().map(|(space, _)| space.as_str()).collect();
         assert_eq!(spaces, [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]);
-
         // The mark commits with the rule deletion, before any row goes.
-        let effects = operation.step(storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                txn_id: mark_txn,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the removal mark, got {effects:?}")
+        let Ok(Next::Call(IoCall::Write(writes))) = drop.next(IoResult::Done) else {
+            panic!("expected the removal mark");
         };
-        assert_eq!(key_space, IMPORT_REMOVAL_KEYSPACE);
-        assert_eq!(key.as_ref(), import_id.to_bytes().as_slice());
-        assert_eq!(*mark_txn, Some(txn_id));
-        let effects = operation.step(storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        operation.step(storage(StorageEvent::TransactionCommitted { txn_id }));
-
-        drain(&mut operation, 2);
-        operation.step(storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        let effects = drain(&mut operation, 0);
-        unmarked(&mut operation, effects);
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(writes[0].0, IMPORT_REMOVAL_KEYSPACE);
+        assert_eq!(writes[0].1, mark_key(Ulid::from_parts(2, 2)));
+        assert_eq!(drop.next(IoResult::Done), Ok(Next::Done(rule().bucket)));
     }
 
-    /// Answers the read of the removal mark with `value`.
-    fn mark(operation: &mut RemoveImportOperation, value: Option<Vec<u8>>) -> Effects {
-        let effects = operation.start();
+    #[test]
+    fn rows_follow_rule() {
+        let mut operation =
+            RemoveImportOperation::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == IMPORT_REMOVAL_KEYSPACE
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        operation.step(storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        }))
+        let dropped = child(Ok::<_, ImportRuleError>("bucket".to_string()));
+        assert!(matches!(
+            operation.next(dropped),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        assert!(matches!(
+            operation.next(page(2)),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
+        operation.next(IoResult::Done).unwrap();
+        let turn = drain(&mut operation);
+        unmarked(&mut operation, turn);
+    }
+
+    /// A resumed removal after the read of its removal mark, answered with `value`.
+    fn resumed(value: Option<Vec<u8>>) -> (RemoveImportOperation, RemoveTurn) {
+        let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = operation.next(IoResult::Values(vec![value.map(Into::into)]));
+        (operation, turn)
     }
 
     fn marked(cleanup: Option<ProviderCleanup>) -> Vec<u8> {
@@ -770,67 +723,62 @@ mod tests {
         }
     }
 
-    /// Runs a provider mark through its rows and the bucket delete answered with `answer`;
-    /// answers the record written in the closing transaction.
-    fn settled(answer: BlobEvent) -> GroupStorage {
-        let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        mark(&mut operation, Some(marked(Some(cleanup()))));
-        let effects = drain(&mut operation, 0);
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::DeleteEmptyBucket {
-                backend: BackendRef::Group(cleanup().backend_id),
-                bucket: "team-a-x".to_string(),
-            })]
-        );
-        operation.step(Event::Blob(answer));
-        let txn_id = TxnId::from(7);
-        operation.step(storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(deleting().to_bytes().unwrap().into()),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the record, got {effects:?}")
+    /// Settles a provider bucket and answers the record written with the mark's removal.
+    fn settled(deleted: bool) -> GroupStorage {
+        let mut settle = SettleProvider {
+            import_id: Ulid::from_parts(2, 2),
+            cleanup: cleanup(),
+            deleted,
+            step: SettleStep::Record,
+        };
+        assert_eq!(settle.transaction(), TransactionMode::Write);
+        settle.first().unwrap();
+        let record = IoResult::Values(vec![Some(deleting().to_bytes().unwrap().into())]);
+        let Ok(Next::Call(IoCall::Write(writes))) = settle.next(record) else {
+            panic!("expected the record");
         };
         let record = GroupStorage::from_bytes(&writes[0].2).unwrap();
         // The mark goes in the same transaction as the record.
-        let effects = operation.step(storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, txn_id: Some(_), .. })]
-                if key_space == IMPORT_REMOVAL_KEYSPACE
-        ));
-        operation.step(storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
-        }));
-        operation.step(storage(StorageEvent::TransactionCommitted { txn_id }));
-        assert_eq!(operation.finalize(), Ok(()));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = settle.next(IoResult::Done) else {
+            panic!("expected the mark delete");
+        };
+        assert_eq!(deletes[0].0, IMPORT_REMOVAL_KEYSPACE);
+        assert_eq!(settle.next(IoResult::Done), Ok(Next::Done(())));
         record
     }
 
     #[test]
     fn settles_provider_bucket() {
-        let deleted = settled(BlobEvent::BucketDeleted { deleted: true });
+        let deleted = settled(true);
         assert_eq!(deleted.bucket_state("team-a-x"), None);
         assert_eq!(deleted.bucket_state("other"), Some("found"));
         // A bucket with objects stays, and Aruna still knows it created it.
-        let kept = settled(BlobEvent::BucketDeleted { deleted: false });
-        assert_eq!(kept.bucket_state("team-a-x"), Some("created"));
+        assert_eq!(settled(false).bucket_state("team-a-x"), Some("created"));
+    }
+
+    #[test]
+    fn provider_drop_settles() {
+        let (mut operation, _) = resumed(Some(marked(Some(cleanup()))));
+        let expected = Effect::Blob(BlobEffect::DeleteEmptyBucket {
+            backend: BackendRef::Group(cleanup().backend_id),
+            bucket: "team-a-x".to_string(),
+        });
+        assert_eq!(drain(&mut operation), Ok(Next::Call(expected.into())));
+        let dropped = Event::Blob(BlobEvent::BucketDeleted { deleted: true });
+        let turn = operation.next(IoResult::Event(Box::new(dropped)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let settled = child(Ok::<_, ImportRuleError>(()));
+        assert_eq!(operation.next(settled), Ok(Next::Done(())));
     }
 
     #[test]
     fn failed_cleanup_retries() {
-        let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        mark(&mut operation, Some(marked(Some(cleanup()))));
-        drain(&mut operation, 0);
-        let failure = aruna_core::errors::BlobError::WriteError("unreachable".to_string());
-        let effects = operation.step(Event::Blob(BlobEvent::Error(failure)));
         // Nothing is written, so the mark and the `deleting` fence stay for the next run.
-        assert!(effects.is_empty());
-        assert!(operation.finalize().is_err());
+        let (mut operation, _) = resumed(Some(marked(Some(cleanup()))));
+        drain(&mut operation).unwrap();
+        let failure = aruna_core::errors::BlobError::WriteError("unreachable".to_string());
+        let failed = Event::Blob(BlobEvent::Error(failure));
+        assert!(operation.next(IoResult::Event(Box::new(failed))).is_err());
     }
 
     #[tokio::test]
@@ -989,25 +937,13 @@ mod tests {
 
     #[test]
     fn resumes_row_removal() {
-        let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        let effects = mark(&mut operation, Some(marked(None)));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
-        let effects = drain(&mut operation, 0);
-        unmarked(&mut operation, effects);
-        assert_eq!(operation.finalize(), Ok(()));
+        let (mut operation, turn) = resumed(Some(marked(None)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let turn = drain(&mut operation);
+        unmarked(&mut operation, turn);
 
-        // A resumed removal never touches a rule.
-        let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        mark(&mut operation, None);
-        operation.step(storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
-        assert_eq!(
-            operation.finalize(),
-            Err(ImportRuleError::Unexpected("RemoveImport"))
-        );
+        // A resumed removal without a mark still clears the rows left behind.
+        let (_, turn) = resumed(None);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
     }
 }
