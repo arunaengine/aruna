@@ -12,6 +12,7 @@ use aruna_core::structs::execution::job::{
     LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::{CapturedInput, InputContent, InputSelection};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use ulid::Ulid;
@@ -322,6 +323,27 @@ impl Family {
 
 pub fn user() -> UserId {
     UserId::new(Ulid::from_bytes([8u8; 16]), REALM)
+}
+
+/// A capture of `input` taken at `source`.
+pub fn captured_input(input: &InputSelection, source: NodeId) -> CapturedInput {
+    CapturedInput {
+        destination_key: input.dest_key.clone(),
+        source_node_id: source,
+        version_id: Ulid::from_parts(1, 1),
+        content: InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: Ulid::from_parts(2, 2),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+        served_by: None,
+    }
 }
 
 pub fn payload() -> ExecutionSpec {

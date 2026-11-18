@@ -57,9 +57,9 @@ pub struct ProfileShaclEngine {
 impl ProfileShaclEngine {
     /// Opens the validation store. Its contents are derived from registered
     /// Profiles, so a previous directory is discarded instead of recovered.
-    pub fn open(path: &Path) -> Result<Self, CraqleError> {
+    pub fn open(path: &Path) -> Result<Self, Box<CraqleError>> {
         if path.exists() {
-            std::fs::remove_dir_all(path)?;
+            std::fs::remove_dir_all(path).map_err(|error| Box::new(CraqleError::Io(error)))?;
         }
         let options = CraqleOptions::new()
             .with_search_storage(SearchStorage::Memory)

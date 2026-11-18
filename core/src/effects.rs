@@ -789,6 +789,14 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Signs a read grant; only a grant naming this node as issuer. Answers
+    /// `NetEvent::GrantSign`.
+    GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
+    /// Checks a forwarded caller's token for a write from `peer`; answers
+    /// `NetEvent::WritePeerAuth`.
+    WritePeerAuth(Box<WritePeerRequest>),
+    /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
+    DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
@@ -822,6 +830,13 @@ pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
     pub timeout: Duration,
+}
+
+/// A forwarded caller's credential and the peer that forwarded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePeerRequest {
+    pub peer: NodeId,
+    pub token: crate::metadata::AuthToken,
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

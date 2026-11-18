@@ -1168,7 +1168,7 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::auth::enforcement::enforce_policies(
+    aruna_operations::auth::policy_load::enforce_policies(
         &state.get_ctx(),
         state.get_realm_id(),
         &aruna_operations::auth::request_policy::policy_request_with(

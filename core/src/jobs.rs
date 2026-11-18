@@ -429,6 +429,13 @@ pub enum SubmissionRefusal {
     Unavailable,
 }
 
+/// A failed call leaves the request unanswered, which another holder may still answer.
+impl From<crate::calls::IoError> for SubmissionRefusal {
+    fn from(_: crate::calls::IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
 /// The inputs an ingress asks their source node to resolve and grant for one caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputResolveRequest {

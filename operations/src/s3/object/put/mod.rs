@@ -1169,10 +1169,9 @@ impl Operation for PutObjectOperation {
         }
     }
 
-    /// Rolls the written bytes back, or leaves them to reconciliation after a publish whose
-    /// commit outcome is unknown, and releases their reservation; the runner makes these
-    /// calls in order before the run ends. The version transaction leaves all of it to its
-    /// parent.
+    /// Rolls the written bytes back, or leaves them to reconciliation when the publish outcome
+    /// is unknown, and releases their reservation, in order before the run ends. The version
+    /// transaction leaves all of it to its parent.
     fn abort(&mut self) -> Vec<IoCall> {
         if self.publishing {
             return Vec::new();

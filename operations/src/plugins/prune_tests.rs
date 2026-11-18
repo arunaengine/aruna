@@ -13,7 +13,8 @@ use super::*;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;
-use crate::plugins::rows::page_result;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::prune_audit;
 
@@ -158,4 +159,14 @@ fn old_hooks_go() {
     ];
     assert_eq!(IoCall::Delete(keys), delete_call(expected));
     assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
+}
+
+#[test]
+fn audit_pages_until_done() {
+    let mut prune = PruneAudit::new(9);
+    assert!(matches!(prune.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let more = child_result(Ok::<_, StoreError>((2usize, true)));
+    assert!(matches!(prune.next(more), Ok(Next::Call(IoCall::Child(_)))));
+    let last = child_result(Ok::<_, StoreError>((1usize, false)));
+    assert_eq!(prune.next(last), Ok(Next::Done(3)));
 }

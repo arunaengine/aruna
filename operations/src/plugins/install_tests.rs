@@ -7,7 +7,7 @@ use super::*;
 use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::read_user;
+use crate::plugins::account::{EnsureAccount, EnsureRole, ReadUser};
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
@@ -267,11 +267,11 @@ impl Fixture {
     }
 
     pub(crate) async fn account(&self, install: &PluginInstall) -> Option<User> {
-        read_user(&self.ctx, install.account).await.unwrap()
+        drive(ReadUser(install.account), &self.ctx).await.unwrap()
     }
 
     pub(crate) async fn roles(&self) -> HashMap<Ulid, Role> {
-        read_auth(&self.ctx, self.group_id)
+        drive(ReadGroupAuth(self.group_id), &self.ctx)
             .await
             .unwrap()
             .unwrap()
@@ -371,38 +371,19 @@ async fn resumes_after_steps() {
         let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
         let id = Ulid::from_parts(9, stop);
         let record = fixture.prepared_only(id).await;
-        let (scope, identity) = (scope_of(actor.realm_id, &record), Identity::of(&record));
+        let change = AccountChange::of((actor, &auth), &record, 1);
         if stop >= 2 {
-            ensure_account(
-                ctx,
-                actor,
-                &auth,
-                &scope,
-                identity,
-                "x".into(),
-                guard_of(&record),
-            )
-            .await
-            .unwrap();
+            let ensure = EnsureAccount::new(change.clone(), "x".into());
+            drive(ensure, ctx).await.unwrap();
         }
         if stop >= 3 {
             let paths = role_paths(&parse_grants(&record.grants));
-            ensure_role(
-                ctx,
-                actor,
-                &auth,
-                &scope,
-                identity,
-                &paths,
-                guard_of(&record),
-            )
-            .await
-            .unwrap();
-        }
-        if stop == 4 {
-            teardown(ctx, actor, &auth, &scope, identity, guard_of(&record))
+            drive(EnsureRole::new(change.clone(), paths), ctx)
                 .await
                 .unwrap();
+        }
+        if stop == 4 {
+            drive(Teardown::new(change), ctx).await.unwrap();
             assert!(fixture.account(&record).await.unwrap().is_deactivated());
             assert!(fixture.role(&record).await.is_none());
         }

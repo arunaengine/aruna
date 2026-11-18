@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{StorageEffect, WritePeerRequest};
+use aruna_core::events::{Event, PeerAuthRefusal, StorageEvent};
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
@@ -130,6 +130,22 @@ impl MetadataHandle {
         }
         self.note_peer_contact(peer);
         Ok(auth)
+    }
+
+    /// The answer to a forwarded token, in the terms an operation receives.
+    pub(crate) async fn check_write_peer(
+        &self,
+        request: WritePeerRequest,
+    ) -> Result<Box<AuthContext>, PeerAuthRefusal> {
+        self.authorize_write_peer(request.peer, Some(request.token))
+            .await
+            .map(Box::new)
+            .map_err(|error| match error {
+                WritePeerError::Unauthorized => PeerAuthRefusal::Unauthorized,
+                WritePeerError::Unavailable(error) => {
+                    PeerAuthRefusal::Unavailable(error.to_string())
+                }
+            })
     }
 
     /// This node's own liveness observation, taken where the peer identity is

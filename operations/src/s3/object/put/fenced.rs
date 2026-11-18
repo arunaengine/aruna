@@ -70,7 +70,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn calls_write_with_rule() {
+    fn writes_with_rule() {
         let row = (
             "intents".to_string(),
             Key::from(vec![2]),

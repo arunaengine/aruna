@@ -4,11 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation, enforce_policies};
+use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::auth::permission_rules::{
     GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
+use crate::auth::policy_load::enforce_policies;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
@@ -180,6 +181,21 @@ pub struct BucketAccess {
 }
 
 impl BucketAccess {
+    /// The access decided by rules and policies an operation has already read.
+    pub(crate) fn from_parts(
+        auth: AuthContext,
+        bucket_path: String,
+        rules: PermissionRules,
+        policies: PolicyEvaluator,
+    ) -> Self {
+        Self {
+            auth,
+            bucket_path,
+            rules,
+            policies,
+        }
+    }
+
     pub async fn load(
         context: &DriverContext,
         auth: &AuthContext,

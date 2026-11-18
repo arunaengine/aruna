@@ -43,7 +43,7 @@ use aruna_operations::device::publish_queue::{
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::forward::token::forward_token_revoke;
+use aruna_operations::forward::entry::forward_token_revoke;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
