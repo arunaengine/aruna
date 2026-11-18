@@ -44,6 +44,7 @@ mod query_cache;
 mod queue_storage;
 pub(crate) mod raw_events;
 pub mod raw_revision;
+pub mod realm_counts;
 pub mod record_reads;
 pub mod repository;
 pub(crate) mod revision_read;

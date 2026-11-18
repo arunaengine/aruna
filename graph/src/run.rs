@@ -33,6 +33,7 @@ impl GraphHandle {
             MetadataEffect::SearchGraphs { .. }
                 | MetadataEffect::QueryGraphs { .. }
                 | MetadataEffect::SyncBestEffort { .. }
+                | MetadataEffect::CachedRecords
         ) {
             return MetadataEvent::Error {
                 graph_iri,
@@ -872,7 +873,8 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
-        | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::SyncBestEffort { .. }
+        | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }
