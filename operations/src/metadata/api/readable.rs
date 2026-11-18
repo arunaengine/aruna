@@ -2,12 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::telemetry::record_stage;
 
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
@@ -25,6 +28,8 @@ pub struct RecordReadableOperation {
     auth: Option<AuthContext>,
     record: MetadataRegistryRecord,
     check: Option<CheckPermissionsConfig>,
+    now_ms: u64,
+    started_ms: u64,
 }
 
 impl RecordReadableOperation {
@@ -38,6 +43,8 @@ impl RecordReadableOperation {
             auth,
             record,
             check: None,
+            now_ms: 0,
+            started_ms: 0,
         }
     }
 
@@ -60,7 +67,12 @@ impl Operation for RecordReadableOperation {
     type Output = ();
     type Error = MetadataApiError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<()>, MetadataApiError> {
+        self.started_ms = self.now_ms;
         if self.record.public {
             return Ok(Next::Call(IoCall::Read(self.policy_reads())));
         }
@@ -82,6 +94,11 @@ impl Operation for RecordReadableOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataApiError> {
+        // A private record's check is the request's "permission" stage, as the API reports it.
+        if self.check.is_some() {
+            let elapsed = self.now_ms.saturating_sub(self.started_ms);
+            record_stage("permission", Duration::from_millis(elapsed));
+        }
         let mut values = all_values(result)?;
         if let Some(check) = self.check.as_ref() {
             let rules = check.reads().map_err(permission_error)?.len();

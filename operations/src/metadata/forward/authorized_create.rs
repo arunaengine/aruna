@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::metadata::{AuthToken, MetadataError};
@@ -11,6 +13,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
+use aruna_core::telemetry::record_stage;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
@@ -37,6 +40,13 @@ use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
 
 type CreateTurn = Result<Next<MetadataRegistryRecord>, CreateAuthorizedError>;
+
+/// Attributes the permission check that started at `started_ms` to the request's
+/// "permission" stage, as the API reports it.
+fn permission_stage(started_ms: u64, now_ms: u64) {
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(started_ms));
+    record_stage("permission", elapsed);
+}
 
 /// The realm config, or why the create cannot go on without it.
 fn read_config(result: IoResult) -> Result<RealmConfigDocument, CreateAuthorizedError> {
@@ -194,6 +204,8 @@ pub struct AuthorizedCreateOperation {
     stage: AuthorizedStage,
     config: Option<CreateDocumentConfig>,
     networked: bool,
+    now_ms: u64,
+    permission_started_ms: u64,
 }
 
 impl AuthorizedCreateOperation {
@@ -214,6 +226,8 @@ impl AuthorizedCreateOperation {
             stage: AuthorizedStage::Config,
             config: None,
             networked,
+            now_ms: 0,
+            permission_started_ms: 0,
         }
     }
 
@@ -264,6 +278,7 @@ impl AuthorizedCreateOperation {
             return Err(CreateAuthorizedError::Forbidden);
         }
         self.stage = AuthorizedStage::Authorize;
+        self.permission_started_ms = self.now_ms;
         let authorize = AuthorizeCreateOperation::new(
             self.realm_id,
             &self.auth,
@@ -294,6 +309,10 @@ impl Operation for AuthorizedCreateOperation {
     type Output = MetadataRegistryRecord;
     type Error = CreateAuthorizedError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> CreateTurn {
         if self.create.path.is_empty() {
             return Err(CreateAuthorizedError::EmptyPath);
@@ -310,6 +329,7 @@ impl Operation for AuthorizedCreateOperation {
                 self.configured(config)
             }
             AuthorizedStage::Authorize => {
+                permission_stage(self.permission_started_ms, self.now_ms);
                 result.child::<(), AuthorizeError>()??;
                 self.route()
             }
@@ -338,6 +358,8 @@ pub struct CreateWithIdOperation {
     create: PinnedCreate,
     local_node: Option<NodeId>,
     stage: PinnedStage,
+    now_ms: u64,
+    permission_started_ms: u64,
 }
 
 impl CreateWithIdOperation {
@@ -354,6 +376,8 @@ impl CreateWithIdOperation {
             create,
             local_node,
             stage: PinnedStage::Authorize,
+            now_ms: 0,
+            permission_started_ms: 0,
         }
     }
 
@@ -386,11 +410,16 @@ impl Operation for CreateWithIdOperation {
     type Output = MetadataRegistryRecord;
     type Error = CreateAuthorizedError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> CreateTurn {
         let realm_id = self.actor.realm_id;
         if self.auth.realm_id != realm_id {
             return Err(CreateAuthorizedError::Forbidden);
         }
+        self.permission_started_ms = self.now_ms;
         let create = &self.create;
         let authorize = AuthorizeCreateOperation::new(
             realm_id,
@@ -408,6 +437,7 @@ impl Operation for CreateWithIdOperation {
         let realm_id = self.actor.realm_id;
         match self.stage {
             PinnedStage::Authorize => {
+                permission_stage(self.permission_started_ms, self.now_ms);
                 result.child::<(), AuthorizeError>()??;
                 self.create()
             }
