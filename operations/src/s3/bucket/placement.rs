@@ -405,10 +405,10 @@ mod pure_tests {
         let Ok(Next::Call(IoCall::Write(writes))) = turn else {
             panic!("expected one bucket write");
         };
-        let written = BucketInfo::from_bytes(value.as_ref()).expect("bucket decodes");
-        assert_eq!(written.placement_policy_generation, 4);
+        let stored = BucketInfo::from_bytes(writes[0].2.as_ref()).expect("bucket decodes");
+        assert_eq!(stored.placement_policy_generation, 4);
         assert_eq!(
-            written.placement_policies,
+            stored.placement_policies,
             PlacementPolicyRef::canonical_set(
                 &policies
                     .iter()
@@ -417,40 +417,29 @@ mod pure_tests {
             )
             .expect("refs are canonical")
         );
+        let Ok(Next::Done(default)) = write.next(IoResult::Done) else {
+            panic!("the written default is returned");
+        };
+        assert_eq!(default.generation, 4);
     }
 
     #[test]
     fn skips_unchanged_default() {
         // Replay must not inflate the generation and supersede stored runs.
         let policies = vec![policy(1)];
-        let mut operation = operation(&policies, None);
-        started(&mut operation, &policies);
-        let effects = operation.step(read(&stored(vec![policies[0].policy_ref()])));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        let default = operation.finalize().expect("default returned");
+        let bucket = stored(vec![policies[0].policy_ref()]);
+        let (_, turn) = written(&policies, None, &bucket);
+        let Ok(Next::Done(default)) = turn else {
+            panic!("expected the stored default, got {turn:?}");
+        };
         assert_eq!(default.generation, 3);
     }
 
     #[test]
     fn rejects_stale_generation() {
-        let policies = vec![policy(1)];
-        let mut operation = operation(&policies, Some(2));
-        started(&mut operation, &policies);
-        let effects = operation.step(read(&stored(Vec::new())));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
+        let (_, turn) = written(&[policy(1)], Some(2), &stored(Vec::new()));
         assert_eq!(
-            operation.finalize(),
+            turn,
             Err(PutPlacementError::GenerationConflict {
                 expected: 2,
                 current: 3
@@ -460,27 +449,22 @@ mod pure_tests {
 
     #[test]
     fn rejects_other_group() {
-        let mut operation = operation(&[], None);
-        started(&mut operation, &[]);
         let mut foreign = stored(Vec::new());
         foreign.group_id = Ulid::from_bytes([9u8; 16]);
-        operation.step(read(&foreign));
-
-        assert_eq!(operation.finalize(), Err(PutPlacementError::GroupMismatch));
+        let (_, turn) = written(&[], None, &foreign);
+        assert_eq!(turn, Err(PutPlacementError::GroupMismatch));
     }
 
     #[test]
     fn denies_non_admin() {
-        // Neither realm-configuration write nor admin write on the bucket's
-        // group: nothing is opened for the caller.
-        let policies = vec![policy(1)];
-        let mut operation = operation(&policies, None);
-        operation.start();
-        operation.step(authorized(false));
-        let effects = operation.step(authorized(false));
-
-        assert!(effects.is_empty(), "nothing is opened for a denied caller");
-        assert_eq!(operation.finalize(), Err(PutPlacementError::Unauthorized));
+        // Neither realm-configuration write nor admin write on the bucket's group.
+        let mut operation = PutPlacementOperation::new(input(&[policy(1)], None));
+        assert!(is_child(&operation.first()));
+        assert!(is_child(&operation.next(authorized(false))));
+        assert_eq!(
+            operation.next(authorized(false)),
+            Err(PutPlacementError::Unauthorized)
+        );
     }
 
     fn owned_policy(seed: u8, owner: Ulid) -> VerifiedPolicy {
@@ -502,38 +486,27 @@ mod pure_tests {
 
     #[test]
     fn accepts_group_admin() {
-        // A group administrator governs that group's own bucket, and its own
-        // rule is a legal reference there.
+        // A group administrator governs that group's own bucket, and its own rule is a legal
+        // reference there.
         let policies = vec![owned_policy(1, group_id())];
-        let mut operation = operation(&policies, None);
-        operation.start();
-        operation.step(authorized(false));
-        operation.step(authorized(true));
-        operation.step(crate::tests::policy::resolved_set(&policies));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
+        let mut operation = PutPlacementOperation::new(input(&policies, None));
+        operation.first().unwrap();
+        operation.next(authorized(false)).unwrap();
+        operation.next(authorized(true)).unwrap();
+        assert!(is_child(&operation.next(resolved(&policies))));
+        assert_eq!(operation.state, PutPlacementState::Write);
     }
 
     #[test]
     fn refuses_foreign_owner() {
-        // A rule another group owns never governs this bucket, and the refusal
-        // lands before any transaction is opened.
-        let foreign = Ulid::from_bytes([8u8; 16]);
-        let policies = vec![owned_policy(1, foreign)];
-        let mut operation = operation(&policies, None);
-        operation.start();
-        operation.step(authorized(true));
-        let effects = operation.step(crate::tests::policy::resolved_set(&policies));
-
-        assert!(effects.is_empty(), "a foreign rule opens no transaction");
+        // A rule another group owns never governs this bucket, and the refusal lands before
+        // any transaction is opened.
+        let policies = vec![owned_policy(1, Ulid::from_bytes([8u8; 16]))];
+        let mut operation = PutPlacementOperation::new(input(&policies, None));
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
         assert_eq!(
-            operation.finalize(),
+            operation.next(resolved(&policies)),
             Err(PutPlacementError::ForeignPolicy {
                 policy_id: Ulid::from_bytes([1u8; 16])
             })
@@ -542,38 +515,26 @@ mod pure_tests {
 
     #[test]
     fn refuses_unresolved_ref() {
-        // An unauthenticated ref must never become a default, and no bucket
-        // record may be touched on the way there.
+        // An unauthenticated ref must never become a default.
         let policies = vec![policy(1)];
-        let mut operation = operation(&policies, None);
-        operation.start();
-        operation.step(authorized(true));
+        let mut operation = PutPlacementOperation::new(input(&policies, None));
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
         let unresolved = crate::tests::policy::unresolved_set(policies[0].policy_ref());
-        let effects = operation.step(unresolved);
-
-        assert!(effects.is_empty(), "a failed resolve opens no transaction");
+        let Event::Child(outcome) = unresolved else {
+            panic!("expected a child outcome");
+        };
         assert!(matches!(
-            operation.finalize(),
+            operation.next(IoResult::Child(outcome)),
             Err(PutPlacementError::PolicyUnavailable { .. })
         ));
     }
 
     #[test]
     fn refuses_exhausted_generation() {
-        let policies = vec![policy(1)];
-        let mut operation = operation(&policies, None);
-        started(&mut operation, &policies);
         let mut bucket = stored(Vec::new());
         bucket.placement_policy_generation = u64::MAX;
-        let effects = operation.step(read(&bucket));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(
-            operation.finalize(),
-            Err(PutPlacementError::GenerationExhausted)
-        );
+        let (_, turn) = written(&[policy(1)], None, &bucket);
+        assert_eq!(turn, Err(PutPlacementError::GenerationExhausted));
     }
 }
