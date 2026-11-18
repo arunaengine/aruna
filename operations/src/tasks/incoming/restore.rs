@@ -340,7 +340,10 @@ impl TaskQueues {
             return;
         }
         if context.blob_handle.is_some() {
-            restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+            let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
+            if let Err(error) = drive(arm, &context).await {
+                warn!(error = %error, "Failed to schedule hidden blob sweep");
+            }
             let arm = ArmSweepOperation::new(TaskKey::DrainReclaimQueue);
             if let Err(error) = drive(arm, &context).await {
                 warn!(error = %error, "Failed to schedule blob reclaim sweep");
@@ -871,7 +874,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn sweep_hidden_blobs(&self) {
-        let after = match process_hidden_sweep(&self.context).await {
+        let sweep = ProcessHiddenOperation::new(unix_timestamp_millis());
+        let after = match drive(sweep, &self.context).await {
             Ok(outcome) if outcome.cleanup_pending => HIDDEN_SWEEP_RETRY,
             Ok(_) => HIDDEN_SWEEP_AFTER,
             Err(error) => {

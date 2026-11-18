@@ -25,7 +25,6 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use super::connect;
-use crate::blob::hidden::delete_hidden;
 use crate::jobs::executor::JobContext;
 use crate::jobs::repository::pull::{PullProgress, running};
 use crate::jobs::repository::{TransferError, interruptible};
@@ -152,7 +151,11 @@ pub(crate) async fn acquire(
             blake3,
         }) => {
             if let Err(error) = written {
-                let _ = delete_hidden(&ctx.driver, &location).await;
+                let _ = crate::driver::drive(
+                    crate::blob::hidden::DeleteHiddenOperation::new(&location),
+                    &ctx.driver,
+                )
+                .await;
                 return Err(error);
             }
             Ok((
