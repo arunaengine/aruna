@@ -368,139 +368,328 @@ impl SetWalkOperation {
         Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))))
     }
 
-    /// Walks one range for its new copy; when the walk ended, states the copy filled.
-    async fn fill(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        local: &DistributionMember,
-        fill: &RangeFill,
-        budget: &mut usize,
-    ) -> Result<Outcome, String> {
-        let range = (snapshot.config.ranges.iter()).find(|range| range.range_id == fill.range_id);
-        let (Some(range), Some(target)) = (range, snapshot.member(fill.member_id)) else {
-            return Ok(Outcome::Settled);
+    fn bucket_read(&mut self, info: Result<BucketInfo, GetBucketError>) -> Turn<Walked> {
+        let scope = self.scope.as_ref().ok_or(IoError::Unfinished)?;
+        let local = &scope.local;
+        let bound = (info.ok().and_then(|info| info.distribution)).is_some_and(|binding| {
+            binding.member_id == local.member_id && local.incarnation == Some(binding.incarnation)
+        });
+        if !bound {
+            return self.clear();
+        }
+        // The cursors of members no longer walked, such as one that left, go in one batch.
+        let walked = (self.targets.iter().map(|target| target.member_id))
+            .chain(self.fills.iter().map(|fill| fill.member_id))
+            .collect();
+        let clear = ClearCursorsOperation::new(self.walk.set_id, Some(walked), CLEAR_BATCH);
+        self.step = SetStep::Departed;
+        Ok(Next::Call(IoCall::child(clear)))
+    }
+
+    fn next_part(&mut self) -> Turn<Walked> {
+        let scope = self.scope.clone().ok_or(IoError::Unfinished)?;
+        self.step = SetStep::Part;
+        if let Some(target) = self.targets.pop_front() {
+            let walk = WalkMemberOperation::new(scope, target, self.budget);
+            return Ok(Next::Call(IoCall::child(walk)));
+        }
+        if let Some(fill) = self.fills.pop_front() {
+            let fill = FillRangeOperation::new(scope, fill, self.budget);
+            return Ok(Next::Call(IoCall::child(fill)));
+        }
+        Ok(Next::Done((self.outcome, self.budget)))
+    }
+}
+
+impl Operation for SetWalkOperation {
+    type Output = Walked;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Walked> {
+        let read = ReadRecordOperation::new(self.walk.set_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Walked> {
+        match self.step {
+            SetStep::Record => {
+                let view = result.child::<Option<DistributionView>, RecordError>()?;
+                self.record_read(view.map_err(failed)?)
+            }
+            SetStep::Bucket => self.bucket_read(result.child()?),
+            SetStep::Departed => {
+                (result.child::<bool, BootstrapError>()?).map_err(failed)?;
+                self.next_part()
+            }
+            SetStep::Clear => {
+                let all_read = (result.child::<bool, BootstrapError>()?).map_err(failed)?;
+                let outcome = match all_read {
+                    true => Outcome::Settled,
+                    false => Outcome::Waiting,
+                };
+                Ok(Next::Done((outcome, self.budget)))
+            }
+            SetStep::Part => {
+                let (outcome, budget) = result.child::<Walked, BlobQueueError>()??;
+                self.outcome = self.outcome.and(outcome);
+                self.budget = budget;
+                self.next_part()
+            }
+        }
+    }
+}
+
+fn read_cursor(key: Vec<u8>) -> IoCall {
+    IoCall::child(ReadCursorOperation::new(key))
+}
+
+fn cursor_answer(result: IoResult) -> Result<Option<BootstrapCursor>, BlobQueueError> {
+    (result.child::<Option<BootstrapCursor>, BootstrapError>()?).map_err(failed)
+}
+
+fn page_answer(result: IoResult) -> Result<PageProgress, BlobQueueError> {
+    (result.child::<PageProgress, BootstrapError>()?).map_err(failed)
+}
+
+#[derive(Debug, PartialEq)]
+enum FillStep {
+    Cursor,
+    Page,
+    Hand,
+}
+
+/// Walks one range for its new copy; when the walk ended, states the copy filled.
+#[derive(Debug, PartialEq)]
+struct FillRangeOperation {
+    scope: Arc<WalkScope>,
+    fill: RangeFill,
+    budget: usize,
+    now_ms: u64,
+    step: FillStep,
+}
+
+impl FillRangeOperation {
+    fn new(scope: Arc<WalkScope>, fill: RangeFill, budget: usize) -> Self {
+        Self {
+            scope,
+            fill,
+            budget,
+            now_ms: 0,
+            step: FillStep::Cursor,
+        }
+    }
+
+    fn range(&self) -> Option<&KeyRange> {
+        let ranges = &self.scope.snapshot.config.ranges;
+        ranges
+            .iter()
+            .find(|range| range.range_id == self.fill.range_id)
+    }
+
+    fn hand(&mut self, watermark: u64) -> Turn<Walked> {
+        let scope = self.scope.clone();
+        let range = self.range().ok_or(IoError::Unfinished)?;
+        let walk = scope.walk;
+        let statement = Statement::copy_filled(
+            walk.realm_id,
+            walk.set_id,
+            &scope.local,
+            &self.fill,
+            (range.epoch, watermark),
+        );
+        let hand = HandStatementOperation::new(scope.clone(), statement, self.fill.member_id);
+        self.step = FillStep::Hand;
+        Ok(Next::Call(IoCall::child(hand)))
+    }
+}
+
+impl Operation for FillRangeOperation {
+    type Output = Walked;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<Walked> {
+        let snapshot = &self.scope.snapshot;
+        let (Some(range), Some(_)) = (self.range(), snapshot.member(self.fill.member_id)) else {
+            return Ok(Next::Done((Outcome::Settled, self.budget)));
         };
         // Until its node opened the range, the copy has nowhere to receive versions.
-        if !fill.admitted {
-            return Ok(Outcome::Waiting);
+        if !self.fill.admitted {
+            return Ok(Next::Done((Outcome::Waiting, self.budget)));
         }
-        let intent = fill.intent();
-        let key = bootstrap_key(self.set_id, fill.member_id, range.range_id);
-        let cursor = (read_cursor(context, key).await?).filter(|c| c.intent == intent);
-        let watermark = match cursor {
-            Some(cursor) if cursor.done => cursor.watermark,
-            _ if *budget == 0 => return Ok(Outcome::Waiting),
-            _ => {
-                *budget -= 1;
+        let key = bootstrap_key(self.scope.walk.set_id, self.fill.member_id, range.range_id);
+        Ok(Next::Call(read_cursor(key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Walked> {
+        match self.step {
+            FillStep::Cursor => {
+                let intent = self.fill.intent();
+                let cursor = cursor_answer(result)?.filter(|cursor| cursor.intent == intent);
+                if let Some(cursor) = cursor.filter(|cursor| cursor.done) {
+                    return self.hand(cursor.watermark);
+                }
+                if self.budget == 0 {
+                    return Ok(Next::Done((Outcome::Waiting, 0)));
+                }
+                self.budget -= 1;
+                let scope = &self.scope;
+                let snapshot = &scope.snapshot;
+                let target = (snapshot.member(self.fill.member_id)).ok_or(IoError::Unfinished)?;
+                let range = self.range().ok_or(IoError::Unfinished)?;
                 let page = BootstrapPage::new(PageConfig {
-                    realm_id: self.realm_id,
+                    realm_id: scope.walk.realm_id,
                     bucket: snapshot.config.bucket.clone(),
-                    set_id: self.set_id,
-                    member_id: fill.member_id,
+                    set_id: scope.walk.set_id,
+                    member_id: self.fill.member_id,
                     node_id: target.node_id,
                     intent,
                     range: range.clone(),
-                    now_ms: unix_timestamp_millis(),
+                    now_ms: self.now_ms,
                     rows: PAGE_ROWS,
                 });
-                match drive(page, context).await.map_err(|e| e.to_string())? {
-                    PageProgress::Done { watermark } => watermark,
-                    PageProgress::Waiting | PageProgress::Queued(_) => return Ok(Outcome::Waiting),
-                }
+                self.step = FillStep::Page;
+                Ok(Next::Call(IoCall::child(page)))
             }
-        };
-        let statement = Statement::copy_filled(
-            self.realm_id,
-            self.set_id,
-            local,
-            fill,
-            (range.epoch, watermark),
-        );
-        self.hand(context, snapshot, statement, fill.member_id)
-            .await
+            FillStep::Page => match page_answer(result)? {
+                PageProgress::Done { watermark } => self.hand(watermark),
+                PageProgress::Waiting | PageProgress::Queued(_) => {
+                    Ok(Next::Done((Outcome::Waiting, self.budget)))
+                }
+            },
+            FillStep::Hand => {
+                let outcome = result.child::<Outcome, BlobQueueError>()??;
+                Ok(Next::Done((outcome, self.budget)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum MemberStep {
+    Cursor,
+    Seed,
+    Page,
+    Hand,
+}
+
+/// Walks the ranges this node publishes to a member; when every walk ended, states the
+/// catch-up.
+#[derive(Debug, PartialEq)]
+struct WalkMemberOperation {
+    scope: Arc<WalkScope>,
+    target: DistributionMember,
+    budget: usize,
+    now_ms: u64,
+    ranges: Vec<KeyRange>,
+    order: VecDeque<usize>,
+    current: usize,
+    watermark: u64,
+    /// A range still waits for its jobs, so nothing is stated yet.
+    blocked: bool,
+    step: MemberStep,
+}
+
+impl WalkMemberOperation {
+    fn new(scope: Arc<WalkScope>, target: DistributionMember, budget: usize) -> Self {
+        let local = scope.local.member_id;
+        let ranges: Vec<KeyRange> = (scope.snapshot)
+            .catch_up_ranges(local, target.member_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        Self {
+            scope,
+            target,
+            budget,
+            now_ms: 0,
+            ranges,
+            order: VecDeque::new(),
+            current: 0,
+            watermark: u64::MAX,
+            blocked: false,
+            step: MemberStep::Cursor,
+        }
     }
 
-    /// Walks the ranges this node publishes to `target`; when every walk ended, states the
-    /// catch-up.
-    async fn walk(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        local: &DistributionMember,
-        target: &DistributionMember,
-        budget: &mut usize,
-    ) -> Result<Outcome, String> {
-        let ranges = snapshot.catch_up_ranges(local.member_id, target.member_id);
-        if ranges.is_empty() {
-            return Ok(Outcome::Settled);
-        }
-        let turns = (self.set_id, target.member_id);
-        let first = turn(turns, None) % ranges.len();
-        let mut watermark = u64::MAX;
-        let mut done = true;
-        let order = (first..ranges.len()).chain(0..first);
-        for index in order {
-            let range = ranges[index];
-            let key = bootstrap_key(self.set_id, target.member_id, range.range_id);
-            let own = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
-            let cursor = match own {
-                Some(cursor) => Some(cursor),
-                None => self.seed_child(context, snapshot, target, range).await?,
+    fn turns(&self) -> (Ulid, Ulid) {
+        (self.scope.walk.set_id, self.target.member_id)
+    }
+
+    fn waiting(&self) -> Turn<Walked> {
+        Ok(Next::Done((Outcome::Waiting, self.budget)))
+    }
+
+    fn next_range(&mut self) -> Turn<Walked> {
+        let Some(index) = self.order.pop_front() else {
+            return match self.blocked {
+                true => self.waiting(),
+                false => self.state(),
             };
-            if let Some(cursor) = cursor
-                && cursor.done
-            {
-                watermark = watermark.min(cursor.watermark);
-                continue;
-            }
-            if *budget == 0 {
-                // The next drain starts at this range; nothing is stated before all are done.
-                turn(turns, Some(index));
-                done = false;
-                break;
-            }
-            *budget -= 1;
-            let page = BootstrapPage::new(PageConfig {
-                realm_id: self.realm_id,
-                bucket: snapshot.config.bucket.clone(),
-                set_id: self.set_id,
-                member_id: target.member_id,
-                node_id: target.node_id,
-                intent: target.intent,
-                range: range.clone(),
-                now_ms: unix_timestamp_millis(),
-                rows: PAGE_ROWS,
-            });
-            match drive(page, context)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                PageProgress::Done { watermark: ended } => watermark = watermark.min(ended),
-                PageProgress::Waiting | PageProgress::Queued(_) => done = false,
-            }
+        };
+        self.current = index;
+        self.step = MemberStep::Cursor;
+        let range_id = self.ranges[index].range_id;
+        let key = bootstrap_key(self.scope.walk.set_id, self.target.member_id, range_id);
+        Ok(Next::Call(read_cursor(key)))
+    }
+
+    fn cursor_known(&mut self, cursor: Option<BootstrapCursor>) -> Turn<Walked> {
+        if let Some(cursor) = cursor.filter(|cursor| cursor.done) {
+            self.watermark = self.watermark.min(cursor.watermark);
+            return self.next_range();
         }
-        if !done {
-            return Ok(Outcome::Waiting);
+        if self.budget == 0 {
+            // The next drain starts at this range; nothing is stated before all are done.
+            turn(self.turns(), Some(self.current));
+            return self.waiting();
         }
-        self.state(context, snapshot, local, target, watermark)
-            .await
+        self.budget -= 1;
+        let scope = &self.scope;
+        let page = BootstrapPage::new(PageConfig {
+            realm_id: scope.walk.realm_id,
+            bucket: scope.snapshot.config.bucket.clone(),
+            set_id: scope.walk.set_id,
+            member_id: self.target.member_id,
+            node_id: self.target.node_id,
+            intent: self.target.intent,
+            range: self.ranges[self.current].clone(),
+            now_ms: self.now_ms,
+            rows: PAGE_ROWS,
+        });
+        self.step = MemberStep::Page;
+        Ok(Next::Call(IoCall::child(page)))
     }
 
     /// Hands the signed catch-up to the publisher; the next record makes the member ready.
-    async fn state(
-        &self,
-        context: &DriverContext,
-        snapshot: &DistributionSnapshot,
-        local: &DistributionMember,
-        target: &DistributionMember,
-        watermark: u64,
-    ) -> Result<Outcome, String> {
-        let cover = snapshot.catch_up_cover(local.member_id, target.member_id);
-        let statement =
-            Statement::caught_up(self.realm_id, self.set_id, local, target, cover, watermark);
-        self.hand(context, snapshot, statement, target.member_id)
-            .await
+    fn state(&mut self) -> Turn<Walked> {
+        let scope = self.scope.clone();
+        let (local, target) = (&scope.local, &self.target);
+        let cover = (scope.snapshot).catch_up_cover(local.member_id, target.member_id);
+        let walk = scope.walk;
+        let statement = Statement::caught_up(
+            walk.realm_id,
+            walk.set_id,
+            local,
+            target,
+            cover,
+            self.watermark,
+        );
+        let hand = HandStatementOperation::new(scope.clone(), statement, target.member_id);
+        self.step = MemberStep::Hand;
+        Ok(Next::Call(IoCall::child(hand)))
+    }
+}
+
+impl Operation for WalkMemberOperation {
+    type Output = Walked;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
     /// Signs a statement about the walks for `member_id` and hands it to the publisher.
