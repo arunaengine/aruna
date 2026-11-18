@@ -1434,3 +1434,446 @@ pub async fn overwrite_retains_index() {
     );
 }
 
+#[tokio::test]
+async fn mismatch_cleans_blob() {
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root.clone(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+
+    let context = DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+
+    let data = b"hello, world!";
+    let err = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::generate(),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: context.net_handle.as_ref().unwrap().node_id(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "bad.txt".to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &data[..],
+                ))),
+            },
+            expected_checksums: vec![ExpectedChecksum {
+                algorithm: ChecksumAlgorithm::Sha256,
+                digest: vec![0; 32],
+            }],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
+        }),
+        &context,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::s3::object::put::PutObjectError::ChecksumMismatch("SHA256")
+    ));
+    assert_eq!(count_files(Path::new(&blob_root)), 0);
+}
+
+/// A version transaction with `output` as the location it publishes.
+fn publishing(config: PutObjectConfig, output: BackendLocation) -> PutObjectOperation {
+    let mut child = publisher(PutObjectOperation::new(config), output.clone());
+    child.output = Some(output);
+    child
+}
+
+#[test]
+fn generation_increments() {
+    let config = put_config(
+        RealmId::from_bytes([1u8; 32]),
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    let output = hashed(test_location(config.user_id));
+    let mut child = publishing(config, output);
+    let version_id = child.version_id.unwrap();
+    let existing = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+
+    let turn = child.object_lookup_read(Some(existing.to_bytes().unwrap().into()));
+    assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+
+    let turn = child.liveness_read(None);
+    // The location row commits with the head.
+    let [(location_space, ..), (head_space, _, head)] = written(&turn) else {
+        panic!("expected the location and head rows, got {turn:?}")
+    };
+    assert_eq!(location_space, BLOB_LOCATIONS_KEYSPACE);
+    assert_eq!(head_space, BLOB_HEAD_KEYSPACE);
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(head.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(version_id, 5)
+    );
+}
+
+#[test]
+fn dedup_keeps_writer() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let (first, writer) = (
+        UserId::local(Ulid::generate(), realm_id),
+        UserId::local(Ulid::generate(), realm_id),
+    );
+    let mut config = put_config(
+        realm_id,
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    config.user_id = writer;
+    // The deduplicated location keeps the earlier copy, written by someone else.
+    let mut child = publisher(
+        PutObjectOperation::new(config),
+        hashed(test_location(writer)),
+    );
+    child.output = Some(hashed(test_location(first)));
+    child.state = PutObjectState::WritePathIndex;
+
+    let turn = child.next(IoResult::Done);
+
+    let writes = written(&turn);
+    let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(version.created_by, writer);
+    // The new version is journaled in the same write: a kept row, a pending row and its
+    // source-id row.
+    let journal: Vec<_> = (writes.iter())
+        .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
+        .map(|(_, _, value)| SourceEvent::from_bytes(value).unwrap())
+        .collect();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0].revision, child.version_id.unwrap().to_string());
+    assert!(journal[0].resource.ends_with("/mybucket/some-file.txt"));
+}
+
+#[test]
+fn history_keeps_head() {
+    let config = put_config(
+        RealmId::from_bytes([1u8; 32]),
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    let user_id = config.user_id;
+    let mut output = hashed(test_location(user_id));
+    output.blob_size = 7;
+    let mut parent = PutObjectOperation::new(config).keep_head();
+    parent.written_location = Some(output.clone());
+    let mut child = parent.publish_child();
+    child.output = Some(output);
+    let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+    child
+        .object_lookup_read(Some(head.to_bytes().unwrap().into()))
+        .unwrap();
+    let live = BlobVersion::materialized(
+        [9; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        user_id,
+        None,
+    );
+    // The head is not written; the version itself is read inside the transaction.
+    let turn = child.liveness_read(Some(live.to_bytes().unwrap().into()));
+    assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+    assert_eq!(child.state, PutObjectState::ReadHistory);
+    let turn = child.history_read(None);
+    let spaces: Vec<_> = written(&turn)
+        .iter()
+        .map(|(space, ..)| space.as_str())
+        .collect();
+    assert_eq!(spaces, [BLOB_LOCATIONS_KEYSPACE, PATHS_INDEX_KEYSPACE]);
+
+    // No replication obligation, no new live object and the head keeps its charge.
+    child.config.quota_ceiling = None;
+    child.state = PutObjectState::RegisterManagedCopy;
+    let turn = child.next(IoResult::Done);
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = turn else {
+        panic!("expected the counter deltas, got {turn:?}")
+    };
+    let expected = UsageDelta {
+        logical_bytes: 7,
+        ..Default::default()
+    };
+    assert_eq!(deltas[0].1, expected);
+
+    // A version that appeared meanwhile is never overwritten.
+    let turn = child.history_read(Some(live.to_bytes().unwrap().into()));
+    assert_eq!(turn.err(), Some(PutObjectError::VersionExists));
+}
+
+#[test]
+fn registered_commits_nothing() {
+    // A listed write an import registered with the same bytes ends with no row written, and
+    // its bytes are still released and announced after the commit.
+    let config = config();
+    let output = hashed(test_location(config.user_id));
+    let mut child = publishing(config, output.clone());
+    let version = BlobVersion::materialized(
+        [7; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        UserId::default(),
+        None,
+    );
+
+    let turn = child.history_read(Some(version.to_bytes().unwrap().into()));
+
+    let Ok(Next::Then {
+        output: result,
+        calls,
+    }) = turn
+    else {
+        panic!("expected the registered version, got {turn:?}")
+    };
+    assert_eq!(result.location, output);
+    assert!(child.registered);
+    assert!(calls.iter().all(|call| !matches!(call, IoCall::Write(_))));
+}
+
+#[test]
+fn writer_reads_trail() {
+    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let writer = || {
+        let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
+        let output = hashed(test_location(config.user_id));
+        let mut child = publishing(config, output);
+        // The version is not registered, so the trail is read before the head moves, in the
+        // incarnation the bucket's creation row names.
+        let turn = child.history_read(None);
+        assert_eq!(
+            read_spaces(&turn),
+            [aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE]
+        );
+        let turn = child.next(values(vec![Some(5u128.to_be_bytes().to_vec().into())]));
+        let Ok(Next::Call(IoCall::Page {
+            space,
+            prefix,
+            after,
+            ..
+        })) = turn
+        else {
+            panic!("expected the trail read, got {turn:?}")
+        };
+        assert_eq!(space, DELETE_TRAIL_KEYSPACE);
+        // Only deletes since the version was created are read.
+        let id = child.version_id.unwrap();
+        let floor = Ulid::from_parts(id.timestamp_ms(), 0).0 - 1;
+        let after = after.expect("a bounded start");
+        assert_eq!(
+            after.as_ref(),
+            [prefix.as_ref(), &Ulid(floor).to_bytes()[..]].concat()
+        );
+        child
+    };
+    let page = |rows: Vec<(Key, Value)>| IoResult::Page { rows, next: None };
+    // An import registered the version and a user deleted it: it is not published again.
+    let mut child = writer();
+    let record = BlobAuditRecord {
+        realm_id,
+        group_id,
+        node_id: iroh::SecretKey::generate().public(),
+        user_id: child.config.user_id,
+        kind: BlobAuditKind::DeleteVersion,
+        bucket: "mybucket".to_string(),
+        key: "some-file.txt".to_string(),
+        version_id: child.version_id,
+        occurred_at_ms: 1,
+    };
+    let turn = child.next(page(vec![(
+        vec![0].into(),
+        record.to_bytes().unwrap().into(),
+    )]));
+    assert_eq!(turn.err(), Some(PutObjectError::HistoryDeleted));
+    // A clean trail moves the head after both ranges; every purge is read, as a purge is
+    // keyed by its job.
+    let mut child = writer();
+    let turn = child.next(page(Vec::new()));
+    let Ok(Next::Call(IoCall::Page {
+        prefix,
+        after: None,
+        ..
+    })) = turn
+    else {
+        panic!("expected the purge read, got {turn:?}")
+    };
+    // The purges are read in the incarnation the creation row named.
+    let purges = aruna_core::structs::storage::delete_audit::purge_prefix(group_id, "mybucket", 5);
+    assert_eq!(prefix, Key::from(purges));
+    let turn = child.next(page(Vec::new()));
+    assert_eq!(written(&turn)[1].0, BLOB_HEAD_KEYSPACE);
+}
+
+#[tokio::test]
+async fn plain_owns_copy() {
+    use aruna_core::handle::Handle as _;
+    use aruna_core::structs::storage::blob::{BlobVersionState, ResolvedBackend};
+    use aruna_core::structs::storage::format::StoredLayout;
+    use aruna_core::structs::storage::routing::PlainTarget;
+    let temp = tempdir().unwrap();
+    let storage = storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+    let backend = BackendRef::Group(Ulid::from_parts(2, 2));
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::generate().public();
+    // Two provider buckets on one storage hold the same bytes, each at its own tenant path.
+    let copy = |path: &str| {
+        let ulid = Ulid::generate();
+        BackendLocation {
+            backend: backend.clone(),
+            storage_bucket: String::new(),
+            backend_path: path.to_string(),
+            ulid,
+            format: StoredFormat {
+                layout: StoredLayout::Plain(ulid),
+                ..StoredFormat::default()
+            },
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![5; 32])]),
+            ..test_location(UserId::default())
+        }
+    };
+    let mut committed = Vec::new();
+    for path in ["team-a-y/a.csv", "team-a-x/data/a.csv"] {
+        let written = copy(path);
+        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        let target = PlainTarget {
+            import_id: Ulid::generate(),
+            backend: backend.clone(),
+            path: written.backend_path.clone(),
+            same_name: false,
+            listed: true,
+            shared: Vec::new(),
+            mapped: false,
+        };
+        op.version_id = Some(Ulid::generate());
+        let _ = op.start_plain(target, ResolvedBackend::new(backend.clone(), None));
+        op.written_location = Some(written.clone());
+        // The lookup and the location row go through the storage, as in the commit.
+        let Ok(Next::Call(IoCall::Read(reads))) = op.start_hash_lookup() else {
+            panic!("expected the location lookup")
+        };
+        let read = Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        });
+        let Event::Storage(StorageEvent::BatchReadResult { values }) =
+            storage.send_effect(read).await
+        else {
+            panic!("expected the lookup answer")
+        };
+        op.hash_checked(values.into_iter().next().and_then(|(_, value)| value))
+            .unwrap();
+        assert!(op.new_blob, "{path} must not adopt another copy");
+        assert_eq!(op.output.as_ref(), Some(&written));
+        let (space, key, value) = op.location_row().unwrap();
+        let write = Effect::Storage(StorageEffect::Write {
+            key_space: space,
+            key,
+            value,
+            txn_id: None,
+        });
+        storage.send_effect(write).await;
+        committed.push(written);
+    }
+    // Each version reads its own copy back; the other bucket's copy stays where it was.
+    for written in &committed {
+        let state = BlobVersionState::Materialized {
+            blob_hash: [5; 32],
+            backend: backend.clone(),
+            encoding: written.format.encoding(),
+            source: None,
+        };
+        let key = state.location_key().unwrap();
+        let event = storage
+            .send_effect(crate::blob::records::blob_location_read(&key, None))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("missing location row: {event:?}");
+        };
+        assert_eq!(&BackendLocation::from_bytes(&value).unwrap(), written);
+    }
+}
+
+/// Starts a put into a bucket bound as member `seed` of the two-shard test set and answers
+/// the bucket and record reads; the key "some-file.txt" lies in member 2's range.
+fn bound_put(seed: u8) -> (PutObjectOperation, Turn) {
+    use crate::distribution::test_record::{binding, record};
+    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+    let (snapshot, bytes) = record(true);
+    let config = config();
+    let mut bucket = bucket(config.group_id, config.user_id, Compression::Off);
+    bucket.distribution = Some(binding(&snapshot, seed, 5));
+    let mut op = PutObjectOperation::new(config);
+    op.first().unwrap();
+    let turn = op.next(values(vec![Some(bucket.to_bytes().unwrap().into())]));
+    assert_eq!(read_spaces(&turn)[0], DISTRIBUTION_KEYSPACE);
+    let Event::Storage(StorageEvent::BatchReadResult { values: rows }) =
+        crate::distribution::test_record::authority_rows(Some(bytes), None)
+    else {
+        panic!("expected the record rows")
+    };
+    let turn = op.next(values(rows.into_iter().map(|(_, value)| value).collect()));
+    (op, turn)
+}
+
+#[test]
+fn coordinator_stamps_put() {
+    let (op, turn) = bound_put(2);
+    assert_eq!(
+        op.version_epoch,
+        aruna_core::structs::storage::distribution::OriginalEpoch(1)
+    );
+    // The coordinator continues with the purge fence.
+    assert_eq!(read_spaces(&turn), [PURGE_FENCE_KEYSPACE]);
+}
+
+#[test]
+fn member_put_refused() {
+    let (_, turn) = bound_put(1);
+    assert!(matches!(
+        turn,
+        Err(PutObjectError::Distribution(
+            GuardError::NotCoordinator { .. }
+        ))
+    ));
+}
+
