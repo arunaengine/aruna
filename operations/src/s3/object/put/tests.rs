@@ -1877,3 +1877,348 @@ fn member_put_refused() {
     ));
 }
 
+mod sealed {
+    use super::*;
+    use aruna_core::structs::storage::abe::{
+        AbeError, AbeParameters, EnvelopeContext, ObjectEnvelope, create_parameters,
+    };
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
+    use aruna_core::structs::storage::format::PithosLayout;
+
+    fn settings() -> BucketEncryption {
+        BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([4; 16])),
+            key_generation: 1,
+            storage_generation: 2,
+            ..Default::default()
+        }
+    }
+
+    fn record() -> BucketKeyRecord {
+        let key = settings().active_key().unwrap();
+        BucketKeyRecord::new(key, Ulid::from_bytes([5; 16]), [6; 32], 1)
+    }
+
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        values(vec![value.map(Into::into)])
+    }
+
+    fn operation() -> PutObjectOperation {
+        let mut config = config();
+        config.request.body = Some(BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from_static(b"data"),
+        )])));
+        PutObjectOperation::new(config)
+    }
+
+    /// Runs a put up to its encryption settings read: no bucket, no purge fence.
+    fn at_settings(op: &mut PutObjectOperation) {
+        op.first().unwrap();
+        op.next(row(None)).unwrap();
+        let turn = op.next(row(None));
+        assert_eq!(read_spaces(&turn), [BUCKET_ENCRYPTION_KEYSPACE]);
+    }
+
+    #[test]
+    fn captures_seal_plan() {
+        let mut op = operation();
+        at_settings(&mut op);
+        let turn = op.next(row(Some(settings().to_bytes().unwrap())));
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the key record read, got {turn:?}")
+        };
+        assert_eq!(reads[0].0, BUCKET_KEY_KEYSPACE);
+        assert_eq!(reads[0].1.as_ref(), record().key.key().as_slice());
+        let turn = op.next(row(Some(record().to_bytes().unwrap())));
+        assert_eq!(read_spaces(&turn).len(), 2);
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let (realm, node) = (op.config.realm_id, op.config.node_id);
+        let parameters = create_parameters(&secret, realm, node, record().key).unwrap();
+        let answers = vec![
+            Some(parameters.to_bytes().unwrap().into()),
+            Some(1u64.to_be_bytes().to_vec().into()),
+        ];
+        let turn = op.next(values(answers));
+        let Effect::Blob(BlobEffect::Abe(effect)) = asked(&turn) else {
+            panic!("expected the write, got {turn:?}")
+        };
+        let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
+            effect.as_ref()
+        else {
+            panic!("expected the envelope write")
+        };
+        assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
+        let seal = SealPlan::capture(&settings(), &record()).unwrap();
+        assert_eq!(resolved.encryption, seal);
+    }
+
+    #[test]
+    fn missing_key_refused() {
+        let mut op = operation();
+        at_settings(&mut op);
+        op.next(row(Some(settings().to_bytes().unwrap()))).unwrap();
+        let turn = op.next(row(None));
+        assert_eq!(turn.err(), Some(seal_error(BucketKeyError::Unsupported)));
+    }
+
+    /// Runs the version transaction up to the seal fence with `current` as the settings row.
+    fn fenced(plan: Option<SealPlan>, current: &BucketEncryption) -> (PutObjectOperation, Turn) {
+        fenced_with(plan, current, |_| {})
+    }
+
+    fn fenced_with(
+        plan: Option<SealPlan>,
+        current: &BucketEncryption,
+        prepare: impl FnOnce(&mut PutObjectOperation),
+    ) -> (PutObjectOperation, Turn) {
+        let mut op = PutObjectOperation::new(config());
+        prepare(&mut op);
+        let mut location = test_location(op.config.user_id);
+        if let Some(plan) = plan {
+            let layout = PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: plan.storage_generation,
+            };
+            location.format = StoredFormat::pithos(layout, plan.key);
+        }
+        op.seal_plan = plan;
+        let mut child = publisher(op, location);
+        child.first().unwrap();
+        child.next(row(None)).unwrap();
+        child.next(values(vec![None, None])).unwrap();
+        let turn = child.next(row(Some(current.to_bytes().unwrap())));
+        (child, turn)
+    }
+
+    #[test]
+    fn stale_seal_refused() {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        // The bucket changed its stored format while the bytes streamed.
+        let mut moved = settings();
+        moved.storage_generation += 1;
+        let (_, turn) = fenced(plan, &moved);
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+        // The current plan passes the fence and reaches the hash step.
+        let (_, turn) = fenced(plan, &settings());
+        assert!(
+            matches!(turn, Err(PutObjectError::MissingHash(_))),
+            "{turn:?}"
+        );
+    }
+
+    #[test]
+    fn plain_into_sealed() {
+        let (_, turn) = fenced(None, &settings());
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn records_copy_owner() {
+        let mut location = test_location(UserId::default());
+        let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
+        let layout = PithosLayout {
+            stored_size: 10,
+            metadata_digest: [1; 32],
+            storage_generation: 0,
+        };
+        location.format = StoredFormat::pithos(layout, key);
+        let mut child = publishing(config(), location);
+        child.state = PutObjectState::CreateVersionRecord;
+
+        let turn = child.next(IoResult::Done);
+
+        assert_eq!(written(&turn)[0].0, COPY_OWNER_KEYSPACE);
+    }
+
+    fn parameters(op: &PutObjectOperation, secret: u8) -> AbeParameters {
+        let secret = aruna_core::compute::SecretBytes::new(vec![secret; 32]);
+        create_parameters(&secret, op.config.realm_id, op.config.node_id, record().key).unwrap()
+    }
+
+    fn envelope(parameters: AbeParameters) -> ObjectEnvelope {
+        ObjectEnvelope {
+            context: EnvelopeContext {
+                parameters,
+                epoch: 1,
+                object_key: "some-file.txt".to_string(),
+                write_id: Ulid::from_bytes([8; 16]),
+                public_key: [3; 32],
+            },
+            abe: vec![1; 16],
+            recovery_enc: [2; 32],
+            recovery_ciphertext: vec![4; 32],
+        }
+    }
+
+    /// Answers the publication fence with substituted parameters or another epoch.
+    fn abe_fence(substituted: bool, epoch: u64) -> Turn {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        let (mut child, _) = fenced_with(plan, &settings(), |op| {
+            op.envelope = Some(envelope(parameters(op, 9)));
+        });
+        assert_eq!(child.state, PutObjectState::FenceAbe);
+        let current = parameters(&child, if substituted { 10 } else { 9 });
+        child.next(values(vec![
+            Some(current.to_bytes().unwrap().into()),
+            Some(epoch.to_be_bytes().to_vec().into()),
+        ]))
+    }
+
+    #[test]
+    fn envelope_fence_refused() {
+        let refused = |turn: Turn| match turn {
+            Err(PutObjectError::BlobWriteFailed(BlobError::Abe(error))) => error,
+            other => panic!("expected an envelope refusal, got {other:?}"),
+        };
+        assert_eq!(refused(abe_fence(false, 2)), AbeError::Epoch);
+        assert_eq!(refused(abe_fence(true, 1)), AbeError::Parameters);
+        // The admitted parameters and epoch pass the fence and reach the hash step.
+        let turn = abe_fence(false, 1);
+        assert!(
+            matches!(turn, Err(PutObjectError::MissingHash(_))),
+            "{turn:?}"
+        );
+    }
+
+    #[test]
+    fn plain_skips_envelope() {
+        let mut op = operation();
+        at_settings(&mut op);
+        let turn = op.next(row(None));
+        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+            panic!("expected the plain write, got {turn:?}")
+        };
+        assert_eq!(resolved.encryption, None);
+    }
+
+    #[test]
+    fn disabled_skips_envelope() {
+        let mut op = operation().without_envelope();
+        at_settings(&mut op);
+        op.next(row(Some(settings().to_bytes().unwrap()))).unwrap();
+        let turn = op.next(row(Some(record().to_bytes().unwrap())));
+        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+            panic!("expected the sealed write without envelope, got {turn:?}")
+        };
+        assert_eq!(
+            resolved.encryption,
+            SealPlan::capture(&settings(), &record()).unwrap()
+        );
+    }
+
+    fn sealed_output(blob_size: u64) -> BackendLocation {
+        let mut location = hashed(test_location(UserId::default()));
+        location.blob_size = blob_size;
+        location.format = StoredFormat::pithos(
+            PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: 2,
+            },
+            record().key,
+        );
+        location
+    }
+
+    #[test]
+    fn charges_envelope_bytes() {
+        let mut config = config();
+        config.quota_ceiling = None;
+        let mut child = publishing(config, sealed_output(1));
+        child.envelope = Some(envelope(parameters(&child, 9)));
+        let turn = child.store_envelope();
+        let writes = written(&turn);
+        let charge = writes[0].2.len() + writes[2].2.len();
+        assert_eq!(child.envelope_bytes, charge as u64);
+        child.state = PutObjectState::WriteReplicationObligation;
+        let turn = child.next(IoResult::Done);
+        let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = turn else {
+            panic!("expected the counter deltas, got {turn:?}")
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|(_, delta)| delta.logical_bytes == 1 + charge as i128)
+        );
+    }
+
+    /// Runs the quota gate for a write with a 2 byte ceiling and no prior usage.
+    fn quota_charge(payload: u64, envelope_bytes: u64) -> Turn {
+        let mut config = config();
+        config.quota_ceiling = Some(2);
+        let mut output = hashed(test_location(UserId::default()));
+        output.blob_size = payload;
+        let mut child = publishing(config, output);
+        child.envelope_bytes = envelope_bytes;
+        child.state = PutObjectState::WriteReplicationObligation;
+        let mut turn = child.next(IoResult::Done);
+        if child.state == PutObjectState::EnforceQuota {
+            // The rebuild marker, the realm config and the local counter are absent.
+            for _ in 0..3 {
+                child.next(row(None)).unwrap();
+            }
+            turn = child.next(IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            });
+        }
+        turn
+    }
+
+    #[test]
+    fn quota_counts_envelope() {
+        let refused = |turn: Turn| matches!(turn, Err(PutObjectError::QuotaExceeded { .. }));
+        // The payload alone fits, but the envelope pushes the charge over the ceiling.
+        assert!(refused(quota_charge(2, 1)));
+        assert!(refused(quota_charge(0, 3)));
+        assert!(!refused(quota_charge(0, 2)));
+        assert!(!refused(quota_charge(1, 1)));
+    }
+
+    /// While usage is rebuilt a write for a group with a quota is refused as retryable; a
+    /// group without a quota never reads the marker and books its usage.
+    #[test]
+    fn rebuild_refuses_quota() {
+        use aruna_core::structs::storage::usage::{USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY};
+        for ceiling in [Some(u64::MAX), None] {
+            let mut config = config();
+            config.quota_ceiling = ceiling;
+            let mut child = publishing(config, hashed(test_location(UserId::default())));
+            child.state = PutObjectState::WriteReplicationObligation;
+            let turn = child.next(IoResult::Done);
+            if ceiling.is_none() {
+                assert!(matches!(turn, Ok(Next::Call(IoCall::AddUsage { .. }))));
+                continue;
+            }
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(ref reads))) if reads[0].1.as_ref() == USAGE_REBUILD_KEY
+            ));
+            let turn = child.next(row(Some(Vec::new())));
+            // No earlier rebuild completed the counters, so nothing backs the quota.
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(ref reads))) if reads[0].1.as_ref() == USAGE_COMPLETE_KEY
+            ));
+            let turn = child.next(row(None));
+            assert_eq!(turn.err(), Some(PutObjectError::UsageRebuilding));
+        }
+    }
+}
+
+/// Routing resolves the backend before any byte moves; the version transaction fences it.
