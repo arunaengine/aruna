@@ -333,10 +333,10 @@ async fn remote_target(
         key: source.key.clone(),
         version,
     };
-    let (metadata, group_id, _) =
-        delegated_read(context, delegation(caller, arn.node_id), &arn, None, true)
-            .await
-            .map_err(staging_error)?;
+    let ids = context.node_and_realm();
+    let read = delegated_read(ids, delegation(caller, arn.node_id), &arn, None, true);
+    let answer = drive(read, context).await.map_err(staging_error)?;
+    let (metadata, group_id) = (answer.metadata, answer.group_id);
     let group_id = group_id.ok_or_else(|| {
         LinkError::Unavailable("the source node did not name its bucket group".to_string())
     })?;
