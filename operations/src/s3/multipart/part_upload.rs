@@ -843,6 +843,137 @@ mod test {
         let Effect::Blob(BlobEffect::WritePiece {
             resolved,
             content_offset,
+            part_number: 3,
+            ..
+        }) = effect_of(&turn)
+        else {
+            panic!("expected one piece write, got {turn:?}")
+        };
+        assert_eq!(*content_offset, Some(16 * MIB));
+        assert_eq!(resolved.encryption, Some(plan));
+
+        let mut location = part_location(BACKEND);
+        location.blob_size = 5 * MIB;
+        let piece = PartPiece {
+            record: vec![1, 2, 3],
+            stored_len: 5 * MIB + 64,
+            content_offset: Some(16 * MIB),
+        };
+        let written = BlobEvent::PieceWritten {
+            location,
+            piece: piece.clone(),
+        };
+        assert!(matches!(
+            op.next(blob(written)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let writes = written_rows(record_write(&op).existing_read(None));
+        let stored = MultipartPart::from_bytes(writes[0].2.as_ref()).unwrap();
+        assert_eq!(stored.piece, Some(piece));
+    }
+
+    #[test]
+    fn replacement_waits_staged() {
+        // A replaced part must not touch the acknowledged provider part before completion.
+        let (mut op, record) = in_place_op(Some(4));
+        let turn = op.next(read_record(&record, Some(b"acknowledged".to_vec())));
+        let Effect::Blob(BlobEffect::WritePart { backend_upload, .. }) = effect_of(&turn) else {
+            panic!("expected one part write, got {turn:?}")
+        };
+        assert!(backend_upload.is_none());
+    }
+
+    #[test]
+    fn provider_needs_length() {
+        let (mut op, record) = in_place_op(None);
+        assert_eq!(
+            op.next(read_record(&record, None)),
+            Err(UploadPartError::MissingContentLength)
+        );
+    }
+
+    #[test]
+    fn keeps_provider_etag() {
+        // A part streamed into the provider upload records the ETag completion must name.
+        let (mut op, record) = in_place_op(Some(4));
+        let upload = record.backend_upload.clone().unwrap();
+        let turn = op.next(read_record(&record, None));
+        let Effect::Blob(BlobEffect::WritePart {
+            backend_upload,
+            size,
+            ..
+        }) = effect_of(&turn)
+        else {
+            panic!("expected one part write, got {turn:?}")
+        };
+        assert_eq!(backend_upload.as_deref(), Some(&upload));
+        assert_eq!(*size, Some(4));
+
+        let mut written = upload.location.clone();
+        written.partial = true;
+        let turn = op.next(blob(BlobEvent::PartWritten {
+            location: written,
+            backend_etag: "\"etag\"".to_string(),
+        }));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let writes = written_rows(record_write(&op).existing_read(None));
+        let part = MultipartPart::from_bytes(writes[0].2.as_ref()).unwrap();
+        assert_eq!(part.backend_etag.as_deref(), Some("\"etag\""));
+        assert!(part.location.partial);
+    }
+
+    fn writing() -> UploadPartOperation {
+        let mut op = part_op();
+        op.step = PartStep::WritePart;
+        op
+    }
+
+    #[test]
+    fn rejects_write_error() {
+        // A rejected body stream (a trailer checksum mismatch) stays a client error.
+        let failed = BlobError::StreamFailed("checksum mismatch".to_string());
+        assert!(matches!(
+            writing().next(blob(BlobEvent::Error(failed))),
+            Err(UploadPartError::WriteFailed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_server_write() {
+        // A full or flapping disk must never be reported as a client bad digest.
+        let failed = BlobError::WriteError("No space left on device".to_string());
+        assert!(matches!(
+            writing().next(blob(BlobEvent::Error(failed))),
+            Err(UploadPartError::BlobWriteFailed(_))
+        ));
+    }
+
+    #[test]
+    fn short_body_rolls_back() {
+        let mut op = writing();
+        op.input.content_length = Some(9);
+        let written = BlobEvent::WriteFinished {
+            location: part_location(BACKEND),
+        };
+        assert_eq!(op.next(blob(written)), Err(UploadPartError::IncompleteBody));
+        assert!(matches!(op.abort().as_slice(), [IoCall::Child(_)]));
+    }
+
+    #[test]
+    fn preserves_write_cleanup() {
+        // Bytes the failed write left behind are rolled back when the run ends.
+        let mut op = writing();
+        let failed = BlobError::WriteCleanup {
+            location: part_location(BACKEND),
+            message: "cleanup failed".to_string(),
+        };
+        assert!(op.next(blob(BlobEvent::Error(failed))).is_err());
+        assert_eq!(op.written_location, Some(part_location(BACKEND)));
+        assert!(matches!(op.abort().as_slice(), [IoCall::Child(_)]));
+    }
+
+    fn disabled_record(backend_id: Ulid) -> Value {
+        let record = GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
             name: "tenant".to_string(),
@@ -853,9 +984,159 @@ mod test {
             created_by: Default::default(),
             disabled: true,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+        };
+        record.to_bytes().unwrap().into()
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // The pin predates the disable, so only the commit fence can catch it.
+        let mut record = record_write(&publishing());
+        record.step = RecordStep::Fence;
+        assert_eq!(record.transaction(), TransactionMode::Write);
+        let turn = record.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(record.step, RecordStep::Backend);
+        let turn = record.next(IoResult::Values(vec![Some(disabled_record(BACKEND))]));
+        assert_eq!(
+            turn,
+            Err(UploadPartError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        );
+    }
+
+    #[test]
+    fn queues_part_row() {
+        // Part reconciliation commits with the record, so no commit can be ambiguous about it.
+        let op = publishing();
+        let location = op.written_location.clone().unwrap();
+        let writes = written_rows(record_write(&op).existing_read(None));
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].1.as_ref(), location.ulid.to_bytes());
+        assert_eq!(
+            cleanup_work(&writes[1]),
+            reconcile_work(location, op.input.upload_id, 1)
+        );
+    }
+
+    #[test]
+    fn writes_old_cleanup() {
+        // A replaced part's bytes go through the cleanup queue in the same transaction.
+        let old = BackendLocation {
+            backend_path: "mybucket/old-part".to_string(),
+            ..part_location(BACKEND)
+        };
+        let replaced = MultipartPart {
+            part_number: 1,
+            location: old.clone(),
+            created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
+            piece: None,
+        };
+        let value = replaced.to_bytes().unwrap().into();
+        let mut record = record_write(&publishing());
+        let writes = written_rows(record.existing_read(Some(value)));
+        assert_eq!(
+            cleanup_work(&writes[2]),
+            BlobCleanupWork::DeleteBlob { location: old }
+        );
+        assert_eq!(record.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    fn failed(error: StorageError) -> IoResult {
+        child(Err::<(), _>(UploadPartError::StorageError(error)))
+    }
+
+    #[test]
+    fn unknown_keeps_part() {
+        // Only a proven refusal rolls the part back; any other commit failure may already
+        // own the record, so the copy goes to reconciliation.
+        for error in [
+            StorageError::CommitFailed,
+            StorageError::PersistError("journal".to_string()),
+            StorageError::Timeout,
+        ] {
+            let mut op = publishing();
+            let location = op.written_location.clone().unwrap();
+            assert_eq!(
+                op.next(failed(error.clone())),
+                Err(UploadPartError::StorageError(error))
+            );
+            let calls = op.abort();
+            let [IoCall::Write(writes), IoCall::Effect(release)] = calls.as_slice() else {
+                panic!("expected reconciliation and release, got {calls:?}")
+            };
+            assert_eq!(
+                cleanup_work(&writes[0]),
+                reconcile_work(location.clone(), op.input.upload_id, 1)
+            );
+            let expected = BlobEffect::ReleaseReservation { id: location.ulid };
+            assert_eq!(release.as_ref(), &Effect::Blob(expected));
         }
-        .to_bytes()
-        .unwrap()
+    }
+
+    #[test]
+    fn cut_commit_reconciles() {
+        // A run cut off during the record transaction may have committed it.
+        let mut op = publishing();
+        assert!(matches!(
+            op.abort().as_slice(),
+            [IoCall::Write(_), IoCall::Effect(_)]
+        ));
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        // The part bytes stay staged; only the record transaction runs again.
+        let mut op = publishing();
+        let location = op.written_location.clone();
+        let turn = op.next(failed(StorageError::TransactionConflict));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(op.written_location, location);
+        assert_eq!(op.conflicts, 1);
+    }
+
+    #[test]
+    fn conflict_exhausts_retries() {
+        let mut op = publishing();
+        op.conflicts = CONFLICT_RETRIES;
+        assert_eq!(
+            op.next(failed(StorageError::TransactionConflict)),
+            Err(UploadPartError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+        // A proven refusal owns nothing, so the bytes are rolled back.
+        assert!(matches!(op.abort().as_slice(), [IoCall::Child(_)]));
+    }
+
+    #[test]
+    fn release_failure_succeeds() {
+        // A refused release runs after the part is committed, so it must not report failure;
+        // the reconciliation row clears the reservation.
+        let mut op = publishing();
+        let location = op.written_location.clone().unwrap();
+        let turn = op.next(child(Ok::<_, UploadPartError>(())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(op.step, PartStep::Release);
+        assert_eq!(op.abort(), Vec::new());
+        let refused = child(Err::<(), _>(StorageError::Timeout));
+        assert_eq!(
+            op.next(refused),
+            Ok(Next::Done(UploadPartResult { location }))
+        );
+    }
+
+    #[test]
+    fn stale_fence_stops_part() {
+        let mut op = part_op();
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let invalid = IoResult::Values(vec![Some(Value::from(vec![0xFF]))]);
+        assert_eq!(
+            op.next(invalid),
+            Err(UploadPartError::PurgeFence(PurgeFenceError::Invalid))
+        );
     }
 
     #[tokio::test]
