@@ -262,7 +262,7 @@ fn failed_write_stops() {
 
 // A live session is asked for its ledger first; one that is gone reports only the end.
 #[test]
-fn live_session_read_first() {
+fn reads_live_ledger() {
     let token = Ulid::from_bytes([2; 16]);
     let mut report = SessionReportOperation::new(job(), token, true, EndReason::Idle);
     assert!(is_child(&report.first()));

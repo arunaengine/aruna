@@ -699,4 +699,6 @@ impl Operation for ExecutionRunOperation {
 }
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod tests;
