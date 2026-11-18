@@ -5,39 +5,23 @@
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::MintPersistentSpec;
-use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
-    ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
-    JobRecord, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, user_dedup_key,
+    ArtifactRef, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobRecord,
+    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
-use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::time::unix_timestamp_millis;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub use super::job_artifacts::{ArtifactLookup, ArtifactRead, OwnedArtifact, RoutedArtifact};
-use super::job_artifacts::{ArtifactRangeOperation, ArtifactRouteOperation};
-pub use super::job_cancel::{CancelJobOutcome, RoutedCancelOutcome};
-use super::job_cancel::{CancelOwnedOperation, RoutedCancelOperation};
-use super::job_delete::DeleteOwnedOperation;
-use super::job_reads::{JobOwnerOperation, OwnedJobOperation, RecordData};
-pub use super::job_reports::JobReportLookup;
-use super::job_reports::{
-    JobReportOperation, ReportQuery, ReportRouteOperation, SessionReasonOperation,
-};
-use super::job_routes::{RecordRouteOperation, StatusRouteOperation};
-use super::route::{JobRouteError, RoutedJobStatus};
-use super::runtime::JobsRuntime;
-use super::store::query::{find_dedup_plan, list_user_jobs};
-use super::store::state::read_job_record;
-use super::store::{JobMutationError, RunDelete};
+use super::job_artifacts::{ArtifactRangeOperation, ArtifactRead};
+use super::store::query::list_user_jobs;
 use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use super::submit_local::{
-    HandedJobOperation, MintJobOperation, QueueJobOperation, SubmitLocalOperation,
+    DedupJobOperation, HandedJobOperation, MintJobOperation, QueueJobOperation,
+    SubmitLocalOperation,
 };
 use crate::driver::{DriverContext, drive};
 
@@ -97,22 +81,6 @@ pub async fn submit_execution_job(
     drive(SubmitExecutionOperation::new(submission), context).await
 }
 
-pub async fn submit_staging_job(
-    context: &DriverContext,
-    spec: StagingJobSpec,
-    owner_node_id: NodeId,
-    retention_ms: u64,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::staging(
-        spec,
-        owner_node_id,
-        retention_ms,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
 /// Queues a staging job a range's former coordinator handed over, starting from `resume`.
 pub(crate) async fn submit_handed_job(
     context: &DriverContext,
@@ -133,23 +101,6 @@ pub(crate) async fn submit_handed_job(
         .map_err(|error| error.to_string())
 }
 
-/// Queues one background object copy on this node for the caller in `spec`.
-pub async fn submit_copy_job(
-    context: &DriverContext,
-    spec: CopyJobSpec,
-    owner_node_id: NodeId,
-    retention_ms: u64,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::copy(
-        spec,
-        owner_node_id,
-        retention_ms,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
 /// Queues one run of a backend import on this node. A scheduled run passes its due
 /// time in `dedup`, so a repeated timer never starts the same run twice.
 pub async fn submit_import_job(
@@ -163,44 +114,6 @@ pub async fn submit_import_job(
         spec,
         owner_node_id,
         (dedup, retention_ms),
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
-/// Queues one run of a harvest source for `created_by`. Provenance keeps a rerun idempotent.
-pub async fn submit_harvest_job(
-    context: &DriverContext,
-    spec: HarvestJobSpec,
-    created_by: UserId,
-    realm_id: RealmId,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::harvest(
-        spec,
-        (created_by, realm_id),
-        owner_node_id,
-        idempotency_key,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
-/// Queues a purge; with `files` it also deletes the linked-storage files of the versions.
-pub async fn submit_purge_job(
-    context: &DriverContext,
-    (spec, files): (StoragePurgeSpec, bool),
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-    retention_ms: u64,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::purge(
-        (spec, files),
-        owner_node_id,
-        (idempotency_key, retention_ms),
         context.node_and_realm(),
         unix_timestamp_millis(),
     );
@@ -301,38 +214,7 @@ pub(crate) async fn find_dedup_job(
     created_by: UserId,
     dedup_key: &[u8],
 ) -> Result<Option<(JobId, [u8; 32])>, SubmitJobError> {
-    let Some((job_id, digest)) = find_dedup_plan(&context, created_by, dedup_key, None)
-        .await
-        .map_err(SubmitJobError::UnexpectedEvent)?
-    else {
-        return Ok(None);
-    };
-    let record = read_job_record(&context, job_id, None)
-        .await
-        .map_err(SubmitJobError::UnexpectedEvent)?;
-    Ok(record.map(|_| (job_id, digest)))
-}
-
-pub async fn lookup_job_dedup(
-    context: &DriverContext,
-    created_by: UserId,
-    idempotency_key: &str,
-    plan_digest: [u8; 32],
-) -> Result<Option<SubmitJobResult>, SubmitJobError> {
-    let dedup_key = user_dedup_key(created_by, idempotency_key);
-    let Some((job_id, existing_digest)) = find_dedup_job(context, created_by, &dedup_key).await?
-    else {
-        return Ok(None);
-    };
-    if existing_digest != plan_digest {
-        return Err(SubmitJobError::JobPlanConflict {
-            existing_job_id: job_id,
-        });
-    }
-    Ok(Some(SubmitJobResult {
-        job_id,
-        created: false,
-    }))
+    drive(DedupJobOperation::new(created_by, dedup_key), context).await
 }
 
 pub async fn submit_export_job(
@@ -364,157 +246,6 @@ pub async fn list_owned_jobs(
     list_user_jobs(context, user_id, cursor, limit, filter).await
 }
 
-/// Removes the caller's finished run from this node's lists.
-pub async fn delete_owned_run(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> Result<RunDelete, JobMutationError> {
-    let serving = context.node_and_realm();
-    let delete = DeleteOwnedOperation::new(auth, job_id, serving, unix_timestamp_millis());
-    drive(delete, context).await
-}
-
-pub async fn read_owned_job(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-) -> Result<Option<JobRecord>, String> {
-    drive(OwnedJobOperation::new(user_id, job_id), context)
-        .await
-        .map_err(|error| error.0)
-}
-
-/// Full owner record for API projections that the status view cannot rebuild off-owner.
-pub async fn read_record_routed(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<Option<JobRecord>, JobRouteError> {
-    Ok(read_staging_routed(context, user_id, job_id, auth_token)
-        .await?
-        .map(|(record, _)| record))
-}
-
-/// Returns a staging record and its checkpoint from the immutable owner.
-pub async fn read_staging_routed(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<Option<RecordData>, JobRouteError> {
-    let route = RecordRouteOperation::new(
-        user_id,
-        job_id,
-        auth_token,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(route, context).await
-}
-
-/// Derives the immutable owner from the JobId alone using replicated placement state.
-pub async fn resolve_job_owner(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<NodeId, JobRouteError> {
-    drive(
-        JobOwnerOperation::new(job_id, context.node_and_realm()),
-        context,
-    )
-    .await
-}
-
-pub async fn read_job_routed(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<RoutedJobStatus, JobRouteError> {
-    let route = StatusRouteOperation::new(
-        auth,
-        job_id,
-        auth_token,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(route, context).await
-}
-
-pub async fn read_owned_report(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    expected_digest: Option<[u8; 32]>,
-    last_key: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<JobReportLookup, String> {
-    let query = ReportQuery {
-        expected_digest,
-        last_key,
-        limit,
-    };
-    let read = JobReportOperation::owned(user_id, job_id, query, unix_timestamp_millis());
-    drive(read, context).await.map_err(|error| error.0)
-}
-
-/// Why a finished session stopped; a failed read reads as no reason.
-pub async fn read_session_reason(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-) -> Option<String> {
-    drive(SessionReasonOperation::new(user_id, job_id), context)
-        .await
-        .ok()
-        .flatten()
-}
-
-pub async fn read_report_routed(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    expected_digest: Option<[u8; 32]>,
-    last_key: Option<Vec<u8>>,
-    limit: usize,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<JobReportLookup, JobRouteError> {
-    let query = ReportQuery {
-        expected_digest,
-        last_key,
-        limit,
-    };
-    let route = ReportRouteOperation::new(
-        auth,
-        job_id,
-        query,
-        auth_token,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(route, context).await
-}
-
-pub async fn read_artifact_routed(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    now_ms: u64,
-    range: Option<Range<u64>>,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<RoutedArtifact, JobRouteError> {
-    let route = ArtifactRouteOperation::new(
-        user_id,
-        job_id,
-        now_ms,
-        range,
-        auth_token,
-        context.node_and_realm(),
-    );
-    drive(route, context).await
-}
-
 pub async fn read_artifact_range(
     context: &DriverContext,
     artifact: &ArtifactRef,
@@ -525,54 +256,23 @@ pub async fn read_artifact_range(
         .map_err(|error| error.0)
 }
 
-pub async fn cancel_owned_job(
-    context: &DriverContext,
-    runtime: &JobsRuntime,
-    user_id: UserId,
-    job_id: JobId,
-) -> Result<CancelJobOutcome, String> {
-    let cancel = CancelOwnedOperation::new(user_id, job_id, unix_timestamp_millis());
-    let report = drive(cancel, context).await.map_err(|error| error.0)?;
-    for running in report.running {
-        runtime.request_cancel(running);
-    }
-    Ok(report.outcome)
-}
-
-/// Cancels a job on the node that answers for it and signals the attempts running here.
-pub async fn cancel_job_routed(
-    context: &DriverContext,
-    runtime: &JobsRuntime,
-    user_id: UserId,
-    job_id: JobId,
-    auth_token: Option<aruna_core::metadata::AuthToken>,
-) -> Result<RoutedCancelOutcome, JobRouteError> {
-    let cancel = RoutedCancelOperation::new(
-        user_id,
-        job_id,
-        auth_token,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    let report = drive(cancel, context).await?;
-    for running in report.running {
-        runtime.request_cancel(running);
-    }
-    Ok(report.outcome)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
     use super::*;
-    use crate::jobs::job_artifacts::OwnedArtifactOperation;
+    use crate::jobs::job_artifacts::{ArtifactLookup, OwnedArtifactOperation};
+    use crate::jobs::job_cancel::CancelJobOutcome;
+    use crate::jobs::job_reads::tests::{cancel_owned_job, read_owned_job, read_owned_report};
+    use crate::jobs::job_reports::{JobReportLookup, ReportQuery};
+    use crate::jobs::runtime::JobsRuntime;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::submit_execution::validate_execution;
+    use crate::jobs::submit_local::DedupLookupOperation;
     use aruna_core::calls::{IoCall, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-        JobPayload, JobState, RoCrateLimits,
+        JobPayload, JobState, RoCrateLimits, user_dedup_key,
     };
     use aruna_core::structs::execution::job::{MAX_EXECUTION_OUTPUTS, OutputDestination};
     use aruna_core::structs::identity::auth::AuthContext;
@@ -854,14 +554,12 @@ mod tests {
         record.finished_at_ms = Some(1);
         insert_job(&context, &record).await.unwrap();
 
-        let found = lookup_job_dedup(&context, owner, "key", payload.plan_digest())
-            .await
-            .unwrap()
-            .unwrap();
+        let lookup = DedupLookupOperation::new(owner, "key", payload.plan_digest());
+        let found = drive(lookup, &context).await.unwrap().unwrap();
         assert_eq!(found.job_id, record.job_id);
         assert!(!found.created);
         assert!(matches!(
-            lookup_job_dedup(&context, owner, "key", [9u8; 32]).await,
+            drive(DedupLookupOperation::new(owner, "key", [9u8; 32]), &context).await,
             Err(SubmitJobError::JobPlanConflict { existing_job_id })
                 if existing_job_id == record.job_id
         ));
@@ -963,7 +661,17 @@ mod tests {
         insert_job(&context, &record).await.unwrap();
 
         assert!(matches!(
-            read_owned_report(&context, owner, job_id, None, None, 1).await,
+            read_owned_report(
+                &context,
+                owner,
+                job_id,
+                ReportQuery {
+                    expected_digest: None,
+                    last_key: None,
+                    limit: 1,
+                },
+            )
+            .await,
             Ok(JobReportLookup::NotFound)
         ));
     }
