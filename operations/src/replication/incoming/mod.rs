@@ -753,7 +753,8 @@ impl Operation for IncomingVersionOperation {
         if self.applying {
             return Vec::new();
         }
-        if self.state == IncomingVersionState::Apply {
+        // A child failure was already judged; only a cut-off leaves the commit outcome open.
+        if self.state == IncomingVersionState::Apply && self.failure.is_none() {
             self.keep_received();
         }
         let stream_id = self.stream_id;
