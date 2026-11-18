@@ -2,32 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
     REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, sync_relationship_key, sync_relationship_prefix,
 };
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
-use aruna_storage::StorageHandle;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use tracing::warn;
 
-use super::drain::abort_cursor;
-use super::members::{BoundRecordOperation, member_jobs};
+use super::members::{BoundRecord, BoundRecordOperation, RecordError, member_jobs};
 use super::page::PAGE_BYTES;
 use super::queue::BlobQueueError;
-use crate::driver::{DriverContext, drive};
-use aruna_core::structs::storage::replication_queue::SyncOrigin;
 use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, RelationshipJobTarget,
     blob_job_entry, blob_job_key, blob_job_preferred, continuation_newer, live_obligation_entry,
@@ -49,18 +46,32 @@ pub(super) const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 /// The obligation the next obligation pass continues after, so later ones get their turn.
 const OBLIGATION_CURSOR_KEY: &[u8] = b"live_obligation_cursor";
 
+type Turn<T> = Result<Next<T>, BlobQueueError>;
+type Obligation = (Vec<u8>, LiveObligationRecord);
+type Retired = (Vec<u8>, Option<LiveReplicationContinuation>);
+
+fn unexpected(event: &Event) -> BlobQueueError {
+    BlobQueueError::UnexpectedEvent(event.label().to_string())
+}
+
+fn cursor_key() -> Key {
+    ByteView::from(OBLIGATION_CURSOR_KEY.to_vec())
+}
+
+#[derive(Debug, PartialEq)]
 pub(super) struct RelationshipPage {
     pub(super) values: Vec<(Vec<u8>, SyncRelationship)>,
     pub(super) next: Option<Vec<u8>>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct LiveRepairWrite {
     pub(super) queued: usize,
     continuation: Option<LiveReplicationContinuation>,
     progressed: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct LiveRepairResult {
     pub(super) processed: usize,
     pub(super) queued: usize,
@@ -69,49 +80,21 @@ pub(super) struct LiveRepairResult {
     pub(super) oldest_ms: Option<u64>,
 }
 
-pub(super) async fn live_obligations_exist(
-    storage: &StorageHandle,
-) -> Result<bool, BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-    }
+fn hop_exhausted(obligation: &LiveObligationRecord) -> bool {
+    (obligation.origin.as_ref()).is_some_and(|origin| origin.hop_count >= 4)
 }
 
-pub(super) async fn process_live_obligations(
-    context: &DriverContext,
-) -> Result<LiveRepairResult, BlobQueueError> {
-    let after = read_obligation_cursor(&context.storage_handle).await?;
-    let (obligations, next) = read_live_obligations(&context.storage_handle, after.clone()).await?;
-    // A pass that started past the first obligation wraps to the start next.
-    let has_more = next.is_some() || after.is_some();
+/// The relationship each bucket's obligations start reading at: the earliest any of them needs.
+fn relationship_starts(obligations: &[Obligation]) -> HashMap<String, Option<Vec<u8>>> {
     let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
-    for (_, obligation) in &obligations {
-        if obligation
-            .origin
-            .as_ref()
-            .is_some_and(|origin| origin.hop_count >= 4)
-            || obligation
-                .continuation
-                .as_ref()
-                .is_some_and(|cursor| cursor.relationships_complete)
-        {
+    for (_, obligation) in obligations {
+        let done =
+            (obligation.continuation.as_ref()).is_some_and(|cursor| cursor.relationships_complete);
+        if hop_exhausted(obligation) || done {
             continue;
         }
-        let start = obligation
-            .continuation
-            .as_ref()
-            .and_then(|cursor| cursor.relationship_after.clone());
+        let start =
+            (obligation.continuation.as_ref()).and_then(|cursor| cursor.relationship_after.clone());
         starts
             .entry(obligation.bucket.clone())
             .and_modify(|current| {
@@ -126,112 +109,296 @@ pub(super) async fn process_live_obligations(
             })
             .or_insert(start);
     }
-    let mut records = HashMap::<String, Option<(DistributionBinding, DistributionSnapshot)>>::new();
-    for (_, obligation) in &obligations {
-        if !records.contains_key(&obligation.bucket) {
-            let record = drive(BoundRecordOperation::new(&obligation.bucket), context)
-                .await
-                .map_err(|error| error.to_string())
-                .map_err(BlobQueueError::UnexpectedEvent)?;
-            records.insert(obligation.bucket.clone(), record);
-        }
-    }
-    let mut relationship_cache = HashMap::<String, RelationshipPage>::new();
-    let mut relationship_work = 0usize;
-    for (bucket, start) in starts {
-        let remaining = REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(relationship_work);
-        if remaining == 0 {
-            break;
-        }
-        let page =
-            read_relationships_limit(&context.storage_handle, &bucket, start, remaining).await?;
-        relationship_work = relationship_work.saturating_add(page.values.len());
-        relationship_cache.insert(bucket, page);
-    }
-    let mut result = LiveRepairResult {
-        has_more,
-        oldest_ms: (obligations.iter())
-            .map(|(_, obligation)| obligation.version_id.timestamp_ms())
-            .min(),
-        ..Default::default()
-    };
-    let mut retired = Vec::new();
-    let mut member_work = Vec::new();
-    let mut worked = 0usize;
-
-    for (obligation_key, obligation) in obligations {
-        let cursor = obligation.continuation.clone().unwrap_or_default();
-        // A hop-exhausted obligation is never scanned for relationships, so it
-        // must reach write_live_jobs to be retired instead of blocking the scan.
-        let hop_exhausted = obligation
-            .origin
-            .as_ref()
-            .is_some_and(|origin| origin.hop_count >= 4);
-        let relationships = if cursor.relationships_complete {
-            None
-        } else {
-            relationship_cache.get(&obligation.bucket)
-        };
-        if !hop_exhausted && !cursor.relationships_complete && relationships.is_none() {
-            result.has_more = true;
-            continue;
-        }
-        let members = match records.get(&obligation.bucket) {
-            Some(Some((binding, snapshot))) if !cursor.members_done => {
-                member_jobs(binding, snapshot, &obligation, unix_timestamp_millis())
-            }
-            _ => Vec::new(),
-        };
-        // A version of a bucket nothing replicates to owes no job: such obligations, one per
-        // imported file, are retired in one transaction instead of one each.
-        let idle = relationships.is_none_or(|page| page.values.is_empty() && page.next.is_none());
-        // Without sync work an obligation owes only its member jobs, queued in one batch.
-        if idle && !hop_exhausted {
-            member_work.extend(members);
-            retired.push((obligation_key, obligation.continuation));
-            continue;
-        }
-        if worked == OBLIGATION_WORK_LIMIT {
-            result.has_more = true;
-            continue;
-        }
-        worked += 1;
-        let write =
-            write_live_jobs(&context.storage_handle, &obligation, relationships, members).await?;
-        if !write.progressed {
-            result.has_more = true;
-            continue;
-        }
-        if let Some(continuation) = write.continuation {
-            let mut next = obligation.clone();
-            next.continuation = Some(continuation);
-            write_live_obligation(&context.storage_handle, &next).await?;
-            result.has_more = true;
-        } else {
-            delete_live_obligation(
-                &context.storage_handle,
-                obligation_key,
-                obligation.continuation.as_ref(),
-            )
-            .await?;
-        }
-        result.processed = result.processed.saturating_add(1);
-        result.queued = result.queued.saturating_add(write.queued);
-    }
-    result.processed = result.processed.saturating_add(retired.len());
-    result.queued = result.queued.saturating_add(member_work.len());
-    let storage = &context.storage_handle;
-    retire_obligations(storage, retired, member_work, (after, next)).await?;
-
-    Ok(result)
+    starts
 }
 
-/// Queues `jobs` and deletes the obligations, a continued one only while it still holds the
-/// continuation read, with the obligation cursor moved from `cursor.0` to `cursor.1`, in one
-/// transaction.
-pub(super) async fn retire_obligations(
-    storage: &StorageHandle,
-    obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
+#[derive(Debug, PartialEq)]
+enum PassStep {
+    Cursor,
+    Page,
+    Malformed,
+    Record(String),
+    Relationships(String),
+    Jobs(Box<Obligation>),
+    Stored(usize),
+    Retired,
+}
+
+/// One pass over the live obligations: those without sync work are retired together with their
+/// member jobs, and a bounded number of the others becomes replication jobs.
+#[derive(Debug, PartialEq)]
+pub(super) struct ProcessObligationsOperation {
+    now_ms: u64,
+    step: PassStep,
+    after: Option<Vec<u8>>,
+    next: Option<Vec<u8>>,
+    malformed: VecDeque<Vec<u8>>,
+    obligations: VecDeque<Obligation>,
+    buckets: VecDeque<String>,
+    records: HashMap<String, Option<BoundRecord>>,
+    starts: VecDeque<(String, Option<Vec<u8>>)>,
+    relationships: HashMap<String, RelationshipPage>,
+    relationship_work: usize,
+    retired: Vec<Retired>,
+    member_work: Vec<BlobJobRecord>,
+    worked: usize,
+    result: LiveRepairResult,
+}
+
+impl ProcessObligationsOperation {
+    pub(super) fn new() -> Self {
+        Self {
+            now_ms: 0,
+            step: PassStep::Cursor,
+            after: None,
+            next: None,
+            malformed: VecDeque::new(),
+            obligations: VecDeque::new(),
+            buckets: VecDeque::new(),
+            records: HashMap::new(),
+            starts: VecDeque::new(),
+            relationships: HashMap::new(),
+            relationship_work: 0,
+            retired: Vec::new(),
+            member_work: Vec::new(),
+            worked: 0,
+            result: LiveRepairResult::default(),
+        }
+    }
+
+    fn call(&mut self, step: PassStep, call: IoCall) -> Turn<LiveRepairResult> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn read_page(&mut self) -> Turn<LiveRepairResult> {
+        let page = IoCall::Page {
+            space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.clone().map(Into::into),
+            limit: OBLIGATION_BATCH_SIZE,
+        };
+        self.call(PassStep::Page, page)
+    }
+
+    fn page_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<LiveRepairResult> {
+        self.next = next.map(|key| key.to_vec());
+        for (key, value) in rows {
+            match LiveObligationRecord::from_bytes(&value) {
+                Ok(record) => self.obligations.push_back((key.to_vec(), record)),
+                Err(error) => {
+                    let key = key.to_vec();
+                    warn!(error = %error, key = ?key, "Deleting malformed live replication obligation");
+                    self.malformed.push_back(key);
+                }
+            }
+        }
+        self.next_malformed()
+    }
+
+    fn next_malformed(&mut self) -> Turn<LiveRepairResult> {
+        match self.malformed.pop_front() {
+            Some(key) => {
+                let delete = DeleteObligationOperation::new(key, None);
+                self.call(PassStep::Malformed, IoCall::child(delete))
+            }
+            None => self.plan_reads(),
+        }
+    }
+
+    fn plan_reads(&mut self) -> Turn<LiveRepairResult> {
+        let obligations = self.obligations.make_contiguous();
+        // A pass that started past the first obligation wraps to the start next.
+        self.result.has_more = self.next.is_some() || self.after.is_some();
+        self.result.oldest_ms = (obligations.iter())
+            .map(|(_, obligation)| obligation.version_id.timestamp_ms())
+            .min();
+        self.starts = relationship_starts(obligations).into_iter().collect();
+        let mut buckets: Vec<String> = Vec::new();
+        for (_, obligation) in obligations.iter() {
+            if !buckets.contains(&obligation.bucket) {
+                buckets.push(obligation.bucket.clone());
+            }
+        }
+        self.buckets = buckets.into();
+        self.next_record()
+    }
+
+    fn next_record(&mut self) -> Turn<LiveRepairResult> {
+        match self.buckets.pop_front() {
+            Some(bucket) => {
+                let read = BoundRecordOperation::new(&bucket);
+                self.call(PassStep::Record(bucket), IoCall::child(read))
+            }
+            None => self.next_relationships(),
+        }
+    }
+
+    fn next_relationships(&mut self) -> Turn<LiveRepairResult> {
+        let remaining = REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(self.relationship_work);
+        match self.starts.pop_front().filter(|_| remaining > 0) {
+            Some((bucket, start)) => {
+                let read = ReadRelationshipsOperation::new(&bucket, start, remaining);
+                self.call(PassStep::Relationships(bucket), IoCall::child(read))
+            }
+            None => self.next_obligation(),
+        }
+    }
+
+    fn next_obligation(&mut self) -> Turn<LiveRepairResult> {
+        while let Some((key, obligation)) = self.obligations.pop_front() {
+            let cursor = obligation.continuation.clone().unwrap_or_default();
+            // A hop-exhausted obligation is never scanned for relationships, so it must reach
+            // the job write to be retired instead of blocking the scan.
+            let exhausted = hop_exhausted(&obligation);
+            let relationships = match cursor.relationships_complete {
+                true => None,
+                false => self.relationships.get(&obligation.bucket),
+            };
+            if !exhausted && !cursor.relationships_complete && relationships.is_none() {
+                self.result.has_more = true;
+                continue;
+            }
+            let members = match self.records.get(&obligation.bucket) {
+                Some(Some((binding, snapshot))) if !cursor.members_done => {
+                    member_jobs(binding, snapshot, &obligation, self.now_ms)
+                }
+                _ => Vec::new(),
+            };
+            // A version of a bucket nothing replicates to owes no job: such obligations, one per
+            // imported file, are retired in one transaction instead of one each.
+            let idle =
+                relationships.is_none_or(|page| page.values.is_empty() && page.next.is_none());
+            // Without sync work an obligation owes only its member jobs, queued in one batch.
+            if idle && !exhausted {
+                self.member_work.extend(members);
+                self.retired.push((key, obligation.continuation));
+                continue;
+            }
+            if self.worked == OBLIGATION_WORK_LIMIT {
+                self.result.has_more = true;
+                continue;
+            }
+            self.worked += 1;
+            let write = WriteLiveJobsOperation::new(&obligation, relationships, members);
+            let step = PassStep::Jobs(Box::new((key, obligation)));
+            return self.call(step, IoCall::child(write));
+        }
+        self.result.processed = self.result.processed.saturating_add(self.retired.len());
+        self.result.queued = self.result.queued.saturating_add(self.member_work.len());
+        let retire = RetireObligationsOperation::new(
+            std::mem::take(&mut self.retired),
+            std::mem::take(&mut self.member_work),
+            (self.after.take(), self.next.take()),
+        );
+        self.call(PassStep::Retired, IoCall::child(retire))
+    }
+
+    fn jobs_written(
+        &mut self,
+        (key, obligation): Obligation,
+        write: LiveRepairWrite,
+    ) -> Turn<LiveRepairResult> {
+        if !write.progressed {
+            self.result.has_more = true;
+            return self.next_obligation();
+        }
+        let step = PassStep::Stored(write.queued);
+        match write.continuation {
+            Some(continuation) => {
+                let mut next = obligation;
+                next.continuation = Some(continuation);
+                self.result.has_more = true;
+                self.call(step, IoCall::child(WriteObligationOperation::new(next)))
+            }
+            None => {
+                let expected = obligation.continuation;
+                let delete = DeleteObligationOperation::new(key, expected);
+                self.call(step, IoCall::child(delete))
+            }
+        }
+    }
+}
+
+impl Operation for ProcessObligationsOperation {
+    type Output = LiveRepairResult;
+    type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<LiveRepairResult> {
+        Ok(Next::Call(read_row(NODE_STATE_KEYSPACE, cursor_key())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<LiveRepairResult> {
+        match std::mem::replace(&mut self.step, PassStep::Retired) {
+            PassStep::Cursor => {
+                self.after = (result.value()?)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_vec());
+                self.read_page()
+            }
+            PassStep::Page => {
+                let (rows, next) = result.page()?;
+                self.page_read(rows, next)
+            }
+            PassStep::Malformed => {
+                result.child::<(), BlobQueueError>()??;
+                self.next_malformed()
+            }
+            PassStep::Record(bucket) => {
+                let record = (result.child::<Option<BoundRecord>, RecordError>()?)
+                    .map_err(|error| BlobQueueError::UnexpectedEvent(error.to_string()))?;
+                self.records.insert(bucket, record);
+                self.next_record()
+            }
+            PassStep::Relationships(bucket) => {
+                let page = result.child::<RelationshipPage, BlobQueueError>()??;
+                self.relationship_work = self.relationship_work.saturating_add(page.values.len());
+                self.relationships.insert(bucket, page);
+                self.next_relationships()
+            }
+            PassStep::Jobs(obligation) => {
+                let write = result.child::<LiveRepairWrite, BlobQueueError>()??;
+                self.jobs_written(*obligation, write)
+            }
+            PassStep::Stored(queued) => {
+                result.child::<(), BlobQueueError>()??;
+                self.result.processed = self.result.processed.saturating_add(1);
+                self.result.queued = self.result.queued.saturating_add(queued);
+                self.next_obligation()
+            }
+            PassStep::Retired => {
+                result.child::<(), BlobQueueError>()??;
+                Ok(Next::Done(std::mem::take(&mut self.result)))
+            }
+        }
+    }
+}
+
+/// The cursor row; an empty value starts the next pass at the first obligation.
+fn cursor_entry(after: Option<Vec<u8>>) -> (String, Key, Value) {
+    (
+        NODE_STATE_KEYSPACE.to_string(),
+        cursor_key(),
+        ByteView::from(after.unwrap_or_default()),
+    )
+}
+
+#[derive(Debug, PartialEq)]
+enum RetireStep {
+    Existing,
+    Cursor,
+    Transaction,
+}
+
+/// Queues the jobs and deletes the obligations, a continued one only while it still holds the
+/// continuation read, with the obligation cursor moved along, in one transaction.
+#[derive(Debug, PartialEq)]
+pub(super) struct RetireObligationsOperation {
+    obligations: Vec<Retired>,
     jobs: Vec<BlobJobRecord>,
     cursor: (Option<Vec<u8>>, Option<Vec<u8>>),
 ) -> Result<(), BlobQueueError> {
