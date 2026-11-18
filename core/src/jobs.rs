@@ -6,6 +6,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -532,7 +533,18 @@ pub struct ArchiveEntryRead {
 }
 
 /// An archive being written, kept by the adapter between its entries.
-pub struct ZipWork(pub Box<dyn Any + Send>);
+pub struct ZipWork(Mutex<Box<dyn Any + Send>>);
+
+impl ZipWork {
+    pub fn new(writer: Box<dyn Any + Send>) -> Self {
+        Self(Mutex::new(writer))
+    }
+
+    /// The writer, for the adapter that created it.
+    pub fn into_inner(self) -> Box<dyn Any + Send> {
+        self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 impl fmt::Debug for ZipWork {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -543,7 +555,7 @@ impl fmt::Debug for ZipWork {
 /// Equal only to itself: a writer has no comparable state.
 impl PartialEq for ZipWork {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::addr_eq(&*self.0, &*other.0)
+        std::ptr::eq(self, other)
     }
 }
 

@@ -11,8 +11,8 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::sync::CancellationToken;
 
-use super::super::FIXTURE_MOMENT_MS;
-use super::super::tests::{export_scope, local_candidate, source_scope};
+use super::super::archive::FIXTURE_MOMENT_MS;
+use super::super::tests::{export_scope, source_scope, stored_candidate};
 use super::*;
 use crate::jobs::repository::test_support::artifact;
 
@@ -97,7 +97,7 @@ pub(in super::super) async fn write_archive(
             entity_index: entry.entity_index,
             candidate_index: entry.candidate_index,
             path: entry.path,
-            candidate: local_candidate(),
+            candidate: stored_candidate(),
             expected_blake3: entry.expected_blake3,
             modified_ms: entry.modified_ms,
         });
