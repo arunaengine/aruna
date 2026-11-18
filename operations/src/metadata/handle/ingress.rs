@@ -17,7 +17,6 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tracing::Span;
 
-use super::effects::metadata_read_error;
 use super::peer_auth::{
     bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
 };
@@ -38,6 +37,7 @@ use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
 use crate::metadata::message_kind::transport_message_kind;
+use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;

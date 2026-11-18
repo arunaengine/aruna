@@ -13,7 +13,7 @@ use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_grap
 use super::search::list_visible_graphs;
 use super::{MetadataHandle, metadata_graph_fence};
 use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataReadError;
+use crate::metadata::query_cache::{CacheStamp, CachedQuery, QueryCacheKey};
 
 /// Runs one metadata effect on this node's graph store and answers with its event.
 pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {
@@ -47,7 +47,36 @@ async fn run_effect(
     effect: MetadataEffect,
 ) -> MetadataEvent {
     let cache = &metadata.inner.visibility_cache;
+    let queries = metadata.query_cache();
     match effect {
+        MetadataEffect::QueryCacheGet { key } => {
+            let stamp = queries.stamp(cache.current_generation());
+            let entry = queries.get(&QueryCacheKey::from_bytes(key), stamp, Instant::now());
+            let entry = entry.map(|cached| ((*cached.results).clone(), cached.nodes_queried));
+            return MetadataEvent::QueryCacheEntry {
+                stamp: stamp.parts(),
+                entry,
+            };
+        }
+        MetadataEffect::QueryCachePut {
+            key,
+            stamp,
+            results,
+            nodes_queried,
+        } => {
+            let cached = CachedQuery {
+                results: std::sync::Arc::new(results),
+                nodes_queried,
+            };
+            let generation = cache.current_generation();
+            let key = QueryCacheKey::from_bytes(key);
+            let stamp = CacheStamp::from_parts(stamp);
+            queries.insert(key, cached, stamp, generation, Instant::now());
+            return MetadataEvent::QueryCacheEntry {
+                stamp: stamp.parts(),
+                entry: None,
+            };
+        }
         MetadataEffect::CacheGeneration => {
             return MetadataEvent::CacheGeneration {
                 generation: cache.current_generation(),
@@ -302,22 +331,5 @@ pub(super) fn record_query_counts(span: &Span, results: &MetadataQueryResults) {
         MetadataQueryResults::Graph(triples) => {
             span.record("triple_count", triples.len() as u64);
         }
-    }
-}
-
-pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
-    match error {
-        MetadataError::GraphNotFound => MetadataReadError::NotFound,
-        MetadataError::InvalidInput(_)
-        | MetadataError::ChannelClosed
-        | MetadataError::InvalidEffect
-        | MetadataError::HandleMissing
-        | MetadataError::TaskJoin(_)
-        | MetadataError::Validation(_)
-        | MetadataError::ProfileValidation(_)
-        | MetadataError::Persist(_)
-        | MetadataError::Storage(_)
-        | MetadataError::Backend(_)
-        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }
 }

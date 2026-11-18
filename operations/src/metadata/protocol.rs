@@ -11,7 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataQueryResults, MetadataSearchHit,
+    MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
 use aruna_core::structs::execution::job::SubmissionId;
@@ -894,6 +894,24 @@ pub enum MetadataReadError {
 impl From<aruna_core::calls::IoError> for MetadataReadError {
     fn from(_: aruna_core::calls::IoError) -> Self {
         Self::Unavailable
+    }
+}
+
+/// The read verdict of a failed graph effect: a missing graph is not found, all else unavailable.
+pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+    match error {
+        MetadataError::GraphNotFound => MetadataReadError::NotFound,
+        MetadataError::InvalidInput(_)
+        | MetadataError::ChannelClosed
+        | MetadataError::InvalidEffect
+        | MetadataError::HandleMissing
+        | MetadataError::TaskJoin(_)
+        | MetadataError::Validation(_)
+        | MetadataError::ProfileValidation(_)
+        | MetadataError::Persist(_)
+        | MetadataError::Storage(_)
+        | MetadataError::Backend(_)
+        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }
 }
 
