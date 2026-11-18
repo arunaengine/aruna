@@ -7,14 +7,12 @@ use crate::jobs::repository::push::creator_auth;
 use crate::jobs::repository::test_support::{
     artifact, body, child, job_scope, link, remote, scope, session,
 };
-use aruna_core::structs::execution::job::{ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget};
+use aruna_core::structs::execution::job::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget,
+};
 
 fn options(all_versions: bool, mode: ImportMode) -> ImportOptions {
-    ImportOptions {
-        all_versions,
-        mode,
-        ..ImportOptions::default()
-    }
+    ImportOptions { mode, all_versions }
 }
 
 fn record(id: &str, index: u64) -> Value {
@@ -39,10 +37,13 @@ fn history(all_versions: bool, mode: ImportMode) -> HistoryOperation {
 }
 
 #[test]
-fn single_version_reads_files() {
+fn single_version_files() {
     let mut operation = history(false, ImportMode::Copy);
     let seed = session().url(&["records", "7"]).unwrap();
-    assert_eq!(operation.first(), Ok(Next::Call(session().get(seed.clone()))));
+    assert_eq!(
+        operation.first(),
+        Ok(Next::Call(session().get(seed.clone())))
+    );
     assert_eq!(
         operation.next(body(record("7", 1))),
         Ok(Next::Call(session().get(seed)))
@@ -55,12 +56,15 @@ fn single_version_reads_files() {
     let listing = json!({"entries": []});
     assert_eq!(
         operation.next(body(listing.clone())),
-        Ok(Next::Done(("7".to_string(), vec![(record("7", 1), listing)])))
+        Ok(Next::Done((
+            "7".to_string(),
+            vec![(record("7", 1), listing)]
+        )))
     );
 }
 
 #[test]
-fn metadata_mode_skips_files() {
+fn metadata_skips_files() {
     let mut operation = history(false, ImportMode::Metadata);
     operation.first().unwrap();
     operation.next(body(record("7", 1))).unwrap();
@@ -72,7 +76,7 @@ fn metadata_mode_skips_files() {
 }
 
 #[test]
-fn draft_seed_is_refused() {
+fn draft_seed_refused() {
     let mut operation = history(false, ImportMode::Copy);
     operation.first().unwrap();
     let mut seed = record("7", 1);
@@ -107,7 +111,7 @@ fn versions_follow_pages() {
 }
 
 #[test]
-fn repeated_version_is_refused() {
+fn repeated_version_refused() {
     let mut operation = history(true, ImportMode::Metadata);
     operation.first().unwrap();
     operation.next(body(record("7", 1))).unwrap();
@@ -155,7 +159,7 @@ fn request(pull: Option<RepositoryPull>) -> AcquireRequest {
 }
 
 #[test]
-fn other_kind_is_refused() {
+fn other_kind_refused() {
     let mut acquire = request(None);
     acquire.kind = RepositoryConnectorKind::OaiPmh;
     assert_eq!(
@@ -185,13 +189,18 @@ fn update_checks_running() {
 #[test]
 fn archive_spools_history() {
     let mut operation = AcquireOperation::new(request(None));
-    operation.step = AcquireStep::Connect;
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(matches!(
         operation.next(child::<_, TransferError>(Ok(session()))),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    let history = ("7".to_string(), vec![(record("7", 1), json!({"entries": []}))]);
+    let history = (
+        "7".to_string(),
+        vec![(record("7", 1), json!({"entries": []}))],
+    );
     let spool = operation
         .next(child::<_, TransferError>(Ok(history)))
         .unwrap();
@@ -205,13 +214,16 @@ fn archive_spools_history() {
 }
 
 #[test]
-fn absent_record_is_refused() {
+fn absent_record_refused() {
     let mut operation = AcquireOperation::new(request(None));
     operation.first().unwrap();
     operation
         .next(child::<_, TransferError>(Ok(session())))
         .unwrap();
-    let history = ("9".to_string(), vec![(record("7", 1), json!({"entries": []}))]);
+    let history = (
+        "9".to_string(),
+        vec![(record("7", 1), json!({"entries": []}))],
+    );
     assert_eq!(
         operation.next(child::<_, TransferError>(Ok(history))),
         Err(invalid("requested record absent from history"))

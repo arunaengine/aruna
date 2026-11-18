@@ -4,9 +4,7 @@
 
 use super::*;
 use crate::jobs::repository::push::creator_auth;
-use crate::jobs::repository::test_support::{
-    child, job_scope, link, remote, scope, session,
-};
+use crate::jobs::repository::test_support::{child, job_scope, link, remote, scope, session};
 use aruna_core::repository::remote::{RemoteAnswer, RemoteFailure, StopReason};
 use aruna_core::repository::{ImportOptions, RepositoryPull};
 use aruna_core::structs::execution::job::{
@@ -79,13 +77,13 @@ fn metadata(size: u64) -> SourceMetadata {
 }
 
 #[test]
-fn other_kind_is_refused() {
+fn other_kind_refused() {
     let mut write = operation(RepositoryConnectorKind::OaiPmh, link().group_id);
     assert_eq!(write.first(), Err(not_supported("references")));
 }
 
 #[test]
-fn foreign_group_is_refused() {
+fn foreign_group_refused() {
     let mut write = operation(RepositoryConnectorKind::Invenio, Ulid::nil());
     assert_eq!(
         write.first(),
@@ -107,7 +105,7 @@ fn at_head() -> WriteRepositoryReference {
 }
 
 #[test]
-fn changed_size_is_refused() {
+fn changed_size_refused() {
     let mut write = at_head();
     let answer = remote(Ok(RemoteAnswer::Metadata(metadata(9))));
     assert_eq!(
@@ -124,17 +122,14 @@ fn stop_precedes_write() {
         .unwrap();
     assert_eq!(
         checkpoint,
-        Next::Call(remote_call(
-            RemoteCall::Checkpoint,
-            Some(job_scope().stop)
-        ))
+        Next::Call(remote_call(RemoteCall::Checkpoint, Some(job_scope().stop)))
     );
     let stopped = remote(Err(RemoteFailure::Stopped(StopReason::Interrupted)));
     assert_eq!(write.next(stopped), Err(TransferError::Interrupted));
 }
 
 #[test]
-fn written_reference_answers_metadata() {
+fn written_reference_answers() {
     let mut write = at_head();
     write
         .next(remote(Ok(RemoteAnswer::Metadata(metadata(4)))))

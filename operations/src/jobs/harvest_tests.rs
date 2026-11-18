@@ -7,8 +7,8 @@ use std::time::SystemTime;
 use super::*;
 use crate::harvest::oai_pmh::parse::OaiHeader;
 use crate::jobs::repository::test_support::{
-    NOW_MS, child, event as io_event, job_scope, link, local_scope, realm,
-    registry_record, remote, scope,
+    NOW_MS, child, event as io_event, job_scope, link, local_scope, realm, registry_record, remote,
+    scope,
 };
 use aruna_core::structs::execution::harvest::{HarvestGranularity, HarvestSelector};
 
@@ -90,7 +90,10 @@ fn listing(source: HarvestSource) -> HarvestJobOperation {
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     let answer = read_answer(Some(&connector(RepositoryConnectorKind::OaiPmh)));
-    assert_eq!(operation.next(answer), Ok(Next::Call(operation.checkpoint())));
+    assert_eq!(
+        operation.next(answer),
+        Ok(Next::Call(operation.checkpoint()))
+    );
     operation
 }
 
@@ -132,7 +135,7 @@ fn saved_cursor(next: Turn<HarvestCounts>) -> HarvestCursor {
 }
 
 #[test]
-fn missing_source_is_permanent() {
+fn missing_source_permanent() {
     let mut operation = job();
     assert_eq!(
         operation.first(),
@@ -147,14 +150,16 @@ fn missing_source_is_permanent() {
 }
 
 #[test]
-fn wrong_connector_is_refused() {
+fn wrong_connector_refused() {
     let mut operation = job();
     operation.first().unwrap();
     operation.next(read_answer(Some(&source()))).unwrap();
     let answer = read_answer(Some(&connector(RepositoryConnectorKind::Invenio)));
     assert_eq!(
         operation.next(answer),
-        Err(permanent("harvest requires an OAI-PMH repository connector"))
+        Err(permanent(
+            "harvest requires an OAI-PMH repository connector"
+        ))
     );
 }
 
@@ -171,7 +176,7 @@ fn harvest_needs_network() {
 }
 
 #[test]
-fn identify_failure_keeps_baseline() {
+fn identify_failure_ignored() {
     let mut unknown = source();
     unknown.granularity = None;
     let mut operation = job();
@@ -183,7 +188,10 @@ fn identify_failure_keeps_baseline() {
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     let failed = remote(Err(RemoteFailure::Retryable("down".into())));
-    assert_eq!(operation.next(failed), Ok(Next::Call(operation.checkpoint())));
+    assert_eq!(
+        operation.next(failed),
+        Ok(Next::Call(operation.checkpoint()))
+    );
 }
 
 #[test]
@@ -197,7 +205,7 @@ fn stop_ends_run() {
 }
 
 #[test]
-fn full_page_advances_window() {
+fn page_advances_window() {
     let mut operation = listing(source());
     assert!(matches!(
         operation.next(gate_open()),
@@ -240,7 +248,9 @@ fn token_keeps_window() {
 #[test]
 fn repeated_token_fails() {
     let mut operation = listing(source());
-    operation.seen_tokens.insert(*blake3::hash(b"T1").as_bytes());
+    operation
+        .seen_tokens
+        .insert(*blake3::hash(b"T1").as_bytes());
     operation.next(gate_open()).unwrap();
     let cursor = saved_cursor(operation.next(text(page_xml(&[], Some("T1")))));
     assert_eq!(cursor.resumption_token, None);
@@ -260,7 +270,7 @@ fn resuming() -> HarvestSource {
 }
 
 #[test]
-fn bad_token_restarts_once() {
+fn bad_token_restarts() {
     let mut operation = listing(resuming());
     operation.next(gate_open()).unwrap();
     let cursor = saved_cursor(operation.next(text(error_xml("badResumptionToken"))));
@@ -274,7 +284,7 @@ fn bad_token_restarts_once() {
 }
 
 #[test]
-fn second_bad_token_fails() {
+fn repeated_rejection_fails() {
     let mut operation = listing(resuming());
     operation.restarted = true;
     operation.next(gate_open()).unwrap();
@@ -286,7 +296,7 @@ fn second_bad_token_fails() {
 }
 
 #[test]
-fn protocol_error_is_permanent() {
+fn protocol_error_permanent() {
     let mut operation = listing(source());
     operation.next(gate_open()).unwrap();
     let Err(HarvestFailure::Job(error)) = operation.next(text(error_xml("badArgument"))) else {
@@ -300,7 +310,7 @@ fn protocol_error_is_permanent() {
 }
 
 #[test]
-fn elapsed_budget_keeps_position() {
+fn budget_keeps_position() {
     let mut operation = listing(resuming());
     operation.stamp(NOW_MS + HARVEST_RUN_DEADLINE.as_millis() as u64 + 1);
     let cursor = saved_cursor(operation.next(gate_open()));
@@ -384,7 +394,9 @@ fn allowed() -> IoResult {
 fn stored_row() -> IoResult {
     io_event(Event::Storage(StorageEvent::ReadResult {
         key: ByteView::from(Vec::new()),
-        value: Some(ByteView::from(postcard::to_allocvec(&registry_record()).unwrap())),
+        value: Some(ByteView::from(
+            postcard::to_allocvec(&registry_record()).unwrap(),
+        )),
     }))
 }
 
@@ -427,7 +439,7 @@ fn stale_record_skips() {
 }
 
 #[test]
-fn new_record_reads_config() {
+fn new_record_mints() {
     let mut operation = apply(false);
     assert_eq!(
         operation.next(read_answer::<HarvestProvenance>(None)),
@@ -442,7 +454,7 @@ fn new_record_reads_config() {
 }
 
 #[test]
-fn pending_row_precedes_create() {
+fn pending_row_first() {
     let mut operation = apply(false);
     operation.row = Some(provenance(HarvestRecordState::PendingCreate, 100));
     operation.step = ApplyStep::MintPending(document());
@@ -469,7 +481,7 @@ fn pending_row_precedes_create() {
 }
 
 #[test]
-fn existing_document_is_updated() {
+fn existing_document_updated() {
     let mut operation = apply(false);
     let pending = provenance(HarvestRecordState::PendingCreate, 50);
     operation.next(read_answer(Some(&pending))).unwrap();
@@ -493,7 +505,7 @@ fn existing_document_is_updated() {
 }
 
 #[test]
-fn stored_document_is_updated() {
+fn stored_document_updated() {
     let mut operation = updating();
     assert!(matches!(
         operation.next(stored_row()),
@@ -510,7 +522,7 @@ fn stored_document_is_updated() {
 }
 
 #[test]
-fn stored_not_found_fails() {
+fn stored_absence_fails() {
     let mut operation = updating();
     operation.next(stored_row()).unwrap();
     let Err(HarvestFailure::Job(error)) =
@@ -518,11 +530,14 @@ fn stored_not_found_fails() {
     else {
         panic!("a stored document cannot be missing");
     };
-    assert_eq!(error.message, "harvest apply failed: metadata document not found");
+    assert_eq!(
+        error.message,
+        "harvest apply failed: metadata document not found"
+    );
 }
 
 #[test]
-fn absent_document_mints_again() {
+fn absent_document_remints() {
     let mut operation = updating();
     assert_eq!(
         operation.next(read_answer::<MetadataRegistryRecord>(None)),
@@ -587,7 +602,7 @@ fn withdrawn_record_tombstones() {
 }
 
 #[test]
-fn rejected_record_is_permanent() {
+fn rejected_record_permanent() {
     let failure = apply_failure(HarvestWriteFailure::Rejected(Vec::new()));
     assert_eq!(
         failure,
@@ -614,22 +629,33 @@ fn access() -> HarvestAccessOperation {
 }
 
 #[test]
-fn access_checks_both_paths() {
+fn access_checks_paths() {
     let mut operation = access();
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let group = child::<(), AccessError>(Ok(()));
-    assert!(matches!(operation.next(group), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(operation.next(child::<(), AccessError>(Ok(()))), Ok(Next::Done(())));
+    assert!(matches!(
+        operation.next(group),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(
+        operation.next(child::<(), AccessError>(Ok(()))),
+        Ok(Next::Done(()))
+    );
 }
 
 #[test]
-fn denied_access_names_path() {
+fn denial_names_path() {
     let mut operation = access();
     operation.first().unwrap();
     let denied = child::<(), AccessError>(Err(AccessError::Denied("no".into())));
     assert_eq!(
         operation.next(denied),
-        Err(permanent("harvest write to [imported/doc] is not permitted"))
+        Err(permanent(
+            "harvest write to [imported/doc] is not permitted"
+        ))
     );
 }
 

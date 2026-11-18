@@ -70,11 +70,10 @@ fn run(target: Option<LinkTarget>) -> ExportRun {
 }
 
 fn checkpoint() -> ExportCheckpoint {
-    ExportCheckpoint {
-        raw_jsonld: Some(CRATE.into()),
-        artifact: Some(artifact()),
-        ..ExportCheckpoint::default()
-    }
+    let mut checkpoint = ExportCheckpoint::default();
+    checkpoint.raw_jsonld = Some(CRATE.into());
+    checkpoint.artifact = Some(artifact());
+    checkpoint
 }
 
 fn record() -> RepositoryRecord {
@@ -151,11 +150,16 @@ fn remote_file(status: &str) -> Value {
 
 fn export(run: ExportRun, checkpoint: ExportCheckpoint) -> RepositoryExportOperation {
     let inspection = Ok(inspection(&[]));
-    RepositoryExportOperation::new(RepositoryConnectorKind::Invenio, run, checkpoint, inspection)
+    RepositoryExportOperation::new(
+        RepositoryConnectorKind::Invenio,
+        run,
+        checkpoint,
+        inspection,
+    )
 }
 
 #[test]
-fn other_kind_ends_export() {
+fn other_kind_ends() {
     let stored = checkpoint();
     let mut operation = export(run(None), stored.clone());
     operation.kind = RepositoryConnectorKind::OaiPmh;
@@ -177,11 +181,17 @@ fn unknown_creation_stops() {
 }
 
 #[test]
-fn export_runs_each_step() {
+fn export_runs_step() {
     let mut operation = export(run(None), checkpoint());
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let created = child::<CreatedDraft, TransferError>(Ok((true, Ok(record()))));
-    assert!(matches!(operation.next(created), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(created),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(operation.checkpoint.repository_started);
     assert_eq!(operation.checkpoint.repository, Some(record()));
     // Saved: the DOI reservation follows.
@@ -202,11 +212,20 @@ fn export_runs_each_step() {
         ))))
     );
     let prepared = child::<_, TransferError>(Ok((record(), [5; 32])));
-    assert!(matches!(operation.next(prepared), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(prepared),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(operation.checkpoint.repository_metadata, Some([5; 32]));
-    assert!(matches!(operation.next(saved()), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(saved()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let deposited = child::<_, TransferError>(Ok((record(), vec!["a.txt".to_string()])));
-    assert!(matches!(operation.next(deposited), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(deposited),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let Ok(Next::Done((stored, Ok(())))) = operation.next(saved()) else {
         panic!("the export is complete");
     };
@@ -215,7 +234,7 @@ fn export_runs_each_step() {
 }
 
 #[test]
-fn failed_create_keeps_fence() {
+fn failed_create_fenced() {
     let mut operation = export(run(None), checkpoint());
     operation.first().unwrap();
     let lost = Err(TransferError::Retryable("lost".into()));
@@ -227,13 +246,16 @@ fn failed_create_keeps_fence() {
 }
 
 #[test]
-fn link_failure_observes_revision() {
+fn link_failure_observes() {
     let linked = run(Some(target()));
     let mut stored = checkpoint();
     stored.repository = Some(record());
     stored.repository_metadata = Some([5; 32]);
     let mut operation = export(linked.clone(), stored);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let prepared = Prepared {
         destination: linked.destination.clone(),
         base: None,
@@ -256,7 +278,7 @@ fn link_failure_observes_revision() {
 }
 
 #[test]
-fn moved_draft_is_recorded() {
+fn moved_draft_recorded() {
     let linked = run(Some(target()));
     let mut current = draft();
     current["revision_id"] = json!(2);
@@ -273,7 +295,7 @@ fn moved_draft_is_recorded() {
 }
 
 #[test]
-fn unread_draft_only_warns() {
+fn unread_draft_warns() {
     let mut operation = ObserveRevisionOperation::new(run(None), record(), [0; 32]);
     operation.first().unwrap();
     operation.next(connected()).unwrap();
@@ -287,13 +309,25 @@ fn create(run: ExportRun, jsonld: &str) -> CreateDraftOperation {
 }
 
 #[test]
-fn new_draft_is_fenced() {
+fn new_draft_fenced() {
     let mut operation = create(run(None), CRATE);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(operation.next(connected()), Ok(Next::Call(run(None).guard())));
-    assert!(matches!(operation.next(passed()), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(
+        operation.next(connected()),
+        Ok(Next::Call(run(None).guard()))
+    );
+    assert!(matches!(
+        operation.next(passed()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(!operation.fenced);
-    assert!(matches!(operation.next(saved()), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.next(saved()),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert!(operation.fenced);
     let Ok(Next::Done((true, Ok(created)))) = operation.next(body(draft())) else {
         panic!("the draft exists");
@@ -316,11 +350,10 @@ fn draft_needs_login() {
 }
 
 #[test]
-fn incomplete_crate_is_refused() {
+fn incomplete_crate_refused() {
     let mut operation = create(run(None), "{}");
     operation.first().unwrap();
-    let Ok(Next::Done((false, Err(TransferError::Refused(reason))))) =
-        operation.next(connected())
+    let Ok(Next::Done((false, Err(TransferError::Refused(reason))))) = operation.next(connected())
     else {
         panic!("the requirements are unmet");
     };
@@ -334,7 +367,10 @@ fn version_checks_parent() {
     let mut operation = create(versioned.clone(), CRATE);
     operation.first().unwrap();
     let source = session().url(&["records", "5"]).unwrap();
-    assert_eq!(operation.next(connected()), Ok(Next::Call(session().get(source))));
+    assert_eq!(
+        operation.next(connected()),
+        Ok(Next::Call(session().get(source)))
+    );
     let published = json!({"is_published": true, "parent": {"id": "1"}});
     assert_eq!(
         operation.next(body(published)),
@@ -357,7 +393,10 @@ fn version_checks_parent() {
 fn reserve() -> ReserveDoiOperation {
     let mut operation = ReserveDoiOperation::new(run(None), record());
     operation.first().unwrap();
-    assert_eq!(operation.next(connected()), Ok(Next::Call(run(None).guard())));
+    assert_eq!(
+        operation.next(connected()),
+        Ok(Next::Call(run(None).guard()))
+    );
     let url = session()
         .url(&["records", "7", "draft", "pids", "doi"])
         .unwrap();
@@ -369,7 +408,7 @@ fn reserve() -> ReserveDoiOperation {
 }
 
 #[test]
-fn reserved_doi_updates_record() {
+fn reserved_doi_stored() {
     let mut reserved = draft();
     reserved["pids"] = json!({"doi": {"identifier": "10.1/7"}});
     let Ok(Next::Done(answer)) = reserve().next(body(reserved)) else {
@@ -379,12 +418,12 @@ fn reserved_doi_updates_record() {
 }
 
 #[test]
-fn missing_provider_keeps_record() {
+fn missing_provider_tolerated() {
     assert_eq!(reserve().next(status(400)), Ok(Next::Done(record())));
 }
 
 #[test]
-fn rejected_token_stops_reservation() {
+fn rejected_reservation_stops() {
     assert_eq!(
         reserve().next(status(403)),
         Err(TransferError::Refused(LinkFailure::TokenRejected))
@@ -396,7 +435,10 @@ fn prepare(run: ExportRun) -> PrepareDraftOperation {
         PrepareDraftOperation::new(run, record(), CRATE.into(), ExportIdentity::default());
     operation.first().unwrap();
     let url = session().url(&["records", "7", "draft"]).unwrap();
-    assert_eq!(operation.next(connected()), Ok(Next::Call(session().get(url))));
+    assert_eq!(
+        operation.next(connected()),
+        Ok(Next::Call(session().get(url)))
+    );
     operation
 }
 
@@ -411,7 +453,7 @@ fn stored_draft(operation: &PrepareDraftOperation) -> Value {
 }
 
 #[test]
-fn new_draft_keeps_revision() {
+fn new_draft_unchanged() {
     let mut operation = prepare(run(None));
     let stored = stored_draft(&operation);
     let digest = metadata_digest(&stored);
@@ -422,7 +464,7 @@ fn new_draft_keeps_revision() {
 }
 
 #[test]
-fn replaced_draft_is_refused() {
+fn replaced_draft_refused() {
     let mut operation = prepare(run(None));
     let mut other = draft();
     other["parent"]["id"] = json!("9");
@@ -433,7 +475,7 @@ fn replaced_draft_is_refused() {
 }
 
 #[test]
-fn requested_draft_is_updated() {
+fn requested_draft_updated() {
     let mut requested = run(None);
     requested.destination.draft_id = Some("7".into());
     let mut operation = prepare(requested.clone());
@@ -442,7 +484,10 @@ fn requested_draft_is_updated() {
         operation.next(body(stored.clone())),
         Ok(Next::Call(requested.guard()))
     );
-    assert!(matches!(operation.next(passed()), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.next(passed()),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     let digest = metadata_digest(&stored);
     assert_eq!(
         operation.next(body(stored)),
@@ -472,7 +517,7 @@ fn draft_listing(operation: &mut DepositOperation) {
 }
 
 #[test]
-fn moved_endpoint_is_refused() {
+fn moved_endpoint_refused() {
     let mut stale = record();
     stale.url = "https://other.example/api/records/7/draft".into();
     let mut operation = deposit(run(None), &[], metadata_digest(&draft()));
@@ -480,7 +525,9 @@ fn moved_endpoint_is_refused() {
     operation.first().unwrap();
     assert_eq!(
         operation.next(connected()),
-        Err(invalid("repository connector endpoint changed during export"))
+        Err(invalid(
+            "repository connector endpoint changed during export"
+        ))
     );
 }
 
@@ -494,11 +541,14 @@ fn empty_deposit_finishes() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let finished = child::<_, TransferError>(Ok(record()));
-    assert_eq!(operation.next(finished), Ok(Next::Done((record(), Vec::new()))));
+    assert_eq!(
+        operation.next(finished),
+        Ok(Next::Done((record(), Vec::new())))
+    );
 }
 
 #[test]
-fn file_upload_counts_progress() {
+fn upload_counts_progress() {
     let digest = metadata_digest(&draft());
     let scope_run = run(None);
     let progress = scope_run.job.progress.clone();
@@ -509,9 +559,15 @@ fn file_upload_counts_progress() {
         Ok(Next::Call(scope_run.guard()))
     );
     assert_eq!(progress.snapshot().total, Some(1));
-    assert!(matches!(operation.next(passed()), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(passed()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let uploaded = child::<_, TransferError>(Ok(digests()));
-    assert!(matches!(operation.next(uploaded), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.next(uploaded),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(progress.snapshot().current, 1);
     let finished = child::<_, TransferError>(Ok(record()));
     assert_eq!(
@@ -521,7 +577,7 @@ fn file_upload_counts_progress() {
 }
 
 #[test]
-fn foreign_remote_file_is_change() {
+fn foreign_file_refused() {
     let digest = metadata_digest(&draft());
     let mut operation = deposit(run(Some(target())), &[], digest);
     draft_listing(&mut operation);
@@ -533,17 +589,23 @@ fn foreign_remote_file_is_change() {
 }
 
 #[test]
-fn dropped_file_is_removed() {
+fn dropped_file_removed() {
     let digest = metadata_digest(&draft());
     let linked = run(Some(target()));
     let mut operation = deposit(linked.clone(), &[], digest);
     draft_listing(&mut operation);
     let listing = json!({"entries": [{"key": "old.txt"}]});
-    assert_eq!(operation.next(body(listing)), Ok(Next::Call(linked.guard())));
+    assert_eq!(
+        operation.next(body(listing)),
+        Ok(Next::Call(linked.guard()))
+    );
     let url = session()
         .url(&["records", "7", "draft", "files", "old.txt"])
         .unwrap();
-    assert_eq!(operation.next(passed()), Ok(Next::Call(session().delete(url))));
+    assert_eq!(
+        operation.next(passed()),
+        Ok(Next::Call(session().delete(url)))
+    );
     assert!(matches!(
         operation.next(remote(Ok(RemoteAnswer::Done))),
         Ok(Next::Call(IoCall::Child(_)))
@@ -551,12 +613,15 @@ fn dropped_file_is_removed() {
 }
 
 #[test]
-fn published_failure_only_warns() {
+fn published_failure_warns() {
     let mut operation = deposit(run(None), &[], [9; 32]);
     operation.first().unwrap();
     operation.next(connected()).unwrap();
     let record_url = session().url(&["records", "7"]).unwrap();
-    assert_eq!(operation.next(status(404)), Ok(Next::Call(session().get(record_url))));
+    assert_eq!(
+        operation.next(status(404)),
+        Ok(Next::Call(session().get(record_url)))
+    );
     let mut published = draft();
     published["is_published"] = json!(true);
     let files = session().url(&["records", "7", "files"]).unwrap();
@@ -577,7 +642,7 @@ fn published_failure_only_warns() {
 }
 
 #[test]
-fn draft_failure_stays_error() {
+fn draft_failure_stays() {
     let mut operation = deposit(run(None), &[], [9; 32]);
     operation.first().unwrap();
     operation.next(connected()).unwrap();
@@ -610,7 +675,7 @@ fn file_url(tail: &[&str]) -> url::Url {
 }
 
 #[test]
-fn compressed_entry_is_refused() {
+fn compressed_entry_refused() {
     let mut operation = upload(None, false, false);
     operation.entry.compression = ArchiveCompression::Deflate;
     assert_eq!(
@@ -620,10 +685,13 @@ fn compressed_entry_is_refused() {
 }
 
 #[test]
-fn changed_bytes_are_refused() {
+fn changed_bytes_refused() {
     let mut operation = upload(None, false, false);
     operation.entry.crc32 = 1;
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert_eq!(
         operation.next(hashed()),
         Err(invalid("crate file differs from snapshot"))
@@ -631,14 +699,14 @@ fn changed_bytes_are_refused() {
 }
 
 #[test]
-fn matching_file_is_kept() {
+fn matching_file_kept() {
     let mut operation = upload(Some(remote_file("completed")), false, false);
     operation.first().unwrap();
     assert_eq!(operation.next(hashed()), Ok(Next::Done(digests())));
 }
 
 #[test]
-fn pending_file_is_committed() {
+fn pending_file_committed() {
     let mut operation = upload(Some(remote_file("pending")), false, false);
     operation.first().unwrap();
     assert_eq!(
@@ -652,7 +720,7 @@ fn pending_file_is_committed() {
 }
 
 #[test]
-fn missing_file_is_uploaded() {
+fn missing_file_uploaded() {
     let mut operation = upload(None, false, false);
     operation.first().unwrap();
     let start = session().url(&["records", "7", "draft", "files"]).unwrap();
@@ -682,7 +750,7 @@ fn missing_file_is_uploaded() {
 }
 
 #[test]
-fn changed_upload_is_refused() {
+fn changed_upload_refused() {
     let mut operation = upload(None, false, false);
     operation.first().unwrap();
     operation.next(hashed()).unwrap();
@@ -695,7 +763,7 @@ fn changed_upload_is_refused() {
 }
 
 #[test]
-fn differing_file_is_replaced() {
+fn differing_file_replaced() {
     let mut stale = remote_file("completed");
     stale["size"] = json!(9);
     let mut operation = upload(Some(stale), false, true);
@@ -711,7 +779,7 @@ fn differing_file_is_replaced() {
 }
 
 #[test]
-fn published_needs_complete_file() {
+fn published_needs_file() {
     let mut operation = upload(None, true, false);
     operation.first().unwrap();
     assert_eq!(
@@ -721,14 +789,7 @@ fn published_needs_complete_file() {
 }
 
 fn finish(run: ExportRun, metadata: [u8; 32]) -> FinishDepositOperation {
-    FinishDepositOperation::new(
-        run,
-        session(),
-        record(),
-        false,
-        metadata,
-        BTreeMap::new(),
-    )
+    FinishDepositOperation::new(run, session(), record(), false, metadata, BTreeMap::new())
 }
 
 fn restricted() -> Value {
@@ -750,7 +811,7 @@ fn verified(run: ExportRun) -> FinishDepositOperation {
 }
 
 #[test]
-fn changed_metadata_stops_finish() {
+fn changed_metadata_stops() {
     let mut operation = finish(run(None), [0; 32]);
     let current = session().url(&["records", "7", "draft"]).unwrap();
     assert_eq!(operation.first(), Ok(Next::Call(session().get(current))));
@@ -761,17 +822,19 @@ fn changed_metadata_stops_finish() {
 }
 
 #[test]
-fn public_files_stop_finish() {
+fn public_files_stop() {
     let mut operation = finish(run(None), metadata_digest(&draft()));
     operation.first().unwrap();
     assert_eq!(
         operation.next(body(draft())),
-        Err(invalid("repository file access is more public than requested"))
+        Err(invalid(
+            "repository file access is more public than requested"
+        ))
     );
 }
 
 #[test]
-fn draft_export_stops_unpublished() {
+fn draft_export_unpublished() {
     let mut unpublished = run(None);
     unpublished.destination.publish = false;
     let mut operation = finish(unpublished, metadata_digest(&restricted()));
@@ -803,11 +866,14 @@ fn publication_is_verified() {
     let Ok(Next::Done(answer)) = operation.next(body(json!({"entries": [{"key": "x"}]}))) else {
         panic!("a published record stays");
     };
-    assert_eq!(answer.warning.as_deref(), Some("repository file set changed"));
+    assert_eq!(
+        answer.warning.as_deref(),
+        Some("repository file set changed")
+    );
 }
 
 #[test]
-fn stop_during_verify_stays() {
+fn verify_stop_stays() {
     let mut operation = verified(run(None));
     operation.next(passed()).unwrap();
     let mut published = restricted();
@@ -828,7 +894,7 @@ fn unconfirmed_publication_fails() {
 }
 
 #[test]
-fn first_version_goes_to_review() {
+fn first_version_reviewed() {
     let mut operation = verified(run(None));
     operation.step = FinishStep::ReviewTarget;
     let target = json!({"id": "c1"});

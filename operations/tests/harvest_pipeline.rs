@@ -491,11 +491,8 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
 }
 
 async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
-    let operation = HarvestJobOperation::new(
-        NodeScope::of(&ctx.driver),
-        JobScope::of(ctx),
-        spec.clone(),
-    );
+    let operation =
+        HarvestJobOperation::new(NodeScope::of(&ctx.driver), JobScope::of(ctx), spec.clone());
     harvest_outcome(drive(operation, &ctx.driver).await)
 }
 

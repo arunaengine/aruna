@@ -42,7 +42,10 @@ fn links_follow_pages() {
     let mut operation = DocumentLinksOperation::new(link().document_id);
     assert_eq!(operation.first(), Ok(Next::Call(pages())));
     let more = operation.next(page(vec![link()], Some(ByteView::from(vec![1]))));
-    assert!(matches!(more, Ok(Next::Call(IoCall::Page { after: Some(_), .. }))));
+    assert!(matches!(
+        more,
+        Ok(Next::Call(IoCall::Page { after: Some(_), .. }))
+    ));
     let done = operation.next(page(vec![link()], None));
     assert_eq!(done, Ok(Next::Done(vec![link(), link()])));
 }
@@ -105,7 +108,7 @@ fn pull_state() -> aruna_core::repository::LinkPull {
 }
 
 #[test]
-fn change_refuses_foreign_owner() {
+fn foreign_owner_refused() {
     let mut scope = scope();
     scope.node = scope.node.map(|(_, realm)| (other_node(), realm));
     let mut operation = ApplyChangeOperation::new(scope, link(), LinkChange::Delete);
@@ -116,7 +119,7 @@ fn change_refuses_foreign_owner() {
 }
 
 #[test]
-fn change_without_net_writes() {
+fn local_change_writes() {
     let stored = link();
     let mut operation =
         ApplyChangeOperation::new(local_scope(), stored.clone(), LinkChange::Delete);
@@ -159,6 +162,10 @@ fn missing_config_fails() {
             crate::jobs::repository::test_support::realm()
         ))))
     );
-    let answer = child::<RealmConfigDocument, GetConfigError>(Err(GetConfigError::DocumentNotFound));
-    assert!(matches!(operation.next(answer), Err(LinkError::Unexpected(_))));
+    let answer =
+        child::<RealmConfigDocument, GetConfigError>(Err(GetConfigError::DocumentNotFound));
+    assert!(matches!(
+        operation.next(answer),
+        Err(LinkError::Unexpected(_))
+    ));
 }

@@ -127,7 +127,9 @@ fn prepare_saves_base() {
         operation.next(base),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    let done = operation.next(child::<(), JobMutationError>(Ok(()))).unwrap();
+    let done = operation
+        .next(child::<(), JobMutationError>(Ok(())))
+        .unwrap();
     let Next::Done(prepared) = done else {
         panic!("the preparation goes on");
     };
@@ -136,7 +138,7 @@ fn prepare_saves_base() {
 }
 
 #[test]
-fn prepare_refuses_other_job() {
+fn prepare_refuses_replaced() {
     let mut other = link();
     other.active_job = Some(job_id(9));
     let mut operation = prepare(ExportCheckpoint::default());
@@ -179,7 +181,7 @@ fn link_row_answer(link: &RepositoryLink) -> IoResult {
 }
 
 #[test]
-fn settle_skips_other_job() {
+fn settle_skips_replaced() {
     let mut operation = settle(ExportEnd::Cancelled);
     operation.first().unwrap();
     assert_eq!(
@@ -228,7 +230,7 @@ fn cancelled_record_ends() {
 }
 
 #[test]
-fn open_end_records_nothing() {
+fn open_end_skipped() {
     let mut operation = settle(ExportEnd::Open);
     operation.first().unwrap();
     operation.next(link_row_answer(&running())).unwrap();
@@ -239,7 +241,7 @@ fn open_end_records_nothing() {
 }
 
 #[test]
-fn guard_passes_without_link() {
+fn unlinked_guard_passes() {
     let mut plain = destination();
     plain.link = None;
     let mut operation = GuardOperation::new(job_scope().job_id, link().document_id, &plain);
@@ -281,7 +283,7 @@ fn record() -> RepositoryRecord {
 }
 
 #[test]
-fn draft_goes_on_link() {
+fn draft_link() {
     let job = job_scope().job_id;
     let stored = link();
     let mut operation = RecordDraftOperation::new(
@@ -315,8 +317,11 @@ fn draft_goes_on_link() {
 }
 
 #[test]
-fn creator_uses_served_realm() {
+fn creator_serving_realm() {
     let auth = creator_auth(&scope(), &link());
     assert_eq!(auth.user_id, link().created_by);
-    assert_eq!(auth.realm_id, crate::jobs::repository::test_support::realm());
+    assert_eq!(
+        auth.realm_id,
+        crate::jobs::repository::test_support::realm()
+    );
 }

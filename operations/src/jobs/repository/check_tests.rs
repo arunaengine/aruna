@@ -53,7 +53,7 @@ fn operation(format: bool, compression: ArchiveCompression) -> CheckContentOpera
 }
 
 #[test]
-fn sizes_need_no_read() {
+fn sizes_skip_reads() {
     let Ok(Next::Done(findings)) = operation(false, ArchiveCompression::Stored).first() else {
         panic!("a size rule reads no bytes");
     };
@@ -78,7 +78,7 @@ fn format_reads_prefix() {
 }
 
 #[test]
-fn compressed_entry_is_refused() {
+fn compressed_entry_refused() {
     let mut check = operation(true, ArchiveCompression::Deflate);
     assert!(matches!(check.first(), Err(TransferError::Permanent(_))));
 }
@@ -95,7 +95,7 @@ fn failed_read_retries() {
 }
 
 #[test]
-fn invalid_crate_is_permanent() {
+fn invalid_crate_permanent() {
     let check = CrateCheck::new(
         RepositoryConnectorKind::Invenio,
         "https://zenodo.org/api/",

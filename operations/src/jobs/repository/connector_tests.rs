@@ -75,9 +75,12 @@ fn view_maps_failures() {
 }
 
 #[test]
-fn denied_access_is_final() {
+fn denied_access_final() {
     let mut operation = ConnectOperation::new(request(None));
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let denied = child::<(), AccessError>(Err(AccessError::Denied("no".into())));
     assert_eq!(
         operation.next(denied),
@@ -97,7 +100,7 @@ fn unavailable_access_retries() {
 }
 
 #[test]
-fn other_kind_is_refused() {
+fn other_kind_refused() {
     let mut operation = ConnectOperation::new(request(None));
     past_access(&mut operation);
     let answer = child::<_, TransferError>(Ok(view(RepositoryConnectorKind::OaiPmh, false)));
@@ -162,7 +165,7 @@ fn credential_needs_key() {
 }
 
 #[test]
-fn stored_secret_is_read() {
+fn stored_secret_read() {
     let mut operation = ConnectOperation::new(request(None));
     past_access(&mut operation);
     let answer = child::<_, TransferError>(Ok(view(RepositoryConnectorKind::Invenio, true)));

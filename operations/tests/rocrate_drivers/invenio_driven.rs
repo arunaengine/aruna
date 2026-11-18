@@ -23,9 +23,7 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
-use aruna_operations::jobs::repository::{
-    NodeScope, RecordReference, TransferError, seal_token,
-};
+use aruna_operations::jobs::repository::{NodeScope, RecordReference, TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
 

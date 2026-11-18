@@ -51,7 +51,7 @@ fn lineage(draft_id: Option<&str>, target: LinkTarget) -> CheckLineageOperation 
 }
 
 #[test]
-fn lineage_needs_links_support() {
+fn lineage_needs_support() {
     let mut operation = lineage(None, target());
     operation.kind = RepositoryConnectorKind::OaiPmh;
     assert_eq!(operation.first(), Err(not_supported("links")));
@@ -60,12 +60,15 @@ fn lineage_needs_links_support() {
 #[test]
 fn no_anchor_passes() {
     let mut operation = lineage(None, target());
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(operation.next(connected()), Ok(Next::Done(None)));
 }
 
 #[test]
-fn edited_draft_is_change() {
+fn edited_draft_change() {
     let mut pinned = target();
     pinned.revision_id = Some(3);
     let mut operation = lineage(Some("7"), pinned);
@@ -75,11 +78,14 @@ fn edited_draft_is_change() {
         operation.next(connected()),
         Ok(Next::Call(session().get(url)))
     );
-    assert_eq!(operation.next(body(json!({"revision_id": 4}))), Err(changed()));
+    assert_eq!(
+        operation.next(body(json!({"revision_id": 4}))),
+        Err(changed())
+    );
 }
 
 #[test]
-fn newer_version_is_change() {
+fn newer_version_change() {
     let mut pinned = target();
     pinned.published_id = Some("7".into());
     let mut operation = lineage(None, pinned);
@@ -104,7 +110,7 @@ fn parent_gives_latest() {
 }
 
 #[test]
-fn missing_parent_is_change() {
+fn missing_parent_change() {
     let mut pinned = target();
     pinned.parent_id = Some("6".into());
     let mut operation = lineage(None, pinned);
@@ -114,7 +120,7 @@ fn missing_parent_is_change() {
 }
 
 #[test]
-fn removed_token_is_permanent() {
+fn removed_token_permanent() {
     let mut operation = LinkSessionOperation::new(scope(), link());
     assert_eq!(
         operation.first(),
@@ -122,7 +128,9 @@ fn removed_token_is_permanent() {
     );
     assert_eq!(
         operation.next(IoResult::Values(vec![None])),
-        Err(TransferError::Permanent("the link token was removed".into()))
+        Err(TransferError::Permanent(
+            "the link token was removed".into()
+        ))
     );
 }
 
@@ -137,13 +145,13 @@ fn record(published: bool) -> Value {
 }
 
 #[test]
-fn no_draft_has_no_review() {
+fn draftless_review_empty() {
     let mut operation = ReviewStateOperation::new(scope(), link());
     assert_eq!(operation.first(), Ok(Next::Done(None)));
 }
 
 #[test]
-fn open_review_answers_nothing() {
+fn open_review_empty() {
     let mut operation = ReviewStateOperation::new(scope(), reviewed());
     operation.first().unwrap();
     operation.next(connected()).unwrap();
@@ -153,19 +161,21 @@ fn open_review_answers_nothing() {
 }
 
 #[test]
-fn accepted_review_reads_record() {
+fn accepted_review_published() {
     let mut operation = ReviewStateOperation::new(scope(), reviewed());
     operation.first().unwrap();
     operation.next(connected()).unwrap();
     let url = session().url(&["records", "7"]).unwrap();
-    assert_eq!(operation.next(refused(404)), Ok(Next::Call(session().get(url))));
+    assert_eq!(
+        operation.next(refused(404)),
+        Ok(Next::Call(session().get(url)))
+    );
     let files = session().url(&["records", "7", "files"]).unwrap();
     assert_eq!(
         operation.next(body(record(true))),
         Ok(Next::Call(session().get(files)))
     );
-    let Ok(Next::Done(Some(state))) =
-        operation.next(body(json!({"entries": [{"key": "a.txt"}]})))
+    let Ok(Next::Done(Some(state))) = operation.next(body(json!({"entries": [{"key": "a.txt"}]})))
     else {
         panic!("the review is decided");
     };
@@ -175,7 +185,7 @@ fn accepted_review_reads_record() {
 }
 
 #[test]
-fn vanished_draft_is_change() {
+fn vanished_draft_change() {
     let mut operation = ReviewStateOperation::new(scope(), reviewed());
     operation.first().unwrap();
     operation.next(connected()).unwrap();
@@ -184,7 +194,7 @@ fn vanished_draft_is_change() {
 }
 
 #[test]
-fn state_without_anchor_is_empty() {
+fn anchorless_state_empty() {
     let mut operation = RemoteStateOperation::new(scope(), link());
     operation.first().unwrap();
     assert_eq!(
@@ -199,7 +209,7 @@ fn state_without_anchor_is_empty() {
 }
 
 #[test]
-fn state_reads_draft_files() {
+fn state_reads_files() {
     let mut operation = RemoteStateOperation::new(scope(), reviewed());
     operation.first().unwrap();
     operation.next(connected()).unwrap();
@@ -236,11 +246,14 @@ fn after_connect() -> LatestVersionOperation {
 #[test]
 fn latest_needs_record() {
     let mut operation = LatestVersionOperation::new(scope(), link());
-    assert!(matches!(operation.first(), Err(TransferError::Permanent(_))));
+    assert!(matches!(
+        operation.first(),
+        Err(TransferError::Permanent(_))
+    ));
 }
 
 #[test]
-fn held_latest_is_found() {
+fn held_latest_found() {
     let mut operation = after_connect();
     let mut latest = record(true);
     latest["versions"] = json!({"is_latest": true});
@@ -255,7 +268,7 @@ fn held_latest_is_found() {
 }
 
 #[test]
-fn older_record_lists_versions() {
+fn older_record_lists() {
     let mut operation = after_connect();
     let listed = operation.next(body(record(true))).unwrap();
     assert!(matches!(listed, Next::Call(IoCall::Effect(_))));
@@ -271,7 +284,7 @@ fn older_record_lists_versions() {
 }
 
 #[test]
-fn withdrawn_record_is_refused() {
+fn withdrawn_record_refused() {
     let mut operation = after_connect();
     assert_eq!(
         operation.next(refused(410)),

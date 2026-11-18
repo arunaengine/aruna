@@ -36,13 +36,14 @@ fn no_record() -> IoResult {
 fn registry_answer() -> IoResult {
     crate::jobs::repository::test_support::event(Event::Storage(StorageEvent::ReadResult {
         key: ByteView::from(Vec::new()),
-        value: Some(ByteView::from(postcard::to_allocvec(&registry_record()).unwrap())),
+        value: Some(ByteView::from(
+            postcard::to_allocvec(&registry_record()).unwrap(),
+        )),
     }))
 }
 
 fn check() -> CheckLinkOperation {
-    let mut operation =
-        CheckLinkOperation::new(local_scope(), link().link_id, entry(1), queued(1));
+    let mut operation = CheckLinkOperation::new(local_scope(), link().link_id, entry(1), queued(1));
     operation.stamp(NOW_MS);
     operation
 }
@@ -63,7 +64,7 @@ fn checked_holder(stored: &RepositoryLink) -> CheckLinkOperation {
 }
 
 #[test]
-fn gone_document_queues_links() {
+fn deleted_document_queues() {
     let mut operation = QueueRowsOperation::new([link().document_id]);
     operation.stamp(NOW_MS);
     assert_eq!(
@@ -89,7 +90,7 @@ fn gone_document_queues_links() {
 }
 
 #[test]
-fn no_links_queue_nothing() {
+fn linkless_document_skipped() {
     let mut operation = QueueRowsOperation::new([link().document_id]);
     operation.first().unwrap();
     let answer = child::<Vec<RepositoryLink>, LinkError>(Ok(Vec::new()));
@@ -121,7 +122,7 @@ fn drain_removes_malformed() {
 }
 
 #[test]
-fn drain_waits_for_later() {
+fn drain_waits_later() {
     let mut operation = drain();
     let due = NOW_MS + 5_000;
     let answer = queue_page(vec![(id_key(link().link_id), queued(due))]);
@@ -132,7 +133,7 @@ fn drain_waits_for_later() {
 }
 
 #[test]
-fn drain_moves_failed_check() {
+fn drain_moves_failure() {
     let mut operation = drain();
     let value = queued(1);
     let answer = queue_page(vec![(id_key(link().link_id), value.clone())]);
@@ -151,9 +152,8 @@ fn drain_moves_failed_check() {
             Some(retry_at)
         )))
     );
-    let conflict = child::<(), LinkError>(Err(LinkError::Storage(
-        StorageError::TransactionConflict,
-    )));
+    let conflict =
+        child::<(), LinkError>(Err(LinkError::Storage(StorageError::TransactionConflict)));
     assert_eq!(
         operation.next(conflict),
         Ok(Next::Done(Some(Duration::from_millis(ERROR_RETRY_MS))))
@@ -161,7 +161,7 @@ fn drain_moves_failed_check() {
 }
 
 #[test]
-fn missing_link_drops_check() {
+fn missing_link_dropped() {
     let mut operation = check();
     let row = link_row(link().document_id, link().link_id);
     assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
@@ -169,11 +169,14 @@ fn missing_link_drops_check() {
         operation.next(IoResult::Values(vec![None])),
         Ok(Next::Call(drop_call()))
     );
-    assert_eq!(operation.next(child::<(), LinkError>(Ok(()))), Ok(Next::Done(None)));
+    assert_eq!(
+        operation.next(child::<(), LinkError>(Ok(()))),
+        Ok(Next::Done(None))
+    );
 }
 
 #[test]
-fn deleted_dataset_removes_link() {
+fn deleted_dataset_unlinks() {
     let mut operation = check();
     operation.first().unwrap();
     operation
@@ -192,7 +195,7 @@ fn deleted_dataset_removes_link() {
 }
 
 #[test]
-fn lost_holder_drops_check() {
+fn lost_holder_dropped() {
     let mut operation = checked_holder(&link());
     let refused = child::<(), LinkError>(Err(LinkError::NotHolder));
     assert_eq!(operation.next(refused), Ok(Next::Call(drop_call())));
@@ -217,7 +220,7 @@ fn running_push_waits() {
 }
 
 #[test]
-fn unchanged_revision_drops_check() {
+fn unchanged_revision_dropped() {
     let event_id = Ulid::from_bytes([8; 16]);
     let mut stored = link();
     stored.last_push = Some(LinkPush {
@@ -243,7 +246,7 @@ fn unchanged_revision_drops_check() {
 }
 
 #[test]
-fn job_limit_retries_push() {
+fn limited_push_retries() {
     let stored = link();
     let mut operation = checked_holder(&stored);
     operation.next(child::<(), LinkError>(Ok(()))).unwrap();
@@ -294,9 +297,12 @@ fn stale(record: Option<JobRecord>) -> SettleStaleOperation {
 }
 
 #[test]
-fn missing_job_fails_push() {
+fn missing_job_fails() {
     let mut operation = stale(None);
-    assert_eq!(operation.first(), Ok(Next::Call(read_checkpoint(job_id(4)))));
+    assert_eq!(
+        operation.first(),
+        Ok(Next::Call(read_checkpoint(job_id(4))))
+    );
     let change = LinkChange::Finish {
         job_id: job_id(4),
         outcome: Box::new(PushOutcome::Failed(LinkFailure::Other(
@@ -317,7 +323,7 @@ fn missing_job_fails_push() {
 }
 
 #[test]
-fn settled_review_is_kept() {
+fn settled_review_kept() {
     let mut operation = RefreshReviewOperation::new(local_scope(), link());
     assert_eq!(operation.first(), Ok(Next::Done(link())));
 }
@@ -329,7 +335,7 @@ fn in_review() -> RepositoryLink {
 }
 
 #[test]
-fn open_review_keeps_link() {
+fn open_review_kept() {
     let mut operation = RefreshReviewOperation::new(local_scope(), in_review());
     assert_eq!(
         operation.first(),
@@ -343,7 +349,7 @@ fn open_review_keeps_link() {
 }
 
 #[test]
-fn refused_review_fails_link() {
+fn refused_review_fails() {
     let mut operation = RefreshReviewOperation::new(local_scope(), in_review());
     operation.first().unwrap();
     let refused = child::<Option<RemoteState>, TransferError>(Err(TransferError::Refused(
@@ -362,7 +368,7 @@ fn refused_review_fails_link() {
 }
 
 #[test]
-fn push_submits_then_begins() {
+fn push_submits_begins() {
     let event_id = Ulid::from_bytes([8; 16]);
     let mut operation = StartPushOperation::new(local_scope(), link(), event_id, true);
     assert_eq!(
@@ -391,13 +397,12 @@ fn push_submits_then_begins() {
 }
 
 #[test]
-fn failed_link_checks_lineage() {
+fn failed_link_lineage() {
     let mut failed = link();
     failed.status = LinkStatus::Failed {
         reason: LinkFailure::RemoteChanged,
     };
-    let mut operation =
-        StartPushOperation::new(local_scope(), failed.clone(), Ulid::nil(), false);
+    let mut operation = StartPushOperation::new(local_scope(), failed.clone(), Ulid::nil(), false);
     operation.first().unwrap();
     assert_eq!(
         operation.next(child::<(), LinkError>(Ok(()))),
@@ -408,7 +413,7 @@ fn failed_link_checks_lineage() {
 }
 
 #[test]
-fn job_limit_stays_apart() {
+fn job_limit_separate() {
     assert_eq!(
         submit_failure(SubmitJobError::ActiveJobLimit { limit: 3 }),
         LinkError::JobLimit(3)
@@ -428,7 +433,7 @@ fn unknown_placement_holds() {
 }
 
 #[test]
-fn lost_dataset_fails_link() {
+fn lost_dataset_fails() {
     let mut operation = EnsureHolderOperation::new(local_scope(), link());
     operation.stamp(NOW_MS);
     operation.first().unwrap();
@@ -470,13 +475,13 @@ fn scaffold_uses_registry() {
 }
 
 #[test]
-fn foreign_iri_queues_nothing() {
+fn foreign_iri_ignored() {
     let mut operation = QueueDeletedOperation::new(scope(), "urn:other".into());
     assert_eq!(operation.first(), Ok(Next::Done(())));
 }
 
 #[test]
-fn deleted_document_arms_timer() {
+fn deletion_arms_timer() {
     let document = link().document_id;
     let iri = MetadataRegistryRecord::graph_iri_for(document);
     let mut operation = QueueDeletedOperation::new(scope(), iri);
@@ -495,7 +500,10 @@ fn deleted_document_arms_timer() {
         operation.next(IoResult::Done),
         Ok(Next::Call(IoCall::child(LinkTimerOperation::new())))
     );
-    assert_eq!(operation.next(child::<(), LinkError>(Ok(()))), Ok(Next::Done(())));
+    assert_eq!(
+        operation.next(child::<(), LinkError>(Ok(()))),
+        Ok(Next::Done(()))
+    );
 }
 
 #[test]
@@ -517,7 +525,7 @@ fn timer_arms_earliest() {
 }
 
 #[test]
-fn empty_queue_arms_nothing() {
+fn empty_queue_idle() {
     let mut operation = LinkTimerOperation::new();
     operation.first().unwrap();
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
@@ -573,7 +581,8 @@ async fn retry_keeps_newer() {
         first_at_ms,
         settle_only: false,
     };
-    let settle = |queued: &Value, retry_at| SettleCheckOperation::new(link_id, queued.clone(), retry_at);
+    let settle =
+        |queued: &Value, retry_at| SettleCheckOperation::new(link_id, queued.clone(), retry_at);
     let queued = queue_row(link_id, &entry(100, 90)).unwrap();
     write_row(&context, queued.clone()).await;
 

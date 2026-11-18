@@ -59,29 +59,27 @@ fn due_checks_lineage() {
 }
 
 #[test]
-fn automatic_pull_retries_limit() {
+fn limited_pull_retries() {
     let stored = pull_link(Some("2"), true);
     let mut operation = due(stored.clone());
     operation.first().unwrap();
     let start = operation.next(child::<_, LinkError>(Ok(Some(stored.clone()))));
-    if stored.auto_pulls() {
-        assert_eq!(
-            start,
-            Ok(Next::Call(IoCall::child(StartPullOperation::new(
-                local_scope(),
-                stored
-            ))))
-        );
-        let limited = child::<JobId, LinkError>(Err(LinkError::JobLimit(1)));
-        assert_eq!(
-            operation.next(limited),
-            Ok(Next::Done(Some(NOW_MS + ACTIVE_RETRY_MS)))
-        );
-    }
+    assert_eq!(
+        start,
+        Ok(Next::Call(IoCall::child(StartPullOperation::new(
+            local_scope(),
+            stored
+        ))))
+    );
+    let limited = child::<JobId, LinkError>(Err(LinkError::JobLimit(1)));
+    assert_eq!(
+        operation.next(limited),
+        Ok(Next::Done(Some(NOW_MS + ACTIVE_RETRY_MS)))
+    );
 }
 
 #[test]
-fn missing_pull_job_fails() {
+fn missing_pull_fails() {
     let mut stored = pull_link(None, false);
     stored.active_job = Some(job_id(3));
     let mut operation = due(stored.clone());
@@ -176,12 +174,12 @@ fn pull_needs_document() {
             read_document_registry(stored.document_id, None).into()
         ))
     );
-    let missing = crate::jobs::repository::test_support::event(
-        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+    let missing = crate::jobs::repository::test_support::event(aruna_core::events::Event::Storage(
+        aruna_core::events::StorageEvent::ReadResult {
             key: byteview::ByteView::from(Vec::new()),
             value: None,
-        }),
-    );
+        },
+    ));
     assert_eq!(operation.next(missing), Err(LinkError::NotHolder));
 }
 
@@ -211,7 +209,10 @@ fn replaced_pull_stops() {
     stored.status = LinkStatus::Paused;
     let mut operation = PullRunningOperation::new(job_id(1), stored.document_id, stored.link_id);
     operation.first().unwrap();
-    assert_eq!(operation.next(running(&stored)), Err(TransferError::Cancelled));
+    assert_eq!(
+        operation.next(running(&stored)),
+        Err(TransferError::Cancelled)
+    );
 }
 
 fn record() -> RepositoryRecord {
@@ -280,12 +281,12 @@ fn settle(
 }
 
 #[test]
-fn plain_import_settles_nothing() {
+fn plain_import_skipped() {
     assert_eq!(settle(None, None, None).first(), Ok(Next::Done(())));
 }
 
 #[test]
-fn kept_import_creates_link() {
+fn kept_import_links() {
     let keep = RepositoryPull::Keep {
         auto_update: true,
         owner_node_url: "https://node.example".into(),
@@ -300,7 +301,7 @@ fn kept_import_creates_link() {
 }
 
 #[test]
-fn unfinished_keep_does_nothing() {
+fn unfinished_keep_skipped() {
     let keep = RepositoryPull::Keep {
         auto_update: true,
         owner_node_url: "https://node.example".into(),
@@ -309,7 +310,7 @@ fn unfinished_keep_does_nothing() {
 }
 
 #[test]
-fn failed_update_finishes_link() {
+fn failed_update_finishes() {
     let mut stored = pull_link(None, false);
     stored.active_job = Some(job_id(1));
     let update = RepositoryPull::Update {
@@ -341,7 +342,7 @@ fn failed_update_finishes_link() {
 }
 
 #[test]
-fn replaced_update_is_left() {
+fn replaced_update_left() {
     let stored = pull_link(None, false);
     let update = RepositoryPull::Update {
         link_id: stored.link_id,

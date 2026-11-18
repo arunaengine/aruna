@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::driven::{seal_credential, search};
 use super::*;
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
-use super::driven::{seal_credential, search};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 
 #[tokio::test]
@@ -218,9 +218,9 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::change_link;
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
     use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
-    use super::driven::change_link;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -408,9 +408,9 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::change_link;
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
     use aruna_core::repository::{LinkPatch, LinkReview};
-    use super::driven::change_link;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -728,11 +728,11 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::drain_links;
+    use super::driven::{change_link, list_links};
     use aruna_core::repository::invenio::crate_versions;
     use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
-    use super::driven::drain_links;
-    use super::driven::{change_link, list_links};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
