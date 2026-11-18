@@ -27,7 +27,7 @@ use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
 /// Entries of one object listing page.
-pub const OBJECT_PAGE: usize = 100;
+pub(crate) const OBJECT_PAGE: usize = 100;
 
 /// A host call that ended without a reply; `changed` says the run called differently than an
 /// earlier attempt, so the run fails as changed.

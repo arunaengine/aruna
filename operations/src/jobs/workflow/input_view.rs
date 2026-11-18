@@ -36,7 +36,7 @@ use crate::s3::object::get::{
 };
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::granted_read::GrantedReadOperation;
-use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION, SignedGrant};
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;

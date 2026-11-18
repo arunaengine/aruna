@@ -23,7 +23,7 @@ use super::walk::{
 };
 use super::{PageFailure, StagingRun, checkpoint_key, committed};
 use crate::jobs::run_rows::SettledRowsOperation;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };

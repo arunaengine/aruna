@@ -99,7 +99,7 @@ pub struct CreateDocumentOperation {
     /// finds a concurrent identical create.
     conflict_recheck: bool,
     stage: CreateStage,
-    pub route_profile_status: Option<ProfileValidationStatus>,
+    pub(crate) route_profile_status: Option<ProfileValidationStatus>,
     /// The author's commit message for the ARC snapshot of this create.
     message: Option<String>,
     /// The phase-time and identity source. Production uses the default source;
@@ -190,7 +190,10 @@ impl CreateDocumentOperation {
     /// built. Production never calls this; tests call the same implementation
     /// with fixed samplers.
     #[cfg(test)]
-    pub fn with_phase_source(mut self, phase_source: crate::metadata::MetadataPhaseSource) -> Self {
+    pub(crate) fn with_phase_source(
+        mut self,
+        phase_source: crate::metadata::MetadataPhaseSource,
+    ) -> Self {
         self.phase_source = phase_source;
         self
     }
@@ -204,7 +207,7 @@ impl CreateDocumentOperation {
     /// A create a non-holder forwarded here. The document's bucket is its blind
     /// hash rather than this node's pick, so every holder the forwarder may try
     /// stamps the same bucket.
-    pub fn new_forwarded(config: CreateDocumentConfig) -> Self {
+    pub(crate) fn new_forwarded(config: CreateDocumentConfig) -> Self {
         let mut operation = Self::new(config);
         operation.forwarded = true;
         operation
@@ -225,7 +228,7 @@ impl CreateDocumentOperation {
     }
 
     /// A pristine operation with the same inputs, for a conflict retry.
-    pub fn fresh_copy(&self) -> Self {
+    pub(crate) fn fresh_copy(&self) -> Self {
         Self {
             config: self.config.clone(),
             skip_existing_check: self.skip_existing_check,
@@ -238,7 +241,7 @@ impl CreateDocumentOperation {
         }
     }
 
-    pub fn create_event_payload(config: &CreateDocumentConfig) -> MetadataEventPayload {
+    pub(crate) fn create_event_payload(config: &CreateDocumentConfig) -> MetadataEventPayload {
         match &config.payload {
             CreateDocumentPayload::Scaffold {
                 name,

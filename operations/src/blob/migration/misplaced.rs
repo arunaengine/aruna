@@ -38,8 +38,6 @@ const COUNT_LIMIT: usize = 10_000;
 /// Version rows of the bucket one count passes over at most, under the prefix or not.
 const SCAN_LIMIT: usize = 200_000;
 const COUNT_PAGE: usize = 256;
-/// Renames one count lists by name; `renamed` counts all of them.
-const RENAME_LIST: usize = 100;
 
 type Turn<T> = Result<Next<T>, MigrationError>;
 

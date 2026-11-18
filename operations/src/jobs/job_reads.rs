@@ -24,7 +24,7 @@ use ulid::Ulid;
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, RoutedJobStatus};
 use super::staging::{ReadCheckpointOperation, StagingStoreError};
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{read_crate_status, read_job_record, read_key_waits};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;

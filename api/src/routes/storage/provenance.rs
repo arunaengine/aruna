@@ -6,7 +6,7 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
-use aruna_operations::driver::drive_until;
+use aruna_operations::driver::{drive, drive_until};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -29,7 +29,7 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
-use aruna_operations::s3::bucket::release::publish::read_crate;
+use aruna_operations::s3::bucket::release::holder::ReadCrateOperation;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -547,8 +547,8 @@ async fn release_crate(
         realm_id,
         node_id,
     };
-    match read_crate(context.as_ref(), read).await {
-        Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
+    match drive(ReadCrateOperation::new(read), context.as_ref()).await {
+        Ok((found, _)) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
                 .map_err(|error| ServerError::InternalError(error.into()))
         }

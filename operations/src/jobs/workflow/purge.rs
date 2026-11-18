@@ -27,8 +27,8 @@ use aruna_core::types::Key;
 use ulid::Ulid;
 
 use super::super::executor::JobRunOutcome;
-use super::super::store::JobMutationError;
 use super::super::store::job_calls::{RenewOutcome, flush_progress, put_purge_checkpoint};
+use super::super::store::mutation_error::JobMutationError;
 use super::super::store::row_calls::read_purge_checkpoint;
 use super::storage_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};

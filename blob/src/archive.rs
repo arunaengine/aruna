@@ -828,11 +828,12 @@ pub fn open_zip() -> (ZipWork, ByteStream) {
     let (writer, reader) = tokio::io::duplex(ZIP_PIPE_BYTES);
     let sink: ZipSink = ZipFileWriter::with_tokio(writer);
     let stream = BackendStream::new(tokio_util::io::ReaderStream::new(reader));
-    (ZipWork(Box::new(sink)), stream)
+    (ZipWork::new(Box::new(sink)), stream)
 }
 
 fn sink_of(zip: ZipWork) -> Result<Box<ZipSink>, String> {
-    (zip.0.downcast::<ZipSink>()).map_err(|_| "the archive writer has another type".to_string())
+    (zip.into_inner().downcast::<ZipSink>())
+        .map_err(|_| "the archive writer has another type".to_string())
 }
 
 /// Writes one whole entry.
@@ -850,7 +851,7 @@ pub async fn zip_whole(
         .write_entry_whole(zip_entry(path, modified_ms), bytes)
         .await;
     let result = written.map_err(|error| error.to_string());
-    (Some(ZipWork(sink)), result)
+    (Some(ZipWork::new(sink)), result)
 }
 
 /// Writes one entry from `stream` until it ends, `stop` completes or a side fails, and answers
@@ -897,7 +898,7 @@ pub async fn zip_stream(
         Ok(*hasher.finalize().as_bytes())
     }
     .await;
-    (Some(ZipWork(sink)), result)
+    (Some(ZipWork::new(sink)), result)
 }
 
 /// Ends the archive and its stream.

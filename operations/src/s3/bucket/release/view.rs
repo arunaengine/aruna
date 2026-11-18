@@ -5,20 +5,20 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::ReleasePointer;
-use aruna_core::structs::storage::release::{
-    CrateBytes, CrateRead, CrateReadError, ReleaseEffect, ReleaseEvent,
-};
+use aruna_core::structs::storage::release::{CrateBytes, CrateRead, CrateReadError};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
+
+use super::access::LoadAccessOperation;
+use super::holder::ReadCrateOperation;
+use super::{Access, BucketScope, ReleaseError};
 
 /// The most entries one page lists.
 pub const MAX_PAGE: usize = 1000;
@@ -136,22 +136,12 @@ impl Operation for ReleaseViewOperation {
             realm_id: config.realm_id,
             node_id: config.node_id,
         };
-        let effect = ReleaseEffect::ReadCrate(Box::new(read));
-        let effect = Effect::Net(NetEffect::Release(Box::new(effect)));
-        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+        Ok(Next::Call(IoCall::child(ReadCrateOperation::new(read))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReleaseView>, ViewError> {
-        match result.event()? {
-            Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read))) => {
-                Ok(Next::Done(self.on_crate(read)?))
-            }
-            other => Err(IoError::Unexpected {
-                expected: "ReleaseEvent::CrateRead",
-                got: other.label(),
-            }
-            .into()),
-        }
+        let read = result.child::<(CrateBytes, u64), CrateReadError>()?;
+        Ok(Next::Done(self.on_crate(read.map(|(found, _)| found))?))
     }
 }
 
@@ -213,6 +203,70 @@ fn page(files: Vec<PinnedFile>, page: &FilePage) -> (Vec<PinnedFile>, Vec<String
         }
     }
     (listed, folders, None)
+}
+
+#[derive(Debug, PartialEq)]
+enum CheckedStep {
+    Access,
+    View,
+}
+
+/// Lists one page of a release's files after checking the caller may read its crate.
+#[derive(Debug, PartialEq)]
+pub struct CheckedViewOperation {
+    load: Option<LoadAccessOperation>,
+    config: Option<ViewConfig>,
+    step: CheckedStep,
+}
+
+impl CheckedViewOperation {
+    pub fn new(
+        scope: BucketScope<'_>,
+        auth: &AuthContext,
+        (key, version_id): (&str, Ulid),
+        page: FilePage,
+    ) -> Self {
+        Self {
+            load: Some(LoadAccessOperation::new(scope, auth)),
+            config: Some(ViewConfig {
+                realm_id: scope.realm_id,
+                node_id: scope.node_id,
+                bucket: scope.bucket.to_string(),
+                info: scope.info.clone(),
+                auth: auth.clone(),
+                key: key.to_string(),
+                version_id,
+                page,
+            }),
+            step: CheckedStep::Access,
+        }
+    }
+}
+
+impl Operation for CheckedViewOperation {
+    type Output = ReleaseView;
+    type Error = ViewError;
+
+    fn first(&mut self) -> Result<Next<ReleaseView>, ViewError> {
+        let load = self.load.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ReleaseView>, ViewError> {
+        match self.step {
+            CheckedStep::Access => {
+                let access = (result.child::<Access, ReleaseError>()?)
+                    .map_err(|error| ViewError::Unavailable(error.to_string()))?;
+                let config = self.config.take().ok_or(IoError::Unfinished)?;
+                if !access.0.allows(Some(&config.key), &Permission::READ) {
+                    return Err(ViewError::Forbidden);
+                }
+                self.step = CheckedStep::View;
+                Ok(Next::Call(IoCall::child(ReleaseViewOperation::new(config))))
+            }
+            CheckedStep::View => Ok(Next::Done(result.child::<ReleaseView, ViewError>()??)),
+        }
+    }
 }
 
 #[cfg(test)]

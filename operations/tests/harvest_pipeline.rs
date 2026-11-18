@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::blob_node::{seed_config, write_value};
+use crate::metadata_calls::route_metadata_delete;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -34,14 +35,14 @@ use aruna_operations::harvest::repository::{
     connector_writes, parse_provenance_read, parse_source_read, read_provenance_effect,
     read_source_effect, write_source_effect,
 };
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use crate::metadata_calls::route_metadata_delete;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;
@@ -459,10 +460,12 @@ async fn restore_config(fixture: &Fixture, saved: Vec<u8>) -> Result<(), BoxErro
 }
 
 async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, BoxError> {
-    Ok(drive(DocumentRecordOperation::new(document_id), &fixture.context)
-        .await
-        .map_err(|error| format!("{error:?}"))?
-        .is_some())
+    Ok(
+        drive(DocumentRecordOperation::new(document_id), &fixture.context)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .is_some(),
+    )
 }
 
 /// Withdraw the document the way an owner would, straight through the metadata

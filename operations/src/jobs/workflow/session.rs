@@ -29,8 +29,8 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::session::SessionOperation;
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::put_job_entry;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 
 /// What a session's start needs to know beyond the job itself.

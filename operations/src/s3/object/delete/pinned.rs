@@ -5,14 +5,11 @@
 
 // Every release counts, also one the caller cannot read, so a refusal names none.
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::release_marker;
 use aruna_core::structs::storage::release::{MembershipQuery, ValidRelease};
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
@@ -26,7 +23,8 @@ use crate::s3::bucket::release::view::{
     FilePage, ReleaseView, ReleaseViewOperation, ViewConfig, ViewError,
 };
 use crate::s3::bucket::release::{
-    Access, BucketScope, MembersConfig, MembersOutput, ReleaseError, ReleaseMembersOperation,
+    Access, BucketScope, MembersConfig, MembersOutput, OwnedScope, ReleaseError,
+    ReleaseMembersOperation,
 };
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -55,35 +53,6 @@ fn unchecked(error: impl std::fmt::Display) -> PinnedError {
     PinnedError::Unchecked(error.to_string())
 }
 
-/// Where the bucket lives, kept by the checks that run after their caller's borrow.
-#[derive(Clone, Debug, PartialEq)]
-struct PinPlace {
-    realm_id: RealmId,
-    node_id: NodeId,
-    bucket: String,
-    info: BucketInfo,
-}
-
-impl PinPlace {
-    fn of(scope: BucketScope<'_>) -> Self {
-        Self {
-            realm_id: scope.realm_id,
-            node_id: scope.node_id,
-            bucket: scope.bucket.to_string(),
-            info: scope.info.clone(),
-        }
-    }
-
-    fn scope(&self) -> BucketScope<'_> {
-        BucketScope {
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            bucket: &self.bucket,
-            info: &self.info,
-        }
-    }
-}
-
 /// Whether a release pins each queried version, in query order. An answer that may miss a
 /// release refuses, since the deletion could break it.
 pub fn pinned(
@@ -104,7 +73,7 @@ pub fn pinned(
 /// distributed bucket deletes no single versions, so only this node's releases count.
 #[derive(Debug, PartialEq)]
 struct RetainedReleases {
-    place: PinPlace,
+    place: OwnedScope,
     auth: AuthContext,
     queries: Vec<MembershipQuery>,
     loaded: bool,
@@ -153,7 +122,7 @@ type PinsOutput = (Vec<bool>, ReleaseGuards);
 /// bucket's release marker is read before its releases.
 #[derive(Debug, PartialEq)]
 pub struct VersionPinsOperation {
-    place: PinPlace,
+    place: OwnedScope,
     auth: AuthContext,
     queries: Vec<MembershipQuery>,
     guards: Option<ReleaseGuards>,
@@ -162,7 +131,7 @@ pub struct VersionPinsOperation {
 impl VersionPinsOperation {
     pub fn new(scope: BucketScope<'_>, auth: &AuthContext, queries: Vec<MembershipQuery>) -> Self {
         Self {
-            place: PinPlace::of(scope),
+            place: OwnedScope::of(scope),
             auth: auth.clone(),
             queries,
             guards: None,
@@ -267,7 +236,7 @@ type ScopeTurn = Result<Next<()>, PinnedError>;
 /// Refuses a file, prefix or bucket purge while a release pins a version in it.
 #[derive(Debug, PartialEq)]
 pub struct RefuseScopeOperation {
-    place: PinPlace,
+    place: OwnedScope,
     auth: AuthContext,
     purge: StoragePurgeScope,
     /// The releases still to look through, once they were listed.
@@ -277,7 +246,7 @@ pub struct RefuseScopeOperation {
 impl RefuseScopeOperation {
     pub fn new(scope: BucketScope<'_>, auth: &AuthContext, purge: &StoragePurgeScope) -> Self {
         Self {
-            place: PinPlace::of(scope),
+            place: OwnedScope::of(scope),
             auth: auth.clone(),
             purge: purge.clone(),
             releases: None,

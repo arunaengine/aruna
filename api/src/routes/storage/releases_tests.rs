@@ -12,7 +12,8 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
-use aruna_operations::s3::object::origin::read_origin;
+use aruna_operations::driver::drive;
+use aruna_operations::s3::object::origin::ReadOriginOperation;
 
 use super::*;
 use crate::auth::RealmAuth;
@@ -182,8 +183,15 @@ async fn publish_needs_reads() {
             key: "db/release.json".to_string(),
             spec: release_spec(&request("https://doi.org/10.5281/zenodo.1")).unwrap(),
         };
-        let refused =
-            release_publish::publish_release(state.get_ctx().as_ref(), scope, input).await;
+        let refused = drive(
+            release_publish::PublishReleaseOperation::new(
+                scope,
+                input,
+                aruna_operations::driver::node_routing(state.get_ctx().as_ref()),
+            ),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         assert!(matches!(refused, Err(PublishError::Forbidden(why)) if why == reason));
     }
     assert!(list(&node).await.releases.is_empty());
@@ -210,9 +218,12 @@ async fn pins_one_version() {
     store(&node, "db/a.fasta", ">a22").await;
     let place = (node.state.get_realm_id(), node.state.get_node_id());
     let context = node.state.get_ctx();
-    let view = read_origin(context.as_ref(), place, BUCKET, "db/a.fasta", None)
-        .await
-        .unwrap();
+    let view = run_operation(
+        ReadOriginOperation::new(place.0, BUCKET, "db/a.fasta", None),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
     assert_eq!(view.size, Some(4), "the size is the current version's");
 }
 

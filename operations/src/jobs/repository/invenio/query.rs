@@ -6,6 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryQuery;
 use aruna_core::repository::invenio::validate_id;
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::normalize_doi;
@@ -299,7 +300,7 @@ mod tests {
     use crate::jobs::repository::invenio::Session;
     use crate::jobs::repository::push::creator_auth;
     use crate::jobs::repository::test_support::{body, child, link, scope};
-    use aruna_core::repository::remote::{InvenioAccess, NodeScope};
+    use aruna_core::repository::remote::InvenioAccess;
     use serde_json::json;
 
     fn session() -> Session {

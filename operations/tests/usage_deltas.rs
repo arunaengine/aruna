@@ -700,9 +700,12 @@ async fn uploads_count_records() {
     create_upload(&h, "bucket", "stale.bin", group_id).await;
     assert_eq!(uploads().await, 1);
     let later = aruna_core::time::unix_timestamp_millis() + 365 * 24 * 3_600_000;
-    aruna_operations::blob::cleanup::sweep_stale_uploads(&h.driver, later)
-        .await
-        .unwrap();
+    drive(
+        aruna_operations::blob::cleanup::SweepUploadsOperation::new(later),
+        &h.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(uploads().await, 0);
     assert_matches_rebuild(&h.driver).await;
 }

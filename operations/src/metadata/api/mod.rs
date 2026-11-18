@@ -51,7 +51,6 @@ use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
     effective_list_limit,
 };
-use self::list_types::{check_policy_limit, merge_pending_records};
 
 use self::path_types::select_fanout_nodes;
 use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
@@ -105,9 +104,9 @@ pub mod preflight;
 pub mod preflight_types;
 pub mod read;
 pub(crate) mod read_access;
-pub mod references;
 pub mod read_types;
 pub(crate) mod readable;
+pub mod references;
 pub mod search;
 pub mod search_types;
 pub(crate) mod title;

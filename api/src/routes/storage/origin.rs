@@ -17,6 +17,7 @@ use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved,
@@ -25,7 +26,9 @@ use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
-use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
+use aruna_operations::s3::object::origin::{
+    BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -54,7 +57,7 @@ use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::s3::bucket::release::read::release_members;
+use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
@@ -516,12 +519,14 @@ async fn origin_answer(
             }));
         }
     }
-    let view = read_origin(
+    let view = drive(
+        ReadOriginOperation::new(
+            state.get_realm_id(),
+            &bucket,
+            &params.key,
+            params.version_id,
+        ),
         state.get_ctx().as_ref(),
-        (state.get_realm_id(), state.get_node_id()),
-        &bucket,
-        &params.key,
-        params.version_id,
     )
     .await;
     // A copy may not have the version yet, so its miss goes on to the range's coordinator; a
@@ -580,7 +585,12 @@ async fn origin_answer(
         key: params.key.clone(),
         version_id,
     }];
-    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+    match drive(
+        MembersCheckOperation::new(scope, caller, &query),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(mut found) => {
             let members = found.answers.remove(0);
             answer.releases = members.releases.into_iter().map(Into::into).collect();
@@ -1001,8 +1011,10 @@ pub async fn get_bucket_runs(
     .await
     .map_err(|error| ServerError::InternalError(error.into()))?;
     // A file the caller may not read, as a listing hides it, names no run.
-    let read = |key: &str| access.allows(Some(key), &Permission::READ);
-    let found = bucket_runs(context.as_ref(), &bucket, &params.prefix, read)
+    let read = AccessRule::new(Arc::new(access), Permission::READ);
+    let runs = BucketRunsOperation::new(&bucket, &params.prefix, read)
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let found = drive(runs, &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let runs = found.run_ids.iter().map(|run_id| BucketRunBody {

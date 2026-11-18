@@ -3,10 +3,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_operations::driver::drive;
+use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, ExportMetadataResult};
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::plugins::calls::*;
+use aruna_operations::plugins::dataset::{
+    content_urls, dataset_change, dataset_crate, same_revision,
+};
+use aruna_operations::plugins::grants::{install_scope, parse_grants};
+use aruna_operations::plugins::install::{pick_version, read_manifest};
 use std::collections::BTreeMap;
 
 use super::*;

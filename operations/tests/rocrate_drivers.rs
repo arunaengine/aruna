@@ -14,6 +14,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use crate::job_calls::read_artifact_range;
+use crate::job_calls::{claim_job, release_job, transition_to_running};
+use crate::job_calls::{insert_job, list_job_entries};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -47,18 +49,17 @@ use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use crate::job_calls::{insert_job, list_job_entries};
-use aruna_operations::jobs::store::state::ClaimOutcome;
-use crate::job_calls::{claim_job, release_job, transition_to_running};
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::origin::read_origin;
+use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::tasks::job_context::JobContext;
 use aruna_operations::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -188,7 +189,11 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(result.failed, 0);
     // The import job wrote the file, not an upload by its owner.
     let place = (fixture.actor.realm_id, fixture.actor.node_id);
-    let origin = read_origin(&fixture.context, place, BUCKET, TARGET_KEY, None).await?;
+    let origin = drive(
+        ReadOriginOperation::new(place.0, BUCKET, TARGET_KEY, None),
+        &fixture.context,
+    )
+    .await?;
     assert_eq!(
         origin.origin,
         Some(VersionOrigin::Source {

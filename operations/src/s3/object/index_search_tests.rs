@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
@@ -15,11 +18,14 @@ use aruna_core::structs::storage::distribution::inventory::head_position;
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use tempfile::TempDir;
 
-use super::super::search_local_objects;
-use super::super::tests::{Fixture, input, seed_materialized, setup, write_value};
+use super::super::tests::{
+    Fixture, input, search_local_objects, seed_materialized, setup, write_value,
+};
 use super::*;
 use crate::distribution::test_record::{binding, record, store_record};
-use aruna_core::key_index::{IndexedKey, KeyChange, MetaTerms};
+use crate::driver::drive;
+use aruna_core::key_index::{IndexedKey, KeyChange};
+use aruna_storage::key_index::RangeIndexes;
 
 struct Distributed {
     fixture: Fixture,
@@ -32,6 +38,15 @@ struct Distributed {
 /// A bucket "spire" whose lower range (keys before "m") member 1 coordinates; `keys` get
 /// live heads and, in generation `state`, index documents.
 async fn distributed(state: IndexState, keys: &[&str]) -> Distributed {
+    distributed_with(state, keys, |path| RangeIndexes::new(path)).await
+}
+
+/// `distributed` with the range indexes `make` opens.
+async fn distributed_with(
+    state: IndexState,
+    keys: &[&str],
+    make: impl FnOnce(&Path) -> RangeIndexes,
+) -> Distributed {
     let fixture = setup().await;
     let (snapshot, bytes) = record(true);
     store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
@@ -57,7 +72,8 @@ async fn distributed(state: IndexState, keys: &[&str]) -> Distributed {
     .await;
     let lower = snapshot.config.ranges[0].range_id;
     let index_dir = tempfile::tempdir().unwrap();
-    let indexes = Arc::new(RangeIndexes::new(index_dir.path()));
+    let storage = &fixture.context.storage_handle;
+    let indexes = storage.install_range_indexes(make(index_dir.path()));
     let mut changes = Vec::new();
     for (seed, key) in keys.iter().enumerate() {
         seed_materialized(&fixture, "spire", key, UNIX_EPOCH, seed as u8 + 10).await;
@@ -101,12 +117,9 @@ fn owner(fixture: &Fixture) -> AuthContext {
 
 impl Distributed {
     async fn search(&self, input: SearchObjectsInput, budget: usize) -> SearchNodePage {
-        let search = RangeSearch {
-            binding: self.binding.clone(),
-            indexes: Some(self.indexes.clone()),
-            budget,
-        };
-        (search_ranges(&self.fixture.context, &input, search).await).unwrap()
+        let binding = self.binding.clone();
+        let search = RangeSearchOperation::new(input, binding, budget, true);
+        drive(search, &self.fixture.context).await.unwrap()
     }
 
     /// Marks the lower range's index as building, with every head up to `key` written.
@@ -464,16 +477,13 @@ async fn metadata_hits_authorized() {
 async fn metadata_prefixes_found() {
     let ready = IndexState::Ready { generation: 1 };
     let folders = [("a/", "SAMD00012345"), ("b/", "SAMN00000001"), ("c/", "sa")];
-    let mut test = distributed(ready, &[]).await;
-    let mut described = Vec::new();
-    for (key, organism) in folders {
-        described.push(describe(&test.fixture, key, organism).await);
-    }
     for (scan, bytes) in [(1_000_000, usize::MAX), (0, usize::MAX), (1_000_000, 0)] {
-        let dir = test._index_dir.path().join(format!("{scan}-{bytes}"));
-        let indexes = RangeIndexes::with_scan(dir, scan).with_range_bytes(bytes);
-        test.indexes = Arc::new(indexes);
-        let changes = described.clone();
+        let make = |path: &Path| RangeIndexes::with_scan(path, scan).with_range_bytes(bytes);
+        let test = distributed_with(ready.clone(), &[], make).await;
+        let mut changes = Vec::new();
+        for (key, organism) in folders {
+            changes.push(describe(&test.fixture, key, organism).await);
+        }
         let set_id = test.binding.set_id;
         (test.indexes.apply(set_id, test.lower, 1, changes))
             .await
@@ -498,7 +508,7 @@ async fn names_skipped_bucket() {
     let mut input = test.input(owner(&test.fixture), "needle");
     input.bucket = None;
 
-    let page = crate::s3::object::search_scan::search_local_objects(&test.fixture.context, input)
+    let page = search_local_objects(&test.fixture.context, input)
         .await
         .unwrap();
 
@@ -539,4 +549,43 @@ fn layout_tracks_coordinators() {
     assert_eq!(layout_digest(&ranges), layout_digest(&ranges.clone()));
     assert_ne!(layout_digest(&ranges), layout_digest(&moved));
     assert_eq!(layout_digest(&ranges), layout_digest(&replicated));
+}
+
+fn step_input() -> SearchObjectsInput {
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+    SearchObjectsInput {
+        auth: AuthContext::anonymous(realm_id),
+        realm_id,
+        node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        query: "needle".to_string(),
+        key_match: ObjectKeyMatch::Substring,
+        bucket: Some("spire".to_string()),
+        limit: 10,
+        start_after: None,
+        as_of: UNIX_EPOCH,
+    }
+}
+
+#[test]
+fn missing_record_uncovers() {
+    let (snapshot, _) = record(true);
+    let mut search =
+        RangeSearchOperation::new(step_input(), binding(&snapshot, 1, 5), EXAMINE_BUDGET, true);
+    search.first().unwrap();
+    let absent: Result<Option<DistributionView>, RecordError> = Ok(None);
+    let outcome = aruna_core::calls::ChildOutcome::new(absent);
+    let Ok(Next::Done(found)) = search.next(IoResult::Child(outcome)) else {
+        panic!("a missing record ends the search");
+    };
+    assert_eq!(found.incomplete_ranges, 1);
+    assert!(found.hits.is_empty());
+}
+
+#[test]
+fn absent_heads_skipped() {
+    let keys = ["a".to_string()];
+    let mut resolve = ResolveKeysOperation::new(&step_input(), "spire", &keys);
+    assert!(matches!(resolve.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let answer = resolve.next(IoResult::Values(vec![None]));
+    assert_eq!(answer, Ok(Next::Done(Vec::new())));
 }

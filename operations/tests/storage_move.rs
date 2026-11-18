@@ -17,8 +17,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
 use aruna_net::NetHandle;
-use aruna_operations::blob::migration::misplaced::count_misplaced;
-use aruna_operations::driver::drive;
+use aruna_operations::blob::migration::misplaced::CountMisplacedOperation;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
@@ -108,9 +108,12 @@ async fn moves_bucket_copies() {
         .location_key()
         .unwrap();
     route_cold(&context, "data/").await;
-    let counted = count_misplaced(&context.driver, BUCKET, "", None)
-        .await
-        .unwrap();
+    let counted = drive(
+        CountMisplacedOperation::new(node_routing(&context.driver), BUCKET, ""),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!((counted.count, counted.complete), (261, true));
 
     let start = StartMoveOperation::new(BUCKET.to_string(), context.group_id, "data/".into(), 1);
@@ -138,9 +141,12 @@ async fn moves_bucket_copies() {
         let small = version(&context, key, *version_id).await;
         assert_eq!(content(&context, &small).await, key.as_bytes());
     }
-    let counted = count_misplaced(&context.driver, BUCKET, "", None)
-        .await
-        .unwrap();
+    let counted = drive(
+        CountMisplacedOperation::new(node_routing(&context.driver), BUCKET, ""),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(counted.count, 0);
 }
 
@@ -167,7 +173,7 @@ async fn settles_gone_versions() {
     use aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::blob::VersionKey;
-    use aruna_operations::blob::migration::drain::settle_move;
+    use aruna_operations::blob::migration::drain::SettleMoveOperation;
     let context = setup_context().await;
     let id = Ulid::generate();
     let intent = WriteIntent {
@@ -192,9 +198,16 @@ async fn settles_gone_versions() {
         .await;
     let version = VersionKey::new(BUCKET, "a.csv", id);
     assert!(
-        settle_move(&context.driver, &version, &[(key.clone(), intent)])
-            .await
-            .unwrap()
+        drive(
+            SettleMoveOperation::new(
+                node_routing(&context.driver),
+                &version,
+                vec![(key.clone(), intent)]
+            ),
+            &context.driver
+        )
+        .await
+        .unwrap()
     );
     assert!(read(&context, IMPORT_INTENT_KEYSPACE, key).await.is_none());
 }
@@ -206,7 +219,7 @@ async fn settles_missing_copies() {
     use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
-    use aruna_operations::blob::migration::drain::settle_move;
+    use aruna_operations::blob::migration::drain::SettleMoveOperation;
     let context = setup_context().await;
     let id = put(&context, "data/a.txt", b"lost research data").await;
     let stored = version(&context, "data/a.txt", id).await;
@@ -239,7 +252,15 @@ async fn settles_missing_copies() {
         .await;
     let moved = VersionKey::new(BUCKET, "data/a.txt", id);
 
-    let settled = settle_move(&context.driver, &moved, &[(row.clone(), intent)]).await;
+    let settled = drive(
+        SettleMoveOperation::new(
+            node_routing(&context.driver),
+            &moved,
+            vec![(row.clone(), intent)],
+        ),
+        &context.driver,
+    )
+    .await;
     assert!(settled.unwrap(), "a missing copy must settle its move");
     assert!(read(&context, IMPORT_INTENT_KEYSPACE, row).await.is_none());
     let broken = read(&context, BROKEN_VERSION_KEYSPACE, moved.to_bytes().unwrap()).await;

@@ -41,7 +41,7 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::origin::read_origin;
+use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offer::list::ListOffersOperation;
@@ -521,12 +521,9 @@ async fn records_pull_origin() -> TestResult<()> {
         .resolved_version_id
         .or(head.version_id)
         .ok_or("the head names its version")?;
-    let recorded = read_origin(
+    let recorded = drive(
+        ReadOriginOperation::new(realm.realm_id, REMOTE_BUCKET, "note.txt", Some(version_id)),
         &server.context,
-        (realm.realm_id, server.node_id()),
-        REMOTE_BUCKET,
-        "note.txt",
-        Some(version_id),
     )
     .await?;
     assert_eq!(

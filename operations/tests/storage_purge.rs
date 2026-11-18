@@ -46,8 +46,8 @@ use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive, node_routing};
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::state::ClaimOutcome;
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
@@ -56,7 +56,7 @@ use aruna_operations::s3::multipart::complete::{
 use aruna_operations::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, upload_part_copy};
+use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
 };
@@ -73,6 +73,7 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_operations::tasks::job_context::JobContext;
 use aruna_operations::tasks::job_host::run_storage_purge;
 use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
@@ -303,23 +304,26 @@ async fn scoped_fence_isolates() {
         )))
     ));
     assert!(matches!(
-        upload_part_copy(
-            &context.driver,
-            PartCopyInput {
-                source_bucket: "bucket".to_string(),
-                source_key: "source.txt".to_string(),
-                source_version_id: None,
-                source_group_id: context.group_id,
-                dest_bucket: upload.bucket.clone(),
-                dest_key: upload.key.clone(),
-                upload_id: upload.upload_id,
-                part_number: 2,
-                range: None,
-                user_id: context.user_id,
-                node_id: context.node_id,
-                source_auth_context: auth(&context),
-                conditions: CopySourceConditions::default(),
-            },
+        drive(
+            PartCopyOperation::new(
+                PartCopyInput {
+                    source_bucket: "bucket".to_string(),
+                    source_key: "source.txt".to_string(),
+                    source_version_id: None,
+                    source_group_id: context.group_id,
+                    dest_bucket: upload.bucket.clone(),
+                    dest_key: upload.key.clone(),
+                    upload_id: upload.upload_id,
+                    part_number: 2,
+                    range: None,
+                    user_id: context.user_id,
+                    node_id: context.node_id,
+                    source_auth_context: auth(&context),
+                    conditions: CopySourceConditions::default(),
+                },
+                None
+            ),
+            &context.driver
         )
         .await,
         Err(PartCopyError::UploadPart(UploadPartError::PurgeFence(
@@ -1122,9 +1126,17 @@ async fn cancelled_queue_releases() {
         backend.to_bytes().unwrap(),
     )
     .await;
-    let outcome = aruna_operations::blob::cleanup::process_cleanup_batch(&context.driver)
-        .await
-        .unwrap();
+    let outcome = drive(
+        aruna_operations::blob::cleanup::ProcessCleanupOperation::new(
+            aruna_operations::blob::cleanup::CleanupNode {
+                routing: aruna_operations::driver::node_routing(&context.driver),
+                has_blob: context.driver.blob_handle.is_some(),
+            },
+        ),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!((outcome.processed, outcome.dropped), (1, 0), "{outcome:?}");
     assert!(releases(storage).await.is_empty());
 }
@@ -1232,11 +1244,12 @@ async fn purge_releases_copies() {
     let location = seed_linked(&context, "linked/a.txt", version_id).await;
     let copy = seed_copy(&context, ("linked/a.txt", version_id), &location).await;
     let spec = files_spec(&context);
-    let readable = |_: &str| true;
-    let totals =
-        aruna_operations::blob::purge::scope_totals(&context.driver, &spec.scope, &readable)
-            .await
-            .unwrap();
+    let totals = aruna_operations::blob::purge::ScopeTotalsOperation::new(
+        aruna_operations::driver::node_routing(&context.driver),
+        &spec.scope,
+        aruna_operations::blob::migration::misplaced::AnyKey,
+    );
+    let totals = drive(totals, &context.driver).await.unwrap();
     assert_eq!((totals.storage_files, totals.storage_bytes), (2, 8));
     let job = claimed_job(
         context.driver.clone(),

@@ -10,11 +10,8 @@ use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
-use crate::forward::transport::RetryDisposition;
-use crate::forward::transport::retry_disposition;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;
@@ -240,18 +237,6 @@ fn unplaced_writes_local() {
     assert_eq!(
         write_route(None, &PlacementRef::NIL, node(1)),
         MetadataWriteRoute::Local
-    );
-}
-
-#[test]
-fn ambiguous_delivery_stops() {
-    assert_eq!(
-        retry_disposition(MetadataRequestDelivery::PossiblySent),
-        RetryDisposition::Stop
-    );
-    assert_eq!(
-        retry_disposition(MetadataRequestDelivery::DefinitelyNotSent),
-        RetryDisposition::TryNext
     );
 }
 

@@ -26,8 +26,8 @@ use super::session::{
     SessionInputs, SessionPlan, SessionPlanOperation, SessionReportOperation, session_call,
 };
 use crate::jobs::lifecycle::ids::session_of;
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::record_attempt_started;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 
 #[derive(Debug, PartialEq)]

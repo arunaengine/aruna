@@ -32,7 +32,7 @@ use crate::jobs::repository::{Action, TransferError, ensure_supported};
 use crate::jobs::run_rows::{
     SettledEntryOperation, SettledRowsOperation, job_state_key, state_row,
 };
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::jobs::submit_local::SubmitLocalOperation;
 use crate::metadata::profile::validation::{

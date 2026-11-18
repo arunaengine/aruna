@@ -833,10 +833,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "iroh",
  "lettre",
  "reqwest 0.13.5",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "ulid 3.0.0",
 ]
 

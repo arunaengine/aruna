@@ -31,11 +31,11 @@ use super::work::{
     install_at, summary_of, update_work, work_scan, work_state,
 };
 use super::work_calls::JobRow;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::records::pages::ServingNode;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
-use crate::jobs::records::pages::ServingNode;
 use crate::jobs::submit_local::{DedupJobOperation, MintJobOperation, QueueJobOperation};
 
 fn record_call(job: JobId) -> IoCall {
@@ -149,7 +149,7 @@ impl Operation for JobState {
 /// Records the job of a reserved work whose submission committed but whose answer was lost; the
 /// job is found by the work's dedup key. `None` while no job was submitted.
 #[derive(Debug, PartialEq)]
-pub struct ReconcileWork {
+pub(crate) struct ReconcileWork {
     install_id: Ulid,
     work_id: Ulid,
     account: UserId,
@@ -157,7 +157,7 @@ pub struct ReconcileWork {
 }
 
 impl ReconcileWork {
-    pub fn new(install_id: Ulid, row: &WorkRow) -> Self {
+    pub(crate) fn new(install_id: Ulid, row: &WorkRow) -> Self {
         Self {
             install_id,
             work_id: row.work_id,
@@ -569,7 +569,7 @@ enum StartPhase {
 /// so a repeated submission with the same payload answers the same job. The work's row stays
 /// reserved after any refusal, so the same call submits again later.
 #[derive(Debug, PartialEq)]
-pub struct StartWork {
+pub(crate) struct StartWork {
     scope: RunScope,
     request: Option<WorkRequest>,
     now_ms: u64,
@@ -579,7 +579,7 @@ pub struct StartWork {
 }
 
 impl StartWork {
-    pub fn new(
+    pub(crate) fn new(
         scope: &RunScope,
         request: WorkRequest,
         (now_ms, work_id): (u64, Ulid),

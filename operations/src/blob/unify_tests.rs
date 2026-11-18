@@ -25,6 +25,21 @@ use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::structs::storage::linked_job::LinkedTask;
 use std::time::SystemTime;
 
+async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<Vec<u8>>, String> {
+    let read = StorageEffect::Read {
+        key_space: space.to_string(),
+        key,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value,
+            ..
+        }) => Ok(value.map(|value| value.to_vec())),
+        other => Err(format!("could not read {space}: {}", other.label())),
+    }
+}
+
 fn file(path: &str, ulid: Ulid, hash: u8) -> BackendLocation {
     BackendLocation {
         backend: BackendRef::Group(rule().backend_id),

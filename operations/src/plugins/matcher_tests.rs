@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{SourceKind, journal_entries};
+use aruna_core::plugin_runs::SourceKind;
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
@@ -18,7 +18,7 @@ use crate::plugins::store::Txn;
 use crate::plugins::test_support::{created, installed, scoped, synced};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::journal_key;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::identity::realm::RealmNodeKind;
 
 pub(crate) async fn gap(
     fixture: &Fixture,

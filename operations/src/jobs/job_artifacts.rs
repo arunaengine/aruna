@@ -29,7 +29,7 @@ use super::job_routes::refused;
 use super::lifecycle::family_reads::FamilyResponderOperation;
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, JobRouteOperation};
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_artifact_tombstone;
 
 /// An export job's artifact as its owner describes it.

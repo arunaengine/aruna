@@ -74,7 +74,7 @@ pub enum WorkRequest {
 
 /// How a work request stands after its checks and its row.
 #[derive(Debug, PartialEq)]
-pub enum PreparedWork {
+pub(crate) enum PreparedWork {
     /// The row names a job already; the call answers its work id.
     Known(Ulid),
     /// The row is reserved; this job is to be submitted.
@@ -101,7 +101,7 @@ enum Step {
 /// Checks a work request step by step and reserves its row. It needs the grants of the request's
 /// kind; a paused install starts nothing, and every attempt checks the version it reads again.
 #[derive(Debug, PartialEq)]
-pub struct PrepareWork {
+pub(crate) struct PrepareWork {
     scope: RunScope,
     request: WorkRequest,
     now_ms: u64,
@@ -114,7 +114,11 @@ pub struct PrepareWork {
 }
 
 impl PrepareWork {
-    pub fn new(scope: &RunScope, request: WorkRequest, (now_ms, minted): (u64, Ulid)) -> Self {
+    pub(crate) fn new(
+        scope: &RunScope,
+        request: WorkRequest,
+        (now_ms, minted): (u64, Ulid),
+    ) -> Self {
         use Step::*;
         let steps: &[Step] = match request {
             WorkRequest::Copy(_) => &[

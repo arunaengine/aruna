@@ -38,7 +38,6 @@ use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::install_artifact;
 use aruna_operations::plugins::test_support::job_context;
 use aruna_operations::plugins::test_support::job_guest;
-use aruna_operations::plugins::test_support::path;
 use aruna_operations::plugins::test_support::queued;
 use aruna_operations::plugins::work::list_work;
 use aruna_operations::s3::object::put::PutObjectOperation;

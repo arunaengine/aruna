@@ -10,9 +10,10 @@ use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
-use aruna_operations::metadata::audit_entry::list_audit as gather_audit;
+use aruna_operations::metadata::audit_entry::{AuditListOperation, outbound_admission};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -211,27 +212,26 @@ pub async fn list_audit(
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
             .map_err(map_api_error)?
     };
-    let page = gather_audit(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        forward_token,
-        ListAuditRequest {
-            group_id,
-            document_id,
-            cursor: query.cursor,
-            limit: query.limit,
-            local_authorized: !user_origin,
-        },
-        deadline,
-    )
-    .await
-    .map_err(|error| match error {
-        ListAuditError::Unavailable => ServerError::ServiceUnavailable,
-        ListAuditError::Unauthorized => ServerError::Unauthorized,
-        ListAuditError::InvalidCursor => ServerError::BadRequest,
-        ListAuditError::Storage(message) => ServerError::InternalError(message.into()),
-    })?;
+    let request = ListAuditRequest {
+        group_id,
+        document_id,
+        cursor: query.cursor,
+        limit: query.limit,
+        local_authorized: !user_origin,
+    };
+    let _admission = outbound_admission().ok_or(ServerError::ServiceUnavailable)?;
+    let node = (state.get_realm_id(), state.get_node_id());
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let list = AuditListOperation::new(node, forward_token, request, wait);
+    let page = tokio::time::timeout_at(deadline, drive(list, ctx.as_ref()))
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)?
+        .map_err(|error| match error {
+            ListAuditError::Unavailable => ServerError::ServiceUnavailable,
+            ListAuditError::Unauthorized => ServerError::Unauthorized,
+            ListAuditError::InvalidCursor => ServerError::BadRequest,
+            ListAuditError::Storage(message) => ServerError::InternalError(message.into()),
+        })?;
 
     Ok((
         StatusCode::OK,

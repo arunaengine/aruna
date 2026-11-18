@@ -44,7 +44,7 @@ pub(super) static AUDIT_INBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
 pub(super) static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_OUTBOUND_LIMIT)));
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ListAuditRequest {
     pub group_id: GroupId,
     pub document_id: Option<Ulid>,
@@ -602,7 +602,7 @@ mod tests {
         Operation, StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;
-    use crate::metadata::audit_entry::{audit_member, authorize_admin, list_audit};
+    use crate::metadata::audit_entry::{admin_refusal, audit_member, outbound_admission};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
     use aruna_core::UserId;
@@ -938,8 +938,8 @@ mod tests {
         assert_eq!(result.missing_nodes, vec![node]);
     }
 
-    #[tokio::test]
-    async fn outbound_admission() {
+    #[test]
+    fn outbound_saturates() {
         let permits: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
             .map(|_| {
                 AUDIT_OUTBOUND_ADMISSION
@@ -948,35 +948,9 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let directory = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let result = list_audit(
-            &context,
-            RealmId([1u8; 32]),
-            node,
-            None,
-            ListAuditRequest {
-                group_id: Ulid::from_bytes([2u8; 16]),
-                document_id: None,
-                cursor: None,
-                limit: Some(10),
-                local_authorized: true,
-            },
-            tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS),
-        )
-        .await;
-        assert!(matches!(result, Err(ListAuditError::Unavailable)));
+        assert!(outbound_admission().is_none());
         drop(permits);
+        assert!(outbound_admission().is_some());
     }
 
     #[test]
@@ -1409,17 +1383,23 @@ mod tests {
             ));
         }
 
-        let result = authorize_admin(
-            &context,
-            AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            format!("/{realm_id}/g/{group_id}/admin"),
-        )
-        .await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let path = format!("/{realm_id}/g/{group_id}/admin");
+        let check = crate::auth::request_authorization::AuthorizeOperation::new(
+            realm_id,
+            &auth,
+            &path,
+            &aruna_core::structs::identity::auth::Permission::WRITE,
+            crate::auth::request_policy::PolicyRequestExtras::rest(),
+        );
+        let result = crate::driver::drive(check, &context)
+            .await
+            .map_err(admin_refusal);
         assert!(matches!(result, Err(MetadataReadError::Forbidden)));
     }
 

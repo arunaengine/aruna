@@ -28,7 +28,7 @@ use crate::jobs::blob_request::BlobRequest;
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::page_intents::{IntentReadError, PageIntentsOperation, PathIntents};
 use crate::jobs::run_rows::{ReadStateOperation, SettledRowsOperation, StateReadError};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 /// Longest time a run of skips goes without a persisted checkpoint.
 const SKIP_PERSIST_MS: u64 = 2_000;

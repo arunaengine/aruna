@@ -3,249 +3,523 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ops::Bound;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
+use std::time::{Duration, UNIX_EPOCH};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::key_index::{IndexEffect, IndexEvent, KeyPage, KeyQuery, MetaTerms};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::table::{query_terms, search_tokens};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
-use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
-use aruna_core::types::{GroupId, Key, TxnId};
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView, KeyRange};
+use aruna_core::types::Key;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use futures_util::future::join_all;
 use ulid::Ulid;
 
 use super::{
-    CHANGED_PAGE_CAP, Candidate, HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
-    SearchNodePage, SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits,
-    changed_until, finish_read, load_live, retain_matches, start_read,
+    BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, ObjectKeyMatch,
+    SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput, SearchTurn, WalkTurn,
 };
-use crate::auth::enforcement::PolicyEvaluator;
-use crate::distribution::feed_walks::state_key;
-use crate::distribution::feed_walks::RangeProgressOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::replication::members::ReadRecordOperation;
-use aruna_core::key_index::KeyPage;
-use aruna_core::key_index::KeyQuery;
-use aruna_core::key_index::MetaTerms;
-use aruna_storage::key_index::RangeIndexes;
+use crate::distribution::feed_walks::{
+    FeedError, IndexProgress, RangeProgressOperation, state_key,
+};
+use crate::replication::members::{ReadRecordOperation, RecordError};
+use std::collections::BTreeMap;
 
 /// Index candidates one node page examines at most, visible or not.
 pub(super) const EXAMINE_BUDGET: usize = 1_000;
 /// Range indexes one page queries at once.
 const RANGE_CONCURRENCY: usize = 4;
 
-pub(super) struct RangeSearch {
-    pub(super) binding: DistributionBinding,
-    pub(super) indexes: Option<Arc<RangeIndexes>>,
-    pub(super) budget: usize,
+/// A range's page of a search, and the key a building index covers through.
+type RangeFound = (KeyPage, Option<String>);
+
+#[derive(Debug, PartialEq)]
+enum RangeStep {
+    Record,
+    States(Vec<Ulid>, KeyQuery),
+    Search(Vec<(Ulid, Option<Option<String>>)>),
+    Through(Ulid, String),
+    ThroughCheck(Ulid, String, VecDeque<Candidate>, Option<Candidate>),
+    Keys,
+    Walk,
+    Progress,
 }
 
 /// One page of a distributed bucket. Ranges are read in key order and continue by key; a
 /// missing or building index is reported as incomplete, with its progress, and never replaced
 /// by a scan. A building index answers for the keys up to its cursor and is reported partial.
-pub(super) async fn search_ranges(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    search: RangeSearch,
-) -> Result<SearchNodePage, SearchObjectsError> {
-    let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
-    let record = drive(ReadRecordOperation::new(set_id), context).await;
-    let record = record.map_err(|error| SearchObjectsError::Storage(error.to_string()));
-    let Some(view) = record? else {
-        // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
-    };
-    let ranges = &view.head.snapshot.config.ranges;
-    let mut unready = Vec::new();
-    let mut page = range_page(context, input, search, ranges, &mut unready).await?;
-    page.layout = Some((set_id, layout_digest(ranges)));
-    page.partial_ranges = (unready.iter())
-        .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
-        .collect();
-    if indexes.is_some() && !unready.is_empty() {
-        let bucket = input.bucket.as_deref().unwrap_or_default();
-        // Progress is a hint, so a failed read leaves it out.
-        let progress = (drive(RangeProgressOperation::new(bucket), context).await).unwrap_or_default();
-        page.index_progress = (unready.into_iter())
-            .filter_map(|(range_id, _)| Some((range_id, *progress.get(&range_id)?)))
-            .collect();
-    }
-    Ok(page)
+#[derive(Debug, PartialEq)]
+pub(super) struct RangeSearchOperation {
+    input: SearchObjectsInput,
+    binding: DistributionBinding,
+    budget: usize,
+    indexed: bool,
+    bucket: String,
+    window: Option<(Bound<String>, Bound<String>)>,
+    layout: Option<[u8; 32]>,
+    chunks: VecDeque<Vec<Ulid>>,
+    found: VecDeque<(Ulid, Option<RangeFound>)>,
+    current: Option<KeyPage>,
+    walk: HitWalk,
+    unready: Vec<(Ulid, Option<Option<String>>)>,
+    certain: bool,
+    examined: usize,
+    incomplete: usize,
+    remote: usize,
+    done_page: Option<SearchNodePage>,
+    now_ms: u64,
+    step: RangeStep,
 }
 
-/// Whether the caller may read `key`, a building index's cursor.
-async fn readable(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    bucket: &str,
-    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
-    key: &str,
-) -> Result<bool, SearchObjectsError> {
-    for candidate in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
-        if authorize(context, input, evaluators, &candidate.hit).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+type RangeTurn = SearchTurn<SearchNodePage>;
 
-/// Adds each incomplete range to `unready`, a partial one with the cursor key it may show.
-async fn range_page(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    search: RangeSearch,
-    ranges: &[KeyRange],
-    unready: &mut Vec<(Ulid, Option<Option<String>>)>,
-) -> Result<SearchNodePage, SearchObjectsError> {
-    let bucket = input.bucket.clone().unwrap_or_default();
-    let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
-    let budget = search.budget.max(1);
-    let after = match input.start_after.as_deref() {
-        Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
-        None => None,
-    };
-    let (start, end) = window(input, after);
-    let mut local = Vec::new();
-    let mut remote = 0;
-    for range in ranges {
-        if !overlaps(range, &start, &end) {
-            continue;
-        }
-        match range.coordinator == search.binding.member_id {
-            true => local.push(range.range_id),
-            false => remote += 1,
+impl RangeSearchOperation {
+    pub(super) fn new(
+        input: SearchObjectsInput,
+        binding: DistributionBinding,
+        budget: usize,
+        indexed: bool,
+    ) -> Self {
+        Self {
+            bucket: input.bucket.clone().unwrap_or_default(),
+            input,
+            binding,
+            budget: budget.max(1),
+            indexed,
+            window: None,
+            layout: None,
+            chunks: VecDeque::new(),
+            found: VecDeque::new(),
+            current: None,
+            walk: HitWalk::default(),
+            unready: Vec::new(),
+            certain: true,
+            examined: 0,
+            incomplete: 0,
+            remote: 0,
+            done_page: None,
+            now_ms: 0,
+            step: RangeStep::Record,
         }
     }
 
-    let names = (input.key_match == ObjectKeyMatch::Substring).then(|| input.query.clone());
-    let meta = (input.key_match == ObjectKeyMatch::Metadata).then(|| {
-        let (text, exact) = query_terms(&input.query);
-        let text = search_tokens(&text).into_iter().collect();
-        MetaTerms {
-            text,
-            exact: exact.into_iter().collect(),
-        }
-    });
-    let mut evaluators = HashMap::new();
-    let mut visible = Vec::with_capacity(limit + 1);
-    let mut changed = Vec::new();
-    let mut certain = true;
-    let (mut examined, mut incomplete) = (0, 0);
-    for chunk in local.chunks(RANGE_CONCURRENCY) {
-        let query = KeyQuery {
-            start: start.clone(),
-            end: end.clone(),
-            names: names.clone(),
-            meta: meta.clone(),
-            limit: budget.saturating_sub(examined).max(1),
+    fn record_read(&mut self, view: DistributionView) -> RangeTurn {
+        let ranges = &view.head.snapshot.config.ranges;
+        self.layout = Some(layout_digest(ranges));
+        let after = match self.input.start_after.as_deref() {
+            Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
+            None => None,
         };
-        let found = search_chunk(context, &search, chunk, query).await?;
-        for (range_id, found) in chunk.iter().zip(found) {
-            let Some((found, through)) = found else {
-                unready.push((*range_id, None));
-                incomplete += 1;
+        let (start, end) = window(&self.input, after);
+        let mut local = Vec::new();
+        for range in ranges {
+            if !overlaps(range, &start, &end) {
+                continue;
+            }
+            match range.coordinator == self.binding.member_id {
+                true => local.push(range.range_id),
+                false => self.remote += 1,
+            }
+        }
+        self.chunks = local
+            .chunks(RANGE_CONCURRENCY)
+            .map(<[Ulid]>::to_vec)
+            .collect();
+        self.window = Some((start, end));
+        self.next_chunk()
+    }
+
+    fn query(&self) -> Result<KeyQuery, SearchObjectsError> {
+        let input = &self.input;
+        let (start, end) = self.window.clone().ok_or(SearchObjectsError::Unavailable)?;
+        let names = (input.key_match == ObjectKeyMatch::Substring).then(|| input.query.clone());
+        let meta = (input.key_match == ObjectKeyMatch::Metadata).then(|| {
+            let (text, exact) = query_terms(&input.query);
+            MetaTerms {
+                text: search_tokens(&text).into_iter().collect(),
+                exact: exact.into_iter().collect(),
+            }
+        });
+        Ok(KeyQuery {
+            start,
+            end,
+            names,
+            meta,
+            limit: self.budget.saturating_sub(self.examined).max(1),
+        })
+    }
+
+    fn next_chunk(&mut self) -> RangeTurn {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return self.finish(None);
+        };
+        let set_id = self.binding.set_id;
+        let reads = (chunk.iter())
+            .map(|range_id| {
+                let key = Key::from(state_key(set_id, *range_id));
+                (SEARCH_INDEX_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.step = RangeStep::States(chunk, self.query()?);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// Queries the searchable indexes of the chunk at once. A building index is searched up to
+    /// its cursor; a range without a searchable index is passed on as not found.
+    fn search_chunk(
+        &mut self,
+        chunk: Vec<Ulid>,
+        query: KeyQuery,
+        states: Vec<Option<aruna_core::types::Value>>,
+    ) -> RangeTurn {
+        let set_id = self.binding.set_id;
+        let (mut members, mut slots) = (Vec::new(), Vec::new());
+        for (range_id, state) in chunk.into_iter().zip(states) {
+            let state = state.and_then(|value| IndexState::from_bytes(value.as_ref()).ok());
+            let Some((generation, through, query)) = searchable(state, &query) else {
+                slots.push((range_id, None));
+                continue;
+            };
+            if !self.indexed {
+                slots.push((range_id, None));
+                continue;
+            }
+            let search = IndexEffect::Search {
+                set_id,
+                range_id,
+                generation,
+                query,
+            };
+            members.push(Effect::Index(Box::new(search)));
+            slots.push((range_id, Some(through)));
+        }
+        if members.is_empty() {
+            self.found = slots.into_iter().map(|(id, _)| (id, None)).collect();
+            return self.next_range();
+        }
+        self.step = RangeStep::Search(slots);
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: RANGE_CONCURRENCY,
+            form: GroupForm::All { deadline: None },
+        })))
+    }
+
+    fn searched(
+        &mut self,
+        slots: Vec<(Ulid, Option<Option<String>>)>,
+        result: IoResult,
+    ) -> RangeTurn {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            return Err(SearchObjectsError::Unavailable);
+        };
+        let mut results = results.into_iter();
+        for (range_id, slot) in slots {
+            let found = slot.and_then(|through| {
+                let GroupResult::Done(event) = results.next()? else {
+                    return None;
+                };
+                let Event::Index(IndexEvent::Searched(page)) = *event else {
+                    return None;
+                };
+                Some((*page, through))
+            });
+            self.found.push_back((range_id, found));
+        }
+        self.next_range()
+    }
+
+    fn next_range(&mut self) -> RangeTurn {
+        loop {
+            let Some((range_id, found)) = self.found.pop_front() else {
+                return self.next_chunk();
+            };
+            let Some((page, through)) = found else {
+                self.unready.push((range_id, None));
+                self.incomplete += 1;
                 continue;
             };
             // A key removed from the index after `as_of` leaves no trace, so a commit since
             // then makes the changed keys of this page unknown.
-            certain &= found.committed_at.is_some_and(|at| at < input.as_of);
-            // Checked once wherever the query ends, so neither coverage nor timing shows the cursor.
-            if let Some(through) = through {
-                let shown = readable(context, input, &bucket, &mut evaluators, &through).await?;
-                if !shown || !ends_by(&end, &through) {
-                    unready.push((*range_id, Some(shown.then_some(through))));
-                    incomplete += 1;
+            self.certain &= page.committed_at.is_some_and(|at| at < self.input.as_of);
+            self.current = Some(page);
+            // Checked once wherever the query ends, so neither coverage nor timing shows the
+            // cursor.
+            return match through {
+                Some(through) => {
+                    let read = self.resolve(std::slice::from_ref(&through));
+                    self.step = RangeStep::Through(range_id, through);
+                    Ok(Next::Call(read))
                 }
+                None => self.read_keys(),
+            };
+        }
+    }
+
+    fn resolve(&self, keys: &[String]) -> IoCall {
+        IoCall::child(ResolveKeysOperation::new(&self.input, &self.bucket, keys))
+    }
+
+    /// Whether the caller may read a building index's cursor, one candidate after another.
+    fn check_through(
+        &mut self,
+        (range_id, through): (Ulid, String),
+        mut pending: VecDeque<Candidate>,
+    ) -> RangeTurn {
+        let Some(candidate) = pending.pop_front() else {
+            return self.through_known(range_id, through, false);
+        };
+        let call = self.walk.check.begin(&self.input, &candidate.hit);
+        self.step = RangeStep::ThroughCheck(range_id, through, pending, Some(candidate));
+        Ok(Next::Call(call))
+    }
+
+    fn through_known(&mut self, range_id: Ulid, through: String, shown: bool) -> RangeTurn {
+        let (_, end) = self
+            .window
+            .as_ref()
+            .ok_or(SearchObjectsError::Unavailable)?;
+        if !shown || !ends_by(end, &through) {
+            self.unready
+                .push((range_id, Some(shown.then_some(through))));
+            self.incomplete += 1;
+        }
+        self.read_keys()
+    }
+
+    fn read_keys(&mut self) -> RangeTurn {
+        let page = self
+            .current
+            .as_mut()
+            .ok_or(SearchObjectsError::Unavailable)?;
+        self.examined += page.examined;
+        let (key_match, query) = (self.input.key_match, &self.input.query);
+        let mut keys = std::mem::take(&mut page.keys);
+        keys.retain(|key| key_match.matches(key, query));
+        if keys.is_empty() {
+            return self.range_done();
+        }
+        let read = self.resolve(&keys);
+        self.step = RangeStep::Keys;
+        Ok(Next::Call(read))
+    }
+
+    fn walked(&mut self, turn: WalkTurn) -> RangeTurn {
+        match turn {
+            WalkTurn::Call(call) => {
+                self.step = RangeStep::Walk;
+                Ok(Next::Call(call))
             }
-            examined += found.examined;
-            let (mut keys, last) = (found.keys, found.last);
-            keys.retain(|key| input.key_match.matches(key, &input.query));
-            for candidate in resolve_keys(context, input, &bucket, &keys).await? {
-                if !authorize(context, input, &mut evaluators, &candidate.hit).await? {
-                    continue;
-                }
-                if candidate.changed {
-                    changed.push(candidate.hit.cursor_key);
-                    if changed.len() >= CHANGED_PAGE_CAP {
-                        let next = changed.last().cloned();
-                        return Ok(page(visible, changed, certain, next, incomplete, remote));
+            WalkTurn::Drained => self.range_done(),
+            WalkTurn::Full(next) => self.finish(next),
+        }
+    }
+
+    /// Zero-hit and denied pages stop at the last examined key too, sealed so the caller never
+    /// learns a key it may not read.
+    fn range_done(&mut self) -> RangeTurn {
+        let page = self.current.take().ok_or(SearchObjectsError::Unavailable)?;
+        let Some(last) = page.last else {
+            return self.next_range();
+        };
+        let position = BlobHeadKey::new(self.bucket.as_str(), last).to_bytes()?;
+        self.finish(Some(seal_position(&position)?))
+    }
+
+    fn finish(&mut self, next: Option<Vec<u8>>) -> RangeTurn {
+        let hits = std::mem::take(&mut self.walk.visible);
+        let changed = std::mem::take(&mut self.walk.changed);
+        let counts = (self.incomplete, self.remote);
+        let mut found = page(hits, changed, self.certain, next, counts, self.now_ms);
+        found.layout = (self.layout).map(|layout| (self.binding.set_id, layout));
+        found.partial_ranges = (self.unready.iter())
+            .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
+            .collect();
+        if !self.indexed || self.unready.is_empty() {
+            return Ok(Next::Done(found));
+        }
+        self.done_page = Some(found);
+        self.step = RangeStep::Progress;
+        let progress = RangeProgressOperation::new(&self.bucket);
+        Ok(Next::Call(IoCall::child(progress)))
+    }
+}
+
+/// The generation, covered key and query a stored index state allows searching with.
+fn searchable(
+    state: Option<IndexState>,
+    query: &KeyQuery,
+) -> Option<(u64, Option<String>, KeyQuery)> {
+    let mut query = query.clone();
+    match state? {
+        IndexState::Ready { generation } => Some((generation, None, query)),
+        IndexState::Building {
+            generation,
+            cursor: Some(cursor),
+        } => {
+            let through = Position::decode(&cursor).ok()?.key;
+            if !ends_by(&query.end, &through) {
+                query.end = Bound::Included(through.clone());
+            }
+            Some((generation, Some(through), query))
+        }
+        IndexState::Building { cursor: None, .. } => None,
+    }
+}
+
+impl Operation for RangeSearchOperation {
+    type Output = SearchNodePage;
+    type Error = SearchObjectsError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> RangeTurn {
+        let read = ReadRecordOperation::new(self.binding.set_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> RangeTurn {
+        match std::mem::replace(&mut self.step, RangeStep::Keys) {
+            RangeStep::Record => {
+                let record = result.child::<Option<DistributionView>, RecordError>()?;
+                let record = record.map_err(|error| SearchObjectsError::Storage(error.to_string()));
+                match record? {
+                    Some(view) => self.record_read(view),
+                    // Without the record the ranges are unknown, so nothing is covered.
+                    None => {
+                        let empty = (Vec::new(), Vec::new());
+                        let found = page(empty.0, empty.1, true, None, (1, 0), self.now_ms);
+                        Ok(Next::Done(found))
                     }
-                    continue;
-                }
-                visible.push(candidate.hit);
-                if visible.len() > limit {
-                    let next = visible.get(limit - 1).map(|hit| hit.cursor_key.clone());
-                    visible.truncate(limit);
-                    changed_until(&mut changed, next.as_deref());
-                    return Ok(page(visible, changed, certain, next, incomplete, remote));
                 }
             }
-            if let Some(last) = last {
-                // Zero-hit and denied pages stop here too and continue after the last key,
-                // sealed so the caller never learns a key it may not read.
-                let position = BlobHeadKey::new(bucket.as_str(), last).to_bytes()?;
-                return Ok(page(
-                    visible,
-                    changed,
-                    certain,
-                    Some(seal_position(&position)?),
-                    incomplete,
-                    remote,
-                ));
+            RangeStep::States(chunk, query) => self.search_chunk(chunk, query, result.values()?),
+            RangeStep::Search(slots) => self.searched(slots, result),
+            RangeStep::Through(range_id, through) => {
+                let found = result.child::<Vec<Candidate>, SearchObjectsError>()??;
+                self.check_through((range_id, through), found.into())
+            }
+            RangeStep::ThroughCheck(range_id, through, pending, candidate) => {
+                let candidate = candidate.ok_or(SearchObjectsError::Unavailable)?;
+                let input = &self.input;
+                match self.walk.check.answer(input, &candidate.hit, result)? {
+                    Checked::Call(call) => {
+                        self.step =
+                            RangeStep::ThroughCheck(range_id, through, pending, Some(candidate));
+                        Ok(Next::Call(call))
+                    }
+                    Checked::Decided(true) => self.through_known(range_id, through, true),
+                    Checked::Decided(false) => self.check_through((range_id, through), pending),
+                }
+            }
+            RangeStep::Keys => {
+                let found = result.child::<Vec<Candidate>, SearchObjectsError>()??;
+                self.walk.add(found);
+                let turn = self.walk.advance(&self.input);
+                self.walked(turn)
+            }
+            RangeStep::Walk => {
+                let turn = self.walk.answer(&self.input, result)?;
+                self.walked(turn)
+            }
+            RangeStep::Progress => {
+                // Progress is a hint, so a failed read leaves it out.
+                let read = result.child::<BTreeMap<Ulid, IndexProgress>, FeedError>()?;
+                let progress = read.unwrap_or_default();
+                let mut found = self
+                    .done_page
+                    .take()
+                    .ok_or(SearchObjectsError::Unavailable)?;
+                found.index_progress = (self.unready.iter())
+                    .filter_map(|(range_id, _)| Some((*range_id, *progress.get(range_id)?)))
+                    .collect();
+                Ok(Next::Done(found))
             }
         }
     }
-    Ok(page(visible, changed, certain, None, incomplete, remote))
 }
 
-/// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
-/// building index is searched up to its cursor and returned with the key it covers through.
-async fn search_chunk(
-    context: &DriverContext,
-    search: &RangeSearch,
-    chunk: &[Ulid],
-    query: KeyQuery,
-) -> Result<Vec<Option<(KeyPage, Option<String>)>>, SearchObjectsError> {
-    let set_id = search.binding.set_id;
-    let reads = (chunk.iter())
-        .map(|range_id| {
-            let key = state_key(set_id, *range_id);
-            (SEARCH_INDEX_KEYSPACE.to_string(), Key::from(key))
-        })
-        .collect();
-    let txn_id = start_read(context).await?;
-    let states = batch_read(context, reads, txn_id).await;
-    let states = finish_read(context, txn_id, states).await?;
-    let searches = chunk.iter().zip(states).map(|(range_id, (_, state))| {
-        let state = state.and_then(|value| IndexState::from_bytes(value.as_ref()).ok());
-        let (indexes, mut query) = (search.indexes.clone(), query.clone());
-        async move {
-            let (generation, through) = match state? {
-                IndexState::Ready { generation } => (generation, None),
-                IndexState::Building {
-                    generation,
-                    cursor: Some(cursor),
-                } => {
-                    let through = Position::decode(&cursor).ok()?.key;
-                    if !ends_by(&query.end, &through) {
-                        query.end = Bound::Included(through.clone());
-                    }
-                    (generation, Some(through))
-                }
-                IndexState::Building { cursor: None, .. } => return None,
-            };
-            let found = indexes?.search(set_id, *range_id, generation, query).await;
-            Some((found.ok()?, through))
+/// The hits of the current heads of `keys`, in their order, from one read snapshot; keys without
+/// a live head are left out, so a lagging index never returns a deleted object.
+#[derive(Debug, PartialEq)]
+struct ResolveKeysOperation {
+    bucket: String,
+    keys: Vec<String>,
+    heads: Vec<(BlobHeadKey, Vec<u8>)>,
+    hits: HitBuilder,
+    building: bool,
+}
+
+impl ResolveKeysOperation {
+    fn new(input: &SearchObjectsInput, bucket: &str, keys: &[String]) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            keys: keys.to_vec(),
+            heads: Vec::new(),
+            hits: HitBuilder::new(input.clone()),
+            building: false,
         }
-    });
-    Ok(join_all(searches).await)
+    }
+
+    fn built(turn: BuildTurn) -> SearchTurn<Vec<Candidate>> {
+        Ok(match turn {
+            BuildTurn::Call(call) => Next::Call(call),
+            BuildTurn::Done(candidates) => Next::Done(candidates),
+        })
+    }
+}
+
+impl Operation for ResolveKeysOperation {
+    type Output = Vec<Candidate>;
+    type Error = SearchObjectsError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
+    fn first(&mut self) -> SearchTurn<Vec<Candidate>> {
+        let mut reads = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let head = BlobHeadKey::new(self.bucket.as_str(), key.as_str());
+            let bytes = head.to_bytes()?;
+            reads.push((BLOB_HEAD_KEYSPACE.to_string(), Key::from(bytes.clone())));
+            self.heads.push((head, bytes));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SearchTurn<Vec<Candidate>> {
+        if self.building {
+            return Self::built(self.hits.answer(result)?);
+        }
+        let mut candidates = Vec::new();
+        let heads = std::mem::take(&mut self.heads);
+        for ((head, cursor_key), value) in heads.into_iter().zip(result.values()?) {
+            let Some(value) = value else {
+                continue;
+            };
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+            candidates.push(HeadCandidate {
+                head,
+                version_id: pointer.version_id,
+                cursor_key,
+            });
+        }
+        self.building = true;
+        // The index leaves very common metadata prefixes out, so versions are matched again.
+        Self::built(self.hits.start(candidates)?)
+    }
 }
 
 /// Starts a sealed position; no head key encoding starts with it, as bucket names are short.
@@ -339,13 +613,13 @@ fn page(
     changed: Vec<Vec<u8>>,
     certain: bool,
     next_start_after: Option<Vec<u8>>,
-    incomplete_ranges: usize,
-    remote_ranges: usize,
+    (incomplete_ranges, remote_ranges): (usize, usize),
+    now_ms: u64,
 ) -> SearchNodePage {
     SearchNodePage {
         hits,
         next_start_after,
-        observed_at: std::time::SystemTime::now(),
+        observed_at: UNIX_EPOCH + Duration::from_millis(now_ms),
         incomplete_ranges,
         remote_ranges,
         index_progress: Vec::new(),
@@ -365,57 +639,6 @@ fn layout_digest(ranges: &[KeyRange]) -> [u8; 32] {
         hasher.update(&postcard::to_allocvec(&(bounds, owner)).unwrap_or_default());
     }
     *hasher.finalize().as_bytes()
-}
-
-/// The hits of the current heads of `keys`, in their order; keys without a live head are
-/// left out, so a lagging index never returns a deleted object.
-async fn resolve_keys(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    bucket: &str,
-    keys: &[String],
-) -> Result<Vec<Candidate>, SearchObjectsError> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let txn_id = start_read(context).await?;
-    let result = resolve_heads(context, input, bucket, keys, txn_id).await;
-    finish_read(context, txn_id, result).await
-}
-
-async fn resolve_heads(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    bucket: &str,
-    keys: &[String],
-    txn_id: TxnId,
-) -> Result<Vec<Candidate>, SearchObjectsError> {
-    let heads: Vec<_> = (keys.iter())
-        .map(|key| BlobHeadKey::new(bucket, key.as_str()))
-        .collect();
-    let reads = (heads.iter())
-        .map(|head| {
-            let key = head.to_bytes()?;
-            Ok((BLOB_HEAD_KEYSPACE.to_string(), Key::from(key)))
-        })
-        .collect::<Result<Vec<_>, SearchObjectsError>>()?;
-    let values = batch_read(context, reads, txn_id).await?;
-    let mut candidates = Vec::new();
-    for (head, (key, value)) in heads.into_iter().zip(values) {
-        let Some(value) = value else {
-            continue;
-        };
-        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-        candidates.push(HeadCandidate {
-            head,
-            version_id: pointer.version_id,
-            cursor_key: key.to_vec(),
-        });
-    }
-    let mut live = load_live(context, input, candidates, txn_id).await?;
-    // The index leaves very common metadata prefixes out, so versions are matched again here.
-    retain_matches(input, &mut live);
-    build_hits(context, input, live, txn_id).await
 }
 
 #[cfg(test)]

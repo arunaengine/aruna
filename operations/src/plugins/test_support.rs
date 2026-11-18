@@ -6,14 +6,11 @@ use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::groups::create_group::CreateGroupConfig;
 use crate::groups::create_group::CreateGroupOperation;
-use crate::jobs::executor::JobContext;
 use crate::jobs::executor::ProgressReporter;
 use crate::plugins::account::ReadGroupAuth;
 use crate::plugins::calls::install_plugin;
-use crate::plugins::calls::open;
 use crate::plugins::calls::prepare_install;
 use crate::plugins::calls::read_config;
-use crate::plugins::calls::release;
 use crate::plugins::calls::store_local;
 use crate::plugins::calls::write_record;
 use crate::plugins::check::RunScope;
@@ -25,15 +22,11 @@ use crate::plugins::publish::PublishEntryOperation;
 use crate::plugins::rows::StoreError;
 use crate::plugins::rows::decode;
 use crate::plugins::rows::read_rows;
-use crate::plugins::rows::row;
 use crate::plugins::rows::write_rows;
 use crate::plugins::rules::EditRules;
 use crate::plugins::rules::RuleError;
 use crate::plugins::rules::RuleGuard;
-use crate::plugins::rules::consumer;
 use crate::plugins::submit::CopyRequest;
-use crate::plugins::submit::digest;
-use crate::plugins::transfer_steps::account;
 use crate::plugins::work::Identity;
 use crate::plugins::work::WorkKind;
 use crate::plugins::work::WorkRow;
@@ -45,6 +38,8 @@ use crate::realm::create_realm::CreateRealmOperation;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::OwnerChange;
 use crate::secrets::owner::OwnerSecretOperation;
+use crate::tasks::job_context::JobContext;
+use crate::testing_objects::seed_bucket;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::compute::Secret;
@@ -863,4 +858,14 @@ pub async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> {
         }
     }
     found
+}
+
+/// Runs one replication batch to its end.
+pub async fn drain_blob_batch(ctx: &DriverContext) -> crate::replication::drain::BlobDrainResult {
+    let drain = crate::replication::drain::ProcessBatchOperation::new(
+        crate::replication::page::deliver::MetadataPages,
+        crate::driver::node_routing(ctx),
+        ctx.node_and_realm(),
+    );
+    crate::driver::drive(drain, ctx).await.unwrap()
 }

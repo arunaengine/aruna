@@ -5,7 +5,7 @@
 use super::*;
 use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::s3::bucket::get::GetBucketError;
 use aruna_core::structs::execution::source_access::ListCursor;
 

@@ -48,7 +48,7 @@ use aruna_operations::groups::update_group::{
 };
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
-use aruna_operations::metadata::stats::count_group_purpose;
+use aruna_operations::metadata::stats::GroupPurposeOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;
@@ -1364,7 +1364,8 @@ pub(crate) async fn run_group_usage(
     let mut response = crate::routes::info::UsageResponse::for_group(local, realm.counters);
     response.realm.distinct_buckets =
         crate::routes::info::distinct_buckets(state, Some(group_id), response.realm.buckets).await;
-    match count_group_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
+    let count = GroupPurposeOperation::new(state.get_realm_id(), group_id);
+    match aruna_operations::driver::drive(count, state.get_ctx().as_ref()).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
             response.profile_count = Some(counts.profile_count);

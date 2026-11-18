@@ -10,7 +10,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, VersionKey};
 use aruna_core::structs::storage::broken::BrokenReason;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::blob::migration::broken::{clean_broken, list_broken, read_check};
+use aruna_operations::blob::migration::broken::{
+    CleanBrokenOperation, ListBrokenOperation, ReadCheckOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use aruna_operations::s3::bucket::storage_check::StartCheckOperation;
@@ -65,13 +67,19 @@ async fn cleans_broken_files() {
     start_check(&context).await;
     // Each run only reads the stored record, so a second run is what a restart sees.
     assert!(run(&context).await.is_some());
-    let partial = read_check(&context.driver, BUCKET).await.unwrap().unwrap();
+    let partial = drive(ReadCheckOperation::new(BUCKET), &context.driver)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(partial.cursor.is_some() && partial.finished_at_ms.is_none());
     assert!(run(&context).await.is_none());
-    let done = read_check(&context.driver, BUCKET).await.unwrap().unwrap();
+    let done = drive(ReadCheckOperation::new(BUCKET), &context.driver)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((done.checked, done.broken, done.failed), (73, 2, 0));
 
-    let (rows, next) = list_broken(&context.driver, BUCKET, None, 10)
+    let (rows, next) = drive(ListBrokenOperation::new(BUCKET, None, 10), &context.driver)
         .await
         .unwrap();
     assert!(next.is_none());
@@ -92,21 +100,27 @@ async fn cleans_broken_files() {
         path_restrictions: None,
         session: None,
     };
-    let cleaned = clean_broken(&context.driver, &template(&context), &auth, None, 10, 100)
-        .await
-        .unwrap();
+    let cleaned = drive(
+        CleanBrokenOperation::new(&template(&context), &auth, None, (10, 100)),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         (cleaned.deleted, cleaned.denied, cleaned.next),
         (0, 2, None)
     );
-    let (rows, _) = list_broken(&context.driver, BUCKET, None, 10)
+    let (rows, _) = drive(ListBrokenOperation::new(BUCKET, None, 10), &context.driver)
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
     // Denied rows never count toward the limit nor name the cursor.
-    let paged = clean_broken(&context.driver, &template(&context), &auth, None, 1, 100)
-        .await
-        .unwrap();
+    let paged = drive(
+        CleanBrokenOperation::new(&template(&context), &auth, None, (1, 100)),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!((paged.denied, paged.next), (2, None));
     for (key, id) in [
         ("genes/b.faa.gz", lost),
@@ -137,7 +151,7 @@ async fn move_records_broken() {
 
     assert!(run(&context).await.is_none());
 
-    let (rows, _) = list_broken(&context.driver, BUCKET, None, 10)
+    let (rows, _) = drive(ListBrokenOperation::new(BUCKET, None, 10), &context.driver)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);

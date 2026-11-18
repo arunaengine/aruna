@@ -8,9 +8,13 @@ use aruna_core::repository::{
     RemoteState, RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryQuery,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::{JobError, JobId};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::executor::JobRunOutcome;
+use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::query::{
     ResolveRecordOperation, SearchRecordsOperation,
@@ -23,9 +27,24 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
+use aruna_operations::tasks::job_context::JobContext;
 use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
+
+pub(super) async fn register_identifiers(
+    ctx: &JobContext,
+    spec: &RegisterIdentifiersSpec,
+) -> JobRunOutcome {
+    let local = ctx.driver.node_and_realm().map(|(node, _)| node);
+    let queued_at_ms = ctx.job_id.timestamp_ms();
+    let operation =
+        RegisterIdentifiersOperation::new(spec, local, queued_at_ms, unix_timestamp_millis());
+    match drive(operation, &ctx.driver).await {
+        Ok(outcome) => outcome,
+        Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
+    }
+}
 
 pub(super) async fn change_link(
     context: &DriverContext,

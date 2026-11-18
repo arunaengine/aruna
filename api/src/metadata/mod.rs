@@ -34,10 +34,10 @@ use aruna_operations::metadata::api::read_types::{
     ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
 use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
+use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedError;
 use aruna_operations::metadata::forward::authorized_create::{
     AuthorizedCreateOperation, DocumentCreate,
 };
-use aruna_operations::metadata::forward::write::CreateAuthorizedError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};

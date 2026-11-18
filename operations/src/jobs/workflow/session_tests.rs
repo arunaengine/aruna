@@ -4,6 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
+use aruna_core::compute::session::StagedInput;
 use aruna_core::structs::execution::job::JobPayload;
 
 use super::*;

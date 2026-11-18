@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
-use aruna_core::metadata::AuthToken;
 use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun, StateRemoval, StateWrite};
@@ -12,15 +11,14 @@ use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::UploadForm;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
-use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::plugins::check::RunScope;
-use aruna_operations::plugins::creates::{FinishCreate, stored_created, write_outcome};
+use aruna_operations::plugins::creates::{FinishCreate, stored_created};
 use aruna_operations::plugins::dataset::file_entity;
 use aruna_operations::plugins::grants::object_path;
 use aruna_operations::plugins::held::{AskRelease, HeldSecrets};
@@ -29,9 +27,9 @@ use aruna_operations::plugins::host_calls::{
     begun_reply, call_intent, version_id,
 };
 use aruna_operations::plugins::host_steps::{
-    AdmitCall, CallStep, ChangeInput, CheckConfigured, CheckReply, ConfiguredCall, ConnectionAsk,
-    ConnectionPlan, Granted, GrantedCall, ListDatasets, NativeCall, PrepareChange,
-    PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReplyPlan, change_message,
+    AdmitCall, ApplyChange, CallStep, ChangeInput, CheckConfigured, CheckReply, ConfiguredCall,
+    ConnectionAsk, ConnectionPlan, Granted, GrantedCall, ListDatasets, NativeCall, PrepareChange,
+    PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReplyPlan,
 };
 use aruna_operations::plugins::intents::{begin, unknown_row};
 use aruna_operations::plugins::job_work::{CancelWork, JobState};
@@ -150,32 +148,14 @@ impl RunBroker {
             CallStep::Replied(reply) => return Ok(reply),
             CallStep::Proceed(ready) => ready,
         };
-        let Granted { install, auth } = ready.granted;
-        let actor = Actor {
-            node_id: self.scope.local,
-            user_id: install.account,
-            realm_id: self.scope.realm_id,
-        };
-        let local_node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
-        let update = drive(
-            RouteUpdateOperation::new(
-                (actor, local_node),
-                (Some((*ready.record).clone()), ready.document_id),
-                DocumentUpdate {
-                    public: None,
-                    mutation: mutation(ready.entity),
-                    expected_revision: Some(ready.expected),
-                    commit_message: Some(change_message(&install, self.scope.run.run_id)),
-                },
-                Some(AuthToken::Internal(auth)),
-            ),
-            &self.ctx,
+        let mutation = mutation(ready.entity.clone());
+        let place = (
+            &self.scope,
+            self.ctx.net_handle.as_ref().map(|net| net.node_id()),
         );
-        let outcome = update
-            .await
-            .map(|record| record.last_event_id.to_string())
-            .map_err(write_outcome);
-        self.record(intent, outcome).await
+        let apply = ApplyChange::new(place, ready, mutation, call_intent(intent));
+        let applied = drive(apply, &self.ctx).await;
+        applied.map_err(|failure| failure.error)
     }
 
     /// Runs a revision-checked change of one file entity under the write grants. A file it names

@@ -2,11 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::read::ensure_record_readable;
@@ -14,8 +11,6 @@ use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
-use crate::metadata::create_document::CreateDocumentPayload;
-use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
@@ -26,15 +21,11 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use aruna_core::NodeId;
-use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -51,34 +42,8 @@ use crate::forward::transport::MetadataWriteError;
 use crate::forward::transport::forwarded_unavailable;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
-use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
-
-/// Errors of the shared authorized create flow. Every variant maps onto the
-/// same transport status the former REST-local sequence produced.
-#[derive(Debug, Error, PartialEq)]
-pub enum CreateAuthorizedError {
-    #[error("metadata document path must not be empty")]
-    EmptyPath,
-    #[error("metadata create is forbidden")]
-    Forbidden,
-    #[error(transparent)]
-    Api(#[from] MetadataApiError),
-    #[error(transparent)]
-    Create(#[from] CreateDocumentError),
-    #[error(transparent)]
-    Authorize(#[from] AuthorizeError),
-    #[error(transparent)]
-    Write(#[from] MetadataWriteError),
-}
-
-/// A runner failure leaves the create undelivered.
-impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
-    fn from(error: aruna_core::calls::IoError) -> Self {
-        Self::Write(error.into())
-    }
-}
 
 /// An offline edit's verdict, as the metadata routes report it.
 pub(super) fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {

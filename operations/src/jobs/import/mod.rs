@@ -16,6 +16,7 @@ mod write;
 
 pub use job::ImportJobOperation;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
@@ -42,11 +43,10 @@ use aruna_core::structs::storage::routing::NodeRouting;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use self::rewrite::CrateValidationError;
+use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
 use super::executor::JobRunOutcome;
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
-use aruna_core::repository::remote::NodeScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::forward::transport::MetadataWriteError;
 use crate::placement::policy::GateContextError;
@@ -54,6 +54,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::PutObjectError;
 use crate::staging::read_source::ReadSourceError;
+use aruna_core::repository::remote::NodeScope;
 
 /// What every operation of one import run knows about it.
 #[derive(Clone, Debug, PartialEq)]

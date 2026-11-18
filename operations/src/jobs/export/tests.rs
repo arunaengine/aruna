@@ -19,13 +19,13 @@ use crate::auth::permission_rules::PermissionRulesOperation;
 use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::jobs::executor::JobContext;
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::key_locks::AskWaitsOperation;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::replication::plaintext::HolderCheckOperation;
+use crate::tasks::job_context::JobContext;
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;
@@ -49,6 +49,8 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::io::AsyncWriteExt;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -3252,7 +3254,7 @@ pub(super) fn plain_entity(id: &str) -> ExportEntity {
     }
 }
 
-pub(super) fn local_candidate() -> ExportCandidate {
+pub(super) fn stored_candidate() -> ExportCandidate {
     ExportCandidate {
         source: CandidateSource::Local {
             location: artifact().location,

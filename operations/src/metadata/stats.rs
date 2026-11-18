@@ -5,19 +5,24 @@
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
+};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use futures_util::{StreamExt, stream};
 use serde_json::Value;
 
 use super::api::MetadataApiError;
-use super::repository::StorageReadError;
-use crate::driver::{DriverContext, drive};
-use crate::metadata::live_records::LiveRecordsOperation;
+use super::api::list::{GroupRecordsOperation, RecordSummaryOperation};
 use crate::metadata::profile::rules::{
     PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
 };
-use crate::metadata::record_reads::RecordMaterializedOperation;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const SUMMARY_FANOUT_LIMIT: usize = 8;
@@ -29,56 +34,127 @@ pub struct GroupDocumentCounts {
     pub process_run_count: u64,
 }
 
-/// Exact lifecycle-live metadata-document counts for one group, classified
-/// solely from each document's root RO-Crate entity via bounded root-summary
-/// reads; full paths never load. `None` without a metadata subsystem.
-pub async fn count_group_purpose(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+enum PurposeStage {
+    Probe,
+    Records,
+    Summaries(Vec<String>),
+}
+
+/// Exact lifecycle-live metadata-document counts for one group, classified solely from each
+/// document's root RO-Crate entity via bounded root-summary reads; full paths never load.
+/// `None` without a metadata subsystem.
+#[derive(Debug, PartialEq)]
+pub struct GroupPurposeOperation {
     realm_id: RealmId,
     group_id: GroupId,
-) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
-    if context.metadata_handle.is_none() {
-        return Ok(None);
-    }
-    let records = crate::metadata::list_cached_group(context, group_id)
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
-        .await?
-        .into_iter()
-        .filter(|record| record.realm_id == realm_id && record.group_id == group_id)
-        .collect::<Vec<_>>();
+    stage: PurposeStage,
+}
 
-    let classifications = stream::iter(records.into_iter().map(|record| async move {
-        if !drive(RecordMaterializedOperation::new(&record), context)
-            .await
-            .map_err(|error| match error {
-                StorageReadError::Storage(error) => MetadataApiError::Internal(error.to_string()),
-                StorageReadError::Conversion(error) => {
-                    MetadataApiError::Internal(error.to_string())
-                }
-            })?
-        {
+impl GroupPurposeOperation {
+    pub fn new(realm_id: RealmId, group_id: GroupId) -> Self {
+        Self {
+            realm_id,
+            group_id,
+            stage: PurposeStage::Probe,
+        }
+    }
+
+    fn summaries(
+        &mut self,
+        records: Vec<MetadataRegistryRecord>,
+    ) -> Next<Option<GroupDocumentCounts>> {
+        let records: Vec<_> = (records.into_iter())
+            .filter(|record| record.realm_id == self.realm_id && record.group_id == self.group_id)
+            .collect();
+        if records.is_empty() {
+            return Next::Done(Some(GroupDocumentCounts::default()));
+        }
+        let graphs = records
+            .iter()
+            .map(|record| record.graph_iri.clone())
+            .collect();
+        let members = (records.into_iter())
+            .map(|record| {
+                Effect::SubOperation(boxed_suboperation(
+                    RecordSummaryOperation::new(record),
+                    |result| Event::Child(ChildOutcome::new(result)),
+                ))
+            })
+            .collect();
+        self.stage = PurposeStage::Summaries(graphs);
+        Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: SUMMARY_FANOUT_LIMIT,
+            form: GroupForm::All { deadline: None },
+        }))
+    }
+
+    fn counted(
+        graphs: Vec<String>,
+        result: IoResult,
+    ) -> Result<GroupDocumentCounts, MetadataApiError> {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
             return Err(MetadataApiError::ServiceUnavailable);
+        };
+        let mut counts = GroupDocumentCounts::default();
+        for (graph_iri, member) in graphs.iter().zip(results) {
+            let GroupResult::Done(event) = member else {
+                return Err(MetadataApiError::ServiceUnavailable);
+            };
+            let Event::Child(outcome) = *event else {
+                return Err(MetadataApiError::ServiceUnavailable);
+            };
+            let summary = outcome.take::<String, MetadataApiError>();
+            let summary = summary.ok_or(MetadataApiError::ServiceUnavailable)??;
+            match classify_root_summary(&summary, graph_iri)? {
+                DocumentPurpose::Profile => counts.profile_count += 1,
+                DocumentPurpose::ProcessRun => counts.process_run_count += 1,
+                DocumentPurpose::Dataset => counts.dataset_count += 1,
+            }
         }
-        let summary = crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
-            .await
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        classify_root_summary(&summary, &record.graph_iri)
-    }))
-    .buffered(SUMMARY_FANOUT_LIMIT)
-    .collect::<Vec<_>>()
-    .await;
+        Ok(counts)
+    }
+}
 
-    let mut counts = GroupDocumentCounts::default();
-    for classification in classifications {
-        match classification? {
-            DocumentPurpose::Profile => counts.profile_count += 1,
-            DocumentPurpose::ProcessRun => counts.process_run_count += 1,
-            DocumentPurpose::Dataset => counts.dataset_count += 1,
+impl Operation for GroupPurposeOperation {
+    type Output = Option<GroupDocumentCounts>;
+    type Error = MetadataApiError;
+
+    fn first(&mut self) -> Result<Next<Option<GroupDocumentCounts>>, MetadataApiError> {
+        // The cache probe tells a node without a metadata subsystem apart.
+        let probe = MetadataEffect::CachedGroup {
+            group_id: self.group_id,
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
+            probe,
+        )))))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<Option<GroupDocumentCounts>>, MetadataApiError> {
+        match std::mem::replace(&mut self.stage, PurposeStage::Records) {
+            PurposeStage::Probe => {
+                if let Event::Metadata(MetadataEvent::Error {
+                    error: MetadataError::HandleMissing,
+                    ..
+                }) = event(result)?
+                {
+                    return Ok(Next::Done(None));
+                }
+                self.stage = PurposeStage::Records;
+                let records = GroupRecordsOperation::new(self.group_id, REGISTRY_CANDIDATE_LIMIT);
+                Ok(Next::Call(IoCall::child(records)))
+            }
+            PurposeStage::Records => {
+                let records = result.child::<Vec<MetadataRegistryRecord>, MetadataApiError>()??;
+                Ok(self.summaries(records))
+            }
+            PurposeStage::Summaries(graphs) => Ok(Next::Done(Some(Self::counted(graphs, result)?))),
         }
     }
-    Ok(Some(counts))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,10 +222,51 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::metadata::MetadataHandle;
     use crate::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 
     const REALM_SEED: [u8; 32] = [7u8; 32];
+
+    async fn count_group_purpose(
+        context: &DriverContext,
+        realm_id: RealmId,
+        group_id: GroupId,
+    ) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
+        drive(GroupPurposeOperation::new(realm_id, group_id), context).await
+    }
+
+    #[test]
+    fn missing_subsystem_counts_nothing() {
+        let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
+        assert!(matches!(count.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let missing = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        })));
+        assert_eq!(count.next(missing), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn empty_group_counts_zero() {
+        let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
+        count.first().unwrap();
+        let cached = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::CachedGroup {
+            records: None,
+        })));
+        assert!(matches!(
+            count.next(cached),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let none = IoResult::Child(ChildOutcome::new(Ok::<
+            Vec<MetadataRegistryRecord>,
+            MetadataApiError,
+        >(Vec::new())));
+        assert_eq!(
+            count.next(none),
+            Ok(Next::Done(Some(GroupDocumentCounts::default())))
+        );
+    }
 
     struct Fixture {
         _storage_dir: TempDir,

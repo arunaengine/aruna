@@ -20,7 +20,7 @@ use super::witness_arm::{
     deadline_index_key, deadline_key,
 };
 pub use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::RowRead;
 
 /// Families one drain pass considers.

@@ -29,7 +29,7 @@ use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::run_rows::{
     ReadStateOperation, SettledRowsOperation, StateReadError, job_state_key, state_row,
 };
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 /// A runner failure of the import job; its checkpoint stays for the next attempt.
 #[derive(Debug, PartialEq, thiserror::Error)]
