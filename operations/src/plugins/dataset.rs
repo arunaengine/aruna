@@ -38,7 +38,7 @@ fn dataset_mut(crate_json: &mut Value) -> Result<&mut Value, HostError> {
 }
 
 /// The fields of a crate's dataset entity, as a plugin reads and patches them.
-pub fn dataset_of(jsonld: &str) -> Result<String, HostError> {
+pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
     let mut crate_json: Value =
         serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
     let dataset = dataset_mut(&mut crate_json)?;
@@ -80,7 +80,7 @@ pub fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostError> {
 }
 
 /// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
-pub fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
+pub(crate) fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
     let page: Value =
         serde_json::from_str(jsonld).map_err(|_| unavailable("the stored page is not JSON"))?;
     let graph = (page.get("@graph").and_then(Value::as_array))
@@ -289,7 +289,7 @@ pub fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
 }
 
 /// The document id a plugin gave as its resource.
-pub fn parse_document(resource: &str) -> Result<Ulid, HostError> {
+pub(crate) fn parse_document(resource: &str) -> Result<Ulid, HostError> {
     Ulid::from_string(resource).map_err(|_| {
         HostError::new(
             ErrorKind::Invalid,

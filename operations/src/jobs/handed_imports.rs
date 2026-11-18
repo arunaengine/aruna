@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::store_call::RowBatch;
 use super::submit::{SubmitJobError, SubmitJobResult};
 use super::submit_local::HandedJobOperation;

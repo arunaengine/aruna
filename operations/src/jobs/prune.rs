@@ -21,7 +21,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{
     self, SchedulePage, artifact_tombstone_key, job_entry_deletes, preserve_artifact_tombstone,
     read_job_record, schedule_page, staging_row_deletes,

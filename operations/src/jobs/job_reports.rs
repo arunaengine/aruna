@@ -20,7 +20,7 @@ use super::lifecycle::family_reads::SessionJobOperation;
 use super::lifecycle::ids::session_of;
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{EntryPage, list_job_entries};
 use super::{REPORT_MAX_ROWS, SESSION_REPORT_ROWS};
 

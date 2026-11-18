@@ -30,6 +30,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
+use super::creates::write_outcome;
 use super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
     same_revision,
@@ -46,6 +47,7 @@ use super::rows::StoreError;
 use super::submit::WorkRequest;
 use super::unavailable;
 use super::work::RequestContext;
+use crate::forward::transport::MetadataWriteError;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
@@ -54,9 +56,11 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, ListVisibleResult, MetadataListOrder};
 use crate::metadata::create_document::CreateDocumentPayload;
+use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
 use crate::metadata::forward::routed_export::RoutedExportOperation;
-use crate::metadata::forward::write::CreateAuthorizedError;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -501,14 +505,14 @@ impl Operation for ListDatasets {
 
 /// The objects an entity names, and the content hash they must have.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct NamedObjects {
+pub(crate) struct NamedObjects {
     objects: Vec<(String, Option<Ulid>)>,
     hash: Option<[u8; 32]>,
 }
 
 /// Reads what an entity names. Export renders each stored value as is, without `./`, or as
 /// literal text, under any term the context gives, so every value of every predicate counts.
-pub fn named_objects(
+pub(crate) fn named_objects(
     scope: &RunScope,
     group: aruna_core::types::GroupId,
     (graph, file): (&str, &Value),
@@ -579,7 +583,7 @@ enum ObjectPhase {
 /// Checks each Aruna object an entity names through the plugin's own `objects.read` call check
 /// and that it lies in a group bucket here. A named hash must be the object's verified digest.
 #[derive(Debug, PartialEq)]
-pub struct CheckObjects {
+pub(crate) struct CheckObjects {
     scope: RunScope,
     install: PluginInstall,
     objects: VecDeque<(String, Option<Ulid>)>,
@@ -588,7 +592,7 @@ pub struct CheckObjects {
 }
 
 impl CheckObjects {
-    pub fn new(scope: &RunScope, install: &PluginInstall, named: NamedObjects) -> Self {
+    pub(crate) fn new(scope: &RunScope, install: &PluginInstall, named: NamedObjects) -> Self {
         Self {
             scope: scope.clone(),
             install: install.clone(),
@@ -835,6 +839,72 @@ impl Operation for PrepareChange {
     }
 }
 
+/// Routes a checked metadata write and records its outcome in the call's intent.
+#[derive(Debug, PartialEq)]
+pub struct ApplyChange {
+    route: Option<RouteUpdateOperation>,
+    run_id: Ulid,
+    intent: CallIntent,
+    recording: bool,
+}
+
+impl ApplyChange {
+    pub fn new(
+        (scope, network_node): (&RunScope, Option<NodeId>),
+        ready: ReadyChange,
+        mutation: UpdateDocumentMutation,
+        intent: CallIntent,
+    ) -> Self {
+        let Granted { install, auth } = ready.granted;
+        let run_id = scope.run.run_id;
+        let actor = Actor {
+            node_id: scope.local,
+            user_id: install.account,
+            realm_id: scope.realm_id,
+        };
+        let update = DocumentUpdate {
+            public: None,
+            mutation,
+            expected_revision: Some(ready.expected),
+            commit_message: Some(change_message(&install, run_id)),
+        };
+        let route = RouteUpdateOperation::new(
+            (actor, network_node),
+            (Some(*ready.record), ready.document_id),
+            update,
+            Some(AuthToken::Internal(auth)),
+        );
+        Self {
+            route: Some(route),
+            run_id,
+            intent,
+            recording: false,
+        }
+    }
+}
+
+impl Operation for ApplyChange {
+    type Output = String;
+    type Error = CallFailure;
+
+    fn first(&mut self) -> Result<Next<String>, CallFailure> {
+        let route = self.route.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(route)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<String>, CallFailure> {
+        if self.recording {
+            return Ok(Next::Done(result.child::<String, CallFailure>()??));
+        }
+        let routed = result.child::<MetadataRegistryRecord, MetadataWriteError>()?;
+        let outcome =
+            (routed.map(|record| record.last_event_id.to_string())).map_err(write_outcome);
+        self.recording = true;
+        let record = RecordCall::new(self.run_id, self.intent.clone(), outcome);
+        Ok(Next::Call(IoCall::child(record)))
+    }
+}
+
 /// A new document's call, checked and with its id and node pinned; `minted` says why not.
 #[derive(Debug, PartialEq)]
 pub struct ReadyCreate {
@@ -917,7 +987,7 @@ impl PrepareCreate {
 }
 
 /// The commit message of a run's metadata change.
-pub fn change_message(install: &PluginInstall, run_id: Ulid) -> String {
+pub(crate) fn change_message(install: &PluginInstall, run_id: Ulid) -> String {
     let (plugin, id) = (&install.plugin, install.install_id);
     format!("plugin {plugin} install {id} run {run_id}")
 }

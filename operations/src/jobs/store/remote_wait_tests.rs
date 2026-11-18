@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use super::{OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::WAKE_PAGE;
 
 fn waiter() -> NodeId {

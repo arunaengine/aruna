@@ -7,33 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aruna_core::errors::ConversionError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::storage::blob::VersionKey;
-use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
+use ulid::Ulid;
 
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::executor::JobRunOutcome;
-use aruna_operations::jobs::key_locks::VersionWaitOperation;
-use aruna_operations::plugins::check::CopyGrants;
-use aruna_operations::plugins::objects::{LocalObject, Unmarked};
-use aruna_operations::plugins::transfer_steps::account;
+use aruna_operations::plugins::copy_steps::{CopyWork, LockedSource, PrepareCopy, copy_locked};
 use aruna_operations::plugins::work::holds_job;
 use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 use aruna_operations::tasks::job_context::{JobContext, PayloadHandler};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
-use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
-};
-use aruna_operations::s3::object::get::GetObjectError;
-use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::copy::CopyObjectOperation;
 
 /// How often the bytes moved so far reach the job's progress.
 pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);
@@ -84,7 +74,23 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
         Err(refusal) => return not_admitted(refusal),
     };
     match &spec.action {
-        PluginWorkAction::Copy { .. } => copy_work(ctx, spec, (&install, &config)).await,
+        PluginWorkAction::Copy {
+            source,
+            source_version,
+            target,
+            version_id,
+        } => {
+            let work = CopyWork {
+                node: (spec.realm_id, ctx.owner_node_id),
+                job: ctx.job_id.as_ulid(),
+                config: &config,
+                install: &install,
+                source,
+                version: *source_version,
+                target,
+            };
+            copy_work(ctx, work, *version_id).await
+        }
         PluginWorkAction::Download {
             target,
             version_id,
@@ -128,69 +134,23 @@ fn not_admitted(refusal: WorkRefusal) -> JobRunOutcome {
     }
 }
 
-/// Copies one object as the account, restricted to its current read patterns of the source and
-/// write patterns of the target.
-async fn copy_work(
-    ctx: &JobContext,
-    spec: &PluginWorkSpec,
-    (install, config): (&PluginInstall, &RealmConfigDocument),
-) -> JobRunOutcome {
-    let PluginWorkAction::Copy {
-        source,
-        source_version,
-        target,
-        version_id,
-    } = &spec.action
-    else {
-        return permanent("the work is not a copy");
-    };
-    let patterns = match drive(CopyGrants::new(install, (source, target)), &ctx.driver).await {
-        Ok(found) => found,
+/// Copies one object as the account. The version was minted once, so a retry after a lost answer
+/// replays it.
+async fn copy_work(ctx: &JobContext, work: CopyWork<'_>, version_id: Ulid) -> JobRunOutcome {
+    let install = work.install;
+    let input = match drive(PrepareCopy::new(work), &ctx.driver).await {
+        Ok(input) => input,
         Err(error) => return refused(error),
     };
-    let place = (spec.realm_id, ctx.owner_node_id);
-    let source_object = LocalObject::new(place, install, source);
-    let (source_bucket, source_key) = match drive(source_object, &ctx.driver).await {
-        Ok(found) => found,
-        Err(error) => return refused(error),
-    };
-    let target_object = LocalObject::new(place, install, target);
-    let (dest_bucket, dest_key) = match drive(target_object, &ctx.driver).await {
-        Ok(found) => found,
-        Err(error) => return refused(error),
-    };
-    // The version checked is the version copied, so a newer marked one never slips in.
-    let readable = Unmarked::new((&source_bucket, &source_key), *source_version);
-    let source_version = match drive(readable, &ctx.driver).await {
-        Ok(found) => found.or(*source_version),
-        Err(error) => return refused(error),
-    };
-    let auth = account(install, &patterns);
-    let read = (source_bucket.clone(), source_key.clone(), source_version);
-    let input = CopyObjectInput {
-        source_bucket,
-        source_key,
-        source_version_id: source_version,
-        source_group_id: install.group_id,
-        source_auth_context: auth.clone(),
-        dest_bucket,
-        dest_key,
-        user_id: install.account,
-        group_id: install.group_id,
-        realm_id: spec.realm_id,
-        node_id: ctx.owner_node_id,
-        quota_ceiling: config.quota.effective_group_ceiling(&install.group_id),
-        conditions: CopySourceConditions::default(),
-        metadata: None,
-        restrictions: auth.path_restrictions,
-        references: CopyReferences::Materialize,
-        job_id: Some(ctx.job_id.as_ulid()),
-    };
+    let read = (
+        input.source_bucket.clone(),
+        input.source_key.clone(),
+        input.source_version_id,
+    );
     let pulled = Arc::new(AtomicU64::new(0));
-    // The version was minted once, so a retry after a lost answer replays it.
     let copy = drive(
         CopyObjectOperation::new(input, node_routing(&ctx.driver))
-            .at_version(*version_id)
+            .at_version(version_id)
             .with_progress(pulled.clone()),
         &ctx.driver,
     );
@@ -212,18 +172,9 @@ async fn copy_work(
                 version_id: Some(copied.version_id),
             })
         }
-        Err(error) if source_locked(&error) => key_wait(ctx, install, read).await,
+        Err(error) if copy_locked(&error) => key_wait(ctx, install, read).await,
         Err(error) => JobRunOutcome::Failed(aruna_operations::jobs::copy::copy_error(error)),
     }
-}
-
-fn source_locked(error: &CopyObjectError) -> bool {
-    matches!(
-        error,
-        CopyObjectError::Get(GetObjectError::ConversionError(ConversionError::BucketKey(
-            BucketKeyError::Locked(_)
-        )))
-    )
 }
 
 /// Parks the work on the key of the source version it reads, so it runs again once that key is
@@ -231,21 +182,11 @@ fn source_locked(error: &CopyObjectError) -> bool {
 pub(super) async fn key_wait(
     ctx: &JobContext,
     install: &PluginInstall,
-    (bucket, key, version_id): (String, String, Option<ulid::Ulid>),
+    read: (String, String, Option<Ulid>),
 ) -> JobRunOutcome {
     let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
-    let head = HeadObjectInput {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        version_id,
-    };
-    let head = drive(HeadObjectOperation::new(head), &ctx.driver).await;
-    let Some(version_id) = head.ok().and_then(|head| head.resolved_version_id) else {
-        return deferred("the locked source version could not be described".into());
-    };
-    let version = VersionKey::new(bucket, key, version_id);
-    let place = (ctx.owner_node_id, install.group_id);
-    match drive(VersionWaitOperation::new(place, version), &ctx.driver).await {
+    let locked = LockedSource::new(ctx.owner_node_id, install, read);
+    match drive(locked, &ctx.driver).await {
         Ok(Some(wait)) => JobRunOutcome::AwaitingKey(vec![wait]),
         Ok(None) => deferred("the source bucket was unlocked meanwhile".into()),
         Err(error) => deferred(error.0),

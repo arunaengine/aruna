@@ -30,7 +30,7 @@ use super::{
 };
 use crate::federation::import::{ImportError, RecheckImportOperation};
 use crate::jobs::run_rows::{SettledRowsOperation, state_row};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 /// The call that rechecks an import of another realm: its binding and policies still hold.
 pub(super) fn federated_call(run: &ImportRun, now_ms: u64) -> IoCall {

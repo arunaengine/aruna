@@ -51,7 +51,7 @@ impl Target {
 }
 
 /// The manifest trigger a journaled event kind starts.
-pub fn event_trigger(kind: SourceKind) -> TriggerKind {
+pub(crate) fn event_trigger(kind: SourceKind) -> TriggerKind {
     match kind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
@@ -65,7 +65,11 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
 /// One page of pending rows in one transaction, matched with at most `bound` forward rows per
 /// install: the forward rows and gaps of the targets each row matches, and the pending rows
 /// deleted. Answers how many rows were read; a full page of `JOURNAL_PAGE` means more may follow.
-pub fn match_page((targets, keep): (&[Target], bool), now_ms: u64, bound: usize) -> MatchPage {
+pub(crate) fn match_page(
+    (targets, keep): (&[Target], bool),
+    now_ms: u64,
+    bound: usize,
+) -> MatchPage {
     MatchPage {
         targets: targets.to_vec(),
         keep,
@@ -204,14 +208,14 @@ impl Operation for MatchPage {
 
 /// A sub-plan that counts the queued forward rows of each install, up to a bound.
 #[derive(Debug, PartialEq)]
-pub struct Counting {
+pub(crate) struct Counting {
     left: Vec<Ulid>,
     bound: usize,
     counted: BTreeMap<Ulid, usize>,
 }
 
 impl Counting {
-    pub fn new(installs: BTreeSet<Ulid>, bound: usize) -> Self {
+    pub(crate) fn new(installs: BTreeSet<Ulid>, bound: usize) -> Self {
         Self {
             left: installs.into_iter().rev().collect(),
             bound,
@@ -220,7 +224,7 @@ impl Counting {
     }
 
     /// The page of the next install to count, or `None` once every install is counted.
-    pub fn ask(&self) -> Option<IoCall> {
+    pub(crate) fn ask(&self) -> Option<IoCall> {
         let install_id = self.left.last()?;
         Some(page_call(
             PLUGIN_OUTBOX_KEYSPACE,
@@ -230,14 +234,14 @@ impl Counting {
         ))
     }
 
-    pub fn take(&mut self, answer: IoResult) -> Result<(), StoreError> {
+    pub(crate) fn take(&mut self, answer: IoResult) -> Result<(), StoreError> {
         let (rows, _) = page_of(answer)?;
         let install_id = self.left.pop().ok_or_else(|| unexpected(IoResult::Done))?;
         self.counted.insert(install_id, rows.len());
         Ok(())
     }
 
-    pub fn counted(self) -> BTreeMap<Ulid, usize> {
+    pub(crate) fn counted(self) -> BTreeMap<Ulid, usize> {
         self.counted
     }
 }
@@ -245,7 +249,7 @@ impl Counting {
 /// The forward rows and gap counts of one transaction, with each install's queued count. Gaps
 /// are counted once their stored rows are read, see [`Outbox::gap_ask`].
 #[derive(Debug, PartialEq)]
-pub struct Outbox {
+pub(crate) struct Outbox {
     now_ms: u64,
     forward: Vec<Row>,
     queued: BTreeMap<Ulid, usize>,
@@ -261,7 +265,7 @@ enum Lost {
 
 impl Outbox {
     /// An outbox over the queued counts of the installs it offers rows to.
-    pub fn new(now_ms: u64, queued: BTreeMap<Ulid, usize>) -> Self {
+    pub(crate) fn new(now_ms: u64, queued: BTreeMap<Ulid, usize>) -> Self {
         Self {
             now_ms,
             forward: Vec::new(),
@@ -272,7 +276,7 @@ impl Outbox {
 
     /// Queues the event of the journal row `key` for the install at `revision`, or counts a gap
     /// when the row is stale or the install has `bound` rows queued.
-    pub fn offer(
+    pub(crate) fn offer(
         &mut self,
         (install_id, revision): (Ulid, u64),
         key: &[u8],
@@ -303,7 +307,7 @@ impl Outbox {
     }
 
     /// Counts one undelivered event of `kind` with the anchor `anchor_ms`.
-    pub fn gap(
+    pub(crate) fn gap(
         &mut self,
         install_id: Ulid,
         (kind, anchor_ms): (SourceKind, u64),
@@ -314,7 +318,7 @@ impl Outbox {
     }
 
     /// Counts a lost range of events of unknown size between two times.
-    pub fn lost_range(
+    pub(crate) fn lost_range(
         &mut self,
         install_id: Ulid,
         (kind, reason): (SourceKind, GapReason),
@@ -326,7 +330,7 @@ impl Outbox {
     }
 
     /// The read of every gap row the outbox counts in, each once.
-    pub fn gap_ask(&self) -> IoCall {
+    pub(crate) fn gap_ask(&self) -> IoCall {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
         read_call(
             keys.into_iter()
@@ -337,7 +341,7 @@ impl Outbox {
 
     /// The forward rows and the counted gap rows, from the stored gap rows `values` that
     /// [`Outbox::gap_ask`] read.
-    pub fn rows(self, values: Vec<Option<Vec<u8>>>) -> Result<Vec<Row>, StoreError> {
+    pub(crate) fn rows(self, values: Vec<Option<Vec<u8>>>) -> Result<Vec<Row>, StoreError> {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
         if keys.len() != values.len() {
             let counts = (values.len(), keys.len());

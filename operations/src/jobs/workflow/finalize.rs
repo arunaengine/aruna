@@ -31,11 +31,11 @@ use super::settle::{
 };
 use super::workspace::merge_outputs;
 use crate::jobs::output_record::StoreOutputsOperation;
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{
     ExecutionCompleteOutcome, RunSuccess, complete_execution, record_attempt_started,
     transition_to_cancelling,
 };
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::{read_attempt_control, read_job_record};
 
 /// What a run is being finalized for.

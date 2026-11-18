@@ -37,11 +37,11 @@ use crate::jobs::runtime_steps::{
     LeasePageOperation, RecoverJobOperation, Recovery, SettleRunOperation, TerminalWrite,
     TerminalWriteOperation, log_terminal,
 };
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{
     ReleaseOutcome, flush_progress, handoff_external_attempt, release_job, renew_lease,
     transition_to_running,
 };
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::schedule_drain_effect;
 use crate::jobs::workflow::ExecutionRunOperation;

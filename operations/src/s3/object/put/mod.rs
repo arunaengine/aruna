@@ -393,7 +393,7 @@ pub struct PutObjectOperation {
     registered: bool,
     row_fence: Option<RowFence>,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
-    pub set_hint: Option<SetHint>,
+    pub(crate) set_hint: Option<SetHint>,
     /// The bucket's distribution binding, whose inventory the version transaction maintains.
     binding: Option<DistributionBinding>,
     /// The coordinator authority the write was routed under; the version transaction rechecks it.

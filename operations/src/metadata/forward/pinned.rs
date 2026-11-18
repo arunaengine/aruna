@@ -15,7 +15,7 @@ use aruna_core::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::write::CreateAuthorizedError;
+use super::authorized_create::CreateAuthorizedError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::is_user_origin;
 use crate::forward::transport::MetadataWriteError;

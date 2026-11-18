@@ -6,16 +6,15 @@
 use std::collections::BTreeMap;
 
 use aruna_core::compute::Secret;
-use aruna_core::document::DocumentTarget;
-use aruna_core::realm_vault::RealmKeys;
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, SecretFields};
-use ed25519_dalek::SigningKey;
+use aruna_core::secrets::Delivery;
+use aruna_core::secrets::ResponseExposure;
+use aruna_core::secrets::SecretFields;
 use serde_json::json;
 
 use super::*;
-use crate::driver::{DriverContext, drive};
+use crate::driver::drive;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::{Fixture, REALM_KEY};
+use crate::plugins::install::tests::Fixture;
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
 #[allow(unused_imports)]

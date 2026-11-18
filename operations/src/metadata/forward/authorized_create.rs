@@ -15,11 +15,11 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::telemetry::record_stage;
 use aruna_core::types::GroupId;
+use thiserror::Error;
 use ulid::Ulid;
 
 use super::pinned::PinnedCreate;
 use super::route_create::RouteCreateOperation;
-use super::write::CreateAuthorizedError;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -38,6 +38,31 @@ use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
+
+/// Errors of the shared authorized create flow. Every variant maps onto the
+/// same transport status the former REST-local sequence produced.
+#[derive(Debug, Error, PartialEq)]
+pub enum CreateAuthorizedError {
+    #[error("metadata document path must not be empty")]
+    EmptyPath,
+    #[error("metadata create is forbidden")]
+    Forbidden,
+    #[error(transparent)]
+    Api(#[from] MetadataApiError),
+    #[error(transparent)]
+    Create(#[from] CreateDocumentError),
+    #[error(transparent)]
+    Authorize(#[from] AuthorizeError),
+    #[error(transparent)]
+    Write(#[from] MetadataWriteError),
+}
+
+/// A runner failure leaves the create undelivered.
+impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Write(error.into())
+    }
+}
 
 type CreateTurn = Result<Next<MetadataRegistryRecord>, CreateAuthorizedError>;
 

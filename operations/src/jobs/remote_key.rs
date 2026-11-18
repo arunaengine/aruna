@@ -34,7 +34,7 @@ use crate::jobs::key_locks::{
 };
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::remote_wait::{
     OwedPage, OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };

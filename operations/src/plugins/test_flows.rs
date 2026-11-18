@@ -100,11 +100,8 @@ pub mod events {
 
 pub mod submit {
     use crate::driver::DriverContext;
-    use crate::driver::drive;
-    use crate::plugins::calls::read_config;
     use crate::plugins::submit::UploadRequest;
     use crate::plugins::test_support::Fixture;
-    use crate::plugins::test_support::bound;
     use crate::plugins::test_support::edit_config;
     use crate::plugins::test_support::path;
     use crate::plugins::work::RequestContext;
@@ -162,8 +159,8 @@ pub mod submit {
         install: &PluginInstall,
     ) -> (tempfile::TempDir, DriverContext) {
         use crate::driver::drive;
-        use crate::s3::object::copy::test::{put_config, with_blob};
         use crate::s3::object::put::PutObjectOperation;
+        use crate::testing_objects::{put_config, with_blob};
         let root = tempfile::tempdir().unwrap();
         let blob = with_blob(&fixture.ctx, root.path()).await;
         let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);

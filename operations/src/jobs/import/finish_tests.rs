@@ -5,7 +5,7 @@
 use super::super::tests::{bucket, entry, hidden_location, plan, run};
 use super::*;
 use crate::jobs::repository::test_support::child;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 fn saved() -> IoResult {
     child(Ok::<_, JobMutationError>(()))

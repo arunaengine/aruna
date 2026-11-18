@@ -52,7 +52,7 @@ impl From<StoreError> for ArtifactError {
 }
 
 /// Whether `bytes` are exactly the artifact `plugin` publishes: digest, size and manifest.
-pub fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
+pub(crate) fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
     let digest = ArtifactDigest::of(bytes);
     if digest.as_str() != plugin.digest || bytes.len() as u64 != plugin.size {
         return Err(ArtifactError::Mismatch);
@@ -236,7 +236,7 @@ impl Operation for FetchArtifact {
 }
 
 /// Who may hand this node a copy to keep: only another management node, to a management node.
-pub fn check_store(
+pub(crate) fn check_store(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -251,7 +251,7 @@ pub fn check_store(
 }
 
 /// Who may fetch a copy from this node: infrastructure nodes, and only published digests.
-pub fn check_fetch(
+pub(crate) fn check_fetch(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -273,7 +273,7 @@ pub fn check_fetch(
 pub type ServingNode = (RealmId, NodeId);
 
 /// The realm config a peer request is decided on.
-pub fn served_config(result: IoResult) -> Result<RealmConfigDocument, MetadataReadError> {
+pub(crate) fn served_config(result: IoResult) -> Result<RealmConfigDocument, MetadataReadError> {
     (result.child::<RealmConfigDocument, GetConfigError>()?)
         .map_err(|_| MetadataReadError::Unavailable)
 }
@@ -282,7 +282,7 @@ pub fn served_config(result: IoResult) -> Result<RealmConfigDocument, MetadataRe
 /// completes the copy once all chunks arrived and the whole artifact checks out. A stored but
 /// never published copy only takes space.
 #[derive(Debug, PartialEq)]
-pub struct ServeStore {
+pub(crate) struct ServeStore {
     node: ServingNode,
     peer: NodeId,
     chunk: Option<Chunk>,
@@ -291,7 +291,7 @@ pub struct ServeStore {
 }
 
 impl ServeStore {
-    pub fn new(node: ServingNode, peer: NodeId, chunk: Chunk, now_ms: u64) -> Self {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, chunk: Chunk, now_ms: u64) -> Self {
         Self {
             node,
             peer,
@@ -336,7 +336,7 @@ impl Operation for ServeStore {
 
 /// The management side of a fetch: one chunk of a published artifact this node keeps.
 #[derive(Debug, PartialEq)]
-pub struct ServeFetch {
+pub(crate) struct ServeFetch {
     node: ServingNode,
     peer: NodeId,
     digest: String,
@@ -345,7 +345,7 @@ pub struct ServeFetch {
 }
 
 impl ServeFetch {
-    pub fn new(node: ServingNode, peer: NodeId, digest: String, index: u32) -> Self {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, digest: String, index: u32) -> Self {
         Self {
             node,
             peer,

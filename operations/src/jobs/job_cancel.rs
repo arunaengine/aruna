@@ -20,8 +20,8 @@ use super::lifecycle::family_reads::FamilyStatusOperation;
 use super::lifecycle::held::HeldReservations;
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome, RoutedJobStatus};
-use super::store::JobMutationError;
 use super::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
+use super::store::mutation_error::JobMutationError;
 use super::submit::schedule_drain_effect;
 
 fn drain_call() -> IoCall {

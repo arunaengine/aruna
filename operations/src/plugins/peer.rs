@@ -61,12 +61,20 @@ pub(crate) enum PeerAnswer {
 impl PeerAnswer {
     /// The answer of a node that cannot serve the request now.
     pub(crate) fn unavailable(self) -> MetadataTransportMessage {
-        let read = || Err(MetadataReadError::Unavailable);
+        use MetadataReadError::Unavailable;
         match self {
-            Self::Stored => MetadataTransportMessage::ArtifactStored { result: read() },
-            Self::Fetched => MetadataTransportMessage::FetchedArtifact { result: read() },
-            Self::Clock => MetadataTransportMessage::ClockProbed { result: read() },
-            Self::Decided => MetadataTransportMessage::EventsDecided { result: read() },
+            Self::Stored => MetadataTransportMessage::ArtifactStored {
+                result: Err(Unavailable),
+            },
+            Self::Fetched => MetadataTransportMessage::FetchedArtifact {
+                result: Err(Unavailable),
+            },
+            Self::Clock => MetadataTransportMessage::ClockProbed {
+                result: Err(Unavailable),
+            },
+            Self::Decided => MetadataTransportMessage::EventsDecided {
+                result: Err(Unavailable),
+            },
             Self::Released => MetadataTransportMessage::SecretReleased {
                 result: Err(ReleaseError::Unavailable("no network".to_string())),
             },

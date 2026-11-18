@@ -38,14 +38,14 @@ use crate::realm::mutate_placement::node_kind;
 
 /// An install as the realm config holds it now, for a caller proven group admin.
 #[derive(Debug, PartialEq)]
-pub struct LoadedInstall {
+pub(crate) struct LoadedInstall {
     config: Arc<RealmConfigDocument>,
     current: PluginInstall,
 }
 
 /// Reads the install and refuses a caller who is not an admin of its group.
 #[derive(Debug, PartialEq)]
-pub struct LoadInstall {
+pub(crate) struct LoadInstall {
     auth: AuthContext,
     realm_id: RealmId,
     install_id: Ulid,

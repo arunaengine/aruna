@@ -13,8 +13,9 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::rows::page_call;
+use crate::plugins::rows::read_call;
 use crate::plugins::rows::tests::{page_result, values_result};
-use crate::plugins::rows::{page_call, read_call, read_rows, write_rows};
 use crate::plugins::store::Txn;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::edit_work;

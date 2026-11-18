@@ -24,7 +24,7 @@ use crate::realm::mutate_placement::is_management;
 pub type RepairNode = (RealmId, NodeId);
 
 /// The repair of one install's account and role, as the admin who granted it.
-pub fn repair_account(
+pub(crate) fn repair_account(
     (realm_id, node_id): RepairNode,
     install: &PluginInstall,
     now_ms: u64,
@@ -48,7 +48,7 @@ pub fn repair_account(
 /// Repairs each settled install and answers how many changed; one that fails is logged and the
 /// others are still repaired.
 #[derive(Debug, PartialEq)]
-pub struct RepairSettled {
+pub(crate) struct RepairSettled {
     node: RepairNode,
     now_ms: u64,
     installs: VecDeque<PluginInstall>,
@@ -57,7 +57,7 @@ pub struct RepairSettled {
 }
 
 impl RepairSettled {
-    pub fn new(node: RepairNode, installs: &[PluginInstall], now_ms: u64) -> Self {
+    pub(crate) fn new(node: RepairNode, installs: &[PluginInstall], now_ms: u64) -> Self {
         let unsettled = [InstallState::Preparing, InstallState::Removing];
         let installs = (installs.iter())
             .filter(|install| !unsettled.contains(&install.state))

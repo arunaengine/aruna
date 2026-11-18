@@ -457,8 +457,8 @@ mod tests {
     use crate::jobs::executor::JobRunOutcome;
     use crate::jobs::runtime_steps::requeue_call;
     use crate::jobs::store::JobMutation;
-    use crate::jobs::store::JobMutationError;
     use crate::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
+    use crate::jobs::store::mutation_error::JobMutationError;
     use crate::jobs::store::test_calls::{
         adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job,
         list_job_entries, mutate_job, read_job_record, record_attempt_intent, requeue_job,

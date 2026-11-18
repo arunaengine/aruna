@@ -27,10 +27,10 @@ use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::create_document::CreateDocumentError;
+use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::authorized_create::CreateWithIdOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
 use crate::metadata::forward::routed_read::RoutedReadOperation;
-use crate::metadata::forward::write::CreateAuthorizedError;
 use crate::metadata::update_document::UpdateDocumentError;
 
 /// How the key row of a create was found.
@@ -68,7 +68,7 @@ pub enum Step {
 
 /// The next step of a keyed create from how its row was found and what a lookup found. A
 /// missing document is sent again only to the stored node, with the stored arguments.
-pub fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
+pub(crate) fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
     match (claim, lookup) {
         (Claim::Fresh, _) => Step::Dispatch,
         (Claim::Earlier, None) => Step::Lookup,
@@ -164,7 +164,7 @@ impl Operation for ClaimKey {
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
+pub(crate) fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
     SettleKey {
         row: create_key(install.install_id, key),
         account: install.account,
@@ -218,7 +218,7 @@ impl Operation for SettleKey {
 }
 
 /// The intent reply of a create: the document id and its establishing revision.
-pub fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+pub(crate) fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
     format!("{document_id} {revision}")
 }
 
