@@ -17,7 +17,7 @@ use aruna_core::request_policy::{
 };
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -206,17 +206,6 @@ impl PolicyEvaluator {
         drive(PolicyLoadOperation::new(realm_id, group_id), context).await
     }
 
-    pub async fn load_with_txn(
-        context: &DriverContext,
-        realm_id: RealmId,
-        group_id: GroupId,
-        txn_id: TxnId,
-    ) -> Result<Self, PolicyEnforcementError> {
-        let realm = realm_txn_scope(context, realm_id, txn_id).await?;
-        let group = Some(group_txn_scope(context, realm_id, group_id, txn_id).await?);
-        Ok(Self { realm, group })
-    }
-
     /// Loads one evaluator per distinct realm/group scope. Realm policy state is
     /// read once per realm, then each group is read once and evaluated in memory.
     pub async fn load_bulk(
@@ -322,43 +311,6 @@ async fn group_scope(
     group_id: GroupId,
 ) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
     match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
-        Ok((group, auth_doc)) => {
-            if group.realm_id != realm_id {
-                return Err(PolicyEnforcementError::Unavailable(
-                    "group belongs to another realm".to_string(),
-                ));
-            }
-            compile_scope(&auth_doc.policies, "group")
-        }
-        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => Err(group_unavailable()),
-        Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    }
-}
-
-async fn realm_txn_scope(
-    context: &DriverContext,
-    realm_id: RealmId,
-    txn_id: TxnId,
-) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(GetConfigOperation::new_with_txn(realm_id, txn_id), context).await {
-        Ok(config) => compile_scope(&config.request_policies, "realm"),
-        Err(GetConfigError::DocumentNotFound) => Err(realm_unavailable()),
-        Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    }
-}
-
-async fn group_txn_scope(
-    context: &DriverContext,
-    realm_id: RealmId,
-    group_id: GroupId,
-    txn_id: TxnId,
-) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(
-        GetGroupOperation::new_with_txn(GetGroupConfig { group_id }, txn_id),
-        context,
-    )
-    .await
-    {
         Ok((group, auth_doc)) => {
             if group.realm_id != realm_id {
                 return Err(PolicyEnforcementError::Unavailable(
