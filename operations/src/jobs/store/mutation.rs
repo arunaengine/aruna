@@ -547,3 +547,164 @@ pub(crate) fn forward<T>(next: Next<JobRecord>) -> Result<Next<T>, JobMutationEr
         ))),
     }
 }
+
+/// Rows of an in-memory store, by key space and key.
+#[cfg(test)]
+pub(crate) type Rows = std::collections::BTreeMap<(String, Vec<u8>), Vec<u8>>;
+
+/// Runs `operation` against `rows`, answering reads, pages, writes and deletes as storage would.
+#[cfg(test)]
+pub(crate) fn run_in_memory<O: Operation>(
+    mut operation: O,
+    rows: &mut Rows,
+) -> Result<O::Output, O::Error> {
+    let mut turn = operation.first();
+    loop {
+        let call = match turn? {
+            Next::Done(output) | Next::Then { output, .. } => return Ok(output),
+            Next::Wait => panic!("a store operation never waits"),
+            Next::Call(call) => call,
+        };
+        let result = match call {
+            IoCall::Read(reads) => IoResult::Values(
+                reads
+                    .into_iter()
+                    .map(|(space, key)| {
+                        let value = rows.get(&(space, key.to_vec()));
+                        value.map(|value| Value::from(value.as_slice()))
+                    })
+                    .collect(),
+            ),
+            IoCall::Page {
+                space,
+                prefix,
+                after,
+                limit,
+            } => {
+                let page: Vec<(Key, Value)> = rows
+                    .iter()
+                    .filter(|((row_space, key), _)| *row_space == space && key.starts_with(&prefix))
+                    .filter(|((_, key), _)| after.as_ref().is_none_or(|after| key[..] > after[..]))
+                    .take(limit)
+                    .map(|((_, key), value)| {
+                        (Key::from(key.as_slice()), Value::from(value.as_slice()))
+                    })
+                    .collect();
+                let next = (page.len() == limit)
+                    .then(|| page.last().map(|(key, _)| key.clone()))
+                    .flatten();
+                IoResult::Page { rows: page, next }
+            }
+            IoCall::Write(writes) => {
+                for (space, key, value) in writes {
+                    rows.insert((space, key.to_vec()), value.to_vec());
+                }
+                IoResult::Done
+            }
+            IoCall::Delete(deletes) => {
+                for (space, key) in deletes {
+                    rows.remove(&(space, key.to_vec()));
+                }
+                IoResult::Done
+            }
+            other => panic!("unexpected store call {other:?}"),
+        };
+        turn = operation.next(result);
+    }
+}
+
+/// The rows of one stored job, as an in-memory store.
+#[cfg(test)]
+pub(crate) fn seeded_rows(record: &JobRecord) -> Rows {
+    job_insert_entries(record)
+        .expect("job rows")
+        .into_iter()
+        .map(|(space, key, value)| ((space, key.to_vec()), value.to_vec()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    fn probe() -> JobRecord {
+        JobRecord::new(
+            JobId::from_bytes([4; 16]),
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            1_000,
+            1_000,
+            None,
+        )
+    }
+
+    fn stored(rows: &Rows, job_id: JobId) -> JobRecord {
+        let row = rows
+            .get(&(JOB_KEYSPACE.to_string(), job_record_key(job_id).to_vec()))
+            .expect("job row");
+        JobRecord::from_bytes(row).expect("job row decodes")
+    }
+
+    // A persisted change writes the job row in the same run; a skip writes nothing.
+    #[test]
+    fn writes_or_skips() {
+        let record = probe();
+        let mut rows = seeded_rows(&record);
+        let mut later = |record: &mut JobRecord| {
+            record.updated_at_ms = 2_000;
+            Ok(JobMutation::Persist)
+        };
+        let operation = MutateJobOperation::new(record.job_id, &mut later, None::<NoGuard>);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        let changed = run_in_memory(operation, &mut rows).expect("mutation");
+        assert_eq!(changed.updated_at_ms, 2_000);
+        assert_eq!(stored(&rows, record.job_id).updated_at_ms, 2_000);
+
+        let before = rows.clone();
+        let mut skip = |_: &mut JobRecord| Ok(JobMutation::Skip);
+        let operation = MutateJobOperation::new(record.job_id, &mut skip, None::<NoGuard>);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(changed));
+        assert_eq!(rows, before);
+    }
+
+    // A missing row is reported, and a guard refusal ends the run before any write.
+    #[test]
+    fn refuses_before_writing() {
+        let record = probe();
+        let mut rows = Rows::new();
+        let mut persist = |_: &mut JobRecord| Ok(JobMutation::Persist);
+        let operation = MutateJobOperation::new(record.job_id, &mut persist, None::<NoGuard>);
+        assert_eq!(
+            run_in_memory(operation, &mut rows),
+            Err(JobMutationError::NotFound)
+        );
+
+        let mut rows = seeded_rows(&record);
+        let before = rows.clone();
+        let mut later = |record: &mut JobRecord| {
+            record.updated_at_ms = 2_000;
+            Ok(JobMutation::Persist)
+        };
+        let mut guard = |_: &JobRecord, control: Option<&AttemptControl>| {
+            assert!(
+                control.is_none(),
+                "a record without an intent has no control"
+            );
+            Err(JobMutationError::EpochMismatch)
+        };
+        let operation = MutateJobOperation::new(record.job_id, &mut later, Some(&mut guard));
+        assert_eq!(
+            run_in_memory(operation, &mut rows),
+            Err(JobMutationError::EpochMismatch)
+        );
+        assert_eq!(rows, before);
+    }
+}
