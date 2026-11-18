@@ -22,12 +22,10 @@ use super::peer_auth::{
     bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
 };
 use super::query::query_local_graphs;
-use crate::metadata::message_kind::transport_message_kind;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, write_body_at, write_message_at, write_stream_body,
-    write_transport_message,
+    read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
 use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
@@ -39,6 +37,7 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
+use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
@@ -1050,19 +1049,46 @@ impl MetadataHandle {
             }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
-                    crate::device::forward::serve_realm_documents(context, peer, fetch).await
+                    drive(
+                        crate::device::forward::serve_realm_documents(
+                            context.node_and_realm(),
+                            peer,
+                            fetch,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             fetch @ MetadataTransportMessage::FetchGraphState { .. } => {
                 Box::pin(async {
-                    crate::device::forward::serve_graph_state(context, peer, fetch).await
+                    drive(
+                        crate::device::forward::serve_graph_state(
+                            context.node_and_realm(),
+                            peer,
+                            fetch,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardApplyBatch { .. } => {
                 Box::pin(async {
-                    crate::device::forward::apply_device_batch(context, peer, forward).await
+                    drive(
+                        crate::device::forward::apply_device_batch(
+                            context.node_and_realm(),
+                            peer,
+                            forward,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
