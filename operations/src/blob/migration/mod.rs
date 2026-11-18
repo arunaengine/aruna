@@ -1482,16 +1482,170 @@ mod tests {
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, MIGRATION_AHEAD_KEYSPACE,
-        RENAME_MOVE_KEYSPACE,
+        MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
     };
     use aruna_core::structs::storage::backend_import::RenameRequest;
     use aruna_core::structs::storage::format::{CompressionMigration, MigrationAhead};
 
     use super::drain::{
-        Handover, MIGRATION_TIME, MIGRATION_WORK, RETRY_BASE, RETRY_MAX, end_aborted, granted,
-        migrate_page, process_migrations, read_ahead, read_handover, read_progress, release_key,
-        rename_access, rename_request, settle_move, store_handover,
+        EndAbortedOperation, HandOverOperation, Handover, MIGRATION_TIME, MIGRATION_WORK,
+        MigratePageOperation, MigrationRun, ProcessMigrationsOperation, RETRY_BASE, RETRY_MAX,
+        RenameAccessOperation, SettleMoveOperation, decode_handover, decode_request, granted,
+        handover_call, release_key,
     };
+    use crate::auth::request_authorization::BucketAccess;
+    use crate::driver::{drive, node_routing};
+    use aruna_core::structs::storage::backend_import::WriteIntent;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
+
+    async fn row_value(
+        context: &crate::driver::DriverContext,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> Result<Option<Value>, String> {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::events::StorageEvent;
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            other => Err(other.label().to_string()),
+        }
+    }
+
+    async fn process_migrations(
+        context: &crate::driver::DriverContext,
+        after: Option<Key>,
+    ) -> Result<MigrationRun, String> {
+        let run =
+            ProcessMigrationsOperation::new(node_routing(context), context.node_and_realm(), after);
+        drive(run, context).await.map_err(|error| error.to_string())
+    }
+
+    async fn read_progress(
+        context: &crate::driver::DriverContext,
+        key: &Key,
+    ) -> Result<Option<CompressionMigration>, String> {
+        let value = row_value(context, COMPRESSION_MIGRATION_KEYSPACE, key.to_vec()).await?;
+        value
+            .map(|value| CompressionMigration::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    async fn read_ahead(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+    ) -> Result<Option<MigrationAhead>, String> {
+        let key = bucket.as_bytes().to_vec();
+        let value = row_value(context, MIGRATION_AHEAD_KEYSPACE, key).await?;
+        value
+            .map(|value| MigrationAhead::from_bytes(&value))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    async fn read_handover(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+    ) -> Result<Option<Handover>, String> {
+        let key = bucket.as_bytes().to_vec();
+        let value = row_value(context, MOVE_HANDOVER_KEYSPACE, key).await?;
+        decode_handover(value).map_err(|error| error.to_string())
+    }
+
+    /// Writes or deletes the hand-over row, as a hand-over run does.
+    #[derive(Debug, PartialEq)]
+    struct StoreHandover(Option<IoCall>);
+
+    impl Operation for StoreHandover {
+        type Output = ();
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            self.0.take().map(Next::Call).ok_or(IoError::Unfinished)
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            result.done()?;
+            Ok(Next::Done(()))
+        }
+    }
+
+    async fn store_handover(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+        handover: Option<&Handover>,
+    ) -> Result<(), String> {
+        let call = handover_call(bucket, handover).map_err(|error| error.to_string())?;
+        drive(StoreHandover(Some(call)), context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn rename_request(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+        record: &CompressionMigration,
+    ) -> Result<Option<RenameRequest>, String> {
+        let key = bucket.as_bytes().to_vec();
+        let value = row_value(context, RENAME_MOVE_KEYSPACE, key).await?;
+        decode_request(value, (record.moving, record.started_at_ms))
+            .map_err(|error| error.to_string())
+    }
+
+    async fn rename_access(
+        context: &crate::driver::DriverContext,
+        request: &RenameRequest,
+        routing: &RoutingSnapshot,
+        bucket: &str,
+    ) -> Result<Option<BucketAccess>, String> {
+        let access = RenameAccessOperation::new(request, routing.group_id, bucket);
+        drive(access, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn migrate_page(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+        record: CompressionMigration,
+        budget: Duration,
+    ) -> Result<Option<Duration>, String> {
+        let page = MigratePageOperation::new(node_routing(context), bucket, record, budget);
+        drive(page, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn end_aborted(
+        context: &crate::driver::DriverContext,
+        bucket: &str,
+        record: CompressionMigration,
+    ) -> Result<Option<Duration>, String> {
+        let end = EndAbortedOperation::new(node_routing(context), bucket, record);
+        drive(end, context).await.map_err(|error| error.to_string())
+    }
+
+    async fn settle_move(
+        context: &crate::driver::DriverContext,
+        version: &VersionKey,
+        intents: &[(Vec<u8>, WriteIntent)],
+    ) -> Result<bool, String> {
+        let settle = SettleMoveOperation::new(node_routing(context), version, intents.to_vec());
+        drive(settle, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn hand_over_first_reads_routing() {
+        let mut hand = HandOverOperation::new(Default::default(), "b", 1);
+        assert!(matches!(hand.first(), Ok(Next::Call(IoCall::Child(_)))));
+    }
 
     #[test]
     fn retries_unavailable_policy() {
