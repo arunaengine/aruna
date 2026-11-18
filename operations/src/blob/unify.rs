@@ -1,37 +1,28 @@
-//! Finds keys whose versions keep the same content in several linked files, lets those
-//! versions read one file and hands the other files to the release of renamed files.
+//! Finds keys whose versions keep the same content in several linked files, for the preview and
+//! the job that lets those versions read one file.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::request_authorization::BucketAccess;
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::import_rows::{BackendRulesOperation, SecondCopiesOperation};
-use crate::blob::migration::drain::move_routing;
-use crate::driver::DriverContext;
+use crate::blob::import_rows::{ImportRowsError, SecondCopiesOperation, SecondCopy};
+use crate::blob::migration::shared::{MigrationError, routing_call, routing_result};
+pub use crate::blob::unify_stage::Unified;
+use crate::blob::unify_stage::UnifyOperation;
 use crate::s3::bucket::job_progress::JobStep;
-use crate::storage_read::iter_prefix_page;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, RENAMED_ROW_KEYSPACE,
-};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PathIdentity, claim_key, names_version, object_key, version_key,
-};
+use aruna_core::structs::storage::backend_import::{BackendImport, PathIdentity, names_version};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobVersion, BlobVersionState, ManagedCopyKey,
-    ManagedCopyRecord, VersionKey,
+    BackendLocation, BackendRef, BlobVersion, BlobVersionState, VersionKey,
 };
-use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::linked_job::LinkedJob;
-use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::types::{GroupId, Key, Value};
-use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_core::types::{Key, Value};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::Arc;
 use ulid::Ulid;
 
 /// Version rows one storage read returns, and one preview or job page passes over at most.
@@ -43,7 +34,8 @@ const JOB_SCAN: usize = 20_000;
 const PREVIEW_CHECKS: usize = 5_000;
 /// Keys with copies one job page unifies at most.
 const JOB_KEYS: usize = 64;
-const RULE_PAGE: usize = 128;
+
+type Turn<T> = Result<Next<T>, MigrationError>;
 
 /// The linked files with the same content of one key: the one its versions keep and the
 /// copies the cleanup releases.
@@ -53,10 +45,10 @@ pub struct Duplicate {
     pub keep: BackendLocation,
     pub copies: Vec<BackendLocation>,
     /// The versions that read a copy now, with their stored rows.
-    versions: Vec<(Ulid, Vec<u8>)>,
+    pub(super) versions: Vec<(Ulid, Vec<u8>)>,
     /// Copies no version reads, which only a row names, by location id with their index row
     /// and the version that row named.
-    twins: Vec<(Ulid, Key, Ulid)>,
+    pub(super) twins: Vec<(Ulid, Key, Ulid)>,
 }
 
 impl Duplicate {
@@ -80,22 +72,32 @@ pub struct UnifyPage {
 /// A key the caller may read and, to continue within it, the content groups already shown.
 pub type Cursor = (String, Option<usize>);
 
-/// The versions of the keys of a bucket in storage order, one key at a time.
-pub(crate) struct KeyWalk<'a> {
-    context: &'a DriverContext,
-    bucket: &'a str,
-    start: Option<Key>,
-    rows: std::collections::VecDeque<(Key, Value)>,
-    end: bool,
-    pub(crate) scanned: usize,
-    /// Versions one key yields at most; a key with more is skipped and marks `cut`.
-    limit: usize,
-    pub(crate) cut: bool,
+/// What a [`KeyWalk`] needs or found next.
+#[derive(Debug, PartialEq)]
+enum WalkStep {
+    Read(IoCall),
+    Key(String, Vec<Reader>),
+    End,
 }
 
-impl<'a> KeyWalk<'a> {
+/// The versions of the keys of a bucket in storage order, one key at a time.
+#[derive(Debug, PartialEq)]
+struct KeyWalk {
+    bucket: String,
+    start: Option<Key>,
+    rows: VecDeque<(Key, Value)>,
+    end: bool,
+    scanned: usize,
+    /// Versions one key yields at most; a key with more is skipped and marks `cut`.
+    limit: usize,
+    cut: bool,
+    key: Option<String>,
+    versions: Vec<Reader>,
+}
+
+impl KeyWalk {
     /// Starts after every version of `after`.
-    pub(crate) fn new(context: &'a DriverContext, bucket: &'a str, after: Option<&str>) -> Self {
+    fn new(bucket: &str, after: Option<&str>) -> Self {
         let start = after.and_then(|key| VersionKey::object_prefix(bucket, key).ok());
         // Every version of the key sorts before its prefix followed by these bytes.
         let start = start.map(|mut prefix| {
@@ -103,77 +105,79 @@ impl<'a> KeyWalk<'a> {
             prefix.into()
         });
         Self {
-            context,
-            bucket,
+            bucket: bucket.to_string(),
             start,
-            rows: Default::default(),
+            rows: VecDeque::new(),
             end: false,
             scanned: 0,
             limit: usize::MAX,
             cut: false,
+            key: None,
+            versions: Vec::new(),
         }
     }
 
     /// Reads at most `limit` versions of one key before skipping the rest of it.
-    pub(crate) fn capped(mut self, limit: usize) -> Self {
+    fn capped(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
     }
 
     /// Starts at the first version of `key`.
-    pub(crate) fn from_key(context: &'a DriverContext, bucket: &'a str, key: &str) -> Self {
-        let mut walk = Self::new(context, bucket, None);
+    fn from_key(bucket: &str, key: &str) -> Self {
+        let mut walk = Self::new(bucket, None);
         walk.start = VersionKey::object_prefix(bucket, key).ok().map(Into::into);
         walk
     }
 
-    async fn fill(&mut self) -> Result<(), String> {
-        let prefix = VersionKey::bucket_prefix(self.bucket).map_err(|error| error.to_string())?;
-        let page = iter_prefix_page(
-            &self.context.storage_handle,
-            BLOB_VERSIONS_KEYSPACE,
-            Some(prefix.into()),
-            self.start.take(),
-            VERSION_PAGE,
-            None,
-        );
-        let (rows, next) = page.await?;
+    /// Takes the page a [`WalkStep::Read`] asked for.
+    fn fill(&mut self, result: IoResult) -> Result<(), MigrationError> {
+        let (rows, next) = result.page()?;
         self.end = next.is_none();
         self.start = rows.last().map(|(key, _)| key.clone());
         self.rows.extend(rows);
         Ok(())
     }
 
-    /// The next key and its versions; `None` at the end of the bucket.
-    pub(crate) async fn next(&mut self) -> Result<Option<(String, Vec<(Ulid, Vec<u8>)>)>, String> {
-        let mut key = None::<String>;
-        let mut versions = Vec::new();
-        self.cut = false;
+    fn emit(&mut self) -> WalkStep {
+        match self.key.take() {
+            Some(key) => WalkStep::Key(key, std::mem::take(&mut self.versions)),
+            None => WalkStep::End,
+        }
+    }
+
+    /// The next key and its versions, the page it needs first, or the end of the bucket.
+    fn advance(&mut self) -> Result<WalkStep, MigrationError> {
+        if self.key.is_none() {
+            self.cut = false;
+        }
         loop {
-            if self.rows.is_empty() {
+            let Some((raw, value)) = self.rows.front().cloned() else {
                 if self.end {
-                    return Ok(key.map(|key| (key, versions)));
+                    return Ok(self.emit());
                 }
-                self.fill().await?;
-                continue;
-            }
-            let (raw, value) = &self.rows[0];
-            let version = VersionKey::from_bytes(raw).map_err(|error| error.to_string())?;
-            match key.as_deref() {
-                Some(current) if current != version.key => return Ok(key.map(|k| (k, versions))),
-                Some(current) if versions.len() == self.limit => {
+                return Ok(WalkStep::Read(IoCall::Page {
+                    space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    prefix: VersionKey::bucket_prefix(&self.bucket)?.into(),
+                    after: self.start.take(),
+                    limit: VERSION_PAGE,
+                }));
+            };
+            let version = VersionKey::from_bytes(&raw)?;
+            match self.key.as_deref() {
+                Some(current) if current != version.key => return Ok(self.emit()),
+                Some(current) if self.versions.len() == self.limit => {
                     // Every version of the key sorts before its prefix followed by these bytes.
-                    let mut after = VersionKey::object_prefix(self.bucket, current)
-                        .map_err(|error| error.to_string())?;
+                    let mut after = VersionKey::object_prefix(&self.bucket, current)?;
                     after.extend([u8::MAX; 32]);
                     (self.start, self.end, self.cut) = (Some(after.into()), false, true);
                     self.rows.clear();
-                    return Ok(key.map(|k| (k, versions)));
+                    return Ok(self.emit());
                 }
                 Some(_) => {}
-                None => key = Some(version.key.clone()),
+                None => self.key = Some(version.key.clone()),
             }
-            versions.push((version.version_id, value.to_vec()));
+            self.versions.push((version.version_id, value.to_vec()));
             self.scanned += 1;
             self.rows.pop_front();
         }
@@ -184,18 +188,183 @@ impl<'a> KeyWalk<'a> {
 type Member = (Ulid, Vec<u8>, Ulid);
 /// A version with its stored row.
 type Reader = (Ulid, Vec<u8>);
+/// A linked file with the versions that read it.
+type File = (BackendLocation, Vec<Reader>);
+/// The members of one content on one backend.
+type Group = (([u8; 32], Vec<u8>), Vec<Member>);
+
+#[derive(Debug, PartialEq)]
+enum DuplicateStep {
+    Twins,
+    Locations(Group, Vec<Reader>),
+}
 
 /// The linked files of `key` with the same content as another of its files, by content.
-async fn duplicates(
-    context: &DriverContext,
-    routing: Option<&RoutingSnapshot>,
-    (bucket, key): (&str, &str),
-    versions: Vec<(Ulid, Vec<u8>)>,
-) -> Result<Vec<Duplicate>, String> {
-    let mut found = Vec::new();
+#[derive(Debug, PartialEq)]
+struct DuplicatesOperation {
+    routing: Option<Arc<RoutingSnapshot>>,
+    bucket: String,
+    key: String,
+    versions: Vec<Reader>,
+    groups: VecDeque<Group>,
+    twins: Vec<SecondCopy>,
+    step: DuplicateStep,
+    found: Vec<Duplicate>,
+}
+
+impl DuplicatesOperation {
+    fn new(
+        routing: Option<Arc<RoutingSnapshot>>,
+        (bucket, key): (&str, &str),
+        versions: Vec<Reader>,
+    ) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            versions,
+            groups: VecDeque::new(),
+            twins: Vec::new(),
+            step: DuplicateStep::Twins,
+            found: Vec::new(),
+        }
+    }
+
+    fn twins_of(&self, (hash, backend): &([u8; 32], Vec<u8>)) -> Vec<SecondCopy> {
+        (self.twins.iter())
+            .filter(|(file, ..)| {
+                file.get_blake3() == Some(&hash[..]) && file.backend.key_bytes() == *backend
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn next_group(&mut self) -> Turn<Vec<Duplicate>> {
+        while let Some(group) = self.groups.pop_front() {
+            // Only content that two files hold needs its location rows read.
+            let twins = self.twins_of(&group.0);
+            let mut files: HashSet<_> = group.1.iter().map(|(.., at)| *at).collect();
+            files.extend(twins.iter().map(|(file, ..)| file.ulid));
+            if files.len() < 2 {
+                continue;
+            }
+            let mut reads = Vec::new();
+            let mut readers = Vec::new();
+            for (id, value, _) in &group.1 {
+                let version = BlobVersion::from_bytes(value)?;
+                let Some(location_key) = version.location_key() else {
+                    continue;
+                };
+                reads.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    location_key.to_bytes().into(),
+                ));
+                readers.push((*id, value.clone()));
+            }
+            if reads.is_empty() {
+                self.add_group(&group, Vec::new(), Vec::new())?;
+                continue;
+            }
+            self.step = DuplicateStep::Locations(group, readers);
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.found)))
+    }
+
+    fn add_group(
+        &mut self,
+        group: &Group,
+        readers: Vec<Reader>,
+        values: Vec<Option<Value>>,
+    ) -> Result<(), MigrationError> {
+        let mut files: Vec<File> = Vec::new();
+        for ((id, value), row) in readers.into_iter().zip(values) {
+            let Some(row) = row else {
+                continue;
+            };
+            let location = BackendLocation::from_bytes(&row)?;
+            if !location.is_external() || location.staging || location.partial {
+                continue;
+            }
+            let known = files
+                .iter_mut()
+                .find(|(file, _)| file.ulid == location.ulid);
+            match known {
+                Some((_, readers)) => readers.push((id, value)),
+                None => files.push((location, vec![(id, value)])),
+            }
+        }
+        let twins = self.twins_of(&group.0);
+        for (file, ..) in &twins {
+            if !files.iter().any(|(known, _)| known.ulid == file.ulid) {
+                files.push((file.clone(), Vec::new()));
+            }
+        }
+        if files.len() < 2 {
+            return Ok(());
+        }
+        let routing = self.routing.as_deref();
+        let keep = kept_file(routing, (&self.bucket, &self.key), &files);
+        let (keep, _) = files.remove(keep);
+        let versions = files
+            .iter()
+            .flat_map(|(_, readers)| readers.clone())
+            .collect();
+        let copies: Vec<BackendLocation> = files.into_iter().map(|(file, _)| file).collect();
+        let listed = |file: &BackendLocation| {
+            file.ulid == keep.ulid || copies.iter().any(|copy| copy.ulid == file.ulid)
+        };
+        let twins = (twins.into_iter())
+            .filter(|(file, ..)| listed(file))
+            .map(|(file, index, version)| (file.ulid, index, version))
+            .collect();
+        self.found.push(Duplicate {
+            key: self.key.clone(),
+            keep,
+            copies,
+            versions,
+            twins,
+        });
+        Ok(())
+    }
+}
+
+impl Operation for DuplicatesOperation {
+    type Output = Vec<Duplicate>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Vec<Duplicate>> {
+        let groups = content_groups(std::mem::take(&mut self.versions))?;
+        let ids = versions_of(&groups);
+        self.groups = groups.into_iter().collect();
+        let twins =
+            SecondCopiesOperation::new(self.routing.as_deref(), (&self.bucket, &self.key), &ids)
+                .map_err(MigrationError::failed)?;
+        Ok(Next::Call(IoCall::child(twins)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Vec<Duplicate>> {
+        match std::mem::replace(&mut self.step, DuplicateStep::Twins) {
+            DuplicateStep::Twins => {
+                self.twins = (result.child::<Vec<SecondCopy>, ImportRowsError>()?)
+                    .map_err(MigrationError::failed)?;
+                self.next_group()
+            }
+            DuplicateStep::Locations(group, readers) => {
+                self.add_group(&group, readers, result.values()?)?;
+                self.next_group()
+            }
+        }
+    }
+}
+
+/// The versions on tenant storage with a linked or shared raw file, by content and backend.
+fn content_groups(
+    versions: Vec<Reader>,
+) -> Result<BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>, MigrationError> {
     let mut groups: BTreeMap<([u8; 32], Vec<u8>), Vec<Member>> = BTreeMap::new();
     for (id, value) in versions {
-        let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
+        let version = BlobVersion::from_bytes(&value)?;
         let BlobVersionState::Materialized {
             blob_hash,
             backend: backend @ BackendRef::Group(_),
@@ -214,108 +383,46 @@ async fn duplicates(
         let group = (*blob_hash, backend.key_bytes());
         groups.entry(group).or_default().push((id, value, file));
     }
-    let twins = second_copies(context, routing, (bucket, key), &versions_of(&groups)).await?;
-    for ((hash, backend), members) in groups {
-        let twins: Vec<_> = (twins.iter())
-            .filter(|(file, ..)| {
-                file.get_blake3() == Some(&hash[..]) && file.backend.key_bytes() == backend
-            })
-            .collect();
-        // Only content that two files hold needs its location rows read.
-        let mut files: std::collections::HashSet<_> = members.iter().map(|(.., at)| *at).collect();
-        files.extend(twins.iter().map(|(file, ..)| file.ulid));
-        if files.len() < 2 {
-            continue;
-        }
-        let mut files: Vec<(BackendLocation, Vec<Reader>)> = Vec::new();
-        for (id, value, _) in &members {
-            let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
-            let Some(location_key) = version.location_key() else {
-                continue;
-            };
-            let read = read(
-                context,
-                BLOB_LOCATIONS_KEYSPACE,
-                location_key.to_bytes().into(),
-            );
-            let Some(row) = read.await? else {
-                continue;
-            };
-            let location = BackendLocation::from_bytes(&row).map_err(|error| error.to_string())?;
-            if !location.is_external() || location.staging || location.partial {
-                continue;
-            }
-            match files
-                .iter_mut()
-                .find(|(file, _)| file.ulid == location.ulid)
-            {
-                Some((_, readers)) => readers.push((*id, value.clone())),
-                None => files.push((location, vec![(*id, value.clone())])),
-            }
-        }
-        for (file, ..) in &twins {
-            if !files.iter().any(|(known, _)| known.ulid == file.ulid) {
-                files.push((file.clone(), Vec::new()));
-            }
-        }
-        if files.len() < 2 {
-            continue;
-        }
-        // A plain name is kept, one a version read before a second copy first; a file whose
-        // name carries the id of a version reading it goes. Without a plain name the newest stays.
-        let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
-        let plain = |(file, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
-            !readers
-                .iter()
-                .any(|(id, _)| id_named(rules, &file.backend_path, *id))
-        };
-        let newest = |(_, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
-            readers.iter().map(|(id, _)| *id).max()
-        };
-        // Among files all named by ids, the one the current pattern names stays.
-        let current = |(file, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
-            readers.iter().any(|(id, _)| {
-                let target = routing.and_then(|routing| routing.plain_target(bucket, key, *id));
-                target.is_some_and(|target| target.path == file.backend_path)
-            })
-        };
-        let read = files
+    Ok(groups)
+}
+
+/// The file a key keeps. A plain name is kept, one a version read before a second copy first; a
+/// file whose name carries the id of a version reading it goes. Without a plain name the newest
+/// stays.
+fn kept_file(
+    routing: Option<&RoutingSnapshot>,
+    (bucket, key): (&str, &str),
+    files: &[File],
+) -> usize {
+    let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
+    let plain = |(file, readers): &File| {
+        !readers
             .iter()
-            .position(|file| plain(file) && !file.1.is_empty());
-        let named = files.iter().position(current);
-        let keep = match read.or_else(|| files.iter().position(plain)).or(named) {
-            Some(at) => at,
-            None => (0..files.len())
-                .max_by_key(|at| newest(&files[*at]))
-                .unwrap_or_default(),
-        };
-        let (keep, _) = files.remove(keep);
-        let versions = files
-            .iter()
-            .flat_map(|(_, readers)| readers.clone())
-            .collect();
-        let copies: Vec<BackendLocation> = files.into_iter().map(|(file, _)| file).collect();
-        let listed = |file: &BackendLocation| {
-            file.ulid == keep.ulid || copies.iter().any(|copy| copy.ulid == file.ulid)
-        };
-        let twins = (twins.into_iter())
-            .filter(|(file, ..)| listed(file))
-            .map(|(file, index, version)| (file.ulid, index.clone(), *version))
-            .collect();
-        found.push(Duplicate {
-            key: key.to_string(),
-            keep,
-            copies,
-            versions,
-            twins,
-        });
+            .any(|(id, _)| id_named(rules, &file.backend_path, *id))
+    };
+    let newest = |(_, readers): &File| readers.iter().map(|(id, _)| *id).max();
+    // Among files all named by ids, the one the current pattern names stays.
+    let current = |(file, readers): &File| {
+        readers.iter().any(|(id, _)| {
+            let target = routing.and_then(|routing| routing.plain_target(bucket, key, *id));
+            target.is_some_and(|target| target.path == file.backend_path)
+        })
+    };
+    let read = files
+        .iter()
+        .position(|file| plain(file) && !file.1.is_empty());
+    let named = files.iter().position(current);
+    match read.or_else(|| files.iter().position(plain)).or(named) {
+        Some(at) => at,
+        None => (0..files.len())
+            .max_by_key(|at| newest(&files[*at]))
+            .unwrap_or_default(),
     }
-    Ok(found)
 }
 
 /// Whether a rule's write pattern gives `path` the version id `id`, or its file name has it
 /// in the id slot of Aruna's names.
-fn id_named(rules: &[BackendImport], path: &str, id: Ulid) -> bool {
+pub(super) fn id_named(rules: &[BackendImport], path: &str, id: Ulid) -> bool {
     names_version(path, id)
         || rules.iter().any(|rule| {
         matches!(rule.decode_any(path, &[]), PathIdentity::Decoded { id: named, .. } if named == id)
