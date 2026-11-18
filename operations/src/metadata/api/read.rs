@@ -456,14 +456,9 @@ pub(crate) async fn ensure_record_readable(
             crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
         );
         let result = match txn_id {
-            Some(txn_id) => crate::auth::enforcement::PolicyEvaluator::load_with_txn(
-                context,
-                realm_id,
-                record.group_id,
-                txn_id,
-            )
-            .await
-            .and_then(|evaluator| evaluator.evaluate(&request)),
+            Some(txn_id) => policies_in(context, realm_id, record.group_id, txn_id)
+                .await
+                .and_then(|evaluator| evaluator.evaluate(&request)),
             None => crate::auth::enforcement::enforce_policies(context, realm_id, &request).await,
         };
         return result.map_err(|_| MetadataApiError::NotFound);
@@ -557,7 +552,8 @@ pub(super) async fn ensure_permission(
     let checked = async {
         match txn_id {
             Some(txn_id) => {
-                drive(CheckPermissionsOperation::new_with_txn(config, txn_id), context).await
+                let values = rows_in(context, config.reads()?, txn_id).await?;
+                config.allowed(values)
             }
             None => drive(CheckPermissionsOperation::new(config), context).await,
         }
@@ -583,15 +579,50 @@ pub(super) async fn ensure_permission(
         crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
     );
     match txn_id {
-        Some(txn_id) => crate::auth::enforcement::PolicyEvaluator::load_with_txn(
-            context, realm_id, group_id, txn_id,
-        )
-        .await
-        .and_then(|evaluator| evaluator.evaluate(&request))
-        .map_err(|_| MetadataApiError::Forbidden)?,
+        Some(txn_id) => policies_in(context, realm_id, group_id, txn_id)
+            .await
+            .and_then(|evaluator| evaluator.evaluate(&request))
+            .map_err(|_| MetadataApiError::Forbidden)?,
         None => crate::auth::enforcement::enforce_policies(context, realm_id, &request)
             .await
             .map_err(|_| MetadataApiError::Forbidden)?,
     }
     Ok(())
+}
+
+/// Reads `reads` inside the caller's transaction and answers their values in that order.
+async fn rows_in(
+    context: &DriverContext,
+    reads: Vec<(String, aruna_core::types::Key)>,
+    txn_id: TxnId,
+) -> Result<Vec<Option<aruna_core::types::Value>>, aruna_core::errors::StorageError> {
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            Ok(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error),
+        other => Err(aruna_core::errors::StorageError::ReadError(
+            other.label().to_string(),
+        )),
+    }
+}
+
+/// The realm's and the group's policies, read inside the caller's transaction.
+async fn policies_in(
+    context: &DriverContext,
+    realm_id: RealmId,
+    group_id: GroupId,
+    txn_id: TxnId,
+) -> Result<crate::auth::enforcement::PolicyEvaluator, crate::auth::error::PolicyEnforcementError> {
+    use crate::auth::enforcement::{policy_reads, read_policies};
+    use crate::auth::error::PolicyEnforcementError;
+    let reads = policy_reads(realm_id, Some(group_id));
+    let values = rows_in(context, reads, txn_id)
+        .await
+        .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
+    read_policies(realm_id, Some(group_id), values)
 }

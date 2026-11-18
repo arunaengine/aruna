@@ -5,8 +5,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
-use aruna_core::events::StorageEvent;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
@@ -18,6 +20,7 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, Value};
 use tempfile::tempdir;
 
 use super::*;
@@ -585,28 +588,43 @@ async fn missing_config_absent() {
 
 #[test]
 fn mutation_schedules_revalidation() {
+    // After the commit the outbox drain and the placement revalidation are woken.
     let realm_id = RealmId::from_bytes([6; 32]);
     let actor = actor(realm_id);
-    let mut operation = MutatePlacementOperation::new(MutatePlacementConfig {
+    let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    document.seed_default_placement();
+    document.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let operation = MutatePlacementOperation::new(MutatePlacementConfig {
         actor: actor.clone(),
         mutation: RealmPlacementMutation::RemoveOverride(Vec::new()),
     });
-    operation.state = MutatePlacementState::ScheduleSyncDrain;
-
-    let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainSyncOutbox,
-        after: std::time::Duration::ZERO,
-    }));
-
+    let mut write = operation.write();
+    assert_eq!(write.transaction(), TransactionMode::Write);
+    write.first().unwrap();
+    let read = IoResult::Values(vec![Some(document.to_bytes(&actor).unwrap().into()), None]);
+    assert!(matches!(write.next(read), Ok(Next::Call(IoCall::Write(_)))));
+    let Ok(Next::Then { calls, .. }) = write.next(IoResult::Done) else {
+        panic!("expected the config with the timers");
+    };
+    let [IoCall::Effect(drain), IoCall::Effect(revalidate)] = calls.as_slice() else {
+        panic!("expected the drain and the revalidation");
+    };
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Task(TaskEffect::ResetTimer {
+        drain.as_ref(),
+        Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainSyncOutbox,
+            ..
+        })
+    ));
+    assert!(matches!(
+        revalidate.as_ref(),
+        Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::SyncPlacements {
                 realm_id: scheduled_realm,
                 node_id,
             },
             after,
-        })] if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
+        }) if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
     ));
 }
 
@@ -1464,33 +1482,33 @@ fn placement_config(actor: &Actor) -> MutatePlacementConfig {
     }
 }
 
-#[test]
-fn authorized_checks_permission() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
+fn checked(
+    allowed: Result<bool, AuthorizationError>,
+) -> Result<Next<RealmConfigDocument>, MutatePlacementError> {
+    let actor = actor(RealmId::from_bytes([1; 32]));
     let mut operation =
         MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    let effects = operation.start();
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-    let emitted = format!("{effects:?}");
-    assert!(emitted.contains(&policy_admin_path(realm_id)));
-    assert!(emitted.contains("WRITE"));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    operation.next(IoResult::Child(ChildOutcome::new(allowed)))
+}
+
+#[test]
+fn authorized_checks_permission() {
+    // The caller's check runs first; an allowed one hands over to the write child.
+    assert!(matches!(
+        checked(Ok(true)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
 }
 
 #[test]
 fn denied_is_terminal() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    let effects = operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-    ));
-    assert!(effects.is_empty());
-    assert!(operation.is_complete());
+    let actor = actor(RealmId::from_bytes([1; 32]));
     assert_eq!(
-        operation.finalize(),
+        checked(Ok(false)),
         Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })
@@ -1500,21 +1518,9 @@ fn denied_is_terminal() {
 #[test]
 fn capacity_not_denied() {
     // Storage exhaustion inside the check is infrastructure, not a verdict.
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult {
-            allowed: Err(AuthorizationError::StorageError(
-                StorageError::CleanupCapacity,
-            )),
-        },
-    ));
-    assert!(operation.is_complete());
+    let capacity = AuthorizationError::StorageError(StorageError::CleanupCapacity);
     assert_eq!(
-        operation.finalize(),
+        checked(Err(capacity)),
         Err(MutatePlacementError::StorageError(
             StorageError::CleanupCapacity
         ))
@@ -1523,15 +1529,13 @@ fn capacity_not_denied() {
 
 #[test]
 fn internal_skips_authorization() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
+    let actor = actor(RealmId::from_bytes([1; 32]));
     let mut operation = MutatePlacementOperation::new(placement_config(&actor));
-    assert_eq!(
-        operation.start().as_slice(),
-        &[Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    );
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(operation.checked);
 }
 
 #[test]
@@ -1541,26 +1545,12 @@ fn refuses_server_node() {
     let actor = actor(realm_id);
     let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     document.ensure_node(actor.node_id, RealmNodeKind::Server);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([7; 16]),
-    }));
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                Key::from(vec![0u8]),
-                Some(document.to_bytes(&actor).unwrap().into()),
-            ),
-            (Key::from(vec![1u8]), None),
-        ],
-    }));
+    let operation = MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
+    let mut write = operation.write();
+    write.first().unwrap();
+    let read = IoResult::Values(vec![Some(document.to_bytes(&actor).unwrap().into()), None]);
     assert_eq!(
-        operation.finalize(),
+        write.next(read),
         Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })
