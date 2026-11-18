@@ -4,33 +4,30 @@
 
 use super::create::{CreateBackendError, CreateBackendInput};
 use super::validation::{check_identity, check_import_root, validate_backend_input};
-use super::{backend_key, parse_read, record_writes};
+use super::{backend_key, record_writes};
 use crate::storage_read::StorageReadError;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::SecretBytes;
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use std::time::SystemTime;
 use ulid::Ulid;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Where a replacement stands before its write transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplaceState {
-    Init,
     ReadRecord,
     ReadSecret,
     Probe,
-    StartTransaction,
-    VerifyRecord,
-    WriteRecords,
-    WriteSecret,
-    CommitTransaction,
-    AbortTransaction,
-    Finish,
-    Error,
+    Write,
 }
+
+type ReplaceTurn = Result<Next<GroupStorage>, CreateBackendError>;
 
 /// Changes a tenant backend's credentials and name in place. The id and the
 /// store it names both survive, so the objects already stamped with this
@@ -45,9 +42,7 @@ pub struct ReplaceBackendOperation {
     existing: Option<GroupStorage>,
     /// A change without keys never writes the vault, so a rotation meanwhile stays.
     keep_secret: bool,
-    txn_id: Option<TxnId>,
     state: ReplaceState,
-    output: Option<Result<GroupStorage, CreateBackendError>>,
 }
 
 impl ReplaceBackendOperation {
@@ -59,74 +54,50 @@ impl ReplaceBackendOperation {
             secret: None,
             existing: None,
             keep_secret: false,
-            txn_id: None,
-            state: ReplaceState::Init,
-            output: None,
+            state: ReplaceState::ReadRecord,
         }
     }
 
-    fn fail(&mut self, error: CreateBackendError) -> Effects {
-        self.output = Some(Err(error));
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = ReplaceState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.state = ReplaceState::Error;
-        smallvec![]
-    }
-
-    fn handle_existing(&mut self, event: Event) -> Effects {
+    fn handle_existing(&mut self, value: Option<Value>) -> ReplaceTurn {
         // Allowed while disabled: a leaked credential must be replaceable
         // without first enabling the backend for writes again.
-        let existing = match parse_read(event, GroupStorage::from_bytes) {
-            Ok(Some(record)) if record.group_id == self.input.group_id => record,
-            Ok(_) => return self.fail(CreateBackendError::NotFound),
-            Err(error) => return self.fail(CreateBackendError::Read(error)),
-        };
+        let existing = stored_record(value, self.input.group_id)?;
         // A change without keys keeps the stored ones.
         if self.input.secret_config.is_empty() {
             self.keep_secret = true;
             self.existing = Some(existing);
             self.state = ReplaceState::ReadSecret;
             let entry = GroupStorageSecret::vault_entry(self.backend_id);
-            return smallvec![crate::node_vault::read_secret(entry, None)];
+            let read = crate::node_vault::read_secret(entry, None);
+            return Ok(Next::Call(IoCall::Effect(Box::new(read))));
         }
         self.prepare(existing)
     }
 
-    fn handle_secret(&mut self, event: Event) -> Effects {
+    fn handle_secret(&mut self, event: Event) -> ReplaceTurn {
         let entry = GroupStorageSecret::vault_entry(self.backend_id);
         let secret = crate::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes);
         let secret = match secret {
             Ok(Some(secret)) => secret,
-            Ok(None) => return self.fail(CreateBackendError::NotFound),
-            Err(StorageReadError::Storage(error)) => return self.fail(error.into()),
-            Err(StorageReadError::Conversion(error)) => return self.fail(error.into()),
+            Ok(None) => return Err(CreateBackendError::NotFound),
+            Err(StorageReadError::Storage(error)) => return Err(error.into()),
+            Err(StorageReadError::Conversion(error)) => return Err(error.into()),
         };
-        let Some(existing) = self.existing.take() else {
-            return self.fail(CreateBackendError::Failed);
-        };
+        let existing = self.existing.take().ok_or(CreateBackendError::Failed)?;
         self.input.secret_config = secret.secret_config;
         self.prepare(existing)
     }
 
-    fn prepare(&mut self, existing: GroupStorage) -> Effects {
-        let normalized = match validate_backend_input(
+    fn prepare(&mut self, existing: GroupStorage) -> ReplaceTurn {
+        let normalized = validate_backend_input(
             &self.input.name,
             self.input.kind,
             &self.input.public_config,
             &self.input.secret_config,
-        ) {
-            Ok(normalized) => normalized,
-            Err(error) => return self.fail(error.into()),
-        };
-        if let Err(error) = check_identity(&existing, self.input.kind, &normalized.public) {
-            return self.fail(error.into());
-        }
+        )?;
+        check_identity(&existing, self.input.kind, &normalized.public)?;
         let (kind, roots) = (self.input.kind, &self.input.import_roots);
-        if let Err(error) = check_import_root(kind, &normalized.public, existing.group_id, roots) {
-            return self.fail(error.into());
-        }
+        check_import_root(kind, &normalized.public, existing.group_id, roots)?;
 
         let now = SystemTime::now();
         let record = GroupStorage {
@@ -154,218 +125,156 @@ impl ReplaceBackendOperation {
         });
         self.record = Some(record);
         self.secret = Some(secret);
-        smallvec![effect]
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
-    fn handle_probe(&mut self, event: Event) -> Effects {
+    fn handle_probe(&mut self, event: Event) -> ReplaceTurn {
         match event {
             Event::Blob(BlobEvent::GroupBackendChecked) => {}
             Event::Blob(BlobEvent::Error(error)) => {
-                return self.fail(CreateBackendError::Unreachable(error));
+                return Err(CreateBackendError::Unreachable(error));
             }
             received => {
-                return self.fail(CreateBackendError::InvalidStateEvent {
+                return Err(CreateBackendError::InvalidStateEvent {
                     state: "Probe",
                     expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
                     received,
                 });
             }
         }
-
-        self.state = ReplaceState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = ReplaceState::Write;
+        Ok(Next::Call(IoCall::child(self.write()?)))
     }
 
-    fn handle_txn_started(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                self.txn_id = Some(txn_id);
-                self.state = ReplaceState::VerifyRecord;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                    key: backend_key(self.backend_id),
-                    txn_id: self.txn_id,
-                })]
+    /// The write transaction of the probed record, with the new keys unless they are kept.
+    fn write(&self) -> Result<ReplaceWrite, CreateBackendError> {
+        let record = self.record.clone().ok_or(CreateBackendError::Failed)?;
+        let secret = match (self.keep_secret, self.secret.as_ref()) {
+            (true, _) => None,
+            (false, Some(secret)) => Some(secret.to_secret()?),
+            (false, None) => return Err(CreateBackendError::Failed),
+        };
+        Ok(ReplaceWrite {
+            group_id: self.input.group_id,
+            record,
+            secret,
+            stage: WriteStage::Verify,
+        })
+    }
+}
+
+/// The stored backend record of `group_id`; a missing one or another group's is not found.
+fn stored_record(
+    value: Option<Value>,
+    group_id: GroupId,
+) -> Result<GroupStorage, CreateBackendError> {
+    value
+        .map(|value| GroupStorage::from_bytes(value.as_ref()))
+        .transpose()?
+        .filter(|record| record.group_id == group_id)
+        .ok_or(CreateBackendError::NotFound)
+}
+
+/// The answer to an effect call, which the runner hands back as its event.
+fn event(result: IoResult) -> Result<Event, CreateBackendError> {
+    match result {
+        IoResult::Event(event) => Ok(*event),
+        _ => Err(CreateBackendError::Failed),
+    }
+}
+
+impl Operation for ReplaceBackendOperation {
+    type Output = GroupStorage;
+    type Error = CreateBackendError;
+
+    fn first(&mut self) -> ReplaceTurn {
+        Ok(Next::Call(IoCall::Read(vec![record_row(self.backend_id)])))
+    }
+
+    fn next(&mut self, result: IoResult) -> ReplaceTurn {
+        match self.state {
+            ReplaceState::ReadRecord => {
+                let [value] = values::<1>(result)?;
+                self.handle_existing(value)
             }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(CreateBackendError::InvalidStateEvent {
-                state: "StartTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received,
-            }),
-        }
-    }
-
-    /// Reading the record again inside the write transaction serializes the
-    /// update against a concurrent disable, which the probe is too slow to see.
-    fn handle_verified(&mut self, event: Event) -> Effects {
-        let verified = match parse_read(event, GroupStorage::from_bytes) {
-            Ok(Some(record)) if record.group_id == self.input.group_id => record,
-            Ok(_) => return self.fail(CreateBackendError::NotFound),
-            Err(error) => return self.fail(CreateBackendError::Read(error)),
-        };
-        if let Some(record) = self.record.as_mut() {
-            record.disabled = verified.disabled;
-            record.public_config.extend(verified.managed_config());
-        }
-
-        let Some(record) = self.record.as_ref() else {
-            return self.fail(CreateBackendError::Failed);
-        };
-        let writes = match record_writes(record) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
-
-        self.state = ReplaceState::WriteRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            received => {
-                return self.fail(CreateBackendError::InvalidStateEvent {
-                    state: "WriteRecords",
-                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                    received,
-                });
-            }
-        }
-
-        if self.keep_secret {
-            let Some(txn_id) = self.txn_id else {
-                return self.fail(CreateBackendError::Failed);
-            };
-            self.state = ReplaceState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        let Some(secret) = self.secret.as_ref() else {
-            return self.fail(CreateBackendError::Failed);
-        };
-        let secret_bytes = match secret.to_secret() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = ReplaceState::WriteSecret;
-        smallvec![crate::node_vault::write_secret(
-            GroupStorageSecret::vault_entry(self.backend_id),
-            secret_bytes,
-            self.txn_id,
-        )]
-    }
-
-    fn handle_secret_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            received => {
-                return self.fail(CreateBackendError::InvalidStateEvent {
-                    state: "WriteSecret",
-                    expected: "Event::Storage(StorageEvent::WriteResult)",
-                    received,
-                });
-            }
-        }
-
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreateBackendError::Failed);
-        };
-        self.state = ReplaceState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        self.txn_id = None;
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                let Some(record) = self.record.clone() else {
-                    return self.fail(CreateBackendError::Failed);
-                };
-                self.state = ReplaceState::Finish;
-                self.output = Some(Ok(record));
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(CreateBackendError::InvalidStateEvent {
-                state: "CommitTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = ReplaceState::Error;
-                smallvec![]
-            }
-            received => self.fail(CreateBackendError::InvalidStateEvent {
-                state: "AbortTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received,
-            }),
+            ReplaceState::ReadSecret => self.handle_secret(event(result)?),
+            ReplaceState::Probe => self.handle_probe(event(result)?),
+            ReplaceState::Write => result
+                .child::<GroupStorage, CreateBackendError>()?
+                .map(Next::Done),
         }
     }
 }
 
-impl EffectOperation for ReplaceBackendOperation {
+fn record_row(backend_id: Ulid) -> (KeySpace, Key) {
+    (
+        STORAGE_BACKEND_KEYSPACE.to_string(),
+        backend_key(backend_id),
+    )
+}
+
+/// Where the replacement's write transaction stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteStage {
+    Verify,
+    Records,
+    Secret,
+}
+
+/// Re-reads the record, then writes it and the new keys in one transaction.
+#[derive(Debug, PartialEq)]
+struct ReplaceWrite {
+    group_id: GroupId,
+    record: GroupStorage,
+    secret: Option<SecretBytes>,
+    stage: WriteStage,
+}
+
+impl Operation for ReplaceWrite {
     type Output = GroupStorage;
     type Error = CreateBackendError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReplaceState::ReadRecord;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-            key: backend_key(self.backend_id),
-            txn_id: None,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ReplaceState::Init => self.start(),
-            ReplaceState::ReadRecord => self.handle_existing(event),
-            ReplaceState::ReadSecret => self.handle_secret(event),
-            ReplaceState::Probe => self.handle_probe(event),
-            ReplaceState::StartTransaction => self.handle_txn_started(event),
-            ReplaceState::VerifyRecord => self.handle_verified(event),
-            ReplaceState::WriteRecords => self.handle_written(event),
-            ReplaceState::WriteSecret => self.handle_secret_written(event),
-            ReplaceState::CommitTransaction => self.handle_committed(event),
-            ReplaceState::AbortTransaction => self.handle_aborted(event),
-            ReplaceState::Finish | ReplaceState::Error => {
-                self.fail(CreateBackendError::InvalidStateEvent {
-                    state: "terminal",
-                    expected: "no event",
-                    received: event,
-                })
+    fn first(&mut self) -> ReplaceTurn {
+        Ok(Next::Call(IoCall::Read(vec![record_row(
+            self.record.backend_id,
+        )])))
+    }
+
+    /// Reading the record again inside the write transaction serializes the
+    /// update against a concurrent disable, which the probe is too slow to see.
+    fn next(&mut self, result: IoResult) -> ReplaceTurn {
+        match self.stage {
+            WriteStage::Verify => {
+                let [value] = values::<1>(result)?;
+                let verified = stored_record(value, self.group_id)?;
+                self.record.disabled = verified.disabled;
+                self.record.public_config.extend(verified.managed_config());
+                self.stage = WriteStage::Records;
+                Ok(Next::Call(IoCall::Write(record_writes(&self.record)?)))
             }
+            WriteStage::Records => {
+                done(result)?;
+                let Some(secret) = self.secret.take() else {
+                    return Ok(Next::Done(self.record.clone()));
+                };
+                self.stage = WriteStage::Secret;
+                // The runner puts the vault write into this operation's transaction.
+                let entry = GroupStorageSecret::vault_entry(self.record.backend_id);
+                let seal = crate::node_vault::write_secret(entry, secret, None);
+                Ok(Next::Call(IoCall::Effect(Box::new(seal))))
+            }
+            WriteStage::Secret => match event(result)? {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    Ok(Next::Done(self.record.clone()))
+                }
+                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+                _ => Err(CreateBackendError::Failed),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReplaceState::Finish | ReplaceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CreateBackendError::Failed))
-    }
-
-    fn abort(&mut self) -> Effects {
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = ReplaceState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        smallvec![]
     }
 }
 
@@ -374,13 +283,13 @@ mod pure_tests {
     use super::ReplaceBackendOperation;
     use crate::groups::backends::create::{CreateBackendError, CreateBackendInput};
     use crate::groups::backends::validation::GroupBackendError;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
-    use aruna_core::types::{Effects, TxnId};
+    use aruna_core::types::{Key, Value};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
     use ulid::Ulid;
@@ -422,47 +331,54 @@ mod pure_tests {
         }
     }
 
+    fn read(stored: &GroupStorage) -> IoResult {
+        IoResult::Values(vec![Some(stored.to_bytes().unwrap().into())])
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
     fn refuse(input: CreateBackendInput) -> CreateBackendError {
         let group_id = input.group_id;
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = ReplaceBackendOperation::new(backend_id, input);
-        operation.start();
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
-        }));
-
-        assert!(effects.is_empty(), "expected no probe, got {effects:?}");
-        operation.finalize().unwrap_err()
+        operation.first().unwrap();
+        operation
+            .next(read(&existing(group_id, backend_id)))
+            .expect_err("expected no probe")
     }
 
-    /// Answers the probe and the transaction reads with the stored record.
-    fn commit_update(operation: &mut ReplaceBackendOperation, stored: GroupStorage) -> Effects {
-        operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(stored.to_bytes().unwrap().into()),
-        }));
-        let secret = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+    /// Answers the probe and runs the write transaction against the stored record; returns the
+    /// record writes and the output.
+    fn commit_update(
+        operation: &mut ReplaceBackendOperation,
+        stored: GroupStorage,
+    ) -> (Vec<(String, Key, Value)>, GroupStorage) {
+        let checked = operation.next(event(Event::Blob(BlobEvent::GroupBackendChecked)));
+        assert!(matches!(checked, Ok(Next::Call(IoCall::Child(_)))));
+        let mut write = operation.write().unwrap();
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        write.first().unwrap();
+        let Ok(Next::Call(IoCall::Write(writes))) = write.next(read(&stored)) else {
+            panic!("expected the record writes");
+        };
+        let seal = write.next(IoResult::Done);
+        assert!(!format!("{seal:?} {operation:?} {write:?}").contains("new-key"));
+        let Ok(Next::Call(IoCall::Effect(seal))) = seal else {
+            panic!("expected the vault write");
+        };
         assert!(matches!(
-            secret.as_slice(),
-            [Effect::Storage(StorageEffect::VaultWrite { txn_id: Some(txn_id), .. })]
-                if *txn_id == TxnId::from(7)
+            *seal,
+            Effect::Storage(StorageEffect::VaultWrite { txn_id: None, .. })
         ));
-        assert!(!format!("{secret:?} {operation:?}").contains("new-key"));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
+        let sealed = Event::Storage(StorageEvent::WriteResult {
             key: b"x".to_vec().into(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::from(7),
-        }));
-        effects
+        });
+        let Ok(Next::Done(record)) = write.next(event(sealed)) else {
+            panic!("expected the stored record");
+        };
+        (writes, record)
     }
 
     #[test]
@@ -486,15 +402,14 @@ mod pure_tests {
         change.public_config.remove("bucket");
         change.secret_config.clear();
         let mut operation = ReplaceBackendOperation::new(backend_id, change);
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(stored.to_bytes().unwrap().into()),
-        }));
+        operation.first().unwrap();
         let entry = GroupStorageSecret::vault_entry(backend_id);
+        let Ok(Next::Call(IoCall::Effect(read_secret))) = operation.next(read(&stored)) else {
+            panic!("expected the vault read");
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::VaultRead { entry: read, txn_id: None })] if *read == entry
+            *read_secret,
+            Effect::Storage(StorageEffect::VaultRead { entry: read, txn_id: None }) if read == entry
         ));
         let secret = GroupStorageSecret {
             backend_id,
@@ -504,36 +419,27 @@ mod pure_tests {
             ]),
             updated_at: SystemTime::UNIX_EPOCH,
         };
-        let effects = operation.step(Event::Storage(StorageEvent::VaultResult {
+        let opened = event(Event::Storage(StorageEvent::VaultResult {
             entry,
             secret: Some(secret.to_secret().unwrap()),
         }));
-        let [Effect::Blob(BlobEffect::CheckGroupBackend { secret: probed, .. })] =
-            effects.as_slice()
-        else {
-            panic!("expected one probe, got {effects:?}")
+        let Ok(Next::Call(IoCall::Effect(probe))) = operation.next(opened) else {
+            panic!("expected one probe");
+        };
+        let Effect::Blob(BlobEffect::CheckGroupBackend { secret: probed, .. }) = *probe else {
+            panic!("expected one probe");
         };
         assert_eq!(probed.secret_config, secret.secret_config);
-        operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(stored.to_bytes().unwrap().into()),
-        }));
+        operation
+            .next(event(Event::Blob(BlobEvent::GroupBackendChecked)))
+            .unwrap();
         // The stored keys are only read: the record commits without a vault write.
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::from(7),
-        }));
-        let record = operation.finalize().unwrap();
+        let mut write = operation.write().unwrap();
+        write.first().unwrap();
+        write.next(read(&stored)).unwrap();
+        let Ok(Next::Done(record)) = write.next(IoResult::Done) else {
+            panic!("expected the record without a vault write");
+        };
         assert_eq!(record.name, "updated");
         assert_eq!(record.default_bucket(), Some("aruna-lab"));
         let config = &record.public_config;
@@ -553,28 +459,24 @@ mod pure_tests {
         let group_id = Ulid::from_bytes([1u8; 16]);
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = ReplaceBackendOperation::new(backend_id, input(group_id));
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
-        }));
-
-        let [Effect::Blob(BlobEffect::CheckGroupBackend { record, .. })] = effects.as_slice()
+        let Ok(Next::Call(IoCall::Effect(probe))) =
+            operation.next(read(&existing(group_id, backend_id)))
         else {
-            panic!("expected one probe, got {effects:?}")
+            panic!("expected one probe");
+        };
+        let Effect::Blob(BlobEffect::CheckGroupBackend { record, .. }) = *probe else {
+            panic!("expected one probe");
         };
         assert_eq!(record.backend_id, backend_id);
         assert_eq!(record.created_at, SystemTime::UNIX_EPOCH);
         assert!(record.updated_at > SystemTime::UNIX_EPOCH + Duration::from_secs(1));
 
-        let effects = commit_update(&mut operation, existing(group_id, backend_id));
-
-        let [Effect::Storage(StorageEffect::BatchWrite { txn_id, .. })] = effects.as_slice() else {
-            panic!("expected one transacted write, got {effects:?}")
-        };
-        assert_eq!(*txn_id, Some(TxnId::from(7)));
-        assert_eq!(operation.finalize().unwrap().name, "updated");
+        let (writes, record) = commit_update(&mut operation, existing(group_id, backend_id));
+        assert!(!writes.is_empty());
+        assert_eq!(record.backend_id, backend_id);
+        assert_eq!(record.name, "updated");
     }
 
     #[test]
@@ -585,23 +487,12 @@ mod pure_tests {
         let mut stored = existing(group_id, backend_id);
         stored.disabled = true;
         let mut operation = ReplaceBackendOperation::new(backend_id, input(group_id));
-        operation.start();
+        operation.first().unwrap();
+        let probe = operation.next(read(&stored));
+        assert!(matches!(probe, Ok(Next::Call(IoCall::Effect(_)))));
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(stored.to_bytes().unwrap().into()),
-        }));
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::CheckGroupBackend { .. })]
-            ),
-            "expected a probe, got {effects:?}"
-        );
-
-        commit_update(&mut operation, stored);
-
-        assert!(operation.finalize().unwrap().disabled);
+        let (_, record) = commit_update(&mut operation, stored);
+        assert!(record.disabled);
     }
 
     #[test]
@@ -614,15 +505,12 @@ mod pure_tests {
             .public_config
             .insert("default_bucket".to_string(), "lab-default".to_string());
         let mut operation = ReplaceBackendOperation::new(backend_id, input(group_id));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
-        }));
+        operation.first().unwrap();
+        operation
+            .next(read(&existing(group_id, backend_id)))
+            .unwrap();
 
-        commit_update(&mut operation, stored);
-
-        let record = operation.finalize().unwrap();
+        let (_, record) = commit_update(&mut operation, stored);
         assert_eq!(record.default_bucket(), Some("lab-default"));
     }
 
@@ -664,57 +552,11 @@ mod pure_tests {
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation =
             ReplaceBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
-        operation.start();
-
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(
-                existing(Ulid::from_bytes([2u8; 16]), backend_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
-        }));
-
-        assert!(matches!(
-            operation.finalize(),
-            Err(CreateBackendError::NotFound)
-        ));
-    }
-
-    // A state that expects no event must reject one instead of ignoring it.
-    #[test]
-    fn terminal_rejects_event() {
-        let backend_id = Ulid::from_bytes([9u8; 16]);
-        let make = || {
-            let mut operation =
-                ReplaceBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
-            operation.start();
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: b"x".to_vec().into(),
-                value: Some(
-                    existing(Ulid::from_bytes([2u8; 16]), backend_id)
-                        .to_bytes()
-                        .unwrap()
-                        .into(),
-                ),
-            }));
-            operation
-        };
-        for (_, effects, error) in rejects_events(
-            make,
-            || {
-                let mut events = sample_events();
-                events.push(Event::Blob(BlobEvent::GroupBackendChecked));
-                events
-            },
-            |_| false,
-        ) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, CreateBackendError::InvalidStateEvent { .. }),
-                "{error:?}"
-            );
-        }
+        operation.first().unwrap();
+        let foreign = read(&existing(Ulid::from_bytes([2u8; 16]), backend_id));
+        assert_eq!(
+            operation.next(foreign).err(),
+            Some(CreateBackendError::NotFound)
+        );
     }
 }

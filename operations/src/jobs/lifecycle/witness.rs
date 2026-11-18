@@ -28,9 +28,10 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::offer::{OfferLaunchOperation, OfferOutcome};
-use super::plan::build_plan;
+use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::witness_arm::{
-    ArmFamilyOperation, DEADLINE_KEY_BYTES, WitnessDeadline, deadline_index_key, deadline_key,
+    ArmFamilyOperation, ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange,
+    WitnessDeadline, WitnessExplain, deadline_index_key, deadline_key,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
@@ -38,7 +39,6 @@ use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, Re
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::store::query::batch_delete;
 use crate::realm::load_config::load_realm_config;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
@@ -51,18 +51,6 @@ pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
 const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
-
-/// The bounded plan this witness stored before it launched, with the targets
-/// that already refused this request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WitnessExplain {
-    pub sequence: u32,
-    pub plan: ExecutionPlan,
-    pub declined: Vec<ExecutionTargetId>,
-    /// The previous launch was never confirmed, so this one may overlap it.
-    pub overlapping: bool,
-    pub stored_at_ms: u64,
-}
 
 /// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
@@ -102,7 +90,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         let deadline = match read_deadline_index(context, &family).await {
             Ok(Some(deadline)) => deadline,
             Ok(None) => {
-                if !remove_stale(context, &family, &key).await {
+                if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
                     remaining = true;
                 }
                 continue;
@@ -113,7 +101,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
             }
         };
         if deadline_key(&family, deadline.due_at_ms) != key {
-            if !remove_stale(context, &family, &key).await {
+            if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
                 remaining = true;
             }
             continue;
@@ -124,7 +112,11 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
         }
         match run_round(context, family, now_ms).await {
             RoundOutcome::Done => {
-                if !clear_deadline(context, &family, &key, deadline).await {
+                let clear = DeadlineChange::Clear {
+                    key,
+                    expected: deadline,
+                };
+                if !change_deadline(context, &family, clear).await {
                     remaining = true;
                 }
             }
@@ -133,12 +125,44 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
                     due_at_ms: now_ms + after_ms,
                     rank: deadline.rank,
                 };
-                let _ = replace_deadline(context, &family, Some(deadline), next).await;
+                let replace = DeadlineChange::Replace {
+                    expected: Some(deadline),
+                    next,
+                };
+                change_deadline(context, &family, replace).await;
                 remaining = true;
             }
         }
     }
     remaining
+}
+
+/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
+/// paged inputs of the spec are read in first.
+async fn build_plan(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    spec: &LogicalJobSpec,
+    excluded: &[ExecutionTargetId],
+    now_ms: u64,
+) -> Result<ExecutionPlan, PlanBuildError> {
+    let local = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
+    let spec = crate::jobs::records::pages::with_inputs(context, spec)
+        .await
+        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
+    let round = PlanRound {
+        config: config.clone(),
+        spec,
+        excluded: excluded.to_vec(),
+        now_ms,
+        local,
+        fresh: context.fresh_heartbeats(),
+    };
+    drive(BuildPlanOperation::new(round), context).await
 }
 
 #[cfg(test)]
@@ -156,18 +180,15 @@ mod tests {
                 submission_id: aruna_core::structs::execution::job::SubmissionId([index as u8; 32]),
                 request_digest: [index as u8; 32],
             };
-            assert!(
-                replace_deadline(
-                    &ctx,
-                    &family,
-                    None,
-                    WitnessDeadline {
-                        due_at_ms: 0,
-                        rank: index as u32,
-                    },
-                )
-                .await
-            );
+            let next = WitnessDeadline {
+                due_at_ms: 0,
+                rank: index as u32,
+            };
+            let arm = DeadlineChange::Replace {
+                expected: None,
+                next,
+            };
+            assert!(change_deadline(&ctx, &family, arm).await);
         }
 
         assert!(drain_witness_deadlines(&ctx, 1).await);
@@ -198,8 +219,16 @@ mod tests {
             due_at_ms: 10,
             rank: 1,
         };
-        assert!(replace_deadline(&ctx, &family, None, first).await);
-        assert!(replace_deadline(&ctx, &family, Some(first), second).await);
+        let arm = DeadlineChange::Replace {
+            expected: None,
+            next: first,
+        };
+        assert!(change_deadline(&ctx, &family, arm).await);
+        let moved = DeadlineChange::Replace {
+            expected: Some(first),
+            next: second,
+        };
+        assert!(change_deadline(&ctx, &family, moved).await);
         assert_eq!(
             read_deadline_index(&ctx, &family)
                 .await
@@ -749,148 +778,14 @@ fn explain_key(family: &JobFamilyId, node: NodeId) -> Key {
     Key::from(bytes.as_slice())
 }
 
-async fn clear_deadline(
+/// Applies one deadline change; a failed or skipped change reads as unchanged.
+async fn change_deadline(
     context: &DriverContext,
     family: &JobFamilyId,
-    key: &Key,
-    expected: WitnessDeadline,
+    change: DeadlineChange,
 ) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let Ok(current) = current else {
-        abort_txn(context, txn_id).await;
-        return false;
-    };
-    if current != Some(expected) || deadline_key(family, expected.due_at_ms) != *key {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    let deletes = vec![
-        (WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone()),
-        (
-            DEADLINE_INDEX_KEYSPACE.to_string(),
-            deadline_index_key(family),
-        ),
-    ];
-    if batch_delete(context, deletes, Some(txn_id)).await.is_err() {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let current_key = current
-        .as_ref()
-        .ok()
-        .and_then(Option::as_ref)
-        .map(|deadline| deadline_key(family, deadline.due_at_ms));
-    if current_key.as_ref() == Some(key) {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if current.is_err()
-        || batch_delete(
-            context,
-            vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
-            Some(txn_id),
-        )
-        .await
-        .is_err()
-    {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-async fn replace_deadline(
-    context: &DriverContext,
-    family: &JobFamilyId,
-    expected: Option<WitnessDeadline>,
-    next: WitnessDeadline,
-) -> bool {
-    let Ok(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let current = read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        Some(txn_id),
-    )
-    .await;
-    let Ok(current) = current else {
-        abort_txn(context, txn_id).await;
-        return false;
-    };
-    if current != expected {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if write_row_txn(
-        context,
-        WITNESS_DEADLINE_KEYSPACE,
-        &deadline_key(family, next.due_at_ms),
-        &next,
-        Some(txn_id),
-    )
-    .await
-    .is_err()
-        || write_row_txn(
-            context,
-            DEADLINE_INDEX_KEYSPACE,
-            &deadline_index_key(family),
-            &next,
-            Some(txn_id),
-        )
-        .await
-        .is_err()
-    {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    if let Some(previous) = expected {
-        let previous_key = deadline_key(family, previous.due_at_ms);
-        if previous_key != deadline_key(family, next.due_at_ms)
-            && batch_delete(
-                context,
-                vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
-                Some(txn_id),
-            )
-            .await
-            .is_err()
-        {
-            abort_txn(context, txn_id).await;
-            return false;
-        }
-    }
-    commit_txn(context, txn_id).await.is_ok()
-}
-
-pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -> bool {
-    match read_deadline_index(context, &family).await {
-        Ok(deadline) => deadline.is_some(),
-        Err(_) => true,
-    }
+    let operation = ChangeDeadlineOperation::new(*family, change);
+    drive(operation, context).await.unwrap_or(false)
 }
 
 fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
@@ -945,47 +840,6 @@ async fn read_deadline_index(
         None,
     )
     .await
-}
-
-async fn start_txn(context: &DriverContext) -> Result<TxnId, LifecycleError> {
-    match context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(aruna_core::events::StorageEvent::TransactionStarted { txn_id }) => {
-            Ok(txn_id)
-        }
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "start transaction".to_string(),
-            expected: "transaction started",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> Result<(), LifecycleError> {
-    match context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "commit transaction".to_string(),
-            expected: "transaction committed",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::AbortTransaction { txn_id })
-        .await;
 }
 
 async fn read_row_txn<T: for<'a> Deserialize<'a>>(

@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{BlobEffect, IterStart, StorageEffect};
-use aruna_core::errors::{BlobError, StorageError};
+use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_CLAIM_KEYSPACE, DELETE_TRAIL_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE, PURGE_FENCE_KEYSPACE,
-    RENAMED_ROW_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE, RENAMED_ROW_KEYSPACE,
 };
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
@@ -47,6 +47,7 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::blob_request::BlobRequest;
+use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::placement::policy::GateOperation;
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::replication::live_queue::complete_put;
@@ -469,7 +470,7 @@ async fn import_object(
     {
         let listed = encode(&listed)?;
         if listed.as_slice() != seen.as_ref() {
-            let note = Note::default();
+            let note = ListingNote::default();
             note_listing(&ctx.driver, rule, row_key, Some(&seen), listed, note).await?;
         }
         return Ok(Outcome::Skipped);
@@ -1005,12 +1006,10 @@ async fn recover(
         None => Vec::new(),
     };
     let repaired = encode(&committed)?;
-    let note = Note {
-        guards: &guards,
+    let note = ListingNote {
+        guards: guards.to_vec(),
         retired,
-        writes: Vec::new(),
-        sharing: None,
-        fenced: None,
+        ..ListingNote::default()
     };
     if !note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await? {
         return Ok(Some(Outcome::Skipped));
@@ -1323,12 +1322,12 @@ async fn register_twin(
             version.into_bytes().into(),
         ));
     }
-    let note = Note {
-        guards: &guards,
+    let note = ListingNote {
+        guards: guards.to_vec(),
         retired: Vec::new(),
         writes,
         sharing: Some(sharing(run)),
-        fenced: Some(key),
+        fenced: Some(key.to_string()),
     };
     let row_key = object_key(rule.import_id, &object.key);
     // A refused copy is looked at again by the next run.
@@ -1909,170 +1908,22 @@ async fn write_value(
     }
 }
 
-/// What else a row update reads and deletes in its transaction.
-#[derive(Default)]
-struct Note<'a> {
-    /// Values that must still be stored as they were read.
-    guards: &'a [(String, Key, Option<Value>)],
-    /// The write intents the committed row makes obsolete.
-    retired: Vec<Key>,
-    /// Rows the committed row comes with.
-    writes: Vec<(String, Key, Value)>,
-    /// The rules that must share the folder at commit, read again in the transaction.
-    sharing: Option<std::collections::BTreeSet<Ulid>>,
-    /// The bucket key a permanent purge must not hold at commit.
-    fenced: Option<&'a str>,
-}
-
-/// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
-/// in one transaction, and answers whether it committed. Otherwise nothing is written and the
-/// next run looks at the object again.
+/// Replaces the row only while the rule exists and the row still holds `seen`; see
+/// [`NoteListingOperation`]. A lost conflict reads as not written.
 async fn note_listing(
     context: &DriverContext,
     rule: &BackendImport,
     row_key: Key,
     seen: Option<&Value>,
     row: Vec<u8>,
-    note: Note<'_>,
+    note: ListingNote,
 ) -> Result<bool, ItemError> {
-    let storage = &context.storage_handle;
-    let unexpected =
-        |event: Event| ItemError::System(format!("unexpected answer {}", event.label()));
-    let started = StorageEffect::StartTransaction { read: false };
-    let txn_id = match storage.send_storage_effect(started).await {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(unexpected(other)),
-    };
-    let abort = StorageEffect::AbortTransaction { txn_id };
-    let mut reads = vec![
-        (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
-        (IMPORTED_OBJECT_KEYSPACE.to_string(), row_key.clone()),
-    ];
-    let guards = note.guards.iter();
-    reads.extend(guards.map(|(space, key, _)| (space.clone(), key.clone())));
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: Some(txn_id),
-    };
-    let values = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => {
-            storage.send_storage_effect(abort).await;
-            return Err(unexpected(other));
-        }
-    };
-    let expected = note.guards.iter().map(|(.., value)| value.as_ref());
-    let held = match values.as_slice() {
-        [(_, Some(_)), (_, value), rest @ ..] if value.as_ref() == seen => {
-            rest.len() == note.guards.len() && rest.iter().map(|(_, v)| v.as_ref()).eq(expected)
-        }
-        _ => false,
-    };
-    let shared = match &note.sharing {
-        Some(expected) if held => match sharing_now(context, rule, txn_id).await {
-            Ok(found) => found == *expected,
-            Err(error) => {
-                storage.send_storage_effect(abort).await;
-                return Err(error);
-            }
-        },
-        _ => true,
-    };
-    let open = match note.fenced.filter(|_| held && shared) {
-        Some(key) => {
-            let read = StorageEffect::Read {
-                key_space: PURGE_FENCE_KEYSPACE.to_string(),
-                key: crate::s3::purge_fence::fence_key(&rule.bucket),
-                txn_id: Some(txn_id),
-            };
-            let event = storage.send_storage_effect(read).await;
-            match crate::s3::purge_fence::check_write_fence(event, &rule.bucket, key) {
-                Ok(()) => true,
-                Err(crate::s3::purge_fence::PurgeFenceError::Suspended) => false,
-                Err(error) => {
-                    storage.send_storage_effect(abort).await;
-                    return Err(ItemError::System(error.to_string()));
-                }
-            }
-        }
-        None => true,
-    };
-    if !held || !shared || !open {
-        storage.send_storage_effect(abort).await;
-        return Ok(false);
-    }
-    let write = StorageEffect::Write {
-        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key: row_key,
-        value: row.into(),
-        txn_id: Some(txn_id),
-    };
-    let retire = note.retired.into_iter().map(|key| StorageEffect::Delete {
-        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-        key,
-        txn_id: Some(txn_id),
-    });
-    let rows = note
-        .writes
-        .into_iter()
-        .map(|(key_space, key, value)| StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: Some(txn_id),
-        });
-    for effect in std::iter::once(write).chain(rows).chain(retire) {
-        match storage.send_storage_effect(effect).await {
-            Event::Storage(
-                StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-            ) => {}
-            other => {
-                storage.send_storage_effect(abort).await;
-                return Err(unexpected(other));
-            }
-        }
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(false),
-        other => Err(unexpected(other)),
-    }
-}
-
-/// The rules that share the folder of `rule` as `txn_id` reads them.
-async fn sharing_now(
-    context: &DriverContext,
-    rule: &BackendImport,
-    txn_id: Ulid,
-) -> Result<std::collections::BTreeSet<Ulid>, ItemError> {
-    let mut found = std::collections::BTreeSet::new();
-    let mut after = None;
-    loop {
-        let page = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
-            BACKEND_IMPORT_KEYSPACE,
-            Some(rule.group_id.to_bytes().to_vec().into()),
-            after.take(),
-            128,
-            Some(txn_id),
-        );
-        let (rows, next) = page.await.map_err(ItemError::System)?;
-        for (_, value) in rows {
-            let other = BackendImport::from_bytes(&value);
-            let other = other.map_err(|error| ItemError::System(error.to_string()))?;
-            if crate::s3::imports::shared::shares_folder(rule, &other) {
-                found.insert(other.import_id);
-            }
-        }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(found),
-        }
+    let operation =
+        NoteListingOperation::new(rule.clone(), row_key, seen.cloned(), row.into(), note);
+    match drive(operation, context).await {
+        Ok(written) => Ok(written),
+        Err(NoteError::Io(IoError::Conflict)) => Ok(false),
+        Err(error) => Err(ItemError::System(error.to_string())),
     }
 }
 
@@ -2300,7 +2151,7 @@ mod tests {
             row_key.clone(),
             Some(&seen),
             update.clone(),
-            Note::default(),
+            ListingNote::default(),
         );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
@@ -2319,7 +2170,7 @@ mod tests {
             row_key.clone(),
             Some(&other),
             update.clone(),
-            Note::default(),
+            ListingNote::default(),
         );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
@@ -2334,12 +2185,10 @@ mod tests {
             Some(Value::from(vec![8u8])),
         );
         let guards = [version];
-        let note = |retired| Note {
-            guards: &guards,
+        let note = |retired| ListingNote {
+            guards: guards.to_vec(),
             retired,
-            writes: Vec::new(),
-            sharing: None,
-            fenced: None,
+            ..ListingNote::default()
         };
         let held = note_listing(
             &context,

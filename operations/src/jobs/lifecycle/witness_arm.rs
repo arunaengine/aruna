@@ -5,11 +5,13 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
+use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
@@ -35,6 +37,18 @@ pub(super) const DEADLINE_KEY_BYTES: usize = 8 + 64;
 pub struct WitnessDeadline {
     pub due_at_ms: u64,
     pub rank: u32,
+}
+
+/// The bounded plan this witness stored before it launched, with the targets
+/// that already refused this request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExplain {
+    pub sequence: u32,
+    pub plan: ExecutionPlan,
+    pub declined: Vec<ExecutionTargetId>,
+    /// The previous launch was never confirmed, so this one may overlap it.
+    pub overlapping: bool,
+    pub stored_at_ms: u64,
 }
 
 /// Kicks the witness queue without persisting a timer of its own.
@@ -274,6 +288,136 @@ impl Operation for ArmFamilyOperation {
                     output: (),
                     calls: vec![drain],
                 })
+            }
+        }
+    }
+}
+
+/// One change of a family's persisted deadline, applied only while the index row still holds the
+/// deadline the drain read.
+#[derive(Debug, PartialEq)]
+pub(super) enum DeadlineChange {
+    /// Removes the due deadline `expected` at `key` with its index row.
+    Clear { key: Key, expected: WitnessDeadline },
+    /// Removes a deadline row at `key` the index no longer names.
+    Stale { key: Key },
+    /// Moves the deadline from `expected` to `next`.
+    Replace {
+        expected: Option<WitnessDeadline>,
+        next: WitnessDeadline,
+    },
+}
+
+/// Applies one [`DeadlineChange`] in one write transaction. The answer is whether it changed
+/// the rows; a deadline that moved meanwhile is left alone.
+#[derive(Debug, PartialEq)]
+enum ChangeState {
+    Index,
+    Write,
+    Delete,
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct ChangeDeadlineOperation {
+    family: JobFamilyId,
+    change: DeadlineChange,
+    deletes: Vec<(String, Key)>,
+    state: ChangeState,
+}
+
+type ChangeStep = Result<Next<bool>, LifecycleError>;
+
+impl ChangeDeadlineOperation {
+    pub(super) fn new(family: JobFamilyId, change: DeadlineChange) -> Self {
+        Self {
+            family,
+            change,
+            deletes: Vec::new(),
+            state: ChangeState::Index,
+        }
+    }
+
+    fn apply(&mut self, current: Option<WitnessDeadline>) -> ChangeStep {
+        let family = &self.family;
+        let index = (
+            DEADLINE_INDEX_KEYSPACE.to_string(),
+            deadline_index_key(family),
+        );
+        let row = |key: &Key| (WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone());
+        match &self.change {
+            DeadlineChange::Clear { key, expected } => {
+                if current != Some(*expected) || deadline_key(family, expected.due_at_ms) != *key {
+                    return Ok(Next::Done(false));
+                }
+                self.state = ChangeState::Delete;
+                Ok(Next::Call(IoCall::Delete(vec![row(key), index])))
+            }
+            DeadlineChange::Stale { key } => {
+                let named = current.map(|deadline| deadline_key(family, deadline.due_at_ms));
+                if named.as_ref() == Some(key) {
+                    return Ok(Next::Done(false));
+                }
+                self.state = ChangeState::Delete;
+                Ok(Next::Call(IoCall::Delete(vec![row(key)])))
+            }
+            DeadlineChange::Replace { expected, next } => {
+                if current != *expected {
+                    return Ok(Next::Done(false));
+                }
+                let key = deadline_key(family, next.due_at_ms);
+                let value = Value::from(to_bytes(next)?.as_slice());
+                let writes = vec![
+                    (
+                        WITNESS_DEADLINE_KEYSPACE.to_string(),
+                        key.clone(),
+                        value.clone(),
+                    ),
+                    (index.0, index.1, value),
+                ];
+                let previous = expected.map(|previous| deadline_key(family, previous.due_at_ms));
+                if let Some(previous) = previous.filter(|previous| *previous != key) {
+                    self.deletes.push(row(&previous));
+                }
+                self.state = ChangeState::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+        }
+    }
+}
+
+impl Operation for ChangeDeadlineOperation {
+    type Output = bool;
+    type Error = LifecycleError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> ChangeStep {
+        let index = (
+            DEADLINE_INDEX_KEYSPACE.to_string(),
+            deadline_index_key(&self.family),
+        );
+        Ok(Next::Call(IoCall::Read(vec![index])))
+    }
+
+    fn next(&mut self, result: IoResult) -> ChangeStep {
+        match self.state {
+            ChangeState::Index => {
+                let [value] = values::<1>(result)?;
+                let current = value.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok());
+                self.apply(current)
+            }
+            ChangeState::Write => {
+                done(result)?;
+                self.state = ChangeState::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            ChangeState::Delete => {
+                done(result)?;
+                Ok(Next::Done(true))
             }
         }
     }

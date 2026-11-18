@@ -354,7 +354,7 @@ async fn remote_run_untouched() {
 async fn deletion_hides_family() {
     // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
     use crate::jobs::lifecycle::cancel::publish_deletion;
-    use crate::jobs::lifecycle::report::family_report;
+    use crate::jobs::lifecycle::routing::family_report;
     use crate::jobs::route::JobRouteError;
     let family = Family::new([43u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.holder).await;
