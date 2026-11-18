@@ -1136,6 +1136,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
     }

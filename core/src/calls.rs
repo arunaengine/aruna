@@ -380,6 +380,7 @@ enum Family {
     Index,
     Session,
     Outbound,
+    Compute,
 }
 
 impl Wait {
@@ -400,6 +401,7 @@ impl Wait {
             Self::Family(Family::Index) => "an index event",
             Self::Family(Family::Session) => "a session event",
             Self::Family(Family::Outbound) => "an outbound event",
+            Self::Family(Family::Compute) => "a compute event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -851,6 +853,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::Index(_) => Ok(Family::Index),
         Effect::Session(_) => Ok(Family::Session),
         Effect::Outbound(_) => Ok(Family::Outbound),
+        Effect::Compute(_) => Ok(Family::Compute),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
@@ -880,6 +883,7 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Index(_) => Some(Family::Index),
         Event::Session(_) => Some(Family::Session),
         Event::Outbound(_) => Some(Family::Outbound),
+        Event::Compute(_) => Some(Family::Compute),
         Event::SubOperation(_)
         | Event::Search()
         | Event::Stream()

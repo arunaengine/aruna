@@ -732,6 +732,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::LocalFile(_)
         | Effect::Index(_)
         | Effect::Session(_)
+        | Effect::Compute(_)
         | Effect::Outbound(_)
         | Effect::SubOperation(_)
         | Effect::Group(_)
