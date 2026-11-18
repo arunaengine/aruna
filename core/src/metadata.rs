@@ -1390,6 +1390,8 @@ pub enum MetadataEffect {
         graph_iri: String,
         cursor: Ulid,
     },
+    /// Writes the graph store and its sync journal to disk.
+    FlushGraph,
     // This node's registry cache.
     /// The generation of the registry cache, read before a write whose row it caches later.
     CacheGeneration,
@@ -1442,6 +1444,7 @@ impl MetadataEffect {
             MetadataEffect::CachedShapes { .. } => "cached_shapes",
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
             MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
+            MetadataEffect::FlushGraph => "flush_graph",
             MetadataEffect::CacheGeneration => "cache_generation",
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
@@ -1486,6 +1489,7 @@ impl MetadataEffect {
             | MetadataEffect::CheckProfile { .. }
             | MetadataEffect::CachedShapes { .. }
             | MetadataEffect::CacheShapes { .. }
+            | MetadataEffect::FlushGraph
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
@@ -1601,6 +1605,8 @@ pub enum MetadataEvent {
         graph_iri: String,
         applied: bool,
     },
+    /// The graph store and its sync journal are on disk.
+    GraphFlushed,
     /// The registry cache generation; a cache change answers with the generation after it.
     CacheGeneration {
         generation: u64,

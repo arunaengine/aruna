@@ -79,7 +79,12 @@ impl RetryView for SyncUpload {
 
 /// Due time for the next attempt after `attempts` failures.
 pub(crate) fn retry_due_ms(attempts: u32) -> u64 {
-    unix_timestamp_millis().saturating_add(retry_delay_ms(attempts))
+    retry_due_at(unix_timestamp_millis(), attempts)
+}
+
+/// Due time for the next attempt after `attempts` failures, counted from `now_ms`.
+pub(crate) fn retry_due_at(now_ms: u64, attempts: u32) -> u64 {
+    now_ms.saturating_add(retry_delay_ms(attempts))
 }
 
 /// Whether `attempts` spent exhausts `max_attempts` and parks the row.

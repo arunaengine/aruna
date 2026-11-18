@@ -279,7 +279,11 @@ impl TaskQueues {
         }
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
-        crate::device::edit::replay_queued_edits(&context).await;
+        if context.metadata_handle.is_some() {
+            drive(crate::device::edit::replay_queued_edits(), &context)
+                .await
+                .ok();
+        }
         if stopped() {
             return;
         }
