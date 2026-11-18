@@ -28,8 +28,8 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
-use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -64,9 +64,12 @@ async fn setup_context() -> TestContext {
     create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: Backend::FileSystem,
@@ -1788,9 +1791,12 @@ async fn setup_s3_context() -> (TestContext, HashMap<String, String>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     // Bucket names stay under 63 characters: the random tail of a ULID is enough.
     let unique = Ulid::generate().to_string().to_lowercase()[14..].to_string();
     let blob_handle = BlobHandler::new(

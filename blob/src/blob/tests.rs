@@ -388,20 +388,20 @@ mod failing_cleanup {
     }
 }
 
+/// A net on loopback without relays or discovery, so a test reaches no outside service.
+fn local_net() -> NetConfig {
+    NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    }
+}
+
 async fn loopback_net_handle() -> (NetHandle, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let net_handle = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage_handle,
-    )
-    .await
-    .unwrap();
+    let net_handle = NetHandle::new(local_net(), storage_handle).await.unwrap();
     (net_handle, dir)
 }
 
@@ -433,7 +433,7 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
 
@@ -1268,9 +1268,7 @@ async fn backfills_free_index() {
     let backends = single_backend(root, 5, BlobTimeoutConfig::default());
     let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
     let storage = context.storage_handle.clone();
-    let net = NetHandle::new(NetConfig::default(), storage.clone())
-        .await
-        .unwrap();
+    let net = NetHandle::new(local_net(), storage.clone()).await.unwrap();
     let restarted =
         BlobHandler::with_registry(registry, storage, net, EgressPolicy::strict(), None)
             .await
@@ -1709,7 +1707,7 @@ async fn local_spool_unconfigured() {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
     let config = BackendConfig {
@@ -1739,7 +1737,7 @@ async fn sweeps_demoted_backend() {
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
     let backends = std::collections::BTreeMap::from([

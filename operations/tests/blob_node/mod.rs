@@ -27,7 +27,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::routing::{RoutingSnapshot, StorageRoutingRule};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::blob::migration::drain::process_migrations;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -57,9 +57,12 @@ pub async fn setup_context() -> TestContext {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: Backend::FileSystem,

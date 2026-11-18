@@ -14,7 +14,7 @@ use aruna_core::structs::execution::source_access::{
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -34,7 +34,7 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
 
     let storage_handle = storage::FjallStorage::open(temp_root).expect("storage must open");
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle must initialize");
     // Verified reads of references spool their bytes before they are served.
