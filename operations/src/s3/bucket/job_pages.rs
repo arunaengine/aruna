@@ -14,7 +14,7 @@ use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive_retry};
-use crate::s3::bucket::remap::{RemapScope, job_page};
+use crate::s3::bucket::remap::{RemapJobOperation, RemapScope};
 
 /// Delay between pages of a running job, and before a waiting job tries again.
 const CONTINUE: Duration = Duration::from_secs(1);
