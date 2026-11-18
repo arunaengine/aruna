@@ -70,3 +70,21 @@ fn full_history_refuses() {
     let answer = publish.next(child(Ok::<_, GitError>(full)));
     assert_eq!(answer, Err(GitError::Full));
 }
+
+// A stored record makes later refreshes project again before replication is woken.
+#[test]
+fn stored_record_noted() {
+    let mut publish = publishing(Some(node(1)));
+    publish.step = PublishStep::Commit;
+    let Ok(Next::Call(IoCall::Effect(effect))) = publish.next(child(Ok::<(), GitError>(()))) else {
+        panic!("expected the store call");
+    };
+    let aruna_core::effects::Effect::Git(call) = *effect else {
+        panic!("expected a Git call");
+    };
+    let expected = aruna_core::git::GitCall::RecordStored {
+        document_id: dataset().document_id,
+        forget: true,
+    };
+    assert_eq!(*call, expected);
+}

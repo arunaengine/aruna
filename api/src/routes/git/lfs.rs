@@ -164,10 +164,10 @@ pub async fn download(
     RealmAuth(auth): RealmAuth,
     Path((repository, oid)): Path<(String, String)>,
 ) -> ServerResult<Response> {
-    let (blob, size) =
-        git::download::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
-            .await
-            .map_err(map_error)?;
+    let context = state.get_ctx();
+    let id = repository_id(&repository)?;
+    let read = git::download::download(context.node_and_realm(), &auth, id, &oid);
+    let (blob, size) = drive(read, &context).await.map_err(map_error)?;
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, size)

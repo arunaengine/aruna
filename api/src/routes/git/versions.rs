@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::map_error;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
+use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::changes::EntityChangeKind;
 use aruna_operations::git::changes::PropertyConflict;
@@ -363,12 +365,13 @@ pub async fn list(
     let branch = query.branch.unwrap_or_else(|| "main".into());
     let limit = query.limit.unwrap_or(50);
     let query = VersionQuery {
-        branch: &branch,
-        since: query.since.as_deref(),
-        cursor: query.cursor.as_deref(),
+        branch,
+        since: query.since,
+        cursor: query.cursor,
         limit,
     };
-    let result = versions::list(&state.get_ctx(), &auth, id, query).await;
+    let list = versions::list(&git_node(&state), &auth, id, query);
+    let result = drive(list, &state.get_ctx()).await;
     Ok(match result {
         Ok((list, next_cursor)) => Json(VersionList {
             versions: list.into_iter().map(version_view).collect(),
@@ -393,7 +396,8 @@ pub async fn show(
     RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let result = versions::show(&state.get_ctx(), &auth, id, &revision).await;
+    let show = versions::show(&git_node(&state), &auth, id, &revision);
+    let result = drive(show, &state.get_ctx()).await;
     Ok(match result {
         Ok((version, files)) => Json(VersionDetail {
             version: version_view(version),
@@ -419,8 +423,8 @@ pub async fn rocrate(
     RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let result =
-        aruna_operations::git::snapshot::export(&state.get_ctx(), &auth, id, revision).await;
+    let export = aruna_operations::git::snapshot::export(&git_node(&state), &auth, id, revision);
+    let result = drive(export, &state.get_ctx()).await;
     Ok(match result {
         Ok(bytes) => {
             let value: Value =
@@ -445,14 +449,14 @@ pub async fn compare(
     Path(id): Path<Ulid>,
     Query(query): Query<CompareQuery>,
 ) -> ServerResult<Response> {
-    let result = versions::compare(
-        &state.get_ctx(),
+    let compare = versions::compare(
+        &git_node(&state),
         &auth,
         id,
         query.from.as_deref(),
         &query.to,
-    )
-    .await;
+    );
+    let result = drive(compare, &state.get_ctx()).await;
     Ok(match result {
         Ok(comparison) => Json(comparison_view(comparison)).into_response(),
         Err(error) => failure(error),
@@ -471,7 +475,8 @@ pub async fn conflicts(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::conflicts(&state.get_ctx(), &auth, id).await;
+    let conflicts = versions::conflicts(&git_node(&state), &auth, id);
+    let result = drive(conflicts, &state.get_ctx()).await;
     Ok(match result {
         Ok(conflicts) => Json(ConflictList {
             conflicts: conflicts

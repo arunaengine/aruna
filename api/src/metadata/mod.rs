@@ -22,7 +22,7 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::git::snapshot::unreadable_file;
+use aruna_operations::git::linked::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataResult, RoCrateExportView as OperationMetadataRoCrateExportView,
@@ -379,9 +379,10 @@ pub(crate) async fn ensure_readable_files(
     if auth.path_restrictions.is_none() {
         return Ok(());
     }
-    match unreadable_file(&state.get_ctx(), auth, entities).await {
-        Some(_) => Err(ServerError::Forbidden),
-        None => Ok(()),
+    let context = state.get_ctx();
+    match drive(unreadable_file(context.node_id(), auth, entities), &context).await {
+        Ok(None) => Ok(()),
+        _ => Err(ServerError::Forbidden),
     }
 }
 

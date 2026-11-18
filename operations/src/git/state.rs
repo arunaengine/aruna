@@ -3,55 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{
-    GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, StoredObject, ZERO_OID, refs_clash,
+    GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, ZERO_OID, refs_clash,
 };
-use aruna_core::structs::storage::dataset_location::DatasetLocation;
+use aruna_core::git_state::{Ancestry, GitState};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GitState {
-    pub refs: BTreeMap<String, String>,
-    pub lfs: BTreeMap<String, StoredObject>,
-    pub locks: BTreeMap<String, LfsLock>,
-    /// Claims that lost to a held lock; they are decided when that lock's unlock is known.
-    pub waiting: Vec<LfsLock>,
-    /// Released locks and the record that released them.
-    pub released: Vec<(LfsLock, Ulid)>,
-    /// Releases the next checkpoint adds.
-    pub new_released: Vec<(LfsLock, Ulid)>,
-    pub revision: Option<Ulid>,
-    /// The graph digest of the newest applied snapshot.
-    pub digest: Option<[u8; 32]>,
-    pub packs: Vec<GitPack>,
-    /// Commits nodes made themselves; only their Aruna trailers are trusted.
-    pub made: BTreeSet<String>,
-    /// The newest checkpoint the state starts from.
-    pub checkpoint: Option<Ulid>,
-    /// Records applied on top of that checkpoint; the next checkpoint covers exactly these.
-    pub applied: Vec<Ulid>,
-    /// Packs and LFS objects those records added.
-    pub new_packs: Vec<GitPack>,
-    pub new_lfs: Vec<StoredObject>,
-    pub new_made: Vec<String>,
-    /// The newest chosen storage location and the record that chose it.
-    pub location: Option<(Ulid, DatasetLocation)>,
-}
-
-impl GitState {
-    /// Records the next checkpoint covers: all applied ones but the newest location choice.
-    pub fn coverable(&self) -> Vec<Ulid> {
-        let kept = self.location.as_ref().map(|(id, _)| *id);
-        self.applied
-            .iter()
-            .copied()
-            .filter(|id| Some(*id) != kept)
-            .collect()
-    }
-}
-
-/// Known answers to "is the first commit an ancestor of the second".
-pub type Ancestry = BTreeMap<(String, String), bool>;
 
 /// The newest checkpoint whose previous checkpoints are all present, that chain from newest
 /// to oldest, and every record id the chain covers, including the checkpoints themselves.
@@ -519,7 +475,10 @@ mod tests {
 
     #[test]
     fn location_survives_checkpoints() {
-        let chosen = |prefix: &str| DatasetLocation::new("lab-data", prefix).unwrap();
+        let chosen = |prefix: &str| {
+            aruna_core::structs::storage::dataset_location::DatasetLocation::new("lab-data", prefix)
+                .unwrap()
+        };
         let mut records = vec![
             record(30, 1, GitChange::Location(chosen("new"))),
             update(10, "refs/heads/main", ZERO_OID, &oid('b'), None),

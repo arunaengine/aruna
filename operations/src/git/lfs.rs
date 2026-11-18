@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
 use super::objects::{self, Blob, StoreObjectOperation};
-use super::state::{Ancestry, reduce};
+use super::state::reduce;
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
@@ -23,6 +23,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use aruna_core::git_state::Ancestry;
 
 type Document = MetadataRegistryRecord;
 

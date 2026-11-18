@@ -17,6 +17,7 @@ mod framing;
 mod fs_source;
 mod fs_write;
 pub mod git;
+pub mod git_cache;
 pub mod invenio;
 pub mod local_fs;
 mod messages;

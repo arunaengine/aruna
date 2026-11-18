@@ -17,6 +17,7 @@ mod task;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
+use aruna_core::operation::SubOperation;
 use aruna_core::outbound::{
     ConnectionError, OutboundEffect, OutboundError, OutboundEvent, RangeAnswer,
 };
@@ -32,6 +33,23 @@ const BACKGROUND_CHILDREN: usize = 8;
 
 static BACKGROUND_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(BACKGROUND_CHILDREN)));
+
+/// Starts `child` beside its caller while a slot is free; `keep` lives as long as the child.
+fn start_background<K: Send + 'static>(
+    child: Box<dyn SubOperation>,
+    context: &DriverContext,
+    keep: K,
+) -> bool {
+    let Ok(slot) = BACKGROUND_SLOTS.clone().try_acquire_owned() else {
+        return false;
+    };
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _held = (slot, keep);
+        dispatch_effect(Effect::SubOperation(child), &context, 0).await;
+    });
+    true
+}
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -172,15 +190,7 @@ async fn dispatch_unboxed(
             }
         }
         Effect::Background(child) => {
-            let slot = BACKGROUND_SLOTS.clone().try_acquire_owned().ok();
-            let started = slot.is_some();
-            if let Some(slot) = slot {
-                let context = context.clone();
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    dispatch_effect(Effect::SubOperation(child), &context, 0).await;
-                });
-            }
+            let started = start_background(child, context, ());
             Event::Task(TaskEvent::BackgroundStarted { started })
         }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
@@ -220,7 +230,9 @@ async fn dispatch_unboxed(
         Effect::Compute(effect) => {
             Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
         }
-        Effect::Git(call) => Event::Git(Box::new(git::dispatch_git(*call, context).await)),
+        Effect::Git(call) => Event::Git(Box::new(
+            Box::pin(git::dispatch_git(*call, context, depth, deadline)).await,
+        )),
         Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 

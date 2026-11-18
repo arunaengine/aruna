@@ -174,6 +174,7 @@ use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 mod drained;
 pub mod folder_pass;
+pub mod git_drain;
 mod outbox;
 pub(crate) use drained::remove_drained_backends;
 mod restore;

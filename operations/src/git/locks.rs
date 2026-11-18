@@ -12,8 +12,9 @@ use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
 use super::publish::PublishRecordOperation;
-use super::state::{Ancestry, reduce};
+use super::state::reduce;
 use super::{GitError, records};
+use aruna_core::git_state::Ancestry;
 
 type Document = MetadataRegistryRecord;
 
