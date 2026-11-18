@@ -10,18 +10,21 @@ use crate::blob::migration::misplaced::{RenamePlan, rename_page};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::fence::{parse_group_record, read_group_record};
+use crate::groups::fence::group_fence_key;
 use crate::jobs::backend_import::listed_intents;
 use crate::jobs::blob_request::BlobRequest;
 use aruna_core::NodeId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key, object_prefix,
 };
@@ -29,8 +32,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::{
     DiscoveryRule, DiscoveryRules, IdentityError, check_naming, check_patterns, file_identity,
 };
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
 /// Files one preview page lists.
@@ -38,15 +40,7 @@ pub const PREVIEW_PAGE: usize = 200;
 /// Listed pages one preview reads past when the caller may see none of their files.
 const HIDDEN_PAGES: usize = 10;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SetState {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Finish,
-}
+type SetTurn = Result<Next<Vec<DiscoveryRule>>, ImportRuleError>;
 
 /// Replaces the discovery rules of one rule in a transaction that rereads the rule, so rules
 /// never outlive it. They apply to files without a recorded mapping from the next page on.
@@ -55,9 +49,7 @@ pub struct SetDiscoveryOperation {
     group_id: GroupId,
     import_id: Ulid,
     rules: Vec<DiscoveryRule>,
-    state: SetState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<Vec<DiscoveryRule>, ImportRuleError>>,
+    written: bool,
 }
 
 impl SetDiscoveryOperation {
@@ -66,52 +58,26 @@ impl SetDiscoveryOperation {
             group_id,
             import_id,
             rules,
-            state: SetState::Init,
-            txn_id: None,
-            output: None,
+            written: false,
         }
     }
 
-    fn fail(&mut self, error: ImportRuleError) -> Effects {
-        self.state = SetState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn write(&mut self, rule: Option<aruna_core::types::Value>) -> Effects {
-        let Some(rule) = rule else {
-            return self.fail(ImportRuleError::NotFound);
-        };
-        let pattern = BackendImport::from_bytes(&rule).map(|rule| rule.write_pattern);
-        match pattern.map(|pattern| check_naming(&self.rules, &pattern)) {
-            Ok(Ok(())) => {}
-            Ok(Err(reason)) => return self.fail(ImportRuleError::Invalid(reason)),
-            Err(error) => return self.fail(error.into()),
-        }
+    fn write(&mut self, [rule, fence]: [Option<Value>; 2]) -> SetTurn {
+        check_group_write(fence.as_deref())?;
+        let rule = rule.ok_or(ImportRuleError::NotFound)?;
+        let pattern = BackendImport::from_bytes(&rule)?.write_pattern;
+        check_naming(&self.rules, &pattern).map_err(ImportRuleError::Invalid)?;
         let key = import_key(self.group_id, self.import_id);
-        let effect = match self.rules.is_empty() {
-            true => StorageEffect::Delete {
-                key_space: IMPORT_DISCOVERY_KEYSPACE.to_string(),
-                key,
-                txn_id: self.txn_id,
-            },
-            false => {
-                let rules = DiscoveryRules {
-                    rules: self.rules.clone(),
-                };
-                match rules.to_bytes() {
-                    Ok(value) => StorageEffect::Write {
-                        key_space: IMPORT_DISCOVERY_KEYSPACE.to_string(),
-                        key,
-                        value: value.into(),
-                        txn_id: self.txn_id,
-                    },
-                    Err(error) => return self.fail(error.into()),
-                }
-            }
+        let space = IMPORT_DISCOVERY_KEYSPACE.to_string();
+        self.written = true;
+        if self.rules.is_empty() {
+            return Ok(Next::Call(IoCall::Delete(vec![(space, key)])));
+        }
+        let rules = DiscoveryRules {
+            rules: self.rules.clone(),
         };
-        self.state = SetState::Write;
-        smallvec![Effect::Storage(effect)]
+        let value = rules.to_bytes()?.into();
+        Ok(Next::Call(IoCall::Write(vec![(space, key, value)])))
     }
 }
 
@@ -143,83 +109,32 @@ pub fn check_rules(rules: &[DiscoveryRule]) -> Result<(), ImportRuleError> {
     Ok(())
 }
 
-impl SetDiscoveryOperation {
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ImportRuleError::Unexpected("Write"));
-        };
-        self.state = SetState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-}
-
-impl EffectOperation for SetDiscoveryOperation {
+impl Operation for SetDiscoveryOperation {
     type Output = Vec<DiscoveryRule>;
     type Error = ImportRuleError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = check_rules(&self.rules) {
-            return self.fail(error);
+    fn first(&mut self) -> SetTurn {
+        check_rules(&self.rules)?;
+        let reads = vec![
+            (
+                BACKEND_IMPORT_KEYSPACE.to_string(),
+                import_key(self.group_id, self.import_id),
+            ),
+            group_fence_key(self.group_id),
+        ];
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SetTurn {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(std::mem::take(&mut self.rules)));
         }
-        self.state = SetState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.write(values::<2>(result)?)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (SetState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = SetState::Read;
-                let key = import_key(self.group_id, self.import_id);
-                smallvec![read_group_record(
-                    self.group_id,
-                    BACKEND_IMPORT_KEYSPACE,
-                    key,
-                    txn_id
-                )]
-            }
-            (SetState::Read, event) => match parse_group_record(event) {
-                Ok(rule) => self.write(rule),
-                Err(error) => self.fail(error.into()),
-            },
-            // No rules delete the record, others write it; only that answer counts.
-            (SetState::Write, Event::Storage(StorageEvent::WriteResult { .. }))
-                if !self.rules.is_empty() =>
-            {
-                self.commit()
-            }
-            (SetState::Write, Event::Storage(StorageEvent::DeleteResult { .. }))
-                if self.rules.is_empty() =>
-            {
-                self.commit()
-            }
-            (SetState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = SetState::Finish;
-                self.output = Some(Ok(std::mem::take(&mut self.rules)));
-                smallvec![]
-            }
-            _ => self.fail(ImportRuleError::Unexpected("SetDiscovery")),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == SetState::Finish
-    }
-
-    fn finalize(self) -> Result<Vec<DiscoveryRule>, ImportRuleError> {
-        self.output
-            .unwrap_or(Err(ImportRuleError::Unexpected("Finish")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -613,10 +528,6 @@ mod tests {
         let refused = bucket_access(&context, &stranger, node, &rule).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
     }
-    fn storage(event: StorageEvent) -> Event {
-        Event::Storage(event)
-    }
-
     fn rules() -> Vec<DiscoveryRule> {
         vec![DiscoveryRule {
             pattern: "*.faa.gz".to_string(),
@@ -687,9 +598,8 @@ mod tests {
             folder: "other/".to_string(),
         });
         let mut operation = SetDiscoveryOperation::new(Ulid::nil(), Ulid::nil(), overlapping);
-        assert!(operation.start().is_empty());
         assert!(matches!(
-            operation.finalize(),
+            operation.first(),
             Err(ImportRuleError::Invalid(_))
         ));
     }
@@ -719,18 +629,12 @@ mod tests {
     fn written(
         rules: Vec<DiscoveryRule>,
         rule: Option<Vec<u8>>,
-    ) -> (SetDiscoveryOperation, Effects) {
+    ) -> (SetDiscoveryOperation, SetTurn) {
         let mut operation = SetDiscoveryOperation::new(Ulid::nil(), Ulid::nil(), rules);
-        operation.start();
-        let txn_id = TxnId::from(3);
-        operation.step(storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), rule.map(Into::into)),
-                (Key::from(Vec::new()), None),
-            ],
-        }));
-        (operation, effects)
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let turn = operation.next(IoResult::Values(vec![rule.map(Into::into), None]));
+        (operation, turn)
     }
 
     #[test]
@@ -742,62 +646,32 @@ mod tests {
         }];
         let mut rule = import_rule();
         rule.write_pattern = "{name}~{id}".to_string();
-        let (operation, _) = written(folders, Some(rule.to_bytes().unwrap()));
-        assert!(matches!(
-            operation.finalize(),
-            Err(ImportRuleError::Invalid(_))
-        ));
+        let (_, turn) = written(folders, Some(rule.to_bytes().unwrap()));
+        assert!(matches!(turn, Err(ImportRuleError::Invalid(_))));
     }
 
     #[test]
     fn stores_with_rule() {
-        let (mut operation, effects) = written(rules(), Some(import_rule().to_bytes().unwrap()));
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                value,
-                txn_id,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the rules write, got {effects:?}")
+        let (mut operation, turn) = written(rules(), Some(import_rule().to_bytes().unwrap()));
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected the rules write, got {turn:?}")
         };
-        assert_eq!(key_space, IMPORT_DISCOVERY_KEYSPACE);
-        assert_eq!(txn_id, &Some(TxnId::from(3)));
-        assert_eq!(DiscoveryRules::from_bytes(value).unwrap().rules, rules());
-        operation.step(storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
-        operation.step(storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::from(3),
-        }));
-        assert_eq!(operation.finalize(), Ok(rules()));
-
-        // A delete answer does not count for a write.
-        let (mut wrong, _) = written(rules(), Some(import_rule().to_bytes().unwrap()));
-        wrong.step(storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
-        }));
-        assert!(matches!(
-            wrong.finalize(),
-            Err(ImportRuleError::Unexpected(_))
-        ));
+        assert_eq!(writes[0].0, IMPORT_DISCOVERY_KEYSPACE);
+        assert_eq!(
+            DiscoveryRules::from_bytes(&writes[0].2).unwrap().rules,
+            rules()
+        );
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(rules())));
 
         // No rules delete the row.
-        let (_, effects) = written(Vec::new(), Some(import_rule().to_bytes().unwrap()));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                if key_space == IMPORT_DISCOVERY_KEYSPACE
-        ));
+        let (_, turn) = written(Vec::new(), Some(import_rule().to_bytes().unwrap()));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the rules delete, got {turn:?}")
+        };
+        assert_eq!(deletes[0].0, IMPORT_DISCOVERY_KEYSPACE);
 
-        // A removed rule gets no rules, and its transaction is aborted.
-        let (operation, effects) = written(rules(), None);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(operation.finalize(), Err(ImportRuleError::NotFound));
+        // A removed rule gets no rules.
+        let (_, turn) = written(rules(), None);
+        assert_eq!(turn, Err(ImportRuleError::NotFound));
     }
 }
