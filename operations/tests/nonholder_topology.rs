@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
 use aruna_core::StructuredId;
@@ -48,7 +49,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::forward::write::{
-    PinnedCreate, create_with_id, route_metadata_delete, route_metadata_update,
+    create_with_id, route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
@@ -1334,7 +1335,8 @@ async fn pinned_create_repeats() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let actor = realm.actor(origin);
     let minted = (payload.clone(), None);
-    let local = PinnedCreate::mint(&origin.context, &actor, (group_id, path), minted).await?;
+    let mint = PinnedMintOperation::new(actor.clone(), (group_id, path), minted);
+    let local = drive(mint, origin.context.as_ref()).await?;
     assert_eq!(local.target, origin.node_id());
 
     let user = realm.user_node();

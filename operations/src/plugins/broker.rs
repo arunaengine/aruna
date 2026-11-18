@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::forward::pinned::PinnedMintOperation;
 use crate::metadata::forward::routed_export::RoutedExportOperation;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -762,8 +763,11 @@ impl Broker for RunBroker {
             install.plugin, install.install_id
         );
         let payload = (CreateDocumentPayload::RoCrate { jsonld }, Some(message));
-        let minted =
-            PinnedCreate::mint(&self.ctx, &actor, (install.group_id, &path), payload).await;
+        let minted = drive(
+            PinnedMintOperation::new(actor.clone(), (install.group_id, &path), payload),
+            &self.ctx,
+        )
+        .await;
         let outcome = match minted {
             Ok(minted) => {
                 let key = (&install, create.key.as_str());

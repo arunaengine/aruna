@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub(crate) mod holder_reads;
+pub mod pinned;
 pub mod profile_export;
 pub mod read;
 pub mod route_create;

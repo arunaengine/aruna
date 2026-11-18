@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::pinned::PinnedCreate;
 use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -20,8 +21,6 @@ use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::create_document::CreateDocumentResult;
-use crate::metadata::create_document::mint_forward_document;
-use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
@@ -49,8 +48,6 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use serde::Deserialize;
-use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
@@ -142,7 +139,7 @@ async fn forward_create(
 
 /// Errors of the shared authorized create flow. Every variant maps onto the
 /// same transport status the former REST-local sequence produced.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateAuthorizedError {
     #[error("metadata document path must not be empty")]
     EmptyPath,
@@ -156,6 +153,13 @@ pub enum CreateAuthorizedError {
     Authorize(#[from] AuthorizeError),
     #[error(transparent)]
     Write(#[from] MetadataWriteError),
+}
+
+/// A runner failure leaves the create undelivered.
+impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Write(error.into())
+    }
 }
 
 /// Shared metadata create used by REST and MCP: normalize the path, mint the document id, run
@@ -250,67 +254,6 @@ pub async fn create_metadata_authorized(
     .await;
 
     Ok(record)
-}
-
-/// A create of a given document on one pinned node, kept so that a retry sends the very same
-/// arguments to the very same node.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PinnedCreate {
-    pub group_id: GroupId,
-    /// The normalized document path.
-    pub path: String,
-    pub document_id: Ulid,
-    /// This node, or the holder of the document's bucket chosen when the id was minted.
-    pub target: NodeId,
-    pub payload: CreateDocumentPayload,
-    pub message: Option<String>,
-}
-
-impl PinnedCreate {
-    /// Mints the id of a new private document at `path` and pins the node that creates it: this
-    /// node when it holds the id's bucket, else the first other holder of that bucket.
-    pub async fn mint(
-        context: &Arc<DriverContext>,
-        actor: &Actor,
-        (group_id, path): (GroupId, &str),
-        (payload, message): (CreateDocumentPayload, Option<String>),
-    ) -> Result<Self, CreateAuthorizedError> {
-        let path = MetadataRegistryRecord::normalize_document_path(path);
-        if path.is_empty() {
-            return Err(CreateAuthorizedError::EmptyPath);
-        }
-        let config = load_realm_config(context, actor.realm_id)
-            .await
-            .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let user_origin =
-            is_user_origin(&config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
-        let local = match user_origin {
-            true => Err(CreateDocumentError::HoldsNoBucket),
-            false => mint_local_document(&config, actor, group_id, &path),
-        };
-        let (document_id, target) = match local {
-            Ok(id) => (id.as_ulid(), actor.node_id),
-            Err(CreateDocumentError::HoldsNoBucket) => {
-                let id = mint_forward_document(&config, actor, group_id, &path)?.as_ulid();
-                let placement = resolve_metadata_id(&config, actor.realm_id, Some(group_id), id)?;
-                let holders = resolve_shard_holders(&config, &placement);
-                let target = holders.into_iter().find(|holder| *holder != actor.node_id);
-                let target = target.ok_or_else(|| {
-                    MetadataWriteError::Undeliverable("the document has no holder".to_string())
-                })?;
-                (id, target)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Self {
-            group_id,
-            path,
-            document_id,
-            target,
-            payload,
-            message,
-        })
-    }
 }
 
 /// Creates the pinned document on its target only, authorized on the document's own path, so a
