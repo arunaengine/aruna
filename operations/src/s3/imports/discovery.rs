@@ -2,37 +2,42 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::shared::{Claim, claim_file, read_shared, taken_paths};
-use super::{ImportRuleError, read_earlier, validate_folder};
+use super::shared::{
+    Claim, PathIntents, PathIntentsOperation, ReadSharedOperation, SharedRule, TakenPathsOperation,
+    claim_file,
+};
+use super::{ImportRuleError, ReadEarlierOperation, validate_folder};
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::BucketAccess;
+use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use crate::blob::migration::misplaced::{RenamePlan, rename_page};
 use crate::driver::{DriverContext, drive};
-use crate::groups::backends::parse_read;
-use crate::groups::backends::query::GetBackendOperation;
+use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::fence::group_fence_key;
-use crate::jobs::backend_import::listed_intents;
 use crate::jobs::blob_request::BlobRequest;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::effects::BlobEffect;
+use aruna_core::errors::BlobError;
+use aruna_core::events::BlobEvent;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::values;
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key, object_prefix,
+    BackendImport, ExternalObject, ImportedObject, PathIdentity, WriteIntent, import_key,
+    object_key, object_prefix,
 };
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::{
     DiscoveryRule, DiscoveryRules, IdentityError, check_naming, check_patterns, file_identity,
 };
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{GroupId, Key, Value};
+use std::collections::HashSet;
 use ulid::Ulid;
 
 /// Files one preview page lists.
@@ -139,79 +144,130 @@ impl Operation for SetDiscoveryOperation {
 }
 
 /// The stored discovery rules of a rule; none when it has no row.
-pub async fn read_discovery(
-    context: &DriverContext,
-    group_id: GroupId,
-    import_id: Ulid,
-) -> Result<Vec<DiscoveryRule>, ImportRuleError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: IMPORT_DISCOVERY_KEYSPACE.to_string(),
+#[derive(Debug, PartialEq)]
+pub struct ReadDiscoveryOperation {
+    key: Key,
+}
+
+impl ReadDiscoveryOperation {
+    pub fn new(group_id: GroupId, import_id: Ulid) -> Self {
+        Self {
             key: import_key(group_id, import_id),
-            txn_id: None,
-        })
-        .await;
-    let rules = parse_read(event, DiscoveryRules::from_bytes)?;
-    Ok(rules.map(|rules| rules.rules).unwrap_or_default())
+        }
+    }
+}
+
+impl Operation for ReadDiscoveryOperation {
+    type Output = Vec<DiscoveryRule>;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> SetTurn {
+        let read = read_row(IMPORT_DISCOVERY_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> SetTurn {
+        let stored = result.value()?;
+        let rules = (stored.as_deref())
+            .map(DiscoveryRules::from_bytes)
+            .transpose()?;
+        Ok(Next::Done(
+            rules.map(|rules| rules.rules).unwrap_or_default(),
+        ))
+    }
 }
 
 /// The caller's WRITE on the rule's bucket, which every key a rule places lies in. A token
 /// limited to some paths is refused: rules place keys anywhere below the rule's folder.
-pub async fn bucket_access(
-    context: &DriverContext,
-    auth: &AuthContext,
+#[derive(Debug, PartialEq)]
+pub struct RuleAccessOperation {
+    auth: AuthContext,
     node_id: NodeId,
-    rule: &BackendImport,
-) -> Result<BucketAccess, ImportRuleError> {
-    if auth.path_restrictions.is_some() {
-        return Err(ImportRuleError::Forbidden);
-    }
-    let scope = (auth.realm_id, rule.group_id, node_id);
-    let access = BucketAccess::load(context, auth, scope, &rule.bucket)
-        .await
-        .map_err(|error| match error {
-            AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => {
-                ImportRuleError::Forbidden
-            }
-            AuthorizeError::Storage(error) => ImportRuleError::Storage(error),
-            AuthorizeError::CheckFailed(message) => ImportRuleError::Read(message),
-        })?;
-    match access.allows(None, &Permission::WRITE) {
-        true => Ok(access),
-        false => Err(ImportRuleError::Forbidden),
+    group_id: GroupId,
+    bucket: String,
+}
+
+impl RuleAccessOperation {
+    pub fn new(auth: &AuthContext, node_id: NodeId, rule: &BackendImport) -> Self {
+        Self {
+            auth: auth.clone(),
+            node_id,
+            group_id: rule.group_id,
+            bucket: rule.bucket.clone(),
+        }
     }
 }
 
+impl Operation for RuleAccessOperation {
+    type Output = BucketAccess;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> Result<Next<BucketAccess>, ImportRuleError> {
+        if self.auth.path_restrictions.is_some() {
+            return Err(ImportRuleError::Forbidden);
+        }
+        let scope = (self.auth.realm_id, self.group_id, self.node_id);
+        let load = BucketAccessOperation::new(&self.auth, scope, &self.bucket);
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<BucketAccess>, ImportRuleError> {
+        let access =
+            result
+                .child::<BucketAccess, AuthorizeError>()?
+                .map_err(|error| match error {
+                    AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => {
+                        ImportRuleError::Forbidden
+                    }
+                    AuthorizeError::Storage(error) => ImportRuleError::Storage(error),
+                    AuthorizeError::CheckFailed(message) => ImportRuleError::Read(message),
+                })?;
+        match access.allows(None, &Permission::WRITE) {
+            true => Ok(Next::Done(access)),
+            false => Err(ImportRuleError::Forbidden),
+        }
+    }
+}
+
+/// The rows a rename's guards keep as read.
+pub type RenameGuards = Vec<(String, Key, Option<Value>)>;
+
 /// The rule and its earlier patterns as stored, read before its renames are checked, so a
 /// rename starts only for the files the check saw.
-pub async fn rename_guards(
-    context: &DriverContext,
-    rule: &BackendImport,
-) -> Result<Vec<(String, Key, Option<Value>)>, ImportRuleError> {
-    let reads = vec![
-        (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
-        (
-            IMPORT_PATTERN_KEYSPACE.to_string(),
-            object_prefix(rule.import_id),
-        ),
-    ];
-    let effect = StorageEffect::BatchRead {
-        reads: reads.clone(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
-            let values = values.into_iter().map(|(_, value)| value);
-            Ok(reads
-                .into_iter()
-                .zip(values)
-                .map(|((space, key), value)| (space, key, value))
-                .collect())
+#[derive(Debug, PartialEq)]
+pub struct RenameGuardsOperation {
+    reads: Vec<(String, Key)>,
+}
+
+impl RenameGuardsOperation {
+    pub fn new(rule: &BackendImport) -> Self {
+        Self {
+            reads: vec![
+                (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
+                (
+                    IMPORT_PATTERN_KEYSPACE.to_string(),
+                    object_prefix(rule.import_id),
+                ),
+            ],
         }
-        other => Err(ImportRuleError::Read(format!(
-            "unexpected answer {other:?}"
-        ))),
+    }
+}
+
+impl Operation for RenameGuardsOperation {
+    type Output = RenameGuards;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> Result<Next<RenameGuards>, ImportRuleError> {
+        Ok(Next::Call(IoCall::Read(self.reads.clone())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RenameGuards>, ImportRuleError> {
+        let [rule, patterns] = values::<2>(result)?;
+        let guards = (self.reads.iter().cloned())
+            .zip([rule, patterns])
+            .map(|((space, key), value)| (space, key, value))
+            .collect();
+        Ok(Next::Done(guards))
     }
 }
 
@@ -223,39 +279,91 @@ pub async fn authorized_renames(
     rule: &BackendImport,
     permission: Permission,
 ) -> Result<RenamePlan, ImportRuleError> {
-    let access = bucket_access(context, auth, node_id, rule).await?;
+    let access = drive(RuleAccessOperation::new(auth, node_id, rule), context).await?;
     let allow = |key: &str| access.allows(Some(key), &permission);
     let all = |_: &str| true;
     let planned = rename_page(context, rule, (&all, &allow), (None, None, 0)).await;
     Ok(planned.map_err(ImportRuleError::Read)?.plan)
 }
 
-/// A preview after `bucket_access`; it shows only files whose key the caller may read.
-pub async fn authorized_preview(
-    context: &DriverContext,
-    (auth, node_id): (&AuthContext, NodeId),
-    rule: &BackendImport,
-    rules: &[DiscoveryRule],
-    start_after: Option<String>,
-) -> Result<DiscoveryPreview, ImportRuleError> {
-    let access = bucket_access(context, auth, node_id, rule).await?;
-    let mut after = start_after;
-    // `next` names only a file the caller sees, so hidden pages are read past here.
-    for _ in 0..HIDDEN_PAGES {
-        let mut preview = preview_discovery(context, rule, rules, after).await?;
-        preview.files.retain(|file| readable(&access, rule, file));
-        if preview.next.is_none() {
-            return Ok(preview);
+type AccessPreviewTurn = Result<Next<DiscoveryPreview>, ImportRuleError>;
+
+/// A preview for a caller with WRITE on the bucket; it shows only files whose key the caller may
+/// read, and reads past pages that show none.
+#[derive(Debug, PartialEq)]
+pub struct AuthorizedPreviewOperation {
+    auth: AuthContext,
+    node_id: NodeId,
+    rule: BackendImport,
+    rules: Vec<DiscoveryRule>,
+    after: Option<String>,
+    access: Option<BucketAccess>,
+    pages: usize,
+}
+
+impl AuthorizedPreviewOperation {
+    pub fn new(
+        (auth, node_id): (&AuthContext, NodeId),
+        rule: &BackendImport,
+        rules: &[DiscoveryRule],
+        start_after: Option<String>,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            node_id,
+            rule: rule.clone(),
+            rules: rules.to_vec(),
+            after: start_after,
+            access: None,
+            pages: 0,
         }
+    }
+
+    fn next_page(&mut self) -> AccessPreviewTurn {
+        if self.pages == HIDDEN_PAGES {
+            return Err(ImportRuleError::Invalid(
+                "too many files in a row are hidden from the caller".to_string(),
+            ));
+        }
+        self.pages += 1;
+        let preview = PreviewDiscoveryOperation::new(&self.rule, &self.rules, self.after.take());
+        Ok(Next::Call(IoCall::child(preview)))
+    }
+
+    fn page_read(&mut self, mut preview: DiscoveryPreview) -> AccessPreviewTurn {
+        let access = self.access.as_ref();
+        let access = access.ok_or(ImportRuleError::Unexpected("Preview"))?;
+        let rule = &self.rule;
+        preview.files.retain(|file| readable(access, rule, file));
+        if preview.next.is_none() {
+            return Ok(Next::Done(preview));
+        }
+        // `next` names only a file the caller sees, so hidden pages are read past here.
         if let Some(last) = preview.files.last() {
             preview.next = Some(last.path.clone());
-            return Ok(preview);
+            return Ok(Next::Done(preview));
         }
-        after = preview.next;
+        self.after = preview.next;
+        self.next_page()
     }
-    Err(ImportRuleError::Invalid(
-        "too many files in a row are hidden from the caller".to_string(),
-    ))
+}
+
+impl Operation for AuthorizedPreviewOperation {
+    type Output = DiscoveryPreview;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> AccessPreviewTurn {
+        let access = RuleAccessOperation::new(&self.auth, self.node_id, &self.rule);
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn next(&mut self, result: IoResult) -> AccessPreviewTurn {
+        if self.access.is_none() {
+            self.access = Some(result.child::<BucketAccess, ImportRuleError>()??);
+            return self.next_page();
+        }
+        self.page_read(result.child::<DiscoveryPreview, ImportRuleError>()??)
+    }
 }
 
 /// A conflict has no key; its file is decided by its key at the bucket root.
@@ -306,58 +414,96 @@ pub struct DiscoveryPreview {
     pub next: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewStep {
+    Backend,
+    List,
+    Rows,
+    Shared,
+    Earlier,
+    Intents,
+    Taken,
+}
+
+type PreviewTurn = Result<Next<DiscoveryPreview>, ImportRuleError>;
+
 /// Lists one page of the rule's folder and places each file with `rules`, without writing.
-pub async fn preview_discovery(
-    context: &DriverContext,
-    rule: &BackendImport,
-    rules: &[DiscoveryRule],
+#[derive(Debug, PartialEq)]
+pub struct PreviewDiscoveryOperation {
+    rule: BackendImport,
+    rules: Vec<DiscoveryRule>,
     start_after: Option<String>,
-) -> Result<DiscoveryPreview, ImportRuleError> {
-    check_rules(rules)?;
-    let backend = drive(GetBackendOperation::new(rule.backend_id), context)
-        .await
-        .map_err(|error| ImportRuleError::Read(error.to_string()))?
-        .filter(|backend| backend.group_id == rule.group_id)
-        .ok_or_else(|| ImportRuleError::Invalid("the storage backend is missing".to_string()))?;
-    let listing = BlobEffect::ListExternal {
-        backend: BackendRef::Group(rule.backend_id),
-        prefix: rule.backend_prefix.clone(),
-        start_after,
-        limit: PREVIEW_PAGE,
-    };
-    let (objects, next) = match drive(BlobRequest::new(listing), context).await {
-        Ok(BlobEvent::ExternalListed { objects, next }) => (objects, next),
-        Ok(other) => {
-            return Err(ImportRuleError::Read(format!(
-                "unexpected answer {other:?}"
-            )));
+    step: PreviewStep,
+    backend: Option<GroupStorage>,
+    objects: Vec<ExternalObject>,
+    next_page: Option<String>,
+    rows: Vec<Option<Value>>,
+    shared: Vec<SharedRule>,
+    earlier: Vec<String>,
+    intents: PathIntents,
+}
+
+impl PreviewDiscoveryOperation {
+    pub fn new(rule: &BackendImport, rules: &[DiscoveryRule], start_after: Option<String>) -> Self {
+        Self {
+            rule: rule.clone(),
+            rules: rules.to_vec(),
+            start_after,
+            step: PreviewStep::Backend,
+            backend: None,
+            objects: Vec::new(),
+            next_page: None,
+            rows: Vec::new(),
+            shared: Vec::new(),
+            earlier: Vec::new(),
+            intents: PathIntents::new(),
         }
-        Err(error) => return Err(ImportRuleError::Read(error.reason())),
-    };
-    let objects: Vec<_> = objects
-        .into_iter()
-        .filter(|object| !backend.is_reserved(&object.key))
-        .collect();
-    let reads = objects
-        .iter()
-        .map(|object| {
-            let key = object_key(rule.import_id, &object.key);
-            (IMPORTED_OBJECT_KEYSPACE.to_string(), key)
-        })
-        .collect();
-    let rows = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => {
-            return Err(ImportRuleError::Read(format!(
-                "unexpected answer {other:?}"
-            )));
+    }
+
+    fn call(&mut self, step: PreviewStep, call: IoCall) -> PreviewTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn backend_read(
+        &mut self,
+        backend: Result<Option<GroupStorage>, GroupQueryError>,
+    ) -> PreviewTurn {
+        let backend = backend.map_err(|error| ImportRuleError::Read(error.to_string()))?;
+        let group_id = self.rule.group_id;
+        let backend = backend
+            .filter(|backend| backend.group_id == group_id)
+            .ok_or_else(|| {
+                ImportRuleError::Invalid("the storage backend is missing".to_string())
+            })?;
+        self.backend = Some(backend);
+        let listing = BlobRequest::new(BlobEffect::ListExternal {
+            backend: BackendRef::Group(self.rule.backend_id),
+            prefix: self.rule.backend_prefix.clone(),
+            start_after: self.start_after.take(),
+            limit: PREVIEW_PAGE,
+        });
+        self.call(PreviewStep::List, IoCall::child(listing))
+    }
+
+    fn listed(&mut self, listed: Result<BlobEvent, BlobError>) -> PreviewTurn {
+        let (objects, next) = match listed {
+            Ok(BlobEvent::ExternalListed { objects, next }) => (objects, next),
+            Ok(other) => {
+                return Err(ImportRuleError::Read(format!(
+                    "unexpected answer {other:?}"
+                )));
+            }
+            Err(error) => return Err(ImportRuleError::Read(error.reason())),
+        };
+        let backend = self.backend.as_ref();
+        let backend = backend.ok_or(ImportRuleError::Unexpected("Preview"))?;
+        self.objects = (objects.into_iter())
+            .filter(|object| !backend.is_reserved(&object.key))
+            .collect();
+        self.next_page = next;
+        if self.objects.is_empty() {
+            return self.read_shared();
         }
     };
     let shared = read_shared(context, rule).await?;
