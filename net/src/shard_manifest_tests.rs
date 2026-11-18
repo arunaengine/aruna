@@ -115,7 +115,7 @@ fn tiny_budget_pages() {
         updated_at_ms: 99,
         entries,
     };
-    let entry_digest = crate::shard::manifest::manifest_entry_digest(&manifest.entries);
+    let entry_digest = manifest_entry_digest(&manifest.entries);
     let sample_page = |entries: Vec<ShardManifestEntry>| ShardManifestPage {
         placement: manifest.placement,
         holder,
