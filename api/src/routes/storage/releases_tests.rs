@@ -348,7 +348,6 @@ async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
     use aruna_operations::driver::drive;
-    use aruna_operations::driver::drive;
     use aruna_operations::s3::object::delete::pinned::{
         PinnedError, RefusePinnedOperation, RefuseScopeOperation,
     };

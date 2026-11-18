@@ -56,14 +56,12 @@ fn topic_missing() -> IoResult {
 }
 
 fn pulled() -> IoResult {
-    shard_event(ShardNetEvent::Pulled { applied: true })
+    IoResult::Child(ChildOutcome::new(Ok::<bool, IoError>(true)))
 }
 
-fn pull_from(peer: NodeId) -> ShardNetEffect {
-    ShardNetEffect::Pull {
-        topics: vec![topic()],
-        peers: vec![peer],
-    }
+fn pull_from(peer: NodeId) -> Result<Next<Option<(NodeId, [u8; 32])>>, IoError> {
+    let pull = crate::shard::pull::PullTopicsOperation::new(vec![topic()], vec![peer]);
+    Ok(Next::Call(IoCall::child(pull)))
 }
 
 fn converging(required: Option<irokle::ActorClock>) -> ConvergeOperation {
@@ -101,7 +99,7 @@ fn equal_digests_converge() {
 #[test]
 fn missing_genesis_pulls() {
     assert_eq!(
-        shard_effect(compared(1, 1, None).next(topic_missing())),
+        compared(1, 1, None).next(topic_missing()),
         pull_from(node(2))
     );
 }
@@ -109,7 +107,7 @@ fn missing_genesis_pulls() {
 #[test]
 fn different_digests_pull() {
     assert_eq!(
-        shard_effect(compared(1, 2, None).next(topic_known())),
+        compared(1, 2, None).next(topic_known()),
         pull_from(node(2))
     );
 }
@@ -124,10 +122,7 @@ fn required_frontier_checked() {
     operation
         .next(child(Ok::<_, ManifestError>(local)))
         .unwrap();
-    assert_eq!(
-        shard_effect(operation.next(topic_known())),
-        pull_from(node(2))
-    );
+    assert_eq!(operation.next(topic_known()), pull_from(node(2)));
 }
 
 #[test]
@@ -162,10 +157,7 @@ fn local_failure_stops() {
 
 /// Runs one failed comparison up to the fetch that follows the pull.
 fn after_pull(operation: &mut ConvergeOperation) {
-    assert!(matches!(
-        shard_effect(operation.next(topic_known())),
-        ShardNetEffect::Pull { .. }
-    ));
+    assert!(runs_child(operation.next(topic_known())));
     assert!(runs_child(operation.next(pulled())));
 }
 

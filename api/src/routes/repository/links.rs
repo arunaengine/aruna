@@ -23,7 +23,7 @@ use aruna_operations::jobs::repository::link_store::{
 };
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::{Action, NodeScope, TransferError, seal_token, supports};
-use aruna_operations::metadata::profile::validation::check_profile;
+use aruna_operations::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -375,8 +375,11 @@ pub(crate) async fn requirements(
         let (jsonld, _) =
             Box::pin(crate_jsonld(&context, auth, document_id, metadata_bytes)).await?;
         let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
-        let status = Box::pin(check_profile(&context, check.profile_iri, &jsonld))
+        let local = context.net_handle.as_ref().map(|net| net.node_id());
+        let assess = ProfileAssessOperation::against(local, check.profile_iri, jsonld.clone());
+        let status = Box::pin(drive(assess, &context))
             .await
+            .map(profile_verdict)
             .map_err(profile_failure)?;
         check.finish(status)
     };

@@ -43,7 +43,9 @@ fn refused() -> IoResult {
 }
 
 fn pulled() -> IoResult {
-    shard_event(ShardNetEvent::Pulled { applied: true })
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(
+        Ok::<bool, aruna_core::calls::IoError>(true),
+    ))
 }
 
 fn probed(probe: GenesisProbe) -> IoResult {
@@ -172,11 +174,10 @@ fn adopting() -> ResolveTopicsOperation {
         ..GenesisProbe::default()
     };
     assert_eq!(
-        shard_effect(operation.next(probed(probe))),
-        ShardNetEffect::Pull {
-            topics: vec![topic(1)],
-            peers: vec![node(2)],
-        }
+        operation.next(probed(probe)),
+        Ok(Next::Call(IoCall::child(
+            crate::shard::pull::PullTopicsOperation::new(vec![topic(1)], vec![node(2)])
+        )))
     );
     assert_eq!(
         shard_effect(operation.next(pulled())),
@@ -334,10 +335,7 @@ fn incomplete_members_withheld() {
 #[test]
 fn unserved_pull_pending() {
     let mut operation = joining();
-    assert!(matches!(
-        shard_effect(operation.next(existing(&[]))),
-        ShardNetEffect::Pull { .. }
-    ));
+    assert!(runs_child(operation.next(existing(&[]))));
     operation.next(pulled()).unwrap();
     let outcome = HeldTopicOutcome {
         withheld: false,

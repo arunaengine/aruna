@@ -519,13 +519,17 @@ fn missing_topic_pulled() {
     let mut operation = with_source();
     let empty = shard_event(ShardNetEvent::Existing(Default::default()));
     assert_eq!(
-        shard_effect(operation.next(empty)),
-        ShardNetEffect::Pull {
-            topics: vec![shard_topic_id(realm(), &placement())],
-            peers: vec![node(2)],
-        }
+        operation.next(empty),
+        Ok(Next::Call(IoCall::child(
+            crate::shard::pull::PullTopicsOperation::new(
+                vec![shard_topic_id(realm(), &placement())],
+                vec![node(2)],
+            )
+        )))
     );
-    let pulled = shard_event(ShardNetEvent::Pulled { applied: true });
+    let pulled = IoResult::Child(aruna_core::calls::ChildOutcome::new(
+        Ok::<bool, aruna_core::calls::IoError>(true),
+    ));
     assert!(runs_child(operation.next(pulled)));
 }
 

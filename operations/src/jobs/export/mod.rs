@@ -506,7 +506,7 @@ async fn repository_export(
     use super::repository::connector::ConnectorViewOperation;
     use super::repository::invenio::export::{ExportRun, RepositoryExportOperation};
     use super::repository::{Action, JobScope, TransferError, ensure_supported};
-    use crate::metadata::profile::validation::check_profile;
+    use crate::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
@@ -531,8 +531,12 @@ async fn repository_export(
                     TransferError::Permanent("source crate metadata missing".into())
                 })?;
                 let check = CrateCheck::new(kind, &view.connector.endpoint, jsonld)?;
-                let status = Box::pin(check_profile(&ctx.driver, check.profile_iri, jsonld))
+                let local = ctx.driver.net_handle.as_ref().map(|net| net.node_id());
+                let assess =
+                    ProfileAssessOperation::against(local, check.profile_iri, jsonld.to_string());
+                let status = Box::pin(drive(assess, &ctx.driver))
                     .await
+                    .map(profile_verdict)
                     .map_err(profile_failure)?;
                 let checked = check.finish(status)?;
                 if !checked.ready {

@@ -2549,7 +2549,9 @@ mod tests {
         let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), generation_two.clone()).await;
 
-        clear_consumed_markers(&ctx, observed).await.unwrap();
+        drive(ClearMarkersOperation::new(observed), &ctx)
+            .await
+            .unwrap();
 
         // The re-dirtied marker survives, keeping the retry signal for the racing
         // write's counter change.
@@ -2563,7 +2565,9 @@ mod tests {
             Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_two),
         )];
-        clear_consumed_markers(&ctx, observed).await.unwrap();
+        drive(ClearMarkersOperation::new(observed), &ctx)
+            .await
+            .unwrap();
         assert!(
             read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await

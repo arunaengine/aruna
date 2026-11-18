@@ -345,7 +345,7 @@ async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    crate::sync::incoming::initialize_incoming_fixture(context.clone());
+    crate::inbound::initialize_incoming_fixture(context.clone());
     RecoveryNode {
         _dir: dir,
         net,

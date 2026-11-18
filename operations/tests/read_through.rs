@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
 use crate::topology;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
