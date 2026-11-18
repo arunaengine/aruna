@@ -1,76 +1,67 @@
-//! Fetches a co-holder's paged shard manifest over the shard ALPN and assembles it.
+//! Asks a co-holder for its shard manifest and checks that the answer is the one requested.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::alpn::Alpn;
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::document::ShardManifest;
+use aruna_core::effects::ShardNetEffect;
+use aruna_core::events::ShardNetEvent;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_net::NetHandle;
-use aruna_net::streams::BiStream;
-use tokio::time::{Instant, timeout};
 
-use crate::shard::protocol::{
-    ManifestAssembler, ShardTransportMessage, ShardTransportResponse, read_shard_response,
-    write_shard_request,
-};
+use super::{ManifestError, shard_answer, shard_call};
 
 pub const SHARD_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Fetches a co-holder's paged manifest for one shard over the shard ALPN and
-/// assembles it. A `Reject` from the co-holder (foreign realm, untrusted peer,
-/// or a shard it does not hold) surfaces as `Err`.
-pub async fn fetch_shard_manifest(
-    net_handle: &NetHandle,
-    node_id: NodeId,
+/// Fetches a co-holder's paged manifest for one shard. A `Reject` from the co-holder
+/// (foreign realm, untrusted peer, or a shard it does not hold) surfaces as an error.
+#[derive(Debug, PartialEq)]
+pub struct FetchManifestOperation {
+    peer: NodeId,
     realm_id: RealmId,
     placement: PlacementRef,
-) -> Result<ShardManifest, String> {
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Shard)
-        .await
-        .map_err(|error| error.to_string())?;
-    let request = ShardTransportMessage::ManifestRequest {
-        realm_id,
-        placement,
-    };
-    write_message(&mut stream, &request).await?;
-    stream.0.finish().map_err(|error| error.to_string())?;
+}
 
-    let deadline = Instant::now() + SHARD_IO_TIMEOUT;
-    let mut assembler = ManifestAssembler::new(node_id, placement);
-    loop {
-        let response = match read_response_before(&mut stream, deadline).await {
-            Ok(response) => response,
-            Err(error) => {
-                close_stream(&mut stream).await;
-                return Err(error);
-            }
-        };
-        match response {
-            ShardTransportResponse::ManifestPage(page) => match assembler.push(*page) {
-                Ok(Some(manifest)) => {
-                    close_stream(&mut stream).await;
-                    return validate_manifest_response(manifest, node_id, placement);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    close_stream(&mut stream).await;
-                    return Err(error);
-                }
-            },
-            ShardTransportResponse::Reject(reason) => {
-                close_stream(&mut stream).await;
-                return Err(reason);
-            }
+impl FetchManifestOperation {
+    pub fn new(peer: NodeId, realm_id: RealmId, placement: PlacementRef) -> Self {
+        Self {
+            peer,
+            realm_id,
+            placement,
         }
     }
 }
 
-fn validate_manifest_response(
+impl Operation for FetchManifestOperation {
+    type Output = ShardManifest;
+    type Error = ManifestError;
+
+    fn first(&mut self) -> Result<Next<ShardManifest>, ManifestError> {
+        Ok(Next::Call(shard_call(ShardNetEffect::FetchManifest {
+            peer: self.peer,
+            realm_id: self.realm_id,
+            placement: self.placement,
+        })))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ShardManifest>, ManifestError> {
+        match shard_answer(result)? {
+            ShardNetEvent::Manifest(manifest) => {
+                Ok(Next::Done(*manifest.map_err(ManifestError)?))
+            }
+            ShardNetEvent::NoNetwork => {
+                Err(ManifestError("shard fetch needs a net handle".to_string()))
+            }
+            other => Err(ManifestError(format!("unexpected shard answer {other:?}"))),
+        }
+    }
+}
+
+pub(crate) fn validate_manifest_response(
     manifest: ShardManifest,
     node_id: NodeId,
     placement: PlacementRef,
@@ -88,30 +79,6 @@ fn validate_manifest_response(
         ));
     }
     Ok(manifest)
-}
-
-async fn write_message(
-    stream: &mut BiStream,
-    message: &ShardTransportMessage,
-) -> Result<(), String> {
-    timeout(SHARD_IO_TIMEOUT, write_shard_request(stream, message))
-        .await
-        .map_err(|_| "timed out writing shard message".to_string())?
-}
-
-async fn read_response_before(
-    stream: &mut BiStream,
-    deadline: Instant,
-) -> Result<ShardTransportResponse, String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    timeout(remaining, read_shard_response(stream))
-        .await
-        .map_err(|_| "timed out waiting for shard response".to_string())?
-}
-
-pub(crate) async fn close_stream(stream: &mut BiStream) {
-    let _ = stream.0.finish();
-    let _ = stream.1.stop(0u32.into());
 }
 
 #[cfg(test)]
