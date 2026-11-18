@@ -817,3 +817,413 @@ async fn bad_config_degrades() {
     assert!(!pass.enumerated);
     assert_eq!(cursor, bound);
 }
+
+#[tokio::test]
+async fn stall_recovery() {
+    let realm_id = RealmId([12; 32]);
+    let local = make_node(realm_id, 6).await;
+    let blocked = make_node(realm_id, 7).await;
+    let (config, placements) = test_config(realm_id, local.net.node_id(), &[blocked.net.node_id()]);
+    save_config(&local, &config).await;
+    save_config(&blocked, &config).await;
+    let topic = shard_topic_id(realm_id, &placements[0]);
+    seed_topic(&blocked, topic, &[blocked.net.node_id()]).await;
+
+    tokio::time::pause();
+    let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
+    let (partial, progress, remaining) = wait_stall(&status).await;
+    // A stalled recovery must keep reporting its outstanding topics.
+    assert!(remaining > 0);
+
+    wait_partial(&status, partial.saturating_add(3)).await;
+    assert_eq!(status.progress_ms(), progress);
+    assert_eq!(status.snapshot().topics_remaining, remaining);
+
+    finish_driver(cancelled, driver).await;
+    stop_node(local).await;
+    stop_node(blocked).await;
+}
+
+#[test]
+fn shared_peers_filter() {
+    let self_id = node(1);
+    let management = node(2);
+    let server = node(3);
+    let user = node(5);
+    let realm_id = RealmId([9; 32]);
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.nodes = vec![
+        RealmNode {
+            node_id: self_id.to_string(),
+            kind: RealmNodeKind::Management,
+        },
+        RealmNode {
+            node_id: management.to_string(),
+            kind: RealmNodeKind::Management,
+        },
+        RealmNode {
+            node_id: user.to_string(),
+            kind: RealmNodeKind::User {
+                owner: UserId::nil(realm_id),
+            },
+        },
+        RealmNode {
+            node_id: "malformed-eligible-id".to_string(),
+            kind: RealmNodeKind::Server,
+        },
+        RealmNode {
+            node_id: server.to_string(),
+            kind: RealmNodeKind::Server,
+        },
+    ];
+
+    assert_eq!(
+        shared_topic_peers(&config, self_id),
+        vec![management, server]
+    );
+}
+
+fn topic(seed: u8) -> TopicId {
+    TopicId::from_bytes([seed; 32])
+}
+
+fn answer(event: ShardNetEvent) -> IoResult {
+    let event = Event::Net(NetEvent::Shard(Box::new(event)));
+    IoResult::Event(Box::new(event))
+}
+
+fn existing(topics: &[TopicId]) -> IoResult {
+    answer(ShardNetEvent::Existing(topics.iter().copied().collect()))
+}
+
+fn outcome(result: Result<(), &str>) -> IoResult {
+    answer(ShardNetEvent::Outcome(result.map_err(str::to_string)))
+}
+
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+fn pulled(applied: bool) -> IoResult {
+    child::<bool, IoError>(Ok(applied))
+}
+
+fn work_unit(kind: RestoreKind, peers: Vec<NodeId>, topics: Vec<TopicId>) -> RestoreUnit {
+    RestoreUnit {
+        kind,
+        peers,
+        publishers: vec![node(1)],
+        retained: BTreeSet::new(),
+        topics,
+    }
+}
+
+fn unit_operation(unit: RestoreUnit) -> RestoreUnitOperation {
+    RestoreUnitOperation::new(node(1), unit, BTreeSet::new())
+}
+
+fn pull_call(topics: Vec<TopicId>, peers: Vec<NodeId>) -> IoCall {
+    IoCall::child(PullTopicsOperation::new(topics, peers))
+}
+
+fn resolved(to_ensure: Vec<TopicId>, withheld: bool) -> IoResult {
+    child::<_, IoError>(Ok(ResolvedTopics {
+        to_ensure,
+        withheld,
+        unreachable: BTreeSet::new(),
+    }))
+}
+
+fn unresolved(topics: &[TopicId]) -> RestoreUnitOutcome {
+    let mut outcome = RestoreUnitOutcome::default();
+    outcome.fail_topics(topics.iter().copied());
+    outcome
+}
+
+#[test]
+fn lone_unit_mints() {
+    let unit = work_unit(RestoreKind::Shared, Vec::new(), vec![topic(1)]);
+    let mut restore = unit_operation(unit);
+    let resolve = ResolveTopicsOperation::new(Vec::new(), vec![topic(1)], true, BTreeSet::new());
+    assert_eq!(restore.first(), Ok(Next::Call(IoCall::child(resolve))));
+    let ensure = shard_call(ShardNetEffect::EnsureLocal(vec![topic(1)]));
+    let turn = restore.next(resolved(vec![topic(1)], false));
+    assert_eq!(turn, Ok(Next::Call(ensure)));
+    let turn = restore.next(outcome(Err("refused")));
+    assert_eq!(turn, Ok(Next::Done(unresolved(&[topic(1)]))));
+}
+
+#[test]
+fn join_never_mints() {
+    let unit = work_unit(RestoreKind::SharedJoin, vec![node(2)], vec![topic(1)]);
+    let mut restore = unit_operation(unit);
+    let resolve =
+        ResolveTopicsOperation::new(vec![node(2)], vec![topic(1)], false, BTreeSet::new());
+    assert_eq!(restore.first(), Ok(Next::Call(IoCall::child(resolve))));
+}
+
+#[test]
+fn shared_unit_pulls() {
+    let unit = work_unit(RestoreKind::Shared, vec![node(2)], vec![topic(1), topic(2)]);
+    let mut restore = unit_operation(unit);
+    restore.first().unwrap();
+    let ensure = shard_call(ShardNetEffect::EnsureShared {
+        topics: vec![topic(1)],
+        peers: vec![node(2)],
+    });
+    let turn = restore.next(resolved(vec![topic(1)], true));
+    assert_eq!(turn, Ok(Next::Call(ensure)));
+    // A failed ensure still pulls: a peer may hold what could not be created here.
+    let turn = restore.next(outcome(Err("refused")));
+    assert_eq!(
+        turn,
+        Ok(Next::Call(pull_call(vec![topic(1)], vec![node(2)])))
+    );
+    let turn = restore.next(pulled(true));
+    assert_eq!(turn, Ok(Next::Done(unresolved(&[topic(1), topic(2)]))));
+}
+
+#[test]
+fn failed_resolve_withholds() {
+    let unit = work_unit(RestoreKind::Shared, vec![node(2)], vec![topic(1)]);
+    let mut restore = unit_operation(unit);
+    restore.first().unwrap();
+    let turn = restore.next(child::<ResolvedTopics, _>(Err(IoError::Aborted)));
+    assert_eq!(turn, Ok(Next::Done(unresolved(&[topic(1)]))));
+}
+
+#[test]
+fn rank_zero_pulls() {
+    let topics = vec![topic(1), topic(2)];
+    let unit = work_unit(RestoreKind::Rank0, vec![node(2)], topics.clone());
+    let mut restore = unit_operation(unit);
+    assert!(matches!(restore.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let genesis = child::<_, IoError>(Ok((true, BTreeSet::<NodeId>::new())));
+    let turn = restore.next(genesis);
+    let check = shard_call(ShardNetEffect::Existing(topics));
+    assert_eq!(turn, Ok(Next::Call(check)));
+    let turn = restore.next(existing(&[topic(1)]));
+    assert_eq!(
+        turn,
+        Ok(Next::Call(pull_call(vec![topic(1)], vec![node(2)])))
+    );
+    let turn = restore.next(pulled(false));
+    assert_eq!(turn, Ok(Next::Done(unresolved(&[topic(1), topic(2)]))));
+}
+
+#[test]
+fn withheld_genesis_reported() {
+    // Every topic exists, but the withheld genesis still counts as a peer problem.
+    let unit = work_unit(RestoreKind::Rank0, vec![node(2)], vec![topic(1)]);
+    let mut restore = unit_operation(unit);
+    restore.first().unwrap();
+    restore
+        .next(child::<(bool, BTreeSet<NodeId>), _>(Err(IoError::Aborted)))
+        .unwrap();
+    restore.next(existing(&[topic(1)])).unwrap();
+    let expected = RestoreUnitOutcome {
+        unresolved_topics: BTreeSet::new(),
+        error: Some(RecoveryError::PeerUnavailable),
+    };
+    assert_eq!(restore.next(pulled(true)), Ok(Next::Done(expected)));
+}
+
+#[test]
+fn join_tops_members() {
+    let topics = vec![topic(1), topic(2)];
+    let unit = work_unit(RestoreKind::Join, vec![node(2)], topics.clone());
+    let mut restore = unit_operation(unit.clone());
+    let membership = |topics| restore_membership(&unit, topics);
+    assert_eq!(restore.first(), Ok(Next::Call(membership(topics.clone()))));
+    let turn = restore.next(outcome(Ok(())));
+    assert_eq!(
+        turn,
+        Ok(Next::Call(pull_call(topics.clone(), vec![node(2)])))
+    );
+    let turn = restore.next(pulled(true));
+    let check = shard_call(ShardNetEffect::Existing(topics));
+    assert_eq!(turn, Ok(Next::Call(check)));
+    let turn = restore.next(existing(&[topic(2)]));
+    assert_eq!(turn, Ok(Next::Call(membership(vec![topic(2)]))));
+    let turn = restore.next(outcome(Err("refused")));
+    assert_eq!(turn, Ok(Next::Done(unresolved(&[topic(1), topic(2)]))));
+}
+
+fn restore_membership(unit: &RestoreUnit, topics: Vec<TopicId>) -> IoCall {
+    let group = (
+        unit.peers.clone(),
+        unit.publishers.clone(),
+        unit.retained.clone(),
+    );
+    membership_call(topics, &group, node(1), &BTreeSet::new())
+}
+
+fn pass_operation(stop: RecoveryStop) -> RestorePassOperation {
+    let cursor = ShardRestoreCursor::default();
+    RestorePassOperation::new(node(1), RealmId([7; 32]), cursor, stop)
+}
+
+/// A pass over a two-node flat realm that has read its verified topics.
+fn started_pass(stop: RecoveryStop) -> (RestorePassOperation, Result<Next<RestoredPass>, IoError>) {
+    let mut pass = pass_operation(stop);
+    let config = flat_config(RealmId([7; 32]), &[node(1), node(2)]);
+    pass.first().unwrap();
+    let turn = pass.next(child::<_, GetConfigError>(Ok(config))).unwrap();
+    assert_eq!(
+        turn,
+        Next::Call(shard_call(ShardNetEffect::Existing(Vec::new())))
+    );
+    pass.next(existing(&[])).unwrap();
+    let turn = pass.next(child::<_, IoError>(Ok(BTreeSet::<TopicId>::new())));
+    (pass, turn)
+}
+
+#[test]
+fn missing_config_wraps() {
+    let mut pass = pass_operation(RecoveryStop::default());
+    pass.first().unwrap();
+    let missing = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+    let Ok(Next::Done((done, cursor))) = pass.next(missing) else {
+        panic!("a missing config ends the pass");
+    };
+    assert!(done.wrapped && done.enumerated);
+    assert_eq!(cursor, ShardRestoreCursor::default());
+}
+
+#[test]
+fn no_network_wraps() {
+    let mut pass = pass_operation(RecoveryStop::default());
+    pass.first().unwrap();
+    let config = flat_config(RealmId([7; 32]), &[node(1)]);
+    pass.next(child::<_, GetConfigError>(Ok(config))).unwrap();
+    let Ok(Next::Done((done, _))) = pass.next(answer(ShardNetEvent::NoNetwork)) else {
+        panic!("no net transport ends the pass");
+    };
+    assert!(done.wrapped && done.enumerated);
+    assert_eq!(done.units_total, 0);
+}
+
+#[test]
+fn stop_keeps_cursor() {
+    let token = CancellationToken::new();
+    token.cancel();
+    let (_, turn) = started_pass(RecoveryStop::new(token));
+    let Ok(Next::Done((done, cursor))) = turn else {
+        panic!("a stopped pass runs no unit");
+    };
+    assert_eq!(done.units_processed, 0);
+    assert!(!done.wrapped);
+    assert_eq!(cursor.next_unit, 0);
+    assert!(cursor.plan_hash.is_some());
+}
+
+#[test]
+fn withheld_arms_retry() {
+    let (mut pass, turn) = started_pass(RecoveryStop::default());
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let topics = pass.units[pass.position].topics.clone();
+    let mut turn = pass.next(child::<_, IoError>(Ok(unresolved(&topics))));
+    while pass.stage == PassStage::Unit {
+        turn = pass.next(child::<_, IoError>(Ok(RestoreUnitOutcome::default())));
+    }
+    let retry = schedule_retry_effect(RealmId([7; 32]), node(1));
+    assert_eq!(turn, Ok(Next::Call(IoCall::from(retry))));
+    let verify = VerifyHeldOperation::new(node(1), RealmId([7; 32]));
+    let turn = pass.next(IoResult::Done);
+    assert_eq!(turn, Ok(Next::Call(IoCall::child(verify))));
+    let summary = ShardVerificationSummary::default();
+    let Ok(Next::Done((done, cursor))) = pass.next(child::<_, IoError>(Ok(summary))) else {
+        panic!("verification ends the pass");
+    };
+    assert!(done.wrapped);
+    assert_eq!(done.unresolved_topics, topics.into_iter().collect());
+    assert_eq!(done.error, Some(RecoveryError::PeerUnavailable));
+    assert_eq!(cursor.next_unit, 0);
+}
+
+#[test]
+fn stopped_unit_unresolved() {
+    let (mut pass, _) = started_pass(RecoveryStop::default());
+    let topics = pass.units[pass.position].topics.clone();
+    pass.next(child::<RestoreUnitOutcome, _>(Err(IoError::Aborted)))
+        .unwrap();
+    assert!(topics.iter().all(|topic| pass.unresolved.contains(topic)));
+}
+
+#[test]
+fn topics_until_wrapped() {
+    let mut restore = RestoreTopicsOperation::new(node(1), RealmId([7; 32]));
+    let pass_at = |cursor| {
+        IoCall::child(RestorePassOperation::new(
+            node(1),
+            RealmId([7; 32]),
+            cursor,
+            RecoveryStop::default(),
+        ))
+    };
+    let start = ShardRestoreCursor::default();
+    assert_eq!(restore.first(), Ok(Next::Call(pass_at(start))));
+    let mut first = ShardRestorePass::default();
+    first.summary.withheld_topics = 2;
+    let resume = ShardRestoreCursor {
+        next_unit: 4,
+        plan_hash: Some([1; 32]),
+    };
+    let turn = restore.next(child::<RestoredPass, IoError>(Ok((first, resume))));
+    assert_eq!(turn, Ok(Next::Call(pass_at(resume))));
+    let mut last = ShardRestorePass {
+        wrapped: true,
+        ..ShardRestorePass::default()
+    };
+    last.summary.withheld_topics = 1;
+    last.summary.held_shards = 3;
+    let turn = restore.next(child::<RestoredPass, IoError>(Ok((last, start))));
+    let expected = RestoreShardSummary {
+        held_shards: 3,
+        withheld_topics: 3,
+        ..RestoreShardSummary::default()
+    };
+    assert_eq!(turn, Ok(Next::Done(expected)));
+}
+
+#[test]
+fn policy_needs_network() {
+    let mut prepare = PreparePolicyOperation::new(node(1), RealmId([7; 32]));
+    let check = shard_call(ShardNetEffect::Existing(Vec::new()));
+    assert_eq!(prepare.first(), Ok(Next::Call(check)));
+    let turn = prepare.next(answer(ShardNetEvent::NoNetwork));
+    assert_eq!(turn, Ok(Next::Done(RestoreShardSummary::default())));
+}
+
+#[test]
+fn policy_covers_present() {
+    let realm_id = RealmId([7; 32]);
+    let config = sharded_config(&[node(1), node(2)], 4);
+    let mut prepare = PreparePolicyOperation::new(node(1), realm_id);
+    prepare.first().unwrap();
+    prepare.next(existing(&[])).unwrap();
+    prepare
+        .next(child::<_, GetConfigError>(Ok(config)))
+        .unwrap();
+    let turn = prepare.next(child::<_, IoError>(Ok(BTreeSet::<TopicId>::new())));
+    let Ok(Next::Call(check)) = turn else {
+        panic!("the first group is checked");
+    };
+    let IoCall::Effect(effect) = check else {
+        panic!("the check is a shard effect");
+    };
+    let Effect::Net(NetEffect::Shard(shard)) = *effect else {
+        panic!("the check is a shard effect");
+    };
+    let ShardNetEffect::Existing(topics) = *shard else {
+        panic!("the check lists existing topics");
+    };
+    let turn = prepare.next(existing(&topics[..1]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+    assert_eq!(prepare.stage, PolicyStage::Members);
+    assert_eq!(prepare.prepared, 1);
+}
