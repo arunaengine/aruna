@@ -755,36 +755,6 @@ impl MetadataHandle {
         }
     }
 
-    /// Asks the node holding some inputs to resolve and grant them for the bearer's caller.
-    pub async fn request_input_resolve(
-        &self,
-        node_id: NodeId,
-        auth_token: AuthToken,
-        request: aruna_core::jobs::InputResolveRequest,
-    ) -> Result<
-        Result<
-            Vec<(
-                aruna_core::structs::execution::job::InputSelection,
-                aruna_core::structs::execution::job::CapturedInput,
-            )>,
-            aruna_core::jobs::SubmissionRefusal,
-        >,
-        String,
-    > {
-        let request = MetadataTransportMessage::ResolveJobInputs {
-            auth_token,
-            request: Box::new(request),
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::ResolvedJobInputs { result }) => Ok(result),
-            Ok(other) => Err(format!(
-                "the node answered {}",
-                transport_message_kind(&other)
-            )),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
     pub(crate) async fn request_store_artifact(

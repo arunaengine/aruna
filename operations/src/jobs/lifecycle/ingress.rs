@@ -35,11 +35,15 @@ use super::admit_here::{
 use super::forward::ForwardSubmissionOperation;
 use super::ids;
 use super::ids::{RequestIdentity, SubmissionRequest, SubmissionScope, store_workspace};
+use super::input_walk::{
+    ExpandDirectoryOperation, FollowLinkOperation, InputCaller, RangeHolderOperation,
+};
 use super::output_policies::OutputPoliciesOperation;
+use super::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use super::submission_rules::{
-    admitted_description, batch_len, caller_of, exact_version, family_view, fits,
-    forwarded_request_fits, input_reference, is_device, is_directory, pin_outputs,
-    reference_content, reference_shape, refusal_of, resolve_answer, resolver_admits, source_error,
+    admitted_description, caller_of, exact_version, family_view, fits, forwarded_request_fits,
+    input_reference, is_device, is_directory, pin_outputs, reference_content, reference_shape,
+    refusal_of, resolver_admits, source_error,
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
@@ -244,40 +248,6 @@ async fn forward_device(
     forward_once(context, (&request, &identity), &view, local, auth_token).await
 }
 
-/// Points a local input of a distributed bucket at the member that coordinates its key, so it
-/// is captured and pinned there, as an S3 read of the key is served there.
-async fn range_holder(
-    context: &DriverContext,
-    mut input: InputSelection,
-    local: NodeId,
-) -> Result<InputSelection, SubmitJobError> {
-    if input.source_node_id.is_some_and(|node| node != local) {
-        return Ok(input);
-    }
-    let aruna_core::structs::execution::job::InputSource::S3 {
-        bucket,
-        key,
-        version_id,
-    } = &input.source;
-    // A missing or unreadable bucket is refused by the capture with its own message.
-    let Ok(info) = drive(GetBucketOperation::new(bucket.clone()), context).await else {
-        return Ok(input);
-    };
-    let Some(binding) = info.distribution else {
-        return Ok(input);
-    };
-    let coordinator = crate::distribution::routing::read_coordinator(context, &binding, key)
-        .await
-        .map_err(|error| {
-            let reference = input_reference(bucket, key, version_id.as_deref());
-            SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"))
-        })?;
-    if let Some((_, node)) = coordinator {
-        input.source_node_id = Some(node);
-    }
-    Ok(input)
-}
-
 /// Resolve every input at the node that holds it, once, at ingress. The values are stored in
 /// the family spec and remain valid when admission or planning is forwarded.
 async fn resolve_inputs(
@@ -361,177 +331,55 @@ async fn resolve_inputs(
     ))
 }
 
-/// Follows links an input names on this node to the version they end at, which the caller
-/// must be able to read like any input. Returns the input of the target and the first link.
-/// A link to a link is followed; a cycle is refused; a target elsewhere ends the walk here.
+fn input_caller(context: &DriverContext, created_by: UserId, local: NodeId) -> InputCaller {
+    InputCaller {
+        created_by,
+        realm_id: context.serving_realm(created_by.realm_id),
+        local,
+    }
+}
+
+/// Points a local input of a distributed bucket at its range coordinator.
+async fn range_holder(
+    context: &DriverContext,
+    input: InputSelection,
+    local: NodeId,
+) -> Result<InputSelection, SubmitJobError> {
+    drive(RangeHolderOperation::new(input, local), context)
+        .await
+        .map_err(placement_failure)
+}
+
+/// Follows the links an input names here; see [`FollowLinkOperation`].
 async fn follow_link(
     context: &DriverContext,
-    mut input: InputSelection,
+    input: InputSelection,
     created_by: UserId,
     local: NodeId,
 ) -> Result<(InputSelection, Option<VersionedObjectArn>), SubmitJobError> {
-    use aruna_core::structs::execution::job::InputSource;
-    use aruna_core::structs::storage::link::LinkTarget;
-    let realm_id = context.serving_realm(created_by.realm_id);
-    let auth = AuthContext {
-        user_id: created_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let mut first = None;
-    let mut seen = std::collections::BTreeSet::new();
-    while input.source_node_id.is_none_or(|node| node == local) {
-        let InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        let reference = input_reference(bucket, key, version_id.as_deref());
-        let version = version_id
-            .as_deref()
-            .and_then(|version| Ulid::from_string(version).ok());
-        let head = drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: version,
-            }),
-            context,
-        )
-        .await;
-        let Ok(head) = head else {
-            break;
-        };
-        let Some(target) =
-            (head.source_binding.as_ref()).and_then(|binding| LinkTarget::of(binding, realm_id))
-        else {
-            break;
-        };
-        // The link itself must be readable by the caller before its target is.
-        authorize_read(context, &auth, local, (bucket, key), READ_OPERATION)
-            .await
-            .map_err(|error| source_error(&reference, error))?;
-        let link = VersionedObjectArn {
-            realm_id,
-            node_id: local,
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version: head
-                .resolved_version_id
-                .or(head.version_id)
-                .unwrap_or(target.arn.version),
-        };
-        if !seen.insert(link.to_w3id()) {
-            return Err(SubmitJobError::InvalidWorkspace(format!(
-                "{reference}: the links form a cycle"
-            )));
-        }
-        first.get_or_insert(link);
-        input.source = InputSource::S3 {
-            bucket: target.arn.bucket.clone(),
-            key: target.arn.key.clone(),
-            version_id: Some(target.arn.version.to_string()),
-        };
-        input.source_node_id = (target.arn.node_id != local).then_some(target.arn.node_id);
-    }
-    Ok((input, first))
+    let caller = input_caller(context, created_by, local);
+    drive(FollowLinkOperation::new(caller, input), context)
+        .await
+        .map_err(placement_failure)
 }
 
-/// One pinned input per object below a directory input's prefix, at the current version, each
-/// below the directory's container path. An object the caller may not read refuses the whole
-/// directory without naming it; a distributed bucket's prefix spans other members' ranges.
+/// The objects below a directory input; see [`ExpandDirectoryOperation`].
 async fn expand_directory(
     context: &DriverContext,
     input: &InputSelection,
     created_by: UserId,
     local: NodeId,
 ) -> Result<Vec<InputSelection>, SubmitJobError> {
-    use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
-    use aruna_core::structs::execution::job::InputSource;
-    let InputSource::S3 {
-        bucket,
-        key: prefix,
-        ..
-    } = &input.source;
-    let reference = format!("s3://{bucket}/{prefix}");
-    let info = drive(GetBucketOperation::new(bucket.clone()), context)
-        .await
-        .map_err(|_| {
-            SubmitJobError::InvalidWorkspace(format!("{reference}: input bucket not found"))
-        })?;
-    if info.distribution.is_some() {
-        return Err(SubmitJobError::InvalidWorkspace(format!(
-            "{reference}: directory inputs of a distributed bucket are not supported"
-        )));
-    }
-    let directory = input
-        .container_path
-        .as_deref()
-        .unwrap_or("/")
-        .trim_end_matches('/');
-    let auth = AuthContext {
-        user_id: created_by,
-        realm_id: context.serving_realm(created_by.realm_id),
-        path_restrictions: None,
-        session: None,
-    };
-    let mut files = Vec::new();
-    let mut continuation_token = None;
-    loop {
-        let page = drive(
-            ListBucketOperation::new(ListBucketInput {
-                bucket: bucket.clone(),
-                group_id: info.group_id,
-                continuation_token,
-                max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
-                prefix: Some(prefix.clone()),
-                delimiter: None,
-                start_after: None,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| SubmitJobError::PlacementUnavailable(format!("{reference}: {error}")))?;
-        for object in page.objects {
-            let relative = &object.head.key[prefix.len()..];
-            if relative.is_empty() || relative.ends_with('/') {
-                continue;
-            }
-            let readable = (object.head.bucket.as_str(), object.head.key.as_str());
-            authorize_read(context, &auth, local, readable, READ_OPERATION)
-                .await
-                .map_err(|error| source_error(&reference, error))?;
-            files.push(InputSelection {
-                source: InputSource::S3 {
-                    bucket: bucket.clone(),
-                    key: object.head.key.clone(),
-                    version_id: Some(object.version_id.to_string()),
-                },
-                source_node_id: input.source_node_id,
-                dest_key: format!("{}{relative}", input.dest_key),
-                mode: input.mode,
-                container_path: Some(format!("{directory}/{relative}")),
-                name: None,
-                description: None,
-            });
-        }
-        match page.continuation_token {
-            Some(token) => continuation_token = Some(token),
-            None => break,
-        }
-    }
-    if files.is_empty() {
-        return Err(SubmitJobError::InvalidWorkspace(format!(
-            "{reference}: the directory input holds no objects"
-        )));
-    }
-    Ok(files)
+    let caller = input_caller(context, created_by, local);
+    drive(
+        ExpandDirectoryOperation::new(caller, input.clone()),
+        context,
+    )
+    .await
+    .map_err(placement_failure)
 }
 
-/// The inputs of another node, resolved and granted by that node for the caller's own bearer.
-/// Every input must name its exact version, so nothing depends on a remote head; the answer
-/// is each input after the links that node followed, with its capture.
+/// The inputs another node resolves; see [`RemoteInputsOperation`].
 async fn remote_captures(
     context: &DriverContext,
     node: NodeId,
@@ -539,36 +387,18 @@ async fn remote_captures(
     (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
     auth_token: Option<&AuthToken>,
 ) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
-    let (Some(metadata), Some(AuthToken::Bearer(token))) =
-        (context.metadata_handle.as_ref(), auth_token)
-    else {
-        return Err(SubmitJobError::PlacementUnavailable(
-            "an input on another node needs the caller's bearer token".to_string(),
-        ));
+    let caller = ResolveCaller {
+        created_by,
+        submission_id,
+        expires_at,
     };
-    // Each request carries the inputs that fit one batch and the node answers a prefix of
-    // them, so the rest go out again until every input is answered.
-    let mut answered = Vec::with_capacity(inputs.len());
-    while answered.len() < inputs.len() {
-        let rest = &inputs[answered.len()..];
-        let batch = &rest[..batch_len(rest)];
-        if batch.is_empty() {
-            return Err(SubmitJobError::InvalidWorkspace(format!(
-                "{}: the input exceeds one message",
-                rest[0].dest_key
-            )));
-        }
-        let request = InputResolveRequest {
-            created_by,
-            submission_id,
-            expires_at,
-            inputs: batch.to_vec(),
-        };
-        let token = AuthToken::Bearer(token.clone());
-        let answer = metadata.request_input_resolve(node, token, request).await;
-        answered.extend(resolve_answer(answer, batch, node)?);
-    }
-    Ok(answered)
+    let token = auth_token.cloned();
+    drive(
+        RemoteInputsOperation::new(node, inputs.to_vec(), caller, token),
+        context,
+    )
+    .await
+    .map_err(placement_failure)
 }
 
 /// Captures inputs this node holds: each is read like an S3 GET by the caller, pinned to an
@@ -1069,7 +899,9 @@ async fn version_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::lifecycle::submission_rules::{answers_input, sources_match};
+    use crate::jobs::lifecycle::submission_rules::{
+        answers_input, batch_len, resolve_answer, sources_match,
+    };
     use crate::s3::bucket::dataset::DescriptionError;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::execution::job::OutputDestination;
