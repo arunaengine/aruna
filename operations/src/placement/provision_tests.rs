@@ -10,6 +10,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
 use tempfile::tempdir;
+use crate::driver::drive;
+use crate::placement::provision::AllocateBindingOperation;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -159,13 +161,7 @@ async fn allocation_sets_provenance() {
     .await;
     let strategy_id = document.default_strategy_id.unwrap();
 
-    let binding = allocate_placement_binding(
-        &context,
-        actor.clone(),
-        PlacementScope::Realm(realm_id),
-        DocumentClass::Metadata,
-        strategy_id,
-    )
+    let binding = drive(AllocateBindingOperation::new(actor.clone(), PlacementScope::Realm(realm_id), DocumentClass::Metadata, strategy_id), &context)
     .await
     .unwrap();
 
