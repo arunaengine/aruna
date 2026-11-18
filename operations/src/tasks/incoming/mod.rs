@@ -70,11 +70,9 @@ use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget
 use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{
-    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
-};
+use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node};
 use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
@@ -1047,8 +1045,12 @@ impl OperationsTaskHandler {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();
                         for start in imports {
-                            let started = crate::jobs::handed_imports::start_kept(context, start);
-                            if let Err(error) = started.await {
+                            let started = crate::jobs::handed_imports::StartKeptOperation::new(
+                                start,
+                                context.node_and_realm(),
+                                unix_timestamp_millis(),
+                            );
+                            if let Err(error) = crate::driver::drive(started, context).await {
                                 warn!(%error, "Handed over imports could not start");
                             }
                         }
