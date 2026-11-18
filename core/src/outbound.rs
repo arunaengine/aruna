@@ -29,6 +29,8 @@ pub enum OutboundEffect {
     Backoff(BackoffRequest),
     /// Sends one request through the egress screen and answers with its status.
     Request(Box<HttpRequest>),
+    /// Drops the cached mail sender unless it belongs to this profile revision.
+    RefreshMail(Option<Ulid>),
     /// Sends one request of a plugin connection and answers with what the service said.
     Connection(Box<ConnectionCall>),
 }
@@ -75,6 +77,7 @@ pub enum OutboundEvent {
     Answered {
         result: Result<u16, OutboundError>,
     },
+    MailRefreshed,
     /// The answer to an [`OutboundEffect::Connection`].
     ConnectionAnswered {
         result: Result<ConnectionAnswer, ConnectionError>,

@@ -61,7 +61,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
     pub sub: String,

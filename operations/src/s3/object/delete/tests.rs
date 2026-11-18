@@ -25,7 +25,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -636,7 +636,7 @@ async fn creates_tombstone() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -790,7 +790,7 @@ async fn deletes_version() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -1464,9 +1464,13 @@ async fn offered_history(
         user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
     };
     std::fs::write(&file, b"one").unwrap();
-    let first = offer_directory(context, offer.clone()).await.unwrap();
+    let first = drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     if withdraw {
         let input = WithdrawOfferInput {
             bucket: offer.bucket.clone(),
@@ -1474,7 +1478,7 @@ async fn offered_history(
             node_id: offer.node_id,
             user_id: offer.user_id,
         };
-        withdraw_offer(context, input).await.unwrap();
+        drive(withdraw_offer(input), context).await.unwrap();
     }
     (offer, first.observed[0].version_id)
 }
@@ -1615,7 +1619,7 @@ async fn bucket_rows_sum() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(

@@ -8,7 +8,7 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
 use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -337,7 +337,7 @@ pub async fn open(
             range: None,
         };
         if let Ok(BaoReadOutput::Stream { blob, size, .. }) =
-            managed_read(context, source, request).await
+            drive(ManagedReadOperation::new(source, request), context).await
             && size == object.size
         {
             return Ok(blob);

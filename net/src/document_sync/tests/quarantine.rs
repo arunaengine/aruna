@@ -554,15 +554,7 @@ async fn quarantine_batch_accounting() {
     let commit = |rejections: Vec<SyncRejection>| {
         let service = service.clone();
         async move {
-            let txn_id = start_storage_transaction(&service.storage)
-                .await
-                .expect("transaction starts");
-            let entries = service
-                .quarantine_entries(&rejections, txn_id)
-                .await
-                .expect("evidence builds")
-                .expect("capacity is available");
-            replace_batch_in(&service.storage, txn_id, Vec::new(), entries)
+            run_plan(&service.storage, EvidencePlan(rejections))
                 .await
                 .expect("evidence commits");
         }

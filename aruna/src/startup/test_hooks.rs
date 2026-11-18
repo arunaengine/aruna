@@ -7,12 +7,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aruna_operations::driver::DriverContext;
+use aruna_operations::node::recovery_run::RecoveryConfig;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_operations::shard::restore::{RecoveryConfig, run_recovery};
 #[cfg(debug_assertions)]
 use tokio_util::sync::CancellationToken;
 #[cfg(debug_assertions)]
 use tracing::{info, warn};
+
+use crate::startup::recovery::run_recovery;
 
 /// Pends after recording that core publication started, or returns at once when
 /// the test did not arm `ARUNA_TEST_CORE_PUBLICATION_BARRIER`.

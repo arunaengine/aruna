@@ -125,7 +125,7 @@ impl RequestPolicy {
 }
 
 /// The request attributes a policy expression may reference.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolicyRequest {
     /// Canonical permission path of the target resource.
     pub path: String,

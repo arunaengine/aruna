@@ -13,7 +13,81 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 
 use super::*;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::store::attempt::put_crate_outcome;
+
+async fn read_run(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    run_id: JobId,
+) -> Result<RunView, RunReadError> {
+    drive(ReadRunOperation::new(realm_id, auth, run_id), context).await
+}
+
+fn link(created_by: UserId, run_crate: Option<Ulid>) -> RunLink {
+    RunLink {
+        family: None,
+        created_by,
+        group_id: Ulid::from_bytes([7u8; 16]),
+        logical_job_id: Some(JobId::from_bytes([8u8; 16])),
+        run_crate,
+    }
+}
+
+fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+}
+
+fn linked(found: Option<RunLink>) -> IoResult {
+    child(Ok::<_, JobMutationError>(found))
+}
+
+// An unknown run reads as absent, and the submitter goes on to the crate status.
+#[test]
+fn submitter_sees_status() {
+    let realm_id = RealmId([1u8; 32]);
+    let owner = user(1, realm_id);
+    let run_id = JobId::from_bytes([2u8; 16]);
+    let mut read = ReadRunOperation::new(realm_id, &auth(owner, realm_id), run_id);
+    assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(read.next(linked(None)), Err(RunReadError::NotFound));
+
+    let mut read = ReadRunOperation::new(realm_id, &auth(owner, realm_id), run_id);
+    let found = linked(Some(link(owner, None)));
+    assert!(matches!(read.next(found), Ok(Next::Call(IoCall::Child(_)))));
+    let status = child(Ok::<_, JobMutationError>(Some(RunCrateStatus::Pending)));
+    let Next::Done(view) = read.next(status).unwrap() else {
+        panic!("expected the view");
+    };
+    assert!(view.logical_job_id.is_some() && view.run_crate_status.is_some());
+}
+
+// Another user needs a run crate and READ on it, and sees no submitter details.
+#[test]
+fn others_need_read() {
+    let realm_id = RealmId([1u8; 32]);
+    let (owner, other) = (user(1, realm_id), user(3, realm_id));
+    let run_id = JobId::from_bytes([2u8; 16]);
+    let start = || ReadRunOperation::new(realm_id, &auth(other, realm_id), run_id);
+    let mut read = start();
+    assert_eq!(
+        read.next(linked(Some(link(owner, None)))),
+        Err(RunReadError::NotFound)
+    );
+    let found = || linked(Some(link(owner, Some(Ulid::from_bytes([9u8; 16])))));
+    let mut read = start();
+    read.next(found()).unwrap();
+    let allowed = child(Ok::<_, AuthorizeError>(()));
+    let Next::Done(view) = read.next(allowed).unwrap() else {
+        panic!("expected the view");
+    };
+    assert!(view.logical_job_id.is_none() && view.run_crate_status.is_none());
+    let mut read = start();
+    read.next(found()).unwrap();
+    let denied = child(Err::<(), _>(AuthorizeError::PermissionDenied));
+    assert_eq!(read.next(denied), Err(RunReadError::NotFound));
+}
 
 fn user(seed: u8, realm_id: RealmId) -> UserId {
     UserId::local(Ulid::from_bytes([seed; 16]), realm_id)

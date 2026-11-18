@@ -13,6 +13,7 @@ mod download;
 pub mod error;
 pub mod forwarded;
 pub mod https;
+mod job_service;
 pub mod jobs;
 mod lookup;
 pub mod mcp;

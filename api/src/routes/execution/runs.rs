@@ -5,11 +5,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::job_service::{read_run, resolve_job_owner};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::runs::{RunReadError, read_run};
-use aruna_operations::jobs::service::resolve_job_owner;
+use aruna_operations::jobs::runs::RunReadError;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};

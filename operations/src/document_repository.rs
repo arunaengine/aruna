@@ -15,6 +15,16 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, TxnId};
 use thiserror::Error;
 
+/// The child that reads a realm's configuration.
+pub(crate) fn realm_config(realm_id: RealmId) -> IoCall {
+    IoCall::child(GetConfigOperation::new(realm_id))
+}
+
+/// The configuration a [`realm_config`] child found; an unreadable one counts as none.
+pub(crate) fn config_of(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {
+    Ok(result.child::<RealmConfigDocument, GetConfigError>()?.ok())
+}
+
 pub fn read_effect(document: &DocumentTarget, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: document.storage_keyspace().to_string(),

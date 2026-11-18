@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
-use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
@@ -35,8 +35,8 @@ use aruna_operations::placement::policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
 use aruna_operations::placement::policy::{
-    PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
-    ResolveQuarantineOperation, create_policy_routed,
+    CreateRoutedOperation, PolicyForwardError, PolicyGateError, QuarantineError,
+    ResolveQuarantineConfig, ResolveQuarantineOperation,
 };
 use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
@@ -486,8 +486,8 @@ fn map_create_error(error: PolicyForwardError) -> ServerError {
         PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
             ServerError::BadRequestReason(reason.to_string())
         }
-        PolicyForwardError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
-        PolicyForwardError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
+        PolicyForwardError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+        PolicyForwardError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
         other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
@@ -782,13 +782,12 @@ pub async fn create_placement_policy(
         policy,
         created_at_ms: unix_timestamp_millis(),
     };
-    let document = create_policy_routed(
-        &state.get_ctx(),
-        config,
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_create_error)?;
+    let ctx = state.get_ctx();
+    let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
+    let create = CreateRoutedOperation::new(config, forwarded_auth_token(bearer_token)?, local);
+    let document = aruna_operations::driver::drive(create, &ctx)
+        .await
+        .map_err(map_create_error)?;
     Ok(Json(policy_response(&document)?))
 }
 

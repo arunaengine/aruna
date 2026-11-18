@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
+use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 use aruna_core::structs::storage::node_info::NODE_LABEL_KEY;
 
@@ -85,6 +85,14 @@ impl ExecutorRegistry {
 
     pub fn register(&mut self, backend: Arc<dyn ExecutorBackend>) {
         self.backends.insert(backend.kind().as_wire(), backend);
+    }
+
+    /// What each registered backend advertises, by its wire kind.
+    pub fn limits(&self) -> BTreeMap<String, ResourceEnvelope> {
+        self.backends
+            .iter()
+            .map(|(kind, backend)| (kind.clone(), backend.capabilities().limits))
+            .collect()
     }
 
     pub fn get(&self, kind: &ExecutorKind) -> Option<&Arc<dyn ExecutorBackend>> {

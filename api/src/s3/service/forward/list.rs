@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
@@ -337,9 +338,9 @@ impl ArunaS3Service {
         let (lower, upper) = named_bounds(query)
             .ok_or_else(|| s3_error!(AccessDenied, "Delegation refused: no key range named"))?;
         let state = self.state.as_ref();
-        let held = match lists_interval(state, binding, &lower, upper.as_deref()).await {
+        let held = match drive(lists_interval(binding, &lower, upper.as_deref()), state).await {
             Ok(false) if named_copy(query) => {
-                copies_interval(state, binding, &lower, upper.as_deref()).await
+                drive(copies_interval(binding, &lower, upper.as_deref()), state).await
             }
             held => held,
         };
@@ -361,7 +362,7 @@ impl ArunaS3Service {
         &self,
         binding: &DistributionBinding,
     ) -> S3Result<DistributionSnapshot> {
-        bound_view(self.state.as_ref(), binding)
+        drive(bound_view(binding), self.state.as_ref())
             .await
             .map(|view| view.head.snapshot)
             .map_err(|error| guard_error(&error))
@@ -371,7 +372,7 @@ impl ArunaS3Service {
         &self,
         binding: &DistributionBinding,
     ) -> S3Result<LocalFence> {
-        local_fence(self.state.as_ref(), binding.set_id)
+        drive(local_fence(binding.set_id), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))
     }

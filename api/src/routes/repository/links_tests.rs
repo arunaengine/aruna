@@ -591,10 +591,12 @@ async fn unmet_link_findings() {
     let link = create(&linked, Some(linked.test.auth.clone()))
         .await
         .unwrap();
-    let mut stored = aruna_operations::jobs::repository::link_store::read_link(
-        &linked.test.state.get_ctx(),
-        parse_document_id(&linked.document_id).unwrap(),
-        Ulid::from_string(&link.link_id).unwrap(),
+    let mut stored = aruna_operations::driver::drive(
+        aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
+            parse_document_id(&linked.document_id).unwrap(),
+            Ulid::from_string(&link.link_id).unwrap(),
+        ),
+        linked.test.state.get_ctx().as_ref(),
     )
     .await
     .unwrap()
@@ -634,10 +636,12 @@ async fn admin_rights_limited() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     let link_id = Ulid::from_string(&link.link_id).unwrap();
     let context = linked.test.state.get_ctx();
-    let mut stored = aruna_operations::jobs::repository::link_store::read_link(
-        &context,
-        document_id,
-        link_id,
+    let mut stored = aruna_operations::driver::drive(
+        aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
+            document_id,
+            link_id,
+        ),
+        context.as_ref(),
     )
     .await
     .unwrap()
@@ -748,10 +752,9 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         link: Box::new(link.clone()),
         secret: None,
     };
-    change_link(linked.test.state.get_ctx().as_ref(), &link, change)
-        .await
-        .unwrap()
-        .unwrap()
+    let context = linked.test.state.get_ctx();
+    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link, change);
+    drive(operation, context.as_ref()).await.unwrap().unwrap()
 }
 
 #[tokio::test]

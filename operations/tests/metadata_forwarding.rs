@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keys::generate_signing_key;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -43,25 +44,23 @@ use aruna_operations::device::publish_queue::{
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::forward::entry::forward_token_revoke;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
-use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::groups::forward::{ForwardGroupError, ForwardGroupOperation};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_update};
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::forward::write::route_metadata_update;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_operations::sync::document_outbox::read_outbox_record;
 use aruna_operations::sync::outbox_record::outbox_key;
 use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -72,6 +71,7 @@ use ulid::Ulid;
 use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::{TestNode, spawn_replica, write};
+use aruna_operations::forward::token::ForwardRevokeOperation;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -280,11 +280,18 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let target = realm.bearer_string();
 
-    forward_token_revoke(
+    drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.bearer_token(),
+            target.clone(),
+            ulid::Ulid::generate(),
+        ),
         &user_node.context,
-        realm.realm_id,
-        realm.bearer_token(),
-        target.clone(),
     )
     .await?;
 
@@ -335,19 +342,33 @@ async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
     let scoped_string = scoped_string.as_str().to_string();
 
     let other = realm.bearer_string();
-    let refused = forward_token_revoke(
+    let refused = drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            scoped.clone(),
+            other.clone(),
+            ulid::Ulid::generate(),
+        ),
         &user_node.context,
-        realm.realm_id,
-        scoped.clone(),
-        other.clone(),
     )
     .await;
     assert!(refused.is_err());
-    forward_token_revoke(
+    drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            scoped,
+            scoped_string.clone(),
+            ulid::Ulid::generate(),
+        ),
         &user_node.context,
-        realm.realm_id,
-        scoped,
-        scoped_string.clone(),
     )
     .await?;
 
@@ -387,11 +408,18 @@ async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
     let (nodes, _config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
 
-    let (group, authorization) = forward_group_create(
+    let (group, authorization) = drive(
+        ForwardGroupOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.bearer_token(),
+            "Device Group".to_string(),
+            Ulid::generate(),
+        ),
         &user_node.context,
-        realm.realm_id,
-        realm.bearer_token(),
-        "Device Group".to_string(),
     )
     .await?;
     assert_eq!(group.owner, realm.user_id);
@@ -429,16 +457,23 @@ async fn foreign_token_refused() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let stranger = UserId::local(Ulid::generate(), realm.realm_id);
 
-    let error = forward_group_create(
+    let error = drive(
+        ForwardGroupOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.token_for(stranger),
+            "Stranger Group".to_string(),
+            Ulid::generate(),
+        ),
         &user_node.context,
-        realm.realm_id,
-        realm.token_for(stranger),
-        "Stranger Group".to_string(),
     )
     .await
     .expect_err("a device must not forward another user's write");
     assert!(
-        matches!(error, ForwardGroupError::Api(MetadataApiError::Forbidden)),
+        matches!(error, ForwardGroupError::Forbidden),
         "unexpected forwarded group create error: {error}"
     );
 
@@ -1007,9 +1042,12 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
-    load_document_record(node.context.as_ref(), document_id)
-        .await
-        .map_err(|error| format!("metadata registry read failed: {error:?}").into())
+    drive(
+        DocumentRecordOperation::new(document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("metadata registry read failed: {error:?}").into())
 }
 
 async fn read_group_auth(
@@ -1071,26 +1109,29 @@ async fn drive_create_at(
     document_id: Ulid,
     document_path: &str,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
-    let created = route_metadata_create(
-        CreateDocumentOperation::new(CreateDocumentConfig {
-            actor: Actor {
-                node_id: node.net.node_id(),
-                user_id: realm.user_id,
-                realm_id: realm.realm_id,
-            },
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: true,
-            payload: CreateDocumentPayload::Scaffold {
-                name: "Forwarded".to_string(),
-                description: "Placed by a holder".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            },
-        }),
-        node.context.clone(),
-        Some(realm.bearer_token()),
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new(CreateDocumentConfig {
+                actor: Actor {
+                    node_id: node.net.node_id(),
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                },
+                group_id,
+                document_id,
+                document_path: document_path.to_string(),
+                public: true,
+                payload: CreateDocumentPayload::Scaffold {
+                    name: "Forwarded".to_string(),
+                    description: "Placed by a holder".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                },
+            }),
+            node.context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(realm.bearer_token()),
+        ),
+        &node.context,
     )
     .await?;
     Ok(created.record)
@@ -1170,21 +1211,19 @@ async fn install_realm_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::shard::restore::restore_shard_subscriptions(
+            aruna_operations::driver::drive(
+                aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    realm_id,
+                ),
                 &node.context,
-                node.net.node_id(),
-                realm_id,
             )
-            .await;
+            .await
+            .expect("shard topics restore");
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {

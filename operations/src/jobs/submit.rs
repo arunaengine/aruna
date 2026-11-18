@@ -823,9 +823,13 @@ mod tests {
         import.source = ImportRoCrateSource::Upload { upload_id };
         let record =
             crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::upload_store::write_rocrate_upload(context, &record)
-            .await
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+            context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         upload_id
     }
 
@@ -1149,15 +1153,25 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored = crate::jobs::import::upload_store::read_rocrate_upload(&ctx, upload_id).await;
+        let stored = crate::driver::drive(
+            crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+            &ctx,
+        )
+        .await
+        .map_err(|error| error.0);
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
-        let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(
+        let reclaimed = crate::driver::drive_retry(
+            || {
+                crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id,
+                    owner,
+                    created.job_id,
+                    3_000,
+                )
+            },
             &ctx,
-            upload_id,
-            owner,
-            created.job_id,
-            3_000,
+            &upload_id.to_bytes(),
         )
         .await;
         assert!(reclaimed.is_ok());

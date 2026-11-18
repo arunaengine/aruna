@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use axum::http::HeaderMap;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,7 +49,7 @@ async fn coordinators(
     state: &ServerState,
     binding: &DistributionBinding,
 ) -> ServerResult<Vec<RestForward>> {
-    let view = bound_view(state.get_ctx().as_ref(), binding)
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
         .map_err(map_guard_error)?;
     let snapshot = view.snapshot();

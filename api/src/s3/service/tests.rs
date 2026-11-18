@@ -42,13 +42,13 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::auth::request_authorization::authorize;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
 use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use aruna_operations::s3::object::metadata_drain::refresh_reference_metadata;
+use aruna_operations::s3::object::metadata_drain::RefreshReferenceOperation;
 use aruna_operations::s3::object::put::PutObjectResult;
 use aruna_operations::testing::read_value;
 use aruna_storage::storage;
@@ -804,6 +804,15 @@ async fn refresh_failure_hidden() {
     assert!(errors.is_empty(), "unexpected stream errors: {errors:?}");
 }
 
+async fn run_refresh(test: &TestState, refresh: ReferenceRefresh) -> Result<(), String> {
+    drive(
+        RefreshReferenceOperation::new(refresh),
+        test.context.as_ref(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[tokio::test]
 async fn stale_refresh_ignored() {
     let test = setup_state();
@@ -811,8 +820,8 @@ async fn stale_refresh_ignored() {
     let original_metadata = source_metadata(10, "original");
     write_reference_version(&test, original_metadata.clone(), last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
+    run_refresh(
+        &test,
         refresh(
             &test,
             source_metadata(20, "older"),
@@ -823,8 +832,8 @@ async fn stale_refresh_ignored() {
     .unwrap();
     assert_reference_state(&test, &original_metadata, last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
+    run_refresh(
+        &test,
         refresh(&test, source_metadata(30, "equal"), last_refresh),
     )
     .await
@@ -842,12 +851,9 @@ async fn newer_refresh_updates() {
     let original = source_metadata(10, "original");
     write_reference_version(&test, original.clone(), last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
-        refresh(&test, original.clone(), refreshed_at),
-    )
-    .await
-    .unwrap();
+    run_refresh(&test, refresh(&test, original.clone(), refreshed_at))
+        .await
+        .unwrap();
 
     assert_reference_state(&test, &original, refreshed_at).await;
 }
@@ -2365,25 +2371,29 @@ async fn object_path_decides() {
     };
 
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("imaging/scan-a"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("imaging/scan-a"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_ok()
     );
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("sequencing/reads"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("sequencing/reads"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_err()

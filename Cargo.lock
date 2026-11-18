@@ -457,6 +457,7 @@ dependencies = [
  "aruna-kpabe",
  "aruna-net",
  "aruna-storage",
+ "astral_async_zip",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -683,12 +684,14 @@ dependencies = [
  "futures-util",
  "iroh",
  "irokle",
+ "lru",
  "oxrdf",
  "oxttl",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "ulid 3.0.0",
 ]
 
 [[package]]
@@ -728,6 +731,7 @@ dependencies = [
  "aruna-core",
  "aruna-storage",
  "async-trait",
+ "blake3",
  "byteview",
  "crossfire",
  "fjall",

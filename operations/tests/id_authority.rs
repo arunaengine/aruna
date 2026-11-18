@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
+use crate::job_calls::read_job_routed;
 use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -19,7 +21,6 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
 use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
@@ -28,14 +29,15 @@ use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_delete};
+use aruna_operations::metadata::forward::write::route_metadata_delete;
+use aruna_operations::metadata::persistent_id::forward::submit_mint_pid;
 use aruna_operations::metadata::persistent_id::forward::{
     mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 use aruna_operations::metadata::persistent_id::read_mapping;
-use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_operations::testing::replay_event_log;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
@@ -903,22 +905,25 @@ async fn seed_document(
     realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
-    let created = route_metadata_create(
-        CreateDocumentOperation::new(CreateDocumentConfig {
-            actor: realm.actor(origin),
-            group_id,
-            document_id,
-            document_path: path.to_string(),
-            public,
-            payload: CreateDocumentPayload::Scaffold {
-                name: "PID Authority Dataset".to_string(),
-                description: "Written on a realm above the replication factor".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            },
-        }),
-        origin.context.clone(),
-        Some(realm.bearer_token()),
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new(CreateDocumentConfig {
+                actor: realm.actor(origin),
+                group_id,
+                document_id,
+                document_path: path.to_string(),
+                public,
+                payload: CreateDocumentPayload::Scaffold {
+                    name: "PID Authority Dataset".to_string(),
+                    description: "Written on a realm above the replication factor".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                },
+            }),
+            origin.context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(realm.bearer_token()),
+        ),
+        &origin.context,
     )
     .await?;
     let placement = created.record.placement;
@@ -952,7 +957,7 @@ async fn seed_document(
 }
 
 async fn registry_present(context: &DriverContext, document_id: Ulid) -> bool {
-    load_document_record(context, document_id)
+    drive(DocumentRecordOperation::new(document_id), context)
         .await
         .is_ok_and(|record| record.is_some())
 }
@@ -961,8 +966,11 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Option<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord> {
-    load_document_record(node.context.as_ref(), document_id)
-        .await
-        .ok()
-        .flatten()
+    drive(
+        DocumentRecordOperation::new(document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .ok()
+    .flatten()
 }

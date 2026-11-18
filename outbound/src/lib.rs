@@ -93,15 +93,14 @@ impl OutboundHandle {
             OutboundEffect::Request(request) => OutboundEvent::Answered {
                 result: self.request(*request).await,
             },
+            OutboundEffect::RefreshMail(current) => {
+                self.inner.mail.refresh(current);
+                OutboundEvent::MailRefreshed
+            }
             OutboundEffect::Connection(call) => OutboundEvent::ConnectionAnswered {
                 result: self.inner.connections.send(*call).await,
             },
         }
-    }
-
-    /// Drops the cached mail sender unless it belongs to the `current` profile revision.
-    pub fn refresh_mail(&self, current: Option<ulid::Ulid>) {
-        self.inner.mail.refresh(current);
     }
 
     async fn post(&self, post: HttpPost) -> Result<u16, OutboundError> {

@@ -18,6 +18,7 @@ use super::admit_here::placement_failure;
 use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{FollowLinkOperation, InputCaller};
 use super::submission_rules::{fits, peer_refusal, refusal_of, resolver_admits};
+use super::submit_external::IngressNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::JOB_RETENTION_MS;
 use crate::jobs::submit::SubmitJobError;
@@ -34,7 +35,7 @@ enum ServeStep {
 /// Each answer is an input after its links with its capture here; the answers that fit one
 /// message return, and the ingress asks again for the rest.
 #[derive(Debug, PartialEq)]
-pub(super) struct ServeInputsOperation {
+pub struct ServeInputsOperation {
     peer: NodeId,
     token: AuthToken,
     caller: InputCaller,
@@ -52,20 +53,19 @@ type ServeNext = Result<Next<ServeOutput>, SubmissionRefusal>;
 type Followed = (InputSelection, Option<VersionedObjectArn>);
 
 impl ServeInputsOperation {
-    /// `local` and the realm in `caller` are this node's; `now_ms` bounds the grants.
-    pub(super) fn new(
+    /// The node's clock bounds the grants.
+    pub fn new(
         peer: NodeId,
         token: AuthToken,
-        caller: InputCaller,
+        node: &IngressNode,
         request: InputResolveRequest,
-        now_ms: u64,
     ) -> Self {
         Self {
             peer,
             token,
-            caller,
+            caller: node.input_caller(request.created_by),
             request,
-            now_ms,
+            now_ms: node.now_ms,
             bearer: String::new(),
             next_input: 0,
             answers: Vec::new(),
@@ -215,10 +215,11 @@ mod tests {
     }
 
     fn operation(token: AuthToken, inputs: Vec<InputSelection>) -> ServeInputsOperation {
-        let caller = InputCaller {
-            created_by: user(),
-            realm_id: REALM,
+        let here = IngressNode {
             local: node(1),
+            realm_id: REALM,
+            now_ms: 0,
+            fresh: Default::default(),
         };
         let request = InputResolveRequest {
             created_by: user(),
@@ -226,7 +227,7 @@ mod tests {
             expires_at: u64::MAX,
             inputs,
         };
-        ServeInputsOperation::new(node(2), token, caller, request, 0)
+        ServeInputsOperation::new(node(2), token, &here, request)
     }
 
     fn bearer() -> AuthToken {

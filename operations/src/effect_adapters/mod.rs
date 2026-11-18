@@ -4,9 +4,12 @@
 
 mod audit;
 mod blob;
+mod compute;
+pub(crate) mod job;
 mod metadata;
 mod net;
 mod session;
+pub(crate) mod shard;
 mod storage;
 mod task;
 
@@ -108,6 +111,20 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::DatasetSummary(request)) => {
             metadata::dispatch_summary(*request, context).await
         }
+        Effect::Net(NetEffect::Shard(effect)) => {
+            Box::pin(shard::dispatch_shard(*effect, context)).await
+        }
+        Effect::Net(NetEffect::AuthorizeWritePeer { peer, auth_token }) => {
+            let auth_token = auth_token.map(|token| *token);
+            Box::pin(metadata::dispatch_peer_check(peer, auth_token, context)).await
+        }
+        Effect::Net(NetEffect::RevocationClaims(token)) => {
+            Box::pin(metadata::dispatch_revocation_claims(*token, context)).await
+        }
+        // A routed harvest write drives metadata operations through the handles the runner holds.
+        Effect::Net(NetEffect::HarvestWrite(write)) => {
+            metadata::dispatch_harvest_write(*write, context).await
+        }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
             Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
@@ -129,6 +146,10 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::DashboardChanged) => {
             context.notify_dashboard_change();
             Event::Net(NetEvent::Recorded)
+        }
+        Effect::Net(NetEffect::LocalNode) => {
+            let node = context.net_handle.as_ref().map(|net| net.node_id());
+            Event::Net(NetEvent::LocalNode(node))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
@@ -182,6 +203,10 @@ async fn dispatch_unboxed(
         Effect::Session(effect) => {
             Event::Session(Box::new(session::dispatch_session(*effect, context).await))
         }
+        Effect::Compute(effect) => {
+            Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
+        }
+        Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
     trace!(
@@ -217,8 +242,10 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 
@@ -230,6 +257,7 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
+        OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
         OutboundEffect::Connection(_) => OutboundEvent::ConnectionAnswered {
             result: Err(ConnectionError::NotSent(
                 "this node sends no connection requests".to_string(),

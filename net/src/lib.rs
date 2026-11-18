@@ -20,6 +20,7 @@ mod eviction;
 mod heartbeat;
 pub mod job_control;
 pub mod notification;
+pub mod shard_manifest;
 mod signing;
 pub mod streams;
 mod tasks;
@@ -38,7 +39,7 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
+use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -341,20 +342,6 @@ impl NetHandle {
             .await
     }
 
-    /// Shard-topic anti-entropy for the startup restore and placement
-    /// reconciler: ensures the topics locally, syncs them with `peers`, and
-    /// reconciles the applied events.
-    pub async fn sync_document_topics(
-        &self,
-        topics: Vec<::irokle::TopicId>,
-        peers: Vec<NodeId>,
-    ) -> aruna_core::document::DocumentNetEvent {
-        self.inner
-            .document_sync
-            .sync_documents_event(topics, peers)
-            .await
-    }
-
     pub async fn handle_sync_stream(
         &self,
         stream: streams::BiStream,
@@ -364,25 +351,6 @@ impl NetHandle {
             .document_sync
             .handle_inbound_stream(stream, peer)
             .await
-    }
-
-    pub async fn reconcile_sync_topics(
-        &self,
-        topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentReconcileResult> {
-        let applied = self
-            .inner
-            .document_sync
-            .reconcile_sync_topics(topic_ids)
-            .await?;
-        if applied
-            .targets
-            .iter()
-            .any(|target| matches!(target, DocumentTarget::RealmConfig { .. }))
-        {
-            self.reload_realm_peers().await?;
-        }
-        Ok(applied)
     }
 
     /// Connection-attempt counters behind the structured connection
@@ -1075,6 +1043,14 @@ impl Handle for NetHandle {
             Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
                 job_control::exchange(self, job.owner, job.request).await,
             )),
+            // The heartbeat table belongs to this handle.
+            Effect::Net(NetEffect::HeartbeatSilence(nodes)) => {
+                let silence = nodes
+                    .into_iter()
+                    .map(|node| (node, self.heartbeat_silence(node).as_millis() as u64))
+                    .collect();
+                Event::Net(NetEvent::HeartbeatSilence(silence))
+            }
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self
@@ -1105,6 +1081,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
+        Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
@@ -1112,14 +1089,26 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
+        Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
+        Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
         Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
+        Effect::Net(NetEffect::HarvestWrite(_)) => "harvest_write",
         Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
+        Effect::Net(NetEffect::Shard(_)) => "shard",
+        Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
+        Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
+        Effect::Net(NetEffect::AuthorizeWritePeer { .. }) => "authorize_write_peer",
+        Effect::Net(NetEffect::RevocationClaims(_)) => "revocation_claims",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
+        Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::LocalNode) => "local_node",
+        Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
         Effect::Net(NetEffect::ReplaceInterest(_)) => "replace_interest",
@@ -1136,8 +1125,10 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

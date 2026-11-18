@@ -119,7 +119,8 @@ async fn record_picks_member() {
     let context = fixture.state.get_ctx();
     let outside = node(9);
     for (key, member) in [("a/x", LOCAL), ("z/y", PEER)] {
-        let members = key_holders(&context, snapshot.set_id(), key).await;
+        let holders = key_holders(snapshot.set_id(), key);
+        let members = drive(holders, &context).await.unwrap_or_default();
         let picked = pick_node(outside, (None, false, None), &set, &members);
         assert_eq!(picked, Ok(Some(node_id(member))), "{key}");
     }

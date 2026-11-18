@@ -76,7 +76,7 @@ async fn group_tombstone_replays() {
     .await
     .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &deleted, None)
+        check_group_authority(&storage, &deleted, None)
             .await
             .unwrap(),
         AdminEventValidation::Deferred { .. }
@@ -105,7 +105,7 @@ async fn group_tombstone_replays() {
     .await
     .unwrap();
     assert_eq!(
-        validate_group_authority(&storage, &deleted, None)
+        check_group_authority(&storage, &deleted, None)
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -1137,7 +1137,7 @@ async fn merge_needs_role() {
                 user_id: survivor,
             },
         );
-        let validation = validate_group_authority(&storage, &grant, None)
+        let validation = check_group_authority(&storage, &grant, None)
             .await
             .expect("validation runs");
         assert_eq!(
@@ -1296,7 +1296,7 @@ async fn pointer_needs_management() {
             1,
             op.clone(),
         );
-        let validation = validate_user_authority(&storage, &event, None)
+        let validation = check_user_authority(&storage, &event, None)
             .await
             .expect("validation runs");
         assert_eq!(

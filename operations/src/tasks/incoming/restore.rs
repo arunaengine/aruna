@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::federation::registration::PublishRegistrationOperation;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -33,32 +34,43 @@ async fn durable_rearm_loop(
         };
         ticks = ticks.saturating_add(1);
         restore_blob_timer(&context.storage_handle, &task_handle).await;
-        crate::s3::object::metadata_drain::restore_timer(&context.storage_handle, &task_handle)
-            .await;
+        let refresh = crate::s3::object::metadata_drain::RestoreRefreshTimer::new();
+        if let Err(error) = drive(refresh, &context).await {
+            warn!(?error, "Failed to scan reference metadata refresh jobs");
+        }
         let restore = crate::connectors::reference_prune::RestorePruneOperation::new();
         if let Err(error) = drive(restore, &context).await {
             warn!(%error, "Failed to restore connector reference pruning");
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
         restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
         if ticks.is_multiple_of(DEAD_LETTER_TICKS) {
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
-        restore_drain_timer(&context, &task_handle).await;
-        restore_prune_timer(&context, &task_handle).await;
+        arm_drain_timer(&context).await;
+        arm_prune_timer(&context).await;
         restore_mirror_timer(&context).await;
-        crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
+        if let Err(error) = drive(
+            crate::jobs::repository::link_queue::LinkTimerOperation::new(),
+            &context,
+        )
+        .await
+        {
+            warn!(%error, "Failed to arm the repository link queue");
+        }
     }
 }
 
@@ -257,7 +269,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         if stopped() {
             return;
         }
@@ -287,8 +299,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        super::registration::restore_registration_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_registration_timer(&context.storage_handle, &task_handle).await;
         if stopped() {
             return;
         }
@@ -296,7 +307,9 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         if stopped() {
             return;
         }
@@ -308,7 +321,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -320,12 +333,14 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::s3::object::metadata_drain::restore_timer(&context.storage_handle, &task_handle)
-            .await;
+        let refresh = crate::s3::object::metadata_drain::RestoreRefreshTimer::new();
+        if let Err(error) = drive(refresh, &context).await {
+            warn!(?error, "Failed to scan reference metadata refresh jobs");
+        }
         if stopped() {
             return;
         }
-        restore_prune_timer(&context, &task_handle).await;
+        arm_prune_timer(&context).await;
         if stopped() {
             return;
         }
@@ -426,20 +441,18 @@ impl OperationsTaskHandler {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
             (Some(net_handle), Some(capabilities)) => {
-                if let Err(error) = super::registration::publish_registration(
-                    &self.context,
+                let publish = PublishRegistrationOperation::new(
                     *net_handle.realm_id(),
                     net_handle.node_id(),
-                    capabilities,
-                )
-                .await
-                {
+                    capabilities.clone(),
+                );
+                if let Err(error) = drive(publish, &self.context).await {
                     warn!(task_id = ?key, error = %error, "Failed to publish registry registration");
                 }
             }
             _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
         }
-        self.reschedule_timer(key, crate::federation::publish::PUBLISH_INTERVAL)
+        self.reschedule_timer(key, aruna_core::federation::PUBLISH_INTERVAL)
             .await;
     }
 
@@ -488,7 +501,12 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
+        match drive(
+            PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
+            &bulk,
+        )
+        .await
+        {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -500,7 +518,10 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match prune_jobs_exist(&bulk).await {
+            Ok(_) => match drive(jobs_queued(), &bulk)
+                .await
+                .map(|due| !due.jobs.is_empty())
+            {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
@@ -523,7 +544,9 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
-        match drain_projection_queue(&self.context).await {
+        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
+        let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+        match drive(drain, &self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
                     .await;
@@ -602,7 +625,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_refresh_queue(&self) {
-        match crate::s3::object::metadata_drain::process_batch(&self.context).await {
+        let drain = crate::s3::object::metadata_drain::DrainRefreshOperation::new();
+        match drive(drain, &self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainRefreshQueue, Duration::ZERO)
                     .await;
@@ -625,7 +649,10 @@ impl OperationsTaskHandler {
 impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
-        let after = match crate::jobs::repository::link_queue::drain_links(&self.context).await {
+        let drain = crate::jobs::repository::link_queue::DrainLinksOperation::new(
+            crate::jobs::repository::NodeScope::of(&self.context),
+        );
+        let after = match drive(drain, &self.context).await {
             Ok(after) => after,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain repository link queue");
@@ -642,7 +669,13 @@ impl OperationsTaskHandler {
     /// Runs every witness round whose persisted deadline has elapsed.
     pub(super) async fn drain_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
-        if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
+        let context = self.context.as_ref();
+        let drain = WitnessDrainOperation::new(witness_node(context), now_ms);
+        let remaining = drive(drain, context).await.unwrap_or_else(|error| {
+            warn!(error = %error, "Witness deadline scan failed");
+            true
+        });
+        if remaining {
             self.reschedule_timer(TaskKey::DrainWitnessQueue, WITNESS_RETRY_AFTER)
                 .await;
         }
@@ -654,7 +687,10 @@ impl OperationsTaskHandler {
     /// reservation row keeps the obligation durable, so the retry re-arms until
     /// every one of them is published and its capacity released.
     pub(super) async fn settle_job_terminals(&self) {
-        let pending = match settle_terminals(self.context.as_ref()).await {
+        let context = self.context.as_ref();
+        let settle =
+            SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
+        let pending = match drive(settle, context).await {
             Ok(pending) => pending,
             Err(error) => {
                 warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
@@ -714,15 +750,8 @@ impl OperationsTaskHandler {
                 .available_slots_for(JobExecutionClass::ExternalAttempt),
         };
 
-        let reconciler = self.jobs_runtime.reconciler();
-        let result = match drain_job_batch(
-            &self.context,
-            owner_node_id,
-            budget,
-            reconciler.as_ref(),
-        )
-        .await
-        {
+        let drain = DrainJobsOperation::new(owner_node_id, budget, unix_timestamp_millis());
+        let mut result = match drive(drain, self.context.as_ref()).await {
             Ok(result) => result,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
@@ -731,6 +760,15 @@ impl OperationsTaskHandler {
                 return;
             }
         };
+
+        // A node without a reconciler leaves the attempt alone: it cannot observe the container.
+        if let Some(reconciler) = self.jobs_runtime.reconciler() {
+            for record in std::mem::take(&mut result.lost_attempts) {
+                reconciler
+                    .reconcile_lost_attempt(self.context.as_ref(), record)
+                    .await;
+            }
+        }
 
         for record in result.claimed {
             if self
@@ -777,7 +815,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn prune_jobs(&self) {
         let handlers = self.jobs_runtime.handlers();
-        let after = match prune_job_batch(&self.context, &handlers).await {
+        let after = match prune_job_page(&self.context, &handlers).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
@@ -868,6 +906,88 @@ pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
     OperationsTaskHandler::new(context, JobsRuntime::new())
         .run_trigger(TaskKey::DrainNotificationOutbox)
         .await;
+}
+
+/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
+async fn restore_mirror_timer(context: &DriverContext) {
+    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore sync mirror repair timer");
+    }
+}
+
+/// Arms the outbox drain for waiting records; a failure waits for the next rearm tick.
+async fn restore_outbox_timer(context: &DriverContext) {
+    if let Err(error) = drive(OutboxTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore document sync outbox timer");
+    }
+}
+
+/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
+/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
+async fn restore_info_timer(task_handle: &TaskHandle) {
+    let effect = Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishNodeInfo,
+        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
+    });
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
+        warn!(message = %message, "Failed to arm node info heartbeat timer");
+    }
+}
+
+/// Arms the registration timer at startup without postponing a restored due time. The due
+/// time is persisted, so repeated restarts do not keep moving the first publication.
+async fn restore_registration_timer(
+    storage: &aruna_storage::StorageHandle,
+    task_handle: &TaskHandle,
+) {
+    let effect = TaskEffect::ShortenTimer {
+        key: TaskKey::PublishRegistration,
+        after: aruna_core::federation::PUBLISH_INTERVAL,
+    };
+    if let Err(message) = persist_task_effect(storage, &effect).await {
+        warn!(message = %message, "Failed to persist registry publication timer");
+    }
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(Effect::Task(effect)).await
+    {
+        warn!(message = %message, "Failed to arm registry publication timer");
+    }
+}
+
+/// Re-arms the debounced publish task when dirty markers survived a restart.
+async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
+    let has_markers = match storage
+        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(Key::from(
+                aruna_core::structs::storage::usage::DIRTY_PREFIX.to_vec(),
+            )),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan node usage dirty markers");
+            return;
+        }
+        other => {
+            warn!(
+                event = other.label(),
+                "Unexpected event while scanning node usage dirty markers"
+            );
+            return;
+        }
+    };
+    if has_markers
+        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(crate::s3::usage::schedule_snapshot_publish())
+            .await
+    {
+        warn!(message = %message, "Failed to restore node usage publish timer");
+    }
 }
 
 #[cfg(test)]
@@ -976,57 +1096,37 @@ mod stop_tests {
     }
 }
 
-/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
-async fn restore_mirror_timer(context: &DriverContext) {
-    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
-        warn!(%error, "Failed to restore sync mirror repair timer");
-    }
-}
-
-/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
-/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
-async fn restore_info_timer(task_handle: &TaskHandle) {
-    let effect = Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::PublishNodeInfo,
-        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
-    });
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
-        warn!(message = %message, "Failed to arm node info heartbeat timer");
-    }
-}
-
-/// Re-arms the debounced publish task when dirty markers survived a restart.
-async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
-    let has_markers = match storage
-        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
-            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(
-                aruna_core::structs::storage::usage::DIRTY_PREFIX.to_vec(),
-            )),
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
+/// One prune pass; the payload handlers decide first which due jobs stay for now.
+async fn prune_job_page(
+    context: &DriverContext,
+    handlers: &[Arc<dyn PayloadHandler>],
+) -> Result<JobPruneOutcome, String> {
+    let now_ms = unix_timestamp_millis();
+    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
         .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan node usage dirty markers");
-            return;
+        .map_err(|error| error.0)?;
+    let mut kept = BTreeSet::new();
+    for (job_id, payload) in due {
+        for handler in handlers {
+            if handler.keeps_job(context, &payload).await? {
+                kept.insert(job_id);
+            }
         }
-        other => {
-            warn!(
-                event = other.label(),
-                "Unexpected event while scanning node usage dirty markers"
-            );
-            return;
-        }
-    };
-    if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(crate::s3::usage::schedule_snapshot_publish())
-            .await
-    {
-        warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
+    drive(prune, context).await.map_err(|error| error.0)
+}
+
+async fn arm_drain_timer(context: &DriverContext) {
+    let timer = DrainTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job drain timer");
+    }
+}
+
+async fn arm_prune_timer(context: &DriverContext) {
+    let timer = PruneTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job prune timer");
     }
 }

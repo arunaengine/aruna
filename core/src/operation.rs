@@ -22,6 +22,10 @@ pub enum HoldScope {
     PluginCopies,
     /// The changes of one plugin install on this node, so they never overlap here.
     PluginInstall(ulid::Ulid),
+    /// This node's writes to one metadata document, so its actor's dots stay in order.
+    DocumentWrite(ulid::Ulid),
+    /// Drawing placement handles and provisioning bindings on this node.
+    PlacementHandles,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the
@@ -159,7 +163,7 @@ pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
     fn stamp(&mut self, _now_ms: u64) {}
 
     /// The backend scope this operation holds from before its first effect until it ends, so
-    /// no two operations with the same scope overlap. Only a top-level drive takes it.
+    /// no two operations with the same scope overlap.
     fn hold_scope(&self) -> Option<HoldScope> {
         None
     }
@@ -206,6 +210,10 @@ pub trait SubOperation: Send + std::fmt::Debug {
     fn abort(&mut self) -> Effects;
     /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
+    /// The backend scope this child holds while it runs.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
     fn eq_dyn(&self, other: &dyn SubOperation) -> bool;
 }
@@ -312,6 +320,10 @@ where
         if let Some(operation) = self.operation.as_mut() {
             operation.stamp(now_ms);
         }
+    }
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        self.operation.as_ref().and_then(O::hold_scope)
     }
 
     fn as_any(&self) -> &dyn Any {

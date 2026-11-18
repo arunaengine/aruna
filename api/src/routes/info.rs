@@ -32,11 +32,11 @@ use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
-use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
+use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
-use aruna_operations::placement::mutation::drive_placement_mutation;
-use aruna_operations::placement::provision::provision_metadata_binding;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
+use aruna_operations::placement::provision::ProvisionBindingOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -1094,14 +1094,19 @@ pub(crate) async fn run_realm_info(
     let metadata_replication = RealmReplicationResponse {
         default_replication_factor: config.effective_replication_factor(),
     };
-    let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
+    let live_datasets = match drive(
+        RealmDocumentsOperation::new(config.realm_id),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(count) => count,
         Err(error) => {
             warn!(error = %error, "metadata document count unavailable for public realm overview");
             None
         }
     };
-    let groups = match count_realm_groups(&state.get_ctx(), config.realm_id).await {
+    let groups = match drive(RealmGroupsOperation::new(config.realm_id), &state.get_ctx()).await {
         Ok(count) => Some(count),
         Err(error) => {
             warn!(error = %error, "group count unavailable for public realm overview");
@@ -1127,7 +1132,7 @@ pub(crate) async fn run_realm_info(
     // A device holds no peer node-info document, so the list a realm node
     // installed on it is what the portal is offered there.
     if management_urls.is_empty() {
-        management_urls = installed_management_urls(&state.get_ctx(), config.realm_id).await;
+        management_urls = drive(installed_management_urls(config.realm_id), &state.get_ctx()).await.unwrap_or_default();
     }
 
     let public_nodes = public_nodes(
@@ -1233,7 +1238,7 @@ async fn node_names(
         state.node_capabilities(),
         aruna_core::structs::identity::auth::NodeCapabilities::User { .. }
     ) {
-        return installed_displays(&state.get_ctx(), realm_id).await;
+        return drive(installed_displays(realm_id), &state.get_ctx()).await.unwrap_or_default();
     }
     drive(ReadNamesOperation::new(realm_id), &state.get_ctx())
         .await
@@ -1673,9 +1678,12 @@ pub async fn mutate_realm_placement(
                 Permission::WRITE,
             )
             .await?;
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                Some(auth),
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig { actor, mutation },
+                    Some(auth),
+                    context.node_and_realm().map(|(node_id, _)| node_id),
+                ),
                 &context,
             )
             .await
@@ -1690,9 +1698,12 @@ pub async fn mutate_realm_placement(
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
-            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
-                .await
-                .map_err(map_handle_error)?;
+            drive(
+                ProvisionBindingOperation::new(actor.clone(), scope, strategy_id),
+                context.as_ref(),
+            )
+            .await
+            .map_err(map_handle_error)?;
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
@@ -2159,14 +2170,18 @@ pub async fn get_usage(
     response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.
-    response.metadata_documents =
-        match count_realm_documents(&state.get_ctx(), state.get_realm_id()).await {
-            Ok(count) => count,
-            Err(error) => {
-                warn!(error = %error, "metadata document count unavailable for usage response");
-                None
-            }
-        };
+    response.metadata_documents = match drive(
+        RealmDocumentsOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            warn!(error = %error, "metadata document count unavailable for usage response");
+            None
+        }
+    };
     Ok((StatusCode::OK, Json(response)))
 }
 

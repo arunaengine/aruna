@@ -82,8 +82,11 @@ fn page_call(request: &QuarantinePageRequest) -> IoCall {
     }
 }
 
+/// The rows of one page and the key to continue after.
+type PageRows = (Vec<(Key, Value)>, Option<Vec<u8>>);
+
 /// The rows of the page that answered [`page_call`] and the key to continue after.
-fn page_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Vec<u8>>), IoError> {
+fn page_rows(result: IoResult) -> Result<PageRows, IoError> {
     match result {
         IoResult::Page { rows, next } => Ok((rows, next.map(|key| key.as_ref().to_vec()))),
         other => Err(IoError::Unexpected {

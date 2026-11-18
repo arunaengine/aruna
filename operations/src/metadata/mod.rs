@@ -16,7 +16,6 @@ pub mod create_entry;
 pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
-pub mod document_holder;
 pub mod forward;
 pub(crate) mod frames;
 pub mod get_document;
@@ -34,7 +33,7 @@ pub(crate) mod object_version;
 pub mod persistent_id;
 pub(crate) mod pid_transition;
 pub mod profile;
-pub mod projector;
+pub mod projection;
 pub(crate) mod protocol;
 pub mod provenance;
 pub(crate) mod prune_jobs;
@@ -44,13 +43,13 @@ mod query_cache;
 mod queue_storage;
 pub(crate) mod raw_events;
 pub mod raw_revision;
+pub mod realm_counts;
 pub mod record_reads;
 pub mod repository;
-pub(crate) mod revision_read;
+pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
-mod summary_cache;
 pub mod timestamp_index;
 pub(crate) mod timestamp_sweep;
 pub mod update_document;
@@ -113,7 +112,6 @@ pub use handle::{
     warm_caches,
 };
 pub(crate) use handle::{
-    export_rocrate_page, export_summary_jsonld, list_group_records, prune_if_deleted,
-    search_local_filtered, transport_message_kind,
+    export_summary_jsonld, list_group_records, search_local_filtered, transport_message_kind,
 };
 pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};

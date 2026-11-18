@@ -18,18 +18,17 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::read_access::SourceReadError;
-use crate::jobs::source_read::authorize_read;
+use crate::jobs::read_access::SourceReadOperation;
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
-use aruna_blob::native::body_stream;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -93,7 +92,9 @@ pub async fn head_target(
     if arn.node_id == local {
         return Ok(());
     }
-    delegated_read(context, delegation(caller, arn.node_id), arn, None, true)
+    let ids = context.node_and_realm();
+    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, None, true);
+    drive(read, context)
         .await
         .map(|_| ())
         .map_err(staging_error)
@@ -124,13 +125,9 @@ pub async fn authorize_target(
         &arn.key,
     );
     let extras = PolicyRequestExtras::operation(operation);
-    match Box::pin(authorize(
+    match Box::pin(drive(
+        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::READ,
-        extras,
     ))
     .await
     {
@@ -174,11 +171,10 @@ pub async fn read_target(
         .map_err(|error| LinkError::Unavailable(error.to_string()))?;
         return Ok(get.blob);
     }
-    let (_, _, stream) =
-        delegated_read(context, delegation(caller, arn.node_id), arn, range, false)
-            .await
-            .map_err(staging_error)?;
-    Ok(body_stream(stream))
+    let ids = context.node_and_realm();
+    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, range, false);
+    let body = drive(read, context).await.map_err(staging_error)?;
+    Ok(body.blob)
 }
 
 /// The verified caller a delegation carries; the read fills in what it binds. A signed-out
@@ -258,12 +254,9 @@ async fn local_target(
     source: &LinkSource,
 ) -> Result<(LinkTarget, SourceMetadata), LinkError> {
     let object = (source.bucket.as_str(), source.key.as_str());
-    let group_id = authorize_read(
+    let group_id = drive(
+        SourceReadOperation::of_object(&caller.auth, source.node_id, object, HEAD_OPERATION),
         context,
-        &caller.auth,
-        source.node_id,
-        object,
-        HEAD_OPERATION,
     )
     .await
     .map_err(|error| match error {

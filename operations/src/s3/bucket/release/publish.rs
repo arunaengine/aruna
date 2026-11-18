@@ -37,7 +37,7 @@ use ulid::Ulid;
 use super::read::load_access;
 use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
@@ -47,7 +47,7 @@ use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::GateOperation;
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::live_queue::complete_put;
+use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
@@ -411,7 +411,12 @@ async fn allowed(
     path: &str,
 ) -> Result<bool, PublishError> {
     let extras = PolicyRequestExtras::rest();
-    match authorize(context, realm_id, auth, path, &Permission::WRITE, extras).await {
+    match drive(
+        AuthorizeOperation::new(realm_id, auth, path, &Permission::WRITE, extras),
+        context,
+    )
+    .await
+    {
         Ok(()) => Ok(true),
         Err(AuthorizeError::Storage(error)) => Err(PublishError::Unavailable(error.to_string())),
         Err(_) => Ok(false),
@@ -431,11 +436,11 @@ async fn coordinated_files(
         return all_files(context, scope, access, asked, None).await;
     };
     let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let view = read_view(context, binding.set_id)
+    let view = drive(read_view(binding.set_id), context)
         .await
         .map_err(|error| unavailable(&error))?
         .ok_or_else(|| PublishError::Unavailable("this node holds no record of the set".into()))?;
-    let fence = local_fence(context, binding.set_id)
+    let fence = drive(local_fence(binding.set_id), context)
         .await
         .map_err(|error| unavailable(&error))?;
     let snapshot = view.snapshot();
@@ -609,18 +614,21 @@ async fn put_crate(
         Err(PutObjectError::FenceTaken) => return Err(PublishError::Conflict(CHANGED.to_string())),
         Err(error) => return Err(failed(&error)),
     };
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            auth: input.auth.clone(),
+            group_id: scope.info.group_id,
+            bucket: scope.bucket.to_string(),
+            key: input.key.clone(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
         context,
-        scope.realm_id,
-        scope.node_id,
-        input.auth.clone(),
-        scope.info.group_id,
-        scope.bucket.to_string(),
-        input.key.clone(),
-        result.version_id,
-        result.location.blob_size,
     )
-    .await;
+    .await
+    .ok();
     Ok(Some(result.version_id))
 }
 
@@ -679,11 +687,11 @@ pub async fn holder_answer(
             let Some(binding) = &info.distribution else {
                 return Ok(HolderAnswer::Files(refused));
             };
-            let view = read_view(context, binding.set_id)
+            let view = drive(read_view(binding.set_id), context)
                 .await
                 .map_err(|error| unavailable(&error))?
                 .ok_or_else(|| PublishError::Unavailable("no record of the set".into()))?;
-            let fence = local_fence(context, binding.set_id)
+            let fence = drive(local_fence(binding.set_id), context)
                 .await
                 .map_err(|error| unavailable(&error))?;
             let snapshot = view.snapshot();

@@ -6,10 +6,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::jobs::family_report;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::drive;
+use aruna_operations::jobs::lifecycle::family_reads::{
+    AuditEndpointsOperation, FamilyLogOperation,
+};
 use aruna_operations::jobs::lifecycle::report::{AuditPaging, AuditRange};
-use aruna_operations::jobs::lifecycle::routing::{audit_endpoints, family_audit, family_report};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -331,13 +336,15 @@ pub async fn get_job_audit(
             },
         )
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let page = family_audit(&context, &auth, job_id, range, paging)
+    let read = FamilyLogOperation::new(&auth, job_id, (range, paging), unix_timestamp_millis());
+    let page = drive(read, context.as_ref())
         .await
-        .ok_or(ServerError::NotFound)?
-        .map_err(map_job_route)?;
+        .map_err(map_job_route)?
+        .ok_or(ServerError::NotFound)?;
 
-    let output_endpoints =
-        audit_endpoints(&context, &page.records, report.output_endpoints.clone()).await;
+    let known = report.output_endpoints.clone();
+    let read = AuditEndpointsOperation::new(&page.records, known.clone());
+    let output_endpoints = drive(read, context.as_ref()).await.unwrap_or(known);
     let mut records = Vec::new();
     for envelope in &page.records {
         if let Some(record) = audit_record(

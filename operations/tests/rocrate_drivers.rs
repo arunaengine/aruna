@@ -13,6 +13,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
+use crate::job_calls::read_artifact_range;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -49,8 +50,6 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::export::run_export_job;
 use aruna_operations::jobs::import::run_rocrate_import;
-use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
-use aruna_operations::jobs::service::read_artifact_range;
 use aruna_operations::jobs::store::query::{insert_job, list_job_entries};
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, release_job, transition_to_running,
@@ -58,12 +57,12 @@ use aruna_operations::jobs::store::state::{
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use async_zip::{Compression, StringEncoding, ZipEntryBuilder, ZipString};
@@ -1339,9 +1338,13 @@ async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(hidden_count(&fixture, upload_id).await?, 0);
     assert!(
-        load_rocrate_upload(&fixture.context, upload_id)
-            .await?
-            .is_none()
+        aruna_operations::driver::drive(
+            aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+            &fixture.context
+        )
+        .await
+        .map_err(|error| error.0)?
+        .is_none()
     );
 
     fixture.stop().await;

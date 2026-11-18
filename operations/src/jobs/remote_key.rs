@@ -3,288 +3,513 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-use std::future::Future;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
-use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
+use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::rows::{read_row, value};
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, object_permission_path};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, HashIndex, VersionKey, object_permission_path,
+};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive, drive_retry};
-use crate::jobs::key_wake::{alias_page, alias_wait, find_alias, read_row, version_wait};
-use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
-use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::key_wait::{read_key_waits, satisfy_key_wait};
-use crate::jobs::store::remote_wait::{
-    OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
+use crate::jobs::key_locks::{
+    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, KeyUnlockedOperation,
+    MAX_AWAITED, VersionWaitOperation,
 };
-use crate::jobs::store::state::read_job_record;
-use crate::tasks::task_persistence::persist_task_effect;
+use crate::jobs::records::pages::ServingNode;
+use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::remote_wait::{
+    OwedPage, OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
+};
+use crate::jobs::store::row_calls::{read_job_record, read_key_waits, satisfy_key_wait};
 
-/// Targets one registration may name; more is refused rather than scanned.
-const MAX_AWAITED: usize = 1024;
+fn stored(error: JobMutationError) -> KeyCheckError {
+    KeyCheckError(error.to_string())
+}
 
-/// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
-/// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
-pub(crate) async fn register_waits(
-    context: &DriverContext,
-    (node_id, peer): (NodeId, NodeId),
+/// Asks whether `auth` may READ one object here, within its path restrictions.
+fn read_check(
     auth: &AuthContext,
-    job_id: JobId,
-    targets: &[WaitTarget],
-) -> Result<Vec<KeyWait>, String> {
-    if targets.len() > MAX_AWAITED {
-        return Err(format!("at most {MAX_AWAITED} targets per key wait"));
-    }
-    let mut waits: Vec<KeyWait> = Vec::new();
-    for target in targets {
-        for wait in target_locks(context, node_id, auth, target).await? {
-            if !waits.contains(&wait) {
-                waits.push(wait);
-            }
-        }
-    }
-    for wait in &waits {
-        let register = WaitRowOperation::register(wait.key, peer, job_id, auth);
-        drive(register, context)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    let mut locked = Vec::new();
-    for wait in waits {
-        if !key_unlocked(context, wait.key).await {
-            locked.push(wait);
-        }
-    }
-    Ok(locked)
+    (node_id, group_id): (NodeId, Ulid),
+    bucket: &str,
+    key: &str,
+) -> IoCall {
+    let path = object_permission_path(auth.realm_id, group_id, node_id, bucket, key);
+    IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
+        auth_context: auth.clone(),
+        path,
+        required_permission: Permission::READ,
+    }))
+}
+
+/// A check that could not be answered grants nothing.
+fn read_allowed(result: IoResult) -> Result<bool, IoError> {
+    Ok(result.child::<bool, AuthorizationError>()?.unwrap_or(false))
+}
+
+fn answered_wait(result: IoResult) -> Result<Option<KeyWait>, KeyCheckError> {
+    result.child::<Option<KeyWait>, KeyCheckError>()?
+}
+
+#[derive(Debug, PartialEq)]
+enum TargetStep {
+    Bucket,
+    ObjectCheck(Ulid),
+    Alias,
+    AliasCheck(Box<HashIndex>),
+    Wait,
+    Page,
+    PageCheck(Box<HashIndex>),
+    PageWait,
 }
 
 /// Locked keys of one target the caller may READ here. An exact version is judged alone, so
 /// another readable alias cannot hide it; a bare content waits only while none is readable.
-async fn target_locks(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct TargetLocksOperation {
     node_id: NodeId,
-    auth: &AuthContext,
-    target: &WaitTarget,
-) -> Result<Vec<KeyWait>, String> {
-    match target {
-        WaitTarget::Object {
+    auth: AuthContext,
+    target: WaitTarget,
+    step: TargetStep,
+    /// Aliases of the current page still to judge, the next one last.
+    aliases: Vec<HashIndex>,
+    next_page: Option<Key>,
+    locked: Vec<KeyWait>,
+}
+
+type TargetNext = Result<Next<Vec<KeyWait>>, KeyCheckError>;
+
+impl TargetLocksOperation {
+    pub fn new(node_id: NodeId, auth: &AuthContext, target: WaitTarget) -> Self {
+        let step = match &target {
+            WaitTarget::Object { .. } => TargetStep::Bucket,
+            WaitTarget::Captured { .. } => TargetStep::Alias,
+            WaitTarget::Content { .. } => TargetStep::Page,
+        };
+        Self {
+            node_id,
+            auth: auth.clone(),
+            target,
+            step,
+            aliases: Vec::new(),
+            next_page: None,
+            locked: Vec::new(),
+        }
+    }
+
+    fn alias_check(&self, alias: &HashIndex) -> IoCall {
+        let place = (self.node_id, alias.group_id);
+        read_check(&self.auth, place, &alias.bucket, &alias.key)
+    }
+
+    fn page_call(&self, blake3: [u8; 32], after: Option<Key>) -> IoCall {
+        IoCall::child(AliasPageOperation::new(blake3, self.node_id, after))
+    }
+
+    /// The next alias of this realm, the next page, or the end of the content.
+    fn next_alias(&mut self) -> TargetNext {
+        while let Some(alias) = self.aliases.pop() {
+            if alias.realm_id == self.auth.realm_id {
+                let check = self.alias_check(&alias);
+                self.step = TargetStep::PageCheck(Box::new(alias));
+                return Ok(Next::Call(check));
+            }
+        }
+        let WaitTarget::Content { blake3 } = self.target else {
+            return Ok(Next::Done(std::mem::take(&mut self.locked)));
+        };
+        match self.next_page.take() {
+            Some(after) => {
+                self.step = TargetStep::Page;
+                Ok(Next::Call(self.page_call(blake3, Some(after))))
+            }
+            None => Ok(Next::Done(std::mem::take(&mut self.locked))),
+        }
+    }
+
+    fn bucket_read(&mut self, result: IoResult) -> TargetNext {
+        let Some(info) = value(result)? else {
+            return Ok(Next::Done(Vec::new()));
+        };
+        let group_id = BucketInfo::from_bytes(&info)
+            .map_err(|error| KeyCheckError(error.to_string()))?
+            .group_id;
+        let WaitTarget::Object { bucket, key, .. } = &self.target else {
+            return Err(KeyCheckError("target is no object".to_string()));
+        };
+        let check = read_check(&self.auth, (self.node_id, group_id), bucket, key);
+        self.step = TargetStep::ObjectCheck(group_id);
+        Ok(Next::Call(check))
+    }
+
+    fn object_wait(&mut self, group_id: Ulid) -> TargetNext {
+        let WaitTarget::Object {
             bucket,
             key,
             version_id,
-        } => {
-            let row = read_row(context, S3_BUCKET_KEYSPACE, bucket.clone().into());
-            let Some(info) = row.await? else {
-                return Ok(Vec::new());
-            };
-            let group_id = BucketInfo::from_bytes(&info)
-                .map_err(|error| error.to_string())?
-                .group_id;
-            if !may_read(context, auth, (node_id, group_id), bucket, key).await {
-                return Ok(Vec::new());
+        } = &self.target
+        else {
+            return Err(KeyCheckError("target is no object".to_string()));
+        };
+        let version = VersionKey::new(bucket, key, *version_id);
+        self.step = TargetStep::Wait;
+        let wait = VersionWaitOperation::new((self.node_id, group_id), version);
+        Ok(Next::Call(IoCall::child(wait)))
+    }
+}
+
+impl Operation for TargetLocksOperation {
+    type Output = Vec<KeyWait>;
+    type Error = KeyCheckError;
+
+    fn first(&mut self) -> TargetNext {
+        Ok(Next::Call(match &self.target {
+            WaitTarget::Object { bucket, .. } => {
+                read_row(S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec())
             }
-            let version = VersionKey::new(bucket, key, *version_id);
-            let wait = version_wait(context, (node_id, group_id), &version).await?;
-            Ok(wait.into_iter().collect())
-        }
-        WaitTarget::Captured { blake3, version_id } => {
-            let alias = find_alias(context, blake3, *version_id, node_id).await?;
-            let Some(alias) = alias.filter(|alias| alias.realm_id == auth.realm_id) else {
-                return Ok(Vec::new());
-            };
-            let place = (node_id, alias.group_id);
-            if !may_read(context, auth, place, &alias.bucket, &alias.key).await {
-                return Ok(Vec::new());
+            WaitTarget::Captured { blake3, version_id } => {
+                IoCall::child(FindAliasOperation::new(*blake3, *version_id, self.node_id))
             }
-            Ok(alias_wait(context, &alias).await?.into_iter().collect())
+            WaitTarget::Content { blake3 } => self.page_call(*blake3, None),
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> TargetNext {
+        match std::mem::replace(&mut self.step, TargetStep::Wait) {
+            TargetStep::Bucket => self.bucket_read(result),
+            TargetStep::ObjectCheck(group_id) => match read_allowed(result)? {
+                true => self.object_wait(group_id),
+                false => Ok(Next::Done(Vec::new())),
+            },
+            TargetStep::Alias => {
+                let alias = result.child::<Option<HashIndex>, KeyCheckError>()??;
+                let realm_id = self.auth.realm_id;
+                let Some(alias) = alias.filter(|alias| alias.realm_id == realm_id) else {
+                    return Ok(Next::Done(Vec::new()));
+                };
+                let check = self.alias_check(&alias);
+                self.step = TargetStep::AliasCheck(Box::new(alias));
+                Ok(Next::Call(check))
+            }
+            TargetStep::AliasCheck(alias) => {
+                if !read_allowed(result)? {
+                    return Ok(Next::Done(Vec::new()));
+                }
+                let wait = VersionWaitOperation::of_alias(&alias);
+                Ok(Next::Call(IoCall::child(wait)))
+            }
+            TargetStep::Wait => Ok(Next::Done(answered_wait(result)?.into_iter().collect())),
+            TargetStep::Page => {
+                let (mut aliases, next) = result.child::<AliasPage, KeyCheckError>()??;
+                aliases.reverse();
+                self.aliases = aliases;
+                self.next_page = next;
+                self.next_alias()
+            }
+            TargetStep::PageCheck(alias) => {
+                if !read_allowed(result)? {
+                    return self.next_alias();
+                }
+                self.step = TargetStep::PageWait;
+                let wait = VersionWaitOperation::of_alias(&alias);
+                Ok(Next::Call(IoCall::child(wait)))
+            }
+            TargetStep::PageWait => match answered_wait(result)? {
+                Some(wait) => {
+                    self.locked.push(wait);
+                    self.next_alias()
+                }
+                None => Ok(Next::Done(Vec::new())),
+            },
         }
-        WaitTarget::Content { blake3 } => {
-            let mut locked = Vec::new();
-            let mut start_after = None;
-            loop {
-                let (aliases, next) = alias_page(context, blake3, node_id, start_after).await?;
-                for alias in aliases {
-                    let place = (node_id, alias.group_id);
-                    if alias.realm_id != auth.realm_id
-                        || !may_read(context, auth, place, &alias.bucket, &alias.key).await
-                    {
-                        continue;
-                    }
-                    match alias_wait(context, &alias).await? {
-                        Some(wait) => locked.push(wait),
-                        None => return Ok(Vec::new()),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RegisterStep {
+    Targets,
+    Rows,
+    Unlocked(KeyWait),
+}
+
+/// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
+/// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
+#[derive(Debug, PartialEq)]
+pub struct RegisterWaitsOperation {
+    node_id: NodeId,
+    peer: NodeId,
+    auth: AuthContext,
+    job_id: JobId,
+    /// Targets still to judge, the next one last.
+    targets: Vec<WaitTarget>,
+    /// Keys found so far; while registering and checking, those still to handle.
+    waits: Vec<KeyWait>,
+    registered: usize,
+    locked: Vec<KeyWait>,
+    step: RegisterStep,
+}
+
+type RegisterNext = Result<Next<Vec<KeyWait>>, KeyCheckError>;
+
+impl RegisterWaitsOperation {
+    pub fn new(
+        (node_id, peer): (NodeId, NodeId),
+        auth: &AuthContext,
+        job_id: JobId,
+        targets: &[WaitTarget],
+    ) -> Self {
+        let mut targets = targets.to_vec();
+        targets.reverse();
+        Self {
+            node_id,
+            peer,
+            auth: auth.clone(),
+            job_id,
+            targets,
+            waits: Vec::new(),
+            registered: 0,
+            locked: Vec::new(),
+            step: RegisterStep::Targets,
+        }
+    }
+
+    fn next_target(&mut self) -> RegisterNext {
+        match self.targets.pop() {
+            Some(target) => {
+                let locks = TargetLocksOperation::new(self.node_id, &self.auth, target);
+                Ok(Next::Call(IoCall::child(locks)))
+            }
+            None => self.next_row(),
+        }
+    }
+
+    fn next_row(&mut self) -> RegisterNext {
+        let Some(wait) = self.waits.get(self.registered) else {
+            self.waits.reverse();
+            return self.next_check();
+        };
+        self.step = RegisterStep::Rows;
+        self.registered += 1;
+        let row = WaitRowOperation::register(wait.key, self.peer, self.job_id, &self.auth);
+        Ok(Next::Call(IoCall::child(row)))
+    }
+
+    fn next_check(&mut self) -> RegisterNext {
+        let Some(wait) = self.waits.pop() else {
+            return Ok(Next::Done(std::mem::take(&mut self.locked)));
+        };
+        let check = KeyUnlockedOperation::new(wait.key);
+        self.step = RegisterStep::Unlocked(wait);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+}
+
+impl Operation for RegisterWaitsOperation {
+    type Output = Vec<KeyWait>;
+    type Error = KeyCheckError;
+
+    fn first(&mut self) -> RegisterNext {
+        if self.targets.len() > MAX_AWAITED {
+            return Err(KeyCheckError(format!(
+                "at most {MAX_AWAITED} targets per key wait"
+            )));
+        }
+        self.next_target()
+    }
+
+    fn next(&mut self, result: IoResult) -> RegisterNext {
+        match std::mem::replace(&mut self.step, RegisterStep::Targets) {
+            RegisterStep::Targets => {
+                for wait in result.child::<Vec<KeyWait>, KeyCheckError>()?? {
+                    if !self.waits.contains(&wait) {
+                        self.waits.push(wait);
                     }
                 }
-                match next {
-                    Some(next) => start_after = Some(next),
-                    None => return Ok(locked),
+                self.next_target()
+            }
+            RegisterStep::Rows => {
+                result.child::<(), JobMutationError>()?.map_err(stored)?;
+                self.next_row()
+            }
+            RegisterStep::Unlocked(wait) => {
+                if !result.child::<bool, IoError>()?.unwrap_or(false) {
+                    self.locked.push(wait);
                 }
+                self.next_check()
             }
         }
     }
 }
 
-/// Whether `auth` may READ one object here, within its path restrictions.
-async fn may_read(
-    context: &DriverContext,
-    auth: &AuthContext,
-    (node_id, group_id): (NodeId, ulid::Ulid),
-    bucket: &str,
-    key: &str,
-) -> bool {
-    let path = object_permission_path(auth.realm_id, group_id, node_id, bucket, key);
-    let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-        auth_context: auth.clone(),
-        path,
-        required_permission: Permission::READ,
-    });
-    drive(check, context).await.unwrap_or(false)
+#[derive(Debug, PartialEq)]
+enum WakeStep {
+    Record,
+    Waits,
+    Satisfy,
 }
 
 /// Waiting node: applies a wake from `peer`. False while the job may still be parking, so the
 /// key node delivers again; any other state acknowledges, as the wake cannot matter any more.
-pub(crate) async fn accept_wake(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct AcceptWakeOperation {
     peer: NodeId,
-    auth: &AuthContext,
+    user_id: UserId,
     job_id: JobId,
     key: BucketKeyRef,
-) -> Result<bool, String> {
-    let Some(record) = read_job_record(context, job_id, None).await? else {
-        return Ok(true);
-    };
-    if record.created_by != auth.user_id {
-        return Ok(true);
-    }
-    match record.state {
-        JobState::Claimed | JobState::Preparing => Ok(false),
-        JobState::AwaitingKey => {
-            let waits = read_key_waits(context, job_id).await?;
-            if waits
-                .iter()
-                .any(|wait| wait.node_id == peer && wait.key == key)
-            {
-                satisfy_key_wait(context, job_id, key, unix_timestamp_millis())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(true)
-        }
-        _ => Ok(true),
-    }
+    now_ms: u64,
+    step: WakeStep,
 }
 
-/// Sends one job-control request straight to `node`.
-async fn ask(
-    context: &DriverContext,
-    node: NodeId,
-    job_id: JobId,
-    request: JobRequest,
-) -> Option<JobResponse> {
-    let net = context.net_handle.as_ref()?;
-    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, Some(request))
-        .with_responder(Some(node));
-    match drive(operation, context).await {
-        Ok(JobRouteOutcome::Remote(response)) => Some(response),
-        Ok(JobRouteOutcome::Local) => None,
-        Err(error) => {
-            warn!(job_id = %job_id, node = %node, %error, "Key wait request failed");
-            None
-        }
-    }
-}
-
-/// Waiting node: registers the job on each source node of its remote inputs and collects the
-/// keys still locked there. An unreachable source is left to staging, as before.
-pub(crate) async fn remote_waits(
-    context: &DriverContext,
-    record: &JobRecord,
-    node_id: NodeId,
-) -> Vec<KeyWait> {
-    let mut by_node: BTreeMap<NodeId, Vec<WaitTarget>> = BTreeMap::new();
-    for input in &record.captured_inputs {
-        if let Some(blake3) = input.content.blake3()
-            && input.source_node_id != node_id
-        {
-            by_node
-                .entry(input.source_node_id)
-                .or_default()
-                .push(WaitTarget::Captured {
-                    blake3,
-                    version_id: input.version_id,
-                });
-        }
-    }
-    let auth = owner_auth(record, context.serving_realm(record.created_by.realm_id));
-    let mut waits = Vec::new();
-    for (node, targets) in by_node {
-        waits.extend(ask_waits(context, &auth, record.job_id, node, &targets).await);
-    }
-    waits
-}
-
-/// Waiting node: registers the job on `node` for `targets` and returns the keys still locked
-/// there. An unreachable or refusing node yields none.
-pub(crate) async fn ask_waits(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    node: NodeId,
-    targets: &[WaitTarget],
-) -> Vec<KeyWait> {
-    let mut waits = Vec::new();
-    for targets in targets.chunks(MAX_AWAITED) {
-        let request = JobRequest::AwaitKeys {
-            auth_token: AuthToken::Internal(auth.clone()),
+impl AcceptWakeOperation {
+    pub fn new(
+        peer: NodeId,
+        user_id: UserId,
+        job_id: JobId,
+        key: BucketKeyRef,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            peer,
+            user_id,
             job_id,
-            targets: targets.to_vec(),
-        };
-        match ask(context, node, job_id, request).await {
-            Some(JobResponse::KeysLocked(locked)) => {
-                // The answering node names its own keys only.
-                waits.extend(locked.into_iter().filter(|wait| wait.node_id == node));
-            }
-            Some(response) => {
-                warn!(job_id = %job_id, node = %node, ?response, "Key wait refused")
-            }
-            None => {}
+            key,
+            now_ms,
+            step: WakeStep::Record,
         }
     }
-    waits
-}
 
-/// The job owner this node vouches for in key wait requests, signed in to `realm_id`.
-fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id: record.created_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
+    fn judged(&mut self, record: Option<JobRecord>) -> Result<Next<bool>, KeyCheckError> {
+        let Some(record) = record.filter(|record| record.created_by == self.user_id) else {
+            return Ok(Next::Done(true));
+        };
+        match record.state {
+            JobState::Claimed | JobState::Preparing => Ok(Next::Done(false)),
+            JobState::AwaitingKey => {
+                self.step = WakeStep::Waits;
+                Ok(Next::Call(IoCall::child(read_key_waits(self.job_id))))
+            }
+            _ => Ok(Next::Done(true)),
+        }
     }
 }
 
-/// Key node: turns the registrations on `key` into owed wakes, in bounded pages.
-pub(crate) async fn queue_wakes(context: &DriverContext, key: BucketKeyRef) -> Result<(), String> {
-    while drive_retry(|| QueueWakesOperation::new(key), context, &key.key())
-        .await
-        .map_err(|error| error.to_string())?
-    {}
-    Ok(())
+impl Operation for AcceptWakeOperation {
+    type Output = bool;
+    type Error = KeyCheckError;
+
+    fn first(&mut self) -> Result<Next<bool>, KeyCheckError> {
+        Ok(Next::Call(IoCall::child(read_job_record(self.job_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, KeyCheckError> {
+        match self.step {
+            WakeStep::Record => {
+                let record = result
+                    .child::<Option<JobRecord>, JobMutationError>()?
+                    .map_err(stored)?;
+                self.judged(record)
+            }
+            WakeStep::Waits => {
+                let waits = result
+                    .child::<Vec<KeyWait>, JobMutationError>()?
+                    .map_err(stored)?;
+                let (peer, key) = (self.peer, self.key);
+                if !waits
+                    .iter()
+                    .any(|wait| wait.node_id == peer && wait.key == key)
+                {
+                    return Ok(Next::Done(true));
+                }
+                self.step = WakeStep::Satisfy;
+                let satisfy = satisfy_key_wait(self.job_id, key, self.now_ms);
+                Ok(Next::Call(IoCall::child(satisfy)))
+            }
+            WakeStep::Satisfy => {
+                result.child::<bool, JobMutationError>()?.map_err(stored)?;
+                Ok(Next::Done(true))
+            }
+        }
+    }
+}
+
+/// Key node: turns the registrations on `key` into owed wakes, in bounded pages, and arms the
+/// persisted delivery timer, so owed wakes are tried even on an idle node. The timer is armed
+/// also when queueing failed, since earlier pages may already owe wakes.
+#[derive(Debug, PartialEq)]
+pub struct RemoteWakesOperation {
+    key: BucketKeyRef,
+    failure: Option<JobMutationError>,
+    arming: bool,
+}
+
+impl RemoteWakesOperation {
+    pub fn new(key: BucketKeyRef) -> Self {
+        Self {
+            key,
+            failure: None,
+            arming: false,
+        }
+    }
+
+    fn queue_page(&self) -> Next<()> {
+        let key = self.key;
+        let build = move || QueueWakesOperation::new(key);
+        let child = boxed_retry(build, &key.key(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(child))
+    }
+}
+
+impl Operation for RemoteWakesOperation {
+    type Output = ();
+    type Error = JobMutationError;
+
+    fn first(&mut self) -> Result<Next<()>, JobMutationError> {
+        Ok(self.queue_page())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobMutationError> {
+        if self.arming {
+            if let IoResult::Event(event) = &result
+                && let Event::Task(TaskEvent::Error { message, .. }) = event.as_ref()
+            {
+                warn!(%message, "Failed to schedule key wake delivery");
+            }
+            return match self.failure.take() {
+                Some(error) => Err(error),
+                None => Ok(Next::Done(())),
+            };
+        }
+        match result.child::<bool, JobMutationError>()? {
+            Ok(true) => return Ok(self.queue_page()),
+            Ok(false) => {}
+            Err(error) => self.failure = Some(error),
+        }
+        self.arming = true;
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::DeliverKeyWakes,
+            after: Duration::ZERO,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(timer))))
+    }
 }
 
 /// Wait before owed wakes are tried again once a full round left some unacknowledged.
@@ -300,103 +525,222 @@ pub struct Delivery {
     pub next: Option<Key>,
 }
 
+impl Delivery {
+    /// The owed wakes could not be read, so a later pass starts over.
+    pub fn unread() -> Self {
+        Self {
+            acked: 0,
+            owed: true,
+            next: None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DeliverStep {
+    Owed,
+    Sent(Box<OwedWake>),
+    Dropped(JobId),
+}
+
 /// Key node: sends one page of owed wakes after `start_after` and drops each acknowledged one.
-pub async fn deliver_owed_wakes(context: &DriverContext, start_after: Option<Key>) -> Delivery {
-    let send = |wake: OwedWake| send_wake(context, wake);
-    deliver_with(context, start_after, send).await
-}
-
-async fn send_wake(context: &DriverContext, wake: OwedWake) -> bool {
-    let request = JobRequest::KeyWake {
-        auth_token: AuthToken::Internal(wake.auth),
-        job_id: wake.job_id,
-        key: wake.key,
-    };
-    matches!(
-        ask(context, wake.waiter, wake.job_id, request).await,
-        Some(JobResponse::KeyWakeAcked)
-    )
-}
-
-/// One delivery pass with `send` as the transport; true from `send` means acknowledged.
-async fn deliver_with<F, Fut>(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct DeliverWakesOperation {
     start_after: Option<Key>,
-    mut send: F,
-) -> Delivery
-where
-    F: FnMut(OwedWake) -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let resumed = start_after.is_some();
-    let (owed, next) = match drive(OwedWakesOperation::new(start_after), context).await {
-        Ok(page) => page,
-        Err(error) => {
-            warn!(%error, "Owed key wakes could not be read");
-            return Delivery {
-                acked: 0,
-                owed: true,
-                next: None,
-            };
+    serving: ServingNode,
+    resumed: bool,
+    /// Wakes of this page still to send, the next one last.
+    pending: Vec<OwedWake>,
+    next_page: Option<Key>,
+    acked: usize,
+    left: bool,
+    step: DeliverStep,
+}
+
+type DeliverNext = Result<Next<Delivery>, IoError>;
+
+impl DeliverWakesOperation {
+    pub fn new(start_after: Option<Key>, serving: ServingNode) -> Self {
+        Self {
+            resumed: start_after.is_some(),
+            start_after,
+            serving,
+            pending: Vec::new(),
+            next_page: None,
+            acked: 0,
+            left: false,
+            step: DeliverStep::Owed,
         }
-    };
-    let mut acked = 0;
-    let mut left = false;
-    for wake in owed {
-        let (waiter, job_id, key) = (wake.waiter, wake.job_id, wake.key);
-        if !send(wake).await {
-            left = true;
-            continue;
-        }
-        match drive(WaitRowOperation::acknowledge(waiter, job_id, key), context).await {
-            Ok(()) => acked += 1,
-            Err(error) => {
-                warn!(job_id = %job_id, %error, "Acknowledged wake not dropped");
-                left = true;
+    }
+
+    fn send_next(&mut self) -> DeliverNext {
+        let Some((local, realm_id)) = self.serving else {
+            self.left |= !self.pending.is_empty();
+            self.pending.clear();
+            return Ok(self.finished());
+        };
+        let Some(wake) = self.pending.pop() else {
+            return Ok(self.finished());
+        };
+        let request = JobRequest::KeyWake {
+            auth_token: AuthToken::Internal(wake.auth.clone()),
+            job_id: wake.job_id,
+            key: wake.key,
+        };
+        let route = JobRouteOperation::new(realm_id, local, wake.job_id, Some(request))
+            .with_responder(Some(wake.waiter));
+        self.step = DeliverStep::Sent(Box::new(wake));
+        Ok(Next::Call(IoCall::child(route)))
+    }
+
+    /// A pass that started mid-way must wrap around before it may report nothing owed.
+    fn finished(&mut self) -> Next<Delivery> {
+        let next = self.next_page.take();
+        Next::Done(Delivery {
+            acked: self.acked,
+            owed: self.left || self.resumed || next.is_some(),
+            next,
+        })
+    }
+}
+
+impl Operation for DeliverWakesOperation {
+    type Output = Delivery;
+    type Error = IoError;
+
+    fn first(&mut self) -> DeliverNext {
+        let owed = OwedWakesOperation::new(self.start_after.take());
+        Ok(Next::Call(IoCall::child(owed)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DeliverNext {
+        match std::mem::replace(&mut self.step, DeliverStep::Owed) {
+            DeliverStep::Owed => match result.child::<OwedPage, JobMutationError>()? {
+                Ok((mut owed, next)) => {
+                    owed.reverse();
+                    self.pending = owed;
+                    self.next_page = next;
+                    self.send_next()
+                }
+                Err(error) => {
+                    warn!(%error, "Owed key wakes could not be read");
+                    Ok(Next::Done(Delivery::unread()))
+                }
+            },
+            DeliverStep::Sent(wake) => {
+                let answer = result.child::<JobRouteOutcome, JobRouteError>()?;
+                let acked = match answer {
+                    Ok(outcome) => outcome == JobRouteOutcome::Remote(JobResponse::KeyWakeAcked),
+                    Err(error) => {
+                        let (job_id, node) = (wake.job_id, wake.waiter);
+                        warn!(job_id = %job_id, node = %node, %error, "Key wait request failed");
+                        false
+                    }
+                };
+                if !acked {
+                    self.left = true;
+                    return self.send_next();
+                }
+                self.step = DeliverStep::Dropped(wake.job_id);
+                let drop_row = WaitRowOperation::acknowledge(wake.waiter, wake.job_id, wake.key);
+                Ok(Next::Call(IoCall::child(drop_row)))
+            }
+            DeliverStep::Dropped(job_id) => {
+                match result.child::<(), JobMutationError>()? {
+                    Ok(()) => self.acked += 1,
+                    Err(error) => {
+                        warn!(job_id = %job_id, %error, "Acknowledged wake not dropped");
+                        self.left = true;
+                    }
+                }
+                self.send_next()
             }
         }
-    }
-    // A pass that started mid-way must wrap around before it may report nothing owed.
-    Delivery {
-        acked,
-        owed: left || resumed || next.is_some(),
-        next,
-    }
-}
-
-/// Arms the persisted delivery timer, so owed wakes are tried even on an idle node.
-pub(crate) async fn arm_delivery(context: &DriverContext) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    let effect = TaskEffect::ShortenTimer {
-        key: TaskKey::DeliverKeyWakes,
-        after: Duration::ZERO,
-    };
-    if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await {
-        warn!(%message, "Failed to persist the key wake timer");
-        return;
-    }
-    if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(Effect::Task(effect)).await
-    {
-        warn!(%message, "Failed to schedule key wake delivery");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::{ClaimOutcome, claim_job};
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
+    use aruna_core::structs::execution::job::JobRecord;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
+    use aruna_core::time::unix_timestamp_millis;
+    use std::future::Future;
     use ulid::Ulid;
+
+    async fn accept_wake(
+        context: &DriverContext,
+        peer: NodeId,
+        auth: &AuthContext,
+        job_id: JobId,
+        key: BucketKeyRef,
+    ) -> Result<bool, KeyCheckError> {
+        let now_ms = unix_timestamp_millis();
+        let accept = AcceptWakeOperation::new(peer, auth.user_id, job_id, key, now_ms);
+        drive(accept, context).await
+    }
+
+    async fn register_waits(
+        context: &DriverContext,
+        nodes: (NodeId, NodeId),
+        auth: &AuthContext,
+        job_id: JobId,
+        targets: &[WaitTarget],
+    ) -> Result<Vec<KeyWait>, KeyCheckError> {
+        let register = RegisterWaitsOperation::new(nodes, auth, job_id, targets);
+        drive(register, context).await
+    }
+
+    /// One delivery pass with `send` as the transport; true from `send` means acknowledged.
+    async fn deliver_with<F, Fut>(
+        context: &DriverContext,
+        start_after: Option<Key>,
+        mut send: F,
+    ) -> Delivery
+    where
+        F: FnMut(OwedWake) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let resumed = start_after.is_some();
+        let Ok((owed, next)) = drive(OwedWakesOperation::new(start_after), context).await else {
+            return Delivery::unread();
+        };
+        let (mut acked, mut left) = (0, false);
+        for wake in owed {
+            let (waiter, job_id, key) = (wake.waiter, wake.job_id, wake.key);
+            if !send(wake).await {
+                left = true;
+                continue;
+            }
+            match drive(WaitRowOperation::acknowledge(waiter, job_id, key), context).await {
+                Ok(()) => acked += 1,
+                Err(_) => left = true,
+            }
+        }
+        Delivery {
+            acked,
+            owed: left || resumed || next.is_some(),
+            next,
+        }
+    }
+
+    fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
+        AuthContext {
+            user_id: record.created_by,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
 
     #[tokio::test]
     async fn wake_requires_parked() {

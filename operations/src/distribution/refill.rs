@@ -3,22 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect, abort_effects};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, read_row, value};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, Cursor, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, account_key, refill_key,
     sample_count_key, sample_prefix,
 };
 use aruna_core::structs::storage::distribution::inventory::{Entry, Position, range_interval};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::metadata::call_results::page_rows;
 
 /// Page transactions one run retries after conflicts before it pauses.
 const MAX_CONFLICTS: usize = 16;
@@ -34,11 +36,7 @@ pub enum RefillError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("the refill stopped before it finished")]
-    Stopped,
-    #[error("refill received unexpected event: {0:?}")]
-    UnexpectedEvent(Box<Event>),
+    Io(#[from] IoError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,33 +55,82 @@ pub struct RefillConfig {
     pub max_pages: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum State {
-    Init,
-    ReadAccount,
-    ReadCursor,
-    Probe,
-    PageTxn,
-    PageCursor,
-    PageRead,
-    ReadSample,
-    ReadCount,
-    Write,
-    Delete,
-    Count,
-    Commit,
-    Abort,
-    Done,
+fn cursor_key(config: &RefillConfig) -> Key {
+    refill_key(config.set_id, config.range_id).into()
 }
 
-#[derive(Debug, PartialEq)]
-pub struct RefillOperation {
-    config: RefillConfig,
-    state: State,
-    bounds: Option<(Vec<u8>, Vec<u8>)>,
-    cursor: Cursor,
+fn read_cursor(config: &RefillConfig) -> IoCall {
+    read_row(KEY_SAMPLE_KEYSPACE, cursor_key(config))
+}
+
+fn decode_cursor(stored: Option<Value>) -> Result<Cursor, RefillError> {
+    match stored {
+        Some(stored) => Ok(postcard::from_bytes(&stored).map_err(ConversionError::from)?),
+        None => Ok(Cursor::Start),
+    }
+}
+
+/// The inventory rows one page walks.
+#[derive(Clone, Debug, PartialEq)]
+struct PageSpan {
+    start: IterStart,
+    upper: Vec<u8>,
+    /// The last row the probe saw, where the page ends unless the probe reached the range's end.
     probe_end: Option<Vec<u8>>,
     terminal: bool,
+}
+
+impl PageSpan {
+    fn read(&self, end: IterEnd, config: &RefillConfig) -> IoCall {
+        let range = StorageEffect::IterRange {
+            key_space: INVENTORY_KEYSPACE.to_string(),
+            start: self.start.clone(),
+            end,
+            limit: config.page_rows,
+            max_bytes: config.page_bytes,
+            txn_id: None,
+        };
+        IoCall::Effect(Box::new(Effect::Storage(range)))
+    }
+
+    /// The read of the page inside its transaction, bounded by what the probe saw.
+    fn page_read(&self, config: &RefillConfig) -> IoCall {
+        let end = match (&self.probe_end, self.terminal) {
+            (Some(probe_end), false) => IterEnd::Through(probe_end.clone().into()),
+            _ => IterEnd::Before(self.upper.clone().into()),
+        };
+        self.read(end, config)
+    }
+}
+
+/// How one page transaction ended.
+#[derive(Clone, Debug, PartialEq)]
+enum PageEnd {
+    /// The page committed and the pass goes on at this cursor.
+    Committed(Cursor),
+    /// Another pass moved the durable cursor; nothing was changed.
+    Stale,
+}
+
+/// What the pending call of a page reads or writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageStep {
+    Cursor,
+    Rows,
+    Sample,
+    Count,
+    Write,
+    Delete,
+    AddCount,
+}
+
+/// Merges one page of head keys into the sample and moves the cursor, in one transaction.
+#[derive(Debug, PartialEq)]
+struct RefillPageOperation {
+    config: RefillConfig,
+    cursor: Cursor,
+    span: PageSpan,
+    step: PageStep,
     /// The head keys this page found, the sample it read, and the cursor it ends at.
     candidates: Vec<SampleEntry>,
     sample: Vec<SampleEntry>,
@@ -92,86 +139,27 @@ pub struct RefillOperation {
     /// The sample read stopped before its end, so the count is not corrected yet.
     truncated: bool,
     next_cursor: Cursor,
-    txn_id: Option<TxnId>,
-    pages: usize,
-    conflicts: usize,
-    outcome: Option<Result<RefillOutcome, RefillError>>,
 }
 
-impl RefillOperation {
-    pub fn new(config: RefillConfig) -> Self {
+impl RefillPageOperation {
+    fn new(config: RefillConfig, cursor: Cursor, span: PageSpan) -> Self {
         Self {
             config,
-            state: State::Init,
-            bounds: None,
-            cursor: Cursor::Start,
-            probe_end: None,
-            terminal: false,
+            cursor,
+            span,
+            step: PageStep::Cursor,
             candidates: Vec::new(),
             sample: Vec::new(),
             deletes: Vec::new(),
             delta: 0,
             truncated: false,
             next_cursor: Cursor::Start,
-            txn_id: None,
-            pages: 0,
-            conflicts: 0,
-            outcome: None,
         }
     }
 
-    fn cursor_key(&self) -> Key {
-        refill_key(self.config.set_id, self.config.range_id).into()
-    }
-
-    fn finish(&mut self, outcome: Result<RefillOutcome, RefillError>) -> Effects {
-        self.state = State::Done;
-        self.outcome = Some(outcome);
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn read_cursor(&mut self, txn_id: Option<TxnId>) -> Effects {
-        self.state = match txn_id {
-            Some(_) => State::PageCursor,
-            None => State::ReadCursor,
-        };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-            key: self.cursor_key(),
-            txn_id,
-        })]
-    }
-
-    fn page_read(&self, txn_id: Option<TxnId>) -> Option<Effect> {
-        let (lower, upper) = self.bounds.clone()?;
-        let start = match &self.cursor {
-            Cursor::Start => IterStart::At(lower.into()),
-            Cursor::At(position) => IterStart::After(position.clone().into()),
-            Cursor::End => return None,
-        };
-        let end = match (&self.probe_end, txn_id, self.terminal) {
-            (Some(probe_end), Some(_), false) => IterEnd::Through(probe_end.clone().into()),
-            _ => IterEnd::Before(upper.into()),
-        };
-        Some(Effect::Storage(StorageEffect::IterRange {
-            key_space: INVENTORY_KEYSPACE.to_string(),
-            start,
-            end,
-            limit: self.config.page_rows,
-            max_bytes: self.config.page_bytes,
-            txn_id,
-        }))
-    }
-
-    fn probe(&mut self) -> Effects {
-        if self.pages >= self.config.max_pages {
-            return self.finish(Ok(RefillOutcome::Paused));
-        }
-        self.state = State::Probe;
-        match self.page_read(None) {
-            Some(effect) => smallvec![effect],
-            None => self.finish(Ok(RefillOutcome::Done)),
-        }
+    fn call(&mut self, step: PageStep, call: IoCall) -> Result<Next<PageEnd>, RefillError> {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
     /// Takes the head keys of the page as candidates and reads the current sample.
@@ -179,7 +167,7 @@ impl RefillOperation {
         &mut self,
         values: Vec<(Key, Value)>,
         truncated: Option<Key>,
-    ) -> Result<Effects, RefillError> {
+    ) -> Result<Next<PageEnd>, RefillError> {
         self.candidates.clear();
         for (key, _) in &values {
             let position = Position::decode(key)?;
@@ -187,25 +175,25 @@ impl RefillOperation {
                 self.candidates.push(SampleEntry::of_key(&position.key));
             }
         }
-        self.next_cursor = match (truncated, self.terminal, self.probe_end.clone()) {
+        let probe_end = self.span.probe_end.clone();
+        self.next_cursor = match (truncated, self.span.terminal, probe_end) {
             (Some(last), _, _) => Cursor::At(last.to_vec()),
             (None, false, Some(probe_end)) => Cursor::At(probe_end),
             (None, _, _) => Cursor::End,
         };
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);
-        self.state = State::ReadSample;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-            prefix: Some(sample_prefix(set_id, range_id).into()),
-            start: None,
+        let sample = IoCall::Page {
+            space: KEY_SAMPLE_KEYSPACE.to_string(),
+            prefix: sample_prefix(set_id, range_id).into(),
+            after: None,
             limit: usize::from(SAMPLE_SIZE) + self.config.page_rows + SAMPLE_SLACK,
-            txn_id: self.txn_id,
-        })])
+        };
+        self.call(PageStep::Sample, sample)
     }
 
     /// Keeps the lowest entries of the sample and the candidates, and corrects the count row
     /// to the kept size.
-    fn write(&mut self, stored: Option<Value>) -> Result<Effects, RefillError> {
+    fn write(&mut self, stored: Option<Value>) -> Result<Next<PageEnd>, RefillError> {
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);
         let current = std::mem::take(&mut self.sample);
         let mut kept: Vec<SampleEntry> = current.clone();
@@ -244,225 +232,228 @@ impl RefillOperation {
         let cursor = postcard::to_allocvec(&self.next_cursor).map_err(ConversionError::from)?;
         writes.push((
             KEY_SAMPLE_KEYSPACE.to_string(),
-            self.cursor_key(),
+            cursor_key(&self.config),
             cursor.into(),
         ));
-        self.state = State::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })])
+        self.call(PageStep::Write, IoCall::Write(writes))
     }
 
-    fn count(&mut self, txn_id: TxnId) -> Effects {
+    fn committed(&mut self) -> Next<PageEnd> {
+        Next::Done(PageEnd::Committed(std::mem::replace(
+            &mut self.next_cursor,
+            Cursor::Start,
+        )))
+    }
+
+    fn count(&mut self) -> Result<Next<PageEnd>, RefillError> {
         if self.delta == 0 {
-            self.state = State::Commit;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            return Ok(self.committed());
         }
-        self.state = State::Count;
         let delta = RangeCounters {
             sampled: std::mem::take(&mut self.delta),
             ..RangeCounters::default()
         };
         let key = sample_count_key(self.config.set_id, self.config.range_id);
-        smallvec![Effect::Storage(StorageEffect::AddCounters {
-            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+        let add = IoCall::AddCounters {
+            space: RANGE_COUNTER_KEYSPACE.to_string(),
             deltas: vec![(key.into(), delta)],
-            txn_id,
-        })]
+        };
+        self.call(PageStep::AddCount, add)
+    }
+}
+
+impl Operation for RefillPageOperation {
+    type Output = PageEnd;
+    type Error = RefillError;
+
+    fn first(&mut self) -> Result<Next<PageEnd>, RefillError> {
+        Ok(Next::Call(read_cursor(&self.config)))
     }
 
-    fn handle(&mut self, event: Event) -> Result<Effects, RefillError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<PageEnd>, RefillError> {
+        match self.step {
+            PageStep::Cursor => {
+                let stored = decode_cursor(value(result)?)?;
+                // A finished pass starts over, so its end marker still matches a fresh start.
+                let restarted = stored == Cursor::End && self.cursor == Cursor::Start;
+                if stored != self.cursor && !restarted {
+                    return Ok(Next::Done(PageEnd::Stale));
+                }
+                let read = self.span.page_read(&self.config);
+                self.call(PageStep::Rows, read)
+            }
+            PageStep::Rows => {
+                let (rows, truncated) = page_rows(result)?;
+                self.collect(rows, truncated)
+            }
+            PageStep::Sample => {
+                let (rows, more) = result.page()?;
+                // A truncated read trims what it saw and repeats the page before it counts.
+                self.truncated = more.is_some();
+                if self.truncated {
+                    self.next_cursor = self.cursor.clone();
+                }
+                self.sample = (rows.iter())
+                    .filter_map(|(key, _)| SampleEntry::decode(key))
+                    .collect();
+                let key = sample_count_key(self.config.set_id, self.config.range_id);
+                self.call(PageStep::Count, read_row(RANGE_COUNTER_KEYSPACE, key))
+            }
+            PageStep::Count => self.write(value(result)?),
+            PageStep::Write => {
+                done(result)?;
+                let deletes = std::mem::take(&mut self.deletes);
+                self.call(PageStep::Delete, IoCall::Delete(deletes))
+            }
+            PageStep::Delete => {
+                done(result)?;
+                self.count()
+            }
+            PageStep::AddCount => {
+                done(result)?;
+                Ok(self.committed())
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// What the pending call of a refill run answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    Account,
+    Cursor,
+    Probe,
+    Page,
+}
+
+/// Walks the range's head rows page by page: each page is probed outside a transaction, then
+/// merged by its own [`RefillPageOperation`].
+#[derive(Debug, PartialEq)]
+pub struct RefillOperation {
+    config: RefillConfig,
+    state: State,
+    bounds: Option<(Vec<u8>, Vec<u8>)>,
+    cursor: Cursor,
+    start: Option<IterStart>,
+    pages: usize,
+    conflicts: usize,
+}
+
+impl RefillOperation {
+    pub fn new(config: RefillConfig) -> Self {
+        Self {
+            config,
+            state: State::Account,
+            bounds: None,
+            cursor: Cursor::Start,
+            start: None,
+            pages: 0,
+            conflicts: 0,
+        }
+    }
+
+    fn call(&mut self, state: State, call: IoCall) -> Result<Next<RefillOutcome>, RefillError> {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn span(&self, probe_end: Option<Vec<u8>>, terminal: bool) -> Option<PageSpan> {
+        Some(PageSpan {
+            start: self.start.clone()?,
+            upper: self.bounds.as_ref()?.1.clone(),
+            probe_end,
+            terminal,
+        })
+    }
+
+    fn probe(&mut self) -> Result<Next<RefillOutcome>, RefillError> {
+        if self.pages >= self.config.max_pages {
+            return Ok(Next::Done(RefillOutcome::Paused));
+        }
+        let lower = self.bounds.as_ref().map(|(lower, _)| lower.clone());
+        self.start = match (&self.cursor, lower) {
+            (Cursor::Start, Some(lower)) => Some(IterStart::At(lower.into())),
+            (Cursor::At(position), Some(_)) => Some(IterStart::After(position.clone().into())),
+            (Cursor::End, _) | (_, None) => return Ok(Next::Done(RefillOutcome::Done)),
+        };
+        let Some(span) = self.span(None, true) else {
+            return Ok(Next::Done(RefillOutcome::Done));
+        };
+        let end = IterEnd::Before(span.upper.clone().into());
+        let read = span.read(end, &self.config);
+        self.call(State::Probe, read)
+    }
+
+    /// Starts over from the durable cursor, until the conflict budget runs out.
+    fn restart(&mut self) -> Result<Next<RefillOutcome>, RefillError> {
+        self.conflicts += 1;
+        if self.conflicts > MAX_CONFLICTS {
+            return Ok(Next::Done(RefillOutcome::Paused));
+        }
+        let read = read_cursor(&self.config);
+        self.call(State::Cursor, read)
+    }
+}
+
+impl Operation for RefillOperation {
+    type Output = RefillOutcome;
+    type Error = RefillError;
+
+    fn first(&mut self) -> Result<Next<RefillOutcome>, RefillError> {
+        let key = account_key(self.config.set_id, self.config.range_id);
+        Ok(Next::Call(read_row(RANGE_ACCOUNT_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RefillOutcome>, RefillError> {
         let range_id = self.config.range_id;
-        match (&self.state, event) {
-            (State::ReadAccount, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let value = value.ok_or(RefillError::RangeMissing(range_id))?;
-                let account = RangeAccount::from_bytes(&value)?;
+        match self.state {
+            State::Account => {
+                let stored = value(result)?.ok_or(RefillError::RangeMissing(range_id))?;
+                let account = RangeAccount::from_bytes(&stored)?;
                 if matches!(account.charge, Charge::Retired { .. }) {
                     return Err(RefillError::RangeRetired(range_id));
                 }
-                let set_id = self.config.set_id;
-                self.bounds = Some(range_interval(
-                    set_id,
-                    &account.lower,
-                    account.upper.as_deref(),
-                ));
-                Ok(self.read_cursor(None))
+                let upper = account.upper.as_deref();
+                let bounds = range_interval(self.config.set_id, &account.lower, upper);
+                self.bounds = Some(bounds);
+                let read = read_cursor(&self.config);
+                self.call(State::Cursor, read)
             }
-            (State::ReadCursor, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.cursor = match value {
-                    Some(value) => postcard::from_bytes(&value).map_err(ConversionError::from)?,
-                    None => Cursor::Start,
-                };
+            State::Cursor => {
+                self.cursor = decode_cursor(value(result)?)?;
                 // A finished pass starts over: the sample is refilled because it ran low.
                 if self.cursor == Cursor::End {
                     self.cursor = Cursor::Start;
                 }
-                Ok(self.probe())
+                self.probe()
             }
-            (
-                State::Probe,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                self.terminal = next_start_after.is_none();
-                self.probe_end = values.last().map(|(key, _)| key.to_vec());
-                self.state = State::PageTxn;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::StartTransaction { read: false }
-                )])
-            }
-            (State::PageTxn, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                Ok(self.read_cursor(Some(txn_id)))
-            }
-            (State::PageCursor, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let stored = match value {
-                    Some(value) => postcard::from_bytes(&value).map_err(ConversionError::from)?,
-                    None => Cursor::Start,
+            State::Probe => {
+                let (rows, more) = page_rows(result)?;
+                let probe_end = rows.last().map(|(key, _)| key.to_vec());
+                let Some(span) = self.span(probe_end, more.is_none()) else {
+                    return Ok(Next::Done(RefillOutcome::Done));
                 };
-                if stored != self.cursor && !(stored == Cursor::End && self.cursor == Cursor::Start)
-                {
-                    return Ok(self.restart());
+                let (config, cursor) = (self.config.clone(), self.cursor.clone());
+                let page = RefillPageOperation::new(config, cursor, span);
+                self.call(State::Page, IoCall::child(page))
+            }
+            State::Page => match result.child::<PageEnd, RefillError>()? {
+                Ok(PageEnd::Committed(cursor)) => {
+                    self.pages += 1;
+                    self.cursor = cursor;
+                    match self.cursor {
+                        Cursor::End => Ok(Next::Done(RefillOutcome::Done)),
+                        _ => self.probe(),
+                    }
                 }
-                self.state = State::PageRead;
-                match self.page_read(self.txn_id) {
-                    Some(effect) => Ok(smallvec![effect]),
-                    None => Ok(self.finish(Ok(RefillOutcome::Done))),
-                }
-            }
-            (
-                State::PageRead,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.collect(values, next_start_after),
-            (
-                State::ReadSample,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                // A truncated read trims what it saw and repeats the page before it counts.
-                self.truncated = next_start_after.is_some();
-                if self.truncated {
-                    self.next_cursor = self.cursor.clone();
-                }
-                self.sample = (values.iter())
-                    .filter_map(|(key, _)| SampleEntry::decode(key))
-                    .collect();
-                self.state = State::ReadCount;
-                let key = sample_count_key(self.config.set_id, range_id);
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-                    key: key.into(),
-                    txn_id: self.txn_id,
-                })])
-            }
-            (State::ReadCount, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.write(value)
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let txn_id = self.txn_id.unwrap_or_default();
-                if self.deletes.is_empty() {
-                    return Ok(self.count(txn_id));
-                }
-                self.state = State::Delete;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: std::mem::take(&mut self.deletes),
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                Ok(self.count(self.txn_id.unwrap_or_default()))
-            }
-            (State::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = State::Commit;
-                let txn_id = self.txn_id.unwrap_or_default();
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction { txn_id }
-                )])
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.pages += 1;
-                self.cursor = std::mem::replace(&mut self.next_cursor, Cursor::Start);
-                match self.cursor {
-                    Cursor::End => Ok(self.finish(Ok(RefillOutcome::Done))),
-                    _ => Ok(self.probe()),
-                }
-            }
-            (
-                State::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => {
-                self.txn_id = None;
-                Ok(self.restart())
-            }
-            (State::Abort, Event::Storage(_)) => {
-                self.txn_id = None;
-                Ok(self.read_cursor(None))
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(RefillError::UnexpectedEvent(Box::new(event))),
+                Ok(PageEnd::Stale) | Err(RefillError::Io(IoError::Conflict)) => self.restart(),
+                Err(error) => Err(error),
+            },
         }
-    }
-
-    fn restart(&mut self) -> Effects {
-        self.conflicts += 1;
-        if self.conflicts > MAX_CONFLICTS {
-            return self.finish(Ok(RefillOutcome::Paused));
-        }
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = State::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => self.read_cursor(None),
-        }
-    }
-}
-
-impl EffectOperation for RefillOperation {
-    type Output = RefillOutcome;
-    type Error = RefillError;
-
-    fn start(&mut self) -> Effects {
-        self.state = State::ReadAccount;
-        let key = account_key(self.config.set_id, self.config.range_id);
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Done {
-            return smallvec![];
-        }
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => self.finish(Err(error)),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<RefillOutcome, RefillError> {
-        self.outcome.unwrap_or(Err(RefillError::Stopped))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
     }
 }
 

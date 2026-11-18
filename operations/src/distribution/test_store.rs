@@ -17,9 +17,7 @@ use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use super::inventory::{
-    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
-};
+use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges};
 
 pub(crate) fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
@@ -243,4 +241,33 @@ pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_see
         event,
         Event::Storage(StorageEvent::BatchWriteResult { .. })
     ));
+}
+
+/// A range index feeder for tests: its passes keep their cursors, as the node's loop does.
+pub(crate) struct Feeder {
+    limits: crate::distribution::feed_walks::FeedLimits,
+    cursors: crate::distribution::feed_walks::FeedCursors,
+}
+
+impl Feeder {
+    pub(crate) fn new(limits: crate::distribution::feed_walks::FeedLimits) -> Self {
+        Self {
+            limits,
+            cursors: Default::default(),
+        }
+    }
+
+    /// One bounded pass over each walk; true when it changed an index or a row.
+    pub(crate) async fn pass(&mut self, context: &crate::driver::DriverContext) -> bool {
+        use crate::distribution::feed_walks::FeedPassOperation;
+        let cursors = std::mem::take(&mut self.cursors);
+        let pass = FeedPassOperation::new(self.limits, cursors);
+        match crate::driver::drive(pass, context).await {
+            Ok(pass) => {
+                self.cursors = pass.cursors;
+                pass.busy
+            }
+            Err(_) => false,
+        }
+    }
 }

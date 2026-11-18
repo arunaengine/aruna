@@ -4,7 +4,7 @@
 
 use super::state::{Ancestry, reduce};
 use super::{GitError, objects, publish, records};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -240,13 +240,15 @@ async fn permit(
     } else {
         object_permission_path(auth.realm_id, bucket.group_id, node, name, prefix)
     };
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
     )
     .await?;
     Ok(())

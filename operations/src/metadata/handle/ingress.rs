@@ -32,12 +32,15 @@ use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
 };
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::forward::realm::ApplyRelayOperation;
+use crate::forward::token::ApplyRevokeOperation;
+use crate::forward::transport::reject;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::local_search::search_local_buckets;
+use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::SearchBucketsInput;
 use crate::s3::object::search::SearchObjectsInput;
@@ -166,13 +169,15 @@ impl MetadataHandle {
             net_handle.node_id(),
             local_bucket,
         );
-        match authorize(
+        match drive(
+            AuthorizeOperation::new(
+                *net_handle.realm_id(),
+                &auth,
+                &path,
+                &Permission::WRITE,
+                extras,
+            ),
             context.as_ref(),
-            *net_handle.realm_id(),
-            &auth,
-            &path,
-            &Permission::WRITE,
-            extras,
         )
         .await
         {
@@ -248,13 +253,15 @@ async fn delete_mirror(
                     net_handle.node_id(),
                     local_bucket,
                 );
-                match authorize(
+                match drive(
+                    AuthorizeOperation::new(
+                        *net_handle.realm_id(),
+                        auth,
+                        &path,
+                        &Permission::WRITE,
+                        extras,
+                    ),
                     context.as_ref(),
-                    *net_handle.realm_id(),
-                    auth,
-                    &path,
-                    &Permission::WRITE,
-                    extras,
                 )
                 .await
                 {
@@ -492,9 +499,8 @@ impl MetadataHandle {
                     .await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match search_local_buckets(
-                                context.as_ref(),
-                                SearchBucketsInput {
+                            Some(net_handle) => match crate::driver::drive(
+                                LocalBucketSearch::new(SearchBucketsInput {
                                     auth,
                                     realm_id: *net_handle.realm_id(),
                                     node_id: net_handle.node_id(),
@@ -505,7 +511,8 @@ impl MetadataHandle {
                                     group_id,
                                     start_after: start_after.map(Into::into),
                                     database,
-                                },
+                                }),
+                                context.as_ref(),
                             )
                             .await
                             {
@@ -698,15 +705,15 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    let result = super::super::api::path::local_path_candidates(
-                                        context.as_ref(),
+                                    let local = super::super::api::path::LocalPathOperation::new(
                                         realm_id,
-                                        group_id,
-                                        &document_path,
-                                        auth.as_ref(),
-                                    )
-                                    .await
-                                    .map_err(crate::forward::transport::read_error);
+                                        (group_id, &document_path),
+                                        auth,
+                                        Some(net.node_id()),
+                                    );
+                                    let result = crate::driver::drive(local, context.as_ref())
+                                        .await
+                                        .map_err(crate::forward::transport::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -735,36 +742,11 @@ impl MetadataHandle {
                 config_digest,
             } => {
                 Box::pin(async {
-                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
-                        Ok(auth) => match context.net_handle.as_ref() {
-                            Some(net) => {
-                                let realm_id = *net.realm_id();
-                                if !config_digest_matches(
-                                    context.as_ref(),
-                                    realm_id,
-                                    &config_digest,
-                                )
-                                .await
-                                {
-                                    Err(MetadataReadError::Unavailable)
-                                } else {
-                                    let result = super::super::api::path::resolve_local_path(
-                                        context.as_ref(),
-                                        realm_id,
-                                        super::super::api::path_types::MetadataLookupRequest {
-                                            group_id,
-                                            document_path,
-                                            auth,
-                                        },
-                                    )
-                                    .await
-                                    .map(|result| {
-                                        Box::new(super::super::protocol::MetadataPathResolution {
-                                            winner: result.winner,
-                                            conflicts: result.conflicts,
-                                        })
-                                    })
-                                    .map_err(crate::forward::transport::read_error);
+                    let result =
+                        match self.authorize_read_peer(peer, auth_token, false).await {
+                            Ok(auth) => match context.net_handle.as_ref() {
+                                Some(net) => {
+                                    let realm_id = *net.realm_id();
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -774,14 +756,44 @@ impl MetadataHandle {
                                     {
                                         Err(MetadataReadError::Unavailable)
                                     } else {
-                                        result
+                                        let request =
+                                            super::super::api::path_types::MetadataLookupRequest {
+                                                group_id,
+                                                document_path,
+                                                auth,
+                                            };
+                                        let lookup =
+                                            super::super::api::path::LookupPathOperation::local(
+                                                realm_id,
+                                                request,
+                                                Some(net.node_id()),
+                                            );
+                                        let result = crate::driver::drive(lookup, context.as_ref())
+                                        .await
+                                    .map(|result| {
+                                        Box::new(super::super::protocol::MetadataPathResolution {
+                                            winner: result.winner,
+                                            conflicts: result.conflicts,
+                                        })
+                                    })
+                                    .map_err(crate::forward::transport::read_error);
+                                        if !config_digest_matches(
+                                            context.as_ref(),
+                                            realm_id,
+                                            &config_digest,
+                                        )
+                                        .await
+                                        {
+                                            Err(MetadataReadError::Unavailable)
+                                        } else {
+                                            result
+                                        }
                                     }
                                 }
-                            }
-                            None => Err(MetadataReadError::Unavailable),
-                        },
-                        Err(error) => Err(error),
-                    };
+                                None => Err(MetadataReadError::Unavailable),
+                            },
+                            Err(error) => Err(error),
+                        };
                     MetadataTransportMessage::ForwardedPathResolution { result }
                 })
                 .await
@@ -903,7 +915,12 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_token_revoke(context, peer, forward).await
+                    drive(
+                        ApplyRevokeOperation::new(context.node_and_realm(), peer, forward),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| reject(format!("token revocation failed: {error}")))
                 })
                 .await
             }
@@ -933,23 +950,38 @@ impl MetadataHandle {
                 MetadataTransportMessage::ForwardedPlacementPolicy { result }
             }
             forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
-                Box::pin(async {
-                    crate::users::vault_route::apply_forwarded_vault(context, peer, forward).await
-                })
-                .await
+                let apply = crate::users::vault_route::ApplyVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Forwarded vault change failed");
+                        MetadataTransportMessage::ForwardedWriteUnavailable
+                    })
             }
             MetadataTransportMessage::FetchVaultRecords { user_id, query } => {
-                Box::pin(async {
-                    crate::users::vault_route::serve_vault_fetch(context, peer, user_id, query)
-                        .await
-                })
-                .await
+                let serve = crate::users::vault_route::ServeVaultOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    user_id,
+                    query,
+                );
+                MetadataTransportMessage::FetchedVaultRecords {
+                    result: Box::pin(crate::driver::drive(serve, context.as_ref())).await,
+                }
             }
             forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
-                Box::pin(async {
-                    crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
-                })
-                .await
+                let apply = crate::placement::policy::ApplyPolicyOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| reject(error.to_string()))
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
                 Box::pin(async {
@@ -984,14 +1016,20 @@ impl MetadataHandle {
             }
             admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
                 Box::pin(async {
-                    crate::distribution::forward::serve_admission(context, peer, admit).await
+                    let serve = crate::distribution::forward::serve_admission(context, peer, admit);
+                    crate::driver::drive(serve, context)
+                        .await
+                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
             | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
                 Box::pin(async {
-                    crate::distribution::forward::serve_publish(context, peer, publish).await
+                    let serve = crate::distribution::forward::serve_publish(context, peer, publish);
+                    crate::driver::drive(serve, context)
+                        .await
+                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
@@ -1015,21 +1053,38 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_admin_relay(context, peer, forward).await
+                    drive(
+                        ApplyRelayOperation::new(context.node_and_realm(), peer, forward),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Failed to persist a relayed admin event");
+                        MetadataTransportMessage::ForwardedWriteUnavailable
+                    })
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
-                Box::pin(async {
-                    crate::groups::forward::apply_group_create(context, peer, forward).await
-                })
-                .await
+                let apply = crate::groups::forward::ApplyGroupOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| reject(format!("group create failed: {error}")))
             }
             request @ MetadataTransportMessage::GroupDeletion { .. } => {
-                Box::pin(crate::groups::deletion::apply_request(
-                    context, peer, request,
-                ))
-                .await
+                let apply = crate::groups::deletion::ApplyRequestOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    request,
+                    ulid::Ulid::generate(),
+                );
+                MetadataTransportMessage::GroupDeletionResult {
+                    result: Box::pin(crate::driver::drive(apply, context.as_ref())).await,
+                }
             }
             _ => unreachable!("request family routed incorrectly"),
         }
@@ -1170,8 +1225,8 @@ impl MetadataHandle {
                 job_id,
             } => {
                 let job = (transfer_id, job_id);
-                let spec = crate::distribution::imports::staging_spec(context, peer, job);
-                let result = spec.await.map(Box::new);
+                let spec = crate::distribution::imports::StagingSpecOperation::new(peer, job);
+                let result = crate::driver::drive(spec, context).await.map(Box::new);
                 (MetadataTransportMessage::StagingSpecResult { result }, None)
             }
             MetadataTransportMessage::ReferencePage { page } => {

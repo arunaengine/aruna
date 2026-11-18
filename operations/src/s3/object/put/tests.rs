@@ -15,8 +15,8 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, HashIndex};
 use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::structs::storage::routing::{BackendCatalog, NodeRoutingRule, RoutingTarget};
+use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
-use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use std::fs::{exists, read_to_string};
 use std::path::Path;
@@ -512,7 +512,7 @@ pub async fn test_put_object() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -797,7 +797,7 @@ pub async fn deduplicates_blob() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -965,7 +965,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
     std::fs::create_dir_all(&hot_root).unwrap();
     std::fs::create_dir_all(&cold_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
 
@@ -1264,7 +1264,7 @@ pub async fn overwrite_retains_index() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -1450,7 +1450,7 @@ async fn mismatch_cleans_blob() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(

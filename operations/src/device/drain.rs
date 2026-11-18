@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::forward::route_create::RouteCreateOperation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
-use aruna_core::task::TaskKey;
+use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_storage::storage::StorageHandle;
@@ -26,11 +27,8 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_forward_document,
 };
-use crate::metadata::forward::write::{apply_batch_routed, route_metadata_create};
+use crate::metadata::forward::write::apply_batch_routed;
 use crate::metadata::update_document::UpdateDocumentError;
-use crate::placement::process_placements::load_realm_config;
-
-use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
 
 use super::edit::{refused_edit, reject_edit};
 use super::publish_queue::{
@@ -40,6 +38,8 @@ use super::publish_queue::{
 use super::replica_store::{read_replica, store_replica};
 use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -66,57 +66,48 @@ pub async fn drain_publish_queue(context: &Arc<DriverContext>) -> DrainOutcome {
     };
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return DrainOutcome::Deferred;
     };
-
+    let mut rechecked = false;
     let now = unix_timestamp_millis();
-    drain_queue(
-        now,
-        PublishDrain {
-            context,
-            config: &config,
-            realm_id,
-            node_id,
-        },
-        1,
-    )
-    .await
-}
-
-/// One publish drain queue handed to the shared page loop.
-struct PublishDrain<'a> {
-    context: &'a Arc<DriverContext>,
-    config: &'a RealmConfigDocument,
-    realm_id: RealmId,
-    node_id: aruna_core::NodeId,
-}
-
-impl QueueDrain for PublishDrain<'_> {
-    type Entry = PublishEntry;
-
-    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<PublishEntry>, Option<Key>)> {
-        read_page(self.context, cursor).await
-    }
-
-    async fn forward(&self, entry: PublishEntry) -> ForwardOutcome {
-        let Some(claim) = claim_entry(
-            self.context,
-            self.config,
-            self.realm_id,
-            self.node_id,
-            &entry,
-        )
-        .await
-        else {
-            // A failed claim still asks for another pass: the entry may have
-            // advanced rather than the queue being empty.
-            return ForwardOutcome::Recheck;
+    let mut cursor: Option<Key> = None;
+    loop {
+        let Some((entries, next)) = read_page(context, cursor).await else {
+            return DrainOutcome::Deferred;
         };
-        let next = forward_entry(self.context, self.realm_id, self.node_id, &entry, &claim).await;
-        store_entry(self.context, &entry_with_state(&entry, next)).await;
-        ForwardOutcome::Recheck
+        for entry in entries.into_iter().filter(|entry| entry.is_due(now)) {
+            forward_due(context, &config, (realm_id, node_id), entry).await;
+            rechecked = true;
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
+    match rechecked {
+        true => DrainOutcome::Recheck,
+        false => DrainOutcome::Idle,
+    }
+}
+
+/// Claims and forwards one due entry. A failed claim still asks for another pass: the entry
+/// may have advanced rather than the queue being empty.
+async fn forward_due(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+    (realm_id, node_id): (RealmId, aruna_core::NodeId),
+    entry: PublishEntry,
+) {
+    let Some(claim) = claim_entry(context, config, realm_id, node_id, &entry).await else {
+        return;
+    };
+    let next = forward_entry(context, realm_id, node_id, &entry, &claim).await;
+    store_entry(context, &entry_with_state(&entry, next)).await;
 }
 
 /// One page of the queue and the cursor of the next one. `None` means the scan
@@ -276,28 +267,25 @@ async fn forward_entry(
             jsonld: entry.jsonld.clone(),
         },
     });
-    match route_metadata_create(operation, context.clone(), Some(token)).await {
+    match drive(
+        RouteCreateOperation::new(
+            operation,
+            context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(token),
+        ),
+        &context,
+    )
+    .await
+    {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published a queued draft");
-            track_created(
-                context,
-                document_id,
-                entry.group_id,
-                entry.document_path.clone(),
-            )
-            .await;
+            note_created(context, document_id, entry).await;
             PublishState::Published { document_id }
         }
         // The id was minted for this entry alone, so an existing document under
         // it is this entry's own earlier forward.
         Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
-            track_created(
-                context,
-                document_id,
-                entry.group_id,
-                entry.document_path.clone(),
-            )
-            .await;
+            note_created(context, document_id, entry).await;
             PublishState::Published { document_id }
         }
         Err(error) if permanent(&error) => PublishState::Failed {
@@ -308,6 +296,15 @@ async fn forward_entry(
         // An unknown outcome keeps the minted id, so the retry is the same
         // create rather than a second document.
         Err(error) => publishing_retry(document_id, attempts, error.to_string()),
+    }
+}
+
+/// Keeps a document this device created readable and editable here.
+async fn note_created(context: &Arc<DriverContext>, document_id: Ulid, entry: &PublishEntry) {
+    let path = entry.document_path.clone();
+    let tracking = track_created(document_id, entry.group_id, path);
+    if let Err(error) = drive(tracking, context).await {
+        warn!(%document_id, error = %error, "Failed to track a created document");
     }
 }
 
@@ -403,11 +400,15 @@ async fn publish_edit(
 
 /// Records that the realm has seen one of this replica's edits.
 async fn settle_edit(context: &Arc<DriverContext>, document_id: Ulid) {
-    let Some(mut replica) = read_replica(context, document_id).await else {
+    let Some(mut replica) = drive(read_replica(document_id), context)
+        .await
+        .ok()
+        .flatten()
+    else {
         return;
     };
     replica.pending_edits = replica.pending_edits.saturating_sub(1);
-    store_replica(context, &replica).await;
+    drive(store_replica(&replica), context).await.ok();
 }
 
 /// Authorization, target and payload verdicts do not improve by waiting.
@@ -478,13 +479,12 @@ pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHa
             return;
         }
     };
-    if has_entries {
-        arm_timer(
-            task_handle,
-            TaskKey::DrainDeviceIntake,
-            "Failed to restore the device publish timer",
-        )
-        .await;
+    if has_entries
+        && let TaskEvent::Error { message, .. } = task_handle
+            .schedule_idle_timer(TaskKey::DrainDeviceIntake, Duration::ZERO)
+            .await
+    {
+        warn!(%message, "Failed to restore the device publish timer");
     }
 }
 

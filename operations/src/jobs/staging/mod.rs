@@ -3,270 +3,330 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod item;
+mod job;
 mod lanes;
 mod limiter;
 mod manifest;
 mod mirrors;
+mod page;
 mod table;
 mod walk;
 
-use std::fmt::Debug;
 use std::sync::Arc;
 
-use aruna_blob::pace::{Pace, paced};
-use aruna_core::calls::IoError;
-use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobError, JobErrorKind, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint,
-    StagingJobPhase, StagingJobSpec,
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::keyspaces::{
+    STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, values};
+use aruna_core::structs::execution::job::{
+    JobId, ManifestRead, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
+};
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
+use ulid::Ulid;
 
-use self::limiter::Retried;
-use self::manifest::read_manifest_chunk;
-use self::walk::{
-    PageFailure, check_access, clear_queue, finish_failed, item_phase, record_failure, start_walk,
-    walk_page,
-};
-use super::executor::{JobContext, JobRunOutcome};
-use super::store::{put_job_rows, read_state};
-use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
-use crate::document_repository::GetConfigOperation;
-use crate::driver::drive;
-use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+pub use self::job::StagingJobOperation;
+use super::run_rows::SettledRowsOperation;
+use super::store::JobMutationError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::reference::{MaterializeReferenceInput, MaterializeReferenceOperation};
-use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
-use aruna_core::structs::checksum::ExpectedChecksum;
+
+/// Queue rows one cleanup pass deletes.
+const QUEUE_CLEANUP_PAGE: usize = 256;
+
+/// What every operation of one staging run knows about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagingRun {
+    pub spec: Arc<StagingJobSpec>,
+    pub job_id: JobId,
+    pub claim_token: Ulid,
+    pub routing: NodeRouting,
+    /// Spreads retry waits and makes the version ids this run mints distinct.
+    pub seed: u64,
+}
+
+impl StagingRun {
+    /// A version id for item `index` of this run, minted at `now_ms`.
+    fn fresh_id(&self, now_ms: u64, index: u64) -> Ulid {
+        let random = (u128::from(self.seed) << 32) | u128::from(index);
+        Ulid::from_parts(now_ms, random)
+    }
+
+    fn bucket_call(&self) -> IoCall {
+        IoCall::child(GetBucketOperation::new(self.spec.bucket.clone()))
+    }
+
+    /// The write of `checkpoint`, of the job or of lane `slot`, with the given job rows.
+    fn commit_call(
+        &self,
+        slot: Option<u64>,
+        checkpoint: &StagingJobCheckpoint,
+        mut writes: Vec<(KeySpace, Key, Value)>,
+        deletes: Vec<(KeySpace, Key)>,
+    ) -> Result<IoCall, String> {
+        let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
+        writes.push((
+            STAGING_STATE_KEYSPACE.to_string(),
+            checkpoint_key(self.job_id, slot),
+            ByteView::from(value),
+        ));
+        Ok(IoCall::child(SettledRowsOperation::new(
+            self.job_id,
+            self.claim_token,
+            writes,
+            deletes,
+        )))
+    }
+}
+
+/// The answer to [`StagingRun::commit_call`].
+fn committed(result: IoResult) -> Result<(), String> {
+    let written = result.child::<(), JobMutationError>();
+    written
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// The live destination bucket, only while it is still the one the job was submitted for.
+fn pinned(spec: &StagingJobSpec, result: IoResult) -> Result<BucketInfo, ItemFailure> {
+    let found = result.child::<BucketInfo, GetBucketError>()?;
+    let bucket_info = match found {
+        Ok(bucket_info) => bucket_info,
+        Err(GetBucketError::NotFound) => {
+            return Err(ItemFailure::Stage(
+                "destination bucket no longer exists".to_string(),
+            ));
+        }
+        Err(error) => return Err(ItemFailure::System(error.to_string())),
+    };
+    if bucket_info.identity() != spec.bucket_identity {
+        return Err(ItemFailure::Lasting(
+            "destination bucket was replaced after job submission".to_string(),
+        ));
+    }
+    Ok(bucket_info)
+}
+
+/// Reads a staging store row or page and decodes it; a failure carries its message.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct StagingStoreError(pub String);
+
+impl From<IoError> for StagingStoreError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadStep {
+    Main,
+    Lanes(Box<StagingJobCheckpoint>),
+}
+
 
 /// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
 /// started yet, as a job handed over goes on from there.
-pub async fn read_staging_checkpoint(
-    context: &crate::driver::DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ReadCheckpointOperation {
     job_id: JobId,
-) -> Result<Option<StagingJobCheckpoint>, String> {
-    let Some(main) = read_main(context, job_id).await? else {
-        return Ok(None);
-    };
-    let open = lanes::read_lanes(context, job_id).await?;
-    Ok(Some(lanes::merged(main, open)))
+    step: ReadStep,
 }
 
-async fn read_main(
-    context: &crate::driver::DriverContext,
-    job_id: JobId,
-) -> Result<Option<StagingJobCheckpoint>, String> {
-    read_state(
-        context,
-        STAGING_STATE_KEYSPACE,
+impl ReadCheckpointOperation {
+    pub fn new(job_id: JobId) -> Self {
+        Self {
+            job_id,
+            step: ReadStep::Main,
+        }
+    }
+}
+
+impl Operation for ReadCheckpointOperation {
+    type Output = Option<StagingJobCheckpoint>;
+    type Error = StagingStoreError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StagingStoreError> {
+        Ok(Next::Call(main_read(self.job_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, StagingStoreError> {
+        match std::mem::replace(&mut self.step, ReadStep::Main) {
+            ReadStep::Main => {
+                let Some(main) = decode_main(result)? else {
+                    return Ok(Next::Done(None));
+                };
+                self.step = ReadStep::Lanes(Box::new(main));
+                Ok(Next::Call(lanes::lanes_page(self.job_id)))
+            }
+            ReadStep::Lanes(main) => {
+                let (rows, _) = result.page()?;
+                let open = lanes::parse_lanes(rows).map_err(StagingStoreError)?;
+                Ok(Next::Done(Some(lanes::merged(*main, open))))
+            }
+        }
+    }
+}
+
+fn main_read(job_id: JobId) -> IoCall {
+    let row = (
+        STAGING_STATE_KEYSPACE.to_string(),
         checkpoint_key(job_id, None),
-        "staging checkpoint read",
-    )
-    .await
-}
-
-pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
-    // Every source request of a table import, adapter retries included, takes a token; a
-    // pause a source asks for ends with the job and shows in its progress.
-    match spec.table.as_ref() {
-        Some(table) => {
-            let progress = ctx.progress.clone();
-            let pace = Pace {
-                stops: vec![ctx.cancel.clone(), ctx.shutdown.clone()],
-                notice: Some(Arc::new(move |until| progress.set_pause(until))),
-                ..Pace::new(spec.connector_id, table.rate())
-            };
-            let outcome = Box::pin(paced(pace, run_job(ctx, spec))).await;
-            stopped_outcome(ctx, outcome).await
-        }
-        None => Box::pin(run_job(ctx, spec)).await,
-    }
-}
-
-/// A failure while the job was cancelled or shut down, such as a paced wait the stop ended,
-/// is that stop's outcome and spends no attempt.
-async fn stopped_outcome(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutcome {
-    if !matches!(
-        outcome,
-        JobRunOutcome::Failed(_) | JobRunOutcome::Deferred(_)
-    ) {
-        return outcome;
-    }
-    if ctx.cancel.is_cancelled() {
-        clear_queue(ctx).await;
-        return JobRunOutcome::Cancelled;
-    }
-    // A permanent failure already cleared the job's rows, so it stays terminal.
-    let permanent = matches!(
-        &outcome,
-        JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent
     );
-    match ctx.shutdown.is_cancelled() && !permanent {
-        true => JobRunOutcome::Interrupted,
-        false => outcome,
+    IoCall::Read(vec![row])
+}
+
+fn decode_main(result: IoResult) -> Result<Option<StagingJobCheckpoint>, StagingStoreError> {
+    let [row] = values::<1>(result)?;
+    row.map(|value| postcard::from_bytes(&value))
+        .transpose()
+        .map_err(|error| StagingStoreError(error.to_string()))
+}
+
+/// Stores the checkpoint a job submitted as `job_id` starts from, before it can run.
+#[derive(Debug, PartialEq)]
+pub struct SeedCheckpointOperation {
+    job_id: JobId,
+    checkpoint: StagingJobCheckpoint,
+}
+
+impl SeedCheckpointOperation {
+    pub fn new(job_id: JobId, checkpoint: StagingJobCheckpoint) -> Self {
+        Self { job_id, checkpoint }
     }
 }
 
-async fn run_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
-    if spec.strategy == StagingStrategy::Sync {
-        return permanent_error("sync is not a staging job strategy");
-    }
-    let mut checkpoint = match read_main(&ctx.driver, ctx.job_id).await {
-        Ok(Some(checkpoint)) => checkpoint,
-        Ok(None) => initial_checkpoint(spec),
-        Err(error) => return retryable_error(error),
-    };
-    if checkpoint.flat.is_none() {
-        match drive(
-            GetSourceOperation::new(GetSourceInput {
-                group_id: spec.group_id,
-                connector_id: spec.connector_id,
-            }),
-            &ctx.driver,
-        )
-        .await
-        {
-            Ok(source) => checkpoint.flat = Some(source.connector.kind.lists_flat()),
-            Err(error) => return finish_failed(ctx, permanent_error(error.to_string())).await,
-        }
-    }
-    if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
-        return retryable_error(error);
-    }
-    let mut ahead = None;
-    let mut gzip = None;
+impl Operation for SeedCheckpointOperation {
+    type Output = ();
+    type Error = StagingStoreError;
 
-    loop {
-        if ctx.cancel.is_cancelled() {
-            clear_queue(ctx).await;
-            return JobRunOutcome::Cancelled;
-        }
-        if ctx.shutdown.is_cancelled() {
-            return JobRunOutcome::Interrupted;
-        }
+    fn first(&mut self) -> Result<Next<()>, StagingStoreError> {
+        let value = postcard::to_allocvec(&self.checkpoint)
+            .map_err(|error| StagingStoreError(error.to_string()))?;
+        let row = (
+            STAGING_STATE_KEYSPACE.to_string(),
+            checkpoint_key(self.job_id, None),
+            ByteView::from(value),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
 
-        if let Some(item) = usize::try_from(checkpoint.items_done)
-            .ok()
-            .and_then(|done| spec.items.get(done))
-        {
-            checkpoint.current_path = Some(item.source_path.clone());
-            checkpoint.phase = item_phase(spec);
-            // Another coordinator of a distributed bucket imports this key with its own job.
-            let elsewhere = match imported_elsewhere(ctx, spec, &item.target_key).await {
-                Ok(elsewhere) => elsewhere,
-                Err(ItemFailure::System(message)) => return retryable_error(message),
-                // A bucket that is gone or replaced fails the item below, as for any bucket.
-                Err(_) => false,
-            };
-            let staged = match elsewhere {
-                true => Ok(None),
-                false => stage_item(ctx, spec, &item.source_path, &item.target_key, Vec::new())
-                    .await
-                    .map(Some),
-            };
-            match staged {
-                Ok(None) => {}
-                Ok(Some(size)) => {
-                    checkpoint.items_current = checkpoint.items_current.saturating_add(1);
-                    checkpoint.items_succeeded = checkpoint.items_succeeded.saturating_add(1);
-                    if spec.strategy == StagingStrategy::Snapshot {
-                        checkpoint.bytes_current = checkpoint.bytes_current.saturating_add(size);
-                    }
-                }
-                // A key whose range moved meanwhile belongs to its new coordinator's job.
-                Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                    if !moved_away(ctx, spec, &item.target_key).await {
-                        record_failure(
-                            &mut checkpoint,
-                            &item.source_path,
-                            &item.target_key,
-                            message,
-                        )
-                    }
-                }
-                Err(ItemFailure::System(message)) => return retryable_error(message),
-                Err(ItemFailure::Lasting(message)) => {
-                    return finish_failed(ctx, permanent_error(message)).await;
-                }
-            }
-            checkpoint.items_done += 1;
-            sync_progress(ctx, &checkpoint);
-            if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
-                return retryable_error(error);
-            }
-            ctx.progress.checkpoint();
-            continue;
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, StagingStoreError> {
+        done(result)?;
+        Ok(Next::Done(()))
+    }
+}
 
-        if lanes::applies(spec, &checkpoint) {
-            match lanes::run_lanes(ctx, spec, &mut checkpoint).await {
-                // Every prefix is walked, so the walk below finds nothing left.
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(PageFailure::Retry(message)) => return retryable_error(message),
-                Err(PageFailure::Conflict(message)) => return conflict_error(message),
-                Err(PageFailure::Permanent(message)) => {
-                    return finish_failed(ctx, permanent_error(message)).await;
-                }
-            }
-        }
-        if table::reads_table(&checkpoint) {
-            // Boxed, as its page import and object writes make a large future.
-            let reading = table::read_table_chunk(ctx, spec, &mut checkpoint, &mut gzip);
-            match Box::pin(reading).await {
-                Ok(()) => continue,
-                Err(PageFailure::Retry(message)) => return retryable_error(message),
-                Err(PageFailure::Conflict(message)) => return conflict_error(message),
-                Err(PageFailure::Permanent(message)) => {
-                    return finish_failed(ctx, permanent_error(message)).await;
-                }
-            }
-        }
-        if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
-            match start_walk(ctx, spec, &mut checkpoint).await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(error) => return retryable_error(error),
-            }
-        }
-        let page = match checkpoint.manifest.is_some() {
-            true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
-            false => {
-                let walking = (&mut ahead, None);
-                walk_page(ctx, spec, (None, None), &mut checkpoint, walking).await
-            }
-        };
-        if let Err(outcome) = page {
-            return match outcome {
-                PageFailure::Retry(message) => retryable_error(message),
-                PageFailure::Conflict(message) => conflict_error(message),
-                PageFailure::Permanent(message) => {
-                    finish_failed(ctx, permanent_error(message)).await
-                }
-            };
+#[derive(Debug, PartialEq)]
+enum ClearStep {
+    Page,
+    Delete,
+}
+
+/// Deletes every row of `key_space` below `prefix`, page by page.
+#[derive(Debug, PartialEq)]
+struct ClearRowsOperation {
+    key_space: KeySpace,
+    prefix: Key,
+    step: ClearStep,
+}
+
+impl ClearRowsOperation {
+    fn new(key_space: &str, prefix: Key) -> Self {
+        Self {
+            key_space: key_space.to_string(),
+            prefix,
+            step: ClearStep::Page,
         }
     }
 
-    checkpoint.phase = StagingJobPhase::Completed;
-    checkpoint.current_path = None;
-    checkpoint.items_total = Some(checkpoint.items_current);
-    if spec.strategy == StagingStrategy::Snapshot {
-        checkpoint.bytes_total = Some(checkpoint.bytes_current);
+    fn page(&mut self) -> Next<()> {
+        self.step = ClearStep::Page;
+        Next::Call(IoCall::Page {
+            space: self.key_space.clone(),
+            prefix: self.prefix.clone(),
+            after: None,
+            limit: QUEUE_CLEANUP_PAGE,
+        })
     }
-    sync_progress(ctx, &checkpoint);
-    if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
-        return retryable_error(error);
+}
+
+impl Operation for ClearRowsOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(self.page())
     }
-    clear_queue(ctx).await;
-    JobRunOutcome::Succeeded(JobResultPayload::Staging {
-        completed_items: checkpoint.items_succeeded,
-        failed_items: checkpoint.items_failed,
-    })
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match self.step {
+            ClearStep::Page => {
+                let (rows, _) = result.page()?;
+                if rows.is_empty() {
+                    return Ok(Next::Done(()));
+                }
+                self.step = ClearStep::Delete;
+                let space = &self.key_space;
+                let deletes = (rows.into_iter())
+                    .map(|(key, _)| (space.clone(), key))
+                    .collect();
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            ClearStep::Delete => {
+                done(result)?;
+                Ok(self.page())
+            }
+        }
+    }
+}
+
+/// Deletes the job's queue and manifest rows; rows a failed pass leaves stay until the next run
+/// and do not change the outcome.
+#[derive(Debug, PartialEq)]
+struct ClearQueueOperation {
+    job_id: JobId,
+    spaces: Vec<&'static str>,
+}
+
+impl ClearQueueOperation {
+    fn new(job_id: JobId) -> Self {
+        Self {
+            job_id,
+            spaces: vec![STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE],
+        }
+    }
+
+    fn clear_next(&mut self) -> Next<()> {
+        match self.spaces.pop() {
+            Some(space) => {
+                let prefix = ByteView::from(self.job_id.to_bytes().to_vec());
+                Next::Call(IoCall::child(ClearRowsOperation::new(space, prefix)))
+            }
+            None => Next::Done(()),
+        }
+    }
+}
+
+impl Operation for ClearQueueOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(self.clear_next())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if let Err(error) = result.child::<(), IoError>()? {
+            warn!(job_id = %self.job_id, error = %error, "Staging job row cleanup failed");
+        }
+        Ok(self.clear_next())
+    }
 }
 
 fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
@@ -334,224 +394,6 @@ pub(crate) fn handed_checkpoint(
     next
 }
 
-/// Stores the checkpoint a job submitted as `job_id` starts from, before it can run.
-pub(crate) async fn seed_checkpoint(
-    context: &crate::driver::DriverContext,
-    job_id: JobId,
-    checkpoint: &StagingJobCheckpoint,
-) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    let write = aruna_core::effects::StorageEffect::Write {
-        key_space: STAGING_STATE_KEYSPACE.to_string(),
-        key: checkpoint_key(job_id, None),
-        value: ByteView::from(value),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
-            ..
-        }) => Ok(()),
-        other => Err(format!("staging checkpoint not seeded: {}", other.label())),
-    }
-}
-
-pub(super) async fn stage_item(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    source_path: &str,
-    target_key: &str,
-    expected_checksums: Vec<ExpectedChecksum>,
-) -> Result<u64, ItemFailure> {
-    let expected_bucket = ensure_item_permission(ctx, spec, source_path, target_key).await?;
-    let mirrors = mirrors::item_mirrors(ctx, spec, source_path).await?;
-    let (size, version_id) = match spec.strategy {
-        StagingStrategy::Reference => drive(
-            MaterializeReferenceOperation::new(
-                MaterializeReferenceInput {
-                    group_id: spec.group_id,
-                    user_id: spec.auth_context.user_id,
-                    realm_id: spec.auth_context.realm_id,
-                    node_id: spec.node_id,
-                    connector_id: spec.connector_id,
-                    source_path: source_path.to_string(),
-                    bucket: spec.bucket.clone(),
-                    key: target_key.to_string(),
-                    expected_bucket,
-                    inherited_policies: Vec::new(),
-                    restrictions: spec.auth_context.path_restrictions.clone(),
-                    mirrors,
-                    job_id: Some(ctx.job_id.as_ulid()),
-                },
-                std::time::SystemTime::now(),
-                ulid::Ulid::generate(),
-            ),
-            &ctx.driver,
-        )
-        .await
-        .map(|result| (result.source_metadata.content_length, result.version_id))
-        .map_err(|error| ItemFailure::Stage(error.to_string()))?,
-        StagingStrategy::Snapshot => {
-            let quota_ceiling = current_quota(ctx, spec).await?;
-            stage_snapshot_blob(
-                &ctx.driver,
-                MaterializeSnapshotInput {
-                    job_id: Some(ctx.job_id.as_ulid()),
-                    group_id: spec.group_id,
-                    user_id: spec.auth_context.user_id,
-                    realm_id: spec.auth_context.realm_id,
-                    node_id: spec.node_id,
-                    connector_id: spec.connector_id,
-                    source_path: source_path.to_string(),
-                    bucket: spec.bucket.clone(),
-                    key: target_key.to_string(),
-                    quota_ceiling,
-                    retry_key: Some(ctx.job_id.to_string()),
-                    expected_bucket,
-                    restrictions: spec.auth_context.path_restrictions.clone(),
-                    expected_checksums,
-                },
-            )
-            .await
-            .map(|result| (result.location.blob_size, result.version_id))
-            .map_err(|error| ItemFailure::Stage(error.to_string()))?
-        }
-        StagingStrategy::Sync => {
-            return Err(ItemFailure::Stage(
-                "sync is not a staging job strategy".to_string(),
-            ));
-        }
-    };
-    // Without the replication seed peers never learn about the staged version, so
-    // the item is not a success.
-    if let Err(error) = drive(
-        LiveVersionOperation::new(LiveVersionInput {
-            local_node_id: spec.node_id,
-            auth_context: spec.auth_context.clone(),
-            bucket: spec.bucket.clone(),
-            key: target_key.to_string(),
-            version_id,
-            delete_marker: false,
-        }),
-        &ctx.driver,
-    )
-    .await
-    {
-        warn!(
-            bucket = %spec.bucket,
-            key = %target_key,
-            error = %error,
-            "Staging replication queue write failed"
-        );
-        return Err(ItemFailure::Stage(format!(
-            "replication queue failed: {error}"
-        )));
-    }
-    Ok(size)
-}
-
-async fn ensure_item_permission(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    source_path: &str,
-    target_key: &str,
-) -> Result<BucketInfo, ItemFailure> {
-    let bucket_info = pinned_bucket(ctx, spec).await?;
-    check_access(ctx, spec, source_path, target_key).await?;
-    Ok(bucket_info)
-}
-
-/// Whether another coordinator of the distributed destination imports `key`.
-async fn imported_elsewhere(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    key: &str,
-) -> Result<bool, ItemFailure> {
-    let bucket = pinned_bucket(ctx, spec).await?;
-    let own = walk::coordinated(ctx, &bucket, &[key])
-        .await
-        .map_err(ItemFailure::System)?;
-    Ok(own.first() == Some(&false))
-}
-
-/// Whether `key` of the distributed destination moved to another coordinator after this job
-/// took it, so a failed write of it is that coordinator's to retry.
-pub(super) async fn moved_away(ctx: &JobContext, spec: &StagingJobSpec, key: &str) -> bool {
-    matches!(imported_elsewhere(ctx, spec, key).await, Ok(true))
-}
-
-/// The live destination bucket, only while it is still the one the job was submitted for.
-pub(super) async fn pinned_bucket(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-) -> Result<BucketInfo, ItemFailure> {
-    let bucket_info = load_live_bucket(ctx, &spec.bucket).await?;
-    if bucket_info.identity() != spec.bucket_identity {
-        return Err(ItemFailure::Lasting(
-            "destination bucket was replaced after job submission".to_string(),
-        ));
-    }
-    Ok(bucket_info)
-}
-
-async fn load_live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ItemFailure> {
-    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
-            "destination bucket no longer exists".to_string(),
-        )),
-        Err(error) => Err(ItemFailure::System(error.to_string())),
-    }
-}
-
-async fn current_quota(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-) -> Result<Option<u64>, ItemFailure> {
-    drive(
-        GetConfigOperation::new(spec.auth_context.realm_id),
-        &ctx.driver,
-    )
-    .await
-    .map(|config| config.quota.effective_group_ceiling(&spec.group_id))
-    .map_err(|error| ItemFailure::System(error.to_string()))
-}
-
-pub(super) fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint) {
-    ctx.progress.set_current(checkpoint.items_current);
-    if let Some(total) = checkpoint.items_total {
-        ctx.progress.set_total(total);
-    }
-}
-
-/// Writes the checkpoint and the given job rows in one claim-guarded transaction.
-pub(super) async fn persist_rows(
-    ctx: &JobContext,
-    checkpoint: &StagingJobCheckpoint,
-    writes: Vec<(KeySpace, Key, Value)>,
-    deletes: Vec<(KeySpace, Key)>,
-) -> Result<(), String> {
-    persist_slot(ctx, None, checkpoint, writes, deletes).await
-}
-
-/// Writes the checkpoint of the job or of prefix lane `slot` with the given job rows.
-pub(super) async fn persist_slot(
-    ctx: &JobContext,
-    slot: Option<u64>,
-    checkpoint: &StagingJobCheckpoint,
-    mut writes: Vec<(KeySpace, Key, Value)>,
-    deletes: Vec<(KeySpace, Key)>,
-) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    writes.push((
-        STAGING_STATE_KEYSPACE.to_string(),
-        checkpoint_key(ctx.job_id, slot),
-        ByteView::from(value),
-    ));
-    put_job_rows(&ctx.driver, ctx.job_id, ctx.claim_token, writes, deletes)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 /// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.
 pub(crate) fn checkpoint_key(job_id: JobId, slot: Option<u64>) -> ByteView {
     let mut key = job_id.to_bytes().to_vec();
@@ -567,6 +409,8 @@ pub(super) fn queue_key(job_id: JobId, position: u64) -> Key {
     ByteView::from(key)
 }
 
+/// How one item or file failed.
+#[derive(Debug, PartialEq)]
 pub(super) enum ItemFailure {
     Denied(String),
     Stage(String),
@@ -575,51 +419,46 @@ pub(super) enum ItemFailure {
     Lasting(String),
 }
 
-fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
-    JobRunOutcome::Failed(JobError::retryable(message.into()))
-}
-
-/// Storage conflicts are transient: the job runs again later without spending an attempt.
-fn conflict_error(message: impl Into<String>) -> JobRunOutcome {
-    JobRunOutcome::Deferred(JobError::retryable(message.into()))
-}
-
-fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
-    JobRunOutcome::Failed(JobError::permanent(message.into()))
-}
-
-/// Sends a source request of a table import again after a transient answer; `transient` tells
-/// a retryable failure. Other jobs send once. A cancel or shutdown ends the waiting.
-async fn retried<I, O>(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    input: I,
-    build: fn(I) -> O,
-    transient: fn(&O::Error) -> bool,
-) -> Result<O::Output, O::Error>
-where
-    I: Clone + Debug + PartialEq + Send + 'static,
-    O: Operation + 'static,
-    O::Output: PartialEq + 'static,
-    O::Error: 'static,
-{
-    let operation = Retried::new(spec, input, build, transient);
-    if spec.table.is_none() {
-        return drive(operation, &ctx.driver).await;
+impl From<IoError> for ItemFailure {
+    fn from(error: IoError) -> Self {
+        Self::System(error.to_string())
     }
-    tokio::select! {
-        result = drive(operation, &ctx.driver) => result,
-        _ = ctx.cancel.cancelled() => Err(IoError::Aborted.into()),
-        _ = ctx.shutdown.cancelled() => Err(IoError::Aborted.into()),
+}
+
+/// How a page, chunk or lane step ended early.
+#[derive(Debug, PartialEq)]
+pub(super) enum PageFailure {
+    Retry(String),
+    Permanent(String),
+    /// Page transactions kept conflicting with other writers; the job is deferred.
+    Conflict(String),
+}
+
+impl From<IoError> for PageFailure {
+    fn from(error: IoError) -> Self {
+        Self::Retry(error.to_string())
+    }
+}
+
+impl From<ItemFailure> for PageFailure {
+    /// A system failure retries the page; any other ends the job.
+    fn from(failure: ItemFailure) -> Self {
+        match failure {
+            ItemFailure::System(message) => Self::Retry(message),
+            ItemFailure::Denied(message)
+            | ItemFailure::Stage(message)
+            | ItemFailure::Lasting(message) => Self::Permanent(message),
+        }
     }
 }
 
 #[cfg(test)]
-mod pure_tests {
+pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
     use super::*;
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
-    use ulid::Ulid;
+    use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+    use aruna_core::structs::execution::staging::StagingStrategy;
 
     pub(super) fn test_spec() -> StagingJobSpec {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
@@ -649,6 +488,58 @@ mod pure_tests {
             table: None,
             mirrors: Vec::new(),
         }
+    }
+
+    /// A run of the test spec.
+    pub(super) fn test_run() -> StagingRun {
+        StagingRun {
+            spec: Arc::new(test_spec()),
+            job_id: JobId::from_bytes([7; 16]),
+            claim_token: Ulid::from_bytes([6; 16]),
+            routing: Default::default(),
+            seed: 9,
+        }
+    }
+
+    /// The bucket the test spec was submitted for.
+    pub(super) fn test_bucket(spec: &StagingJobSpec) -> BucketInfo {
+        let (group_id, created_at, created_by) = spec.bucket_identity.clone();
+        BucketInfo {
+            group_id,
+            created_at,
+            created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    /// A connector of the test spec's group.
+    pub(super) fn test_connector() -> SourceConnector {
+        let spec = test_spec();
+        SourceConnector {
+            connector_id: spec.connector_id,
+            group_id: spec.group_id,
+            name: "source".to_string(),
+            kind: SourceConnectorKind::S3,
+            public_config: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: spec.auth_context.user_id,
+            namespace: None,
+        }
+    }
+
+    /// The answer of a child with this outcome.
+    pub(super) fn child_answer<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
     }
 
     // A handed-over job keeps a flat walk's position and restarts a prefix whose directory
@@ -765,44 +656,98 @@ mod pure_tests {
     }
 
     // A bucket recreated under the submitted name ends the job instead of receiving its files.
-    #[tokio::test]
-    async fn replaced_bucket_ends() {
-        use crate::jobs::executor::ProgressReporter;
-        use crate::tests::staging::{create_test_bucket, setup_driver_context};
-        use aruna_core::structs::execution::job::JobProgress;
-        use std::sync::Arc;
-        use tokio_util::sync::CancellationToken;
-
-        let test = setup_driver_context().await;
+    #[test]
+    fn replaced_bucket_ends() {
         let spec = test_spec();
-        let bucket = create_test_bucket(
-            &test.driver_context,
-            spec.group_id,
-            spec.auth_context.user_id,
-            &spec.bucket,
-        )
-        .await;
-        let ctx = JobContext {
-            driver: Arc::new(test.driver_context),
-            job_id: JobId::from_bytes([7; 16]),
-            owner_node_id: spec.node_id,
-            claim_token: Ulid::from_bytes([6; 16]),
-            final_attempt: false,
-            cancel: CancellationToken::new(),
-            shutdown: CancellationToken::new(),
-            progress: ProgressReporter::from_progress(&JobProgress::new("items")),
-            range_turns: Default::default(),
-            handlers: Default::default(),
-        };
-
-        let pinned = StagingJobSpec {
-            bucket_identity: bucket.identity(),
-            ..spec.clone()
-        };
-        assert!(pinned_bucket(&ctx, &pinned).await.is_ok());
+        let mut bucket = test_bucket(&spec);
+        let answer = |bucket: BucketInfo| child_answer(Ok::<_, GetBucketError>(bucket));
+        assert!(pinned(&spec, answer(bucket.clone())).is_ok());
+        bucket.group_id = Ulid::from_bytes([8; 16]);
         assert!(matches!(
-            pinned_bucket(&ctx, &spec).await,
+            pinned(&spec, answer(bucket)),
             Err(ItemFailure::Lasting(_))
         ));
+    }
+
+    // The checkpoint read adds the open lanes to the job's own counters.
+    #[test]
+    fn checkpoint_read_merges() {
+        let job_id = JobId::from_bytes([7; 16]);
+        let spec = test_spec();
+        let mut main = initial_checkpoint(&spec);
+        main.items_current = 2;
+        let mut read = ReadCheckpointOperation::new(job_id);
+        assert_eq!(read.first(), Ok(Next::Call(main_read(job_id))));
+        let value = ByteView::from(postcard::to_allocvec(&main).unwrap());
+        let Ok(Next::Call(IoCall::Page { limit, .. })) =
+            read.next(IoResult::Values(vec![Some(value)]))
+        else {
+            panic!("expected the lane page");
+        };
+        assert_eq!(limit, lanes::LANE_ROWS);
+        let mut lane = main.clone();
+        lane.items_current = 3;
+        let key = checkpoint_key(job_id, Some(0));
+        let row = (key, ByteView::from(postcard::to_allocvec(&lane).unwrap()));
+        let page = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        let Ok(Next::Done(Some(view))) = read.next(page) else {
+            panic!("expected the merged checkpoint");
+        };
+        assert_eq!(view.items_current, 5);
+    }
+
+    // A job without a checkpoint row has nothing to read further.
+    #[test]
+    fn missing_checkpoint_none() {
+        let mut read = ReadCheckpointOperation::new(JobId::from_bytes([7; 16]));
+        read.first().unwrap();
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
+    }
+
+    // The queue cleanup pages through a key space until it finds no row.
+    #[test]
+    fn clear_rows_pages() {
+        let prefix = ByteView::from(vec![1]);
+        let mut clear = ClearRowsOperation::new(STAGING_QUEUE_KEYSPACE, prefix.clone());
+        assert!(matches!(clear.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let key = ByteView::from(vec![1, 2]);
+        let rows = vec![(key.clone(), ByteView::from(vec![0]))];
+        let page = IoResult::Page { rows, next: None };
+        assert_eq!(
+            clear.next(page),
+            Ok(Next::Call(IoCall::Delete(vec![(
+                STAGING_QUEUE_KEYSPACE.to_string(),
+                key
+            )])))
+        );
+        assert!(matches!(
+            clear.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(clear.next(empty), Ok(Next::Done(())));
+    }
+
+    // A failed cleanup of one key space is logged and the other is still cleared.
+    #[test]
+    fn clear_queue_continues() {
+        let mut clear = ClearQueueOperation::new(JobId::from_bytes([7; 16]));
+        assert!(matches!(clear.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let failed = child_answer(Err::<(), _>(IoError::Aborted));
+        assert!(matches!(
+            clear.next(failed),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let cleared = child_answer(Ok::<(), IoError>(()));
+        assert_eq!(clear.next(cleared), Ok(Next::Done(())));
     }
 }

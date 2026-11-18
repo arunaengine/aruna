@@ -3,43 +3,48 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Arc, Mutex};
+use aruna_core::rows::{outside_answer, outside_call};
+use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_ORIGIN_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
+use aruna_core::NodeId;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::keyspaces::{
+    SYNC_BASE_KEYSPACE, SYNC_ORIGIN_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
+};
 use aruna_core::metadata::AuthToken;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, value};
 use aruna_core::structs::execution::offered_directory::modified_ms;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
     EntrySide, EntryState, FolderState, LocalOrigin, SyncBase, SyncPull, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder,
 };
-use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId, Value};
-use aruna_storage::storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::types::{Key, Value};
 use tracing::{info, warn};
+use ulid::Ulid;
 
-use crate::device::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
-
+use crate::device::backlog::{
+    DrainOperation, DrainQueue, ForwardOutcome, forward_member, outcome_rechecks,
+};
 use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
-use crate::device::scan_rows::ScanRowsOperation;
-use crate::driver::{DriverContext, drive};
-use crate::placement::process_placements::load_realm_config;
+use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::document_repository::{config_of, realm_config};
+use crate::driver::DriverContext;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 use super::folders::FolderError;
-use super::pull::forward_pull;
+use super::pull::{PullStep, PullWalk};
 use super::repository::{
-    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, StoreUploadOperation, SyncUpload, UploadState, base_entry,
-    base_key, folder_key, requeued, same_version,
+    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, StoreUploadError, StoreUploadOperation, SyncUpload,
+    UploadState, base_entry, base_key, folder_key, requeued, same_version,
 };
-use super::rows::{abort_txn, commit_txn, read_value, start_txn, write_rows};
 
 /// Delay before a deferred pass looks for the realm again.
 pub const UPLOAD_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -50,155 +55,341 @@ pub const UPLOAD_CONTINUE_AFTER: Duration = Duration::from_millis(250);
 /// Uploads forwarded at once. Each one holds a single realm pull and its polls.
 const UPLOADS_IN_FLIGHT: usize = 8;
 
-/// Forwards every due upload, oldest folder first.
-pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return DrainOutcome::Deferred;
-    };
-    let realm_id = *net_handle.realm_id();
-    let node_id = net_handle.node_id();
-    // A realm that limits a device's concurrent requests gets no more uploads at once.
-    let in_flight = load_realm_config(context, realm_id)
-        .await
-        .and_then(|config| config.quota.device_concurrent_pulls)
-        .map_or(UPLOADS_IN_FLIGHT, |limit| {
-            UPLOADS_IN_FLIGHT.min(limit as usize)
-        });
-    let now = unix_timestamp_millis();
-    drain_queue(
-        now,
-        UploadDrain {
-            context,
-            realm_id,
-            node_id,
-        },
-        in_flight,
-    )
-    .await
-}
-
-/// One upload drain queue handed to the shared page loop.
-struct UploadDrain<'a> {
-    context: &'a Arc<DriverContext>,
+/// The upload outbox as the page drain runs it.
+#[derive(Debug, PartialEq)]
+struct UploadQueue {
     realm_id: RealmId,
-    node_id: aruna_core::NodeId,
+    node_id: NodeId,
 }
 
-impl UploadDrain<'_> {
-    /// The pull that asks the folder's realm node for this upload's exact local version.
-    fn pull_of(&self, folder: &SyncedFolder, upload: &SyncUpload) -> Result<SyncPull, String> {
-        let source = VersionedObjectArn::new(
-            self.realm_id,
-            self.node_id,
-            folder.local_bucket.clone(),
-            upload.relative.clone(),
-            upload.local_version.unwrap_or_default(),
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(SyncPull {
-            source,
-            blake3: upload.blake3,
-            size: upload.size,
-            target_bucket: folder.remote.bucket.clone(),
-            target_key: folder.remote.remote_key(&upload.relative),
-            deleted: upload.deleted,
-        })
-    }
-
-    fn owner_token(&self, folder: &SyncedFolder) -> AuthToken {
-        AuthToken::internal(AuthContext {
-            user_id: folder.created_by,
-            realm_id: self.realm_id,
-            path_restrictions: None,
-            session: None,
-        })
-    }
-}
-
-impl QueueDrain for UploadDrain<'_> {
+impl DrainQueue for UploadQueue {
     type Entry = SyncUpload;
 
-    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<SyncUpload>, Option<Key>)> {
-        read_page(self.context, cursor).await
+    fn page(&self) -> (&'static str, usize) {
+        (SYNC_UPLOAD_KEYSPACE, SYNC_PAGE_SIZE)
     }
 
-    async fn forward(&self, upload: SyncUpload) -> ForwardOutcome {
-        let Some(folder) = load_folder(self.context, upload.folder_id).await else {
-            // The folder is unbound: this entry is nobody's work any more, and
-            // leaving it would keep the drain awake for a folder that is gone.
-            drop_upload(self.context, &upload).await;
-            return ForwardOutcome::Settled;
+    fn entry(&self, value: &Value) -> Option<SyncUpload> {
+        SyncUpload::from_bytes(value).ok()
+    }
+
+    fn forward(&self, upload: SyncUpload) -> Effect {
+        forward_member(ForwardUploadOperation::new(
+            self.realm_id,
+            self.node_id,
+            upload,
+        ))
+    }
+
+    fn rechecks(&self, outcome: ChildOutcome) -> bool {
+        outcome_rechecks::<IoError>(outcome)
+    }
+}
+
+/// Forwards every due upload, oldest folder first. A realm that limits a device's concurrent
+/// requests gets no more uploads at once.
+#[derive(Debug, PartialEq)]
+pub struct DrainOutboxOperation {
+    ids: NodeRealm,
+    draining: bool,
+}
+
+/// One pass over the upload outbox; see [`DrainOutboxOperation`].
+pub fn drain_sync_outbox(context: &DriverContext) -> DrainOutboxOperation {
+    DrainOutboxOperation {
+        ids: context.node_and_realm(),
+        draining: false,
+    }
+}
+
+impl DrainOutboxOperation {
+    fn limit(config: Option<RealmConfigDocument>) -> usize {
+        config
+            .and_then(|config| config.quota.device_concurrent_pulls)
+            .map_or(UPLOADS_IN_FLIGHT, |limit| {
+                UPLOADS_IN_FLIGHT.min(limit as usize)
+            })
+    }
+}
+
+impl Operation for DrainOutboxOperation {
+    type Output = DrainOutcome;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<DrainOutcome>, IoError> {
+        match self.ids {
+            Some((_, realm_id)) => Ok(Next::Call(realm_config(realm_id))),
+            None => Ok(Next::Done(DrainOutcome::Deferred)),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<DrainOutcome>, IoError> {
+        if self.draining {
+            return Ok(Next::Done(result.child::<DrainOutcome, IoError>()??));
+        }
+        let (node_id, realm_id) = self.ids.ok_or(IoError::Unfinished)?;
+        let limit = Self::limit(config_of(result)?);
+        let queue = UploadQueue { realm_id, node_id };
+        let drain = DrainOperation::new(queue, unix_timestamp_millis(), limit);
+        self.draining = true;
+        Ok(Next::Call(IoCall::child(drain)))
+    }
+}
+
+/// The pull that asks the folder's realm node for this upload's exact local version.
+fn pull_of(
+    (realm_id, node_id): (RealmId, NodeId),
+    folder: &SyncedFolder,
+    upload: &SyncUpload,
+) -> Result<SyncPull, String> {
+    let source = VersionedObjectArn::new(
+        realm_id,
+        node_id,
+        folder.local_bucket.clone(),
+        upload.relative.clone(),
+        upload.local_version.unwrap_or_default(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(SyncPull {
+        source,
+        blake3: upload.blake3,
+        size: upload.size,
+        target_bucket: folder.remote.bucket.clone(),
+        target_key: folder.remote.remote_key(&upload.relative),
+        deleted: upload.deleted,
+    })
+}
+
+fn owner_token(realm_id: RealmId, folder: &SyncedFolder) -> AuthToken {
+    AuthToken::internal(AuthContext {
+        user_id: folder.created_by,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    })
+}
+
+fn upload_row(upload: &SyncUpload) -> (String, Key) {
+    (
+        SYNC_UPLOAD_KEYSPACE.to_string(),
+        base_key(upload.folder_id, &upload.relative),
+    )
+}
+
+fn store_call(upload: &SyncUpload, next: UploadState) -> IoCall {
+    IoCall::child(StoreUploadOperation::new(upload.clone(), next, true))
+}
+
+fn stored(result: IoResult) -> Result<bool, IoError> {
+    Ok(result.child::<bool, StoreUploadError>()?.unwrap_or(false))
+}
+
+/// What the pending call of one forwarded upload answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadStep {
+    Folder,
+    Drop,
+    Claim,
+    Answer,
+    Progress,
+    Delay,
+    Settle,
+    Parked,
+}
+
+/// Forwards one due upload: claims it, runs the pull, and stores how the pull ended. The row
+/// follows the bytes the realm node has, so the transfer list shows them.
+#[derive(Debug, PartialEq)]
+struct ForwardUploadOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    upload: SyncUpload,
+    step: UploadStep,
+    walk: Option<PullWalk>,
+    moved: Option<UploadState>,
+}
+
+type Forwarding = Result<Next<ForwardOutcome>, IoError>;
+
+impl ForwardUploadOperation {
+    fn new(realm_id: RealmId, node_id: NodeId, upload: SyncUpload) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            upload,
+            step: UploadStep::Folder,
+            walk: None,
+            moved: None,
+        }
+    }
+
+    /// Removes the row of a folder that is gone or of a delete that stays local.
+    fn drop_row(&mut self) -> Forwarding {
+        self.step = UploadStep::Drop;
+        let delete = IoCall::Delete(vec![upload_row(&self.upload)]);
+        Ok(Next::Call(outside_call(delete)))
+    }
+
+    fn park(&mut self, reason: String) -> Forwarding {
+        let next = UploadState::Failed {
+            reason,
+            retryable: false,
+        };
+        self.step = UploadStep::Parked;
+        Ok(Next::Call(store_call(&self.upload, next)))
+    }
+
+    /// Spends one attempt and backs off, parking the row once the attempts are spent.
+    fn retry(&mut self, reason: String) -> Forwarding {
+        let attempts = self.upload.attempts().saturating_add(1);
+        let next = match exhausted(attempts, MAX_UPLOAD_ATTEMPTS) {
+            true => UploadState::Failed {
+                reason,
+                retryable: true,
+            },
+            false => UploadState::Pending {
+                due_at_ms: retry_due_ms(attempts),
+                attempts,
+                last_error: Some(reason),
+            },
+        };
+        self.step = UploadStep::Parked;
+        Ok(Next::Call(store_call(&self.upload, next)))
+    }
+
+    fn foldered(&mut self, folder: Option<SyncedFolder>) -> Forwarding {
+        // The folder is unbound: this entry is nobody's work any more, and leaving it would
+        // keep the drain awake for a folder that is gone.
+        let Some(folder) = folder else {
+            return self.drop_row();
         };
         // An unbinding folder publishes nothing more; its entries are going.
         if folder.state == FolderState::Deleting {
-            return ForwardOutcome::Settled;
+            return Ok(Next::Done(ForwardOutcome::Settled));
         }
         // A deletion the owner stopped propagating stays local; the next pass reports it.
-        if upload.deleted && !folder.propagate_deletes {
-            drop_upload(self.context, &upload).await;
-            return ForwardOutcome::Settled;
+        if self.upload.deleted && !folder.propagate_deletes {
+            return self.drop_row();
         }
-        let pull = match self.pull_of(&folder, &upload) {
+        let ids = (self.realm_id, self.node_id);
+        let pull = match pull_of(ids, &folder, &self.upload) {
             Ok(pull) => pull,
-            Err(reason) => {
-                park(self.context, &upload, reason, false).await;
-                return ForwardOutcome::Recheck;
-            }
+            Err(reason) => return self.park(reason),
         };
-        let Some(claimed) = claim_upload(self.context, &upload).await else {
-            return ForwardOutcome::Settled;
+        let token = owner_token(self.realm_id, &folder);
+        self.walk = Some(PullWalk::new(folder.remote.node_id, token, pull));
+        // The running state goes in only while the row still carries what the scan read, so a
+        // concurrent unbind or a newer version wins instead of coming back.
+        let claimed = UploadState::Transferring {
+            attempts: self.upload.attempts(),
+            bytes_done: 0,
         };
-        // The row follows the bytes the realm node has, so the transfer list shows them.
-        let current = Mutex::new(claimed);
-        let progress = |bytes_done| record_progress(self.context, &current, bytes_done);
-        let node_id = folder.remote.node_id;
-        let auth_token = self.owner_token(&folder);
-        let result = forward_pull(self.context, node_id, auth_token, pull, progress).await;
-        let current = current
-            .into_inner()
-            .unwrap_or_else(|error| error.into_inner());
-        match result {
-            Ok(ack) => settle_upload(self.context, &current, &ack).await,
-            Err(refusal) if permanent(&refusal) => {
-                park(self.context, &current, format!("{refusal:?}"), false).await;
-            }
-            Err(refusal) => retry(self.context, &current, format!("{refusal:?}")).await,
+        self.moved = Some(claimed.clone());
+        self.step = UploadStep::Claim;
+        Ok(Next::Call(store_call(&self.upload, claimed)))
+    }
+
+    fn walk(&mut self) -> Result<&mut PullWalk, IoError> {
+        self.walk.as_mut().ok_or(IoError::Unfinished)
+    }
+
+    /// Keeps a state the row now holds as the one later writes are guarded by.
+    fn state_kept(&mut self, kept: bool) {
+        if let (true, Some(state)) = (kept, self.moved.take()) {
+            self.upload.state = state;
         }
-        ForwardOutcome::Recheck
+    }
+
+    fn follow(&mut self, step: PullStep) -> Forwarding {
+        match step {
+            PullStep::Ask(call) => {
+                self.step = UploadStep::Answer;
+                Ok(Next::Call(call))
+            }
+            PullStep::Moved(bytes_done) => {
+                let next = UploadState::Transferring {
+                    attempts: self.upload.attempts(),
+                    bytes_done,
+                };
+                self.moved = Some(next.clone());
+                self.step = UploadStep::Progress;
+                Ok(Next::Call(store_call(&self.upload, next)))
+            }
+            PullStep::Wait(delay) => {
+                self.step = UploadStep::Delay;
+                Ok(Next::Call(IoCall::Delay(delay)))
+            }
+            PullStep::Ended(Ok(ack)) => {
+                self.step = UploadStep::Settle;
+                let settle = SettleUploadOperation::new(self.upload.clone(), ack);
+                Ok(Next::Call(IoCall::child(settle)))
+            }
+            PullStep::Ended(Err(refusal)) if permanent(&refusal) => {
+                self.park(format!("{refusal:?}"))
+            }
+            PullStep::Ended(Err(refusal)) => self.retry(format!("{refusal:?}")),
+        }
     }
 }
 
-/// Stores the bytes a running pull has received, while the row is still the one claimed.
-async fn record_progress(context: &Arc<DriverContext>, current: &Mutex<SyncUpload>, bytes: u64) {
-    let row = current
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    let next = UploadState::Transferring {
-        attempts: row.attempts(),
-        bytes_done: bytes,
-    };
-    if store_state(context, &row, next.clone(), true).await {
-        current
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .state = next;
-    }
-}
+impl Operation for ForwardUploadOperation {
+    type Output = ForwardOutcome;
+    type Error = IoError;
 
-/// Removes one upload row whose folder no longer exists.
-async fn drop_upload(context: &Arc<DriverContext>, upload: &SyncUpload) {
-    if !super::rows::delete_rows(
-        context,
-        vec![(
-            SYNC_UPLOAD_KEYSPACE.to_string(),
-            base_key(upload.folder_id, &upload.relative),
-        )],
-        None,
-    )
-    .await
-    {
-        warn!(relative = %upload.relative, "Failed to drop an orphaned upload row");
+    fn first(&mut self) -> Forwarding {
+        let key = folder_key(self.upload.folder_id).to_vec();
+        let read = read_row(SYNCED_FOLDER_KEYSPACE, key);
+        Ok(Next::Call(outside_call(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Forwarding {
+        let recheck = Ok(Next::Done(ForwardOutcome::Recheck));
+        match self.step {
+            UploadStep::Folder => {
+                let stored = outside_answer(result).and_then(|read| read.value());
+                let folder =
+                    (stored.ok().flatten()).and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
+                self.foldered(folder)
+            }
+            UploadStep::Drop => {
+                if outside_answer(result).is_err() {
+                    let relative = &self.upload.relative;
+                    warn!(%relative, "Failed to drop an orphaned upload row");
+                }
+                Ok(Next::Done(ForwardOutcome::Settled))
+            }
+            UploadStep::Claim => {
+                let claimed = stored(result)?;
+                if !claimed {
+                    return Ok(Next::Done(ForwardOutcome::Settled));
+                }
+                self.state_kept(true);
+                let step = self.walk()?.request();
+                self.follow(step)
+            }
+            UploadStep::Answer => {
+                let step = self.walk()?.answered(result)?;
+                self.follow(step)
+            }
+            UploadStep::Progress => {
+                let kept = stored(result)?;
+                self.state_kept(kept);
+                let step = self.walk()?.wait();
+                self.follow(step)
+            }
+            UploadStep::Delay => {
+                let step = self.walk()?.poll();
+                self.follow(step)
+            }
+            UploadStep::Settle => {
+                result.child::<(), IoError>()?.ok();
+                recheck
+            }
+            UploadStep::Parked => {
+                stored(result)?;
+                recheck
+            }
+        }
     }
 }
 
@@ -214,51 +405,99 @@ fn permanent(refusal: &SyncRefusal) -> bool {
     )
 }
 
-/// Records the realm version as the entry's new base and drops the outbox row in
-/// one transaction, so an acknowledged pull is never forwarded twice; a row the
-/// owner must still answer keeps its reported state.
-async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &SyncPullAck) {
-    let current = read_value(
-        context,
-        SYNC_BASE_KEYSPACE,
-        base_key(upload.folder_id, &upload.relative),
-        None,
-    )
-    .await
-    .and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
-    let base = settled_base(upload, ack, current);
-    let Ok(row) = base_entry(upload.folder_id, &upload.relative, &base) else {
-        warn!(relative = %upload.relative, "Failed to encode a synced base");
-        return;
-    };
-    let mut rows: Vec<_> = origin_row(upload, ack).into_iter().collect();
-    let Some(txn_id) = start_txn(context).await else {
-        return;
-    };
-    let stored = stored_upload(context, upload, txn_id).await;
-    // Without a row this answer repeats a settled one, and a newer base may already stand.
-    if stored.is_some() {
-        rows.push(row);
+/// Records the realm version as the entry's new base and drops the outbox row in one
+/// transaction, so an acknowledged pull is never forwarded twice; a row the owner must still
+/// answer keeps its reported state.
+#[derive(Debug, PartialEq)]
+struct SettleUploadOperation {
+    upload: SyncUpload,
+    ack: SyncPullAck,
+    step: SettleStep,
+    holds: bool,
+}
+
+/// What the pending call of a settle answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettleStep {
+    Rows,
+    Write,
+    Delete,
+}
+
+impl SettleUploadOperation {
+    fn new(upload: SyncUpload, ack: SyncPullAck) -> Self {
+        Self {
+            upload,
+            ack,
+            step: SettleStep::Rows,
+            holds: false,
+        }
     }
-    // A pass may have queued a newer version of the file meanwhile; that row is still owed.
-    let holds = stored.is_some_and(|stored| same_version(&stored, upload));
-    let settled = write_rows(context, rows, Some(txn_id)).await
-        && (!holds
-            || super::rows::delete_rows(
-                context,
-                vec![(
-                    SYNC_UPLOAD_KEYSPACE.to_string(),
-                    base_key(upload.folder_id, &upload.relative),
-                )],
-                Some(txn_id),
-            )
-            .await);
-    if !settled {
-        abort_txn(context, txn_id).await;
-        return;
+
+    fn base_key(&self) -> Key {
+        base_key(self.upload.folder_id, &self.upload.relative)
     }
-    if commit_txn(context, txn_id).await {
-        info!(relative = %upload.relative, version = %ack.version_id, "Published a synced file");
+
+    fn committed(&self) -> Next<()> {
+        let (relative, version) = (&self.upload.relative, self.ack.version_id);
+        info!(%relative, %version, "Published a synced file");
+        Next::Done(())
+    }
+}
+
+impl Operation for SettleUploadOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Read(vec![
+            (SYNC_BASE_KEYSPACE.to_string(), self.base_key()),
+            upload_row(&self.upload),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match self.step {
+            SettleStep::Rows => {
+                let mut rows = result.values()?.into_iter();
+                let current =
+                    (rows.next().flatten()).and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
+                let held =
+                    (rows.next().flatten()).and_then(|bytes| SyncUpload::from_bytes(&bytes).ok());
+                let base = settled_base(&self.upload, &self.ack, current);
+                let (folder_id, relative) = (self.upload.folder_id, &self.upload.relative);
+                let row = base_entry(folder_id, relative, &base).map_err(|_| {
+                    warn!(%relative, "Failed to encode a synced base");
+                    IoError::Codec("the synced base does not encode".to_string())
+                })?;
+                let mut writes: Vec<_> = origin_row(&self.upload, &self.ack).into_iter().collect();
+                // Without a row this answer repeats a settled one, and a newer base may
+                // already stand.
+                if held.is_some() {
+                    writes.push(row);
+                }
+                // A pass may have queued a newer version of the file; that row is still owed.
+                self.holds = held.is_some_and(|held| same_version(&held, &self.upload));
+                self.step = SettleStep::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            SettleStep::Write => {
+                result.done()?;
+                if !self.holds {
+                    return Ok(self.committed());
+                }
+                self.step = SettleStep::Delete;
+                Ok(Next::Call(IoCall::Delete(vec![upload_row(&self.upload)])))
+            }
+            SettleStep::Delete => {
+                result.done()?;
+                Ok(self.committed())
+            }
+        }
     }
 }
 
@@ -278,24 +517,30 @@ fn origin_row(upload: &SyncUpload, ack: &SyncPullAck) -> Option<(String, Key, Va
     Some((SYNC_ORIGIN_KEYSPACE.to_string(), key, bytes.into()))
 }
 
-/// The local file this device published as realm version `version_id`, if it did.
-pub async fn local_origin(
-    context: &Arc<DriverContext>,
-    version_id: ulid::Ulid,
-) -> Result<Option<LocalOrigin>, FolderError> {
-    let read = StorageEffect::Read {
-        key_space: SYNC_ORIGIN_KEYSPACE.to_string(),
-        key: version_id.to_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => LocalOrigin::from_bytes(&bytes)
-            .map(Some)
-            .map_err(|_| FolderError::Unavailable),
-        _ => Err(FolderError::Unavailable),
+/// The local file this device published as a realm version, if it did.
+#[derive(Debug, PartialEq)]
+pub struct LocalOriginOperation {
+    version_id: Ulid,
+}
+
+/// The read of a version's local origin; see [`LocalOriginOperation`].
+pub fn local_origin(version_id: Ulid) -> LocalOriginOperation {
+    LocalOriginOperation { version_id }
+}
+
+impl Operation for LocalOriginOperation {
+    type Output = Option<LocalOrigin>;
+    type Error = FolderError;
+
+    fn first(&mut self) -> Result<Next<Option<LocalOrigin>>, FolderError> {
+        let key = self.version_id.to_bytes().to_vec();
+        Ok(Next::Call(read_row(SYNC_ORIGIN_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<LocalOrigin>>, FolderError> {
+        let origin = value(result)?.map(|bytes| LocalOrigin::from_bytes(&bytes));
+        let origin = origin.transpose().map_err(|_| FolderError::Unavailable)?;
+        Ok(Next::Done(origin))
     }
 }
 
@@ -353,165 +598,62 @@ fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase
     }
 }
 
-/// Stores the running state only while the row still carries the state the scan read, so a
-/// concurrent unbind or a newer version wins instead of coming back.
-async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload) -> Option<SyncUpload> {
-    let claimed = SyncUpload {
-        state: UploadState::Transferring {
-            attempts: upload.attempts(),
-            bytes_done: 0,
-        },
-        ..upload.clone()
-    };
-    store_state(context, upload, claimed.state.clone(), true)
-        .await
-        .then_some(claimed)
-}
-
-/// Spends one attempt and backs off, parking the row once the attempts are spent.
-async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String) {
-    let attempts = upload.attempts().saturating_add(1);
-    let next = match exhausted(attempts, MAX_UPLOAD_ATTEMPTS) {
-        true => UploadState::Failed {
-            reason,
-            retryable: true,
-        },
-        false => UploadState::Pending {
-            due_at_ms: retry_due_ms(attempts),
-            attempts,
-            last_error: Some(reason),
-        },
-    };
-    store_state(context, upload, next, true).await;
-}
-
-async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String, retryable: bool) {
-    store_state(
-        context,
-        upload,
-        UploadState::Failed { reason, retryable },
-        true,
-    )
-    .await;
-}
-
 /// Makes every backed-off upload due now and re-arms retryable failures, for an explicit
 /// owner-requested sync. A running pull keeps its polls.
-pub(crate) async fn requeue_uploads(context: &Arc<DriverContext>, now_ms: u64) {
-    let scan = ScanRowsOperation::new(SYNC_UPLOAD_KEYSPACE, None, SYNC_PAGE_SIZE);
-    let rows = match drive(scan, context).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            warn!(error = %error, "Failed to scan the folder uploads");
-            return;
+#[derive(Debug, PartialEq)]
+pub(crate) struct RequeueUploadsOperation {
+    now_ms: u64,
+    scanned: bool,
+    uploads: VecDeque<SyncUpload>,
+}
+
+impl RequeueUploadsOperation {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            scanned: false,
+            uploads: VecDeque::new(),
         }
-    };
-    for upload in rows
-        .iter()
-        .filter_map(|bytes| SyncUpload::from_bytes(bytes).ok())
-    {
-        if let Some(state) = requeued(&upload.state, now_ms) {
-            store_state(context, &upload, state, true).await;
+    }
+
+    fn next_upload(&mut self) -> Result<Next<()>, IoError> {
+        while let Some(upload) = self.uploads.pop_front() {
+            if let Some(state) = requeued(&upload.state, self.now_ms) {
+                return Ok(Next::Call(store_call(&upload, state)));
+            }
         }
+        Ok(Next::Done(()))
     }
 }
 
-/// Writes one upload row under a new state; see [`StoreUploadOperation`].
-async fn store_state(
-    context: &Arc<DriverContext>,
-    upload: &SyncUpload,
-    next: UploadState,
-    guarded: bool,
-) -> bool {
-    let store = StoreUploadOperation::new(upload.clone(), next, guarded);
-    drive(store, context).await.unwrap_or(false)
-}
+impl Operation for RequeueUploadsOperation {
+    type Output = ();
+    type Error = IoError;
 
-async fn stored_upload(
-    context: &Arc<DriverContext>,
-    upload: &SyncUpload,
-    txn_id: TxnId,
-) -> Option<SyncUpload> {
-    read_value(
-        context,
-        SYNC_UPLOAD_KEYSPACE,
-        base_key(upload.folder_id, &upload.relative),
-        Some(txn_id),
-    )
-    .await
-    .and_then(|bytes| SyncUpload::from_bytes(&bytes).ok())
-}
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let scan = ScanRowsOperation::new(SYNC_UPLOAD_KEYSPACE, None, SYNC_PAGE_SIZE);
+        Ok(Next::Call(IoCall::child(scan)))
+    }
 
-async fn read_page(
-    context: &Arc<DriverContext>,
-    cursor: Option<Key>,
-) -> Option<(Vec<SyncUpload>, Option<Key>)> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: SYNC_UPLOAD_KEYSPACE.to_string(),
-            prefix: None,
-            start: cursor.map(IterStart::After),
-            limit: SYNC_PAGE_SIZE,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Some((
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| SyncUpload::from_bytes(&bytes).ok())
-                .collect(),
-            next_start_after,
-        )),
-        other => {
-            warn!(event = ?other, "Failed to scan the synced-folder upload outbox");
-            None
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.scanned {
+            stored(result)?;
+            return self.next_upload();
+        }
+        self.scanned = true;
+        match result.child::<Vec<Value>, ScanRowsError>()? {
+            Ok(rows) => {
+                self.uploads = (rows.iter())
+                    .filter_map(|bytes| SyncUpload::from_bytes(bytes).ok())
+                    .collect();
+                self.next_upload()
+            }
+            Err(error) => {
+                warn!(%error, "Failed to scan the folder uploads");
+                Ok(Next::Done(()))
+            }
         }
     }
-}
-
-async fn load_folder(context: &Arc<DriverContext>, folder_id: ulid::Ulid) -> Option<SyncedFolder> {
-    read_value(
-        context,
-        aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE,
-        folder_key(folder_id),
-        None,
-    )
-    .await
-    .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok())
-}
-
-/// Re-arms the drain when the outbox still holds rows.
-pub async fn restore_upload_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    if !has_rows(storage, SYNC_UPLOAD_KEYSPACE).await {
-        return;
-    }
-    arm_timer(
-        task_handle,
-        TaskKey::DrainUploadOutbox,
-        "Failed to restore the synced-folder upload timer",
-    )
-    .await;
-}
-
-/// Whether a keyspace holds at least one row.
-pub(crate) async fn has_rows(storage: &StorageHandle, key_space: &str) -> bool {
-    matches!(
-        storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1,
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty()
-    )
 }
 
 #[cfg(test)]
@@ -523,16 +665,14 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        ForwardOutcome, QueueDrain, SyncPullAck, SyncUpload, UploadDrain, UploadState,
-        claim_upload, drain_sync_outbox, settle_upload,
+        ForwardOutcome, ForwardUploadOperation, SettleUploadOperation, StoreUploadOperation,
+        SyncPullAck, SyncUpload, UploadState, drain_sync_outbox,
     };
     use crate::device::drain::DrainOutcome;
-    use crate::device::sync::folders::store_folder;
     use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
-    use crate::device::sync::rows::{read_value, write_rows};
-    use crate::driver::DriverContext;
-    use crate::tests::device::context;
+    use crate::driver::{DriverContext, drive};
+    use crate::tests::device::{context, read_value, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
@@ -583,12 +723,28 @@ mod tests {
         }
     }
 
-    fn drain(context: &Arc<DriverContext>) -> UploadDrain<'_> {
-        UploadDrain {
-            context,
-            realm_id: RealmId::from_bytes([1u8; 32]),
-            node_id: node_id(),
-        }
+    async fn forward(context: &Arc<DriverContext>, entry: SyncUpload) -> ForwardOutcome {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let forward = ForwardUploadOperation::new(realm_id, node_id(), entry);
+        drive(forward, context).await.unwrap()
+    }
+
+    async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload) -> Option<SyncUpload> {
+        let state = UploadState::Transferring {
+            attempts: upload.attempts(),
+            bytes_done: 0,
+        };
+        let claim = StoreUploadOperation::new(upload.clone(), state.clone(), true);
+        let claimed = SyncUpload {
+            state,
+            ..upload.clone()
+        };
+        drive(claim, context).await.unwrap().then_some(claimed)
+    }
+
+    async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &SyncPullAck) {
+        let settle = SettleUploadOperation::new(upload.clone(), ack.clone());
+        drive(settle, context).await.unwrap();
     }
 
     async fn store(context: &Arc<DriverContext>, upload: &SyncUpload) {
@@ -611,7 +767,10 @@ mod tests {
     async fn defers_without_realm() {
         let (_tempdir, context) = context().await;
         let context = Arc::new(context);
-        assert_eq!(drain_sync_outbox(&context).await, DrainOutcome::Deferred);
+        assert_eq!(
+            drive(drain_sync_outbox(&context), &context).await,
+            Ok(DrainOutcome::Deferred)
+        );
     }
 
     #[tokio::test]
@@ -624,7 +783,7 @@ mod tests {
         store(&context, &entry).await;
 
         assert_eq!(
-            drain(&context).forward(entry.clone()).await,
+            forward(&context, entry.clone()).await,
             ForwardOutcome::Settled
         );
         assert!(
@@ -651,7 +810,7 @@ mod tests {
         store(&context, &entry).await;
 
         assert_eq!(
-            drain(&context).forward(entry.clone()).await,
+            forward(&context, entry.clone()).await,
             ForwardOutcome::Recheck
         );
         assert!(matches!(
@@ -674,7 +833,7 @@ mod tests {
         store(&context, &entry).await;
 
         assert_eq!(
-            drain(&context).forward(entry.clone()).await,
+            forward(&context, entry.clone()).await,
             ForwardOutcome::Settled
         );
         assert!(
@@ -708,10 +867,7 @@ mod tests {
         };
         store(&context, &newer).await;
 
-        assert_eq!(
-            drain(&context).forward(entry).await,
-            ForwardOutcome::Settled
-        );
+        assert_eq!(forward(&context, entry).await, ForwardOutcome::Settled);
         assert_eq!(stored(&context, &newer).await.state, newer.state);
     }
 

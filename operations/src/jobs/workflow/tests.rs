@@ -14,7 +14,7 @@ use crate::jobs::store::attempt::{
 };
 use crate::jobs::store::query::insert_job;
 use crate::jobs::store::state::{ClaimOutcome, claim_job, handoff_external_attempt};
-use crate::jobs::workflow::workspace::mint_workspace_credential;
+use crate::jobs::workflow::prepare::workspace_mint;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
@@ -326,15 +326,8 @@ async fn denied_write_blocks() {
         "a run never creates the bucket it names"
     );
 
-    let Err(error) = Box::pin(mint_workspace_credential(
-        &context,
-        &spec,
-        &record,
-        node_id(7),
-        (&bucket, None),
-    ))
-    .await
-    else {
+    let mint = workspace_mint(&context, &spec, &record, node_id(7), (&bucket, None));
+    let Err(error) = Box::pin(drive(mint, &context)).await else {
         panic!("workspace credential mint unexpectedly succeeded");
     };
     assert_eq!(error.kind, JobErrorKind::Permanent);
@@ -943,11 +936,16 @@ async fn session_end_succeeds() {
     assert!(stored.report_digest.is_some());
     assert_eq!(session.finished().await, EndReason::Ended);
     assert!(registry.sessions().get(&job_id.to_string()).is_none());
+    let query = crate::jobs::job_reports::ReportQuery {
+        expected_digest: None,
+        last_key: None,
+        limit: 10,
+    };
     let report =
-        crate::jobs::service::read_owned_report(&ctx, stored.created_by, job_id, None, None, 10)
+        crate::jobs::job_reads::tests::read_owned_report(&ctx, stored.created_by, job_id, query)
             .await
             .unwrap();
-    let crate::jobs::service::JobReportLookup::Ready { rows, .. } = report else {
+    let crate::jobs::job_reports::JobReportLookup::Ready { rows, .. } = report else {
         panic!("ended session report must be readable");
     };
     assert_eq!(rows.len(), 1);

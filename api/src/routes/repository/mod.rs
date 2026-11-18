@@ -117,24 +117,26 @@ pub async fn search_records(
     .await?;
     let kind = links::connector_kind(&state, query.group_id, query.connector_id).await?;
     links::ensure_capable(kind, Action::Search)?;
-    aruna_operations::jobs::repository::search(
+    let context = state.get_ctx();
+    let search = aruna_operations::jobs::repository::invenio::query::SearchRecordsOperation::new(
         kind,
-        &state.get_ctx(),
-        &auth,
-        &query,
+        aruna_operations::jobs::repository::NodeScope::of(&context),
+        auth.clone(),
+        query,
         state.rocrate_limits().metadata_bytes,
-    )
-    .await
-    .map(Json)
-    .map_err(|error| match error {
-        aruna_operations::jobs::repository::TransferError::Permanent(message) => {
-            ServerError::BadRequestReason(message)
-        }
-        error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
-            ServerError::BadRequestReason(error.to_string())
-        }
-        _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
-    })
+    );
+    aruna_operations::driver::drive(search, context.as_ref())
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            aruna_operations::jobs::repository::TransferError::Permanent(message) => {
+                ServerError::BadRequestReason(message)
+            }
+            error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
+        })
 }
 
 /// Names the record by exactly one of record_id, doi or url.
@@ -270,7 +272,8 @@ pub async fn import_record(
     auth: UnrestrictedAuth,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
+    use aruna_operations::jobs::repository::invenio::query::ResolveRecordOperation;
+    use aruna_operations::jobs::repository::{NodeScope, RecordReference, TransferError};
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -299,23 +302,25 @@ pub async fn import_record(
             let kind = links::connector_kind(&state, group_id, connector_id).await?;
             links::ensure_capable(kind, Action::Import)?;
             links::ensure_capable(kind, Action::Search)?;
-            resolve(
+            let context = state.get_ctx();
+            let resolve = ResolveRecordOperation::new(
                 kind,
-                &state.get_ctx(),
-                &caller,
+                NodeScope::of(&context),
+                caller,
                 group_id,
                 connector_id,
-                &reference,
+                reference,
                 state.rocrate_limits().metadata_bytes,
-            )
-            .await
-            .map_err(|error| match error {
-                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
-                error @ TransferError::Refused(_) => {
-                    ServerError::BadRequestReason(error.to_string())
-                }
-                _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
-            })?
+            );
+            aruna_operations::driver::drive(resolve, context.as_ref())
+                .await
+                .map_err(|error| match error {
+                    TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                    error @ TransferError::Refused(_) => {
+                        ServerError::BadRequestReason(error.to_string())
+                    }
+                    _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
+                })?
         }
     };
     super::rocrate_import::submit_import(

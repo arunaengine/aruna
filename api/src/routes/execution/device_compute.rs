@@ -16,13 +16,13 @@ use aruna_core::UserId;
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
-use aruna_operations::device::compute::{
-    BackendState, ComputeStatus, LocalExecutionError, LocalRunsOperation, status_of,
-};
 use aruna_operations::device::publish_run::{
     PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::local_run::{
+    BackendState, ComputeStatus, LocalExecutionError, LocalRunsOperation, status_of,
+};
 
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};

@@ -7,20 +7,21 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::errors::{ConversionError, SourceResolutionError};
+use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::SOURCE_ROOT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, checked_key, decode_key};
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::connectors::ResolveBindingInput;
-use crate::connectors::resolver::resolve_binding_effect;
+use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 
 /// Root rows one pass reads; a set has few roots, so one page is typical.
 const ROOT_PAGE: usize = 256;
@@ -45,42 +46,25 @@ pub enum RootsOutcome {
 #[derive(Debug, Error, PartialEq)]
 pub enum RootsError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event while checking source roots in state {state}: {received}")]
-    UnexpectedEvent {
-        state: &'static str,
-        received: &'static str,
-    },
+    #[error("unexpected answer while checking source roots: {0}")]
+    UnexpectedEvent(&'static str),
     #[error("checking source roots did not finish")]
     NotFinished,
 }
 
+/// What the pending call of a pass answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    Init,
     Page,
     Resolve,
     Check,
     Mark,
-    Finish,
-    Error,
 }
 
-impl State {
-    fn name(self) -> &'static str {
-        match self {
-            State::Init => "init",
-            State::Page => "page",
-            State::Resolve => "resolve",
-            State::Check => "check",
-            State::Mark => "mark",
-            State::Finish => "finish",
-            State::Error => "error",
-        }
-    }
-}
+type RootsNext = Result<Next<RootsOutcome>, RootsError>;
 
 /// What the walk does once the running probe ends.
 #[derive(Debug, PartialEq)]
@@ -110,7 +94,6 @@ pub struct RootsCheckOperation {
     all_checked: bool,
     probing: Option<([u8; 32], RootEntry)>,
     then: Option<Resume>,
-    output: Option<Result<RootsOutcome, RootsError>>,
 }
 
 impl RootsCheckOperation {
@@ -124,7 +107,7 @@ impl RootsCheckOperation {
             resume: after.clone(),
             after,
             clean,
-            state: State::Init,
+            state: State::Page,
             rows: VecDeque::new(),
             full: false,
             unchecked: None,
@@ -132,21 +115,11 @@ impl RootsCheckOperation {
             all_checked: true,
             probing: None,
             then: None,
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<RootsOutcome, RootsError>) -> Effects {
-        self.state = match output {
-            Ok(_) => State::Finish,
-            Err(_) => State::Error,
-        };
-        self.output = Some(output);
-        smallvec![]
-    }
-
     /// Walks the page rows until a probe starts or the page ends.
-    fn walk(&mut self) -> Effects {
+    fn walk(&mut self) -> RootsNext {
         while let Some((key, value)) = self.rows.pop_front() {
             let Some((digest, checked)) = decode_key(&key) else {
                 self.previous = Some(key.to_vec());
@@ -157,14 +130,12 @@ impl RootsCheckOperation {
                 (true, open) => self.unchecked = open,
                 (false, open) => {
                     if let Some(open) = open
-                        && let Some(effects) =
+                        && let Some(probe) =
                             self.probe(open, Resume::Row(key.clone(), value.clone(), digest))
                     {
-                        return effects;
+                        return Ok(Next::Call(probe));
                     }
-                    if let Err(error) = self.record(&key, &value, digest) {
-                        return self.finish(Err(error));
-                    }
+                    self.record(&key, &value, digest)?;
                     continue;
                 }
             }
@@ -182,7 +153,12 @@ impl RootsCheckOperation {
         Ok(())
     }
 
-    fn end(&mut self) -> Effects {
+    fn finished(&self) -> RootsNext {
+        let checked = self.clean && self.all_checked;
+        Ok(Next::Done(RootsOutcome::Done(checked)))
+    }
+
+    fn end(&mut self) -> RootsNext {
         if self.full {
             let next = match self.unchecked.take() {
                 Some(_) => self.resume.take(),
@@ -192,19 +168,18 @@ impl RootsCheckOperation {
                 after: next.unwrap_or_default(),
                 clean: self.clean && self.all_checked,
             };
-            return self.finish(Ok(RootsOutcome::Continue(sweep)));
+            return Ok(Next::Done(RootsOutcome::Continue(sweep)));
         }
         if let Some(open) = self.unchecked.take()
-            && let Some(effects) = self.probe(open, Resume::End)
+            && let Some(probe) = self.probe(open, Resume::End)
         {
-            return effects;
+            return Ok(Next::Call(probe));
         }
-        let checked = self.clean && self.all_checked;
-        self.finish(Ok(RootsOutcome::Done(checked)))
+        self.finished()
     }
 
     /// Starts probing one unchecked root while the pass has probes left; `None` when it has not.
-    fn probe(&mut self, (digest, entry): ([u8; 32], RootEntry), then: Resume) -> Option<Effects> {
+    fn probe(&mut self, (digest, entry): ([u8; 32], RootEntry), then: Resume) -> Option<IoCall> {
         if self.probes >= MAX_PROBES {
             self.all_checked = false;
             return None;
@@ -217,11 +192,11 @@ impl RootsCheckOperation {
         self.probing = Some((digest, entry));
         self.then = Some(then);
         self.state = State::Resolve;
-        Some(smallvec![resolve_binding_effect(input)])
+        Some(IoCall::child(ResolveBindingOperation::new(input)))
     }
 
     /// Ends the running probe; a failed one leaves its root unchecked for this sweep.
-    fn probed(&mut self, failure: Option<String>) -> Effects {
+    fn probed(&mut self, failure: Option<String>) -> RootsNext {
         if let (Some(reason), Some((digest, entry))) = (failure, self.probing.as_ref()) {
             warn!(
                 set_id = %self.set_id,
@@ -234,91 +209,68 @@ impl RootsCheckOperation {
         }
         self.probing = None;
         match self.then.take() {
-            Some(Resume::Row(key, value, digest)) => match self.record(&key, &value, digest) {
-                Ok(()) => self.walk(),
-                Err(error) => self.finish(Err(error)),
-            },
-            Some(Resume::End) | None => {
-                let checked = self.clean && self.all_checked;
-                self.finish(Ok(RootsOutcome::Done(checked)))
+            Some(Resume::Row(key, value, digest)) => {
+                self.record(&key, &value, digest)?;
+                self.walk()
             }
+            Some(Resume::End) | None => self.finished(),
         }
-    }
-
-    fn unexpected(&mut self, event: &Event) -> Effects {
-        let state = self.state.name();
-        self.finish(Err(RootsError::UnexpectedEvent {
-            state,
-            received: event.label(),
-        }))
     }
 }
 
-impl EffectOperation for RootsCheckOperation {
+impl Operation for RootsCheckOperation {
     type Output = RootsOutcome;
     type Error = RootsError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: SOURCE_ROOT_KEYSPACE.to_string(),
-            prefix: Some(self.set_id.to_bytes().to_vec().into()),
-            start: self.after.clone().map(|key| IterStart::After(key.into())),
+    fn first(&mut self) -> RootsNext {
+        Ok(Next::Call(IoCall::Page {
+            space: SOURCE_ROOT_KEYSPACE.to_string(),
+            prefix: self.set_id.to_bytes().to_vec().into(),
+            after: self.after.clone().map(Key::from),
             limit: ROOT_PAGE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (State::Page, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.full = values.len() == ROOT_PAGE;
-                self.rows = values.into();
+    fn next(&mut self, result: IoResult) -> RootsNext {
+        match self.state {
+            State::Page => {
+                let (rows, _) = result.page()?;
+                self.full = rows.len() == ROOT_PAGE;
+                self.rows = rows.into();
                 self.walk()
             }
-            (
-                State::Resolve,
-                Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
-            ) => match result {
-                Ok(access) => {
-                    self.state = State::Check;
-                    smallvec![Effect::StagingSource(StagingSourceEffect::Check { access })]
+            State::Resolve => {
+                match result.child::<ResolvedSourceAccess, SourceResolutionError>()? {
+                    Ok(access) => {
+                        self.state = State::Check;
+                        let check = StagingSourceEffect::Check { access };
+                        let check = Effect::StagingSource(check);
+                        Ok(Next::Call(IoCall::Effect(Box::new(check))))
+                    }
+                    Err(error) => self.probed(Some(error.to_string())),
                 }
-                Err(error) => self.probed(Some(error.to_string())),
+            }
+            State::Check => match result.event()? {
+                Event::StagingSource(StagingSourceEvent::CheckResult) => {
+                    let (digest, _) = self.probing.as_ref().ok_or(RootsError::NotFinished)?;
+                    let row = (
+                        SOURCE_ROOT_KEYSPACE.to_string(),
+                        checked_key(self.set_id, digest).into(),
+                        Vec::new().into(),
+                    );
+                    self.state = State::Mark;
+                    Ok(Next::Call(IoCall::Write(vec![row])))
+                }
+                Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                    self.probed(Some(error.to_string()))
+                }
+                other => Err(RootsError::UnexpectedEvent(other.label())),
             },
-            (State::Check, Event::StagingSource(StagingSourceEvent::CheckResult)) => {
-                let Some((digest, _)) = self.probing.as_ref() else {
-                    return self.finish(Err(RootsError::NotFinished));
-                };
-                self.state = State::Mark;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: SOURCE_ROOT_KEYSPACE.to_string(),
-                    key: checked_key(self.set_id, digest).into(),
-                    value: Vec::new().into(),
-                    txn_id: None,
-                })]
+            State::Mark => {
+                done(result)?;
+                self.probed(None)
             }
-            (State::Check, Event::StagingSource(StagingSourceEvent::Error { error })) => {
-                self.probed(Some(error.to_string()))
-            }
-            (State::Mark, Event::Storage(StorageEvent::WriteResult { .. })) => self.probed(None),
-            (State::Page | State::Mark, Event::Storage(StorageEvent::Error { error })) => {
-                self.finish(Err(error.into()))
-            }
-            (_, event) => self.unexpected(&event),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RootsError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -327,11 +279,10 @@ mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
     use crate::driver::{DriverContext, drive};
-    use aruna_core::errors::{SourceResolutionError, StagingSourceError};
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
-    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::errors::{StagingSourceError, StorageError};
+    use aruna_core::events::StorageEvent;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::distribution::source_root::{SourceRoot, root_key};
     use std::collections::BTreeMap;
@@ -432,41 +383,32 @@ mod tests {
     const SET: Ulid = Ulid::from_bytes([7; 16]);
     const GROUP: Ulid = Ulid::from_bytes([8; 16]);
 
-    fn page_read(after: Option<Vec<u8>>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: SOURCE_ROOT_KEYSPACE.to_string(),
-            prefix: Some(SET.to_bytes().to_vec().into()),
-            start: after.map(|key| IterStart::After(key.into())),
+    fn page_read(after: Option<Vec<u8>>) -> Next<RootsOutcome> {
+        Next::Call(IoCall::Page {
+            space: SOURCE_ROOT_KEYSPACE.to_string(),
+            prefix: SET.to_bytes().to_vec().into(),
+            after: after.map(Key::from),
             limit: ROOT_PAGE,
-            txn_id: None,
         })
     }
 
-    fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: (values.into_iter())
+    fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> IoResult {
+        IoResult::Page {
+            rows: (values.into_iter())
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
-            next_start_after: None,
-        })
+            next: None,
+        }
     }
 
-    fn unchecked_row(name: &str) -> ((Vec<u8>, Vec<u8>), RootEntry, [u8; 32]) {
+    fn unchecked_row(name: &str) -> ((Vec<u8>, Vec<u8>), [u8; 32]) {
         let root = entry(name);
         let digest = root.root.digest().unwrap();
-        let row = (root_key(SET, &digest), root.to_bytes().unwrap());
-        (row, root, digest)
+        ((root_key(SET, &digest), root.to_bytes().unwrap()), digest)
     }
 
-    fn resolve(root: &RootEntry) -> Effect {
-        resolve_binding_effect(ResolveBindingInput {
-            source: root.probe(),
-            group_id: Some(GROUP),
-        })
-    }
-
-    fn resolved(result: Result<ResolvedSourceAccess, SourceResolutionError>) -> Event {
-        Event::SubOperation(SubOperationEvent::VersionAccessResolved { result })
+    fn resolved(result: Result<ResolvedSourceAccess, SourceResolutionError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
     fn access() -> ResolvedSourceAccess {
@@ -478,68 +420,59 @@ mod tests {
         }
     }
 
-    fn mark(digest: &[u8; 32]) -> Effect {
-        Effect::Storage(StorageEffect::Write {
-            key_space: SOURCE_ROOT_KEYSPACE.to_string(),
-            key: checked_key(SET, digest).into(),
-            value: Vec::new().into(),
-            txn_id: None,
-        })
+    fn staged(event: StagingSourceEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::StagingSource(event)))
+    }
+
+    fn probing(row: (Vec<u8>, Vec<u8>)) -> RootsCheckOperation {
+        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
+        operation.first().unwrap();
+        let child = operation.next(rows(vec![row]));
+        assert!(matches!(child, Ok(Next::Call(IoCall::Child(_)))));
+        operation
     }
 
     // A readable root is resolved, checked and marked, and the short page ends the sweep.
     #[test]
     fn probes_unchecked_root() {
-        let (row, root, digest) = unchecked_row("one");
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        check_trace(
-            &mut operation,
-            &[page_read(None)],
-            vec![
-                (rows(vec![row]), vec![resolve(&root)]),
-                (
-                    resolved(Ok(access())),
-                    vec![Effect::StagingSource(StagingSourceEffect::Check {
-                        access: access(),
-                    })],
-                ),
-                (
-                    Event::StagingSource(StagingSourceEvent::CheckResult),
-                    vec![mark(&digest)],
-                ),
-                (
-                    Event::Storage(StorageEvent::WriteResult {
-                        key: checked_key(SET, &digest).into(),
-                    }),
-                    Vec::new(),
-                ),
-            ],
+        let (row, digest) = unchecked_row("one");
+        assert_eq!(
+            RootsCheckOperation::new(SET, GROUP, None).first(),
+            Ok(page_read(None))
         );
-        assert_eq!(operation.finalize(), Ok(RootsOutcome::Done(true)));
+        let mut operation = probing(row);
+        let check = StagingSourceEffect::Check { access: access() };
+        let check = IoCall::Effect(Box::new(Effect::StagingSource(check)));
+        assert_eq!(operation.next(resolved(Ok(access()))), Ok(Next::Call(check)));
+        let mark = (
+            SOURCE_ROOT_KEYSPACE.to_string(),
+            checked_key(SET, &digest).into(),
+            Vec::new().into(),
+        );
+        assert_eq!(
+            operation.next(staged(StagingSourceEvent::CheckResult)),
+            Ok(Next::Call(IoCall::Write(vec![mark])))
+        );
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Done(RootsOutcome::Done(true)))
+        );
     }
 
     // A root that does not resolve or check stays unchecked, and the sweep reports it.
     #[test]
     fn failed_probe_waits() {
-        let (row, _, _) = unchecked_row("one");
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        operation.start();
-        operation.step(rows(vec![row.clone()]));
-        let effects = operation.step(resolved(Err(SourceResolutionError::ResolveFailed)));
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Ok(RootsOutcome::Done(false)));
+        let (row, _) = unchecked_row("one");
+        let unchecked = Ok(Next::Done(RootsOutcome::Done(false)));
+        let mut operation = probing(row.clone());
+        let failed = resolved(Err(SourceResolutionError::ResolveFailed));
+        assert_eq!(operation.next(failed), unchecked);
 
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        operation.start();
-        operation.step(rows(vec![row]));
-        operation.step(resolved(Ok(access())));
+        let mut operation = probing(row);
+        operation.next(resolved(Ok(access()))).unwrap();
         let error = StagingSourceError::AccessDenied;
-        assert!(
-            operation
-                .step(Event::StagingSource(StagingSourceEvent::Error { error }))
-                .is_empty()
-        );
-        assert_eq!(operation.finalize(), Ok(RootsOutcome::Done(false)));
+        let denied = staged(StagingSourceEvent::Error { error });
+        assert_eq!(operation.next(denied), unchecked);
     }
 
     // A full page continues the sweep after its last row; a dirty sweep stays dirty.
@@ -554,77 +487,29 @@ mod tests {
             clean: false,
         };
         let mut operation = RootsCheckOperation::new(SET, GROUP, Some(sweep));
-        check_trace(
-            &mut operation,
-            &[page_read(Some(vec![1]))],
-            vec![(rows(checked), Vec::new())],
-        );
+        assert_eq!(operation.first(), Ok(page_read(Some(vec![1]))));
         let next = Sweep {
             after: last,
             clean: false,
         };
-        assert_eq!(operation.finalize(), Ok(RootsOutcome::Continue(next)));
-    }
-
-    // Failed reads and writes end the pass with their error.
-    #[test]
-    fn storage_errors_fail() {
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        operation.start();
-        operation.step(error());
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-
-        let (row, _, _) = unchecked_row("one");
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        operation.start();
-        operation.step(rows(vec![row]));
-        operation.step(resolved(Ok(access())));
-        operation.step(Event::StagingSource(StagingSourceEvent::CheckResult));
-        operation.step(error());
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-    }
-
-    // Events outside each phase are refused; abort has nothing to clean up.
-    #[test]
-    fn rejects_unexpected() {
-        let make = || RootsCheckOperation::new(SET, GROUP, None);
         assert_eq!(
-            rejects_events(make, sample_events, |_| false).len(),
-            sample_events().len()
+            operation.next(rows(checked)),
+            Ok(Next::Done(RootsOutcome::Continue(next)))
         );
-        let started = || {
-            let mut operation = make();
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(started, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert_eq!(refused.len(), sample_events().len() - 2);
-        let (row, _, _) = unchecked_row("one");
-        let probing = || {
-            let mut operation = started();
-            operation.step(rows(vec![row.clone()]));
-            operation
-        };
-        let refused = rejects_events(probing, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        assert!(probing().abort().is_empty());
     }
 
+    // The runner's storage failures end the pass; a wrong answer to a check does too.
     #[test]
-    fn rejects_early_finalize() {
-        rejects_finalize(RootsCheckOperation::new(SET, GROUP, None));
-        let mut operation = RootsCheckOperation::new(SET, GROUP, None);
-        operation.start();
-        rejects_finalize(operation);
+    fn failures_fail() {
+        let failure = RootsError::from(IoError::Storage(StorageError::Timeout));
+        assert_eq!(failure, RootsError::Io(IoError::Storage(StorageError::Timeout)));
+        let (row, _) = unchecked_row("one");
+        let mut operation = probing(row);
+        operation.next(resolved(Ok(access()))).unwrap();
+        let other = IoResult::Event(Box::new(Event::Search()));
+        assert_eq!(
+            operation.next(other),
+            Err(RootsError::UnexpectedEvent("Event::Search"))
+        );
     }
 }

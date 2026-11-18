@@ -9,9 +9,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::auth::bearer_token::{ArunaValidationState, decode_bearer_token};
-use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
 use axum::Extension;
@@ -444,7 +443,7 @@ pub(crate) async fn bearer_auth(
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
-    decode_bearer_token(state, token).await.map_err(Into::into)
+    state.decode_token(token).await.map_err(Into::into)
 }
 
 /// Fully verified claims of a token that may already be revoked, so revoking it
@@ -453,53 +452,7 @@ pub(crate) async fn claims_for_revocation(
     state: &ServerState,
     token: &str,
 ) -> Result<TokenClaims, TokenError> {
-    decode_bearer_token(&RevocationBlindState(state), token)
-        .await
-        .map_err(Into::into)
-}
-
-/// Reports every token as unrevoked; every other check stays the server's.
-struct RevocationBlindState<'a>(&'a ServerState);
-
-#[async_trait::async_trait]
-impl ArunaValidationState for RevocationBlindState<'_> {
-    async fn is_token_revoked(
-        &self,
-        _realm_id: &aruna_core::structs::identity::realm::RealmId,
-        _token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        Ok(false)
-    }
-
-    async fn user_cutoff(
-        &self,
-        _realm_id: &aruna_core::structs::identity::realm::RealmId,
-        _user_id: &aruna_core::UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    async fn is_trusted_realm(
-        &self,
-        realm_id: &aruna_core::structs::identity::realm::RealmId,
-    ) -> bool {
-        self.0.is_trusted_realm(realm_id).await
-    }
-
-    async fn linked_owner(
-        &self,
-        realm_id: &aruna_core::structs::identity::realm::RealmId,
-        via: &aruna_core::UserId,
-    ) -> Result<Option<aruna_core::UserId>, ArunaBearerError> {
-        self.0.linked_owner(realm_id, via).await
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        self.0.issuer_decoding_key(issuer_pubkey).await
-    }
+    state.decode_revoked(token).await.map_err(Into::into)
 }
 
 pub async fn auth_middleware(
@@ -715,13 +668,15 @@ pub(crate) async fn ensure_permission_with(
 ) -> ServerResult<()> {
     aruna_core::telemetry::time_stage(
         "permission",
-        aruna_operations::auth::request_authorization::authorize(
+        drive(
+            AuthorizeOperation::new(
+                state.get_realm_id(),
+                auth,
+                &path,
+                &required_permission,
+                extras,
+            ),
             &state.get_ctx(),
-            state.get_realm_id(),
-            auth,
-            &path,
-            &required_permission,
-            extras,
         ),
     )
     .await

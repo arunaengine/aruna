@@ -5,8 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::document::DocumentEffect;
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
@@ -24,21 +23,19 @@ use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::inbound::initialize_net_holder;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
 };
-use aruna_operations::notifications::dispatch::{
-    NotificationDispatchError, list_for_user, mark_for_user, unread_for_user,
-};
+use aruna_operations::notifications::dispatch::NotificationDispatchError;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::settings::{Delivery, DeliveryOperation};
 use aruna_operations::notifications::webhook::{
-    WebhookOutcome, read_webhook, remove_webhook, set_webhook,
+    ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookOutcome,
 };
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
@@ -50,6 +47,7 @@ use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{realm_config_for, user_with_holder};
+use crate::user_calls::{list_for_user, mark_for_user, unread_for_user};
 
 const LIST_LIMIT: u32 = LIST_MAX_LIMIT as u32;
 
@@ -595,12 +593,7 @@ async fn install_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }
@@ -706,13 +699,9 @@ impl SettingRealm {
 
     /// Pulls the realm settings topic on node `index` from node `from`.
     async fn pull(&self, index: usize, from: usize) {
-        let effect = DocumentEffect::SyncDocument {
-            topic: self.topic(),
-            peers: vec![self.id(from)],
-        };
-        let net = &self.nodes[index].net;
-        net.send_effect(Effect::Net(NetEffect::DocumentSync(effect)))
-            .await;
+        let peers = vec![self.id(from)];
+        let _ =
+            aruna_operations::testing::sync_topic(self.context(index), self.topic(), peers).await;
     }
 
     /// Pulls on node `index` from every node in `from` until its setting satisfies `done`.
@@ -730,7 +719,7 @@ impl SettingRealm {
             for source in from {
                 self.pull(index, *source).await;
             }
-            read_webhook(self.context(index), owner)
+            drive(ReadWebhookOperation::new(owner), self.context(index))
                 .await
                 .is_ok_and(&done)
         })
@@ -758,8 +747,9 @@ impl SettingRealm {
     }
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {
-        let set = set_webhook(self.context(index), self.id(index), owner, url.to_string());
-        Ok(set.await?)
+        let now_ms = unix_timestamp_millis();
+        let set = SetWebhookOperation::new(owner, self.id(index), url.to_string(), now_ms);
+        Ok(drive(set, self.context(index)).await?)
     }
 
     async fn shutdown(self) {
@@ -821,7 +811,8 @@ async fn opt_out_wins() -> TestResult<()> {
     realm
         .sync_until(1, &[3], owner, |current| current == on)
         .await?;
-    remove_webhook(realm.context(1), realm.id(1), owner).await?;
+    let remove = RemoveWebhookOperation::new(owner, realm.id(1), unix_timestamp_millis());
+    drive(remove, realm.context(1)).await?;
     for index in [0, 2, 3] {
         realm
             .sync_until(index, &[1, 3], owner, |current| current.is_none())

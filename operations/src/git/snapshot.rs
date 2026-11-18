@@ -2,19 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::revision_read::RawDisplayOperation;
 use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::distribution::resolve::version_holders;
-use crate::driver::DriverContext;
+use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
+use tokio::time::Instant;
+use crate::driver::{DriverContext, drive_until};
 use crate::driver::drive;
 use crate::metadata::materialization_queue::capture_pending;
 use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::GetObjectInput;
@@ -84,7 +86,7 @@ pub(super) async fn current(
     }
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
-        None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
+        None => drive(RawDisplayOperation::new(document.document_id), context)
             .await
             .map_err(|_| GitError::Unavailable)?
             .map(|view| view.revision),
@@ -138,13 +140,15 @@ async fn resolve(
             &exact.bucket,
             &exact.key,
         );
-        authorize(
+        drive(
+            AuthorizeOperation::new(
+                exact.realm_id,
+                auth,
+                &path,
+                &Permission::READ,
+                PolicyRequestExtras::rest(),
+            ),
             context,
-            exact.realm_id,
-            auth,
-            &path,
-            &Permission::READ,
-            PolicyRequestExtras::rest(),
         )
         .await
         .map_err(|_| GitError::NotFound)?;
@@ -177,7 +181,7 @@ async fn resolve(
             known_refs: Vec::new(),
             range: None,
         };
-        match managed_read(context, exact.node_id, request).await {
+        match drive(ManagedReadOperation::new(exact.node_id, request), context).await {
             Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None, None),
             _ => return Err(GitError::NotFound),
         }
@@ -277,7 +281,10 @@ async fn located(
                     .extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
             }
             _ => {
-                if let Some(resolved) = version_holders(context, *version_id).await {
+                let deadline = Instant::now() + RESOLVE_BUDGET;
+                let resolve = resolve_version(context, *version_id, deadline);
+                let holders = version_found(drive_until(resolve, context, deadline).await);
+                if let Some(resolved) = holders {
                     found.extend(resolved.holders.iter().take(4).filter_map(|holder| {
                         let (bucket, key) = (&resolved.bucket, &resolved.key);
                         VersionedObjectArn::new(realm_id, *holder, bucket, key, *version_id).ok()

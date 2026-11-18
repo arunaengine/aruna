@@ -7,6 +7,7 @@ use crate::auth::{
     ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::job_service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
 use crate::lookup::bucket_info;
 use crate::routes::execution::jobs::map_submit_error;
@@ -30,13 +31,12 @@ use aruna_core::structs::execution::table::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::ReadRoute;
-use aruna_operations::auth::request_authorization::permission_rules;
+use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
-use aruna_operations::jobs::staging::read_staging_checkpoint;
+use aruna_operations::jobs::staging::ReadCheckpointOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::object::list::{
@@ -1030,9 +1030,12 @@ pub async fn list_staging_jobs(
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut jobs = Vec::with_capacity(records.len());
     for record in records {
-        let checkpoint = read_staging_checkpoint(&state.get_ctx(), record.job_id)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?;
+        let checkpoint = drive(
+            ReadCheckpointOperation::new(record.job_id),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
     }
     Ok((
@@ -1201,7 +1204,7 @@ pub async fn list_references(
     );
     ensure_permission(&state, &auth, bucket_path.clone(), Permission::READ).await?;
     // Denies and path restrictions below the bucket hide single keys from the page.
-    let rules = permission_rules(&state.get_ctx(), &auth, &bucket_path)
+    let rules = drive(rules_operation(&auth, &bucket_path), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
 
@@ -1216,7 +1219,7 @@ pub async fn list_references(
         None => true,
         Some(binding) => {
             let reach = prefix.as_deref().unwrap_or_default();
-            let route = route_read(state.get_ctx().as_ref(), binding, reach, true).await;
+            let route = drive(route_read(binding, reach, true), state.get_ctx().as_ref()).await;
             matches!(route, Ok(ReadRoute::Local { catching_up: false }))
         }
     };
@@ -1530,24 +1533,27 @@ async fn snapshot_blob(
 
     let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
 
-    let result = stage_snapshot_blob(
+    let result = drive(
+        stage_snapshot_blob(
+            &state.get_ctx(),
+            MaterializeSnapshotInput {
+                job_id: None,
+                group_id,
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+                node_id: state.get_node_id(),
+                connector_id,
+                source_path: request.source_path,
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                quota_ceiling,
+                retry_key: None,
+                expected_bucket: bucket_info,
+                restrictions: auth.path_restrictions.clone(),
+                expected_checksums: Vec::new(),
+            },
+        ),
         &state.get_ctx(),
-        MaterializeSnapshotInput {
-            job_id: None,
-            group_id,
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-            connector_id,
-            source_path: request.source_path,
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
-            quota_ceiling,
-            retry_key: None,
-            expected_bucket: bucket_info,
-            restrictions: auth.path_restrictions.clone(),
-            expected_checksums: Vec::new(),
-        },
     )
     .await
     .map_err(map_snapshot_error)?;
@@ -1703,7 +1709,7 @@ async fn coordinator_jobs(
     (bearer, request): (Option<&ValidatedBearer>, &StageBatchRequest),
     source: &GetSourceResult,
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
-    let view = bound_view(state.get_ctx().as_ref(), binding)
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
         .map_err(crate::lookup::map_guard_error)?;
     let snapshot = view.snapshot();

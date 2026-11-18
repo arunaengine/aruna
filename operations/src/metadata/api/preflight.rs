@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fanout::run_metadata_fanout;
-use super::list::load_pending_records;
+use super::list::PendingRecordsOperation;
 use super::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
@@ -27,13 +27,14 @@ use super::{
     select_fanout_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
 
 use super::head_versions::{HeadVersionsError, HeadVersionsOperation};
 use super::prefix_scan::{PrefixScanError, PrefixScanOperation};
 use super::read::{ensure_permission, load_live_record};
+use crate::document_repository::GetConfigOperation;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::search_cursor::tie_order;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 
 pub(super) async fn resolve_preflight_targets(
@@ -476,7 +477,8 @@ pub(crate) async fn references_preflight_local(
         crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, &returned)
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let pending_for_realm = load_pending_records(context, None, REGISTRY_CANDIDATE_LIMIT)
+    let pending = PendingRecordsOperation::new(None, REGISTRY_CANDIDATE_LIMIT);
+    let pending_for_realm = crate::driver::drive(pending, context)
         .await?
         .into_values()
         .flatten()
@@ -629,7 +631,11 @@ pub(crate) async fn discover_realm_nodes(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> RealmNodeDiscovery {
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return RealmNodeDiscovery {
             nodes: vec![local_node_id],
             failed: true,

@@ -66,7 +66,7 @@ use aruna_operations::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::object::delete::bulk::{
-    BulkDeleteEntry, BulkDeleteInput, delete_objects,
+    BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
 use aruna_operations::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
@@ -399,9 +399,8 @@ async fn scoped_fence_isolates() {
         .await,
         Err(DeleteObjectError::PurgeFence(PurgeFenceError::Suspended))
     ));
-    let batch = delete_objects(
-        &context.driver,
-        BulkDeleteInput {
+    let batch = drive(
+        BulkDeleteOperation::new(BulkDeleteInput {
             bucket: "bucket".to_string(),
             entries: vec![BulkDeleteEntry {
                 key: "blocked/batch-delete.txt".to_string(),
@@ -413,9 +412,11 @@ async fn scoped_fence_isolates() {
             deleted_by: context.user_id,
             restrictions: None,
             guards: Vec::new(),
-        },
+        }),
+        &context.driver,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(matches!(
         batch[0].result,
         Err(DeleteObjectError::PurgeFence(PurgeFenceError::Suspended))
@@ -993,17 +994,23 @@ async fn aborted_purge_releases() {
     .await;
     // A page planned before the abort stays in the cleanup queue, released once it ended.
     let versions: Vec<_> = list_linked(&context).await;
-    let found = aruna_operations::blob::purge::storage_files(
+    let found = drive(
+        aruna_operations::blob::purge::StorageFilesOperation::new(
+            aruna_operations::driver::node_routing(&context.driver),
+            ("bucket", context.group_id),
+            &versions,
+            None,
+        ),
         &context.driver,
-        ("bucket", context.group_id),
-        &versions,
-        None,
     )
     .await
     .unwrap();
-    aruna_operations::blob::purge::plan_files(&context.driver, job.job_id.as_ulid(), &found)
-        .await
-        .unwrap();
+    drive(
+        aruna_operations::blob::purge::PlanFilesOperation::new(job.job_id.as_ulid(), &found),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let pause = PausePurgeOperation::new(job.job_id.as_ulid(), true);
     drive(pause, &context.driver).await.unwrap();
     job.cancel.cancel();
@@ -1047,8 +1054,8 @@ async fn list_linked(context: &TestContext) -> Vec<(String, Ulid)> {
 async fn cancelled_queue_releases() {
     // A purge cancelled while queued ends at once; the files it planned before are released
     // by the cleanup queue, because the job ended.
+    use crate::job_calls::cancel_owned_job;
     use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::service::cancel_owned_job;
     let context = setup_context().await;
     seed_linked(&context, "linked/a.txt", Ulid::generate()).await;
     let spec = files_spec(&context);
@@ -1064,17 +1071,23 @@ async fn cancelled_queue_releases() {
     );
     insert_job(&context.driver, &record).await.unwrap();
     let versions = list_linked(&context).await;
-    let found = aruna_operations::blob::purge::storage_files(
+    let found = drive(
+        aruna_operations::blob::purge::StorageFilesOperation::new(
+            aruna_operations::driver::node_routing(&context.driver),
+            ("bucket", context.group_id),
+            &versions,
+            None,
+        ),
         &context.driver,
-        ("bucket", context.group_id),
-        &versions,
-        None,
     )
     .await
     .unwrap();
-    aruna_operations::blob::purge::plan_files(&context.driver, job_id.as_ulid(), &found)
-        .await
-        .unwrap();
+    drive(
+        aruna_operations::blob::purge::PlanFilesOperation::new(job_id.as_ulid(), &found),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let storage = &context.driver.storage_handle;
     assert_eq!(releases(storage).await.len(), 1);
 

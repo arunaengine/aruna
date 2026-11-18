@@ -2,22 +2,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::future::Future;
 use std::sync::Arc;
 
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
 };
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
+use ulid::Ulid;
 
+use super::settle;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::launch_admit::{
+    CommitReceiptOperation, CommitVerdict, SettleLaunchOperation, classify, existing_receipt,
+};
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
-use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
@@ -116,6 +125,84 @@ pub(super) fn config(
         subject_digest: receipt.subject_digest,
         record: Box::new(record),
         now_ms: 4_000,
+    }
+}
+
+/// Commits one stored receipt with its reservation, as a target does for an offer.
+pub(super) async fn commit_receipt(
+    ctx: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    launch: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let commit = CommitReceiptOperation::new(config, launch.clone());
+    let answer = drive(commit, ctx.as_ref()).await.ok()?;
+    settle(ctx, answer).await
+}
+
+/// Commits one stored receipt with `reserve` answering every reservation attempt, the way the
+/// runner would answer the commit operation's other calls.
+pub(super) async fn commit_with<F, Fut>(
+    ctx: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    launch: &LaunchIntent,
+    mut reserve: F,
+) -> Option<Result<ReceiptFrame, LaunchDecline>>
+where
+    F: FnMut(ReserveExecutionConfig) -> Fut,
+    Fut: Future<Output = Result<Ulid, LifecycleError>>,
+{
+    enum Waiting {
+        Reserve,
+        Receipts(CommitVerdict),
+        Settle(Result<ReceiptFrame, LaunchDecline>),
+    }
+    let family = config.receipt.envelope().family();
+    let mut commit = CommitReceiptOperation::new(config.clone(), launch.clone());
+    let mut turn = commit.first();
+    let mut waiting = Waiting::Reserve;
+    loop {
+        match turn {
+            Ok(Next::Done(answer)) => return settle(ctx, answer).await,
+            Ok(Next::Call(IoCall::Child(_))) => {}
+            Ok(other) => panic!("unexpected turn {other:?}"),
+            Err(_) => return None,
+        }
+        let answer = match waiting {
+            Waiting::Reserve => {
+                let reserved = reserve(config.clone()).await;
+                waiting = match &reserved {
+                    Ok(_) => Waiting::Settle(
+                        ReceiptFrame::new(config.receipt.envelope().clone())
+                            .map_err(|_| LaunchDecline::Unauthorized),
+                    ),
+                    Err(error) => Waiting::Receipts(classify(error)),
+                };
+                if let Waiting::Receipts(CommitVerdict::Retry) = waiting {
+                    waiting = Waiting::Reserve;
+                }
+                IoResult::Child(ChildOutcome::new(reserved))
+            }
+            Waiting::Receipts(verdict) => {
+                let read = LoadFamilyOperation::kind(family, JobRecordKind::Receipt);
+                let records = drive(read, ctx.as_ref()).await;
+                let found = records
+                    .as_ref()
+                    .ok()
+                    .and_then(|records| existing_receipt(records, launch));
+                waiting = match found {
+                    Some(found) => Waiting::Settle(found),
+                    None if verdict == CommitVerdict::Raced => Waiting::Reserve,
+                    None => Waiting::Receipts(verdict),
+                };
+                IoResult::Child(ChildOutcome::new(records))
+            }
+            Waiting::Settle(decision) => {
+                let settled = drive(SettleLaunchOperation::new(decision), ctx.as_ref()).await;
+                waiting = Waiting::Reserve;
+                IoResult::Child(ChildOutcome::new(settled))
+            }
+        };
+        turn = commit.next(answer);
     }
 }
 

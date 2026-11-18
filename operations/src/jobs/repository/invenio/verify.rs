@@ -2,28 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::invenio::InvenioClient;
-use aruna_core::repository::RepositoryRecord;
+use std::collections::{BTreeMap, HashSet};
+
 use aruna_core::repository::invenio::normalize_metadata;
-use aruna_core::structs::checksum::Hasher;
-use http::Method;
+use aruna_core::repository::remote::FileDigests;
 use serde_json::{Value, json};
 
-use super::export::invalid;
+use super::invalid;
 use crate::jobs::repository::TransferError;
 
-pub(super) async fn verify_files(
-    client: &InvenioClient<'_>,
-    record: &RepositoryRecord,
-    published: bool,
-    expected: &std::collections::BTreeMap<String, (Hasher, u64)>,
+/// Whether the file listing `files` holds exactly the `expected` files, each complete.
+pub(super) fn verify_files(
+    files: &Value,
+    expected: &BTreeMap<String, FileDigests>,
 ) -> Result<(), TransferError> {
-    let url = if published {
-        client.url(&["records", &record.id, "files"])?
-    } else {
-        client.url(&["records", &record.id, "draft", "files"])?
-    };
-    let files = client.json(Method::GET, url, None).await?;
     let entries = files["entries"]
         .as_array()
         .ok_or_else(|| invalid("missing repository files"))?;
@@ -34,7 +26,7 @@ pub(super) async fn verify_files(
     {
         return Err(invalid("repository file set changed"));
     }
-    let mut keys = std::collections::HashSet::new();
+    let mut keys = HashSet::new();
     for file in entries {
         let key = file["key"]
             .as_str()
@@ -42,10 +34,10 @@ pub(super) async fn verify_files(
         if !keys.insert(key) {
             return Err(invalid("duplicate repository file"));
         }
-        let (hash, size) = expected
+        let digests = expected
             .get(key)
             .ok_or_else(|| invalid("unexpected repository file"))?;
-        verify_file(file, hash, *size, true)?;
+        verify_file(file, digests, true)?;
     }
     Ok(())
 }
@@ -136,8 +128,7 @@ fn matches_fields(expected: &Value, actual: &Value) -> bool {
 
 pub(super) fn verify_file(
     file: &Value,
-    hasher: &Hasher,
-    size: u64,
+    digests: &FileDigests,
     completed: bool,
 ) -> Result<(), TransferError> {
     let checksum = file["checksum"]
@@ -146,10 +137,9 @@ pub(super) fn verify_file(
     let (algorithm, digest) = checksum
         .split_once(':')
         .ok_or_else(|| invalid("invalid uploaded checksum"))?;
-    let hashes = hasher.to_map();
     if (completed && file["status"] != "completed")
-        || file["size"].as_u64() != Some(size)
-        || hashes.get(algorithm).map(hex::encode).as_deref() != Some(digest)
+        || file["size"].as_u64() != Some(digests.size)
+        || digests.hashes.get(algorithm).map(hex::encode).as_deref() != Some(digest)
     {
         return Err(invalid("repository file checksum or size mismatch"));
     }

@@ -117,3 +117,81 @@ fn unexpected_results_fail() {
     emit.first().unwrap();
     assert!(emit.next(IoResult::Done).is_err());
 }
+
+fn holders_answer(holders: Option<(NodeId, Vec<NodeId>)>) -> IoResult {
+    IoResult::Event(Box::new(Event::Net(NetEvent::WatchHolders(holders))))
+}
+
+/// The event asks for its holders, then emits to them; a failed emission reaches the caller.
+#[test]
+fn event_reads_holders() {
+    let event = event(user(1, 2));
+    let mut emit = EmitEventOperation::new(event.clone());
+    let holders = NetEffect::WatchHolders {
+        realm_id: event.realm_id,
+        path: event.path.clone(),
+        kind: event.kind,
+    };
+    assert_eq!(
+        emit.first(),
+        Ok(Next::Call(IoCall::from(Effect::Net(holders))))
+    );
+    let found = holders_answer(Some((node_id(1), vec![node_id(2)])));
+    assert!(matches!(emit.next(found), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(emit.next(child::<(), IoError>(Ok(()))), Ok(Next::Done(())));
+
+    let mut failed = EmitEventOperation::new(event);
+    failed.first().unwrap();
+    failed
+        .next(holders_answer(Some((node_id(1), Vec::new()))))
+        .unwrap();
+    let error = IoError::Unexpected {
+        expected: "an answer",
+        got: "another",
+    };
+    assert_eq!(
+        failed.next(child::<(), IoError>(Err(error.clone()))),
+        Err(error)
+    );
+}
+
+/// Without a net handle nothing is emitted, and any other answer is refused.
+#[test]
+fn event_without_net() {
+    let mut emit = EmitEventOperation::new(event(user(1, 2)));
+    emit.first().unwrap();
+    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(())));
+
+    let mut wrong = EmitEventOperation::new(event(user(1, 2)));
+    wrong.first().unwrap();
+    let other = IoResult::Event(Box::new(Event::Net(NetEvent::Recorded)));
+    assert!(matches!(wrong.next(other), Err(IoError::Unexpected { .. })));
+}
+
+#[test]
+fn created_event_dated() {
+    let (group_id, document_id) = (Ulid::from_parts(5, 5), Ulid::from_parts(6, 6));
+    let event_id = Ulid::from_parts(77, 7);
+    let actor = user(1, 2);
+    let emit = EmitEventOperation::metadata_created(
+        actor.realm_id,
+        actor,
+        group_id,
+        document_id,
+        "datasets/a",
+        event_id,
+    );
+    let expected = WatchEvent {
+        event_id,
+        realm_id: actor.realm_id,
+        kind: WatchEventKind::MetadataCreated,
+        path: format!("meta/{group_id}/datasets/a"),
+        actor,
+        occurred_at_ms: 77,
+        detail: WatchEventDetail::MetadataCreated {
+            group_id,
+            document_id,
+        },
+    };
+    assert_eq!(emit, EmitEventOperation::new(expected));
+}
