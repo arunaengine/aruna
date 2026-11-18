@@ -69,11 +69,17 @@ impl GraphHandle {
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
-            | MetadataEffect::CachedGroup { .. } => {
+            | MetadataEffect::CachedGroup { .. }
+            | MetadataEffect::QueryCacheGet { .. }
+            | MetadataEffect::QueryCachePut { .. } => {
                 return MetadataEvent::Error {
                     graph_iri: None,
                     error: MetadataError::InvalidEffect,
                 };
+            }
+            MetadataEffect::MergeRows { job, budget } => {
+                let result = crate::merge::run_merge(job, budget).await;
+                return MetadataEvent::RowsMerged { result };
             }
             MetadataEffect::DescribeTitle {
                 graph_iri,
@@ -960,9 +966,12 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CacheRecords { .. }
         | MetadataEffect::UncacheRecord { .. }
         | MetadataEffect::CachedGroup { .. }
+        | MetadataEffect::QueryCacheGet { .. }
+        | MetadataEffect::QueryCachePut { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
         | MetadataEffect::FlushGraph
+        | MetadataEffect::MergeRows { .. }
         | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs

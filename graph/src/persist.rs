@@ -109,10 +109,13 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::CachedShapes { .. }
         | MetadataEffect::CacheShapes { .. }
         | MetadataEffect::FlushGraph
+        | MetadataEffect::MergeRows { .. }
         | MetadataEffect::CacheGeneration
         | MetadataEffect::CacheRecords { .. }
         | MetadataEffect::UncacheRecord { .. }
-        | MetadataEffect::CachedGroup { .. } => false,
+        | MetadataEffect::CachedGroup { .. }
+        | MetadataEffect::QueryCacheGet { .. }
+        | MetadataEffect::QueryCachePut { .. } => false,
     }
 }
 

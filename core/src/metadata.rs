@@ -1265,6 +1265,53 @@ impl MetadataQueryResults {
     }
 }
 
+/// A row of SPARQL solutions: variable name to term text.
+pub type SolutionRow = std::collections::BTreeMap<String, String>;
+
+/// CPU-bound work on query results that the graph runs off the async workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeJob {
+    /// The union of partition results in the order the `ORDER BY` of `partition` names.
+    Order {
+        partition: String,
+        results: Vec<MetadataQueryResults>,
+    },
+    /// How many leading rows order equal to the first one under the order of `partition`.
+    Ties {
+        partition: String,
+        rows: Vec<SolutionRow>,
+    },
+    /// The rows of both sides of the bounded join `query` plans, joined.
+    Join {
+        query: String,
+        left: Vec<SolutionRow>,
+        right: Vec<SolutionRow>,
+    },
+}
+
+/// What a merge produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutput {
+    Rows(MetadataQueryResults),
+    Tied(usize),
+}
+
+/// Why a merge produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MergeError {
+    /// The rows exceed the result byte budget.
+    #[error("the merged result is too large")]
+    TooLarge,
+    /// The query cannot be merged this way; the text says why.
+    #[error("{0}")]
+    Refused(String),
+    /// The time budget ran out.
+    #[error("the merge ran out of time")]
+    Cancelled,
+    #[error("the merge failed: {0}")]
+    Failed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEffect {
     ValidateCreateCrate {
@@ -1384,6 +1431,11 @@ pub enum MetadataEffect {
         revision: Ulid,
         shapes: Vec<String>,
     },
+    /// Merges query results off the async workers within `budget`.
+    MergeRows {
+        job: MergeJob,
+        budget: std::time::Duration,
+    },
     /// The title of a document: the name of its graph's root entity, else its path.
     DescribeTitle {
         graph_iri: String,
@@ -1408,6 +1460,19 @@ pub enum MetadataEffect {
     /// Drops one document's row from the registry cache.
     UncacheRecord {
         document_id: Ulid,
+    },
+    /// A distributed query result this node's query cache holds under `key`, with the
+    /// invalidation stamp taken before the read.
+    QueryCacheGet {
+        key: [u8; 32],
+    },
+    /// Keeps a complete distributed query result under `key`, unless anything it depends on
+    /// changed since `stamp`.
+    QueryCachePut {
+        key: [u8; 32],
+        stamp: [u64; 2],
+        results: MetadataQueryResults,
+        nodes_queried: usize,
     },
     /// The live registry rows of one group, when the registry cache holds a fresh copy.
     CachedGroup {
@@ -1450,11 +1515,14 @@ impl MetadataEffect {
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
             MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
             MetadataEffect::DescribeTitle { .. } => "describe_title",
+            MetadataEffect::MergeRows { .. } => "merge_rows",
             MetadataEffect::FlushGraph => "flush_graph",
             MetadataEffect::CacheGeneration => "cache_generation",
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
             MetadataEffect::CachedGroup { .. } => "cached_group",
+            MetadataEffect::QueryCacheGet { .. } => "query_cache_get",
+            MetadataEffect::QueryCachePut { .. } => "query_cache_put",
         }
     }
 
@@ -1497,10 +1565,13 @@ impl MetadataEffect {
             | MetadataEffect::CachedShapes { .. }
             | MetadataEffect::CacheShapes { .. }
             | MetadataEffect::FlushGraph
+            | MetadataEffect::MergeRows { .. }
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
-            | MetadataEffect::CachedGroup { .. } => None,
+            | MetadataEffect::CachedGroup { .. }
+            | MetadataEffect::QueryCacheGet { .. }
+            | MetadataEffect::QueryCachePut { .. } => None,
         }
     }
 
@@ -1618,9 +1689,19 @@ pub enum MetadataEvent {
     CacheGeneration {
         generation: u64,
     },
+    /// The merged rows or tie count, or why there are none.
+    RowsMerged {
+        result: Result<MergeOutput, MergeError>,
+    },
     /// The title of a document, or `None` when it has neither a name nor a path.
     DocumentTitle {
         title: Option<String>,
+    },
+    /// The query cache's stamp and its entry, if it holds a current one; a store answers
+    /// without an entry.
+    QueryCacheEntry {
+        stamp: [u64; 2],
+        entry: Option<(MetadataQueryResults, usize)>,
     },
     /// The cached registry rows of one group, or `None` without a fresh copy.
     CachedGroup {

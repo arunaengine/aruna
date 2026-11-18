@@ -21,6 +21,7 @@ use crate::convert::{error_from_craqle, fjall_persist_mode, irokle_peer_id, poli
 use crate::persist::flush_metadata_persistence;
 
 mod convert;
+pub mod merge;
 mod persist;
 mod profiles;
 mod read;
