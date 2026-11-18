@@ -151,10 +151,6 @@ pub enum SubOperationEvent {
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
     },
-    /// Epoch due markers were written in the caller's transaction.
-    EpochsMarked {
-        result: Result<(), StorageError>,
-    },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
     /// One version of a re-key page ended.
@@ -955,7 +951,6 @@ impl Event {
                     UserUpdated,
                     VaultHeld,
                     KeyRequestsOpened,
-                    EpochsMarked,
                     KeyRequestsFailed,
                     VersionRekeyed,
                     AuditStored,
