@@ -31,7 +31,8 @@ use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
-use crate::jobs::store::job_rows::ReadJobOperation;
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::row_calls::read_job_record;
 
 /// A projection that lost its transaction every time is busy, not failed: the
 /// caller reads again rather than seeing a storage error.
@@ -257,7 +258,7 @@ impl SessionJobOperation {
     fn projected(&mut self, read: Option<FamilyView>) -> SessionNext {
         let Some((projected, spec)) = read else {
             self.step = SessionStep::LocalJob;
-            let read = ReadJobOperation::new(self.job_id);
+            let read = read_job_record(self.job_id);
             return Ok(Next::Call(IoCall::child(read)));
         };
         if spec.created_by != self.user_id || session_of(&spec.payload).is_none() {
@@ -301,7 +302,7 @@ impl Operation for SessionJobOperation {
         match std::mem::replace(&mut self.step, SessionStep::Projection) {
             SessionStep::Projection => self.projected(projection_read(result)?),
             SessionStep::LocalJob => {
-                let read = result.child::<Option<JobRecord>, aruna_core::calls::IoError>()?;
+                let read = result.child::<Option<JobRecord>, JobMutationError>()?;
                 let record = read.map_err(|error| JobRouteError::Internal(error.to_string()))?;
                 self.local(record)
             }
@@ -643,7 +644,6 @@ impl Operation for AuditEndpointsOperation {
 mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node, user};
-    use aruna_core::calls::IoError;
 
     fn job() -> JobId {
         JobId::from_bytes([3; 16])
@@ -740,7 +740,7 @@ mod tests {
             read.next(absent()),
             Ok(Next::Call(IoCall::Child(_)))
         ));
-        let missing = read.next(child(Ok::<Option<JobRecord>, IoError>(None)));
+        let missing = read.next(child(Ok::<Option<JobRecord>, JobMutationError>(None)));
         assert_eq!(missing, Err(JobRouteError::NotFound));
     }
 

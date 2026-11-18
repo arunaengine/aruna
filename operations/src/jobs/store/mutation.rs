@@ -531,6 +531,70 @@ where
     }
 }
 
+/// [`MutateJobOperation`], answering the final row and whether the change was written.
+pub(crate) struct ChangeJobOperation<F, G>(MutateJobCalls<F, G>);
+
+impl<F, G> std::fmt::Debug for ChangeJobOperation<F, G> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<F, G> PartialEq for ChangeJobOperation<F, G> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<F> ChangeJobOperation<F, NoGuard>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+{
+    pub(crate) fn new(job_id: JobId, mutate: F) -> Self {
+        Self(MutateJobCalls::new(job_id, mutate, None))
+    }
+}
+
+impl<F, G> ChangeJobOperation<F, G>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError>,
+{
+    pub(crate) fn guarded(job_id: JobId, mutate: F, guard: G) -> Self {
+        Self(MutateJobCalls::new(job_id, mutate, Some(guard)))
+    }
+
+    fn answered(&self, next: Next<JobRecord>) -> Result<Next<(JobRecord, bool)>, JobMutationError> {
+        match next {
+            Next::Done(record) => Ok(Next::Done((record, self.0.persisted()))),
+            other => forward(other),
+        }
+    }
+}
+
+impl<F, G> Operation for ChangeJobOperation<F, G>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
+{
+    type Output = (JobRecord, bool);
+    type Error = JobMutationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<(JobRecord, bool)>, JobMutationError> {
+        let next = self.0.first()?;
+        self.answered(next)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(JobRecord, bool)>, JobMutationError> {
+        let next = self.0.next(result)?;
+        self.answered(next)
+    }
+}
+
 /// A mutation without a guard names this guard type.
 pub(crate) type NoGuard = fn(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError>;
 
