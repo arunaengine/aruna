@@ -483,4 +483,79 @@ mod tests {
         };
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
+
+    fn deadline(due_at_ms: u64) -> WitnessDeadline {
+        WitnessDeadline { due_at_ms, rank: 1 }
+    }
+
+    fn family() -> JobFamilyId {
+        Family::new([3u8; 32]).family()
+    }
+
+    // A move writes the new rows and drops the old one; a deadline that moved meanwhile stays.
+    #[test]
+    fn replaces_expected_deadline() {
+        use crate::jobs::store::mutation::{Rows, run_in_memory};
+        let family = family();
+        let mut rows = Rows::new();
+        let arm = DeadlineChange::Replace {
+            expected: None,
+            next: deadline(20),
+        };
+        let operation = ChangeDeadlineOperation::new(family, arm);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(true));
+        let moved = DeadlineChange::Replace {
+            expected: Some(deadline(20)),
+            next: deadline(10),
+        };
+        let operation = ChangeDeadlineOperation::new(family, moved);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(true));
+        let space = WITNESS_DEADLINE_KEYSPACE.to_string();
+        assert!(!rows.contains_key(&(space.clone(), deadline_key(&family, 20).to_vec())));
+        assert!(rows.contains_key(&(space, deadline_key(&family, 10).to_vec())));
+
+        let before = rows.clone();
+        let stale = DeadlineChange::Replace {
+            expected: Some(deadline(20)),
+            next: deadline(5),
+        };
+        let operation = ChangeDeadlineOperation::new(family, stale);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(false));
+        assert_eq!(rows, before);
+    }
+
+    // A clear removes only the deadline the index names; a stale row goes only when unnamed.
+    #[test]
+    fn clears_named_deadline() {
+        use crate::jobs::store::mutation::{Rows, run_in_memory};
+        let family = family();
+        let mut rows = Rows::new();
+        let arm = DeadlineChange::Replace {
+            expected: None,
+            next: deadline(20),
+        };
+        run_in_memory(ChangeDeadlineOperation::new(family, arm), &mut rows).expect("armed");
+        let key = deadline_key(&family, 20);
+        let named = DeadlineChange::Stale { key: key.clone() };
+        let operation = ChangeDeadlineOperation::new(family, named);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(false));
+        let wrong = DeadlineChange::Clear {
+            key: key.clone(),
+            expected: deadline(30),
+        };
+        let operation = ChangeDeadlineOperation::new(family, wrong);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(false));
+
+        let clear = DeadlineChange::Clear {
+            key: key.clone(),
+            expected: deadline(20),
+        };
+        let operation = ChangeDeadlineOperation::new(family, clear);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(true));
+        assert!(rows.is_empty());
+        let unnamed = DeadlineChange::Stale { key };
+        let operation = ChangeDeadlineOperation::new(family, unnamed);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(true));
+    }
 }

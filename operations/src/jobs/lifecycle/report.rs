@@ -422,3 +422,86 @@ pub enum AuditRange {
     /// Every request family of the submission, including idempotency conflicts.
     Submission,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, node};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::{CancelAuthority, OutputSet};
+
+    fn projection(fixture: &Family) -> JobProjection {
+        let family = fixture.family();
+        JobProjection {
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            canonical_job_id: fixture.spec().job_id,
+            aliases: Vec::new(),
+            state: LogicalJobState::Indeterminate,
+            canonical_execution_id: None,
+            executions: Vec::new(),
+            outputs: OutputSet::try_from(Vec::new()).expect("no outputs"),
+            cancel_requested: false,
+        }
+    }
+
+    fn records(result: Vec<JobRecordEnvelope>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, FamilyReadError>(result)))
+    }
+
+    // A deletion cancel ends the read at once; nothing else is read.
+    #[test]
+    fn deleted_family_stops() {
+        let fixture = Family::new([1u8; 32]);
+        let mut cancel = fixture.cancel(&fixture.spec());
+        cancel.authority = CancelAuthority::Deletion;
+        let deleted = fixture.sign(&fixture.holder, JobFamilyRecord::Cancel(cancel));
+        let mut details =
+            ReportDetailsOperation::new(fixture.family(), &projection(&fixture), None);
+        assert!(matches!(details.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let Ok(Next::Done(found)) = details.next(records(vec![deleted])) else {
+            panic!("a deleted family answers at once");
+        };
+        assert!(found.deleted);
+    }
+
+    // Other request digests count as conflicts; without a stored plan the newest launch places.
+    #[test]
+    fn reads_conflicts_and_launch() {
+        let fixture = Family::new([2u8; 32]);
+        let family = fixture.family();
+        let mut details = ReportDetailsOperation::new(family, &projection(&fixture), None);
+        details.first().expect("cancels read");
+        let Ok(Next::Call(IoCall::Page { .. })) = details.next(records(Vec::new())) else {
+            panic!("the siblings are paged");
+        };
+        let sibling = |digest: [u8; 32]| {
+            let key = [family.submission_id.0.as_slice(), &digest, &[0u8; 8]].concat();
+            (Key::from(key), aruna_core::types::Value::from(vec![1]))
+        };
+        let siblings = vec![sibling(family.request_digest), sibling([9u8; 32])];
+        let Ok(Next::Call(IoCall::Page { .. })) = details.next(IoResult::Page {
+            rows: siblings,
+            next: None,
+        }) else {
+            panic!("the stored plan is paged");
+        };
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let Ok(Next::Call(IoCall::Child(_))) = details.next(empty) else {
+            panic!("the launches are read");
+        };
+        let launch = fixture.launch(&fixture.spec(), node(4), 0);
+        let launched = fixture.sign(&fixture.holder, JobFamilyRecord::Launch(Box::new(launch)));
+        let Ok(Next::Done(found)) = details.next(records(vec![launched])) else {
+            panic!("no output endpoint is read");
+        };
+        assert_eq!(found.conflicts, 1);
+        assert_eq!(
+            found.plan.and_then(|plan| plan.scheduler_node_id),
+            Some(node(4))
+        );
+    }
+}

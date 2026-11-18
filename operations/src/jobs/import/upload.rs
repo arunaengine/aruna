@@ -639,4 +639,40 @@ pub(crate) mod tests {
                 .is_none()
         );
     }
+
+    // A claim writes the job into an unclaimed upload once; a repeat changes nothing.
+    #[test]
+    fn claim_writes_once() {
+        use crate::jobs::store::mutation::{Rows, run_in_memory};
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let upload_id = Ulid::from_bytes([3u8; 16]);
+        let job_id = JobId::from_bytes([4u8; 16]);
+        let missing = ClaimUploadOperation::new(upload_id, owner, job_id, 5);
+        assert_eq!(missing.transaction(), TransactionMode::Write);
+        let mut rows = Rows::new();
+        assert_eq!(
+            run_in_memory(missing, &mut rows),
+            Err(UploadClaimError::NotFound)
+        );
+
+        let record = upload_record(owner, upload_id, 10);
+        let key = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(upload_id).to_vec(),
+        );
+        rows.insert(key.clone(), postcard::to_allocvec(&record).unwrap());
+        let claim = ClaimUploadOperation::new(upload_id, owner, job_id, 5);
+        let claimed = run_in_memory(claim, &mut rows).expect("claimed");
+        assert_eq!(claimed.claimed_by, Some(job_id));
+        let stored: RoCrateUploadRecord = postcard::from_bytes(&rows[&key]).unwrap();
+        assert_eq!(stored, claimed);
+
+        let again = ClaimUploadOperation::new(upload_id, owner, job_id, 11);
+        assert_eq!(run_in_memory(again, &mut rows), Ok(claimed));
+        let other = ClaimUploadOperation::new(upload_id, owner, JobId::from_bytes([6u8; 16]), 5);
+        assert_eq!(
+            run_in_memory(other, &mut rows),
+            Err(UploadClaimError::AlreadyClaimed)
+        );
+    }
 }

@@ -542,26 +542,6 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 }
 
 /// This node's own advertisement for the offered executor kind.
-/// This node's executor capability that runs `intent`; see [`LocalCapabilityOperation`].
-#[cfg(test)]
-pub(crate) async fn local_capability(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    intent: &LaunchIntent,
-    spec: &LogicalJobSpec,
-) -> Result<ExecutorCapability, LaunchDecline> {
-    let operation = super::launch_checks::LocalCapabilityOperation::new(
-        config.clone(),
-        local,
-        intent.clone(),
-        spec.clone(),
-    );
-    drive(operation, context)
-        .await
-        .unwrap_or(Err(LaunchDecline::Draining))
-}
-
 fn backend_limits(context: &DriverContext, intent: &LaunchIntent) -> Option<ResourceEnvelope> {
     let registry: &ExecutorRegistry = context.compute_handle.as_ref()?;
     let backend = registry.get(&ExecutorKind::from_wire(&intent.target.executor_kind))?;

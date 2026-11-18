@@ -90,3 +90,77 @@ impl Operation for ResolvePoliciesOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placement::policy::{PolicyCacheStats, PolicySource};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::errors::StorageError;
+    use aruna_core::structs::placement::policy::{
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
+    };
+
+    fn policy_ref(seed: u8) -> PlacementPolicyRef {
+        PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([seed; 16]),
+            digest: [seed; 32],
+        }
+    }
+
+    fn verified() -> VerifiedPolicy {
+        let selector = PlacementSelector {
+            node_id: None,
+            location: Some("eu".to_string()),
+            labels: Vec::new(),
+            executor_kind: None,
+        };
+        let policy = PlacementPolicy::new(Ulid::from_bytes([1; 16]), "eu".into(), vec![selector]);
+        VerifiedPolicy::verify(policy.expect("policy is valid")).expect("policy is canonical")
+    }
+
+    fn answer(result: Result<ResolvedPolicy, ReadPolicyError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    // Each distinct ref is resolved once, in order; a failed resolve is recorded as unresolved.
+    #[test]
+    fn resolves_each_ref() {
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let refs = vec![policy_ref(2), policy_ref(1), policy_ref(2)];
+        let mut operation = ResolvePoliciesOperation::new(RealmId([1; 32]), node, 9, refs);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let known = ResolvedPolicy {
+            policy: verified(),
+            source: PolicySource::Cached,
+            stats: PolicyCacheStats::default(),
+        };
+        assert!(matches!(
+            operation.next(answer(Ok(known))),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err(ReadPolicyError::Storage(StorageError::TransactionConflict));
+        let Ok(Next::Done(resolved)) = operation.next(answer(failed)) else {
+            panic!("two distinct refs resolve");
+        };
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved[&policy_ref(1).policy_id],
+            PolicyResolution::Known(verified())
+        );
+        assert_eq!(
+            resolved[&policy_ref(2).policy_id],
+            PolicyResolution::Unresolved
+        );
+    }
+
+    // A request without refs resolves nothing.
+    #[test]
+    fn empty_resolves_nothing() {
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let mut operation = ResolvePoliciesOperation::new(RealmId([1; 32]), node, 9, Vec::new());
+        assert_eq!(operation.first(), Ok(Next::Done(BTreeMap::new())));
+    }
+}
