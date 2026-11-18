@@ -501,3 +501,282 @@ impl Operation for MemberReadOperation {
         self.now_ms = now_ms;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::distribution::DistributionRevision;
+
+    use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([1; 32])
+    }
+
+    fn range() -> Ulid {
+        Ulid::from_bytes([5; 16])
+    }
+
+    fn caller() -> MemberCaller {
+        MemberCaller {
+            auth: AuthContext::anonymous(realm()),
+            group_id: Ulid::from_bytes([2; 16]),
+            credential_expiry: 0,
+        }
+    }
+
+    fn object(version: Option<Ulid>) -> MemberKey {
+        MemberKey {
+            bucket: "spire".to_string(),
+            key: "a b".to_string(),
+            version,
+        }
+    }
+
+    fn read(version: Option<Ulid>) -> MemberReadOperation {
+        let binding = DistributionBinding {
+            set_id: Ulid::from_bytes([3; 16]),
+            member_id: Ulid::from_bytes([4; 16]),
+            incarnation: 0,
+            revision: DistributionRevision::default(),
+        };
+        let ids = Some((node(1), realm()));
+        MemberReadOperation::new(ids, caller(), binding, object(version))
+    }
+
+    fn child<T, E>(answer: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(answer))
+    }
+
+    fn body(version: &str) -> MemberBody {
+        let chunks = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+        MemberBody {
+            version: Some(version.to_string()),
+            stream: ByteStream::new(chunks),
+        }
+    }
+
+    fn refused(status: u16, code: Option<&str>) -> Result<MemberBody, MemberRefusal> {
+        let code = code.map(str::to_string);
+        Err(MemberRefusal { status, code })
+    }
+
+    fn coordinated(read: &mut MemberReadOperation) {
+        read.first().unwrap();
+        let coordinator = Some((range(), node(2)));
+        read.next(child::<_, GuardError>(Ok(coordinator))).unwrap();
+    }
+
+    #[test]
+    fn own_range_local() {
+        let mut read = read(None);
+        read.first().unwrap();
+        let answer = read.next(child::<Option<(Ulid, NodeId)>, GuardError>(Ok(None)));
+        assert_eq!(answer, Ok(Next::Done(MemberRead::Local(None))));
+    }
+
+    #[test]
+    fn refusal_sets_status() {
+        let mut read = read(None);
+        coordinated(&mut read);
+        let answer = read.next(child(refused(403, Some("AccessDenied"))));
+        assert_eq!(answer, Err(EntryStatus::Denied));
+    }
+
+    #[test]
+    fn missing_version_unavailable() {
+        let mut read = read(None);
+        coordinated(&mut read);
+        let answer = read.next(child::<_, MemberRefusal>(Ok(body("not a ulid"))));
+        assert_eq!(answer, Err(EntryStatus::Unavailable));
+    }
+
+    #[test]
+    fn copy_answers_stale() {
+        let version = Ulid::from_bytes([9; 16]);
+        let mut read = read(None);
+        coordinated(&mut read);
+        let readers = read.next(child(refused(503, None))).unwrap();
+        assert!(matches!(readers, Next::Call(IoCall::Child(_))));
+        let copies = (range(), false, vec![node(3)]);
+        read.next(child::<_, GuardError>(Ok(copies))).unwrap();
+        let answer = read.next(child::<_, MemberRefusal>(Ok(body(&version.to_string()))));
+        let Ok(Next::Done(MemberRead::Remote {
+            version: found,
+            stale,
+            ..
+        })) = answer
+        else {
+            panic!("the copy answers");
+        };
+        assert_eq!((found, stale), (version, Some(range())));
+    }
+
+    #[test]
+    fn own_copy_serves() {
+        let mut read = read(None);
+        coordinated(&mut read);
+        read.next(child(refused(503, None))).unwrap();
+        let readers = (range(), true, Vec::<NodeId>::new());
+        let answer = read.next(child::<_, GuardError>(Ok(readers)));
+        assert_eq!(answer, Ok(Next::Done(MemberRead::Local(Some(range())))));
+    }
+
+    #[test]
+    fn silent_copies_fail() {
+        let mut read = read(None);
+        coordinated(&mut read);
+        read.next(child(refused(503, Some("AccessDenied"))))
+            .unwrap();
+        let readers = (range(), false, vec![node(3)]);
+        read.next(child::<_, GuardError>(Ok(readers))).unwrap();
+        let answer = read.next(child(refused(503, None)));
+        assert_eq!(answer, Err(EntryStatus::Denied));
+    }
+
+    #[test]
+    fn replica_miss_retried() {
+        let mut read = read(Some(Ulid::from_bytes([9; 16])));
+        read.first().unwrap();
+        let route = ReadRoute::Holder {
+            range_id: range(),
+            node_id: node(2),
+        };
+        read.next(child::<_, GuardError>(Ok(route))).unwrap();
+        read.next(child::<_, IoError>(Ok(vec![node(3)]))).unwrap();
+        let candidate = HolderCandidate {
+            node_id: node(3),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            free_slots: 1,
+            bandwidth: 1,
+        };
+        let chosen = child::<_, HolderChoiceError>(Ok(vec![candidate]));
+        read.next(chosen).unwrap();
+        assert_eq!(read.holder, Some(node(3)));
+        read.next(child(refused(404, Some("NoSuchKey")))).unwrap();
+        assert_eq!(read.step, ReadStep::Coordinating);
+        let answer = read.next(child(refused(404, Some("NoSuchKey"))));
+        assert_eq!(answer, Err(EntryStatus::Missing));
+    }
+
+    fn get(copy_read: bool) -> MemberGetOperation {
+        MemberGetOperation {
+            ids: Some((node(1), realm())),
+            caller: caller(),
+            target: MemberTarget {
+                set_id: Ulid::from_bytes([3; 16]),
+                range_id: range(),
+                node_id: node(2),
+            },
+            object: object(Some(Ulid::from_bytes([9; 16]))),
+            copy_read,
+            now_ms: 10_000,
+            step: GetStep::Urls,
+        }
+    }
+
+    fn urls(s3: Option<&str>) -> IoResult {
+        let urls = NodeUrls {
+            api: None,
+            s3: s3.map(str::to_string),
+        };
+        child::<_, NodeInfoError>(Ok(Some(urls)))
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    #[test]
+    fn get_binds_request() {
+        let mut get = get(true);
+        get.first().unwrap();
+        let Ok(Next::Call(IoCall::Effect(effect))) = get.next(urls(Some("http://s3/"))) else {
+            panic!("the delegation is signed");
+        };
+        let Effect::Net(NetEffect::DelegationSign(delegation)) = *effect else {
+            panic!("the delegation is signed");
+        };
+        assert_eq!(delegation.operation, "GetObject");
+        assert_eq!(delegation.target, node(2));
+        // A caller without a credential is bounded by a short window.
+        assert_eq!(delegation.credential_expiry, 10 + ANONYMOUS_SECS);
+        let version = Ulid::from_bytes([9; 16]);
+        let query = format!("versionId={version}");
+        let bound = [("accept", ACCEPT_ANY), (COPY_READ_HEADER, "1")];
+        let digest = request_digest("GET", "spire", "a b", Some(&query), &bound);
+        assert_eq!(delegation.request_digest, digest);
+        let signed = SignedDelegation {
+            signature: iroh::SecretKey::from_bytes(&[1; 32]).sign(b"delegation"),
+            delegation: *delegation,
+        };
+        let header = signed.encode().unwrap();
+        let signed = Event::Net(NetEvent::DelegationSign(Some(Box::new(signed))));
+        let Ok(Next::Call(IoCall::Effect(effect))) = get.next(event(signed)) else {
+            panic!("the read is sent");
+        };
+        let Effect::Blob(BlobEffect::MemberGet(request)) = *effect else {
+            panic!("the read is sent");
+        };
+        assert_eq!(request.url, format!("http://s3/spire/a%20b?{query}"));
+        let expected = [
+            ("accept", ACCEPT_ANY),
+            (COPY_READ_HEADER, "1"),
+            (DELEGATION_HEADER, header.as_str()),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(request.headers, expected);
+    }
+
+    #[test]
+    fn silent_member_avoided() {
+        let mut get = get(false);
+        get.step = GetStep::Answer;
+        let silent = Box::new(MemberAnswer::Silent);
+        let silent = Event::Blob(BlobEvent::MemberAnswered(silent));
+        let avoid = NetEffect::AvoidHolder {
+            node_id: node(2),
+            now_ms: 10_000,
+        };
+        let expected = IoCall::from(Effect::Net(avoid));
+        assert_eq!(get.next(event(silent)), Ok(Next::Call(expected)));
+        let answer = get.next(event(Event::Net(NetEvent::HolderAvoided)));
+        assert_eq!(answer, Err(MemberRefusal::new(UNREACHED)));
+    }
+
+    #[test]
+    fn refusal_keeps_holder() {
+        let mut get = get(false);
+        get.step = GetStep::Answer;
+        let code = Some("AccessDenied".to_string());
+        let status = 403;
+        let refused = Box::new(MemberAnswer::Refused {
+            status,
+            code: code.clone(),
+        });
+        let answer = get.next(event(Event::Blob(BlobEvent::MemberAnswered(refused))));
+        assert_eq!(answer, Err(MemberRefusal { status, code }));
+    }
+
+    #[test]
+    fn unpublished_member_avoided() {
+        let mut get = get(false);
+        get.first().unwrap();
+        assert!(matches!(
+            get.next(urls(None)),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        assert!(matches!(get.step, GetStep::Avoid(_)));
+    }
+}
