@@ -375,48 +375,181 @@ fn local_metadata(head: &HeadObjectResult, version: Ulid) -> SourceMetadata {
         last_modified: head.version_created_at,
         source_version: None,
         digests: Default::default(),
-    };
-    let target = LinkTarget {
-        arn: VersionedObjectArn {
-            realm_id: caller.auth.realm_id,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CreateLinkStep {
+    Access,
+    Head(GroupId),
+    Remote(VersionedObjectArn),
+    Write,
+}
+
+/// Writes a link at a destination to the source's exact version, for a caller who may read that
+/// version now. A source on another node must name its version.
+#[derive(Debug, PartialEq)]
+pub struct CreateLinkOperation {
+    caller: LinkCaller,
+    bucket: String,
+    key: String,
+    group_id: GroupId,
+    node: LinkNode,
+    source: LinkSource,
+    fresh: Ulid,
+    now_ms: u64,
+    step: CreateLinkStep,
+}
+
+impl CreateLinkOperation {
+    pub fn new(
+        caller: &LinkCaller,
+        (bucket, key, group_id): (&str, &str, GroupId),
+        node: LinkNode,
+        source: LinkSource,
+    ) -> Self {
+        Self {
+            caller: caller.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            group_id,
+            node,
+            source,
+            fresh: Ulid::generate(),
+            now_ms: 0,
+            step: CreateLinkStep::Access,
+        }
+    }
+
+    /// A source on another node, described by that node for the caller in one delegated HEAD.
+    fn ask_remote(&mut self) -> LinkTurn<Ulid> {
+        let source = &self.source;
+        let version = source.version.ok_or_else(|| {
+            LinkError::Invalid("a link to another node names the exact version".to_string())
+        })?;
+        let arn = VersionedObjectArn {
+            realm_id: self.caller.auth.realm_id,
             node_id: source.node_id,
             bucket: source.bucket.clone(),
             key: source.key.clone(),
             version,
-        },
-        group_id,
-    };
-    Ok((target, metadata))
+        };
+        let caller = delegation(&self.caller, arn.node_id, self.now_ms / 1000);
+        let read = delegated_read(self.node.ids, caller, &arn, None, true);
+        self.step = CreateLinkStep::Remote(arn);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn write(&mut self, target: LinkTarget, metadata: SourceMetadata) -> LinkTurn<Ulid> {
+        let caller = &self.caller;
+        let write = ReferenceWrite {
+            job_id: None,
+            preassigned_version_id: None,
+            group_id: self.group_id,
+            user_id: caller.auth.user_id,
+            realm_id: caller.auth.realm_id,
+            node_id: self.node.local,
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            expected_bucket: None,
+            version_source: target.binding(),
+            metadata,
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+            restrictions: caller.auth.path_restrictions.clone(),
+            mirror_guards: Vec::new(),
+        };
+        let now = UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        self.step = CreateLinkStep::Write;
+        let write = WriteReferenceOperation::new(write, now, self.fresh);
+        Ok(Next::Call(IoCall::child(write)))
+    }
 }
 
-/// A source on another node, described by that node for the caller in one delegated HEAD.
-async fn remote_target(
-    context: &DriverContext,
-    caller: &LinkCaller,
-    source: &LinkSource,
-) -> Result<(LinkTarget, SourceMetadata), LinkError> {
-    let version = source.version.ok_or_else(|| {
-        LinkError::Invalid("a link to another node names the exact version".to_string())
-    })?;
-    let arn = VersionedObjectArn {
-        realm_id: caller.auth.realm_id,
-        node_id: source.node_id,
-        bucket: source.bucket.clone(),
-        key: source.key.clone(),
-        version,
-    };
-    let ids = context.node_and_realm();
-    let read = delegated_read(ids, delegation(caller, arn.node_id), &arn, None, true);
-    let answer = drive(read, context).await.map_err(staging_error)?;
-    let (metadata, group_id) = (answer.metadata, answer.group_id);
-    let group_id = group_id.ok_or_else(|| {
-        LinkError::Unavailable("the source node did not name its bucket group".to_string())
-    })?;
-    let metadata = SourceMetadata {
-        etag: Some(version.to_string()),
-        ..metadata
-    };
-    Ok((LinkTarget { arn, group_id }, metadata))
+impl Operation for CreateLinkOperation {
+    type Output = Ulid;
+    type Error = LinkError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> LinkTurn<Ulid> {
+        let source = &self.source;
+        if source.node_id != self.node.local {
+            return self.ask_remote();
+        }
+        let object = (source.bucket.as_str(), source.key.as_str());
+        let read = SourceReadOperation::of_object(
+            &self.caller.auth,
+            source.node_id,
+            object,
+            HEAD_OPERATION,
+        );
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LinkTurn<Ulid> {
+        match std::mem::replace(&mut self.step, CreateLinkStep::Write) {
+            CreateLinkStep::Access => {
+                let group_id =
+                    (result.child::<GroupId, SourceReadError>()?).map_err(|error| match error {
+                        SourceReadError::NotFound => LinkError::NotFound,
+                        SourceReadError::Denied => LinkError::Denied,
+                        SourceReadError::Unavailable(error) => LinkError::Unavailable(error),
+                    })?;
+                let head = HeadObjectOperation::new(HeadObjectInput {
+                    bucket: self.source.bucket.clone(),
+                    key: self.source.key.clone(),
+                    version_id: self.source.version,
+                });
+                self.step = CreateLinkStep::Head(group_id);
+                Ok(Next::Call(IoCall::child(head)))
+            }
+            CreateLinkStep::Head(group_id) => {
+                let head =
+                    (result.child::<HeadObjectResult, HeadObjectError>()?).map_err(|error| {
+                        match error {
+                            HeadObjectError::NoSuchKey
+                            | HeadObjectError::NoSuchVersion
+                            | HeadObjectError::DeleteMarker => LinkError::NotFound,
+                            other => unavailable(other),
+                        }
+                    })?;
+                let version =
+                    (head.resolved_version_id.or(head.version_id)).ok_or(LinkError::NotFound)?;
+                let metadata = local_metadata(&head, version);
+                let source = &self.source;
+                let target = LinkTarget {
+                    arn: VersionedObjectArn {
+                        realm_id: self.caller.auth.realm_id,
+                        node_id: source.node_id,
+                        bucket: source.bucket.clone(),
+                        key: source.key.clone(),
+                        version,
+                    },
+                    group_id,
+                };
+                self.write(target, metadata)
+            }
+            CreateLinkStep::Remote(arn) => {
+                let answer = result.child::<DelegatedBody, StagingSourceError>()?;
+                let answer = answer.map_err(staging_error)?;
+                let group_id = answer
+                    .group_id
+                    .ok_or_else(|| unavailable("the source node did not name its bucket group"))?;
+                let metadata = SourceMetadata {
+                    etag: Some(arn.version.to_string()),
+                    ..answer.metadata
+                };
+                self.write(LinkTarget { arn, group_id }, metadata)
+            }
+            CreateLinkStep::Write => {
+                let written = result.child::<(Ulid, bool), MaterializeReferenceError>()?;
+                Ok(Next::Done(written.map_err(unavailable)?.0))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -424,6 +557,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
 
     use super::*;
+    use crate::driver::drive;
     use crate::testing::test_context;
     use crate::tests::access::seed_access;
     use crate::tests::s3::test_storage;
@@ -452,9 +586,14 @@ mod tests {
             },
             group_id,
         };
-        let here = target_visible(&context, &caller, &target(local), local).await;
+        let node = LinkNode {
+            local,
+            ids: context.node_and_realm(),
+        };
+        let visible = |target| TargetVisibleOperation::new(&caller, &target, node);
+        let here = drive(visible(target(local)), &context).await;
         assert_eq!(here, Ok(true));
-        let there = target_visible(&context, &caller, &target(remote), local).await;
+        let there = drive(visible(target(remote)), &context).await;
         assert!(matches!(there, Err(LinkError::Unavailable(_))), "{there:?}");
     }
 
@@ -467,14 +606,17 @@ mod tests {
             auth,
             credential: (String::new(), Ulid::from_parts(2, 2), 0),
         };
-        let now = aruna_core::time::unix_timestamp_secs();
-        let visitor = delegation(&caller(AuthContext::anonymous(realm_id)), target);
-        assert!(visitor.credential_expiry >= now);
+        let now = 1_000;
+        let visitor = delegation(&caller(AuthContext::anonymous(realm_id)), target, now);
+        assert_eq!(visitor.credential_expiry, now + MAX_VALID_SECS);
         let member = AuthContext {
             user_id: aruna_core::UserId::new(Ulid::from_parts(7, 7), realm_id),
             ..AuthContext::anonymous(realm_id)
         };
-        assert_eq!(delegation(&caller(member), target).credential_expiry, 0);
+        assert_eq!(
+            delegation(&caller(member), target, now).credential_expiry,
+            0
+        );
     }
 
     #[tokio::test]
@@ -496,14 +638,80 @@ mod tests {
             key: "n3.txt".to_string(),
             version: None,
         };
-        let created = create_link(
-            &context,
-            &caller,
-            ("work", "n3.txt", group_id),
-            (local, source),
-        );
-        let error = created.await.unwrap_err();
+        let node = LinkNode {
+            local,
+            ids: context.node_and_realm(),
+        };
+        let created = CreateLinkOperation::new(&caller, ("work", "n3.txt", group_id), node, source);
+        let error = drive(created, &context).await.unwrap_err();
         assert!(matches!(&error, LinkError::Invalid(_)), "{error:?}");
         assert!(error.to_string().contains("names the exact version"));
+    }
+
+    fn step_target() -> (LinkCaller, LinkTarget, LinkNode) {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let caller = LinkCaller {
+            auth: AuthContext::anonymous(realm_id),
+            credential: (String::new(), Ulid::from_parts(2, 2), 0),
+        };
+        let target = LinkTarget {
+            arn: VersionedObjectArn {
+                realm_id,
+                node_id: node,
+                bucket: "db".to_string(),
+                key: "file".to_string(),
+                version: Ulid::from_parts(3, 3),
+            },
+            group_id: Ulid::from_parts(2, 2),
+        };
+        let here = LinkNode {
+            local: node,
+            ids: None,
+        };
+        (caller, target, here)
+    }
+
+    fn outcome<T>(result: Result<T, LinkError>) -> IoResult
+    where
+        T: std::fmt::Debug + PartialEq + Send + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    #[test]
+    fn local_head_ends() {
+        let (caller, target, node) = step_target();
+        let mut head = HeadTargetOperation::new(&caller, &target, node);
+        head.first().unwrap();
+        assert_eq!(head.next(outcome(Ok(()))), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn denied_target_hidden() {
+        let (caller, target, node) = step_target();
+        let mut visible = TargetVisibleOperation::new(&caller, &target, node);
+        visible.first().unwrap();
+        let denied = outcome::<()>(Err(LinkError::Denied));
+        assert_eq!(visible.next(denied), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn failed_head_surfaces() {
+        let (caller, target, node) = step_target();
+        let mut visible = TargetVisibleOperation::new(&caller, &target, node);
+        visible.first().unwrap();
+        let failed = LinkError::Unavailable("down".to_string());
+        let answer = visible.next(outcome::<()>(Err(failed.clone())));
+        assert_eq!(answer, Err(failed));
+    }
+
+    #[test]
+    fn denied_read_stops() {
+        let (caller, target, node) = step_target();
+        let mut read = ReadTargetOperation::new(&caller, &target, node, None);
+        read.first().unwrap();
+        let answer = read.next(outcome::<()>(Err(LinkError::Denied)));
+        assert_eq!(answer, Err(LinkError::Denied));
     }
 }
