@@ -26,7 +26,7 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::routing::bound_view;
 use crate::distribution::routing::local_fence;
 use crate::driver::{DriverContext, drive};
-use crate::s3::object::link::{LinkCaller, target_visible};
+use crate::s3::object::link::{LinkCaller, LinkNode, TargetVisibleOperation};
 use crate::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
 };
@@ -322,6 +322,10 @@ async fn shown_part<R: RangeRelay>(
         auth: auth.clone(),
         credential: (String::new(), info.group_id, expiry),
     };
+    let link_node = LinkNode {
+        local: node_id,
+        ids: context.node_and_realm(),
+    };
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);
     let page = visible_page(
         context,
@@ -340,7 +344,10 @@ async fn shown_part<R: RangeRelay>(
                     .map(|link| LinkTarget::of(link, realm_id))
                 {
                     None => Ok(true),
-                    Some(Some(target)) => target_visible(context, caller, &target, node_id).await,
+                    Some(Some(target)) => {
+                        let visible = TargetVisibleOperation::new(caller, &target, link_node);
+                        drive(visible, context).await
+                    }
                     Some(None) => Ok(false),
                 }
             })
