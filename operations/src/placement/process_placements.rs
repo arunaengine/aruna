@@ -142,8 +142,8 @@ impl ResolveTopicsOperation {
     }
 
     fn split_local(&mut self, existing: &BTreeSet<TopicId>) -> ResolveTurn {
-        let (known, missing): (Vec<_>, Vec<_>) = (self.topics.drain(..))
-            .partition(|topic| existing.contains(topic));
+        let (known, missing): (Vec<_>, Vec<_>) =
+            (self.topics.drain(..)).partition(|topic| existing.contains(topic));
         self.to_ensure = known;
         self.missing = missing;
         if self.missing.is_empty() {
@@ -158,8 +158,8 @@ impl ResolveTopicsOperation {
         }
         // Probe an unreachable peer once per pass; recovery is observed on the next pass.
         let unreachable = &self.unreachable;
-        let (live, skipped): (Vec<_>, Vec<_>) = (self.co_members.iter().copied())
-            .partition(|peer| !unreachable.contains(peer));
+        let (live, skipped): (Vec<_>, Vec<_>) =
+            (self.co_members.iter().copied()).partition(|peer| !unreachable.contains(peer));
         self.skipped = skipped;
         if live.is_empty() {
             return self.decide(GenesisProbe::default());
@@ -453,8 +453,8 @@ impl Operation for MemberGroupOperation {
             }
             MemberStage::Local => {
                 let existing = existing_answer(result)?;
-                let (known, missing): (Vec<_>, Vec<_>) = (self.topics.drain(..))
-                    .partition(|topic| existing.contains(topic));
+                let (known, missing): (Vec<_>, Vec<_>) =
+                    (self.topics.drain(..)).partition(|topic| existing.contains(topic));
                 if missing.is_empty() {
                     return self.top_up(known);
                 }
@@ -808,7 +808,7 @@ struct PlacementRecordOperation {
     value: Value,
     now_ms: u64,
     stage: RecordStage,
-    record: Option<aruna_core::structs::placement::record::PendingShardPlacement>,
+    record: Option<aruna_core::document::PendingShardPlacement>,
 }
 
 impl PlacementRecordOperation {
@@ -896,7 +896,10 @@ impl Operation for PlacementRecordOperation {
                 let topic = shard_topic_id(self.realm_id, &placement);
                 // This loop tops up known topics and keeps records of a missing genesis.
                 if !existing_answer(result)?.contains(&topic) {
-                    debug!(?topic, "Shard topic genesis not local yet; keeping placement record");
+                    debug!(
+                        ?topic,
+                        "Shard topic genesis not local yet; keeping placement record"
+                    );
                     return self.keep();
                 }
                 // The topic exists locally, so reconcile its exact canonical holder
@@ -1030,10 +1033,9 @@ enum ReconcileStage {
 
 type ReconcileTurn = Result<Next<PlacementReconcileOutcome>, IoError>;
 
-/// Reconciles the local node's held shard topics with their co-holders: held topics get
-/// genesis or pull work, then pending placement records set exact members and publishers;
+/// Reconciles held shard topics with their co-holders, then applies pending placement records;
 /// withheld work arms a retry. `run_transitions` is false on request paths: every placement
-/// mutation arms a zero-delay timer, so barriers and proofs run in the background instead.
+/// mutation arms a zero-delay timer, so barriers and proofs run in the background.
 #[derive(Debug, PartialEq)]
 pub struct ReconcilePlacementsOperation {
     realm_id: RealmId,
@@ -1183,21 +1185,23 @@ impl Operation for ReconcilePlacementsOperation {
     fn next(&mut self, result: IoResult) -> ReconcileTurn {
         let realm_id = self.realm_id;
         match self.stage {
-            ReconcileStage::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
-                Ok(config) => {
-                    self.config = Some(Arc::new(config));
-                    self.stage = ReconcileStage::Network;
-                    Ok(Next::Call(existing_call(Vec::new())))
+            ReconcileStage::Config => {
+                match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => {
+                        self.config = Some(Arc::new(config));
+                        self.stage = ReconcileStage::Network;
+                        Ok(Next::Call(existing_call(Vec::new())))
+                    }
+                    Err(GetConfigError::DocumentNotFound) => {
+                        warn!(%realm_id, "Cannot process shard placements without a realm config");
+                        Ok(Next::Done(PlacementReconcileOutcome::clean()))
+                    }
+                    Err(error) => {
+                        warn!(%realm_id, error = %error, "Failed to read realm config for shard placements");
+                        Ok(Next::Done(PlacementReconcileOutcome::storage_failure()))
+                    }
                 }
-                Err(GetConfigError::DocumentNotFound) => {
-                    warn!(%realm_id, "Cannot process shard placements without a realm config");
-                    Ok(Next::Done(PlacementReconcileOutcome::clean()))
-                }
-                Err(error) => {
-                    warn!(%realm_id, error = %error, "Failed to read realm config for shard placements");
-                    Ok(Next::Done(PlacementReconcileOutcome::storage_failure()))
-                }
-            },
+            }
             ReconcileStage::Network => {
                 if matches!(shard_answer(result)?, ShardNetEvent::NoNetwork) {
                     return Ok(Next::Done(PlacementReconcileOutcome::clean()));
@@ -1210,7 +1214,9 @@ impl Operation for ReconcilePlacementsOperation {
             ReconcileStage::Verified => {
                 match result.child::<BTreeSet<TopicId>, IoError>()? {
                     Ok(verified) => self.verified = verified,
-                    Err(error) => warn!(%realm_id, error = %error, "Failed to scan verified shards"),
+                    Err(error) => {
+                        warn!(%realm_id, error = %error, "Failed to scan verified shards")
+                    }
                 }
                 // Withheld genesis and pending pulls retry even without a placement record.
                 self.stage = ReconcileStage::Held;
@@ -1246,18 +1252,20 @@ impl Operation for ReconcilePlacementsOperation {
                 event(result)?;
                 self.next_page()
             }
-            ReconcileStage::Page => match result.child::<(Vec<(Key, Value)>, Option<Key>), IoError>()? {
-                Ok((mut rows, next)) => {
-                    rows.reverse();
-                    self.rows = rows;
-                    self.after = next;
-                    self.next_row()
+            ReconcileStage::Page => {
+                match result.child::<(Vec<(Key, Value)>, Option<Key>), IoError>()? {
+                    Ok((mut rows, next)) => {
+                        rows.reverse();
+                        self.rows = rows;
+                        self.after = next;
+                        self.next_row()
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Failed to list pending shard placements");
+                        Ok(Next::Done(PlacementReconcileOutcome::storage_failure()))
+                    }
                 }
-                Err(error) => {
-                    warn!(error = %error, "Failed to list pending shard placements");
-                    Ok(Next::Done(PlacementReconcileOutcome::storage_failure()))
-                }
-            },
+            }
             ReconcileStage::Record => {
                 match result.child::<bool, IoError>()? {
                     Ok(retry) => self.retry_needed |= retry,
@@ -1336,6 +1344,7 @@ mod pure_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::driver::DriverContext;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use irokle::Storage as _;
     use ulid::Ulid;

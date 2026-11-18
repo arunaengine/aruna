@@ -55,7 +55,7 @@ impl Operation for KickDrainOperation {
             return Ok(Next::Done(()));
         }
         self.scanned = true;
-        let arm = TaskEffect::ArmIdleTimer {
+        let arm = TaskEffect::ScheduleIdleTimer {
             key: TaskKey::DrainSyncOutbox,
             after: Duration::ZERO,
         };

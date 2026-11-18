@@ -165,7 +165,9 @@ impl ApplyPolicyOperation {
             created_at_ms: *created_at_ms,
         };
         self.creating = true;
-        Ok(Next::Call(IoCall::child(CreatePolicyOperation::new(config))))
+        Ok(Next::Call(IoCall::child(CreatePolicyOperation::new(
+            config,
+        ))))
     }
 }
 

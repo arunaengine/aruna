@@ -25,10 +25,11 @@ use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 use super::{IncomingVersionOperation, IncomingVersionResult};
-use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
@@ -43,9 +44,6 @@ use crate::replication::protocol::{
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_authorization::GroupRulesOperation;
-use crate::auth::enforcement::PolicyBulkOperation;
 
 const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -537,7 +535,16 @@ async fn allow_policy(
     permission: &Permission,
     operation: &str,
 ) -> Result<bool, String> {
-    match drive(AuthorizeOperation::new(auth.realm_id, auth, path, permission, PolicyRequestExtras::operation(operation)), context)
+    match drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            path,
+            permission,
+            PolicyRequestExtras::operation(operation),
+        ),
+        context,
+    )
     .await
     {
         Ok(()) => Ok(true),
@@ -687,13 +694,25 @@ async fn bao_policy(
                 unique.entry(key).or_insert(candidate);
             }
             let candidates = unique.into_values().collect::<Vec<_>>();
-            let evaluators = drive(PolicyBulkOperation::new(candidates
-                    .iter()
-                    .map(|candidate| (candidate.realm_id, candidate.group_id))), context)
+            let evaluators = drive(
+                PolicyBulkOperation::new(
+                    candidates
+                        .iter()
+                        .map(|candidate| (candidate.realm_id, candidate.group_id)),
+                ),
+                context,
+            )
             .await
             .map_err(|error| error.to_string())?;
-            let permissions = drive(GroupRulesOperation::new(Some(&request.auth_context), candidates.iter().map(|candidate| candidate.group_id)), context)
-            .await;
+            let permissions = drive(
+                GroupRulesOperation::new(
+                    Some(&request.auth_context),
+                    candidates.iter().map(|candidate| candidate.group_id),
+                ),
+                context,
+            )
+            .await
+            .unwrap_or_default();
             let mut allowed = Vec::with_capacity(candidates.len());
             let mut had_denial = false;
             for candidate in candidates {

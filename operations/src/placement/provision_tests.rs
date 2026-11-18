@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
+use crate::placement::provision::AllocateBindingOperation;
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
@@ -10,8 +12,6 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
 use tempfile::tempdir;
-use crate::driver::drive;
-use crate::placement::provision::AllocateBindingOperation;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -92,10 +92,10 @@ async fn allocation_survives_restart() {
     )
     .await;
 
-    let first = allocate_handle(&context, realm_id, actor.node_id)
+    let first = drive(DrawHandleOperation::new(realm_id, actor.node_id), &context)
         .await
         .unwrap();
-    let second = allocate_handle(&context, realm_id, actor.node_id)
+    let second = drive(DrawHandleOperation::new(realm_id, actor.node_id), &context)
         .await
         .unwrap();
     // The range's first handle is the reserved JobControl handle.
@@ -105,7 +105,7 @@ async fn allocation_survives_restart() {
 
     // "Restart": a fresh allocation reads the persisted cursor and does not
     // re-issue a spent handle.
-    let third = allocate_handle(&context, realm_id, actor.node_id)
+    let third = drive(DrawHandleOperation::new(realm_id, actor.node_id), &context)
         .await
         .unwrap();
     assert_eq!(third.handle.get(), FIRST_GRANTABLE_HANDLE + 3);
@@ -129,8 +129,8 @@ async fn concurrent_allocation_unique() {
     .await;
 
     let (left, right) = tokio::join!(
-        allocate_handle(&context, realm_id, actor.node_id),
-        allocate_handle(&context, realm_id, actor.node_id),
+        drive(DrawHandleOperation::new(realm_id, actor.node_id), &context),
+        drive(DrawHandleOperation::new(realm_id, actor.node_id), &context),
     );
     let left = left.unwrap();
     let right = right.unwrap();
@@ -161,7 +161,15 @@ async fn allocation_sets_provenance() {
     .await;
     let strategy_id = document.default_strategy_id.unwrap();
 
-    let binding = drive(AllocateBindingOperation::new(actor.clone(), PlacementScope::Realm(realm_id), DocumentClass::Metadata, strategy_id), &context)
+    let binding = drive(
+        AllocateBindingOperation::new(
+            actor.clone(),
+            PlacementScope::Realm(realm_id),
+            DocumentClass::Metadata,
+            strategy_id,
+        ),
+        &context,
+    )
     .await
     .unwrap();
 
@@ -191,7 +199,7 @@ async fn exhaustion_returns_error() {
     .await;
 
     assert_eq!(
-        allocate_handle(&context, realm_id, actor.node_id)
+        drive(DrawHandleOperation::new(realm_id, actor.node_id), &context)
             .await
             .unwrap()
             .handle
@@ -199,7 +207,7 @@ async fn exhaustion_returns_error() {
         FIRST_GRANTABLE_HANDLE + 1
     );
     assert!(matches!(
-        allocate_handle(&context, realm_id, actor.node_id).await,
+        drive(DrawHandleOperation::new(realm_id, actor.node_id), &context).await,
         Err(HandleAllocationError::PlacementHandleExhausted { node }) if node == actor.node_id
     ));
 }
@@ -214,7 +222,7 @@ async fn no_range_exhausted() {
     seed_range_config(&context, &actor, range(node(2), 1, 1025)).await;
 
     assert!(matches!(
-        allocate_handle(&context, realm_id, actor.node_id).await,
+        drive(DrawHandleOperation::new(realm_id, actor.node_id), &context).await,
         Err(HandleAllocationError::PlacementHandleExhausted { .. })
     ));
 }

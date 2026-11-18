@@ -273,13 +273,13 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::protocol::decode_message;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::{Effect, NetEffect};
     use aruna_core::events::{Event, MetadataAnswer, NetEvent};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::realm::RealmId;
-    use crate::metadata::protocol::{decode_message};
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
     fn node(rank: u8) -> NodeId {
@@ -419,9 +419,7 @@ mod tests {
     }
 
     fn ready(answer: bool) -> MetadataTransportMessage {
-        MetadataTransportMessage::PromotionReady {
-            result: Ok(answer),
-        }
+        MetadataTransportMessage::PromotionReady { result: Ok(answer) }
     }
 
     /// Runs up to the first readiness check.
@@ -473,7 +471,11 @@ mod tests {
     #[test]
     fn conflicts_list_again() {
         let (mut operation, _) = listed_operation();
-        let lost = || Err(EnsureConfigError::StorageError(StorageError::TransactionConflict));
+        let lost = || {
+            Err(EnsureConfigError::StorageError(
+                StorageError::TransactionConflict,
+            ))
+        };
         for _ in 1..LIST_ATTEMPTS {
             let turn = operation.next(listed(lost()));
             assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
@@ -487,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_target_sends_nothing() {
+    fn refused_target_silent() {
         let (mut operation, mut document) = operation();
         document.nodes.clear();
         operation.first().unwrap();

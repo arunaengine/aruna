@@ -20,10 +20,10 @@ use super::grants::{InstallScope, accesses, covers, parse_grants, patterns_for};
 use super::install::read_config;
 use super::unavailable;
 use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 /// What one run's calls are checked against: the run and the node that runs it.
 #[derive(Clone, Debug)]
@@ -149,7 +149,12 @@ pub(crate) async fn authorize_access(
         session: None,
     };
     let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
-    match drive(AuthorizeOperation::new(realm_id, &auth, target, &access, extras), ctx).await {
+    match drive(
+        AuthorizeOperation::new(realm_id, &auth, target, &access, extras),
+        ctx,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(AuthorizeError::Storage(error)) => Err(unavailable(error.to_string())),
         Err(AuthorizeError::CheckFailed(error)) => Err(unavailable(error)),

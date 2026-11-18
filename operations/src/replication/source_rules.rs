@@ -8,10 +8,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::GroupId;
 
 use super::version_replication::{SourceAuthorization, SourceAuthorizationError};
-use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::PolicyLoadOperation;
 use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
 use crate::driver::{DriverContext, drive};
-use crate::auth::enforcement::PolicyLoadOperation;
 
 impl SourceAuthorization {
     pub(crate) async fn load(
@@ -29,9 +28,12 @@ impl SourceAuthorization {
         )
         .await
         .map_err(permission_error)?;
-        let policies = drive(PolicyLoadOperation::new(auth_context.realm_id, Some(group_id)), context)
-            .await
-            .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
+        let policies = drive(
+            PolicyLoadOperation::new(auth_context.realm_id, Some(group_id)),
+            context,
+        )
+        .await
+        .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
         Ok(Self {
             group_id,
             source_node_id,

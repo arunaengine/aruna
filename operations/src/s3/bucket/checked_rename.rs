@@ -6,9 +6,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 
 use super::rename::{RenameError, RenameInput, RenameKeysOperation, RenamePlan, renamed_key};
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::BucketAccess;
-use crate::driver::{DriverContext, drive};
 use crate::auth::request_authorization::BucketAccessOperation;
+use crate::driver::{DriverContext, drive};
 
 /// Plans or applies a rename only with WRITE, by role and policy, on every old and new key.
 /// A denial answers `Forbidden` before any key is shown or moved.
@@ -18,9 +17,12 @@ pub async fn authorized_rename(
     input: RenameInput,
 ) -> Result<RenamePlan, RenameError> {
     let scope = (input.realm_id, input.group_id, input.node_id);
-    let access = drive(BucketAccessOperation::new(auth, scope, &input.bucket), context)
-        .await
-        .map_err(access_error)?;
+    let access = drive(
+        BucketAccessOperation::new(auth, scope, &input.bucket),
+        context,
+    )
+    .await
+    .map_err(access_error)?;
     let allowed = |key: &str| access.allows(Some(key), &Permission::WRITE);
     let permits = |from: &str, to: &str| allowed(from) && allowed(to);
     let keys = input.keys.clone().unwrap_or_default();

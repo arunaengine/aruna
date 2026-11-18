@@ -42,14 +42,14 @@ use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
+use crate::auth::enforcement::EnforcePolicyOperation;
+use crate::auth::request_authorization::rules_operation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
-use crate::auth::enforcement::EnforcePolicyOperation;
-use crate::auth::request_authorization::rules_operation;
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -532,7 +532,12 @@ pub(crate) async fn check_holder(
                 }
                 let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
                 let request = policy_request_with(pattern, access, Some(auth), extras);
-                if let Err(error) = drive(EnforcePolicyOperation::new(scope.realm_id, request.clone()), ctx).await {
+                if let Err(error) = drive(
+                    EnforcePolicyOperation::new(scope.realm_id, request.clone()),
+                    ctx,
+                )
+                .await
+                {
                     return Err(InstallError::NotHeld(format!("{} ({error})", what())));
                 }
             }

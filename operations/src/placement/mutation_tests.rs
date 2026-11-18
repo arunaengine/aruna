@@ -25,10 +25,17 @@ async fn concurrent_mutations_land() {
         let context = context.clone();
         let actor = actor.clone();
         tasks.push(tokio::spawn(async move {
-            drive(PlacementMutationOperation::new(MutatePlacementConfig {
-                    actor,
-                    mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
-                }, None, None), &context)
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig {
+                        actor,
+                        mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+                    },
+                    None,
+                    None,
+                ),
+                &context,
+            )
             .await
         }));
     }
@@ -65,7 +72,7 @@ fn upsert() -> RealmPlacementMutation {
 }
 
 #[test]
-fn conflicts_wait_then_fail() {
+fn conflicts_then_fail() {
     let mut operation = PlacementMutationOperation::new(mutation_config(upsert()), None, None);
     operation.first().unwrap();
     for _ in 0..CONFLICT_ATTEMPTS {
@@ -98,7 +105,7 @@ fn plain_mutation_finishes() {
 }
 
 #[test]
-fn kick_needs_outbox_rows() {
+fn kick_needs_rows() {
     let mut kick = KickDrainOperation::default();
     kick.first().unwrap();
     let empty = IoResult::Page {
