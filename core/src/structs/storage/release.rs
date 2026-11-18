@@ -168,11 +168,18 @@ pub struct HolderRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseEffect {
     ReadCrate(Box<CrateRead>),
+    /// Reads one [`CRATE_CHUNK`] of a crate version from `offset`.
+    ReadChunk {
+        read: Box<CrateRead>,
+        offset: u64,
+    },
     Holder(HolderRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseEvent {
     CrateRead(Result<CrateBytes, CrateReadError>),
+    /// The chunk's bytes and the size of the whole version.
+    CrateChunk(Result<(CrateBytes, u64), CrateReadError>),
     Holder(Result<HolderAnswer, String>),
 }

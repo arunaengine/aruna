@@ -8,6 +8,7 @@ mod compute;
 pub(crate) mod job;
 mod metadata;
 mod net;
+mod release;
 mod session;
 pub(crate) mod shard;
 mod storage;
@@ -84,10 +85,7 @@ async fn dispatch_unboxed(
         }
         // Release crate reads and holder requests need the runner's handles.
         Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
-            Box::pin(crate::s3::bucket::release::publish::dispatch_release(
-                context, *effect,
-            ))
-            .await,
+            Box::pin(release::dispatch_release(context, *effect)).await,
         )),
         // A plugin artifact chunk travels over the metadata transport, which the runner holds.
         Effect::Net(NetEffect::ArtifactStore(store)) => {
