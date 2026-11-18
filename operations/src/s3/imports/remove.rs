@@ -452,393 +452,157 @@ impl RemoveImportOperation {
             }
             _ => return Err(ImportRuleError::Unexpected("DropProvider")),
         };
-        self.state = RemoveState::Check;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: 1,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    /// A deleted bucket leaves the record; one that still holds objects is `created` again.
-    fn settle(&mut self, value: Option<Value>) -> Effects {
-        let Some(cleanup) = self.cleanup.as_ref() else {
-            return self.fail(ImportRuleError::Unexpected("ReadRecord"));
+        let cleanup = self.cleanup.clone();
+        let cleanup = cleanup.ok_or(ImportRuleError::Unexpected("DropProvider"))?;
+        let settle = SettleProvider {
+            import_id: self.import_id,
+            cleanup,
+            deleted,
+            step: SettleStep::Record,
         };
-        let record = value
-            .map(|value| GroupStorage::from_bytes(&value))
-            .transpose();
-        let mut record = match record {
-            Ok(Some(record)) if record.bucket_state(&cleanup.bucket) == Some(BUCKET_DELETING) => {
-                record
-            }
-            Ok(_) => return self.delete_mark(),
-            Err(error) => return self.fail(error.into()),
-        };
-        let state = format!("{BUCKET_STATE}{}", cleanup.bucket);
-        match self.deleted {
-            true => record.public_config.remove(&state),
-            false => record.public_config.insert(state, "created".to_string()),
-        };
-        let writes = match record_writes(&record) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = RemoveState::WriteRecord;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn delete_mark(&mut self) -> Effects {
-        self.state = RemoveState::DeleteMark;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
-            key: self.mark_key(),
-            txn_id: self.txn_id,
-        })]
+        self.call(RemoveState::Settle, IoCall::child(settle))
     }
 }
 
-impl EffectOperation for RemoveImportOperation {
+impl Operation for RemoveImportOperation {
     type Output = ();
     type Error = ImportRuleError;
 
-    fn start(&mut self) -> Effects {
-        if self.group_id.is_none() {
-            self.state = RemoveState::ReadMark;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
-                key: self.mark_key(),
-                txn_id: None,
-            })];
+    fn first(&mut self) -> RemoveTurn {
+        match self.group_id {
+            Some(group_id) => {
+                let drop = DropRule::new(group_id, self.import_id);
+                self.call(RemoveState::DropRule, IoCall::child(drop))
+            }
+            None => {
+                let mark = read_row(IMPORT_REMOVAL_KEYSPACE, mark_key(self.import_id));
+                self.call(RemoveState::ReadMark, mark)
+            }
         }
-        self.state = RemoveState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, self.group_id, event) {
-            (_, _, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (
-                RemoveState::Start,
-                Some(group_id),
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = RemoveState::Read;
-                let key = import_key(group_id, self.import_id);
-                smallvec![read_group_record(
-                    group_id,
-                    BACKEND_IMPORT_KEYSPACE,
-                    key,
-                    txn_id
-                )]
-            }
-            (RemoveState::Read, Some(_), event) => match parse_group_record(event) {
-                Ok(Some(rule)) => {
-                    let rule = match BackendImport::from_bytes(&rule) {
-                        Ok(rule) => rule,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    self.bucket = Some(rule.bucket.clone());
-                    if rule.mapped_bucket().is_none() {
-                        return self.check_files();
-                    }
-                    // A 1:1 link may be the only storage its bucket has.
-                    self.state = RemoveState::CheckStorage;
-                    smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: vec![
-                            (
-                                STORAGE_BACKEND_KEYSPACE.to_string(),
-                                backend_key(rule.backend_id)
-                            ),
-                            (
-                                S3_BUCKET_KEYSPACE.to_string(),
-                                rule.bucket.as_bytes().to_vec().into(),
-                            ),
-                        ],
-                        txn_id: self.txn_id,
-                    })]
-                }
-                Ok(None) => self.fail(ImportRuleError::NotFound),
-                Err(error) => self.fail(error.into()),
-            },
-            (
-                RemoveState::CheckStorage,
-                Some(_),
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let mut values = values.into_iter().map(|(_, value)| value);
-                let (storage, bucket) = (values.next().flatten(), values.next().flatten());
-                let storage = storage.as_deref().map(GroupStorage::from_bytes).transpose();
-                let storage = match storage {
-                    Ok(storage) => storage,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let shared = storage
-                    .is_none_or(|storage| !storage.splits() || storage.default_bucket().is_some());
-                if bucket.is_some() && !shared {
-                    return self.fail(ImportRuleError::Conflict(ONLY_STORAGE.to_string()));
-                }
-                self.check_files()
-            }
-            (
-                RemoveState::Check,
-                Some(group_id),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => {
-                if !values.is_empty() {
-                    return self.fail(ImportRuleError::Conflict(LINKED_FILES.to_string()));
-                }
-                self.state = RemoveState::Delete;
-                let key = import_key(group_id, self.import_id);
-                // The discovery rules go with the rule.
-                let deletes = [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]
-                    .map(|key_space| (key_space.to_string(), key.clone()))
-                    .to_vec();
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            (RemoveState::Delete, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.state = RemoveState::Mark;
-                let mark = RemovalMark {
-                    bucket: self.bucket.clone().unwrap_or_default(),
-                    cleanup: None,
-                };
-                let value = match mark.to_bytes() {
-                    Ok(value) => value,
-                    Err(error) => return self.fail(error.into()),
-                };
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
-                    key: self.mark_key(),
-                    value: value.into(),
-                    txn_id: self.txn_id,
-                })]
-            }
-            (RemoveState::Mark, _, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(ImportRuleError::Unexpected("Mark"));
-                };
-                self.state = RemoveState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (RemoveState::Commit, _, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
+    fn next(&mut self, result: IoResult) -> RemoveTurn {
+        match self.state {
+            RemoveState::DropRule => {
+                self.bucket = Some(result.child::<String, ImportRuleError>()??);
                 self.scan()
             }
-            (RemoveState::Scan, _, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.purge(values)
-            }
-            (RemoveState::Purge, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+            RemoveState::ReadMark => self.mark_read(result.value()?),
+            RemoveState::Scan => self.purge(result.page()?.0),
+            RemoveState::Purge => {
+                result.done()?;
                 self.scan()
             }
-            (RemoveState::QueueMoves, _, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+            RemoveState::QueueMoves => {
+                result.done()?;
                 let deletes = std::mem::take(&mut self.pending);
                 self.purge_rows(deletes)
             }
-            (
-                RemoveState::QueueClaims,
-                _,
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
+            RemoveState::QueueClaims => {
+                result.done()?;
                 self.claims_queued = true;
-                self.purge(Vec::new())
+                self.rows_gone()
             }
-            (RemoveState::ReadMark, _, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let mark = value.as_deref().map(RemovalMark::from_bytes).transpose();
-                match mark {
-                    Ok(Some(mark)) => {
-                        self.cleanup = mark.cleanup;
-                        self.bucket = Some(mark.bucket);
-                    }
-                    Ok(None) => {}
-                    Err(error) => return self.fail(error.into()),
-                }
-                self.scan()
+            RemoveState::DropProvider => self.provider_dropped(result.event()?),
+            RemoveState::Settle => {
+                result.child::<(), ImportRuleError>()??;
+                Ok(Next::Done(()))
             }
-            (RemoveState::DropProvider, _, Event::Blob(BlobEvent::BucketDeleted { deleted })) => {
-                self.deleted = deleted;
-                self.state = RemoveState::StartRecord;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
+            RemoveState::Unmark => {
+                result.done()?;
+                Ok(Next::Done(()))
             }
-            // The mark stays, so the schedule tries the provider bucket again.
-            (RemoveState::DropProvider, _, Event::Blob(BlobEvent::Error(error))) => {
-                self.fail(ImportRuleError::Read(error.reason()))
-            }
-            (
-                RemoveState::StartRecord,
-                _,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                let Some(cleanup) = self.cleanup.as_ref() else {
-                    return self.fail(ImportRuleError::Unexpected("StartRecord"));
-                };
-                self.txn_id = Some(txn_id);
-                self.state = RemoveState::ReadRecord;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                    key: backend_key(cleanup.backend_id),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (
-                RemoveState::ReadRecord,
-                _,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => self.settle(value),
-            (
-                RemoveState::WriteRecord,
-                _,
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => self.delete_mark(),
-            (RemoveState::DeleteMark, _, Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(ImportRuleError::Unexpected("DeleteMark"));
-                };
-                self.state = RemoveState::CommitRecord;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (
-                RemoveState::CommitRecord,
-                _,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.txn_id = None;
-                self.state = RemoveState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            (RemoveState::Unmark, _, Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                self.state = RemoveState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            _ => self.fail(ImportRuleError::Unexpected("RemoveImport")),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == RemoveState::Finish
-    }
-
-    fn finalize(self) -> Result<(), ImportRuleError> {
-        self.output
-            .unwrap_or(Err(ImportRuleError::Unexpected("Finish")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::rename::tests::rule;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
 
-    fn storage(event: StorageEvent) -> Event {
-        Event::Storage(event)
+    fn page(rows: usize) -> IoResult {
+        IoResult::Page {
+            rows: (0..rows)
+                .map(|row| (Key::from(vec![row as u8]), Value::from(Vec::new())))
+                .collect(),
+            next: None,
+        }
     }
 
-    /// Answers a page scan with `rows` object rows and checks that their delete follows.
-    fn drain(operation: &mut RemoveImportOperation, rows: usize) -> Effects {
-        let values = (0..rows)
-            .map(|row| (Key::from(vec![row as u8]), Value::from(Vec::new())))
-            .collect();
-        let effects = operation.step(storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }));
-        if rows > 0 {
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchDelete { .. })]
-            ));
-        }
-        // The write intents and earlier patterns of the rule go after its rows.
-        if let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() {
-            assert!(
-                [IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE].contains(&key_space.as_str())
-            );
-            return drain(operation, 0);
-        }
-        // The rule's delete claims and moved-row records are queued before the mark goes.
-        if let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() {
-            let works: Vec<_> = writes
-                .iter()
-                .map(|(_, _, value)| BlobCleanupWork::from_bytes(value).unwrap())
-                .collect();
-            assert!(matches!(
-                works.as_slice(),
-                [
-                    BlobCleanupWork::DropClaims { .. },
-                    BlobCleanupWork::DropRows { .. }
-                ]
-            ));
-            return operation.step(storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-        }
-        effects
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
-    fn unmarked(operation: &mut RemoveImportOperation, effects: Effects) {
-        let [
-            Effect::Storage(StorageEffect::Delete {
-                key_space, txn_id, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the mark delete, got {effects:?}")
+    /// Answers scans until no space is left, checks the queued claims and returns the next turn.
+    fn drain(operation: &mut RemoveImportOperation) -> RemoveTurn {
+        loop {
+            match operation.next(page(0)) {
+                Ok(Next::Call(IoCall::Page { space, .. })) => {
+                    assert!(
+                        [IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE].contains(&space.as_str())
+                    );
+                }
+                Ok(Next::Call(IoCall::Write(writes))) => {
+                    let works: Vec<_> = (writes.iter())
+                        .map(|(_, _, value)| BlobCleanupWork::from_bytes(value).unwrap())
+                        .collect();
+                    assert!(matches!(
+                        works.as_slice(),
+                        [
+                            BlobCleanupWork::DropClaims { .. },
+                            BlobCleanupWork::DropRows { .. }
+                        ]
+                    ));
+                    return operation.next(IoResult::Done);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn unmarked(operation: &mut RemoveImportOperation, turn: RemoveTurn) {
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the mark delete, got {turn:?}")
         };
-        assert_eq!(
-            (key_space.as_str(), *txn_id),
-            (IMPORT_REMOVAL_KEYSPACE, None)
-        );
-        operation.step(storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
-        }));
-        assert!(operation.is_complete());
+        assert_eq!(deletes[0].0, IMPORT_REMOVAL_KEYSPACE);
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    fn dropping() -> DropRule {
+        let mut drop = DropRule::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        assert_eq!(drop.transaction(), TransactionMode::Write);
+        assert!(matches!(drop.first(), Ok(Next::Call(IoCall::Read(_)))));
+        drop
+    }
+
+    fn rule_rows(rule: &BackendImport) -> IoResult {
+        IoResult::Values(vec![Some(rule.to_bytes().unwrap().into()), None])
+    }
+
+    #[test]
+    fn missing_rule_refused() {
+        let turn = dropping().next(IoResult::Values(vec![None, None]));
+        assert_eq!(turn, Err(ImportRuleError::NotFound));
     }
 
     #[test]
     fn keeps_filled_link() {
-        let mut operation =
-            RemoveImportOperation::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
-        let rule = crate::s3::bucket::rename::tests::rule();
-        operation.start();
-        operation.step(storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
-        operation.step(storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
-                (Key::from(Vec::new()), None),
-            ],
-        }));
-        let effects = operation.step(storage(StorageEvent::IterResult {
-            values: vec![(Key::from(vec![1]), Value::from(vec![1]))],
-            next_start_after: None,
-        }));
+        let mut drop = dropping();
+        let turn = drop.next(rule_rows(&rule()));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            turn,
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
         ));
         assert_eq!(
-            operation.finalize(),
+            drop.next(page(1)),
             Err(ImportRuleError::Conflict(LINKED_FILES.to_string()))
         );
     }
@@ -846,7 +610,7 @@ mod tests {
     #[test]
     fn keeps_only_storage() {
         // A 1:1 link on a storage without a shared bucket is all the bucket has.
-        let mut rule = crate::s3::bucket::rename::tests::rule();
+        let mut rule = rule();
         rule.backend_prefix = "lab/".to_string();
         rule.write_pattern =
             aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
