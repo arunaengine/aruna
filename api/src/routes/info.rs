@@ -29,7 +29,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::federation::totals::data_totals;
+use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
@@ -2066,7 +2066,9 @@ pub(crate) async fn distinct_buckets(
 /// The realm's current objects and data bytes, stored and referenced alike, private data
 /// included; aggregates only, so no bucket or dataset is named. `None` when unknown here.
 pub(crate) async fn realm_totals(state: &ServerState) -> Option<(u64, u64)> {
-    data_totals(&state.get_ctx(), state.get_node_id())
+    let context = state.get_ctx();
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    drive(DataTotalsOperation::new(state.get_node_id(), realm_id), context.as_ref())
         .await
         .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
         .ok()

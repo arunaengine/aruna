@@ -36,7 +36,7 @@ fn failed(error: impl std::fmt::Display) -> RegistrationError {
 
 /// The counts a registration reports, read before it is signed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct RegistrationCounts {
+pub(crate) struct RegistrationCounts {
     pub kpis: RealmKpis,
     /// `None` when a total is unknown.
     pub totals: Option<RealmTotals>,
@@ -63,7 +63,7 @@ type SendTurn = Result<Next<()>, RegistrationError>;
 /// Sends one publication unless the settings changed since it was decided; counting takes time.
 /// A refused totals report only warns: a registry from before that route keeps the registration.
 #[derive(Debug, PartialEq)]
-pub(super) struct SendRegistrationOperation {
+pub(crate) struct SendRegistrationOperation {
     realm_id: RealmId,
     node_id: NodeId,
     capabilities: NodeCapabilities,
@@ -75,7 +75,7 @@ pub(super) struct SendRegistrationOperation {
 }
 
 impl SendRegistrationOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         (realm_id, node_id): (RealmId, NodeId),
         capabilities: NodeCapabilities,
         publication: Publication,

@@ -30,7 +30,9 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::transfer::{MAX_TRANSFER_SECS, import_key, intent_digest};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::federation::import::{bound_upload, read_import};
+use aruna_operations::federation::import::{
+    BoundUploadOperation, ReadImportOperation, WriteImportOperation,
+};
 use aruna_operations::jobs::import::upload_store::{
     claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, write_rocrate_upload,
 };
@@ -315,7 +317,7 @@ async fn push_binds_principal() {
         .unwrap();
     assert_eq!(record.owner, fixture.user);
     let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
-    let bound = bound_upload(&context, fixture.user, &key).await;
+    let bound = drive(BoundUploadOperation::new(fixture.user, &key), context.as_ref()).await;
     assert_eq!(bound, Ok(Some(upload_id)));
     let again = push(&fixture, &intent, &grant).await.unwrap();
     assert_eq!(again.upload_id, first.upload_id);
@@ -324,7 +326,7 @@ async fn push_binds_principal() {
     let renewed = self::grant(&fresh, BODY);
     let resumed = push(&fixture, &fresh, &renewed).await.unwrap();
     assert_eq!(resumed.upload_id, first.upload_id);
-    let stored = read_import(&context, upload_id).await.unwrap().unwrap();
+    let stored = drive(ReadImportOperation::new(upload_id), context.as_ref()).await.unwrap().unwrap();
     assert_eq!(stored.intent, fresh);
     // Another artifact under the same import key is never handed the bound upload.
     let other = self::grant(&intent, b"another export body");
@@ -347,7 +349,7 @@ async fn push_checks_artifact() {
         ServerError::Refused(_, "artifact_mismatch", _)
     ));
     let key = import_key(&mismatch.payload, &intent.payload.destination).unwrap();
-    let bound = bound_upload(&fixture.state.get_ctx(), fixture.user, &key).await;
+    let bound = drive(BoundUploadOperation::new(fixture.user, &key), fixture.state.get_ctx().as_ref()).await;
     assert_eq!(bound, Ok(None));
     // A body above the granted size is cut off as too large.
     let small = grant(&intent, &BODY[..4]);
@@ -482,7 +484,7 @@ async fn bound_upload_confirmed() {
     let (first, second) = (Ulid::generate(), Ulid::generate());
     seed_upload(&fixture, first).await;
     let context = fixture.state.get_ctx();
-    write_import(&context, &key, first, &binding).await.unwrap();
+    drive(WriteImportOperation::new(&key, first, binding.clone()), context.as_ref()).await.unwrap();
     let user = fixture.user;
     let error = import(&fixture, user, &intent, &grant, SECRET).await;
     assert!(matches!(
@@ -490,7 +492,7 @@ async fn bound_upload_confirmed() {
         Err(ServerError::ServiceUnavailableReason(_))
     ));
     seed_upload(&fixture, second).await;
-    let bound = write_import(&context, &key, second, &binding).await;
+    let bound = drive(WriteImportOperation::new(&key, second, binding.clone()), context.as_ref()).await;
     assert_eq!(bound, Ok(first));
 }
 
@@ -527,7 +529,7 @@ async fn losing_spool_discarded() {
         grant: grant.clone(),
         confirmed: false,
     };
-    write_import(&context, &key, first, &binding).await.unwrap();
+    drive(WriteImportOperation::new(&key, first, binding.clone()), context.as_ref()).await.unwrap();
     let losing = load_rocrate_upload(&context, second)
         .await
         .unwrap()
@@ -560,7 +562,7 @@ async fn conflicting_winner_refused() {
         grant: other,
         confirmed: false,
     };
-    write_import(&context, &key, first, &winner).await.unwrap();
+    drive(WriteImportOperation::new(&key, first, winner.clone()), context.as_ref()).await.unwrap();
     let losing = load_rocrate_upload(&context, second)
         .await
         .unwrap()
@@ -590,7 +592,7 @@ async fn retry_keeps_plan() {
     let upload_id = Ulid::generate();
     seed_upload(&fixture, upload_id).await;
     let context = fixture.state.get_ctx();
-    write_import(&context, &key, upload_id, &binding)
+    drive(WriteImportOperation::new(&key, upload_id, binding.clone()), context.as_ref())
         .await
         .unwrap();
     let first = submit(&fixture, upload_id, &key, "first").await.unwrap();
@@ -647,7 +649,7 @@ async fn push_replaces_expired() {
     let second = push(&fixture, &intent, &grant).await.unwrap();
     let second_id = Ulid::from_string(&second.upload_id).unwrap();
     assert_ne!(second_id, first_id);
-    let bound = bound_upload(&context, fixture.user, &key).await;
+    let bound = drive(BoundUploadOperation::new(fixture.user, &key), context.as_ref()).await;
     assert_eq!(bound, Ok(Some(second_id)));
     // The sweep removes the second upload unused as well.
     let swept = storage

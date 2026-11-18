@@ -37,13 +37,13 @@ use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
 
 const EXPORT_OPERATION: &str = "federation.export";
 
-pub(crate) fn record_key(job_id: JobId) -> Vec<u8> {
+pub fn record_key(job_id: JobId) -> Vec<u8> {
     [&b"grant/"[..], &job_id.to_bytes()].concat()
 }
 
 /// Owned inputs of [`IssueGrantOperation`].
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IssueGrantConfig {
+pub struct IssueGrantConfig {
     pub realm_id: RealmId,
     pub principal: UserId,
     pub job_id: JobId,
@@ -58,12 +58,12 @@ pub(crate) struct IssueGrantConfig {
 /// Reads the grant record and checkpoint of an export, then returns the stored grant while it
 /// is valid, or signs a new one from the finished checkpoint. Nothing is written here.
 #[derive(Debug, PartialEq)]
-pub(crate) struct IssueGrantOperation {
+pub struct IssueGrantOperation {
     config: IssueGrantConfig,
 }
 
 impl IssueGrantOperation {
-    pub(crate) fn new(config: IssueGrantConfig) -> Self {
+    pub fn new(config: IssueGrantConfig) -> Self {
         Self { config }
     }
 
@@ -149,7 +149,7 @@ fn storage_error(error: impl std::fmt::Display) -> GrantError {
 }
 
 /// The context a stored grant is checked under: its consenting user, without a session.
-pub(crate) fn grant_principal(user_id: UserId, realm_id: RealmId) -> AuthContext {
+pub fn grant_principal(user_id: UserId, realm_id: RealmId) -> AuthContext {
     AuthContext {
         user_id,
         realm_id,
@@ -159,7 +159,7 @@ pub(crate) fn grant_principal(user_id: UserId, realm_id: RealmId) -> AuthContext
 }
 
 /// READ on the document and the deny-only `federation.export` policies for `audience`.
-pub(crate) fn export_access(
+pub fn export_access(
     auth: &AuthContext,
     document_path: &str,
     audience: RealmId,
@@ -194,7 +194,7 @@ type RecheckTurn = Result<Next<()>, GrantError>;
 /// versions themselves, and for a copy read under a bucket key that key unlocked and held. A
 /// credential cutoff of the consenting user also ends grants issued before it.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RecheckGrantOperation {
+pub struct RecheckGrantOperation {
     auth: AuthContext,
     record: GrantRecord,
     now_secs: u64,
@@ -202,7 +202,7 @@ pub(crate) struct RecheckGrantOperation {
 }
 
 impl RecheckGrantOperation {
-    pub(crate) fn new(auth: AuthContext, record: GrantRecord) -> Self {
+    pub fn new(auth: AuthContext, record: GrantRecord) -> Self {
         Self {
             auth,
             record,
@@ -368,7 +368,7 @@ enum IssueStep {
 /// repeated request returns the stored grant while it is valid; an expired grant needs a new
 /// intent and export. A racing request may store its grant or a revocation first; that one wins.
 #[derive(Debug, PartialEq)]
-pub(crate) struct IssueExportOperation {
+pub struct IssueExportOperation {
     auth: AuthContext,
     config: Option<IssueGrantConfig>,
     job_id: JobId,
@@ -377,7 +377,7 @@ pub(crate) struct IssueExportOperation {
 }
 
 impl IssueExportOperation {
-    pub(crate) fn new(auth: AuthContext, config: IssueGrantConfig) -> Self {
+    pub fn new(auth: AuthContext, config: IssueGrantConfig) -> Self {
         Self {
             auth,
             job_id: config.job_id,
@@ -432,7 +432,7 @@ impl Operation for IssueExportOperation {
 /// Admits one artifact read by a grant: its signature, binding and lifetime, the stored record
 /// and revoked flag, and the current checks of the consenting user.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AdmitGrantOperation {
+pub struct AdmitGrantOperation {
     local: RealmId,
     job_id: JobId,
     grant: Signed<ExportGrant>,
@@ -441,7 +441,7 @@ pub(crate) struct AdmitGrantOperation {
 }
 
 impl AdmitGrantOperation {
-    pub(crate) fn new(local: RealmId, job_id: JobId, grant: Signed<ExportGrant>, now: u64) -> Self {
+    pub fn new(local: RealmId, job_id: JobId, grant: Signed<ExportGrant>, now: u64) -> Self {
         Self {
             local,
             job_id,
@@ -482,12 +482,12 @@ impl Operation for AdmitGrantOperation {
 
 /// The grant record of one export job, if one was issued.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadGrantOperation {
+pub struct ReadGrantOperation {
     job_id: JobId,
 }
 
 impl ReadGrantOperation {
-    pub(crate) fn new(job_id: JobId) -> Self {
+    pub fn new(job_id: JobId) -> Self {
         Self { job_id }
     }
 }
@@ -503,6 +503,35 @@ impl Operation for ReadGrantOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, GrantError> {
         Ok(Next::Done(decoded(result)?))
+    }
+}
+
+/// Revokes the grant of one export for every later read; false when none was issued.
+#[derive(Debug, PartialEq)]
+pub struct RevokeGrantOperation {
+    job_id: JobId,
+}
+
+impl RevokeGrantOperation {
+    pub fn new(job_id: JobId) -> Self {
+        Self { job_id }
+    }
+}
+
+impl Operation for RevokeGrantOperation {
+    type Output = bool;
+    type Error = GrantError;
+
+    fn first(&mut self) -> Result<Next<bool>, GrantError> {
+        let key = record_key(self.job_id);
+        Ok(Next::Call(change_call(RecordChange::RevokeGrant { key })))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, GrantError> {
+        match (result.child::<RecordOutcome, RecordError>()?).map_err(storage_error)? {
+            RecordOutcome::Revoked(existed) => Ok(Next::Done(existed)),
+            other => Err(GrantError::Storage(format!("unexpected outcome {other:?}"))),
+        }
     }
 }
 
@@ -740,6 +769,17 @@ mod tests {
             ..record()
         };
         assert_eq!(admit().next(stored(&revoked)), Err(GrantError::Revoked));
+    }
+
+    #[test]
+    fn revoke_reports_existing() {
+        let mut operation = RevokeGrantOperation::new(job());
+        let revoke = change_call(RecordChange::RevokeGrant {
+            key: record_key(job()),
+        });
+        assert_eq!(operation.first(), Ok(Next::Call(revoke)));
+        let answer = operation.next(child::<_, RecordError>(Ok(RecordOutcome::Revoked(true))));
+        assert_eq!(answer, Ok(Next::Done(true)));
     }
 
     #[test]
