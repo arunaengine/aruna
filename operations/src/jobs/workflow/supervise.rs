@@ -19,7 +19,7 @@ use super::super::store::attempt::record_attempt_started;
 use super::super::store::state::{read_job_record, renew_lease};
 use super::DEFAULT_WALLTIME;
 use super::finalize::{finalize_attempt, finalize_session, finalize_walltime};
-use super::session::{start_session, write_session_report};
+use super::session::{report_session, start_session};
 use crate::driver::DriverContext;
 
 /// Heartbeat + backend wait race, then evidence-based terminalization. Shared by
@@ -76,7 +76,7 @@ pub async fn supervise_and_finalize(
                         false => EndReason::KernelExit,
                     };
                     session.end(reason);
-                    Box::pin(write_session_report(
+                    Box::pin(report_session(
                         &context,
                         job_id,
                         token,
@@ -93,7 +93,7 @@ pub async fn supervise_and_finalize(
             SessionOutcome::Walltime => {
                 if let Some(session) = &session {
                     session.end(EndReason::Walltime);
-                    Box::pin(write_session_report(
+                    Box::pin(report_session(
                         &context,
                         job_id,
                         token,

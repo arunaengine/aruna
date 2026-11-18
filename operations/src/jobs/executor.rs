@@ -165,6 +165,7 @@ impl RangeTurns {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
@@ -216,13 +217,14 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             attempt,
             access_key,
         } => {
-            Box::pin(crate::jobs::workflow::cleanup::run_terminal_cleanup(
-                ctx,
+            let cleanup = crate::jobs::workflow::cleanup::TerminalCleanupOperation::new(
                 *for_job,
-                attempt.as_ref(),
+                ctx.claim_token,
+                attempt.clone(),
                 access_key,
-            ))
-            .await
+            );
+            let result = Box::pin(crate::driver::drive(cleanup, &ctx.driver)).await;
+            crate::jobs::workflow::cleanup::cleanup_outcome(result)
         }
         JobPayload::Staging(spec) => {
             Box::pin(crate::jobs::staging::run_staging_job(ctx, spec)).await

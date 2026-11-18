@@ -776,7 +776,8 @@ mod tests {
         };
         let job = JobRecord::new(job_id, payload, creator, node, 1_000, 1_000, None);
         insert_job(&context, &job).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -795,7 +796,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!crate::jobs::runtime::key_unlocked(&context, key.key).await);
+        assert!(
+            !crate::driver::drive(
+                crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
+                &context
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(
             read_job_record(&context, job_id, None)
                 .await
@@ -951,14 +959,10 @@ mod tests {
             })
             .await;
         assert_eq!(process_transitions(&context).await.unwrap(), Some(RECHECK));
-        let stored = read_row(
-            &context,
-            TRANSITION_KEYSPACE,
-            b"sealed".to_vec(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
         let parked = EncryptionTransition::from_bytes(&stored).unwrap();
         assert_eq!(
             (parked.state, parked.remaining),
@@ -1005,14 +1009,10 @@ mod tests {
                 .is_some_and(|remaining| remaining <= duration)
         );
         while fired.recv().await.unwrap() != TaskKey::MigrateCompression {}
-        let resumed = read_row(
-            &context,
-            TRANSITION_KEYSPACE,
-            b"sealed".to_vec(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let resumed = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             EncryptionTransition::from_bytes(&resumed)
                 .unwrap()
@@ -1022,14 +1022,10 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
         assert!(duration < RECHECK);
         process_transitions(&context).await.unwrap();
-        let stored = read_row(
-            &context,
-            TRANSITION_KEYSPACE,
-            b"sealed".to_vec(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
         let progressed = EncryptionTransition::from_bytes(&stored).unwrap();
         assert_eq!(
             (progressed.done, progressed.remaining, progressed.failed),

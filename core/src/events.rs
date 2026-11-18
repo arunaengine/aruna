@@ -66,6 +66,8 @@ pub enum Event {
     },
     /// The typed outcome of a child made with `IoCall::child`; never persisted.
     Child(crate::calls::ChildOutcome),
+    /// Answers `Effect::Compute`; never persisted.
+    Compute(Box<crate::compute::effect::ComputeAnswer>),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -1097,6 +1099,7 @@ impl Event {
                 }
             ),
             Event::Session(_) => "Event::Session",
+            Event::Compute(_) => "Event::Compute",
             Event::Outbound(event) => variant_label!(
                 event,
                 OutboundEvent {

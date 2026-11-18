@@ -332,7 +332,8 @@ async fn workspace_credential_writes() -> TestResult<()> {
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
     };
-    use aruna_operations::jobs::workflow::workspace::mint_workspace_credential;
+    use aruna_operations::driver::drive;
+    use aruna_operations::jobs::workflow::prepare::workspace_mint;
 
     let seed = spawn_complete_seed().await?;
     let result = async {
@@ -379,15 +380,11 @@ async fn workspace_credential_writes() -> TestResult<()> {
         );
         record.workspace_mode = WorkspaceMode::Existing;
         record.workspace_bucket = Some("ws-run".to_string());
-        let minted = mint_workspace_credential(
-            seed.context.as_ref(),
-            &spec,
-            &record,
-            node_id,
-            ("ws-run", None),
-        )
-        .await
-        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let context = seed.context.as_ref();
+        let mint = workspace_mint(context, &spec, &record, node_id, ("ws-run", None));
+        let minted = drive(mint, context)
+            .await
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         let run = client(
             &seed,
             &S3Credentials {

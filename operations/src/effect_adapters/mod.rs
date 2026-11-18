@@ -4,6 +4,7 @@
 
 mod audit;
 mod blob;
+mod compute;
 mod metadata;
 mod net;
 mod session;
@@ -193,6 +194,9 @@ async fn dispatch_unboxed(
         Effect::Session(effect) => {
             Event::Session(Box::new(session::dispatch_session(*effect, context).await))
         }
+        Effect::Compute(effect) => {
+            Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
+        }
     };
 
     trace!(
@@ -228,6 +232,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
     }
