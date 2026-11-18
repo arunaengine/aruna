@@ -2198,16 +2198,10 @@ mod pure_tests {
         let owner = UserId::new(Ulid::from(11u128), test_realm());
         let mut operation = device_operation(local_node, peer, owner);
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(device_realm_value(peer, owner)),
-        }));
+        operation.first().unwrap();
+        let turn = operation.next(row(Some(device_realm_value(peer, owner))));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
         assert_eq!(operation.request.auth_context.user_id, owner);
         // A device is never a placement destination, so nothing governed lands.
         assert_eq!(operation.peer_placement, None);
@@ -2221,13 +2215,10 @@ mod pure_tests {
         let other = UserId::new(Ulid::from(12u128), test_realm());
         let mut operation = device_operation(local_node, peer, other);
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(device_realm_value(peer, owner)),
-        }));
+        operation.first().unwrap();
+        let turn = operation.next(row(Some(device_realm_value(peer, owner))));
 
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     // Governed content stays out of reach: the device claims no subject, so the
@@ -2247,9 +2238,9 @@ mod pure_tests {
         operation.peer_placement = None;
 
         let (location, _) = location_value([4u8; 32]);
-        let effects = operation.challenge_destination(location);
+        let turn = operation.challenge_destination(location);
 
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2301,13 +2292,10 @@ mod pure_tests {
             read_request(local_node, [4u8; 32]),
         );
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(realm_value(configured_peer)),
-        }));
+        operation.first().unwrap();
+        let turn = operation.next(row(Some(realm_value(configured_peer))));
 
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::RealmPeerDenied);
     }
 
     #[test]
@@ -2323,22 +2311,9 @@ mod pure_tests {
         )
         .with_snapshot();
 
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: true
-            })]
-        ));
-        let txn_id = Ulid::from(10u128);
-        assert!(matches!(
-            operation
-                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
-                .as_slice(),
-            [Effect::Storage(StorageEffect::Read {
-                txn_id: Some(read_txn),
-                ..
-            })] if *read_txn == txn_id
-        ));
+        // Every read of the serve joins one read snapshot.
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
     }
 
     #[test]
@@ -2366,14 +2341,11 @@ mod pure_tests {
             let stream_id = Ulid::from(9u128);
             let mut operation =
                 IncomingBaoOperation::new(peer, local_node, test_realm(), stream_id, request);
-            let effects = operation.start();
+            let turn = operation.first();
             if accepted {
-                assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::Read { .. })]
-                ));
+                assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
             } else {
-                assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
+                assert_eq!(refusal_from(&turn), BaoReadRefusal::RealmPeerDenied);
             }
         }
     }
@@ -2391,16 +2363,10 @@ mod pure_tests {
             read_request(local_node, hash),
         );
 
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(realm_value(peer)),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(bucket_value()),
-        }));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        operation.first().unwrap();
+        operation.next(row(Some(realm_value(peer)))).unwrap();
+        let turn = operation.next(row(Some(bucket_value())));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     /// A request for one version of `set_id` by its logical identity.
@@ -2459,50 +2425,35 @@ mod pure_tests {
                 version_request(set_id, hash),
             )
             .with_policy_paths(HashSet::from([path.clone()]));
-            operation.start();
-            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: Some(realm_value(peer)),
-            }));
+            operation.first().unwrap();
+            let turn = operation.next(row(Some(realm_value(peer))));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+                &turn,
+            Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2
             ));
-            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (Vec::new().into(), Some(record.clone().into())),
-                    (Vec::new().into(), Some(index.to_bytes().unwrap().into())),
-                ],
-            }));
+            let turn = operation.next(rows(vec![
+                Some(record.clone().into()),
+                Some(index.to_bytes().unwrap().into()),
+            ]));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == b"spire"
+                &turn,
+            Ok(Next::Call(IoCall::Read(reads))) if reads[0].1.as_ref() == b"spire"
             ));
             operation
         };
 
         // A bucket of the name that is not the set's member never answers for it.
         let mut stranger = start();
-        let effects = stranger.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(bound_bucket(None)),
-        }));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+        let turn = stranger.next(row(Some(bound_bucket(None))));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
 
         let mut operation = start();
         let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(bound_bucket(Some(binding))),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(version_value(hash)),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
+        operation
+            .next(row(Some(bound_bucket(Some(binding)))))
+            .unwrap();
+        let turn = operation.next(row(Some(version_value(hash))));
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
     }
 
     // A node that keeps only the record of a distributed version serves its verified attachment.
@@ -2556,37 +2507,25 @@ mod pure_tests {
             read_request(local_node, hash),
         )
         .with_policy_paths(HashSet::from([read_path(local_node)]));
-        operation.start();
+        operation.first().unwrap();
         for value in [realm_value(peer), bucket_value()] {
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: Some(value),
-            }));
+            operation.next(row(Some(value))).unwrap();
         }
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(record_only.to_bytes().unwrap().into()),
-        }));
+        let turn = operation.next(row(Some(record_only.to_bytes().unwrap().into())));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 3
+            &turn,
+            Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 3
         ));
         let (location, _) = location_value(hash);
         let attached = Attachment {
             blake3: hash,
             location: location.clone(),
         };
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
-                (Vec::new().into(), None),
-            ],
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: None,
-        }));
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        operation
+            .next(rows(vec![Some(attached.to_bytes().unwrap().into()), None]))
+            .unwrap();
+        let turn = operation.next(row(None));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected accepted frame")
         };
         assert!(matches!(
@@ -2647,27 +2586,17 @@ mod pure_tests {
             read_request(local_node, hash),
         )
         .with_policy_paths(HashSet::from([read_path(local_node)]));
-        operation.start();
+        operation.first().unwrap();
         for value in [realm_value(peer), bucket_value()] {
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: Some(value),
-            }));
+            operation.next(row(Some(value))).unwrap();
         }
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(record_only.to_bytes().unwrap().into()),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Vec::new().into(), None),
-                (Vec::new().into(), None),
-                (Vec::new().into(), Some(record.into())),
-            ],
-        }));
+        operation
+            .next(row(Some(record_only.to_bytes().unwrap().into())))
+            .unwrap();
+        let turn = operation.next(rows(vec![None, None, Some(record.into())]));
         let holder = crate::distribution::test_record::secret(2).public();
         assert_eq!(
-            refusal_from(&effects),
+            refusal_from(&turn),
             BaoReadRefusal::HeldBy { holder, set_id }
         );
     }
@@ -2732,7 +2661,7 @@ mod pure_tests {
             .held_version(&reference)
             .expect("a kept reference");
         assert_eq!((held.identity, held.blake3), (identity, None));
-        operation.read_kept(held);
+        operation.read_kept(held).unwrap();
         let (location, _) = location_value(bytes);
         let entry = CacheEntry {
             key: identity,
@@ -2741,17 +2670,11 @@ mod pure_tests {
             size: 42,
             order: Ulid::from(3u128),
         };
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Vec::new().into(), None),
-                (Vec::new().into(), Some(entry.to_bytes().unwrap().into())),
-            ],
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: None,
-        }));
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        operation
+            .next(rows(vec![None, Some(entry.to_bytes().unwrap().into())]))
+            .unwrap();
+        let turn = operation.next(row(None));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected accepted frame")
         };
         assert!(matches!(
@@ -2772,30 +2695,15 @@ mod pure_tests {
             IncomingBaoOperation::new(peer, local_node, test_realm(), stream_id, request)
                 .with_policy_paths(HashSet::from([read_path(local_node)]));
 
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(realm_value(peer)),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(bucket_value()),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(version_value(hash)),
-        }));
+        operation.first().unwrap();
+        operation.next(row(Some(realm_value(peer)))).unwrap();
+        operation.next(row(Some(bucket_value()))).unwrap();
+        operation.next(row(Some(version_value(hash)))).unwrap();
         let (location, value) = location_value(hash);
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(value),
-        }));
+        operation.next(row(Some(value))).unwrap();
         // The bucket has no encryption settings, so the plain copy is offered without a lease.
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: None,
-        }));
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        let turn = operation.next(row(None));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected accepted frame")
         };
         assert_eq!(
@@ -2808,22 +2716,20 @@ mod pure_tests {
             }
         );
 
-        let effects = operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        let turn = operation.next(blob(BlobEvent::MessageSent { stream_id }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ServeRead {
+            asked(&turn),
+            Effect::Blob(BlobEffect::ServeRead {
                 stream_id: id,
                 location: selected,
                 expected_blake3,
                 range: None,
-            })] if *id == stream_id && selected == &location && expected_blake3 == &hash
+            }) if *id == stream_id && selected == &location && expected_blake3 == &hash
         ));
-        assert!(
-            operation
-                .step(Event::Blob(BlobEvent::ReadServed { stream_id }))
-                .is_empty()
+        assert_eq!(
+            operation.next(blob(BlobEvent::ReadServed { stream_id })),
+            Ok(Next::Done(IncomingBaoResult::Served))
         );
-        assert_eq!(operation.finalize().unwrap(), IncomingBaoResult::Served);
     }
 
     #[test]
@@ -2839,21 +2745,12 @@ mod pure_tests {
         )
         .with_policy_paths(HashSet::from([read_path(local_node)]));
 
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(realm_value(peer)),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(bucket_value()),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(version_value([5u8; 32])),
-        }));
+        operation.first().unwrap();
+        operation.next(row(Some(realm_value(peer)))).unwrap();
+        operation.next(row(Some(bucket_value()))).unwrap();
+        let turn = operation.next(row(Some(version_value([5u8; 32]))));
 
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::HashMismatch);
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::HashMismatch);
     }
 
     #[test]
@@ -2866,13 +2763,10 @@ mod pure_tests {
         let mut operation =
             IncomingBaoOperation::new(peer, local_node, test_realm(), Ulid::from(9u128), request);
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: Some(realm_value(peer)),
-        }));
+        operation.first().unwrap();
+        let turn = operation.next(row(Some(realm_value(peer))));
 
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::BackendFailure);
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::BackendFailure);
     }
 
     /// An incoming read that resolved to a sealed copy of `bucket_id`, ready to be offered.
@@ -2920,17 +2814,14 @@ mod pure_tests {
 
         let bucket_id = Ulid::from(30u128);
         let (mut operation, location) = sealed_serve(bucket_id);
-        let effects = operation.send_accepted(location);
+        let turn = operation.send_accepted(location);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if key.bucket_id == bucket_id
+            asked(&turn),
+            Effect::Blob(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id
         ));
         let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
-        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            refusal_from(&effects),
-            BaoReadRefusal::BucketLocked(bucket_id)
-        );
+        let turn = operation.next(blob(BlobEvent::Error(locked)));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::BucketLocked(bucket_id));
     }
 
     #[test]
@@ -2941,7 +2832,7 @@ mod pure_tests {
 
         let bucket_id = Ulid::from(30u128);
         let (mut operation, location) = sealed_serve(bucket_id);
-        operation.send_accepted(location.clone());
+        operation.send_accepted(location.clone()).unwrap();
         let key = BucketKeyRef::new(bucket_id, 1);
         let lease = ReadLease::new(
             key,
@@ -2949,20 +2840,20 @@ mod pure_tests {
             Ulid::from(31u128),
             Arc::new(()),
         );
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
-            panic!("expected the accepted frame, got {effects:?}")
+        let turn = operation.next(blob(BlobEvent::ReadAdmitted { lease }));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+            panic!("expected the accepted frame, got {turn:?}")
         };
         assert!(matches!(
             VersionReplicationMessage::from_bytes(payload).unwrap(),
             VersionReplicationMessage::BaoReadAccepted { .. }
         ));
-        let effects = operation.step(Event::Blob(BlobEvent::MessageSent {
+        let turn = operation.next(blob(BlobEvent::MessageSent {
             stream_id: Ulid::from(9u128),
         }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ServeSealedRead { lease, .. })] if lease.key == key
+            asked(&turn),
+            Effect::Blob(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key
         ));
     }
 
@@ -2982,12 +2873,7 @@ mod pure_tests {
             key_generation: 1,
             ..Default::default()
         };
-        let settings_row = || {
-            Event::Storage(StorageEvent::ReadResult {
-                key: b"bucket".to_vec().into(),
-                value: Some(settings.to_bytes().unwrap().into()),
-            })
-        };
+        let settings_row = || row(Some(settings.to_bytes().unwrap().into()));
         let plain = || {
             let (mut operation, mut location) = sealed_serve(bucket_id);
             location.format = StoredFormat::default();
@@ -3003,36 +2889,32 @@ mod pure_tests {
 
         // Locked: a raw copy not converted yet is refused like a sealed one.
         let (mut operation, location) = plain();
-        let effects = operation.send_accepted(location);
+        let turn = operation.send_accepted(location);
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = operation.next(settings_row());
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
-        let effects = operation.step(settings_row());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })]
+            asked(&turn),
+            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
                 if *admitted == key && *named == archive
         ));
         let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
-        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            refusal_from(&effects),
-            BaoReadRefusal::BucketLocked(bucket_id)
-        );
+        let turn = operation.next(blob(BlobEvent::Error(locked)));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::BucketLocked(bucket_id));
 
         // Unlocked: it is served under the bucket lease.
         let (mut operation, location) = plain();
-        operation.send_accepted(location);
-        operation.step(settings_row());
+        operation.send_accepted(location).unwrap();
+        operation.next(settings_row()).unwrap();
         let lease = ReadLease::new(key, archive, Ulid::from(31u128), Arc::new(()));
-        operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        let effects = operation.step(Event::Blob(BlobEvent::MessageSent {
+        operation
+            .next(blob(BlobEvent::ReadAdmitted { lease }))
+            .unwrap();
+        let turn = operation.next(blob(BlobEvent::MessageSent {
             stream_id: Ulid::from(9u128),
         }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ServeSealedRead { lease, .. })] if lease.key == key
+            asked(&turn),
+            Effect::Blob(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key
         ));
     }
 
@@ -3057,27 +2939,23 @@ mod pure_tests {
         };
         let resolved = || {
             let mut operation = device_serve(Some([5u8; 32]));
-            operation.serve_observation(observation(5, Some("5-1")));
+            operation
+                .serve_observation(observation(5, Some("5-1")))
+                .unwrap();
             let access = ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::new(),
                 path: "file.txt".to_string(),
                 version: None,
             };
-            let effects = operation.step(Event::SubOperation(
-                SubOperationEvent::VersionAccessResolved { result: Ok(access) },
-            ));
+            let resolved = SubOperationEvent::VersionAccessResolved { result: Ok(access) };
+            let event = Event::SubOperation(resolved);
+            let turn = operation.next(IoResult::Event(Box::new(event)));
+            assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
+            let turn = operation.next(row(Some(settings.to_bytes().unwrap().into())));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { .. })]
-            ));
-            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: b"bucket".to_vec().into(),
-                value: Some(settings.to_bytes().unwrap().into()),
-            }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if key.bucket_id == bucket_id
+                asked(&turn),
+            Effect::Blob(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id
             ));
             operation
         };
@@ -3085,11 +2963,8 @@ mod pure_tests {
         // Locked: the device's file is refused before any accepted frame.
         let mut operation = resolved();
         let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
-        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            refusal_from(&effects),
-            BaoReadRefusal::BucketLocked(bucket_id)
-        );
+        let turn = operation.next(blob(BlobEvent::Error(locked)));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::BucketLocked(bucket_id));
 
         // Unlocked: the file is served while the operation holds the bucket lease.
         let mut operation = resolved();
@@ -3097,13 +2972,15 @@ mod pure_tests {
         let archive = ArchiveKey::new(bucket_id, BackendRef::node_default());
         let guard = Arc::new(());
         let lease = ReadLease::new(key, archive, Ulid::from(41u128), guard.clone());
-        operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        let effects = operation.step(Event::Blob(BlobEvent::MessageSent {
+        operation
+            .next(blob(BlobEvent::ReadAdmitted { lease }))
+            .unwrap();
+        let turn = operation.next(blob(BlobEvent::MessageSent {
             stream_id: Ulid::from(9u128),
         }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ServeSourceRead { .. })]
+            asked(&turn),
+            Effect::Blob(BlobEffect::ServeSourceRead { .. })
         ));
         assert_eq!(Arc::strong_count(&guard), 2);
     }
