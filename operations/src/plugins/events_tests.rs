@@ -24,7 +24,6 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, journal};
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
-use crate::replication::drain::process_blob_batch;
 use crate::replication::queue::QueueBlobOperation;
 use crate::sync::sync_relationship::StoreRelationshipOperation;
 use crate::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
@@ -256,7 +255,16 @@ async fn sync_job_runs() {
     let queue = QueueBlobOperation::new_relationship(input, None, relationship.id);
     drive(queue, &fixture.ctx).await.unwrap();
 
-    let drained = process_blob_batch(&fixture.ctx).await.unwrap();
+    let drained = crate::driver::drive(
+        crate::replication::drain::ProcessBlobBatchOperation::new(
+            crate::replication::page::deliver::MetadataPages,
+            crate::driver::node_routing(&fixture.ctx),
+            (&fixture.ctx).node_and_realm(),
+        ),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     assert_eq!(drained.succeeded, 1);
     for _ in 0..2 {
         let worker = worker(&fixture);

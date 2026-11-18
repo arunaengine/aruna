@@ -1010,7 +1010,15 @@ async fn import_records(
             return;
         }
         loop {
-            let drained = crate::replication::drain::process_blob_batch(&drain).await;
+            let drained = crate::driver::drive(
+                crate::replication::drain::ProcessBlobBatchOperation::new(
+                    crate::replication::page::deliver::MetadataPages,
+                    crate::driver::node_routing(&drain),
+                    (&drain).node_and_realm(),
+                ),
+                &drain,
+            )
+            .await;
             if !drained.is_ok_and(|drained| drained.has_more_due) && woken.changed().await.is_err()
             {
                 return;
