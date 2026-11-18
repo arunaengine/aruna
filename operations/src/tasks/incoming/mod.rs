@@ -51,9 +51,8 @@ use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
 use crate::blob::holders::RefreshHoldersOperation;
-use crate::blob::reclaim_sweep::{
-    RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
-};
+use crate::blob::reclaim_sweep::{RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, ReclaimSweepOperation};
+use crate::blob::sweep_timer::ArmSweepOperation;
 use crate::device::drain::{
     DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, restore_publish_timer,
 };
@@ -904,14 +903,13 @@ impl OperationsTaskHandler {
                 };
                 let key = BucketKeyRef::new(bucket_id, generation);
                 let origin = (*net_handle.realm_id(), net_handle.node_id());
-                let promoted = crate::blob::unlocked::promote_unlocked(
-                    &self.context,
+                let promoted = crate::blob::unlocked::PromoteUnlockedOperation::new(
                     key,
                     origin,
                     &self.rocrate_limits,
                 );
                 // A locked key leaves the archives pending; its next unlock promotes them.
-                if let Err(error) = promoted.await {
+                if let Err(error) = drive(promoted, &self.context).await {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),

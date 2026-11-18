@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::node_routing;
+use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -339,7 +341,10 @@ impl TaskQueues {
         }
         if context.blob_handle.is_some() {
             restore_hidden_sweep(&context.storage_handle, &task_handle).await;
-            restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
+            let arm = ArmSweepOperation::new(TaskKey::DrainReclaimQueue);
+            if let Err(error) = drive(arm, &context).await {
+                warn!(error = %error, "Failed to schedule blob reclaim sweep");
+            }
             handler
                 .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
@@ -817,37 +822,41 @@ impl OperationsTaskHandler {
             .await;
     }
 
+    fn reclaim_sweep(&self) -> ReclaimSweepOperation {
+        let catalog = node_routing(&self.context).catalog;
+        ReclaimSweepOperation::new(catalog, SystemTime::now(), self.reclaim_start())
+    }
+
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
         // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
         // failing one cannot hold a one-minute rescan of the whole queue forever.
-        let (after, drained) =
-            match process_reclaim_batch(&self.context, self.reclaim_start()).await {
-                Ok(outcome) => {
-                    self.set_reclaim_start(outcome.next_start_after);
-                    match (outcome.capped, outcome.failed) {
-                        (true, _) => {
-                            self.reset_backoff(&key);
-                            (RECLAIM_SWEEP_RETRY, false)
-                        }
-                        (false, 0) => {
-                            self.reset_backoff(&key);
-                            (RECLAIM_SWEEP_AFTER, true)
-                        }
-                        (false, _) => (
-                            self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                            true,
-                        ),
+        let (after, drained) = match drive(self.reclaim_sweep(), &self.context).await {
+            Ok(outcome) => {
+                self.set_reclaim_start(outcome.next_start_after);
+                match (outcome.capped, outcome.failed) {
+                    (true, _) => {
+                        self.reset_backoff(&key);
+                        (RECLAIM_SWEEP_RETRY, false)
                     }
-                }
-                Err(error) => {
-                    warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-                    (
+                    (false, 0) => {
+                        self.reset_backoff(&key);
+                        (RECLAIM_SWEEP_AFTER, true)
+                    }
+                    (false, _) => (
                         self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                        false,
-                    )
+                        true,
+                    ),
                 }
-            };
+            }
+            Err(error) => {
+                warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+                (
+                    self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                    false,
+                )
+            }
+        };
         // Removal walks whole keyspaces too, so it only rides a sweep that
         // reached the end of the queue, never the fast retries behind a backlog.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {

@@ -17,6 +17,7 @@ pub mod reclaim;
 pub mod reclaim_sweep;
 pub mod records;
 pub(crate) mod release;
+pub mod sweep_timer;
 pub(crate) mod trail;
 pub mod unify;
 pub(crate) mod unlocked;
