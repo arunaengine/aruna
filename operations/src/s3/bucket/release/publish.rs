@@ -1050,75 +1050,270 @@ impl ReadCrateOperation {
     }
 }
 
-/// Reads `range` of a release crate version, or all of it, and the version's whole size.
-async fn read_part(
-    context: &DriverContext,
-    read: CrateRead,
-    range: Option<ObjectRangeRequest>,
-) -> Result<(CrateBytes, u64), CrateReadError> {
-    let input = GetObjectInput {
-        bucket: read.bucket,
-        key: read.key,
-        version_id: Some(read.version_id),
-        range,
-        group_id: read.group_id,
-        user_identity: read.auth.user_id,
-        realm_id: read.realm_id,
-        node_id: read.node_id,
-    };
-    let restrictions = read.auth.path_restrictions.clone();
-    let result = match routed_read(context, input, restrictions).await {
-        Ok(result) => result,
-        Err(
-            GetObjectError::NoSuchKey
-            | GetObjectError::NoSuchVersion
-            | GetObjectError::DeleteMarker,
-        ) => return Err(CrateReadError::Missing),
-        Err(error) => return Err(CrateReadError::Failed(error.to_string())),
-    };
-    let size = result.info.size;
-    let mut bytes = Vec::new();
-    let mut blob = result.blob;
-    while let Some(chunk) = blob.next().await {
-        let chunk = chunk.map_err(|error| CrateReadError::Failed(error.to_string()))?;
-        bytes.extend_from_slice(&chunk);
+impl Operation for ReadCrateOperation {
+    type Output = Result<CrateBytes, CrateReadError>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+        let read = self.read.take().ok_or(IoError::Unfinished)?;
+        let effect = ReleaseEffect::ReadCrate(Box::new(read));
+        Ok(Next::Call(
+            Effect::Net(NetEffect::Release(Box::new(effect))).into(),
+        ))
     }
-    let found = CrateBytes {
-        metadata: result.metadata,
-        bytes,
-    };
-    Ok((found, size))
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
+        match result.event()? {
+            Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read))) => Ok(Next::Done(read)),
+            other => Err(IoError::Unexpected {
+                expected: "ReleaseEvent::CrateRead",
+                got: other.label(),
+            }),
+        }
+    }
 }
 
-/// Asks a holder with the caller's bearer, which goes only to a realm infrastructure node.
-async fn ask_holder(
-    context: &DriverContext,
-    request: HolderRequest,
-) -> Result<HolderAnswer, String> {
-    let handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or("no metadata handle")?;
-    let realm_id = (context.net_handle.as_ref())
-        .map(|net| *net.realm_id())
-        .ok_or("no realm")?;
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !is_sync_eligible(&config, request.node_id) {
-        return Err(format!("{} is no infrastructure node", request.node_id));
+#[derive(Debug, PartialEq)]
+enum HolderStep {
+    Bucket,
+    Access,
+    Members,
+    View(Box<AskedFiles>),
+    Fence(Box<AskedFiles>, Box<DistributionView>),
+    Files,
+    Chunk,
+}
+
+/// The files of one range another member asks for.
+#[derive(Debug, PartialEq)]
+struct AskedFiles {
+    range_id: Ulid,
+    prefix: String,
+    skip: String,
+    after: Option<String>,
+}
+
+/// A holder's answer for its ranges, for the caller it validated from the request's bearer
+/// itself. It answers only for ranges it coordinates now.
+#[derive(Debug, PartialEq)]
+pub struct HolderAnswerOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: AuthContext,
+    bucket: String,
+    ask: Option<HolderAsk>,
+    scope: Option<ReleaseScope>,
+    access: Option<Access>,
+    step: HolderStep,
+}
+
+type HolderTurn = PublishTurn<HolderAnswer>;
+
+fn no_files() -> HolderTurn {
+    Ok(Next::Done(HolderAnswer::Files(RangeFiles {
+        files: Vec::new(),
+        refused: true,
+        next: None,
+    })))
+}
+
+impl HolderAnswerOperation {
+    pub fn new(
+        (realm_id, node_id): (RealmId, NodeId),
+        auth: &AuthContext,
+        (bucket, ask): (&str, HolderAsk),
+    ) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            auth: auth.clone(),
+            bucket: bucket.to_string(),
+            ask: Some(ask),
+            scope: None,
+            access: None,
+            step: HolderStep::Bucket,
+        }
     }
-    let token = AuthToken::bearer(request.bearer).map_err(|error| format!("{error:?}"))?;
-    handle
-        .request_release_holder(request.node_id, Some(token), request.bucket, request.ask)
-        .await
-        .map_err(|error| format!("{error:?}"))
+
+    fn scope(&self) -> Result<&ReleaseScope, IoError> {
+        self.scope.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn access(&self) -> Result<&Access, IoError> {
+        self.access.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn answer(&mut self) -> HolderTurn {
+        let scope = self.scope()?.clone();
+        let access = self.access()?.clone();
+        match self.ask.take().ok_or(IoError::Unfinished)? {
+            HolderAsk::Members { range_ids, queries } => {
+                let members = ReleaseMembersOperation::new(MembersConfig {
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                    bucket: self.bucket.clone(),
+                    info: scope.info,
+                    auth: self.auth.clone(),
+                    access,
+                    bearer: None,
+                    queries,
+                    ranges: Some(range_ids),
+                    retention: false,
+                });
+                self.step = HolderStep::Members;
+                Ok(Next::Call(IoCall::child(members)))
+            }
+            HolderAsk::Files {
+                range_id,
+                prefix,
+                skip,
+                after,
+            } => {
+                let Some(binding) = &scope.info.distribution else {
+                    return no_files();
+                };
+                self.step = HolderStep::View(Box::new(AskedFiles {
+                    range_id,
+                    prefix,
+                    skip,
+                    after,
+                }));
+                Ok(Next::Call(IoCall::child(read_view(binding.set_id))))
+            }
+            HolderAsk::Crate {
+                key,
+                version_id,
+                offset,
+            } => {
+                if !access.0.allows(Some(&key), &Permission::READ) {
+                    return Err(PublishError::Forbidden("the release crate is not readable"));
+                }
+                let read = CrateRead {
+                    bucket: self.bucket.clone(),
+                    key,
+                    version_id,
+                    group_id: scope.info.group_id,
+                    auth: self.auth.clone(),
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                };
+                let read = Box::new(read);
+                let effect = ReleaseEffect::ReadChunk { read, offset };
+                self.step = HolderStep::Chunk;
+                Ok(Next::Call(
+                    Effect::Net(NetEffect::Release(Box::new(effect))).into(),
+                ))
+            }
+        }
+    }
+
+    fn list_range(&mut self, asked: AskedFiles, range: &KeyRange) -> HolderTurn {
+        let scope = self.scope()?;
+        let names = (asked.prefix.as_str(), asked.skip.as_str());
+        let page = (Some(range), asked.after);
+        let list = ReleaseFilesOperation::new(scope.view(), self.access()?, names, page);
+        self.step = HolderStep::Files;
+        Ok(Next::Call(IoCall::child(list)))
+    }
+}
+
+impl Operation for HolderAnswerOperation {
+    type Output = HolderAnswer;
+    type Error = PublishError;
+
+    fn first(&mut self) -> HolderTurn {
+        let bucket = GetBucketOperation::new(self.bucket.clone());
+        Ok(Next::Call(IoCall::child(bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> HolderTurn {
+        match std::mem::replace(&mut self.step, HolderStep::Files) {
+            HolderStep::Bucket => {
+                let info = result.child::<BucketInfo, GetBucketError>()?;
+                let scope = ReleaseScope {
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                    bucket: self.bucket.clone(),
+                    info: info.map_err(unavailable)?,
+                };
+                let load = LoadAccessOperation::new(scope.view(), &self.auth);
+                self.scope = Some(scope);
+                self.step = HolderStep::Access;
+                Ok(Next::Call(IoCall::child(load)))
+            }
+            HolderStep::Access => {
+                self.access = Some(result.child::<Access, ReleaseError>()??);
+                self.answer()
+            }
+            HolderStep::Members => {
+                let output = result.child::<MembersOutput, ReleaseError>()??;
+                Ok(Next::Done(HolderAnswer::Members(RangeMembers {
+                    answers: output.answers,
+                    releases: output.releases,
+                    complete: output.complete,
+                    refused: output.refused,
+                })))
+            }
+            HolderStep::View(asked) => {
+                let view = (result.child::<Option<DistributionView>, StatusError>()?)
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("no record of the set"))?;
+                let binding =
+                    (self.scope()?.info.distribution.as_ref()).ok_or(IoError::Unfinished)?;
+                let fence = local_fence(binding.set_id);
+                self.step = HolderStep::Fence(asked, Box::new(view));
+                Ok(Next::Call(IoCall::child(fence)))
+            }
+            HolderStep::Fence(asked, view) => {
+                let fence = result.child::<LocalFence, GuardError>()?;
+                let fence = fence.map_err(unavailable)?;
+                let binding =
+                    (self.scope()?.info.distribution.as_ref()).ok_or(IoError::Unfinished)?;
+                let member_id = binding.member_id;
+                let snapshot = view.snapshot();
+                let range = (snapshot.config.ranges.iter())
+                    .find(|range| range.range_id == asked.range_id)
+                    .filter(|range| snapshot.lists_locally(member_id, range, &fence));
+                match range {
+                    Some(range) => self.list_range(*asked, range),
+                    None => no_files(),
+                }
+            }
+            HolderStep::Files => {
+                let (files, next) = result.child::<FilesPage, PublishError>()??;
+                Ok(Next::Done(HolderAnswer::Files(RangeFiles {
+                    files,
+                    refused: false,
+                    next,
+                })))
+            }
+            HolderStep::Chunk => {
+                let Event::Net(NetEvent::Release(ReleaseEvent::CrateChunk(read))) =
+                    result.event()?
+                else {
+                    return Err(unavailable("no release crate answer"));
+                };
+                match read {
+                    Ok((found, size)) if found.metadata.contains_key(RELEASE_TAG) => {
+                        let bytes = found.bytes;
+                        let chunk = CrateChunk { bytes, size };
+                        Ok(Next::Done(HolderAnswer::Crate(Some(chunk))))
+                    }
+                    Ok(_) | Err(CrateReadError::Missing) => {
+                        Ok(Next::Done(HolderAnswer::Crate(None)))
+                    }
+                    Err(CrateReadError::Failed(reason)) => Err(PublishError::Unavailable(reason)),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{pinned_ids, upstream_of};
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::identifier::IdentifierTarget;
     use aruna_core::structs::storage::global_id::GlobalId;
     use aruna_core::structs::storage::origin::OriginVersion;
@@ -1198,5 +1393,90 @@ mod tests {
                 .find(|entity| entity["@id"] == id.as_str());
             assert_eq!(entity.unwrap()["value"], value);
         }
+    }
+
+    fn step_info(realm_id: RealmId) -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::UNIX_EPOCH,
+            created_by: aruna_core::UserId::nil(realm_id),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    fn step_input(realm_id: RealmId) -> PublishInput {
+        PublishInput {
+            auth: AuthContext::anonymous(realm_id),
+            bearer: Some("do-not-print".to_string()),
+            key: "db/release.json".to_string(),
+            spec: ReleaseSpec::default(),
+        }
+    }
+
+    #[test]
+    fn bearer_stays_hidden() {
+        let input = step_input(RealmId::from_bytes([1; 32]));
+        assert!(!format!("{input:?}").contains("do-not-print"));
+    }
+
+    #[test]
+    fn missing_write_refused() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let info = step_info(realm_id);
+        let scope = BucketScope {
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            bucket: "db",
+            info: &info,
+        };
+        let routing = NodeRouting::default();
+        let mut publish = PublishReleaseOperation::new(scope, step_input(realm_id), routing);
+        publish.first().unwrap();
+        let denied: Result<(), AuthorizeError> = Err(AuthorizeError::PermissionDenied);
+        let answer = publish.next(IoResult::Child(ChildOutcome::new(denied)));
+        assert_eq!(
+            answer,
+            Err(PublishError::Forbidden("no WRITE on the bucket"))
+        );
+    }
+
+    #[test]
+    fn failed_transport_unavailable() {
+        let peer = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let answer = MetadataAnswer {
+            peer,
+            elapsed: Duration::ZERO,
+            result: Ok(vec![0xff]),
+        };
+        let event = Event::Net(NetEvent::MetadataAnswer(Box::new(answer)));
+        assert_eq!(
+            holder_reply(IoResult::Event(Box::new(event))),
+            Ok(Err(MetadataReadError::Unavailable))
+        );
+    }
+
+    #[test]
+    fn missing_chunk_answers() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let auth = AuthContext::anonymous(realm_id);
+        let ask = HolderAsk::Crate {
+            key: "db/release.json".to_string(),
+            version_id: Ulid::from_bytes([4; 16]),
+            offset: 0,
+        };
+        let mut holder = HolderAnswerOperation::new((realm_id, node), &auth, ("db", ask));
+        holder.step = HolderStep::Chunk;
+        let read = ReleaseEvent::CrateChunk(Err(CrateReadError::Missing));
+        let event = Event::Net(NetEvent::Release(read));
+        assert_eq!(
+            holder.next(IoResult::Event(Box::new(event))),
+            Ok(Next::Done(HolderAnswer::Crate(None)))
+        );
     }
 }
