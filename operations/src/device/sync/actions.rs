@@ -26,8 +26,7 @@ use crate::device::sync_status::ArmTimerOperation;
 use crate::driver::DriverContext;
 
 use super::download::{Blob, FetchError, FetchRemoteOperation};
-use super::folder_reads::{list_entries, read_bound};
-use super::folders::FolderError;
+use super::folders::{FolderError, list_entries, read_bound};
 use super::materialize::{
     MaterializeEntryOperation, MaterializeError, MaterializeInput, MaterializeOutcome,
 };
