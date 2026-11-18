@@ -87,8 +87,8 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
-use crate::node::node_info::observe_placement;
-use crate::node::usage_publish::restore_usage_timer;
+use crate::node::info::facts::NodeFacts;
+use crate::node::info::flows::ObservePlacementOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;
@@ -117,6 +117,7 @@ use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
+mod registration;
 mod restore;
 
 pub use outbox::drive_sync_drain;
@@ -786,10 +787,13 @@ impl OperationsTaskHandler {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
                 // The same observation that reconciles shards reconciles this node's placement subject: a moved,
                 // draining or removed node stops admitting governed data and revalidates its inventory.
-                if let Err(error) =
-                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
-                        .await
-                {
+                let observe = ObservePlacementOperation::new(
+                    realm_id,
+                    node_id,
+                    unix_timestamp_millis(),
+                    NodeFacts::gather(&self.context),
+                );
+                if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
                 let outcome = process_shard_placements(&self.context, realm_id, node_id).await;

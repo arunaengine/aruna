@@ -10,6 +10,7 @@ use crate::error::ServerError;
 use crate::lookup::map_guard_error;
 use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::ReadRoute;
@@ -20,7 +21,6 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::node::node_info::node_urls;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
@@ -258,7 +258,10 @@ impl McpServer {
                 ),
             ));
         }
-        let urls = node_urls(context.as_ref(), node_id).await;
+        let urls = drive(NodeUrlsOperation::new(node_id), context.as_ref())
+            .await
+            .ok()
+            .flatten();
         let Some(base) = urls.and_then(|urls| urls.api) else {
             return Err(silent("publishes no api address".to_string()));
         };

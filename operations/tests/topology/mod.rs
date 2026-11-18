@@ -905,7 +905,7 @@ impl Topology {
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
-        aruna_operations::node::startup::restore_shard_subscriptions(
+        aruna_operations::shard::restore::restore_shard_subscriptions(
             &node.context,
             node_id,
             self.realm_id,
@@ -1201,7 +1201,7 @@ async fn install_realm_config(
         "shard placement reconciliation never reported clean",
         || async {
             join_all(nodes.iter().map(|node| {
-                aruna_operations::node::startup::restore_shard_subscriptions(
+                aruna_operations::shard::restore::restore_shard_subscriptions(
                     &node.context,
                     node.node_id(),
                     realm_id,
@@ -1678,7 +1678,7 @@ pub async fn install_replica_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::shard::restore::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 *realm_id,

@@ -10,7 +10,6 @@ pub mod drain;
 pub mod edit;
 pub mod enqueue_draft;
 pub mod forward;
-mod local_run;
 pub mod inspect_draft;
 pub mod install_graph;
 pub mod list_drafts;

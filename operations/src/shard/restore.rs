@@ -18,18 +18,18 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::document_sync::apply_metadata;
-use crate::node::recovery::{
+use crate::metadata::after_sync::apply_metadata;
+use crate::node::summary_refresh::RefreshUsageOperation;
+use crate::notifications::watch::interest::RefreshInterestOperation;
+use crate::shard::recovery::{
     PhaseOutcome, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass, RecoveryRotation,
     RecoveryStatus, apply_recovery_pass,
 };
-use crate::node::restore_plan::{
+use crate::shard::restore_plan::{
     RestoreKind, RestoreRange, RestoreShardSummary, RestoreUnit, RestoreUnitOutcome,
     ShardRestoreCursor, ShardRestorePass, bind_restore_plan, plan_shard_groups, restore_range,
     sync_eligible_node,
 };
-use crate::node::summary_refresh::RefreshUsageOperation;
-use crate::notifications::watch::interest::RefreshInterestOperation;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -346,13 +346,13 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::node::usage_publish::publish_refresh_snapshots(
+    let publish = crate::node::usage_publish::PublishUsageOperation::new(
         context.as_ref(),
-        config.node_id,
-        config.realm_id,
+        (config.node_id, config.realm_id),
         true,
-    )
-    .await;
+        true,
+    );
+    let result = drive(publish, context.as_ref()).await;
     match result {
         Ok(_) => {
             *pending = false;
@@ -858,8 +858,8 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::recovery::RecoveryState;
-    use crate::node::restore_plan::{
+    use crate::shard::recovery::RecoveryState;
+    use crate::shard::restore_plan::{
         RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
     };
     use aruna_core::UserId;

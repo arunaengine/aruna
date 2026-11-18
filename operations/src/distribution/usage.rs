@@ -3,12 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::types::TxnId;
-
 pub use super::charged_ranges::{
     HeldRange, HeldRanges, HeldRangesOperation, RangeUsage, UsageError, sum_held,
 };
-pub use super::replica_shares::{GroupShare, ReplicaSharesOperation};
 
 /// The local distributed bucket's binding, record and the charged rows of every range this
 /// member holds; `None` for an ordinary bucket or a member whose record has not arrived.
@@ -16,29 +13,28 @@ pub fn held_ranges(bucket: &str) -> HeldRangesOperation {
     HeldRangesOperation::new(bucket)
 }
 
-/// Each group's replica share on this node; see [`ReplicaSharesOperation`].
-pub fn replica_shares(txn_id: TxnId) -> ReplicaSharesOperation {
-    ReplicaSharesOperation::new(txn_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::distribution::charged_ranges::{charged_rows, sum_rows};
-    use crate::distribution::replica_shares::BindingShareOperation;
+    use crate::distribution::replica_shares::{
+        BindingShareOperation, GroupShare, ReplicaSharesOperation,
+    };
+    use crate::driver::drive;
     use crate::replication::members::BoundRecordOperation;
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
+    use aruna_core::keyspaces::{
+        RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::distribution::accounting::{
         Charge, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
     };
     use aruna_core::structs::storage::distribution::DistributionSnapshot;
     use aruna_core::structs::storage::usage::UsageCounters;
-    use aruna_core::types::Value;
+    use aruna_core::types::{GroupId, Value};
     use ulid::Ulid;
 
     /// What this member holds of `bucket`'s set as copies: every range with an account here, one
@@ -55,25 +51,42 @@ mod tests {
         else {
             return Ok((RangeCounters::default(), None));
         };
-        let txn_id = match (context.storage_handle)
-            .send_storage_effect(StorageEffect::StartTransaction { read: true })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(StorageError::ReadError(format!(
-                    "unexpected answer {}",
-                    other.label()
-                ))
-                .into());
+        drive(BindingShareOperation::new(binding), context).await
+    }
+
+    /// Reads the shares in a snapshot opened before `purge` runs outside it.
+    #[derive(Debug, PartialEq)]
+    struct PurgedShares {
+        purge: Option<IoCall>,
+        opened: bool,
+        shares: ReplicaSharesOperation,
+    }
+
+    impl Operation for PurgedShares {
+        type Output = BTreeMap<GroupId, GroupShare>;
+        type Error = UsageError;
+
+        fn first(&mut self) -> Result<Next<Self::Output>, UsageError> {
+            let row = (S3_BUCKET_KEYSPACE.to_string(), b"opens".to_vec().into());
+            Ok(Next::Call(IoCall::Read(vec![row])))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, UsageError> {
+            if !self.opened {
+                self.opened = true;
+                let purge = self.purge.take().ok_or(IoError::Unfinished)?;
+                return Ok(Next::Call(purge));
             }
-        };
-        let share = drive(BindingShareOperation::new(binding, txn_id), context).await;
-        (context.storage_handle)
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        share
+            if self.purge.is_none() && matches!(result, IoResult::Done) {
+                self.purge = Some(IoCall::Sync);
+                return self.shares.first();
+            }
+            self.shares.next(result)
+        }
+
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::ReadSnapshot
+        }
     }
 
     fn account(charge: Charge) -> RangeAccount {
@@ -276,23 +289,17 @@ mod tests {
             replica_share(&context, "spire").await.unwrap().0,
             counted(3, 15, 7)
         );
-        let txn_id = match handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: true })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            other => panic!("unexpected answer {other:?}"),
-        };
         // A purge after the snapshot opened does not reach the shares read in it.
-        let purge = StorageEffect::BatchDelete {
-            deletes: vec![(
-                RANGE_ACCOUNT_KEYSPACE.to_string(),
-                account_key(set_id, purged).into(),
-            )],
-            txn_id: None,
+        let purge = IoCall::Delete(vec![(
+            RANGE_ACCOUNT_KEYSPACE.to_string(),
+            account_key(set_id, purged).into(),
+        )]);
+        let read = PurgedShares {
+            purge: Some(purge),
+            opened: false,
+            shares: ReplicaSharesOperation::new(),
         };
-        handle.send_storage_effect(purge).await;
-        let shares = drive(replica_shares(txn_id), &context).await.unwrap();
+        let shares = drive(read, &context).await.unwrap();
         let expected = UsageCounters {
             objects: 3,
             logical_bytes: 15,
@@ -349,13 +356,9 @@ mod tests {
             replica_share(&context, "spire").await.unwrap().0,
             objects(-1)
         );
-        let start = StorageEffect::StartTransaction { read: true };
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
-            handle.send_storage_effect(start).await
-        else {
-            panic!("no read transaction");
-        };
-        let shares = drive(replica_shares(txn_id), &context).await.unwrap();
+        let shares = drive(ReplicaSharesOperation::new(), &context)
+            .await
+            .unwrap();
         assert!(
             shares.values().all(|share| share.replicas.objects == 0),
             "a negative share reads as zero"

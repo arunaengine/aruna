@@ -1132,7 +1132,7 @@ mod tests {
     };
     use crate::node::summary_refresh::RefreshUsageOperation;
     use crate::node::usage_publish::{
-        clear_consumed_markers, publish_refresh_snapshots, publish_usage_snapshots,
+        ClearMarkersOperation, PublishUsageOperation, PublishedUsage,
     };
     use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::s3::bucket::create::CreateBucketOperation;
@@ -1165,6 +1165,25 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
+    async fn publish_usage_snapshots(
+        ctx: &DriverContext,
+        node_id: NodeId,
+        realm_id: RealmId,
+        full: bool,
+    ) -> Result<PublishedUsage, String> {
+        let publish = PublishUsageOperation::new(ctx, (node_id, realm_id), full, false);
+        drive(publish, ctx).await.map_err(|error| error.to_string())
+    }
+
+    async fn publish_refresh_snapshots(
+        ctx: &DriverContext,
+        node_id: NodeId,
+        realm_id: RealmId,
+        full: bool,
+    ) -> Result<PublishedUsage, String> {
+        let publish = PublishUsageOperation::new(ctx, (node_id, realm_id), full, true);
+        drive(publish, ctx).await.map_err(|error| error.to_string())
+    }
     fn row(value: Option<Vec<u8>>) -> IoResult {
         IoResult::Values(vec![value.map(Into::into)])
     }
@@ -2664,7 +2683,7 @@ mod tests {
         let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), generation_two.clone()).await;
 
-        clear_consumed_markers(&ctx, observed)
+        drive(ClearMarkersOperation::new(observed), &ctx)
             .await
             .unwrap();
 
@@ -2680,7 +2699,7 @@ mod tests {
             Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_two),
         )];
-        clear_consumed_markers(&ctx, observed)
+        drive(ClearMarkersOperation::new(observed), &ctx)
             .await
             .unwrap();
         assert!(

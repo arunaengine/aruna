@@ -827,11 +827,7 @@ mod tests {
             .map(|(user, _)| user)
             .map_err(link_error);
         assert_eq!(linked, Err(LinkLoginError::CutOff));
-        let row = crate::jobs::key_wake::read_row(
-            &context,
-            USER_KEYSPACE,
-            local(2).to_bytes(),
-        );
+        let row = crate::jobs::key_wake::read_row(&context, USER_KEYSPACE, local(2).to_bytes());
         let user = User::from_bytes(&row.await.unwrap().unwrap()).unwrap();
         assert!(!user.alias_user_ids.contains(&foreign()));
     }

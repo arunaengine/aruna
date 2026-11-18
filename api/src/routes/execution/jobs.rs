@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
 use aruna_operations::driver::drive;
-use aruna_operations::federation::export::admit_grant;
+use aruna_operations::federation::grant::AdmitGrantOperation;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
@@ -1421,7 +1421,8 @@ async fn artifact_response(
             let context = state.get_ctx();
             let local = state.get_realm_id();
             let now = now_ms / 1000;
-            let record = admit_grant(&context, local, job_id, &grant, now)
+            let admit = AdmitGrantOperation::new(local, job_id, grant, now);
+            let record = drive(admit, context.as_ref())
                 .await
                 .map_err(crate::routes::federation::export::grant_refused)?;
             (record.principal, None)

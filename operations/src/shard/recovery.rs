@@ -99,7 +99,7 @@ impl RecoveryError {
         }
     }
 
-    pub(super) fn merge(current: Option<Self>, next: Option<Self>) -> Option<Self> {
+    pub(crate) fn merge(current: Option<Self>, next: Option<Self>) -> Option<Self> {
         match (current, next) {
             (Some(Self::Panicked), _) | (_, Some(Self::Panicked)) => Some(Self::Panicked),
             (Some(Self::Storage), _) | (_, Some(Self::Storage)) => Some(Self::Storage),
@@ -181,7 +181,7 @@ impl RecoveryStatus {
 
     /// The last progress time in milliseconds, finer than the snapshot's seconds.
     #[cfg(test)]
-    pub(super) fn progress_ms(&self) -> u64 {
+    pub(crate) fn progress_ms(&self) -> u64 {
         self.inner.last_progress_ms.load(Ordering::Relaxed)
     }
 
@@ -190,7 +190,7 @@ impl RecoveryStatus {
     }
 
     /// Marks a bounded pass as started.
-    pub(super) fn begin_pass(&self) {
+    pub(crate) fn begin_pass(&self) {
         self.inner
             .state
             .store(RecoveryState::Running.code(), Ordering::Relaxed);
@@ -210,7 +210,7 @@ impl RecoveryStatus {
             .store(unix_timestamp_millis(), Ordering::Relaxed);
     }
 
-    pub(super) fn set_remaining(&self, topics_remaining: u64) {
+    pub(crate) fn set_remaining(&self, topics_remaining: u64) {
         self.inner
             .topics_remaining
             .store(topics_remaining, Ordering::Relaxed);
@@ -230,27 +230,27 @@ impl RecoveryStatus {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct RecoveryPass {
-    pub(super) unresolved_topics: BTreeSet<::irokle::TopicId>,
-    pub(super) unvisited_topics: usize,
-    pub(super) error: Option<RecoveryError>,
+pub(crate) struct RecoveryPass {
+    pub(crate) unresolved_topics: BTreeSet<::irokle::TopicId>,
+    pub(crate) unvisited_topics: usize,
+    pub(crate) error: Option<RecoveryError>,
     /// Unvisited units are local work, not a peer problem: retry at once.
-    pub(super) more_local_work: bool,
-    pub(super) plan_changed: bool,
-    pub(super) topics_completed: usize,
+    pub(crate) more_local_work: bool,
+    pub(crate) plan_changed: bool,
+    pub(crate) topics_completed: usize,
     phase_progress: bool,
     /// False when the pass could not enumerate outstanding work.
-    pub(super) enumerated: bool,
+    pub(crate) enumerated: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct RecoveryFailure {
-    pub(super) unresolved_topics: BTreeSet<::irokle::TopicId>,
-    pub(super) error: Option<RecoveryError>,
+pub(crate) struct RecoveryFailure {
+    pub(crate) unresolved_topics: BTreeSet<::irokle::TopicId>,
+    pub(crate) error: Option<RecoveryError>,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct RecoveryBaseline {
+pub(crate) struct RecoveryBaseline {
     fewest_topics: usize,
     error_cleared: bool,
 }
@@ -274,7 +274,7 @@ impl RecoveryBaseline {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct RecoveryRotation {
+pub(crate) struct RecoveryRotation {
     unresolved_topics: BTreeSet<::irokle::TopicId>,
     error: Option<RecoveryError>,
 }
@@ -294,7 +294,7 @@ impl RecoveryRotation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum RecoveryDecision {
+pub(crate) enum RecoveryDecision {
     ContinueLocal {
         progress: bool,
         topics_remaining: u64,
@@ -310,7 +310,7 @@ pub(super) enum RecoveryDecision {
     },
 }
 
-pub(super) fn apply_recovery_pass(
+pub(crate) fn apply_recovery_pass(
     rotation: &mut RecoveryRotation,
     recovery_baseline: &mut Option<RecoveryBaseline>,
     first_rotation: &mut bool,
@@ -370,13 +370,13 @@ pub(super) fn apply_recovery_pass(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct PhaseOutcome {
-    pub(super) progress: bool,
-    pub(super) error: Option<RecoveryError>,
+pub(crate) struct PhaseOutcome {
+    pub(crate) progress: bool,
+    pub(crate) error: Option<RecoveryError>,
 }
 
 impl RecoveryPass {
-    pub(super) fn merge_phase(&mut self, outcome: PhaseOutcome) {
+    pub(crate) fn merge_phase(&mut self, outcome: PhaseOutcome) {
         self.phase_progress |= outcome.progress;
         self.error = RecoveryError::merge(self.error, outcome.error);
     }
