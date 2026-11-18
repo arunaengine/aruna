@@ -302,7 +302,7 @@ fn paused_ends_turn() {
 
 // No upload left moves on to the release check of the versions.
 #[test]
-fn no_uploads_checks_guards() {
+fn empty_uploads_guard() {
     let mut page = turn(run_at(prefix_scope(), PurgePhase::AbortPage));
     page.first().unwrap();
     assert!(is_child(&page.next(child(Ok::<_, PauseError>(false)))));
@@ -379,7 +379,7 @@ fn delete_records_batch() {
 
 // An empty page leads to the final proof that nothing is left.
 #[test]
-fn final_list_must_be_empty() {
+fn final_list_empty() {
     let mut last = turn(run_at(prefix_scope(), PurgePhase::FinalList));
     assert!(is_child(&last.first()));
     let error = failure(last.next(versions(vec![version("a")], None)));

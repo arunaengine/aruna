@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::{
-    JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
+    JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
 };
+use aruna_core::structs::storage::storage_purge::{StoragePurgeResult, StoragePurgeSpec};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use futures_util::future::FutureExt;
@@ -21,7 +22,8 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::blob::pause::PausePurgeOperation;
+use crate::driver::{DriverContext, drive, drive_retry, node_routing};
 use crate::jobs::executor::{
     JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, dispatch_payload,
     run_cleanup,
@@ -38,9 +40,15 @@ use crate::jobs::store::job_calls::{
 };
 use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::schedule_drain_effect;
+use crate::jobs::workflow::purge::{
+    PurgeRun, PurgeStop, PurgeTurn, PurgeTurnOperation, fence_error,
+};
 use crate::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
+use crate::s3::fence_store::AcquireFenceOperation;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often a paused purge looks whether it was resumed.
+const PAUSE_POLL: Duration = Duration::from_secs(2);
 
 impl JobsRuntime {
     pub(crate) async fn claim_producer(&self) -> Option<RwLockReadGuard<'_, ()>> {
@@ -479,5 +487,90 @@ async fn heartbeat_loop(
                 }
             }
         }
+    }
+}
+
+/// How a purge run ended early.
+enum PurgeEnd {
+    Cancelled,
+    Interrupted,
+    Failed(JobError),
+}
+
+impl From<PurgeStop> for PurgeEnd {
+    fn from(stop: PurgeStop) -> Self {
+        match stop {
+            PurgeStop::Cancelled => Self::Cancelled,
+            PurgeStop::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+fn purge_stop(ctx: &JobContext) -> Result<(), PurgeEnd> {
+    if ctx.cancel.is_cancelled() {
+        Err(PurgeEnd::Cancelled)
+    } else if ctx.shutdown.is_cancelled() {
+        Err(PurgeEnd::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+/// Runs the turns of a purge, checking for a cancel or a shutdown between them.
+async fn purge_turns(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    files: bool,
+) -> Result<StoragePurgeResult, PurgeEnd> {
+    let wiring = (node_routing(&ctx.driver), ctx.driver.node_and_realm());
+    let ids = (ctx.job_id, ctx.claim_token);
+    let mut run = PurgeRun::new(ids, spec, files, wiring, ctx.progress.snapshot());
+    loop {
+        purge_stop(ctx)?;
+        let turn = PurgeTurnOperation::new(run, unix_timestamp_millis());
+        let end = Box::pin(drive(turn, &ctx.driver)).await?;
+        run = *end.run;
+        if let Some(total) = run.progress().total {
+            ctx.progress.set_total(total);
+        }
+        ctx.progress.set_current(run.progress().current);
+        match end.turn {
+            PurgeTurn::Continue => {}
+            PurgeTurn::Finished(result) => return Ok(result),
+            PurgeTurn::Paused => {
+                tokio::select! {
+                    () = ctx.cancel.cancelled() => {}
+                    () = ctx.shutdown.cancelled() => {}
+                    () = tokio::time::sleep(PAUSE_POLL) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Runs a purge; with `files` it also releases the linked-storage files of the versions.
+pub async fn run_storage_purge(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    files: bool,
+) -> JobRunOutcome {
+    let acquire = || AcquireFenceOperation::new(ctx.job_id, spec.scope.clone());
+    let seed = ctx.job_id.to_bytes();
+    if let Err(error) = drive_retry(acquire, &ctx.driver, &seed).await {
+        return JobRunOutcome::Failed(fence_error(error));
+    }
+    // The planned files wait in the cleanup queue until the job has ended.
+    let outcome = purge_turns(ctx, spec, files).await;
+    if !matches!(outcome, Err(PurgeEnd::Interrupted)) {
+        let resume = PausePurgeOperation::new(ctx.job_id.as_ulid(), false);
+        if let Err(error) = drive(resume, &ctx.driver).await {
+            warn!(%error, "A purge's pause mark could not be removed");
+        }
+    }
+    match outcome {
+        Ok(result) => JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)),
+        Err(PurgeEnd::Cancelled) => JobRunOutcome::Cancelled,
+        Err(PurgeEnd::Interrupted) => JobRunOutcome::Interrupted,
+        Err(PurgeEnd::Failed(error)) => JobRunOutcome::Failed(error),
     }
 }

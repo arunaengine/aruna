@@ -50,7 +50,6 @@ use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, transition_to_running,
 };
-use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
@@ -59,6 +58,7 @@ use aruna_operations::s3::imports::discovery::{
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
+use aruna_operations::tasks::job_runner::run_storage_purge;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

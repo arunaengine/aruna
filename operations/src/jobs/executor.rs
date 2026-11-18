@@ -248,16 +248,13 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
         }
         JobPayload::StoragePurge(spec) => {
-            Box::pin(crate::jobs::workflow::purge::run_storage_purge(
+            Box::pin(crate::tasks::job_runner::run_storage_purge(
                 ctx, spec, false,
             ))
             .await
         }
         JobPayload::StoragePurgeFiles(spec) => {
-            Box::pin(crate::jobs::workflow::purge::run_storage_purge(
-                ctx, spec, true,
-            ))
-            .await
+            Box::pin(crate::tasks::job_runner::run_storage_purge(ctx, spec, true)).await
         }
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => {

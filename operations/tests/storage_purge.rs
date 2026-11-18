@@ -49,7 +49,6 @@ use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, fail_job, transition_to_running,
 };
-use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
@@ -75,6 +74,7 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_operations::tasks::job_runner::run_storage_purge;
 use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
