@@ -158,7 +158,7 @@ fn empty_frontier_passes() {
 }
 
 #[test]
-fn failed_fetch_moves_on() {
+fn failed_fetch_continues() {
     let mut operation = converging(None);
     assert!(runs_child(operation.next(unavailable())));
     assert_eq!(operation.holder, Some(node(3)));
@@ -188,7 +188,7 @@ fn after_pull(operation: &mut ConvergeOperation) {
 }
 
 #[test]
-fn failed_refetch_moves_on() {
+fn failed_refetch_continues() {
     let mut operation = compared(1, 2, None);
     after_pull(&mut operation);
     assert!(runs_child(operation.next(unavailable())));
@@ -238,7 +238,7 @@ fn marked_shard_skipped() {
 }
 
 #[test]
-fn sole_holder_waits_genesis() {
+fn sole_holder_waits() {
     let mut operation = verifying(Vec::new());
     assert_eq!(
         shard_effect(operation.next(no_marker())),
@@ -269,7 +269,7 @@ fn sole_holder_marked() {
 }
 
 #[test]
-fn sole_manifest_failure_open() {
+fn sole_failure_open() {
     assert_eq!(
         sole_with_genesis().next(unavailable()),
         Ok(Next::Done(ShardVerdict::Open))
@@ -293,7 +293,7 @@ fn converged_holder_marked() {
 }
 
 #[test]
-fn failed_marker_still_verified() {
+fn failed_marker_verified() {
     let mut operation = with_holder();
     let converged = Some((node(2), [1u8; 32]));
     operation.next(child(Ok::<_, IoError>(converged))).unwrap();
@@ -336,7 +336,7 @@ fn marker_row_written() {
 }
 
 #[test]
-fn held_shards_keep_rank() {
+fn held_shards_ranked() {
     let config = config(&[node(1), node(2)]);
     let shards = held_shards(&config, node(1));
     assert_eq!(shards, vec![(placement(), vec![node(2)])]);
