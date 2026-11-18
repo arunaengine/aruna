@@ -139,7 +139,9 @@ async fn refuses_unreadable_link() {
     };
     let token = || AuthToken::bearer("token").unwrap();
     let missing = change(Some(Ulid::from_bytes([7; 16])));
-    let link = |request| ReadableLinkOperation::new(auth.clone(), token(), request);
+    let link = |request: &DistributionRequest| {
+        ReadableLinkOperation::new(auth.clone(), token(), request)
+    };
     let refused = drive(link(&missing), &context).await;
     assert!(
         matches!(refused, Err(PublishRefusal::Rejected(_))),

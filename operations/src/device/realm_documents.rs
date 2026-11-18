@@ -1706,17 +1706,15 @@ mod tests {
         );
     }
 
-    // The explicit plan still needs the handles that name this device and carry
-    // the read: an owner and a peer list alone never make one.
-    #[tokio::test]
-    async fn plan_needs_handles() {
-        let (_dir, context) = device(&config(&[1])).await;
-
-        assert!(
-            build_plan(&context, UserId::nil(realm()), vec![node(2)])
-                .await
-                .is_none()
-        );
+    // A fetch needs the transport that names this device: owner and peers alone never do.
+    #[test]
+    fn fetch_needs_transport() {
+        let source = FetchSource::Peers {
+            owner: UserId::nil(realm()),
+            peers: vec![node(2)],
+        };
+        let mut fetch = FetchDocumentsOperation::new(None, source, Duration::from_secs(1));
+        assert_eq!(fetch.first(), Ok(Next::Done(false)));
     }
 
     fn revoked(revoked: &[(&str, u64)], floor: u64) -> RealmConfigDocument {

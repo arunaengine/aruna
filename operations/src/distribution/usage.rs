@@ -20,8 +20,9 @@ mod tests {
     use crate::distribution::replica_shares::{
         BindingShareOperation, GroupShare, ReplicaSharesOperation,
     };
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
     use crate::replication::members::BoundRecordOperation;
+    use std::collections::BTreeMap;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{

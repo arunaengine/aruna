@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,

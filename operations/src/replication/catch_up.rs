@@ -5,7 +5,7 @@
 
 use aruna_core::handle::Handle;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -172,7 +172,7 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
         };
         match walk.run(context, &mut budget).await {
             Ok(Outcome::Settled) => {
-                let settle = SettleMarkerOperation::new(CATCH_UP_KEYSPACE, key.clone(), seen);
+                let settle = SettleMarkerOperation::new(CATCH_UP_KEYSPACE, key.to_vec(), seen.to_vec());
                 drive(settle, context)
                     .await
                     .map_err(|error| error.to_string())?;

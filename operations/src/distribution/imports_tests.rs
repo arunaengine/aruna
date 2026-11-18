@@ -16,7 +16,7 @@ fn transfer() -> Ulid {
 }
 
 fn job(seed: u8) -> JobId {
-    JobId::from(Ulid::from_bytes([seed; 16]))
+    JobId::from_bytes([seed; 16])
 }
 
 fn child<T>(value: T) -> IoResult

@@ -105,7 +105,7 @@ pub async fn apply_local_edit(
     edited.dataset_digest = craqle::canonicalize_jsonld(&edited.displayed_jsonld)
         .ok()
         .map(|canonical| canonical.digest);
-    drive(store_replica(&edited), context).await.is_ok();
+    drive(store_replica(&edited), context).await.ok();
     arm_drain(context).await;
     Ok(record)
 }
@@ -362,6 +362,7 @@ mod tests {
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
+    use crate::driver::drive;
     use crate::driver::DriverContext;
     use crate::metadata::MetadataHandle;
     use crate::tests::device::record;

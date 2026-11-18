@@ -776,6 +776,7 @@ mod tests {
         // A split of this node's accounting moves the charged rows, so the group's replica
         // share is published again.
         use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+        use aruna_core::structs::storage::distribution::split::RetiredRange;
         use aruna_core::structs::storage::usage::dirty_group_key;
         let (_dir, handle) = open();
         let (snapshot, _) = crate::distribution::test_record::record(true);
@@ -792,24 +793,22 @@ mod tests {
         }
         let context = std::sync::Arc::new(context(&handle));
         let account = account(&handle, set, range_id).await.unwrap();
-        let tending = super::Tending {
-            realm_id: crate::distribution::test_record::realm(),
-            local: crate::distribution::test_record::secret(1).public(),
-            snapshot: &snapshot,
+        let mut snapshot = snapshot;
+        snapshot.retired.push(RetiredRange {
             range_id,
-            account: &account,
-        };
-        let config = super::SplitConfig {
-            set_id: set,
-            range_id,
+            lineage: None,
             split_key: "m".to_string(),
-            left: Ulid::from_bytes([2; 16]),
-            right: Ulid::from_bytes([3; 16]),
-        };
-        assert_eq!(
-            tending.split_accounting(&context, config).await,
-            super::Tended::Busy
+            lower_id: Ulid::from_bytes([2; 16]),
+            upper_id: Ulid::from_bytes([3; 16]),
+        });
+        let tend = super::TendRangeOperation::new(
+            crate::distribution::test_record::realm(),
+            crate::distribution::test_record::secret(1).public(),
+            snapshot.clone(),
+            range_id,
+            account,
         );
+        assert_eq!(drive(tend, &context).await, Ok(super::Tended::Busy));
         let marker = super::super::test_store::get(
             &handle,
             NODE_STATS_KEYSPACE,

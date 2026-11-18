@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use aruna_core::types::Key;
 
 use super::*;
@@ -121,16 +123,4 @@ fn defers_failed_page() {
     drain.first().unwrap();
     let failed = IoResult::Child(ChildOutcome::new(Err::<IoResult, _>(IoError::Unfinished)));
     assert_eq!(drain.next(failed), Ok(Next::Done(DrainOutcome::Deferred)));
-}
-
-// Arming asks for the timer now, without pushing back one that is due sooner.
-#[test]
-fn arms_immediately() {
-    let key = TaskKey::DrainUploadOutbox;
-    let call = arm_call(key.clone());
-    let wanted = Effect::Task(TaskEffect::ShortenTimer {
-        key,
-        after: Duration::ZERO,
-    });
-    assert_eq!(call, IoCall::from(wanted));
 }

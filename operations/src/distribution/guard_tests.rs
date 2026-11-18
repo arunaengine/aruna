@@ -8,6 +8,7 @@ use crate::distribution::routing::{
     read_coordinator, upload_route, upload_tag,
 };
 use crate::distribution::test_record::{binding, record, secret};
+use crate::driver::drive;
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 
 #[test]

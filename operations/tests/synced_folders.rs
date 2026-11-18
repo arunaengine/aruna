@@ -65,7 +65,7 @@ async fn await_uploads(realm: &Topology) -> TestResult<()> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "the device never published its queued uploads",
         || async {
-            drain_sync_outbox(&device.context).await;
+            drive(drain_sync_outbox(&device.context), &device.context).await?;
             Ok(list_transfers(&device.context).await?.len())
         },
     )
@@ -520,7 +520,7 @@ async fn records_pull_origin() -> TestResult<()> {
         }),
         "the version's origin names the device"
     );
-    let origin = local_origin(&device.context, version_id)
+    let origin = drive(local_origin(version_id), &device.context)
         .await?
         .ok_or("the device keeps the origin of what it published")?;
     assert_eq!(origin.folder_id, folder.folder_id);

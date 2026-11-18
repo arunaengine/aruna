@@ -36,7 +36,7 @@ use super::publish_queue::{
     entry_with_state, publish_entry, publish_key, scan_publish_queue,
 };
 use super::replica_store::{read_replica, store_replica};
-use super::retry::{RetryView, exhausted, retry_due_ms};
+use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.
@@ -389,7 +389,7 @@ async fn settle_edit(context: &Arc<DriverContext>, document_id: Ulid) {
         return;
     };
     replica.pending_edits = replica.pending_edits.saturating_sub(1);
-    drive(store_replica(&replica), context).await.is_ok();
+    drive(store_replica(&replica), context).await.ok();
 }
 
 /// Authorization, target and payload verdicts do not improve by waiting.

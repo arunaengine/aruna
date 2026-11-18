@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::fmt::Debug;
-use std::time::Duration;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
-use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use tracing::warn;
 
@@ -24,12 +22,6 @@ pub(crate) enum ForwardOutcome {
     Recheck,
     /// This pass is done with the entry.
     Settled,
-}
-
-/// The call that arms `key` now, unless it is due sooner.
-pub(crate) fn arm_call(key: TaskKey) -> IoCall {
-    let after = Duration::ZERO;
-    IoCall::from(Effect::Task(TaskEffect::ShortenTimer { key, after }))
 }
 
 /// One forward as a member of the drain's window.
