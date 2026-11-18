@@ -966,310 +966,210 @@ impl WriteLiveJobsOperation {
         Ok(())
     }
 
-            }
+    /// Publications to set members are bounded by the member count and queued once.
+    fn queue_members(&mut self) -> Turn<LiveRepairWrite> {
+        let members = std::mem::take(&mut self.members);
+        if self.cursor.members_done || members.is_empty() {
+            return self.queue_relationships();
         }
+        self.step = LiveStep::Members;
+        let persist = PersistJobsOperation::new(members, None);
+        Ok(Next::Call(IoCall::child(persist)))
+    }
+
+    fn queue_relationships(&mut self) -> Turn<LiveRepairWrite> {
+        self.cursor.members_done = true;
+        let mut jobs = Vec::new();
+        if !self.cursor.relationships_complete {
+            let Some(page) = self.page.as_ref() else {
+                return Ok(Next::Done(no_progress()));
+            };
+            let planned = relationship_jobs(
+                &self.obligation,
+                &self.upstream_sources,
+                page,
+                &mut self.cursor,
+            );
+            let Some(planned) = planned else {
+                return Ok(Next::Done(no_progress()));
+            };
+            jobs = planned;
+        }
+        let continuation = (!self.cursor.relationships_complete).then(|| self.cursor.clone());
+        self.step = LiveStep::Relationships;
+        let persist = PersistJobsOperation::new(jobs, continuation);
+        Ok(Next::Call(IoCall::child(persist)))
     }
 }
 
-pub(super) async fn write_live_jobs(
-    storage: &StorageHandle,
-    obligation: &LiveObligationRecord,
-    relationships: Option<&RelationshipPage>,
-    members: Vec<BlobJobRecord>,
-) -> Result<LiveRepairWrite, BlobQueueError> {
-    if obligation
-        .origin
-        .as_ref()
-        .is_some_and(|origin| origin.hop_count >= 4)
-    {
-        warn!(
-            bucket = %obligation.bucket,
-            key = %obligation.key,
-            version_id = %obligation.version_id,
-            "Retiring live replication obligation at the hop limit"
-        );
-        return Ok(LiveRepairWrite {
-            queued: 0,
-            continuation: None,
-            progressed: true,
-        });
-    }
-    let inbound_source = match obligation.origin.as_ref() {
-        Some(origin) => read_inbound_source(storage, &obligation.bucket, origin).await?,
-        None => None,
-    };
-    let mut upstream_sources = obligation.upstream_sources.clone();
-    if let Some(source) = inbound_source
-        && !upstream_sources
-            .iter()
-            .any(|existing| same_endpoint(existing, &source))
-    {
-        upstream_sources.push(source);
-    }
-    let mut cursor = obligation.continuation.clone().unwrap_or_default();
-    // Publications to set members are bounded by the member count and queued once.
-    let mut queued = 0;
-    if !cursor.members_done && !members.is_empty() {
-        queued = persist_live_jobs(storage, members, None).await?.queued;
-    }
-    cursor.members_done = true;
-    let mut relationship_jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
-    if !cursor.relationships_complete {
-        let Some(page) = relationships else {
-            return Ok(LiveRepairWrite {
+impl Operation for WriteLiveJobsOperation {
+    type Output = LiveRepairWrite;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<LiveRepairWrite> {
+        let obligation = &self.obligation;
+        if hop_exhausted(obligation) {
+            warn!(
+                bucket = %obligation.bucket,
+                key = %obligation.key,
+                version_id = %obligation.version_id,
+                "Retiring live replication obligation at the hop limit"
+            );
+            return Ok(Next::Done(LiveRepairWrite {
                 queued: 0,
                 continuation: None,
-                progressed: false,
-            });
-        };
-        let mut found = false;
-        let mut complete = page.next.is_none();
-        for (index, (key, relationship)) in page.values.iter().enumerate() {
-            if cursor
-                .relationship_after
-                .as_ref()
-                .is_some_and(|after| key <= after)
-            {
-                continue;
-            }
-            found = true;
-            cursor.relationship_after = Some(key.clone());
-            if obligation.reference_advance.is_some()
-                && relationship.mode != SyncMode::Reference
-                && relationship.reference_handling != ReferenceHandling::Preserve
-            {
-                continue;
-            }
-            if let Some(job) = relationship_job(
-                obligation.local_node_id,
-                RelationshipJobTarget {
-                    bucket: &obligation.bucket,
-                    key: &obligation.key,
-                    version_id: obligation.version_id,
-                    delete_marker: obligation.delete_marker,
-                },
-                relationship.clone(),
-                obligation.origin.as_ref(),
-                &upstream_sources,
-            )
-            .map(|mut job| {
-                if let Some(advance) = obligation.reference_advance {
-                    job.input.auth_context = obligation.auth_context.clone();
-                    job.writer_auth_context = None;
-                    job.with_reference_advance(advance)
-                } else {
-                    job.with_writer_auth(obligation.auth_context.clone())
-                }
-            }) {
-                if relationship_jobs.len() == REPLICATION_JOB_LIMIT {
-                    complete = false;
-                    break;
-                }
-                relationship_jobs.push(job);
-                if relationship_jobs.len() == REPLICATION_JOB_LIMIT {
-                    complete = index + 1 == page.values.len() && page.next.is_none();
-                    break;
-                }
-            }
+                progressed: true,
+            }));
         }
-        if !found {
-            if page.next.is_none() {
-                cursor.relationship_after = None;
-                cursor.relationships_complete = true;
-            } else {
-                return Ok(LiveRepairWrite {
-                    queued: 0,
-                    continuation: None,
-                    progressed: false,
-                });
+        match obligation.origin.as_ref() {
+            Some(origin) => {
+                let key = sync_relationship_key(&obligation.bucket, origin.relationship_id);
+                Ok(Next::Call(read_row(RELATIONSHIP_IN_KEYSPACE, key)))
             }
-        } else if complete {
-            cursor.relationship_after = None;
-            cursor.relationships_complete = true;
-        } else {
-            cursor.relationships_complete = false;
+            None => self.queue_members(),
         }
     }
-    let continuation = (!cursor.relationships_complete).then_some(cursor);
-    let mut write = persist_live_jobs(storage, relationship_jobs, continuation).await?;
-    write.queued = write.queued.saturating_add(queued);
-    Ok(write)
+
+    fn next(&mut self, result: IoResult) -> Turn<LiveRepairWrite> {
+        match self.step {
+            LiveStep::Inbound => {
+                self.inbound_read(result.value()?)?;
+                self.queue_members()
+            }
+            LiveStep::Members => {
+                let write = result.child::<LiveRepairWrite, BlobQueueError>()??;
+                self.queued = write.queued;
+                self.queue_relationships()
+            }
+            LiveStep::Relationships => {
+                let mut write = result.child::<LiveRepairWrite, BlobQueueError>()??;
+                write.queued = write.queued.saturating_add(self.queued);
+                Ok(Next::Done(write))
+            }
+        }
+    }
 }
 
-async fn persist_live_jobs(
-    storage: &StorageHandle,
+/// Queues the jobs a stored job does not already cover.
+#[derive(Debug, PartialEq)]
+struct PersistJobsOperation {
     jobs: Vec<BlobJobRecord>,
     continuation: Option<LiveReplicationContinuation>,
-) -> Result<LiveRepairWrite, BlobQueueError> {
-    if jobs.is_empty() {
-        return Ok(LiveRepairWrite {
-            queued: 0,
+    writing: Option<usize>,
+}
+
+impl PersistJobsOperation {
+    fn new(jobs: Vec<BlobJobRecord>, continuation: Option<LiveReplicationContinuation>) -> Self {
+        Self {
+            jobs,
             continuation,
-            progressed: true,
-        });
-    }
-
-    let reads = jobs
-        .iter()
-        .map(|job| Ok((REPLICATION_JOB_KEYSPACE.to_string(), blob_job_key(job)?)))
-        .collect::<Result<Vec<_>, ConversionError>>()?;
-    let values = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    if values.len() != jobs.len() {
-        return Err(BlobQueueError::UnexpectedEvent(
-            "blob replication existing job read count mismatch".to_string(),
-        ));
-    }
-
-    let mut writes = Vec::with_capacity(jobs.len());
-    for (job, (_, value)) in jobs.iter().zip(values) {
-        match value {
-            Some(value) => match BlobJobRecord::from_bytes(&value) {
-                Ok(existing) if blob_job_preferred(&existing, job) => {}
-                Ok(_) | Err(_) => writes.push(blob_job_entry(job)?),
-            },
-            None => writes.push(blob_job_entry(job)?),
+            writing: None,
         }
     }
-    if writes.is_empty() {
-        return Ok(LiveRepairWrite {
-            queued: 0,
-            continuation,
+
+    fn finish(&mut self, queued: usize) -> Turn<LiveRepairWrite> {
+        Ok(Next::Done(LiveRepairWrite {
+            queued,
+            continuation: self.continuation.take(),
             progressed: true,
-        });
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { entries }) => Ok(LiveRepairWrite {
-            queued: entries.len(),
-            continuation,
-            progressed: true,
-        }),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+        }))
     }
 }
 
-async fn read_inbound_source(
-    storage: &StorageHandle,
-    bucket: &str,
-    origin: &SyncOrigin,
-) -> Result<Option<ArunaArn>, BlobQueueError> {
-    let key = sync_relationship_key(bucket, origin.relationship_id);
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: RELATIONSHIP_IN_KEYSPACE.to_string(),
-            key: ByteView::from(key.clone()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let relationship = SyncRelationship::from_bytes(&value)?;
-            if relationship.id != origin.relationship_id
-                || relationship.target.bucket() != Some(bucket)
-                || sync_relationship_key(bucket, relationship.id) != key
-            {
-                return Err(ConversionError::FromStrError(
-                    "incoming sync relationship key does not match payload".to_string(),
-                )
-                .into());
+impl Operation for PersistJobsOperation {
+    type Output = LiveRepairWrite;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<LiveRepairWrite> {
+        if self.jobs.is_empty() {
+            return self.finish(0);
+        }
+        let mut reads = Vec::with_capacity(self.jobs.len());
+        for job in &self.jobs {
+            reads.push((REPLICATION_JOB_KEYSPACE.to_string(), blob_job_key(job)?));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<LiveRepairWrite> {
+        if let Some(queued) = self.writing {
+            result.done()?;
+            return self.finish(queued);
+        }
+        let values = result.values()?;
+        if values.len() != self.jobs.len() {
+            return Err(BlobQueueError::UnexpectedEvent(
+                "blob replication existing job read count mismatch".to_string(),
+            ));
+        }
+        let mut writes = Vec::with_capacity(self.jobs.len());
+        for (job, value) in self.jobs.iter().zip(values) {
+            let kept = (value.as_deref())
+                .and_then(|value| BlobJobRecord::from_bytes(value).ok())
+                .is_some_and(|existing| blob_job_preferred(&existing, job));
+            if !kept {
+                writes.push(blob_job_entry(job)?);
             }
-            Ok(Some(relationship.source))
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+        if writes.is_empty() {
+            return self.finish(0);
+        }
+        self.writing = Some(writes.len());
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-pub(super) async fn delete_live_obligation(
-    storage: &StorageHandle,
-    key: Vec<u8>,
-    expected: Option<&LiveReplicationContinuation>,
-) -> Result<(), BlobQueueError> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let current = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key: ByteView::from(key.clone()),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_cursor(storage, txn_id).await;
-            return Err(error.into());
-        }
-        other => {
-            abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let should_delete = match current {
-        None => false,
-        Some(value) => match LiveObligationRecord::from_bytes(&value) {
-            Ok(record) => record.continuation.as_ref() == expected,
-            Err(_) => expected.is_none(),
-        },
-    };
-    if !should_delete {
-        abort_cursor(storage, txn_id).await;
-        return Ok(());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_cursor(storage, txn_id).await;
-            return Err(error.into());
-        }
-        other => {
-            abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
         }
     }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+
+    #[test]
+    fn nothing_to_retire_ends() {
+        let mut retire = RetireObligationsOperation::new(Vec::new(), Vec::new(), (None, None));
+        assert_eq!(retire.first(), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn moved_cursor_written() {
+        let cursor = (None, Some(vec![1]));
+        let mut retire = RetireObligationsOperation::new(Vec::new(), Vec::new(), cursor);
+        assert!(matches!(retire.first(), Ok(Next::Call(IoCall::Write(_)))));
+        assert_eq!(retire.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn zero_limit_reads_nothing() {
+        let mut read = ReadRelationshipsOperation::new("b", None, 0);
+        let expected = RelationshipPage {
+            values: Vec::new(),
+            next: None,
+        };
+        assert_eq!(read.first(), Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn missing_obligation_kept() {
+        let mut delete = DeleteObligationOperation::new(vec![1], None);
+        assert!(matches!(delete.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = IoResult::Values(vec![None]);
+        assert_eq!(delete.next(answer), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn empty_pass_moves_on() {
+        let mut pass = ProcessObligationsOperation::new();
+        assert!(matches!(pass.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = pass.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let turn = pass.next(empty_page());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     }
 }
 
