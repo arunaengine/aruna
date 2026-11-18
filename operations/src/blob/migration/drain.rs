@@ -510,34 +510,389 @@ impl Operation for MigrateRowOperation {
     }
 }
 
-/// Writes the rows a run finished after its cursor in `txn_id`, the transaction of its progress,
-/// so they count exactly when the progress does; without any the row goes.
-async fn stage_ahead(
-    storage: &aruna_storage::StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    ahead: &MigrationAhead,
-) -> Result<(), String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let space = MIGRATION_AHEAD_KEYSPACE.to_string();
-    let effect = match ahead.rows.is_empty() {
-        true => StorageEffect::Delete {
-            key_space: space,
-            key,
-            txn_id: Some(txn_id),
-        },
-        false => StorageEffect::Write {
-            key_space: space,
-            key,
-            value: ahead.to_bytes().map_err(|error| error.to_string())?.into(),
-            txn_id: Some(txn_id),
-        },
-    };
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
+#[derive(Debug, PartialEq)]
+enum PageStep {
+    Handover,
+    HandedOver,
+    Routing,
+    Request,
+    Access,
+    Earlier,
+    Versions,
+    Ahead,
+    Window,
+    StopRequest,
+    FinalHandOver,
+    /// The child that decides the answer of this operation.
+    Tail,
+    Store(Option<Duration>),
+}
+
+/// Migrates one page of a bucket's versions and stores the progress, unless a newer setting
+/// replaced the record meanwhile. A run that worked for `budget` starts no more versions.
+/// Outputs when the bucket needs the next run.
+#[derive(Debug, PartialEq)]
+pub(super) struct MigratePageOperation {
+    routing: NodeRouting,
+    bucket: String,
+    record: CompressionMigration,
+    budget: Duration,
+    begun_ms: u64,
+    now_ms: u64,
+    step: PageStep,
+    snapshot: Option<RoutingSnapshot>,
+    request: Option<RenameRequest>,
+    access: Option<Arc<BucketAccess>>,
+    earlier: Earlier,
+    versions: Vec<Key>,
+    keys: Vec<VersionKey>,
+    more: bool,
+    batch: Batch,
+    limit: usize,
+    /// The row of each window member, in the order they started.
+    members: Vec<usize>,
+    started: usize,
+    worked: usize,
+    denied: usize,
+    stop: Option<Stop>,
+    failure: Option<MigrationError>,
+    pending_after: Option<MigrationAhead>,
+}
+
+type PageTurn = Turn<Option<Duration>>;
+
+impl MigratePageOperation {
+    pub(super) fn new(
+        routing: NodeRouting,
+        bucket: &str,
+        record: CompressionMigration,
+        budget: Duration,
+    ) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            record,
+            budget,
+            begun_ms: 0,
+            now_ms: 0,
+            step: PageStep::Handover,
+            snapshot: None,
+            request: None,
+            access: None,
+            earlier: Earlier::new(),
+            versions: Vec::new(),
+            keys: Vec::new(),
+            more: false,
+            batch: Batch::new(Vec::new()),
+            limit: 1,
+            members: Vec::new(),
+            started: 0,
+            worked: 0,
+            denied: 0,
+            stop: None,
+            failure: None,
+            pending_after: None,
         }
-        other => Err(format!("could not store the rows ahead: {}", other.label())),
+    }
+
+    fn call(&mut self, step: PageStep, call: IoCall) -> PageTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn store(&mut self, ahead: Option<MigrationAhead>, after: Option<Duration>) -> PageTurn {
+        let store = StoreMigrationOperation::new(&self.bucket, self.record.clone(), ahead);
+        self.call(PageStep::Store(after), IoCall::child(store))
+    }
+
+    fn end_now(&mut self) -> PageTurn {
+        self.record.finished_at_ms = Some(self.now_ms);
+        self.store(None, None)
+    }
+
+    fn end_aborted(&mut self) -> PageTurn {
+        let end = EndAbortedOperation::new(self.routing.clone(), &self.bucket, self.record.clone());
+        self.call(PageStep::Tail, IoCall::child(end))
+    }
+
+    fn hand_over(&self) -> IoCall {
+        let started = self.record.started_at_ms;
+        IoCall::child(HandOverOperation::new(
+            self.routing.clone(),
+            &self.bucket,
+            started,
+        ))
+    }
+
+    /// A due retry pass counts its own skips and failures.
+    fn after_handover(&mut self) -> PageTurn {
+        if self.record.retry_at_ms.take().is_some() {
+            self.record.skipped = 0;
+            self.record.failed = 0;
+        }
+        if !self.record.moving {
+            return self.read_versions();
+        }
+        let call = routing_call(self.routing.clone(), &self.bucket);
+        self.call(PageStep::Routing, call)
+    }
+
+    /// Without earlier patterns no file is renamed, so only an asked rename reads them; each
+    /// file is renamed only while the caller who asked may still write its key.
+    fn request_read(&mut self, value: Option<Value>) -> PageTurn {
+        let record = (self.record.moving, self.record.started_at_ms);
+        self.request = decode_request(value, record)?;
+        let Some(request) = self.request.as_ref() else {
+            return self.read_versions();
+        };
+        // An aborted rename ends here with its counts, once no version of it is in flight.
+        if request.aborted_at_ms.is_some() {
+            return self.end_aborted();
+        }
+        // A paused rename waits for its resume, which wakes this task again.
+        if request.paused {
+            return Ok(Next::Done(None));
+        }
+        let Some(routing) = self.snapshot.as_ref() else {
+            return self.read_versions();
+        };
+        let access = RenameAccessOperation::new(request, routing.group_id, &self.bucket);
+        self.call(PageStep::Access, IoCall::child(access))
+    }
+
+    fn read_versions(&mut self) -> PageTurn {
+        let page = IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: VersionKey::bucket_prefix(&self.bucket)?.into(),
+            after: self.record.cursor.clone().map(Into::into),
+            limit: MIGRATION_ROWS,
+        };
+        self.call(PageStep::Versions, page)
+    }
+
+    /// The routing a key moves with; keys outside a move's prefix are only re-encoded.
+    fn moves(&self, key: &VersionKey) -> Option<&RoutingSnapshot> {
+        (self.snapshot.as_ref()).filter(|_| key.key.starts_with(&self.record.prefix))
+    }
+
+    fn versions_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> PageTurn {
+        self.more = next.is_some();
+        self.versions = rows.into_iter().map(|(key, _)| key).collect();
+        self.keys = (self.versions.iter())
+            .map(|key| VersionKey::from_bytes(key.as_ref()))
+            .collect::<Result<_, _>>()?;
+        // A rename moves several keys at once, but never two versions of one key or one name.
+        self.limit = match self.request {
+            Some(_) => RENAME_PARALLEL,
+            None => 1,
+        };
+        let name = |key: &VersionKey| {
+            let routing = self.moves(key).filter(|_| self.limit > 1)?;
+            Some(place(routing, key).ok()?.1?.path)
+        };
+        let rows = self.keys.iter().map(|key| (key.key.clone(), name(key)));
+        let batch = Batch::new(rows.collect());
+        self.batch = batch;
+        let read = read_row(MIGRATION_AHEAD_KEYSPACE, bucket_key(&self.bucket));
+        self.call(PageStep::Ahead, read)
+    }
+
+    /// Rows the last run of this pass finished after its cursor already count, so they pass.
+    fn ahead_read(&mut self, value: Option<Value>) -> PageTurn {
+        let ahead = value
+            .map(|value| MigrationAhead::from_bytes(&value))
+            .transpose()?;
+        let ahead: HashSet<Vec<u8>> = ahead
+            .map(|ahead| ahead.rows_for(&self.record))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for (row, key) in self.versions.iter().enumerate() {
+            if ahead.contains(key.as_ref()) {
+                self.batch.passed(row);
+            }
+        }
+        self.begun_ms = self.now_ms;
+        let mut members = Vec::new();
+        while let Some(row) = self.ready_row() {
+            members.push(self.row_member(row));
+        }
+        if members.is_empty() {
+            return self.after_window();
+        }
+        let group = EffectGroup {
+            members,
+            limit: self.limit,
+            form: GroupForm::Window,
+        };
+        self.call(PageStep::Window, IoCall::Group(group))
+    }
+
+    /// The next row to start. A run with enough work or time starts no more, and stores its
+    /// progress; a pause or an abort is seen by the row itself.
+    fn ready_row(&mut self) -> Option<usize> {
+        if self.stop.is_some() || self.failure.is_some() || self.batch.running() >= self.limit {
+            return None;
+        }
+        let row = self.batch.ready()?;
+        let elapsed = aruna_core::time::unix_timestamp_millis().saturating_sub(self.begun_ms);
+        let spent = Duration::from_millis(elapsed) >= self.budget || self.worked >= MIGRATION_WORK;
+        if self.started > 0 && spent {
+            self.stop = Some(Stop::More);
+            return None;
+        }
+        self.started += 1;
+        self.batch.start(row);
+        self.members.push(row);
+        Some(row)
+    }
+
+    fn row_operation(&mut self, row: usize) -> MigrateRowOperation {
+        let version = self.keys[row].clone();
+        let moved = self.moves(&version).cloned().map(|routing| {
+            let write = Permission::WRITE;
+            let access = self.access.as_ref();
+            let allowed = access.is_some_and(|access| access.allows(Some(&version.key), &write));
+            let denied = !self.earlier.is_empty() && !allowed;
+            let earlier = match allowed {
+                true => self.earlier.clone(),
+                false => Earlier::new(),
+            };
+            let started_ms = self.record.started_at_ms;
+            let moved = RowMove {
+                routing,
+                earlier,
+                started_ms,
+            };
+            (moved, denied)
+        });
+        let moved = moved.map(|(moved, denied)| {
+            self.denied += usize::from(denied);
+            moved
+        });
+        let rename =
+            (self.request.is_some()).then_some((self.record.moving, self.record.started_at_ms));
+        MigrateRowOperation {
+            bucket: self.bucket.clone(),
+            version,
+            target: self.record.target,
+            moved,
+            moving: false,
+            step: match rename {
+                Some(_) => RowStep::Rename,
+                None => RowStep::Migrate,
+            },
+            rename,
+            now_ms: 0,
+        }
+    }
+
+    fn row_member(&mut self, row: usize) -> Effect {
+        let operation = self.row_operation(row);
+        Effect::SubOperation(boxed_suboperation(operation, |result| {
+            Event::Child(ChildOutcome::new(result))
+        }))
+    }
+
+    fn row_ended(&mut self, row: usize, end: Result<RowEnd, MigrationError>) {
+        let end = match end {
+            Ok(end) => end,
+            Err(error) => {
+                self.batch.abandon(row);
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        if end == RowEnd::Halted {
+            self.batch.abandon(row);
+            self.stop = Some(Stop::Halted);
+            return;
+        }
+        self.batch.finish(row);
+        self.worked += usize::from(end != RowEnd::Skipped);
+        match end {
+            RowEnd::Migrated => self.record.migrated += 1,
+            // A move records a copy that cannot be read as broken instead of retrying it.
+            RowEnd::Skipped | RowEnd::Broken => self.record.skipped += 1,
+            RowEnd::Failed => self.record.failed += 1,
+            RowEnd::Halted => {}
+        }
+    }
+
+    fn window_event(&mut self, event: GroupEvent) -> PageTurn {
+        let (index, result) = match event {
+            GroupEvent::Member { index, result } => (index, result),
+            GroupEvent::Closed => return self.after_window(),
+            GroupEvent::Finished { .. } => {
+                return Err(MigrationError::Failed(
+                    "unexpected group answer".to_string(),
+                ));
+            }
+        };
+        let row = (self.members.get(index).copied())
+            .ok_or_else(|| MigrationError::Failed("unknown window member".to_string()))?;
+        let end = match result {
+            GroupResult::Done(event) => match *event {
+                Event::Child(outcome) => {
+                    IoResult::Child(outcome).child::<RowEnd, MigrationError>()?
+                }
+                other => Err(MigrationError::Failed(other.label().to_string())),
+            },
+            other => Err(MigrationError::Failed(format!("{other:?}"))),
+        };
+        self.row_ended(row, end);
+        self.step = PageStep::Window;
+        match self.ready_row() {
+            Some(row) => {
+                let operation = self.row_operation(row);
+                Ok(Next::Call(IoCall::child(operation)))
+            }
+            None => Ok(Next::Wait),
+        }
+    }
+
+    /// Each row this run finished counts once; the next run starts after the rows finished in
+    /// storage order and passes over those finished after them.
+    fn after_window(&mut self) -> PageTurn {
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        let done = self.batch.done();
+        let rows = (self.batch.finished_after()).map(|row| self.versions[row].to_vec());
+        let rows = rows.collect();
+        if let Some(last) = done.checked_sub(1) {
+            self.record.cursor = Some(self.versions[last].to_vec());
+        }
+        let ahead = MigrationAhead {
+            started_at_ms: self.record.started_at_ms,
+            retries: self.record.retries,
+            cursor: self.record.cursor.clone(),
+            rows,
+        };
+        let more = self.more || done < self.versions.len();
+        self.pending_after = Some(ahead);
+        if self.stop == Some(Stop::Halted) {
+            let read = read_row(RENAME_MOVE_KEYSPACE, bucket_key(&self.bucket));
+            return self.call(PageStep::StopRequest, read);
+        }
+        if self.denied > 0 {
+            tracing::warn!(
+                bucket = %self.bucket,
+                denied = self.denied,
+                "Files the rename's caller may not write keep their name"
+            );
+        }
+        let record = &mut self.record;
+        let after = match (more, record.failed > 0) {
+            // This run moved the cursor, so the rows left can go on at once.
+            (true, _) => Some(Duration::ZERO),
+            // Successful versions are already in the target, so a retry pass reads no blob for
+            // them.
+            (false, true) if record.retries < MIGRATION_RETRIES => {
+                let wait = capped_backoff(RETRY_BASE, RETRY_MAX, record.retries, 0);
+                record.retries += 1;
+                record.cursor = None;
+                record.retry_at_ms = Some(self.now_ms.saturating_add(wait.as_millis() as u64));
     }
 }
 
