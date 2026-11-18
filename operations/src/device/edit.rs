@@ -105,7 +105,7 @@ pub async fn apply_local_edit(
     edited.dataset_digest = craqle::canonicalize_jsonld(&edited.displayed_jsonld)
         .ok()
         .map(|canonical| canonical.digest);
-    store_replica(context, &edited).await;
+    drive(store_replica(&edited), context).await.is_ok();
     arm_drain(context).await;
     Ok(record)
 }
@@ -536,7 +536,7 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(crate::device::replica_store::store_replica(&context, &read).await);
+        assert!(drive(crate::device::replica_store::store_replica(&read), &context).await.is_ok());
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,

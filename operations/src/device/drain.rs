@@ -403,11 +403,11 @@ async fn publish_edit(
 
 /// Records that the realm has seen one of this replica's edits.
 async fn settle_edit(context: &Arc<DriverContext>, document_id: Ulid) {
-    let Some(mut replica) = read_replica(context, document_id).await else {
+    let Some(mut replica) = drive(read_replica(document_id), context).await.ok().flatten() else {
         return;
     };
     replica.pending_edits = replica.pending_edits.saturating_sub(1);
-    store_replica(context, &replica).await;
+    drive(store_replica(&replica), context).await.is_ok();
 }
 
 /// Authorization, target and payload verdicts do not improve by waiting.

@@ -190,7 +190,7 @@ pub fn pending_total(documents: &[DocumentRow], datasets: &[DatasetRow]) -> usiz
 pub async fn sync_status(context: &Arc<DriverContext>) -> SyncStatus {
     let now = unix_timestamp_millis();
     let state = read_sync_state(context).await;
-    let replicas = list_replicas(context).await.unwrap_or_default();
+    let replicas = drive(list_replicas(), context).await.ok().unwrap_or_default();
     let entries = read_publish_entries(context).await;
     let documents = document_rows(replicas, &entries);
     let datasets = read_datasets(context).await;

@@ -99,12 +99,12 @@ impl From<SyncRefusal> for MemberRefusal {
     }
 }
 
-pub(super) fn realm_config(realm_id: RealmId) -> IoCall {
+pub(crate) fn realm_config(realm_id: RealmId) -> IoCall {
     IoCall::child(GetConfigOperation::new(realm_id))
 }
 
 /// The realm configuration a config read found; an unreadable one counts as none.
-pub(super) fn config_of(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {
+pub(crate) fn config_of(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {
     Ok(result.child::<RealmConfigDocument, GetConfigError>()?.ok())
 }
 

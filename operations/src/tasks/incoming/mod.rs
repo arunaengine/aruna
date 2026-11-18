@@ -721,7 +721,8 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
+        let pass = crate::device::refresh::refresh_replicas(&self.context);
+        if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
                 warn!(%error, "Failed to note the device sync state");
