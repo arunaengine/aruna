@@ -363,10 +363,12 @@ impl Operation for InstallKeyOperation {
 mod tests {
     use super::*;
     use crate::driver::DriverContext;
-    use crate::s3::bucket::key::wake::activate_and_wake;
+    use crate::driver::drive;
+    use crate::jobs::key_wake::wake_unlocked;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::operation::Runnable;
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
@@ -386,6 +388,24 @@ mod tests {
             Ok(Next::Call(IoCall::Effect(effect))) => effect,
             other => panic!("expected an effect call, got {other:?}"),
         }
+    }
+
+    /// Activates a key as the routes do, then resumes the work that waited for it.
+    async fn activate_and_wake<O, K>(
+        context: &DriverContext,
+        operation: O,
+        origin: (RealmId, NodeId),
+    ) -> Result<UnlockStatus, O::Error>
+    where
+        O: Runnable<K, Output = UnlockStatus>,
+    {
+        let status = drive(operation, context).await?;
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let limits = RoCrateLimits::default();
+        wake_unlocked(context, status.key, now_ms, origin, &limits)
+            .await
+            .unwrap();
+        Ok(status)
     }
 
     fn write_done(result: Result<(), StorageError>) -> IoResult {
@@ -801,7 +821,7 @@ mod tests {
             duration: None,
             max: None,
         });
-        let status = activate_and_wake(&context, install, (realm, node), &RoCrateLimits::default())
+        let status = activate_and_wake(&context, install, (realm, node))
             .await
             .unwrap();
         assert!(status.active && status.remaining.is_none());
@@ -982,7 +1002,7 @@ mod tests {
             now_ms: aruna_core::time::unix_timestamp_millis(),
         };
         let unlock = UnlockBucketOperation::new(input, enabled.private_key);
-        let status = activate_and_wake(&context, unlock, (realm, node), &RoCrateLimits::default())
+        let status = activate_and_wake(&context, unlock, (realm, node))
             .await
             .unwrap();
         assert!(
