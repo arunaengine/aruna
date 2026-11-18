@@ -718,38 +718,75 @@ pub struct ReadObjectOperation {
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
     private: SharedSecret,
-    limits: &RoCrateLimits,
-) -> Result<GetObjectResult, GetObjectError> {
-    let version = input.version_id.ok_or(GetObjectError::NoSuchVersion)?;
-    let mut promoted = false;
-    loop {
+    limits: RoCrateLimits,
+    promoted: bool,
+    step: ObjectStep,
+}
+
+impl ReadObjectOperation {
+    pub fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        private: SharedSecret,
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            input,
+            restrictions,
+            private,
+            limits: limits.clone(),
+            promoted: false,
+            step: ObjectStep::Envelope,
+        }
+    }
+
+    fn read_envelope(&mut self) -> Turn<GetObjectResult> {
+        let version = self.input.version_id.ok_or(GetObjectError::NoSuchVersion)?;
+        let input = &self.input;
         let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
-        let (envelope, mapping) = drive(read, context).await?;
-        let operation = GetObjectOperation::new(input.clone())
-            .with_restrictions(restrictions.clone())
-            .with_object(envelope.clone(), mapping.clone(), private.clone());
-        let archive = match drive(operation, context).await {
-            Err(GetObjectError::PendingContent(archive))
-                if !promoted && archive == mapping.archive =>
-            {
+        self.step = ObjectStep::Envelope;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn read_with(
+        &mut self,
+        envelope: ObjectEnvelope,
+        mapping: EnvelopeArchive,
+    ) -> Turn<GetObjectResult> {
+        let archive = mapping.archive.clone();
+        let get = GetObjectOperation::new(self.input.clone())
+            .with_restrictions(self.restrictions.clone())
+            .with_object(envelope.clone(), mapping, self.private.clone());
+        self.step = ObjectStep::Get(Box::new(envelope), archive);
+        Ok(Next::Call(IoCall::child(get)))
+    }
+
+    fn read_done(
+        &mut self,
+        envelope: ObjectEnvelope,
+        mapped: ArchiveKey,
+        read: Read,
+    ) -> Turn<GetObjectResult> {
+        let archive = match read {
+            Err(GetObjectError::PendingContent(archive)) if !self.promoted && archive == mapped => {
                 archive
             }
-            result => return result,
+            read => return Ok(Next::Done(read?)),
         };
-        promoted = true;
-        let blob = context
-            .blob_handle
-            .as_ref()
-            .ok_or(GetObjectError::GetObjectFailed)?;
+        self.promoted = true;
         let admit = AbeEffect::Admit {
             envelope,
             archive: archive.clone(),
-            private: private.clone(),
+            private: self.private.clone(),
         };
-        let lease = match blob
-            .send_blob_effect(BlobEffect::Abe(Box::new(admit)))
-            .await
-        {
+        self.step = ObjectStep::Admit(archive);
+        Ok(Next::Call(
+            Effect::Blob(BlobEffect::Abe(Box::new(admit))).into(),
+        ))
+    }
+
+    fn admitted(&mut self, archive: ArchiveKey, event: Event) -> Turn<GetObjectResult> {
+        let lease = match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease }) => lease,
             Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
@@ -757,88 +794,206 @@ pub struct ReadObjectOperation {
             }
             _ => return Err(GetObjectError::GetObjectFailed),
         };
-        promote_leased(context, &input, archive, lease, limits).await?;
+        let origin = (self.input.realm_id, self.input.node_id);
+        let promote = PromoteLeasedOperation::new(origin, archive, lease, &self.limits);
+        self.step = ObjectStep::Promote;
+        Ok(Next::Call(IoCall::child(promote)))
     }
 }
 
-/// Promotes the pending `archive` under `lease`, as an unlock would.
-pub(super) async fn promote_leased(
-    context: &DriverContext,
-    input: &GetObjectInput,
+impl Operation for ReadObjectOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        self.read_envelope()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        match std::mem::replace(&mut self.step, ObjectStep::Promote) {
+            ObjectStep::Envelope => {
+                let read = result.child::<(ObjectEnvelope, EnvelopeArchive), AbeError>()?;
+                let (envelope, mapping) = read?;
+                self.read_with(envelope, mapping)
+            }
+            ObjectStep::Get(envelope, mapped) => self.read_done(*envelope, mapped, result.child()?),
+            ObjectStep::Admit(archive) => self.admitted(archive, result.event()?),
+            ObjectStep::Promote => {
+                result.child::<(), GetObjectError>()??;
+                self.read_envelope()
+            }
+        }
+    }
+}
+
+/// Promotes a pending archive under a read lease, as an unlock would.
+#[derive(Debug, PartialEq)]
+pub(super) struct PromoteLeasedOperation {
+    origin: (RealmId, NodeId),
     archive: ArchiveKey,
-    lease: ReadLease,
-    limits: &RoCrateLimits,
-) -> Result<(), GetObjectError> {
-    let (realm_id, node_id) = (input.realm_id, input.node_id);
-    let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
-    let outcome = match drive(promote.with_lease(lease), context).await {
-        Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
-            let drop = DropReceivedOperation::rejected(archive, (realm_id, node_id), reason);
-            drive(drop, context)
-                .await
+    lease: Option<ReadLease>,
+    limits: RoCrateLimits,
+    /// A rejected archive is being dropped; the read fails either way.
+    dropping: bool,
+}
+
+impl PromoteLeasedOperation {
+    pub(super) fn new(
+        origin: (RealmId, NodeId),
+        archive: ArchiveKey,
+        lease: ReadLease,
+        limits: &RoCrateLimits,
+    ) -> Self {
+        Self {
+            origin,
+            archive,
+            lease: Some(lease),
+            limits: limits.clone(),
+            dropping: false,
+        }
+    }
+
+    fn drop_archive(&mut self, drop: DropReceivedOperation) -> Turn<()> {
+        self.dropping = true;
+        Ok(Next::Call(IoCall::child(drop)))
+    }
+}
+
+impl Operation for PromoteLeasedOperation {
+    type Output = ();
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<()> {
+        let (realm_id, node_id) = self.origin;
+        let lease = self.lease.take().ok_or(IoError::Unfinished)?;
+        let promote = PromotePendingOperation::new(
+            self.archive.clone(),
+            realm_id,
+            node_id,
+            self.limits.clone(),
+        );
+        Ok(Next::Call(IoCall::child(promote.with_lease(lease))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.dropping {
+            (result.child::<usize, PromoteError>()?)
                 .map_err(|_| GetObjectError::GetObjectFailed)?;
             return Err(GetObjectError::GetObjectFailed);
         }
-        result => result.map_err(|error| {
-            warn!(error = %error, "Token promotion of a pending version failed");
-            GetObjectError::GetObjectFailed
-        })?,
-    };
-    match outcome {
-        Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
-        Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),
-        Promotion::Mismatch { claimed } => {
-            let drop = DropReceivedOperation::mismatched(archive, claimed, (realm_id, node_id));
-            drive(drop, context)
-                .await
-                .map_err(|_| GetObjectError::GetObjectFailed)?;
-            Err(GetObjectError::GetObjectFailed)
+        let archive = self.archive.clone();
+        match result.child::<Promotion, PromoteError>()? {
+            Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => self.drop_archive(
+                DropReceivedOperation::rejected(archive, self.origin, reason),
+            ),
+            Err(error) => {
+                warn!(error = %error, "Token promotion of a pending version failed");
+                Err(GetObjectError::GetObjectFailed)
+            }
+            Ok(Promotion::Promoted { .. } | Promotion::Gone) => Ok(Next::Done(())),
+            Ok(Promotion::AwaitingKey(_)) => Err(GetObjectError::GetObjectFailed),
+            Ok(Promotion::Mismatch { claimed }) => self.drop_archive(
+                DropReceivedOperation::mismatched(archive, claimed, self.origin),
+            ),
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum InfoStep {
+    Get,
+    User(Box<RoutedRead>),
+    Holders,
+}
+
 /// Resolves complete object facts without transferring holder bytes.
-pub async fn get_object_info(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ObjectInfoOperation {
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
-) -> Result<ObjectInfo, GetObjectError> {
-    if input.range.is_some() {
-        return Err(GetObjectError::InvalidRange);
+    step: InfoStep,
+}
+
+impl ObjectInfoOperation {
+    pub fn new(input: GetObjectInput, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        Self {
+            input,
+            restrictions,
+            step: InfoStep::Get,
+        }
     }
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
-    match drive(operation, context).await {
-        Ok(result) => Ok(result.info),
-        Err(GetObjectError::HeldElsewhere(held)) => Ok(held.info()),
-        Err(GetObjectError::BlobNotLocal {
-            blake3,
-            version_id,
-            metadata,
-            version_created_at,
-            source_policies,
-        }) if drive(LocalUserOperation::new(realm_id), context)
-            .await
-            .unwrap_or(false) =>
-        {
-            let read = RoutedRead {
-                user_id,
-                realm_id,
+
+    fn got(&mut self, read: Read) -> Turn<ObjectInfo> {
+        match read {
+            Ok(result) => Ok(Next::Done(result.info)),
+            Err(GetObjectError::HeldElsewhere(held)) => Ok(Next::Done(held.info())),
+            Err(GetObjectError::BlobNotLocal {
                 blake3,
                 version_id,
                 metadata,
                 version_created_at,
                 source_policies,
-                restrictions,
-            };
-            routed_metadata(context, read).await
+            }) => {
+                let routed = RoutedRead {
+                    user_id: self.input.user_identity,
+                    realm_id: self.input.realm_id,
+                    blake3,
+                    version_id,
+                    metadata,
+                    version_created_at,
+                    source_policies,
+                    restrictions: self.restrictions.take(),
+                };
+                self.step = InfoStep::User(Box::new(routed));
+                let user = LocalUserOperation::new(self.input.realm_id);
+                Ok(Next::Call(IoCall::child(user)))
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
+    }
+}
+
+impl Operation for ObjectInfoOperation {
+    type Output = ObjectInfo;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<ObjectInfo> {
+        if self.input.range.is_some() {
+            return Err(GetObjectError::InvalidRange);
+        }
+        let get = GetObjectOperation::new(self.input.clone())
+            .with_restrictions(self.restrictions.clone());
+        Ok(Next::Call(IoCall::child(get)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<ObjectInfo> {
+        match std::mem::replace(&mut self.step, InfoStep::Holders) {
+            InfoStep::Get => self.got(result.child()?),
+            InfoStep::User(read) => {
+                // Elsewhere than on a User node a missing local blob is a fault.
+                if !result.child::<bool, IoError>()?.unwrap_or(false) {
+                    return Err(GetObjectError::BlobNotLocal {
+                        blake3: read.blake3,
+                        version_id: read.version_id,
+                        metadata: read.metadata,
+                        version_created_at: read.version_created_at,
+                        source_policies: read.source_policies,
+                    });
+                }
+                let holders = HolderReadOperation::new(*read, true);
+                Ok(Next::Call(IoCall::child(holders)))
+            }
+            InfoStep::Holders => match result.child::<HolderRead, GetObjectError>()?? {
+                HolderRead::Info(info) => Ok(Next::Done(*info)),
+                HolderRead::Blob(_) => Err(GetObjectError::GetObjectFailed),
+            },
+        }
     }
 }
 
 /// One holder-backed read: the local version facts plus the caller's scoped
 /// credential, so the routed result is never less constrained than the record.
+#[derive(Debug, PartialEq)]
 pub(super) struct RoutedRead {
     pub(super) user_id: UserId,
     pub(super) realm_id: RealmId,
@@ -934,41 +1089,106 @@ impl HolderFailures {
     }
 }
 
-async fn routed_blob(
-    context: &DriverContext,
-    read: RoutedRead,
-) -> Result<GetObjectResult, GetObjectError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.realm_id;
-    let holders = drive(
-        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
-        context,
-    )
-    .await
-    .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let summary = local_multipart_summary(context, read.version_id).await?;
+/// What the holders gave a routed read.
+#[derive(Debug, PartialEq)]
+enum HolderRead {
+    Blob(Box<GetObjectResult>),
+    Info(Box<ObjectInfo>),
+}
 
-    let mut failures = HolderFailures::default();
-    for holder in holders {
+#[derive(Debug, PartialEq)]
+enum HolderStep {
+    Node,
+    Holders,
+    Summary,
+    Read,
+}
+
+/// Asks the holders of a blob one after another for its bytes or only its facts.
+#[derive(Debug, PartialEq)]
+struct HolderReadOperation {
+    read: Option<RoutedRead>,
+    metadata_only: bool,
+    holders: VecDeque<NodeId>,
+    summary: Option<MultipartObjectSummary>,
+    failures: HolderFailures,
+    step: HolderStep,
+}
+
+impl HolderReadOperation {
+    fn new(read: RoutedRead, metadata_only: bool) -> Self {
+        Self {
+            read: Some(read),
+            metadata_only,
+            holders: VecDeque::new(),
+            summary: None,
+            failures: HolderFailures::default(),
+            step: HolderStep::Node,
+        }
+    }
+
+    fn read(&self) -> Result<&RoutedRead, IoError> {
+        self.read.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    /// The local version owns multipart facts even when another holder supplies bytes.
+    fn read_summary(&mut self) -> Turn<HolderRead> {
+        let Some(version_id) = self.read()?.version_id else {
+            return self.next_holder();
+        };
+        let key = MultipartObjectKey::summary(version_id)
+            .to_bytes()
+            .map_err(GetObjectError::ConversionError)?;
+        self.step = HolderStep::Summary;
+        Ok(Next::Call(read_row(OBJECT_METADATA_KEYSPACE, key)))
+    }
+
+    fn next_holder(&mut self) -> Turn<HolderRead> {
+        let Some(holder) = self.holders.pop_front() else {
+            return Err(self.failures.into_error());
+        };
+        let read = self.read()?;
         let request = BaoReadRequest {
             auth_context: AuthContext {
                 user_id: read.user_id,
-                realm_id,
+                realm_id: read.realm_id,
                 path_restrictions: read.restrictions.clone(),
                 session: None,
             },
-            realm_id,
+            realm_id: read.realm_id,
             target: BaoReadTarget::Blake3(read.blake3),
             expected_blake3: Some(read.blake3),
-            metadata_only: false,
+            metadata_only: self.metadata_only,
             destination: None,
             known_refs: Vec::new(),
             range: None,
         };
-        match failures.consider(drive(ManagedReadOperation::new(holder, request), context).await) {
+        self.step = HolderStep::Read;
+        let managed = ManagedReadOperation::new(holder, request);
+        Ok(Next::Call(IoCall::child(managed)))
+    }
+
+    fn answered(&mut self, answer: Result<BaoReadOutput, BaoReadError>) -> Turn<HolderRead> {
+        if self.metadata_only {
+            return match answer {
+                Ok(BaoReadOutput::Metadata {
+                    size, etag, hashes, ..
+                }) => {
+                    let summary = self.summary.take();
+                    let info = routed_info(self.read()?, size, etag, hashes, summary);
+                    Ok(Next::Done(HolderRead::Info(Box::new(info))))
+                }
+                Ok(BaoReadOutput::Stream { .. }) => {
+                    self.failures.unavailable = true;
+                    self.next_holder()
+                }
+                Err(error) => {
+                    self.failures.record(error);
+                    self.next_holder()
+                }
+            };
+        }
+        match self.failures.consider(answer) {
             Some(BaoReadOutput::Stream {
                 blob,
                 size,
@@ -976,32 +1196,19 @@ async fn routed_blob(
                 hashes,
                 ..
             }) => {
-                return Ok(routed_result(read, blob, size, etag, hashes, summary));
+                let read = self.read.take().ok_or(IoError::Unfinished)?;
+                let summary = self.summary.take();
+                let result = routed_result(read, blob, size, etag, hashes, summary);
+                Ok(Next::Done(HolderRead::Blob(Box::new(result))))
             }
-            None => {}
-            Some(BaoReadOutput::Metadata { .. }) => unreachable!("metadata does not serve bytes"),
+            _ => self.next_holder(),
         }
     }
-    Err(failures.into_error())
 }
 
-async fn routed_metadata(
-    context: &DriverContext,
-    read: RoutedRead,
-) -> Result<ObjectInfo, GetObjectError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.realm_id;
-    let holders = drive(
-        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
-        context,
-    )
-    .await
-    .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let summary = local_multipart_summary(context, read.version_id).await?;
-    let mut failures = HolderFailures::default();
+impl Operation for HolderReadOperation {
+    type Output = HolderRead;
+    type Error = GetObjectError;
 
     for holder in holders {
         let request = BaoReadRequest {
