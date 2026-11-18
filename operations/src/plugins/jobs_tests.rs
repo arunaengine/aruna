@@ -7,7 +7,8 @@ use aruna_core::structs::execution::job::OutputObject;
 
 use super::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::submit::start_copy;
+use crate::plugins::jobs::start_work;
+use crate::plugins::submit::WorkRequest;
 use crate::plugins::submit::tests::{ready, request, scope};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, WorkState};
@@ -30,9 +31,13 @@ async fn status_from_row() {
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
     let copy = request(&fixture, &install, "out/a.txt");
-    let id = start_copy(&fixture.ctx, &scope(&fixture, &install), copy)
-        .await
-        .unwrap();
+    let id = start_work(
+        &fixture.ctx,
+        &scope(&fixture, &install),
+        WorkRequest::Copy(copy),
+    )
+    .await
+    .unwrap();
     let local = fixture.actor.node_id;
     let place = (&install, local);
     let queued = job_status(&fixture.ctx, place, &id.to_string())
@@ -96,7 +101,12 @@ async fn cancel_stops_job() {
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
     let copy = request(&fixture, &install, "out/a.txt");
-    let id = start_copy(&fixture.ctx, &scope(&fixture, &install), copy).await;
+    let id = start_work(
+        &fixture.ctx,
+        &scope(&fixture, &install),
+        WorkRequest::Copy(copy),
+    )
+    .await;
     let id = id.unwrap().to_string();
     let place = (&install, fixture.actor.node_id);
     for _ in 0..2 {

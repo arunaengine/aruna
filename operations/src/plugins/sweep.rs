@@ -69,7 +69,7 @@ mod tests {
     use crate::plugins::install::sweep_orphans;
     use crate::plugins::install::tests::Fixture;
     use crate::plugins::install::{read_config, write_record};
-    use crate::plugins::rows::page_result;
+    use crate::plugins::rows::tests::page_result;
     use aruna_core::UserId;
 
     #[tokio::test]

@@ -20,11 +20,10 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 
-use super::account::read_user;
-use super::broker::local_object;
-use super::broker::unmarked;
-use super::check::{check_identity, copy_grants};
+use super::account::ReadUser;
+use super::check::{CopyGrants, check_identity};
 use super::install::read_config;
+use super::objects::{LocalObject, Unmarked};
 use super::work::holds_job;
 use super::work::{WorkRow, read_work};
 use crate::driver::{DriverContext, drive};
@@ -127,9 +126,8 @@ async fn admit_work(
     let Some(row) = row else {
         return Err(permanent("the plugin work is no longer recorded"));
     };
-    let user = read_user(&ctx.driver, row.account)
-        .await
-        .map_err(deferred)?;
+    let user = drive(ReadUser(row.account), &ctx.driver).await;
+    let user = user.map_err(|error| deferred(error.0))?;
     let place = (&config, spec.realm_id, ctx.owner_node_id);
     let binding = (spec.install_id, row.binding.digest.as_str());
     let install = check_identity(place, binding, user.as_ref()).map_err(refused)?;
@@ -164,26 +162,27 @@ async fn copy_work(
     else {
         return permanent("the work is not a copy");
     };
-    let patterns = match copy_grants(&ctx.driver, install, (source, target)).await {
+    let patterns = match drive(CopyGrants::new(install, (source, target)), &ctx.driver).await {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
     let place = (spec.realm_id, ctx.owner_node_id);
-    let (source_bucket, source_key) = match local_object(&ctx.driver, place, install, source).await
-    {
+    let source_object = LocalObject::new(place, install, source);
+    let (source_bucket, source_key) = match drive(source_object, &ctx.driver).await {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
-    let (dest_bucket, dest_key) = match local_object(&ctx.driver, place, install, target).await {
+    let target_object = LocalObject::new(place, install, target);
+    let (dest_bucket, dest_key) = match drive(target_object, &ctx.driver).await {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
     // The version checked is the version copied, so a newer marked one never slips in.
-    let source_version =
-        match unmarked(&ctx.driver, (&source_bucket, &source_key), *source_version).await {
-            Ok(found) => found.or(*source_version),
-            Err(error) => return refused(error),
-        };
+    let readable = Unmarked::new((&source_bucket, &source_key), *source_version);
+    let source_version = match drive(readable, &ctx.driver).await {
+        Ok(found) => found.or(*source_version),
+        Err(error) => return refused(error),
+    };
     let auth = account(install, &patterns);
     let read = (source_bucket.clone(), source_key.clone(), source_version);
     let input = CopyObjectInput {
@@ -283,7 +282,8 @@ pub(super) fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> A
 }
 
 /// A refused check ends the work; a check that could not run is tried again later.
-pub(super) fn refused(error: HostError) -> JobRunOutcome {
+pub(super) fn refused(error: impl Into<HostError>) -> JobRunOutcome {
+    let error = error.into();
     match error.kind {
         ErrorKind::Unavailable => JobRunOutcome::Deferred(JobError::retryable(error.message)),
         _ => permanent(error.message),

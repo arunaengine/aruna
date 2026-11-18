@@ -16,7 +16,7 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, SecretAudit, 
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use url::Url;
 
-use super::account::{owned, read_user};
+use super::account::{ReadUser, owned};
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
 use super::rows::write_rows;
@@ -148,8 +148,8 @@ async fn authorized(ctx: &DriverContext, install: &PluginInstall) -> Result<bool
     if install.state != InstallState::Active {
         return Ok(false);
     }
-    let user = read_user(ctx, install.account).await;
-    let user = user.map_err(ReleaseError::Unavailable)?;
+    let user = drive(ReadUser(install.account), ctx).await;
+    let user = user.map_err(|error| ReleaseError::Unavailable(error.0))?;
     let scope = InstallScope {
         realm_id: install.account.realm_id,
         group_id: install.group_id,

@@ -278,9 +278,10 @@ async fn marked_source_refused() {
 
     use crate::driver::drive;
     use crate::plugins::broker::RunBroker;
+    use crate::plugins::jobs::start_work;
     use crate::plugins::marks::{MARKED, Mark, mark_row};
     use crate::plugins::rows::write_rows;
-    use crate::plugins::submit::start_copy;
+    use crate::plugins::submit::WorkRequest;
     use crate::plugins::submit::tests::{request, scope};
     use crate::plugins::work::WorkKind;
     use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -307,7 +308,7 @@ async fn marked_source_refused() {
     let run = scope(&fixture, &install);
     let mut copy = request(&fixture, &install, "out/b.txt");
     copy.ordinal = 7;
-    let refused = start_copy(&blob, &run, copy).await;
+    let refused = start_work(&blob, &run, WorkRequest::Copy(copy)).await;
     assert_eq!(
         refused.map_err(|error| error.message),
         Err(MARKED.to_string())

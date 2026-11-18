@@ -230,6 +230,42 @@ fn received(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(key.get(1..9)?.try_into().ok()?))
 }
 
+/// Deletes the use audit rows past their retention, a page per transaction; answers how many
+/// records went.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PruneAudit {
+    now_ms: u64,
+    pruned: usize,
+}
+
+impl PruneAudit {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self { now_ms, pruned: 0 }
+    }
+
+    fn page(&self) -> IoCall {
+        IoCall::child(prune_uses(self.now_ms, PAGE))
+    }
+}
+
+impl Operation for PruneAudit {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        let (count, more) = answer.child::<(usize, bool), StoreError>()??;
+        self.pruned += count;
+        Ok(match more {
+            true => Next::Call(self.page()),
+            false => Next::Done(self.pruned),
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "prune_tests.rs"]
 mod tests;

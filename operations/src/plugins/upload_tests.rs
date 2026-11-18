@@ -223,7 +223,8 @@ async fn marked_source_kept() {
     let (_root, blob) = ready(&fixture, &install).await;
     let (base, seen) = server(201).await;
     let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
-    let version = crate::plugins::broker::unmarked(&blob, ("in", "a.txt"), None).await;
+    let readable = crate::plugins::objects::Unmarked::new(("in", "a.txt"), None);
+    let version = crate::driver::drive(readable, &blob).await;
     let version = version.unwrap().unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),
