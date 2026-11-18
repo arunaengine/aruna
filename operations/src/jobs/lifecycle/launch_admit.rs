@@ -600,7 +600,6 @@ impl AdmitLaunchOperation {
         let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
         let intent = self.intent()?;
         let planned = self.planned.as_ref().ok_or(LaunchUndecided)?;
-        let limits = node.limits.ok_or(LaunchUndecided)?;
         let declined = |reason| Ok(Next::Done(LaunchAnswer::declined(reason)));
         let subject = node.execution_id.to_bytes();
         let Ok(job_id) = mint_configured_job(self.config()?, node.local, &subject) else {

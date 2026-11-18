@@ -24,7 +24,7 @@ use crate::jobs::lifecycle::launch_admit::{
     CommitReceiptOperation, CommitVerdict, SettleLaunchOperation, classify, existing_receipt,
 };
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
-use crate::jobs::lifecycle::target::{commit_receipt, settle};
+use crate::jobs::lifecycle::target::settle;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::state::read_job_record;
@@ -126,6 +126,17 @@ pub(super) fn config(
         record: Box::new(record),
         now_ms: 4_000,
     }
+}
+
+/// Commits one stored receipt with its reservation, as a target does for an offer.
+pub(super) async fn commit_receipt(
+    ctx: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    launch: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let commit = CommitReceiptOperation::new(config, launch.clone());
+    let answer = drive(commit, ctx.as_ref()).await.ok()?;
+    Some(settle(ctx, answer).await)
 }
 
 /// Commits one stored receipt with `reserve` answering every reservation attempt, the way the

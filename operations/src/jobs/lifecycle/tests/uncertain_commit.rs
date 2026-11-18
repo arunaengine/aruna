@@ -28,12 +28,13 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
-use super::admission_race::{commit_with, config, envelope, minted, receipts, rows, seed};
+use super::admission_race::{
+    commit_receipt, commit_with, config, envelope, minted, receipts, rows, seed,
+};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{CommitVerdict, RESERVE_ATTEMPTS, classify};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionOperation, reservation_key};
-use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::node::node_info::set_operator_drain;
 use crate::tests::records::{Family, REALM, context, local_capability};

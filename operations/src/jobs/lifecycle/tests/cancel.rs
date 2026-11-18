@@ -13,12 +13,12 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 
-use super::admission_race::{commit_with, config, envelope, rows, seed};
+use super::admission_race::{commit_receipt, commit_with, config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::cancel_family;
-use crate::jobs::lifecycle::target::{admit_launch, commit_receipt};
+use crate::jobs::lifecycle::target::admit_launch;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
@@ -353,8 +353,8 @@ async fn remote_run_untouched() {
 #[tokio::test]
 async fn deletion_hides_family() {
     // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
+    use super::family_report;
     use crate::jobs::lifecycle::cancel::publish_deletion;
-    use crate::jobs::lifecycle::routing::family_report;
     use crate::jobs::route::JobRouteError;
     let family = Family::new([43u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.holder).await;

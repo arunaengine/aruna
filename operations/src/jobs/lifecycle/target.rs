@@ -14,8 +14,7 @@ use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use super::cancel::cancel_local_run;
-use super::launch_admit::{AdmitLaunchOperation, CommitReceiptOperation, LaunchAnswer, LaunchNode};
-use super::reservation::ReserveExecutionConfig;
+use super::launch_admit::{AdmitLaunchOperation, LaunchAnswer, LaunchNode};
 use crate::driver::{DriverContext, drive};
 
 /// Admits one offered launch, or answers why it was refused. `None` means the
@@ -39,18 +38,6 @@ pub async fn admit_launch(
     };
     let admit = AdmitLaunchOperation::new(launch, node);
     let answer = drive(admit, context.as_ref()).await.ok()?;
-    Some(settle(context, answer).await)
-}
-
-/// Commits one stored receipt with its reservation. `None` is undecidable: the
-/// offer was neither admitted nor refused and the scheduler may ask again.
-pub(crate) async fn commit_receipt(
-    context: &Arc<DriverContext>,
-    config: ReserveExecutionConfig,
-    intent: &LaunchIntent,
-) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let commit = CommitReceiptOperation::new(config, intent.clone());
-    let answer = drive(commit, context.as_ref()).await.ok()?;
     Some(settle(context, answer).await)
 }
 
