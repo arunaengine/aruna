@@ -28,10 +28,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::key_locks::{
-    AliasPage, AliasPageOperation, AskWaitsOperation, FindAliasOperation, KeyCheckError,
-    KeyUnlockedOperation, MAX_AWAITED, VersionWaitOperation,
+    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, KeyUnlockedOperation,
+    MAX_AWAITED, VersionWaitOperation,
 };
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
@@ -450,19 +449,6 @@ impl Operation for AcceptWakeOperation {
     }
 }
 
-/// See [`AskWaitsOperation`].
-pub(crate) async fn ask_waits(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    node: NodeId,
-    targets: &[WaitTarget],
-) -> Vec<KeyWait> {
-    let serving = context.node_and_realm();
-    let ask = AskWaitsOperation::new(auth, job_id, node, targets, serving);
-    drive(ask, context).await.unwrap_or_default()
-}
-
 /// Key node: turns the registrations on `key` into owed wakes, in bounded pages, and arms the
 /// persisted delivery timer, so owed wakes are tried even on an idle node. The timer is armed
 /// also when queueing failed, since earlier pages may already owe wakes.
@@ -676,6 +662,7 @@ impl Operation for DeliverWakesOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};

@@ -668,8 +668,7 @@ async fn register_published(
     if record.identifiers.is_empty() {
         return Ok(());
     }
-    crate::jobs::service::submit_identifiers(
-        &ctx.driver,
+    let submit = crate::jobs::submit_local::SubmitLocalOperation::identifiers(
         aruna_core::structs::secondary_id::RegisterIdentifiersSpec {
             document_id: spec.document_id,
             identifiers: record.identifiers.clone(),
@@ -677,12 +676,17 @@ async fn register_published(
         },
         ctx.owner_node_id,
         format!("identifiers/{}", ctx.job_id),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        super::repository::TransferError::Retryable(format!("queueing identifiers failed: {error}"))
-    })
+        ctx.driver.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    crate::driver::drive(submit, ctx.driver.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            super::repository::TransferError::Retryable(format!(
+                "queueing identifiers failed: {error}"
+            ))
+        })
 }
 
 /// Reads the dataset's PID and live identifiers from its PID authority.

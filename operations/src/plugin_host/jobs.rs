@@ -16,11 +16,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::set_cancel_requested;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
+use crate::jobs::submit_local::{DedupJobOperation, MintJobOperation, QueueJobOperation};
 use crate::plugins::check::RunScope;
 use crate::plugins::grants::short_path;
 use crate::plugins::rows::{StoreError, decode, delete_rows, scan_rows};
@@ -167,7 +167,11 @@ pub(crate) async fn reconcile(
     install_id: Ulid,
     row: &WorkRow,
 ) -> Result<Option<JobId>, StoreError> {
-    let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
+    let found = drive(
+        DedupJobOperation::new(row.account, &dedup_key(row.work_id)),
+        ctx,
+    )
+    .await;
     let Some((job, _)) = found.map_err(|error| StoreError(error.to_string()))? else {
         return Ok(None);
     };
@@ -288,8 +292,9 @@ pub(crate) async fn start_work(
     };
     let (install_id, work_id) = (spec.install_id, spec.work_id);
     let dedup = dedup_key(work_id);
-    let job_id = mint_local_job(ctx, scope.realm_id, scope.local, Some(&dedup)).await;
-    let job_id = job_id.map_err(submit_error)?;
+    let serving = ctx.node_and_realm();
+    let mint = MintJobOperation::new(scope.realm_id, scope.local, Some(&dedup), serving);
+    let job_id = drive(mint, ctx).await.map_err(submit_error)?;
     let submitted = SubmitJobSpec {
         payload: JobPayload::PluginWork(spec),
         created_by: account,
@@ -301,8 +306,8 @@ pub(crate) async fn start_work(
         workspace_bucket: None,
         active_cap: Some(WORK_ACTIVE),
     };
-    let result = submit_local_job(ctx, submitted, job_id).await;
-    let result = result.map_err(submit_error)?;
+    let queue = QueueJobOperation::new(submitted, job_id, serving);
+    let result = drive(queue, ctx).await.map_err(submit_error)?;
     let change = WorkChange::Dispatched(result.job_id);
     let recorded = drive(update_work((install_id, work_id), change), ctx).await;
     recorded.map_err(|error| unavailable(error.0))?;

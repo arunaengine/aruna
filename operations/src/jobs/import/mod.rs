@@ -364,7 +364,8 @@ async fn reference_kind(
     let Some((group_id, connector_id)) = super::repository::reference_source(spec) else {
         return Ok(None);
     };
-    let connector = super::repository::connector::ConnectorViewOperation::new(group_id, connector_id);
+    let connector =
+        super::repository::connector::ConnectorViewOperation::new(group_id, connector_id);
     let view = drive(connector, &ctx.driver)
         .await
         .map_err(transfer_failure)?;
@@ -1330,8 +1331,7 @@ async fn register_identifiers(
     spec: &ImportRoCrateSpec,
     identifiers: Vec<SecondaryIdentifier>,
 ) -> Result<(), ImportFailure> {
-    crate::jobs::service::submit_identifiers(
-        &ctx.driver,
+    let submit = crate::jobs::submit_local::SubmitLocalOperation::identifiers(
         RegisterIdentifiersSpec {
             document_id: spec.document_id,
             identifiers,
@@ -1339,12 +1339,15 @@ async fn register_identifiers(
         },
         ctx.owner_node_id,
         format!("identifiers/{}", ctx.job_id),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        ImportFailure::Retryable(format!("queueing repository identifiers failed: {error}"))
-    })
+        ctx.driver.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    crate::driver::drive(submit, ctx.driver.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            ImportFailure::Retryable(format!("queueing repository identifiers failed: {error}"))
+        })
 }
 
 async fn cleanup_source(
@@ -1389,9 +1392,11 @@ async fn cleanup_source(
         checkpoint.pull.clone(),
         checkpoint.failure.clone(),
     );
-    Box::pin(drive(settle, &ctx.driver)).await.map_err(|error| {
-        ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
-    })?;
+    Box::pin(drive(settle, &ctx.driver))
+        .await
+        .map_err(|error| {
+            ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
+        })?;
     checkpoint.phase = ImportPhase::Done;
     Ok(())
 }

@@ -6,12 +6,13 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 
 use super::JOB_RETENTION_MS;
-use super::service::submit_handed_job;
+use super::submit_local::HandedJobOperation;
 use crate::distribution::imports::KeptStart;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 /// Runs each fetched job here as its own job from its handed position; a started job leaves
 /// the row at once.
@@ -30,7 +31,16 @@ pub(crate) async fn start_kept(context: &DriverContext, start: KeptStart) -> Res
             bucket_identity: bucket.identity(),
             ..spec
         };
-        submit_handed_job(context, spec, resume.as_ref(), local, JOB_RETENTION_MS).await?;
+        let handed = HandedJobOperation::new(
+            spec,
+            resume,
+            local,
+            JOB_RETENTION_MS,
+            (context.node_and_realm(), unix_timestamp_millis()),
+        );
+        drive(handed, context)
+            .await
+            .map_err(|error| error.to_string())?;
         kept.ready.remove(0);
         let value = postcard::to_allocvec(&kept).map_err(|error| error.to_string())?;
         let write = StorageEffect::Write {
