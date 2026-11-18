@@ -1830,7 +1830,11 @@ async fn plain_owns_copy() {
         };
         let key = state.location_key().unwrap();
         let event = storage
-            .send_effect(crate::blob::records::blob_location_read(&key, None))
+            .send_effect(aruna_core::effects::Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                key: key.to_bytes().into(),
+                txn_id: None,
+            }))
             .await;
         let Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..

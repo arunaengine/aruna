@@ -6,16 +6,15 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE,
-    COPY_OWNER_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, COPY_OWNER_KEYSPACE,
+    PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CopyOwner,
-    CurrentVersionPointer, HashIndex, VersionKey,
+    ArchiveKey, BlobHeadKey, BlobVersion, CopyOwner, CurrentVersionPointer, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key, release_marker};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -63,144 +62,61 @@ impl HeadAliasContext {
     }
 }
 
-pub fn blob_location_read(key: &BlobLocationKey, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-        key: ByteView::from(key.to_bytes()),
-        txn_id,
-    })
-}
-
-/// Records that a version uses a Pithos archive, in the transaction that writes the version.
-pub fn owner_write_effect(
-    owner: &CopyOwner,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
+pub fn owner_write_effect(owner: &CopyOwner) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: COPY_OWNER_KEYSPACE.to_string(),
         key: ByteView::from(owner.key()?),
         value: ByteView::from(Vec::new()),
-        txn_id,
+        txn_id: None,
     }))
 }
 
-pub fn owner_delete_effect(
-    owner: &CopyOwner,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Delete {
-        key_space: COPY_OWNER_KEYSPACE.to_string(),
-        key: ByteView::from(owner.key()?),
-        txn_id,
-    }))
-}
-
-/// Reads up to two owners of an archive: enough to see whether another owner remains.
-pub fn owners_scan_effect(archive: &ArchiveKey, txn_id: Option<TxnId>) -> Effect {
+pub fn owners_scan_effect(archive: &ArchiveKey) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: COPY_OWNER_KEYSPACE.to_string(),
         prefix: Some(ByteView::from(CopyOwner::prefix(archive))),
         start: None,
         limit: 2,
-        txn_id,
+        txn_id: None,
     })
 }
 
 /// Reads the location of an archive whose content hash is still pending.
-pub fn pending_location_read(archive: &ArchiveKey, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-        key: ByteView::from(archive.to_bytes()),
-        txn_id,
-    })
-}
-
-/// Keyed by the location's own backend, so a rewrite of identical content only
-/// ever replaces the copy on the backend the write resolved to.
-pub fn write_location_effect(
-    blake3_hash: [u8; 32],
-    location: BackendLocation,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    let key = BlobLocationKey::new(
-        blake3_hash,
-        location.format.encoding(),
-        location.backend.clone(),
-    );
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-        key: ByteView::from(key.to_bytes()),
-        value: location.to_bytes()?.into(),
-        txn_id,
-    }))
-}
-
 pub fn write_head_effect(
     context: &HeadAliasContext,
     pointer: CurrentVersionPointer,
-    txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: BLOB_HEAD_KEYSPACE.to_string(),
         key: context.head_key().to_bytes()?.into(),
         value: pointer.to_bytes()?.into(),
-        txn_id,
+        txn_id: None,
     }))
 }
 
-fn delete_head_effect(
-    context: &HeadAliasContext,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
+fn delete_head_effect(context: &HeadAliasContext) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Delete {
         key_space: BLOB_HEAD_KEYSPACE.to_string(),
         key: context.head_key().to_bytes()?.into(),
-        txn_id,
-    }))
-}
-
-pub fn read_version_effect(
-    version_key: &VersionKey,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Read {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: version_key.to_bytes()?.into(),
-        txn_id,
+        txn_id: None,
     }))
 }
 
 pub fn write_version_effect(
     version_key: &VersionKey,
     version: &BlobVersion,
-    txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
         key: version_key.to_bytes()?.into(),
         value: version.to_bytes()?.into(),
-        txn_id,
+        txn_id: None,
     }))
 }
 
-/// The release row a version's own tags declare and the bucket's release marker: written in the
-/// same transaction as the version, on every node that commits it, so a tagged release is never
-/// missing its row.
-pub fn release_row_effect(
-    version_key: &VersionKey,
-    version: &BlobVersion,
-    txn_id: Option<TxnId>,
-) -> Result<Option<Effect>, ConversionError> {
-    let writes = release_rows(version_key, version)?;
-    Ok(
-        (!writes.is_empty()).then_some(Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id,
-        })),
-    )
-}
-
-/// The rows of [`release_row_effect`]: none for a version without a release tag.
+/// The release row a version's own tags declare and the bucket's release marker, for the same
+/// transaction as the version, on every node that commits it, so a tagged version is never
+/// missing its row. None for a version without a release tag.
 pub fn release_rows(
     version_key: &VersionKey,
     version: &BlobVersion,
@@ -218,22 +134,10 @@ pub fn release_rows(
     ])
 }
 
-pub fn delete_version_effect(
-    version_key: &VersionKey,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Delete {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: version_key.to_bytes()?.into(),
-        txn_id,
-    }))
-}
-
 pub fn add_index_effect(
     context: &HeadAliasContext,
     blake3_hash: [u8; 32],
     version_id: Ulid,
-    txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: PATHS_INDEX_KEYSPACE.to_string(),
@@ -242,32 +146,15 @@ pub fn add_index_effect(
             .to_bytes()?
             .into(),
         value: ByteView::from(Vec::<u8>::new()),
-        txn_id,
-    }))
-}
-
-pub fn delete_index_effect(
-    context: &HeadAliasContext,
-    blake3_hash: [u8; 32],
-    version_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Delete {
-        key_space: PATHS_INDEX_KEYSPACE.to_string(),
-        key: context
-            .path_index_key(blake3_hash, version_id)
-            .to_bytes()?
-            .into(),
-        txn_id,
+        txn_id: None,
     }))
 }
 
 pub fn iter_index_effect(
     blake3_hash: &[u8],
     start_after: Option<Key>,
-    txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    iter_hash_page(blake3_hash, start_after, txn_id, usize::MAX)
+    iter_hash_page(blake3_hash, start_after, usize::MAX)
 }
 
 pub fn iter_hash_page(
@@ -281,7 +168,7 @@ pub fn iter_hash_page(
         prefix: Some(HashIndex::hash_prefix(blake3_hash)?.into()),
         start: start_after.map(IterStart::After),
         limit,
-        txn_id,
+        txn_id: None,
     }))
 }
 
@@ -289,24 +176,18 @@ pub fn build_transition_effects(
     context: &HeadAliasContext,
     new_pointer: Option<CurrentVersionPointer>,
     new_current_hash: Option<[u8; 32]>,
-    txn_id: Option<TxnId>,
 ) -> Result<Effects, ConversionError> {
     let mut effects = smallvec![];
 
     match new_pointer.as_ref() {
-        Some(pointer) => effects.push(write_head_effect(context, pointer.clone(), txn_id)?),
-        None => effects.push(delete_head_effect(context, txn_id)?),
+        Some(pointer) => effects.push(write_head_effect(context, pointer.clone())?),
+        None => effects.push(delete_head_effect(context)?),
     }
 
     if let Some(new_hash) = new_current_hash
         && let Some(pointer) = new_pointer.as_ref()
     {
-        effects.push(add_index_effect(
-            context,
-            new_hash,
-            pointer.version_id,
-            txn_id,
-        )?);
+        effects.push(add_index_effect(context, new_hash, pointer.version_id)?);
     }
 
     Ok(effects)
@@ -337,7 +218,7 @@ mod pure_tests {
     fn adds_marker_entry() {
         let context = alias_context();
         let version_id = Ulid::from_bytes([4u8; 16]);
-        let effect = add_index_effect(&context, [9u8; 32], version_id, None).unwrap();
+        let effect = add_index_effect(&context, [9u8; 32], version_id).unwrap();
 
         let Effect::Storage(StorageEffect::Write { key, value, .. }) = effect else {
             panic!("expected storage write effect");
@@ -351,7 +232,7 @@ mod pure_tests {
 
     #[test]
     fn iterates_hash_prefix() {
-        let effect = iter_index_effect(&[7u8; 32], None, None).unwrap();
+        let effect = iter_index_effect(&[7u8; 32], None).unwrap();
 
         let Effect::Storage(StorageEffect::Iter { prefix, .. }) = effect else {
             panic!("expected storage iter effect");
@@ -366,7 +247,7 @@ mod pure_tests {
     #[test]
     fn checks_page_limit() {
         let Effect::Storage(StorageEffect::Iter { limit, .. }) =
-            iter_hash_page(&[7u8; 32], None, None, 1024).unwrap()
+            iter_hash_page(&[7u8; 32], None, 1024).unwrap()
         else {
             panic!("expected storage iter effect");
         };
@@ -401,7 +282,7 @@ mod pure_tests {
     #[test]
     fn deletes_without_alias() {
         let context = alias_context();
-        let effects = build_transition_effects(&context, None, None, None).unwrap();
+        let effects = build_transition_effects(&context, None, None).unwrap();
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(

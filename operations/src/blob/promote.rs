@@ -608,7 +608,7 @@ impl PromotePage {
                     version_key.bucket.clone(),
                     version_key.key.clone(),
                 );
-                let index = add_index_effect(&alias, blake3, version_key.version_id, None)?;
+                let index = add_index_effect(&alias, blake3, version_key.version_id)?;
                 if let Effect::Storage(StorageEffect::Write {
                     key_space,
                     key,

@@ -104,7 +104,7 @@ impl VersionChange {
             &scope.bucket,
             key,
         );
-        let transition = build_transition_effects(&alias, Some(next), None, None)?;
+        let transition = build_transition_effects(&alias, Some(next), None)?;
         let calls = (transition.into_iter()).chain([write]).map(IoCall::from);
         Ok(Self {
             calls: calls.collect(),
@@ -239,7 +239,7 @@ impl ObserveFileOperation {
             now,
         );
         let key = VersionKey::new(&scope.bucket, &self.path, version_id);
-        let write = journaled(write_version_effect(&key, &version, None)?, &uploaded)?;
+        let write = journaled(write_version_effect(&key, &version)?, &uploaded)?;
         // Charge the current observation and release the observation it replaces.
         let live = existing.filter(|version| !version.is_deleted());
         let released = (live.as_ref())
@@ -321,7 +321,7 @@ impl TombstoneOperation {
         let version_id = Ulid::generate();
         let marker = BlobVersion::deleted(SystemTime::now(), scope.user_id);
         let key = VersionKey::new(&scope.bucket, &self.key, version_id);
-        let write = write_version_effect(&key, &marker, None)?;
+        let write = write_version_effect(&key, &marker)?;
         let size = live.offered_size(&scope.bucket, &self.key).unwrap_or(0);
         let delta = UsageDelta {
             objects: -1,
