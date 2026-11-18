@@ -7,25 +7,21 @@ use std::collections::BTreeSet;
 use aruna_core::admin_checks::coalescible_config_op;
 use aruna_core::admin_documents::{AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::document::{DocumentEvent, DocumentTarget};
+use aruna_core::document_apply::create::PendingCreateApply;
+use aruna_core::document_apply::distribution::Handled;
+use aruna_core::document_apply::events::{ApplyEventPlan, ApplyOutcome};
 use aruna_core::metadata::GraphLifecycleRecord;
-use aruna_core::reducer::reduced_admin_target;
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_storage::StorageHandle;
 use tracing::warn;
 
-use crate::document_sync::{
-    DocumentSyncDependency, DocumentSyncService, PendingCreateApply, SyncRejection,
-};
-use crate::error::{NetError, Result};
+use crate::document_sync::plan_run::retry_plan;
+use crate::document_sync::{DocumentSyncDependency, DocumentSyncService, SyncRejection};
+use crate::error::Result;
 
-use super::admin::{apply_admin_operation, flush_config_run};
-use super::distribution::apply_distribution_operation;
-use super::links::apply_link_event;
-use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
-use super::parked::Handled;
+use super::admin::{apply_admin_operation, apply_distribution_operation, flush_config_run};
 use super::satisfied_dependencies;
-use super::shared::{SharedOutcome, apply_shared_event, apply_watch_event};
 use super::validate::{ConfigValidationCache, validate_admin_event};
 use aruna_core::config_authority::AdminEventValidation;
 
@@ -119,155 +115,60 @@ pub(super) async fn apply_batch_event(
     event: DocumentEvent,
     state: &mut BatchState,
 ) -> Result<()> {
-    if matches!(
-        event.target(),
-        DocumentTarget::WatchSubscription { .. }
-            | DocumentTarget::EmailPreference { .. }
-            | DocumentTarget::WebhookSubscription { .. }
-            | DocumentTarget::OwnerSecret { .. }
-    ) && matches!(
+    if let DocumentEvent::AdminOperation {
+        target,
         event,
-        DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. }
-    ) {
-        let outcome = apply_watch_event(service, topic_id, actor_id, identity, event).await?;
-        record_shared(outcome, state);
-        return Ok(());
-    }
-    if matches!(
-        event.target(),
-        DocumentTarget::NodeUsage { .. }
-            | DocumentTarget::WatchInterest { .. }
-            | DocumentTarget::NodeInfo { .. }
-    ) {
-        let outcome = apply_shared_event(service, topic_id, actor_id, identity, event).await?;
-        record_shared(outcome, state);
-        return Ok(());
-    }
-
-    if matches!(
-        &event,
-        DocumentEvent::Upsert {
-            target: DocumentTarget::MetadataRegistry { .. }
-                | DocumentTarget::MetadataCreateEvent { .. }
-                | DocumentTarget::MetadataDocumentLifecycle { .. }
-                | DocumentTarget::MetadataGraphLifecycle { .. },
-            ..
-        }
-    ) {
-        let outcome = apply_metadata_event(service, topic_id, identity, event).await?;
-        record_metadata(outcome, state);
-        return Ok(());
-    }
-    if matches!(event.target(), DocumentTarget::RepositoryLink { .. }) {
-        let outcome = apply_link_event(service, topic_id, actor_id, identity, event).await?;
-        record_metadata(outcome, state);
-        return Ok(());
-    }
-    if matches!(
-        &event,
-        DocumentEvent::Upsert {
-            target: DocumentTarget::GitRecord { .. } | DocumentTarget::GitPack { .. },
-            ..
-        }
-    ) {
-        let outcome = super::git::apply_git_event(service, topic_id, identity, event).await?;
-        record_metadata(outcome, state);
-        return Ok(());
-    }
-    if matches!(
-        event.target(),
-        DocumentTarget::VaultRevision { .. } | DocumentTarget::UserKey { .. }
-    ) {
-        let outcome =
-            super::vault::apply_vault_event(service, topic_id, actor_id, identity, event).await?;
-        record_metadata(outcome, state);
-        return Ok(());
-    }
-    if matches!(
-        event.target(),
-        DocumentTarget::PersistentIdMapping { .. } | DocumentTarget::PlacementPolicy { .. }
-    ) {
-        let outcome = apply_policy_event(service, topic_id, actor_id, identity, event).await?;
-        record_metadata(outcome, state);
-        return Ok(());
-    }
-
-    match event {
-        event @ (DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. })
-            if reduced_admin_target(event.target()).is_some() =>
-        {
-            // Whole-document admin sync is unsupported, but must not wedge replay.
-            warn!(
-                %topic_id,
-                target = ?event.target(),
-                "Skipping unsupported whole-document admin sync event"
-            );
-            state.add_rejection(SyncRejection::new(
-                identity,
-                event,
-                "unsupported whole-document admin sync event",
-            ));
-        }
-        DocumentEvent::AdminOperation {
+        placement,
+        origin_signature,
+    } = event
+    {
+        return apply_admin_event(
+            service,
+            topic_id,
+            actor_id,
+            identity,
             target,
             event,
             placement,
             origin_signature,
+            state,
+        )
+        .await;
+    }
+    let build = || ApplyEventPlan {
+        topic_id,
+        actor_id,
+        realm_id: service.realm_id,
+        identity,
+        event: event.clone(),
+    };
+    let conflicted = "document apply conflict retries exhausted";
+    match retry_plan(&service.storage, build, conflicted).await? {
+        ApplyOutcome::Applied {
+            target,
+            tombstone,
+            git_document,
         } => {
-            apply_admin_event(
-                service,
-                topic_id,
-                actor_id,
-                identity,
-                target,
-                event,
-                placement,
-                origin_signature,
-                state,
-            )
-            .await?;
-        }
-        event => {
-            let target = event.target().clone();
-            match service.apply_document_event(event.clone()).await {
-                Ok(()) => state.add_target(target),
-                Err(NetError::Bootstrap(reason)) => {
-                    warn!(
-                        %topic_id,
-                        ?target,
-                        %reason,
-                        "Quarantining a malformed or unsupported sync event"
-                    );
-                    state.add_rejection(SyncRejection::new(identity, event, reason));
-                }
-                Err(error) => return Err(error),
+            if let Some(document_id) = git_document {
+                aruna_core::git::record_written(document_id);
             }
-        }
-    }
-    Ok(())
-}
-
-fn record_shared(outcome: SharedOutcome, state: &mut BatchState) {
-    match outcome {
-        SharedOutcome::Applied(target) => state.add_target(target),
-        SharedOutcome::Skipped => {}
-        SharedOutcome::Rejected(rejection) => state.add_rejection(rejection),
-    }
-}
-
-fn record_metadata(outcome: MetadataOutcome, state: &mut BatchState) {
-    match outcome {
-        MetadataOutcome::Applied { target, tombstone } => {
             if let Some(tombstone) = tombstone {
                 state.add_tombstone(tombstone);
             }
             state.add_target(target);
         }
-        MetadataOutcome::Deferred(dependency) => state.add_dependency(dependency),
-        MetadataOutcome::Pending(pending) => state.add_pending(*pending),
-        MetadataOutcome::Rejected(rejection) => state.add_rejection(rejection),
-        MetadataOutcome::Skipped => {}
+        ApplyOutcome::Deferred(dependency) => {
+            warn!(%topic_id, target = ?event.target(), ?dependency, "Deferring a document until its dependency replicates");
+            state.add_dependency(dependency);
+        }
+        ApplyOutcome::Pending(pending) => state.add_pending(*pending),
+        ApplyOutcome::Rejected(rejection) => {
+            warn!(%topic_id, target = ?event.target(), reason = %rejection.reason, "Rejecting a replicated document event");
+            state.add_rejection(*rejection);
+        }
+        ApplyOutcome::Skipped => {}
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

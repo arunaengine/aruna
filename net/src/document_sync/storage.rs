@@ -45,6 +45,17 @@ impl DocumentSyncService {
     }
 }
 
+/// Makes every committed write durable.
+pub(super) async fn sync_storage(storage: &StorageHandle) -> Result<()> {
+    match storage.send_storage_effect(StorageEffect::SyncAll).await {
+        Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while syncing: {other:?}"
+        ))),
+    }
+}
+
 pub(super) async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
     match storage
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })

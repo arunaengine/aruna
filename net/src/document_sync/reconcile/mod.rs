@@ -2,33 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::document_apply::reads::DependencyPlan;
+
+use super::plan_run::run_plan;
 use super::*;
 
 pub(crate) mod admin;
-mod apply;
 mod batch;
 pub(crate) mod cursor;
-mod distribution;
 mod document;
-mod git;
-mod links;
-mod materialize;
-mod metadata;
 mod overflow;
-mod parked;
-mod registry;
-mod shared;
 mod validate;
-mod vault;
 
 pub(in crate::document_sync) use self::admin::*;
-#[cfg(test)]
-pub(in crate::document_sync) use self::apply::*;
 pub(in crate::document_sync) use self::cursor::*;
-pub(in crate::document_sync) use self::distribution::*;
-pub(in crate::document_sync) use self::materialize::*;
-pub(in crate::document_sync) use self::parked::*;
-pub(in crate::document_sync) use self::registry::*;
 pub(in crate::document_sync) use self::validate::*;
 
 impl DocumentSyncService {
@@ -426,81 +413,11 @@ impl DocumentSyncService {
             .document_event_batch(topic_id, cursor, FRAME_LEN_LIMIT)?
             .events)
     }
-
-    /// `Err` is permanent evidence: a create event whose payload does not decode
-    /// or does not name its own target can never become valid.
-    pub(in crate::document_sync) fn prepare_create(
-        &self,
-        identity: SyncQuarantineIdentity,
-        event: DocumentEvent,
-    ) -> std::result::Result<PendingCreateApply, Box<SyncRejection>> {
-        let (document_id, target_event_id, bytes) = match &event {
-            DocumentEvent::Upsert {
-                target:
-                    DocumentTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: target_event_id,
-                    },
-                bytes,
-                ..
-            } => (*document_id, *target_event_id, bytes.clone()),
-            _ => unreachable!(
-                "metadata create apply helper is only called for metadata create upserts"
-            ),
-        };
-        let record = match postcard::from_bytes::<MetadataEventRecord>(&bytes) {
-            Ok(record) => record,
-            Err(error) => {
-                return Err(Box::new(SyncRejection::new(
-                    identity,
-                    event,
-                    format!("undecodable metadata create event: {error}"),
-                )));
-            }
-        };
-        if record.record.document_id != document_id || record.event_id != target_event_id {
-            let reason = format!(
-                "metadata create-event target {document_id}/{target_event_id} does not match payload {}/{}",
-                record.record.document_id, record.event_id
-            );
-            return Err(Box::new(SyncRejection::new(identity, event, reason)));
-        }
-        Ok(PendingCreateApply {
-            identity,
-            event,
-            target: DocumentTarget::MetadataCreateEvent {
-                document_id,
-                event_id: target_event_id,
-            },
-            record,
-            bytes,
-            lifecycle_revision: None,
-            message: None,
-        })
-    }
 }
 
 pub(in crate::document_sync) async fn dependency_available(
     storage: &StorageHandle,
     dependency: DocumentSyncDependency,
 ) -> Result<bool> {
-    match dependency {
-        DocumentSyncDependency::RealmConfig(realm_id) => {
-            Ok(read_realm_config(storage, realm_id).await?.is_some())
-        }
-        DocumentSyncDependency::RealmAuthorization(realm_id) => {
-            Ok(read_realm_authorization(storage, realm_id).await?.is_some())
-        }
-        DocumentSyncDependency::PlacementStrategy {
-            realm_id,
-            strategy_id,
-        } => Ok(read_realm_config(storage, realm_id)
-            .await?
-            .is_some_and(|config| {
-                config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
-            })),
-        DocumentSyncDependency::GroupAuthorization(group_id) => {
-            Ok(read_group_authorization(storage, group_id).await?.is_some())
-        }
-    }
+    run_plan(storage, DependencyPlan(dependency)).await
 }

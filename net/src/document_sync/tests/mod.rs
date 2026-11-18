@@ -72,7 +72,38 @@ mod shard;
 mod validation;
 mod vault;
 
+use crate::document_sync::plan_run::run_plan;
 use crate::tests::document_sync_support::*;
+use aruna_core::document_apply::registry::{document_delete_entries, record_fenced};
+use aruna_core::document_apply::{ApplyError, Step, quarantine::quarantine_entries};
+use aruna_core::row_plan::{PlanRows, Planned, RowPlan};
+
+/// Asks whether a stored delete or graph tombstone fences a registry record out.
+#[derive(Debug, PartialEq)]
+struct FencePlan(MetadataRegistryRecord);
+
+impl RowPlan for FencePlan {
+    type Output = bool;
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<bool>> {
+        Ok(Planned::output(record_fenced(rows, &self.0)?))
+    }
+}
+
+/// Stores the evidence of these rejections.
+#[derive(Debug, PartialEq)]
+struct EvidencePlan(Vec<SyncRejection>);
+
+impl RowPlan for EvidencePlan {
+    type Output = ();
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
+        let entries = quarantine_entries(rows, &self.0)?.expect("capacity is available");
+        Ok(Planned::changes((), Vec::new(), entries))
+    }
+}
 
 // Two services fork one admin topic. The tie-break resets the losing side, whose
 // evicted event decodes back to an outbox publish with its original event id.

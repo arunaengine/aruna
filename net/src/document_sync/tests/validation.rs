@@ -105,7 +105,7 @@ async fn admits_authentic_policy() {
             .apply_policy_document(&document, placement)
             .await
             .expect("apply runs"),
-        MetadataPlacementOutcome::Accepted(true)
+        PlacementOutcome::Accepted(true)
     ));
 
     let target = placement_policy_target(policy.policy().policy_id);
@@ -157,7 +157,7 @@ async fn rejects_forged_publication() {
                 .apply_policy_document(&forged, placement)
                 .await
                 .expect("apply runs"),
-            MetadataPlacementOutcome::Rejected
+            PlacementOutcome::Rejected
         ));
     }
 
@@ -205,7 +205,7 @@ async fn defers_unknown_authority() {
             .apply_policy_document(&document, placement)
             .await
             .expect("apply runs"),
-        MetadataPlacementOutcome::Deferred(DocumentSyncDependency::RealmAuthorization(deferred))
+        PlacementOutcome::Deferred(DocumentSyncDependency::RealmAuthorization(deferred))
             if deferred == realm_id
     ));
 }

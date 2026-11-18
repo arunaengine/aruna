@@ -8,35 +8,26 @@ use ::irokle::{Event as _, Storage as _};
 use aruna_core::document::{
     BatchEvent, DocumentEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
 };
-use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
+use aruna_core::document_apply::create::{CreateBatchPlan, PendingCreateApply};
+use aruna_core::document_apply::quarantine::CursorEvidencePlan;
+use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::storage_entries::{
-    commit_message_entry, create_acceptance_entry, create_acceptance_key,
-    create_projection_entries, shard_manifest_entry, sync_revision_entry,
-};
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::sync_checks::{EventScreen, screen_event};
 use aruna_core::types::Value;
 use byteview::ByteView;
 use tracing::warn;
-use ulid::Ulid;
 
-use crate::document_sync::storage::{
-    abort_txn, replace_batch_in, start_storage_transaction, transaction_read,
-};
+use crate::document_sync::plan_run::run_plan;
 use crate::document_sync::{
     DeferredRegistrationOutcome, DocumentSyncDependency, DocumentSyncService, FRAME_LEN_LIMIT,
-    MetadataPlacementFence, MetadataPlacementOutcome, PendingCreateApply, SyncRejection,
+    SyncRejection,
 };
 use crate::error::{NetError, Result};
 
 use super::batch::{BatchOutcome, BatchState, apply_batch_event, is_config_candidate, retry_admin};
 use super::cursor::{
     applied_cursor_clock, applied_cursor_value, deferred_topics_key, topic_cursor_key,
-};
-use super::registry::{
-    create_fence_txn, lifecycle_stale_txn, same_create_event, transaction_placement_fence,
-    validate_metadata_event,
 };
 use super::{dependency_available, register_deferred_topic, remove_deferred_topic};
 
@@ -112,12 +103,14 @@ impl DocumentSyncService {
             } else if outcome.rejections.is_empty() {
                 self.storage_write(APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value)
                     .await?;
-            } else if !self
-                .commit_cursor_evidence(
-                    &outcome.rejections,
-                    (APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value),
-                )
-                .await?
+            } else if !run_plan(
+                &self.storage,
+                CursorEvidencePlan {
+                    rejections: outcome.rejections,
+                    cursor: (APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value),
+                },
+            )
+            .await?
             {
                 // Fail closed: the events redeliver once evidence fits again.
                 continue;
@@ -313,273 +306,36 @@ impl DocumentSyncService {
         &self,
         pending: Vec<PendingCreateApply>,
         cursor_writes: Vec<(::irokle::TopicId, (String, ByteView, Value))>,
-        mut rejections: Vec<SyncRejection>,
+        rejections: Vec<SyncRejection>,
         deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>>,
         applied_targets: &mut Vec<DocumentTarget>,
         metadata_create_events: &mut Vec<MetadataEventRecord>,
     ) -> Result<()> {
-        if pending.is_empty() && cursor_writes.is_empty() && rejections.is_empty() {
-            return Ok(());
+        let plan = CreateBatchPlan::new(pending, cursor_writes, rejections)?;
+        let outcome = run_plan(&self.storage, plan).await?;
+        for note in outcome.notes {
+            warn!(
+                topic_id = %note.topic,
+                document_id = %note.document_id,
+                "{}",
+                note.message
+            );
         }
-        let mut candidates = Vec::with_capacity(pending.len());
-        for apply in pending {
-            if let Err(error) = validate_metadata_event(&apply.record) {
+        for (dependency, topic_id) in outcome.deferred {
+            if matches!(
+                register_deferred_topic(deferred_topics, dependency, topic_id),
+                DeferredRegistrationOutcome::CapacityExceeded
+            ) {
                 warn!(
-                    topic_id = %apply.identity.topic,
-                    document_id = %apply.record.record.document_id,
-                    %error,
-                    "Rejecting replicated metadata event with inconsistent identity"
+                    %topic_id,
+                    ?dependency,
+                    "Dropping metadata placement dependency because the deferred-topic registry is full"
                 );
-                rejections.push(SyncRejection::new(
-                    apply.identity,
-                    apply.event,
-                    format!("replicated metadata event has an inconsistent identity: {error}"),
-                ));
-                continue;
-            }
-            let mut revision_entries = Vec::new();
-            if let Some(revision) = &apply.lifecycle_revision {
-                revision_entries.push(
-                    sync_revision_entry(&apply.target, revision)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                );
-                if let Some(manifest) = shard_manifest_entry(&apply.target, revision)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                {
-                    revision_entries.push(manifest);
-                }
-            }
-            let mut entries = Vec::new();
-            let mut event_entries = create_projection_entries(&apply.record)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if let Some((_, _, value)) = event_entries.first_mut() {
-                *value = ByteView::from(apply.bytes.clone());
-            }
-            entries.extend(event_entries);
-            if let Some(message) = &apply.message {
-                entries.push(
-                    commit_message_entry(&apply.record, message)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                );
-            }
-            if apply.record.is_create() {
-                entries.push(
-                    create_acceptance_entry(&apply.record)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                );
-            }
-            candidates.push((apply, revision_entries, entries));
-        }
-
-        let txn_id = start_storage_transaction(&self.storage).await?;
-        let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
-        let mut accepted = Vec::with_capacity(candidates.len());
-        let mut accepted_candidates = Vec::with_capacity(candidates.len());
-        let mut create_acceptances: BTreeMap<Ulid, MetadataEventRecord> = BTreeMap::new();
-        let mut deferred_cursor_topics = BTreeSet::new();
-        for (apply, revision_entries, mut entries) in candidates {
-            let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
-                Ok(fenced) => fenced,
-                Err(error) => {
-                    let _ = abort_txn(&self.storage, txn_id).await;
-                    return Err(error);
-                }
-            };
-            if fenced {
-                continue;
-            }
-            if let Some(revision) = &apply.lifecycle_revision {
-                let stale =
-                    match lifecycle_stale_txn(&self.storage, &apply.target, revision, txn_id).await
-                    {
-                        Ok(stale) => stale,
-                        Err(error) => {
-                            let _ = abort_txn(&self.storage, txn_id).await;
-                            return Err(error);
-                        }
-                    };
-                // One lifecycle target carries every event, so an older concurrent event
-                // still belongs in the log; only the lifecycle revision must not regress.
-                if !stale {
-                    entries.extend(revision_entries);
-                } else if match transaction_read(
-                    &self.storage,
-                    aruna_core::keyspaces::EVENT_LOG_KEYSPACE.to_string(),
-                    aruna_core::storage_entries::event_log_key(
-                        apply.record.record.document_id,
-                        apply.record.event_id,
-                    ),
-                    Some(txn_id),
-                )
-                .await
-                {
-                    Ok(logged) => logged.is_some(),
-                    Err(error) => {
-                        let _ = abort_txn(&self.storage, txn_id).await;
-                        return Err(error);
-                    }
-                } {
-                    continue;
-                }
-            }
-            match transaction_placement_fence(&self.storage, &apply.record.record, txn_id).await {
-                Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
-                Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
-                    warn!(
-                        topic_id = %apply.identity.topic,
-                        realm_id = %apply.record.record.realm_id,
-                        document_id = %apply.record.record.document_id,
-                        strategy_id = %apply.record.record.placement.strategy_id,
-                        "Deferring replicated metadata create until its placement strategy is available"
-                    );
-                    deferred_cursor_topics.insert(apply.identity.topic);
-                    if matches!(
-                        register_deferred_topic(deferred_topics, dependency, apply.identity.topic),
-                        DeferredRegistrationOutcome::CapacityExceeded
-                    ) {
-                        warn!(
-                            topic_id = %apply.identity.topic,
-                            ?dependency,
-                            "Dropping metadata placement dependency because the deferred-topic registry is full"
-                        );
-                    }
-                    continue;
-                }
-                Ok(MetadataPlacementOutcome::Rejected) => {
-                    warn!(
-                        topic_id = %apply.identity.topic,
-                        realm_id = %apply.record.record.realm_id,
-                        document_id = %apply.record.record.document_id,
-                        strategy_id = %apply.record.record.placement.strategy_id,
-                        "Rejecting replicated metadata create with mismatched placement configuration"
-                    );
-                    rejections.push(SyncRejection::new(
-                        apply.identity,
-                        apply.event,
-                        "replicated metadata create has a mismatched placement configuration",
-                    ));
-                    continue;
-                }
-                Err(error) => {
-                    let _ = abort_txn(&self.storage, txn_id).await;
-                    return Err(error);
-                }
-            };
-            let document_id = apply.record.record.document_id;
-            let accepted_create = if let Some(event) = create_acceptances.get(&document_id) {
-                Some(event.clone())
-            } else {
-                let value = match transaction_read(
-                    &self.storage,
-                    CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                    create_acceptance_key(document_id),
-                    Some(txn_id),
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = abort_txn(&self.storage, txn_id).await;
-                        return Err(error);
-                    }
-                };
-                let event = match value
-                    .as_deref()
-                    .map(postcard::from_bytes::<MetadataEventRecord>)
-                    .transpose()
-                {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let _ = abort_txn(&self.storage, txn_id).await;
-                        return Err(NetError::Bootstrap(error.to_string()));
-                    }
-                };
-                if let Some(event) = &event {
-                    if !event.is_create() {
-                        let _ = abort_txn(&self.storage, txn_id).await;
-                        return Err(NetError::Bootstrap(
-                            "metadata create acceptance contains a non-create event".to_string(),
-                        ));
-                    }
-                    if let Err(error) = validate_metadata_event(event) {
-                        let _ = abort_txn(&self.storage, txn_id).await;
-                        return Err(error);
-                    }
-                    create_acceptances.insert(document_id, event.clone());
-                }
-                event
-            };
-            if apply.record.is_create() {
-                if accepted_create
-                    .as_ref()
-                    .is_some_and(|accepted| !same_create_event(accepted, &apply.record))
-                {
-                    warn!(
-                        topic_id = %apply.identity.topic,
-                        %document_id,
-                        "Rejecting divergent replicated metadata create"
-                    );
-                    rejections.push(SyncRejection::new(
-                        apply.identity,
-                        apply.event,
-                        "divergent replicated metadata create",
-                    ));
-                    continue;
-                }
-                create_acceptances
-                    .entry(document_id)
-                    .or_insert_with(|| apply.record.clone());
-            } else if accepted_create.is_none() {
-                warn!(
-                    topic_id = %apply.identity.topic,
-                    %document_id,
-                    "Deferring replicated metadata update until its create is accepted"
-                );
-                deferred_cursor_topics.insert(apply.identity.topic);
-                continue;
-            } else if accepted_create
-                .as_ref()
-                .is_some_and(|accepted| !accepted.record.same_identity(&apply.record.record))
-            {
-                warn!(
-                    topic_id = %apply.identity.topic,
-                    %document_id,
-                    "Rejecting replicated metadata update with mismatched accepted create"
-                );
-                rejections.push(SyncRejection::new(
-                    apply.identity,
-                    apply.event,
-                    "replicated metadata update has a mismatched accepted create",
-                ));
-                continue;
-            }
-            accepted_candidates.push((apply, entries));
-        }
-        for (apply, entries) in accepted_candidates {
-            writes.extend(entries);
-            accepted.push(apply);
-        }
-        match self.quarantine_entries(&rejections, txn_id).await {
-            Ok(Some(entries)) => writes.extend(entries),
-            Ok(None) => {
-                // Fail closed: no topic may advance past evidence that does not fit.
-                deferred_cursor_topics.extend(rejections.iter().map(|reject| reject.topic_id()));
-            }
-            Err(error) => {
-                let _ = abort_txn(&self.storage, txn_id).await;
-                return Err(error);
             }
         }
-        writes.extend(cursor_writes.into_iter().filter_map(|(topic_id, write)| {
-            (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
-        }));
-        if let Err(error) = replace_batch_in(&self.storage, txn_id, Vec::new(), writes).await {
-            let _ = abort_txn(&self.storage, txn_id).await;
-            return Err(error);
-        }
-        for apply in accepted {
-            applied_targets.push(apply.target);
-            metadata_create_events.push(apply.record);
+        for (target, record) in outcome.accepted {
+            applied_targets.push(target);
+            metadata_create_events.push(record);
         }
         Ok(())
     }

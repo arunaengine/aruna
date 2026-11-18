@@ -40,6 +40,9 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
     DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
 };
+use aruna_core::document_apply::PlacementOutcome;
+use aruna_core::document_apply::create::PendingCreateApply;
+use aruna_core::document_apply::registry::{same_create_event, validate_metadata_event};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -110,6 +113,7 @@ use crate::streams::{BiStream, PeerKinds};
 mod eviction;
 mod inbound;
 mod peers;
+mod plan_run;
 mod publish;
 pub(crate) mod reconcile;
 pub(crate) mod storage;
@@ -147,20 +151,6 @@ const REPLAY_BATCH_LIMIT: usize = 1_024;
 /// an unbounded number of simultaneous sync streams.
 const SHARD_PROBE_CONCURRENCY: usize = 8;
 
-#[derive(Debug)]
-struct PendingCreateApply {
-    identity: SyncQuarantineIdentity,
-    /// The event exactly as received, so a reject in the create batch keeps the
-    /// genuine envelope instead of the payload the batch reconstructed.
-    event: DocumentEvent,
-    target: DocumentTarget,
-    record: MetadataEventRecord,
-    bytes: Vec<u8>,
-    lifecycle_revision: Option<DocumentChange>,
-    /// The author's commit message for the event's ARC snapshot.
-    message: Option<String>,
-}
-
 struct DocumentEventBatch {
     cursor: ::irokle::ActorClock,
     events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
@@ -175,17 +165,6 @@ struct DocumentEventBatch {
 pub struct PendingEviction {
     pub key: ::irokle::EvictionKey,
     pub documents: Vec<DocumentEvictedDocument>,
-}
-
-/// Placement fence outcome. The transactional read of the realm config is the
-/// whole fence: a concurrent config mutation conflicts the commit. The config
-/// row is never written back, which would only conflict its readers.
-struct MetadataPlacementFence;
-
-enum MetadataPlacementOutcome<T> {
-    Accepted(T),
-    Deferred(DocumentSyncDependency),
-    Rejected,
 }
 
 #[derive(Default)]

@@ -5,12 +5,11 @@
 
 use std::collections::HashMap;
 
-use aruna_core::structs::storage::distribution::SignedSnapshot;
-use aruna_core::structs::storage::distribution::parking::{Authority, snapshot_of};
-use aruna_core::structs::storage::distribution::snapshot::forked;
+use aruna_core::document_apply::distribution::{Handled, ReplayForkPlan};
 
 use super::cursor::{applied_cursor_clock, applied_cursor_value, topic_cursor_key};
 use super::*;
+use crate::document_sync::plan_run::retry_plan;
 
 const OVERFLOW_PREFIX: &[u8] = b"overflow-cursor/";
 /// Where the current sweep over the overflowed operations continues.
@@ -184,28 +183,23 @@ impl DocumentSyncService {
             .await
     }
 
-    /// Installs a replayed snapshot together with the last replayed one of its set when the
-    /// two prove equivocation, so a newer head cannot hide the fork. Returns whether it did.
+    /// Installs a replayed snapshot with the last replayed one of its set when they prove
+    /// equivocation, so a newer head cannot hide the fork. Returns whether it did.
     async fn replay_fork(
         &self,
         evidence: &mut HashMap<Ulid, AdminDocumentEvent>,
         event: &AdminDocumentEvent,
     ) -> Result<bool> {
-        let (AdminDocumentTarget::Distribution { realm_id, set_id }, Some(signed)) =
-            (&event.target, snapshot_of(event))
-        else {
+        let AdminDocumentTarget::Distribution { set_id, .. } = &event.target else {
             return Ok(false);
         };
-        if let Some(earlier) = evidence.get(set_id)
-            && let Some(first) = snapshot_of(earlier)
-            && forked(&first.snapshot, &signed.snapshot)
-        {
-            let membership = Membership::read(&self.storage, *realm_id).await?;
-            let current =
-                |signed: &SignedSnapshot| membership.authority(signed) == Authority::Current;
-            if current(first) && current(signed) {
-                let pair = [earlier.clone(), event.clone()];
-                install_events(&self.storage, &pair, *set_id).await?;
+        if let Some(earlier) = evidence.get(set_id) {
+            let build = || ReplayForkPlan {
+                earlier: earlier.clone(),
+                event: event.clone(),
+            };
+            let conflicted = "distribution snapshot apply conflict retries exhausted";
+            if retry_plan(&self.storage, build, conflicted).await? {
                 return Ok(true);
             }
         }
