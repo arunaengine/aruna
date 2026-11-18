@@ -32,6 +32,7 @@ pub(crate) mod message_kind;
 pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
+pub mod pid_read;
 pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projection;

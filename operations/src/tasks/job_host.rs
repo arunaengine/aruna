@@ -8,7 +8,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use aruna_blob::pace::{Pace, paced};
-use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure};
+use aruna_core::jobs::{JobReport, JobStops};
 use aruna_core::operation::Runnable;
 use aruna_core::structs::execution::job::{JobError, StagingJobSpec};
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
@@ -25,8 +25,6 @@ use crate::jobs::backend_import::{BackendImportOperation, ImportJob};
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
 use crate::jobs::staging::{StagingJobOperation, StagingRun};
 use crate::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
-use crate::s3::object::read::GetRoutedOperation;
 
 /// The running job's signals and shared state, as its operations reach them through effects.
 struct ContextHost {
@@ -80,43 +78,6 @@ impl JobHost for ContextHost {
                 guards.push(lock.lock_owned().await);
             }
             Box::new(guards) as Box<dyn Any + Send>
-        })
-    }
-
-    fn read_object(
-        &self,
-        read: ObjectRead,
-    ) -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>> {
-        Box::pin(async move {
-            let input = GetObjectInput {
-                bucket: read.bucket,
-                key: read.key,
-                version_id: read.version_id,
-                range: (read.range).map(|(start, end)| ObjectRangeRequest::StartEnd { start, end }),
-                group_id: read.group_id,
-                user_identity: read.user_id,
-                realm_id: read.realm_id,
-                node_id: read.node_id,
-            };
-            let found = drive(
-                GetRoutedOperation::new(input, read.restrictions, None),
-                &self.driver,
-            )
-            .await;
-            match found {
-                Ok(found) => Ok(ObjectBody {
-                    version_id: found.resolved_version_id.or(found.version_id),
-                    size: found.info.size,
-                    stream: found.blob,
-                }),
-                Err(GetObjectError::InvalidRange) => Err(ObjectReadFailure::InvalidRange),
-                Err(
-                    error @ (GetObjectError::NoSuchKey
-                    | GetObjectError::NoSuchVersion
-                    | GetObjectError::DeleteMarker),
-                ) => Err(ObjectReadFailure::Gone(error.to_string())),
-                Err(error) => Err(ObjectReadFailure::Failed(error.to_string())),
-            }
         })
     }
 }

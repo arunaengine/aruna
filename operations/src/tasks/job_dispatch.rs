@@ -66,10 +66,10 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
         }
         JobPayload::Staging(spec) => Box::pin(run_staging_job(ctx, spec)).await,
         JobPayload::ExportRoCrate(spec) => {
-            Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await
+            Box::pin(crate::tasks::rocrate_jobs::run_export_job(ctx, spec)).await
         }
         JobPayload::ImportRoCrate(spec) => {
-            Box::pin(crate::jobs::import::run_rocrate_import(ctx, spec)).await
+            Box::pin(crate::tasks::rocrate_jobs::run_rocrate_import(ctx, spec)).await
         }
         JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
             Box::pin(crate::driver::drive(

@@ -25,11 +25,12 @@ use super::verify::{
     complete_fields, complete_metadata, matches_access, metadata_digest, verify_file, verify_files,
     verify_metadata,
 };
+use aruna_core::rocrate_archive::{ArchiveCompression, ArchiveEntry, ArchiveInspection};
+
 use super::{Session, finished, invalid, json as json_body, json_reply, reply};
 use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::harvest::read_connector::ConnectorView;
 use crate::jobs::export::ExportCheckpoint;
-use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry, ArchiveInspection};
 use crate::jobs::repository::check::{unmet, uploads};
 use crate::jobs::repository::connector::{
     ConnectOperation, ConnectRequest, ConnectorViewOperation,

@@ -1,62 +1,75 @@
-//! Inspects an uploaded RO-Crate ZIP: its entries, the metadata file and the signature entry.
+//! Reads and writes RO-Crate ZIP archives over hidden blobs: inspects an archive, streams one
+//! entry and builds a new archive entry by entry.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, HashSet};
-use std::path::{Component, Path};
+use std::collections::HashSet;
+use std::future::Future;
+use std::io;
+use std::ops::Range;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use aruna_blob::blob::BlobHandle;
+use aruna_core::effects::BlobEffect;
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::jobs::{ByteStream, ZipFailure, ZipWork};
+use aruna_core::rocrate_archive::{
+    ArchiveCompression, ArchiveEntry, ArchiveInspection, inspect_layout, normalize_entry_path,
+    reject_special_entry,
+};
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::storage::blob::BackendLocation;
-use async_zip::Compression;
 use async_zip::base::read::seek::ZipFileReader as BaseZipReader;
-use futures_util::io::AsyncReadExt as FuturesReadExt;
-use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt as TokioReadExt, AsyncSeekExt as TokioSeekExt, BufReader, SeekFrom};
-use unicode_normalization::UnicodeNormalization;
-use url::Url;
+use async_zip::base::write::ZipFileWriter;
+use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
+use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use futures::StreamExt;
+use futures::io::{AsyncReadExt as FuturesReadExt, AsyncWriteExt as FuturesWriteExt};
+use tokio::io::{
+    AsyncRead, AsyncReadExt as TokioReadExt, AsyncSeek, AsyncSeekExt as TokioSeekExt, BufReader,
+    DuplexStream, ReadBuf, SeekFrom,
+};
+use tokio::sync::mpsc;
+use tokio_util::compat::Compat;
 
-use super::reader::{HiddenRangeReader, read_hidden_range};
+use crate::blob::BlobHandle;
 
 pub type ArchiveReader = async_zip::tokio::read::seek::ZipFileReader<BufReader<HiddenRangeReader>>;
 
-const METADATA_PATH: &str = "ro-crate-metadata.json";
-const SIGNATURE_PATH: &str = "ro-crate-metadata.json.minisig";
+/// The archive being written to a duplex stream.
+type ZipSink = ZipFileWriter<Compat<DuplexStream>>;
+
 const EOCD_BYTES: u64 = 20 + 22 + u16::MAX as u64;
 const EOCD_SIGNATURE: [u8; 4] = 0x0605_4b50u32.to_le_bytes();
 const LOCAL_SIGNATURE: [u8; 4] = 0x0403_4b50u32.to_le_bytes();
 const ZIP64_EOCD_SIGNATURE: [u8; 4] = 0x0606_4b50u32.to_le_bytes();
 const ZIP64_LOCATOR_SIGNATURE: [u8; 4] = 0x0706_4b50u32.to_le_bytes();
+const RANGE_CHUNK_BYTES: u64 = 1024 * 1024;
+const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// Bytes buffered between the archive writer and the spool that stores it.
+const ZIP_PIPE_BYTES: usize = 128 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ArchiveCompression {
-    Stored,
-    Deflate,
+/// Inspects the archive and, when `metadata` holds the limit, reads its metadata file.
+pub async fn inspect_full(
+    handle: BlobHandle,
+    location: BackendLocation,
+    size: u64,
+    eln: bool,
+    limits: &RoCrateLimits,
+    metadata: Option<u64>,
+) -> Result<(ArchiveInspection, Option<String>), String> {
+    let (inspection, mut reader) = inspect_reader(handle, location, size, eln, limits).await?;
+    let jsonld = match metadata {
+        Some(limit) => Some(read_metadata(&mut reader, inspection.metadata_index, limit).await?),
+        None => None,
+    };
+    Ok((inspection, jsonld))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ArchiveEntry {
-    pub index: usize,
-    pub archive_path: String,
-    pub path: String,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
-    pub crc32: u32,
-    pub data_offset: u64,
-    pub compression: ArchiveCompression,
-    pub directory: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ArchiveInspection {
-    pub entries: Vec<ArchiveEntry>,
-    pub metadata_index: usize,
-    pub wrapper: Option<String>,
-    pub eln: bool,
-}
-
-#[cfg(test)]
+/// The entries of an archive, each checked against its local header and the limits.
 pub async fn inspect_archive(
     handle: BlobHandle,
     location: BackendLocation,
@@ -69,7 +82,7 @@ pub async fn inspect_archive(
         .map(|(inspection, _)| inspection)
 }
 
-pub async fn inspect_reader(
+async fn inspect_reader(
     handle: BlobHandle,
     location: BackendLocation,
     size: u64,
@@ -578,288 +591,368 @@ pub async fn read_metadata(
     String::from_utf8(bytes).map_err(|_| "RO-Crate metadata is not UTF-8".to_string())
 }
 
-pub fn file_id_candidates(value: &str) -> Result<Option<Vec<String>>, String> {
-    if Url::parse(value).is_ok() {
-        return Ok(None);
+type RangeFuture = Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + 'static>>;
+
+/// Presents a hidden blob, read in ranges, as a seekable stream.
+pub struct HiddenRangeReader {
+    handle: BlobHandle,
+    location: BackendLocation,
+    length: u64,
+    position: u64,
+    buffer_start: u64,
+    buffer: Bytes,
+    pending: Option<RangeFuture>,
+}
+
+impl HiddenRangeReader {
+    pub fn new(handle: BlobHandle, location: BackendLocation, length: u64) -> Self {
+        Self {
+            handle,
+            location,
+            length,
+            position: 0,
+            buffer_start: 0,
+            buffer: Bytes::new(),
+            pending: None,
+        }
     }
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("%2f") || lower.contains("%5c") {
-        return Err(format!(
-            "File identifier contains an encoded path separator `{value}`"
+
+    fn buffered(&self) -> Option<&[u8]> {
+        let offset = self.position.checked_sub(self.buffer_start)?;
+        let offset = usize::try_from(offset).ok()?;
+        self.buffer.get(offset..)
+    }
+
+    fn begin_fetch(&mut self) {
+        let start = self.position;
+        let end = start.saturating_add(RANGE_CHUNK_BYTES).min(self.length);
+        self.pending = Some(fetch_range(
+            self.handle.clone(),
+            self.location.clone(),
+            start..end,
         ));
     }
-    let raw = normalize_relative_id(value)?;
-    let mut candidates = vec![raw.clone()];
-    if let Ok(decoded) = percent_decode_str(value).decode_utf8() {
-        let decoded = normalize_relative_id(&decoded)?;
-        if decoded != raw {
-            candidates.push(decoded);
-        }
+}
+
+impl Clone for HiddenRangeReader {
+    fn clone(&self) -> Self {
+        Self::new(self.handle.clone(), self.location.clone(), self.length)
     }
-    Ok(Some(candidates))
 }
 
-pub fn payload_entries(inspection: &ArchiveInspection) -> BTreeMap<String, &ArchiveEntry> {
-    inspection
-        .entries
-        .iter()
-        .filter(|entry| {
-            !entry.directory && entry.path != METADATA_PATH && entry.path != SIGNATURE_PATH
-        })
-        .map(|entry| (entry.path.clone(), entry))
-        .collect()
-}
-
-pub fn signature_entry(inspection: &ArchiveInspection) -> Option<&ArchiveEntry> {
-    inspection
-        .entries
-        .iter()
-        .find(|entry| entry.path == SIGNATURE_PATH)
-}
-
-fn inspect_layout(mut entries: Vec<ArchiveEntry>, eln: bool) -> Result<ArchiveInspection, String> {
-    let root_metadata = entries
-        .iter()
-        .filter(|entry| entry.path == METADATA_PATH)
-        .map(|entry| entry.index)
-        .collect::<Vec<_>>();
-    let wrapper_metadata = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .path
-                .split_once('/')
-                .filter(|(_, suffix)| *suffix == METADATA_PATH)
-                .map(|(wrapper, _)| (wrapper.to_string(), entry.index))
-        })
-        .collect::<Vec<_>>();
-    let (wrapper, metadata_index) = match (root_metadata.as_slice(), wrapper_metadata.as_slice()) {
-        ([metadata_index], []) if !eln => (None, *metadata_index),
-        ([_], []) => {
-            return Err("ELN archive requires a single wrapper directory".to_string());
-        }
-        ([], [(wrapper, metadata_index)]) => {
-            let prefix = format!("{wrapper}/");
-            if entries.iter().any(|entry| {
-                (entry.path == *wrapper && !entry.directory)
-                    || (entry.path != *wrapper && !entry.path.starts_with(&prefix))
-            }) {
-                return Err("wrapper archive contains another top-level entry".to_string());
+impl AsyncRead for HiddenRangeReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        destination: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if self.position >= self.length || destination.remaining() == 0 {
+                return Poll::Ready(Ok(()));
             }
-            (Some(wrapper.clone()), *metadata_index)
+            if let Some(buffered) = self.buffered().filter(|buffered| !buffered.is_empty()) {
+                let copied = buffered.len().min(destination.remaining());
+                destination.put_slice(&buffered[..copied]);
+                self.position = self.position.saturating_add(copied as u64);
+                return Poll::Ready(Ok(()));
+            }
+            if self.pending.is_none() {
+                self.begin_fetch();
+            }
+            let Some(pending) = self.pending.as_mut() else {
+                return Poll::Ready(Err(io::Error::other("range fetch was not initialized")));
+            };
+            match pending.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    self.pending = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Ok(bytes)) => {
+                    self.pending = None;
+                    self.buffer_start = self.position;
+                    self.buffer = bytes;
+                    if self.buffer.is_empty() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "hidden blob range returned no bytes",
+                        )));
+                    }
+                }
+            }
         }
-        ([], []) => return Err("archive does not contain ro-crate-metadata.json".to_string()),
-        _ => {
-            return Err("archive has ambiguous root and wrapper metadata descriptors".to_string());
-        }
-    };
+    }
+}
 
-    if let Some(wrapper) = wrapper.as_deref() {
-        let prefix = format!("{wrapper}/");
-        entries.retain(|entry| entry.path != wrapper);
-        for entry in &mut entries {
-            entry.path = entry
-                .path
-                .strip_prefix(&prefix)
-                .ok_or_else(|| "archive entry is outside its wrapper".to_string())?
-                .to_string();
-        }
+impl AsyncSeek for HiddenRangeReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        self.position = seek_offset(self.position, self.length, position)?;
+        self.pending = None;
+        Ok(())
     }
-    let metadata_count = entries
-        .iter()
-        .filter(|entry| entry.path == METADATA_PATH)
-        .count();
-    if metadata_count != 1 {
-        return Err("archive must contain exactly one metadata descriptor".to_string());
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.position))
     }
-    Ok(ArchiveInspection {
-        entries,
-        metadata_index,
-        wrapper,
-        eln,
+}
+
+fn seek_offset(current: u64, length: u64, position: SeekFrom) -> io::Result<u64> {
+    let target = match position {
+        SeekFrom::Start(target) => i128::from(target),
+        SeekFrom::End(delta) => i128::from(length) + i128::from(delta),
+        SeekFrom::Current(delta) => i128::from(current) + i128::from(delta),
+    };
+    if !(0..=i128::from(length)).contains(&target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZIP seek is outside the hidden blob",
+        ));
+    }
+    u64::try_from(target).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZIP seek offset is not representable",
+        )
     })
 }
 
-fn normalize_entry_path(value: &str) -> Result<String, String> {
-    if value.contains('\\') || value.contains('\0') {
-        return Err(format!("unsafe archive path `{value}`"));
-    }
-    let mut value = value.trim_end_matches('/');
-    while let Some(stripped) = value.strip_prefix("./") {
-        value = stripped;
-    }
-    if value.is_empty() {
-        return Err("archive contains an empty path".to_string());
-    }
-    if value.starts_with('/') {
-        return Err(format!("unsafe relative path `{value}`"));
-    }
-    let value = value
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    validate_relative_path(&value)?;
-    Ok(value.nfc().collect())
+fn fetch_range(handle: BlobHandle, location: BackendLocation, range: Range<u64>) -> RangeFuture {
+    Box::pin(async move {
+        let expected = range.end.saturating_sub(range.start);
+        let event = handle
+            .send_blob_effect(BlobEffect::ReadHiddenRange { location, range })
+            .await;
+        let Event::Blob(BlobEvent::HiddenRead { mut blob, .. }) = event else {
+            return match event {
+                Event::Blob(BlobEvent::Error(error)) => Err(io::Error::other(error.to_string())),
+                other => Err(io::Error::other(format!(
+                    "unexpected hidden range event: {}",
+                    other.label()
+                ))),
+            };
+        };
+        let capacity = usize::try_from(expected).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "hidden range is too large")
+        })?;
+        let mut bytes = BytesMut::with_capacity(capacity);
+        while let Some(chunk) = blob.next().await {
+            let chunk = chunk.map_err(|error| io::Error::other(error.to_string()))?;
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hidden range exceeded requested length",
+                ));
+            }
+        }
+        if bytes.len() != capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "hidden range was truncated",
+            ));
+        }
+        Ok(bytes.freeze())
+    })
 }
 
-fn normalize_relative_id(value: &str) -> Result<String, String> {
-    let mut value = value;
-    while let Some(stripped) = value.strip_prefix("./") {
-        value = stripped;
-    }
-    if value.is_empty() {
-        return Err("File identifier is empty".to_string());
-    }
-    validate_relative_path(value)?;
-    Ok(value.nfc().collect())
+async fn read_hidden_range(
+    handle: BlobHandle,
+    location: BackendLocation,
+    range: Range<u64>,
+) -> io::Result<Bytes> {
+    fetch_range(handle, location, range).await
 }
 
-fn validate_relative_path(value: &str) -> Result<(), String> {
-    if value.starts_with('/')
-        || value
-            .as_bytes()
-            .get(1)
-            .is_some_and(|byte| *byte == b':' && value.as_bytes()[0].is_ascii_alphabetic())
-        || value.split('/').any(|part| part.is_empty() || part == "..")
-        || Path::new(value)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(format!("unsafe relative path `{value}`"));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(format!("path contains a control character `{value}`"));
-    }
-    Ok(())
+/// Where one entry lies in an archive and how it is stored.
+#[derive(Clone, Copy, Debug)]
+pub struct EntrySpan {
+    pub data_offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub compression: ArchiveCompression,
 }
 
-fn reject_special_entry(
-    permissions: Option<u16>,
-    directory: bool,
-    path: &str,
-) -> Result<(), String> {
-    let Some(mode) = permissions else {
-        return Ok(());
+/// The expanded bytes of one archive entry; a size other than the declared one fails the stream.
+pub async fn entry_stream(
+    handle: BlobHandle,
+    location: BackendLocation,
+    size: u64,
+    span: EntrySpan,
+) -> io::Result<ByteStream> {
+    let mut source = HiddenRangeReader::new(handle, location, size);
+    source.seek(SeekFrom::Start(span.data_offset)).await?;
+    let source = BufReader::new(source.take(span.compressed_size));
+    let mut reader: Pin<Box<dyn AsyncRead + Send>> = match span.compression {
+        ArchiveCompression::Stored => Box::pin(source),
+        ArchiveCompression::Deflate => Box::pin(
+            async_compression::tokio::bufread::DeflateDecoder::new(source),
+        ),
     };
-    let file_type = mode & 0o170000;
-    if file_type == 0 || file_type == 0o100000 || (directory && file_type == 0o040000) {
-        return Ok(());
+    let expected = span.uncompressed_size;
+    let (sender, mut receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    tokio::spawn(async move {
+        let mut buffer = vec![0; PAYLOAD_CHUNK_BYTES];
+        let mut expanded = 0u64;
+        loop {
+            let failure = match reader.read(&mut buffer).await {
+                Ok(0) if expanded == expected => break,
+                Ok(0) => "ZIP entry is shorter than its declared expanded size",
+                Ok(read) => {
+                    expanded = expanded.saturating_add(read as u64);
+                    if expanded <= expected {
+                        let chunk = Bytes::copy_from_slice(&buffer[..read]);
+                        if sender.send(Ok(chunk)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    "ZIP entry exceeds its declared expanded size"
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    break;
+                }
+            };
+            let error = io::Error::new(io::ErrorKind::InvalidData, failure);
+            let _ = sender.send(Err(error)).await;
+            break;
+        }
+    });
+    Ok(BackendStream::new(futures::stream::poll_fn(move |cx| {
+        receiver.poll_recv(cx)
+    })))
+}
+
+/// A new archive and the stream of its bytes.
+pub fn open_zip() -> (ZipWork, ByteStream) {
+    let (writer, reader) = tokio::io::duplex(ZIP_PIPE_BYTES);
+    let sink: ZipSink = ZipFileWriter::with_tokio(writer);
+    let stream = BackendStream::new(tokio_util::io::ReaderStream::new(reader));
+    (ZipWork(Box::new(sink)), stream)
+}
+
+fn sink_of(zip: ZipWork) -> Result<Box<ZipSink>, String> {
+    (zip.0.downcast::<ZipSink>()).map_err(|_| "the archive writer has another type".to_string())
+}
+
+/// Writes one whole entry.
+pub async fn zip_whole(
+    zip: ZipWork,
+    path: &str,
+    modified_ms: u64,
+    bytes: &[u8],
+) -> (Option<ZipWork>, Result<(), String>) {
+    let mut sink = match sink_of(zip) {
+        Ok(sink) => sink,
+        Err(error) => return (None, Err(error)),
+    };
+    let written = sink
+        .write_entry_whole(zip_entry(path, modified_ms), bytes)
+        .await;
+    let result = written.map_err(|error| error.to_string());
+    (Some(ZipWork(sink)), result)
+}
+
+/// Writes one entry from `stream` until it ends, `stop` completes or a side fails, and answers
+/// the BLAKE3 hash of its bytes.
+pub async fn zip_stream(
+    zip: ZipWork,
+    path: &str,
+    modified_ms: u64,
+    mut stream: ByteStream,
+    stop: impl Future<Output = ()>,
+) -> (Option<ZipWork>, Result<[u8; 32], ZipFailure>) {
+    let mut sink = match sink_of(zip) {
+        Ok(sink) => sink,
+        Err(error) => return (None, Err(ZipFailure::Sink(error))),
+    };
+    let result = async {
+        let entry = zip_entry(path, modified_ms);
+        let sink_error = |error: async_zip::error::ZipError| ZipFailure::Sink(error.to_string());
+        let mut writer = sink.write_entry_stream(entry).await.map_err(sink_error)?;
+        let mut hasher = blake3::Hasher::new();
+        tokio::pin!(stop);
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = &mut stop => return Err(ZipFailure::Stopped),
+                next = stream.next() => next,
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    hasher.update(&bytes);
+                    (writer.write_all(&bytes).await)
+                        .map_err(|error| ZipFailure::Sink(error.to_string()))?;
+                }
+                Some(Err(error)) => {
+                    return Err(ZipFailure::Source {
+                        corrupt: corrupt_stream(&error),
+                        message: error.to_string(),
+                    });
+                }
+                None => break,
+            }
+        }
+        writer.close().await.map_err(sink_error)?;
+        Ok(*hasher.finalize().as_bytes())
     }
-    Err(format!("archive entry `{path}` is not a regular file"))
+    .await;
+    (Some(ZipWork(sink)), result)
+}
+
+/// Ends the archive and its stream.
+pub async fn zip_close(zip: ZipWork) -> Result<(), String> {
+    let sink = sink_of(zip)?;
+    sink.close()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn corrupt_stream(error: &StreamError) -> bool {
+    matches!(
+        error.0.downcast_ref::<BlobError>(),
+        Some(BlobError::IntegrityCheckFailed(_))
+    )
+}
+
+/// An archive entry stored as it is.
+pub fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
+    // A regular file readable by everyone, so an unpacked archive opens without a chmod.
+    ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
+        .last_modification_date(zip_date(modified_ms))
+        .unix_permissions(0o100_644)
+}
+
+/// MS-DOS ZIP timestamps only cover 1980 through 2107, so a moment outside
+/// that window keeps its month and day but clamps to the nearest year.
+pub fn zip_date(modified_ms: u64) -> ZipDateTime {
+    let Some(moment) = i64::try_from(modified_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+    else {
+        return ZipDateTime::default();
+    };
+    ZipDateTimeBuilder::new()
+        .year(moment.year().clamp(1980, 2107))
+        .month(moment.month())
+        .day(moment.day())
+        .hour(moment.hour())
+        .minute(moment.minute())
+        .second(moment.second())
+        .build()
 }
 
 #[cfg(test)]
-mod pure_tests {
+mod tests {
     use super::*;
 
-    fn entry(index: usize, path: &str) -> ArchiveEntry {
-        ArchiveEntry {
-            index,
-            archive_path: path.to_string(),
-            path: path.to_string(),
-            compressed_size: 1,
-            uncompressed_size: 1,
-            crc32: 0,
-            data_offset: 0,
-            compression: ArchiveCompression::Stored,
-            directory: false,
-        }
-    }
-
     #[test]
-    fn layout_accepts_root() {
-        let inspected = inspect_layout(
-            vec![entry(0, METADATA_PATH), entry(1, "data/file.txt")],
-            false,
-        )
-        .unwrap();
-        assert_eq!(inspected.wrapper, None);
-        assert_eq!(inspected.entries[1].path, "data/file.txt");
-    }
-
-    #[test]
-    fn layout_strips_wrapper() {
-        let inspected = inspect_layout(
-            vec![
-                entry(0, "experiment/ro-crate-metadata.json"),
-                entry(1, "experiment/data/file.txt"),
-            ],
-            true,
-        )
-        .unwrap();
-        assert_eq!(inspected.wrapper.as_deref(), Some("experiment"));
-        assert_eq!(inspected.entries[1].path, "data/file.txt");
-    }
-
-    #[test]
-    fn layout_rejects_siblings() {
-        assert!(
-            inspect_layout(
-                vec![
-                    entry(0, "experiment/ro-crate-metadata.json"),
-                    entry(1, "outside.txt"),
-                ],
-                true,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn layout_rejects_file() {
-        assert!(
-            inspect_layout(
-                vec![
-                    entry(0, "experiment/ro-crate-metadata.json"),
-                    entry(1, "experiment"),
-                ],
-                true,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn path_rejects_traversal() {
-        for path in ["/root", "../escape", "a/../b", "C:/drive", "a\\b"] {
-            assert!(normalize_entry_path(path).is_err(), "{path}");
-        }
-        assert!(file_id_candidates("data%2Fsecret").is_err());
-    }
-
-    #[test]
-    fn path_collapses_slashes() {
-        assert_eq!(
-            normalize_entry_path("wrapper/data//file.txt").unwrap(),
-            "wrapper/data/file.txt"
-        );
-        assert!(normalize_entry_path("//server/file.txt").is_err());
-        assert!(normalize_entry_path("data//../file.txt").is_err());
-    }
-
-    #[test]
-    fn ids_decode_spaces() {
-        assert_eq!(
-            file_id_candidates("./data/a%20b.txt").unwrap().unwrap(),
-            vec!["data/a%20b.txt".to_string(), "data/a b.txt".to_string()]
-        );
-        assert!(
-            file_id_candidates("https://example.org/file")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn ids_ignore_absolute() {
-        for id in [
-            "urn:uuid:12345678-1234-1234-1234-123456789abc",
-            "ftp://example.org/file",
-            "doi:10.1234/example",
-        ] {
-            assert!(file_id_candidates(id).unwrap().is_none(), "{id}");
-        }
+    fn seek_checks_bounds() {
+        assert_eq!(seek_offset(4, 10, SeekFrom::Current(3)).unwrap(), 7);
+        assert_eq!(seek_offset(4, 10, SeekFrom::End(-2)).unwrap(), 8);
+        assert!(seek_offset(0, 10, SeekFrom::Current(-1)).is_err());
+        assert!(seek_offset(0, 10, SeekFrom::Start(11)).is_err());
     }
 
     #[test]

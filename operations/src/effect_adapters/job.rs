@@ -5,26 +5,34 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::io;
 use std::sync::Arc;
 
+use aruna_blob::archive::{self, EntrySpan};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::jobs::{
-    ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent, JobReport, JobStops, ObjectBody,
-    ObjectRead, ObjectReadFailure,
+    ArchiveEntryRead, ArchiveRead, ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent,
+    JobReport, JobStops,
 };
+use aruna_core::rocrate_archive::ArchiveInspection;
+use aruna_core::stream::BackendStream;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use tokio::sync::mpsc;
 use ulid::Ulid;
 
 use super::dispatch_effect_until;
 use crate::driver::DriverContext;
 
+const NO_BLOB_HANDLE: &str = "this job needs a blob handle";
+
 tokio::task_local! {
     static JOB_HOST: Arc<dyn JobHost>;
 }
 
-/// The runtime side of one running job: its stop signals, progress, turns and object reads.
+/// The runtime side of one running job: its stop signals, progress and turns.
 pub trait JobHost: Send + Sync {
     fn stops(&self) -> JobStops;
     fn report(&self, report: JobReport);
@@ -35,8 +43,6 @@ pub trait JobHost: Send + Sync {
         &'a self,
         turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>>;
-    fn read_object(&self, read: ObjectRead)
-    -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>>;
 }
 
 /// Runs `future` with `host` answering the job effects of every operation it drives.
@@ -92,12 +98,109 @@ pub(super) async fn dispatch_job(
             None => JobEvent::Finished(Box::new(run(child).await)),
         },
         JobEffect::Collect(stream) => JobEvent::Collected(collect(stream).await),
+        JobEffect::CollectUpTo { stream, limit } => {
+            JobEvent::CollectedUpTo(collect_limited(stream, limit).await)
+        }
         JobEffect::FillGzip(work) => fill_gzip(work).await,
-        JobEffect::ReadObject(read) => JobEvent::Object(match host {
-            Some(host) => host.read_object(*read).await,
-            None => Err(ObjectReadFailure::Failed("no job host".to_string())),
+        JobEffect::StoppableStream(stream) => JobEvent::Stream(match host {
+            Some(host) => stoppable_stream(host, stream),
+            None => stream,
         }),
+        JobEffect::InspectArchive(read) => {
+            JobEvent::ArchiveInspected(inspect(*read, context).await)
+        }
+        JobEffect::OpenArchiveEntry(read) => {
+            JobEvent::ArchiveEntry(open_entry(*read, context).await)
+        }
+        JobEffect::OpenZip => {
+            let (zip, stream) = archive::open_zip();
+            JobEvent::ZipOpened { zip, stream }
+        }
+        JobEffect::ZipWhole {
+            zip,
+            path,
+            modified_ms,
+            bytes,
+        } => {
+            let (zip, result) = archive::zip_whole(zip, &path, modified_ms, &bytes).await;
+            JobEvent::ZipWritten { zip, result }
+        }
+        JobEffect::ZipStream {
+            zip,
+            path,
+            modified_ms,
+            stream,
+        } => {
+            let stop = async {
+                match &host {
+                    Some(host) => host.stopped().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let (zip, result) = archive::zip_stream(zip, &path, modified_ms, stream, stop).await;
+            JobEvent::ZipStreamed { zip, result }
+        }
+        JobEffect::ZipClose(zip) => JobEvent::ZipClosed(archive::zip_close(zip).await),
     })
+}
+
+/// Forwards `stream` until the job stops, then ends it with an error.
+fn stoppable_stream(host: Arc<dyn JobHost>, mut stream: ByteStream) -> ByteStream {
+    let (sender, mut receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    tokio::spawn(async move {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = host.stopped() => {
+                    let message = match host.stops().cancelled {
+                        true => "the job was cancelled",
+                        false => "the job was interrupted",
+                    };
+                    Some(Err(io::Error::new(io::ErrorKind::Interrupted, message)))
+                }
+                next = stream.next() => next.map(|result| {
+                    result.map_err(|error| io::Error::other(error.to_string()))
+                }),
+            };
+            let Some(next) = next else {
+                break;
+            };
+            let failed = next.is_err();
+            if sender.send(next).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    BackendStream::new(futures_util::stream::poll_fn(move |cx| {
+        receiver.poll_recv(cx)
+    }))
+}
+
+async fn inspect(
+    read: ArchiveRead,
+    context: &DriverContext,
+) -> Result<(ArchiveInspection, Option<String>), String> {
+    let handle = (context.blob_handle.clone()).ok_or_else(|| NO_BLOB_HANDLE.to_string())?;
+    let ArchiveRead {
+        location,
+        size,
+        eln,
+        limits,
+        metadata_bytes,
+    } = read;
+    archive::inspect_full(handle, location, size, eln, &limits, metadata_bytes).await
+}
+
+async fn open_entry(read: ArchiveEntryRead, context: &DriverContext) -> Result<ByteStream, String> {
+    let handle = (context.blob_handle.clone()).ok_or_else(|| NO_BLOB_HANDLE.to_string())?;
+    let span = EntrySpan {
+        data_offset: read.data_offset,
+        compressed_size: read.compressed_size,
+        uncompressed_size: read.uncompressed_size,
+        compression: read.compression,
+    };
+    (archive::entry_stream(handle, read.location, read.size, span).await)
+        .map_err(|error| error.to_string())
 }
 
 async fn collect(mut stream: ByteStream) -> Result<Vec<u8>, String> {
@@ -106,6 +209,18 @@ async fn collect(mut stream: ByteStream) -> Result<Vec<u8>, String> {
         bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
     }
     Ok(bytes)
+}
+
+async fn collect_limited(mut stream: ByteStream, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len() as u64 + chunk.len() as u64 > limit {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
 }
 
 /// Pulls compressed bytes until the cursor holds the next chunk or the table's end.

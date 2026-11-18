@@ -880,7 +880,7 @@ impl Operation for ServePidOperation {
     }
 }
 
-pub(super) fn pid_error(error: PersistentIdError) -> MetadataApiError {
+pub(crate) fn pid_error(error: PersistentIdError) -> MetadataApiError {
     match error {
         PersistentIdError::DocumentMissing | PersistentIdError::IntentMissing => {
             MetadataApiError::NotFound

@@ -2,9 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::*;
-use aruna_core::structs::storage::data::identity::ObjectLocation;
-use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use aruna_core::archive_path::{KeyLayout, StorageKey, safe_zip_path, synthesized_path};
+use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportRoCrateSpec,
+    JobError, ReasonCode,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::data::identity::{DataIdentity, ObjectLocation, content_id};
+use oxrdf::{NamedOrBlankNode, Term};
+use oxttl::NQuadsParser;
+use serde_json::{Value as JsonValue, json};
+use ulid::Ulid;
+use url::Url;
+
+use super::resolve::CandidateSource;
+use super::{
+    ABOUT_HTTPS_IRI, CONTENT_HTTPS_IRI, ENCODING_HTTPS_IRI, ExportCheckpoint, ExportEntity,
+    ExportFailure, ExportPhase, JSONLD_BASE_IRI, LOCAL_PATH_IRI, METADATA_PATH, NAME_HTTPS_IRI,
+    PART_HTTPS_IRI, PATH_HTTP_IRI, ProbedEntry, REPORT_PATH, SCHEMA_ABOUT_IRI, SCHEMA_CONTENT_IRI,
+    SCHEMA_ENCODING_IRI, SCHEMA_NAME_IRI, SCHEMA_PART_IRI, SCHEMA_SUBJECT_IRI, SUBJECT_HTTPS_IRI,
+};
+use crate::jobs::executor::JobRunOutcome;
+use crate::jobs::rocrate_jsonld::{
+    JsonLdKeywords, MEDIA_HTTPS_IRI, RDF_TYPE_IRI, SCHEMA_MEDIA_IRI, is_file_type,
+};
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,
@@ -744,332 +768,6 @@ pub(super) fn precheck_size(
     Ok(())
 }
 
-pub(super) async fn assemble_export(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    checkpoint: &ExportCheckpoint,
-    opened: Vec<ProbedEntry>,
-    policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
-) -> Result<ArtifactRef, ExportFailure> {
-    let metadata = checkpoint
-        .rewritten_jsonld
-        .clone()
-        .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
-    let mut entries = Vec::with_capacity(opened.len());
-    let source_spec = std::sync::Arc::new(spec.clone());
-    let snapshot_ms = snapshot_moment(checkpoint)?;
-    for entry in opened {
-        let entity = &checkpoint.entities[entry.entity_index];
-        let path = entity
-            .zip_path
-            .clone()
-            .ok_or_else(|| ExportFailure::Permanent("planned ZIP path is missing".to_string()))?;
-        let mut candidate = entity
-            .candidates
-            .get(entry.candidate_index)
-            .cloned()
-            .ok_or_else(|| {
-                ExportFailure::Permanent("planned export candidate is missing".to_string())
-            })?;
-        candidate.expected_blake3 = Some(entry.hash);
-        entries.push(PlannedEntry {
-            entity_index: entry.entity_index,
-            candidate_index: entry.candidate_index,
-            path,
-            source: PlannedSource::Candidate {
-                driver: ctx.driver.clone(),
-                spec: source_spec.clone(),
-                candidate,
-            },
-            expected_blake3: entry.hash,
-            modified_ms: entry
-                .resolved_version
-                .map_or(snapshot_ms, |version| version.timestamp_ms()),
-        });
-    }
-    let report = checkpoint.report_json.clone();
-    let policies = std::sync::Arc::new(policies.clone());
-    let Some(blob_handle) = ctx.driver.blob_handle.as_ref() else {
-        return Err(ExportFailure::Retryable(
-            "blob handle unavailable".to_string(),
-        ));
-    };
-    let (writer, reader) = tokio::io::duplex(128 * 1024);
-    let cancel = ctx.cancel.clone();
-    let shutdown = ctx.shutdown.clone();
-    let writer_task = tokio::spawn(Box::pin(write_archive_checked(
-        writer,
-        metadata,
-        entries,
-        report,
-        policies,
-        cancel,
-        shutdown,
-        snapshot_ms,
-    )));
-    let event = blob_handle
-        .send_blob_effect(BlobEffect::SpoolHidden {
-            namespace: ctx.job_id.as_ulid(),
-            name: "rocrate.zip".to_string(),
-            created_by: spec.auth_context.user_id,
-            max_bytes: Some(spec.limits.export_artifact_bytes),
-            deadline: None,
-            blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
-        })
-        .await;
-    let write_result = match writer_task.await {
-        Ok(result) => result,
-        Err(error) => Err(ExportFailure::Retryable(error.to_string())),
-    };
-    match (event, write_result) {
-        (
-            Event::Blob(BlobEvent::HiddenSpooled {
-                location,
-                blake3,
-                size,
-            }),
-            Ok(()),
-        ) => Ok(ArtifactRef {
-            location,
-            blake3,
-            size,
-            expires_at_ms: unix_timestamp_millis()
-                .saturating_add(spec.limits.artifact_retention_ms),
-        }),
-        (Event::Blob(BlobEvent::HiddenSpooled { location, .. }), Err(error)) => {
-            let _ = crate::driver::drive(
-                crate::blob::hidden::DeleteHiddenOperation::new(&location),
-                &ctx.driver,
-            )
-            .await;
-            Err(error)
-        }
-        (Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })), _) => {
-            Err(ExportFailure::Permanent(format!(
-                "assembled ZIP exceeds the {limit} byte artifact limit"
-            )))
-        }
-        (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Cancelled)) => {
-            Err(ExportFailure::Cancelled)
-        }
-        (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Interrupted)) => {
-            Err(ExportFailure::Interrupted)
-        }
-        (Event::Blob(BlobEvent::Error(error)), _) => {
-            Err(ExportFailure::Retryable(error.to_string()))
-        }
-        (event, _) => Err(ExportFailure::Retryable(format!(
-            "unexpected hidden artifact event: {}",
-            event.label()
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn write_archive_checked(
-    writer: tokio::io::DuplexStream,
-    metadata: Vec<u8>,
-    mut entries: Vec<PlannedEntry>,
-    report: Option<Vec<u8>>,
-    policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
-    cancel: tokio_util::sync::CancellationToken,
-    shutdown: tokio_util::sync::CancellationToken,
-    snapshot_ms: u64,
-) -> Result<(), ExportFailure> {
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
-    archive
-        .write_entry_whole(zip_entry(METADATA_PATH, snapshot_ms), &metadata)
-        .await
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    for entry in entries {
-        let PlannedEntry {
-            entity_index,
-            candidate_index,
-            path,
-            source,
-            expected_blake3,
-            modified_ms,
-        } = entry;
-        let opened = match source {
-            PlannedSource::Candidate {
-                driver,
-                spec,
-                candidate,
-            } => {
-                Box::pin(open_candidate_checked(
-                    &driver, &spec, &policies, &candidate, false,
-                ))
-                .await?
-            }
-            #[cfg(test)]
-            PlannedSource::Ready(blob) => CandidateOpen::Opened(BaoReadOutput::Stream {
-                blob,
-                size: 0,
-                blake3: expected_blake3,
-                etag: None,
-                hashes: HashMap::new(),
-            }),
-        };
-        let mut blob = match opened {
-            CandidateOpen::Opened(BaoReadOutput::Stream { blob, blake3, .. })
-                if blake3 == expected_blake3 =>
-            {
-                blob
-            }
-            CandidateOpen::Opened(BaoReadOutput::Stream { .. })
-            | CandidateOpen::Status(OpenStatus::Corrupt) => {
-                return Err(ExportFailure::Candidate {
-                    entity_index,
-                    candidate_index,
-                    status: OpenStatus::Corrupt,
-                    message: format!("payload integrity check failed for `{path}`"),
-                });
-            }
-            CandidateOpen::Opened(BaoReadOutput::Metadata { .. }) => {
-                return Err(ExportFailure::Retryable(
-                    "source open unexpectedly returned metadata".to_string(),
-                ));
-            }
-            CandidateOpen::Status(status) => {
-                return Err(ExportFailure::Candidate {
-                    entity_index,
-                    candidate_index,
-                    status,
-                    message: format!("payload source became unavailable for `{path}`"),
-                });
-            }
-        };
-        let mut writer = archive
-            .write_entry_stream(zip_entry(&path, modified_ms))
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-        let mut hasher = blake3::Hasher::new();
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(ExportFailure::Cancelled),
-                _ = shutdown.cancelled() => return Err(ExportFailure::Interrupted),
-                next = blob.next() => next,
-            };
-            match next {
-                Some(Ok(bytes)) => {
-                    hasher.update(&bytes);
-                    writer
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-                }
-                Some(Err(error)) => {
-                    return Err(ExportFailure::Candidate {
-                        entity_index,
-                        candidate_index,
-                        status: stream_status(&error),
-                        message: error.to_string(),
-                    });
-                }
-                None => break,
-            }
-        }
-        if hasher.finalize().as_bytes() != &expected_blake3 {
-            return Err(ExportFailure::Candidate {
-                entity_index,
-                candidate_index,
-                status: OpenStatus::Corrupt,
-                message: format!("payload integrity check failed for `{path}`"),
-            });
-        }
-        writer
-            .close()
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    }
-    if let Some(report) = report {
-        archive
-            .write_entry_whole(zip_entry(REPORT_PATH, snapshot_ms), &report)
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    }
-    archive
-        .close()
-        .await
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    Ok(())
-}
-
-pub(crate) fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
-    // A regular file readable by everyone, so an unpacked archive opens without a chmod.
-    ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
-        .last_modification_date(zip_date(modified_ms))
-        .unix_permissions(0o100_644)
-}
-
-/// MS-DOS ZIP timestamps only cover 1980 through 2107, so a moment outside
-/// that window keeps its month and day but clamps to the nearest year.
-pub(super) fn zip_date(modified_ms: u64) -> ZipDateTime {
-    let Some(moment) = i64::try_from(modified_ms)
-        .ok()
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-    else {
-        return ZipDateTime::default();
-    };
-    ZipDateTimeBuilder::new()
-        .year(moment.year().clamp(1980, 2107))
-        .month(moment.month())
-        .day(moment.day())
-        .hour(moment.hour())
-        .minute(moment.minute())
-        .second(moment.second())
-        .build()
-}
-
-fn stream_status(error: &StreamError) -> OpenStatus {
-    if matches!(
-        error.0.downcast_ref::<BlobError>(),
-        Some(BlobError::IntegrityCheckFailed(_))
-    ) {
-        OpenStatus::Corrupt
-    } else {
-        OpenStatus::Offline
-    }
-}
-
-pub(super) async fn publish_export(
-    ctx: &JobContext,
-    checkpoint: &ExportCheckpoint,
-) -> JobRunOutcome {
-    let Some(artifact) = checkpoint.artifact.clone() else {
-        return permanent("export artifact is missing");
-    };
-    for row in &checkpoint.report {
-        if ctx.cancel.is_cancelled() {
-            return JobRunOutcome::Cancelled;
-        }
-        if ctx.shutdown.is_cancelled() {
-            return JobRunOutcome::Interrupted;
-        }
-        if let Err(error) = put_job_entry(
-            &ctx.driver,
-            ctx.job_id,
-            ctx.claim_token,
-            row.entry_key.as_bytes(),
-            row,
-        )
-        .await
-        {
-            return retryable(error.to_string());
-        }
-    }
-    let (included, omitted) = report_counts(&checkpoint.report);
-    JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
-        repository: checkpoint.repository.clone(),
-        artifact: Some(artifact),
-        included,
-        omitted,
-        report_digest: [0; 32],
-    }))
-}
-
 pub(super) fn report_counts(rows: &[ExportReportRow]) -> (u64, ExportOmissionCounts) {
     let mut included = 0u64;
     let mut omitted = ExportOmissionCounts::default();
@@ -1282,62 +980,6 @@ pub(crate) fn web_entity(entity_id: &str) -> bool {
     entity_id.starts_with("https://") || entity_id.starts_with("http://")
 }
 
-pub(super) async fn discard_artifact(
-    ctx: &JobContext,
-    checkpoint: &mut ExportCheckpoint,
-    persist: bool,
-) {
-    if let Some(artifact) = checkpoint.artifact.as_ref() {
-        let _ = crate::driver::drive(
-            crate::blob::hidden::DeleteHiddenOperation::new(&artifact.location),
-            &ctx.driver,
-        )
-        .await;
-    }
-    checkpoint.artifact = None;
-    checkpoint.refs.hidden_locations.clear();
-    if persist {
-        let _ = persist_checkpoint(ctx, checkpoint).await;
-    }
-}
-
-pub(crate) async fn read_export_checkpoint(
-    ctx: &JobContext,
-    job_id: JobId,
-) -> Result<Option<ExportCheckpoint>, String> {
-    stored_checkpoint(&ctx.driver, job_id).await
-}
-
-/// The checkpoint an export job left, also after the job ended.
-pub(crate) async fn stored_checkpoint(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<ExportCheckpoint>, String> {
-    read_state(
-        context,
-        JOB_STATE_KEYSPACE,
-        ByteView::from(job_id.to_bytes().to_vec()),
-        "export checkpoint",
-    )
-    .await
-}
-
-pub(crate) async fn persist_checkpoint<T: Serialize>(
-    ctx: &JobContext,
-    checkpoint: &T,
-) -> Result<(), String> {
-    put_state(
-        &ctx.driver,
-        ctx.job_id,
-        ctx.claim_token,
-        JOB_STATE_KEYSPACE,
-        ByteView::from(ctx.job_id.to_bytes().to_vec()),
-        checkpoint,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
 pub(super) fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
     match error {
         craqle::RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
@@ -1347,47 +989,10 @@ pub(super) fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
     }
 }
 
-pub(super) async fn finish_export(
-    ctx: &JobContext,
-    checkpoint: &mut ExportCheckpoint,
-    error: ExportFailure,
-) -> JobRunOutcome {
-    discard_artifact(ctx, checkpoint, false).await;
-    // A remote holder with a locked key wakes this job once it registers there.
-    if let ExportFailure::RemoteLocked {
-        node_id,
-        target,
-        auth,
-    } = &error
-    {
-        let ask = crate::jobs::key_locks::AskWaitsOperation::new(
-            auth,
-            ctx.job_id,
-            *node_id,
-            std::slice::from_ref(target),
-            ctx.driver.node_and_realm(),
-        );
-        let waits = crate::driver::drive(ask, ctx.driver.as_ref())
-            .await
-            .unwrap_or_default();
-        if !waits.is_empty() {
-            return JobRunOutcome::AwaitingKey(waits);
-        }
-    }
-    if let ExportFailure::Validation(violations) = &error
-        && let Err(message) = write_validation_rows(ctx, violations).await
-    {
-        return retryable(message);
-    }
-    failure_outcome(error)
-}
-
-pub(super) async fn write_validation_rows(
-    ctx: &JobContext,
-    violations: &[MetadataValidationViolation],
-) -> Result<(), String> {
-    for (index, violation) in violations.iter().enumerate() {
-        let row = ExportReportRow {
+/// The report rows of a crate that failed validation.
+pub(super) fn validation_rows(violations: &[MetadataValidationViolation]) -> Vec<ExportReportRow> {
+    (violations.iter().enumerate())
+        .map(|(index, violation)| ExportReportRow {
             entry_key: format!("validation/{index:08}"),
             code: if violation.code == "unsupported_crate_version" {
                 ReasonCode::UnsupportedCrateVersion
@@ -1402,18 +1007,8 @@ pub(super) async fn write_validation_rows(
                 resolved_version: None,
                 validation: Some(violation.clone()),
             },
-        };
-        put_job_entry(
-            &ctx.driver,
-            ctx.job_id,
-            ctx.claim_token,
-            row.entry_key.as_bytes(),
-            &row,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+        })
+        .collect()
 }
 
 pub(super) fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
