@@ -583,249 +583,304 @@ impl WriteSelectionOperation {
         }
     }
 
-    /// Writes each distinct version the claims on `key` resolve to, once.
-    async fn write_key<R: MemberReader>(
-        &mut self,
-        scope: &ArchiveScope<'_, R>,
-        auth: &AuthContext,
-        (bucket, info): (&str, &BucketInfo),
-        key: &str,
-        claims: Vec<Option<Ulid>>,
-    ) -> Result<(), SelectionError> {
-        let mut written = Vec::new();
-        for requested in claims {
-            let pinned = match resolve(scope, auth, (bucket, info), key, requested).await {
-                Ok(pinned) => pinned,
-                Err(status) => {
-                    self.report.add(file_row(bucket, key, requested, status));
-                    continue;
-                }
-            };
-            let version = pinned.version;
-            if written.contains(&version) {
-                continue;
-            }
-            match self
-                .write_object(scope, auth, (bucket, info), key, pinned)
-                .await?
-            {
-                Ok(()) => written.push(version),
-                Err(status) => self
-                    .report
-                    .add(file_row(bucket, key, Some(version), status)),
-            }
-        }
-        Ok(())
+    fn list_page(&mut self) -> ArchiveTurn {
+        let work = self.bucket.as_mut().ok_or(IoError::Unfinished)?;
+        let listing = work.walk.current.as_mut().ok_or(IoError::Unfinished)?;
+        let request = ListRequest {
+            bucket: work.name.clone(),
+            prefix: Some(listing.prefix.clone()),
+            delimiter: None,
+            cursor: listing.cursor.take(),
+            limit: FOLDER_PAGE,
+            partial: true,
+        };
+        let list = ObjectPageOperation::<FolderKey>::new(
+            self.node,
+            self.access.clone(),
+            &work.info,
+            Some((&self.caller.0, self.caller.1)),
+            request,
+        );
+        self.step = ArchiveStep::Page;
+        Ok(Next::Call(IoCall::child(list)))
     }
 
-    /// Streams one pinned version into the archive; a version that cannot be opened is
-    /// reported by its status and takes no path.
-    async fn write_object<R: MemberReader>(
+    /// Ranges a page could not list from current records are reported; a folder whose rest
+    /// cannot be listed is reported once.
+    fn page_read(&mut self, page: Result<ObjectPage<FolderKey>, PageError>) -> ArchiveTurn {
+        let work = self.bucket.as_mut().ok_or(IoError::Unfinished)?;
+        let listing = work.walk.current.as_mut().ok_or(IoError::Unfinished)?;
+        match page {
+            Ok(page) => {
+                let ranges = page.stale_ranges.into_iter().chain(page.unavailable_ranges);
+                for range in ranges {
+                    if listing.ranges.insert(range.clone()) {
+                        let row = folder_row(&work.name, &listing.prefix, Some(range));
+                        self.report.add(row);
+                    }
+                }
+                let keys = page.objects.iter().map(|object| object.key().to_string());
+                work.walk.buffer.extend(keys);
+                listing.done = page.next_cursor.is_none();
+                listing.cursor = page.next_cursor;
+            }
+            Err(_) => {
+                self.report
+                    .add(folder_row(&work.name, &listing.prefix, None));
+                listing.done = true;
+            }
+        }
+        self.advance()
+    }
+
+    /// Starts the lowest of the listed key and the next explicit file, with all claims on it.
+    fn take_key(&mut self, listed: Option<String>) -> ArchiveTurn {
+        let work = self.work()?;
+        let file = work.files.front().map(|(file, _)| file.clone());
+        let Some(key) = [listed, file].into_iter().flatten().min() else {
+            return self.next_bucket();
+        };
+        let mut claims = Vec::new();
+        if work.walk.buffer.front() == Some(&key) {
+            work.walk.buffer.pop_front();
+            claims.push(None);
+        }
+        while work.files.front().is_some_and(|(file, _)| *file == key) {
+            claims.extend(work.files.pop_front().map(|(_, version)| version));
+        }
+        claims.sort();
+        claims.dedup();
+        work.key = Some(KeyWork {
+            key,
+            claims: claims.into(),
+            written: Vec::new(),
+        });
+        self.next_claim()
+    }
+
+    fn next_claim(&mut self) -> ArchiveTurn {
+        let work = self.bucket.as_mut().ok_or(IoError::Unfinished)?;
+        let claim = work.key.as_mut().ok_or(IoError::Unfinished)?;
+        let Some(requested) = claim.claims.pop_front() else {
+            work.key = None;
+            return self.advance();
+        };
+        let resolve = ResolveKeyOperation::new(
+            self.node,
+            (&self.caller.0, self.caller.1),
+            (&work.name, &work.info),
+            &claim.key,
+            requested,
+        );
+        self.step = ArchiveStep::Resolve(requested);
+        Ok(Next::Call(IoCall::child(resolve)))
+    }
+
+    /// Each distinct version the claims resolve to is written once.
+    fn claim_resolved(
         &mut self,
-        scope: &ArchiveScope<'_, R>,
-        auth: &AuthContext,
-        (bucket, info): (&str, &BucketInfo),
-        key: &str,
-        pinned: Pinned,
-    ) -> Result<Result<(), EntryStatus>, SelectionError> {
+        requested: Option<Ulid>,
+        pinned: Result<Pinned, EntryStatus>,
+    ) -> ArchiveTurn {
+        let pinned = match pinned {
+            Ok(pinned) => pinned,
+            Err(status) => {
+                self.add_file(requested, status)?;
+                return self.next_claim();
+            }
+        };
+        let work = self.work()?;
+        let claim = work.key.as_ref().ok_or(IoError::Unfinished)?;
+        if claim.written.contains(&pinned.version) {
+            return self.next_claim();
+        }
         let Pinned {
             version,
             blob,
             stale,
         } = pinned;
-        let (path, renamed) = self.paths.place(bucket, key, version);
+        let (bucket, key) = self.names()?;
+        let (path, renamed) = self.paths.place(&bucket, &key, version);
+        let placed = Placed {
+            version,
+            path,
+            renamed,
+            stale,
+        };
+        match blob {
+            Some(blob) => self.write_entry(placed, blob),
+            None => self.read_here(placed, bucket, key),
+        }
+    }
+
+    fn read_here(&mut self, placed: Placed, bucket: String, key: String) -> ArchiveTurn {
+        let group_id = self.work()?.info.group_id;
+        let auth = &self.caller.0;
         let input = GetObjectInput {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: Some(version),
+            bucket,
+            key,
+            version_id: Some(placed.version),
             range: None,
-            group_id: info.group_id,
+            group_id,
             user_identity: auth.user_id,
             realm_id: auth.realm_id,
-            node_id: scope.node.node_id,
+            node_id: self.node.node_id,
         };
-        let restrictions = auth.path_restrictions.clone();
-        let blob = match blob {
-            Some(blob) => blob,
-            None => match drive(
-                GetRoutedOperation::new(input, restrictions, None),
-                scope.context,
-            )
-            .await
-            {
-                Ok(read) => read.blob,
-                Err(error) => return Ok(Err(read_status(&error))),
-            },
+        let read = GetRoutedOperation::new(input, auth.path_restrictions.clone(), None);
+        self.step = ArchiveStep::Read(placed);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Streams one pinned version into the archive.
+    fn write_entry(&mut self, placed: Placed, stream: ByteStream) -> ArchiveTurn {
+        let effect = JobEffect::ZipCounted {
+            zip: self.zip()?,
+            path: placed.path.clone(),
+            modified_ms: placed.version.timestamp_ms(),
+            stream,
         };
-        let size = write_entry(&mut self.zip, &path, version.timestamp_ms(), blob).await?;
+        self.step = ArchiveStep::Entry(placed);
+        Ok(Next::Call(job_call(effect)))
+    }
+
+    fn entry_written(&mut self, placed: Placed, size: u64) -> ArchiveTurn {
+        let Placed {
+            version,
+            path,
+            renamed,
+            stale,
+        } = placed;
+        let (bucket, key) = self.names()?;
         self.report.totals.bytes += size;
         if !renamed {
             self.paths.record(&path);
         }
+        let row = file_row(&bucket, &key, Some(version), EntryStatus::Stale);
         if let Some(range_id) = stale {
             self.report.add(ReportRow {
                 range_id: Some(range_id.to_string()),
                 path: renamed.then_some(path),
-                ..file_row(bucket, key, Some(version), EntryStatus::Stale)
+                ..row
             });
         } else if renamed {
             self.report.add(ReportRow {
                 path: Some(path),
-                ..file_row(bucket, key, Some(version), EntryStatus::Renamed)
+                status: EntryStatus::Renamed,
+                ..row
             });
         } else {
             self.report.count(EntryStatus::Included);
         }
-        Ok(Ok(()))
+        let claim = self.work()?.key.as_mut().ok_or(IoError::Unfinished)?;
+        claim.written.push(version);
+        self.next_claim()
+    }
+
+    fn write_report(&mut self) -> ArchiveTurn {
+        let bytes = serde_json::to_vec_pretty(&self.report)
+            .map_err(|error| SelectionError::Stream(error.to_string()))?;
+        let effect = JobEffect::ZipWhole {
+            zip: self.zip()?,
+            path: REPORT_PATH.to_string(),
+            modified_ms: self.now_ms,
+            bytes,
+        };
+        self.step = ArchiveStep::Report;
+        Ok(Next::Call(job_call(effect)))
     }
 }
 
-/// Streams `blob` into one stored archive entry and returns its size.
-async fn write_entry<W: AsyncWrite + Unpin>(
-    zip: &mut ZipFileWriter<W>,
-    path: &str,
-    modified_ms: u64,
-    mut blob: BackendStream<Result<Bytes, StreamError>>,
-) -> Result<u64, SelectionError> {
-    let mut stream = zip
-        .write_entry_stream(zip_entry(path, modified_ms))
-        .await
-        .map_err(|_| SelectionError::Write)?;
-    let mut size = 0u64;
-    while let Some(chunk) = blob.next().await {
-        let chunk = chunk.map_err(|error| SelectionError::Stream(error.to_string()))?;
-        size += chunk.len() as u64;
-        stream
-            .write_all(&chunk)
-            .await
-            .map_err(|_| SelectionError::Write)?;
+impl Operation for WriteSelectionOperation {
+    type Output = Report;
+    type Error = SelectionError;
+
+    fn first(&mut self) -> ArchiveTurn {
+        validate_selection(&self.entries)?;
+        self.buckets = by_bucket(std::mem::take(&mut self.entries)).into();
+        self.next_bucket()
     }
-    stream.close().await.map_err(|_| SelectionError::Write)?;
-    Ok(size)
-}
 
-/// The folders of one bucket, listed one after another a page at a time.
-#[derive(Default)]
-struct FolderWalk {
-    folders: VecDeque<String>,
-    current: Option<FolderListing>,
-    buffer: VecDeque<String>,
-}
-
-struct FolderListing {
-    prefix: String,
-    cursor: Option<String>,
-    done: bool,
-    /// Ranges already reported for this folder.
-    ranges: HashSet<String>,
-}
-
-impl FolderWalk {
-    /// The next listed key; ranges a page could not list from current records are reported.
-    async fn peek<R: MemberReader>(
-        &mut self,
-        scope: &ArchiveScope<'_, R>,
-        caller: Caller<'_>,
-        (bucket, info): (&str, &BucketInfo),
-        report: &mut Report,
-    ) -> Option<String> {
-        loop {
-            if let Some(key) = self.buffer.front() {
-                return Some(key.clone());
+    fn next(&mut self, result: IoResult) -> ArchiveTurn {
+        match std::mem::replace(&mut self.step, ArchiveStep::Close) {
+            ArchiveStep::Bucket(name, picks) => {
+                let info = result.child::<BucketInfo, GetBucketError>()?;
+                self.bucket_read((name, picks), info)
             }
-            let listing = match self.current.as_mut() {
-                Some(listing) if !listing.done => listing,
-                _ => {
-                    let prefix = self.folders.pop_front()?;
-                    self.current = Some(FolderListing {
-                        prefix,
-                        cursor: None,
-                        done: false,
-                        ranges: HashSet::new(),
-                    });
-                    continue;
+            ArchiveStep::Folder(prefix) => {
+                let answer = result.child::<(), AuthorizeError>()?;
+                self.folder_checked(prefix, access_status(answer))
+            }
+            ArchiveStep::Page => {
+                let page = result.child::<ObjectPage<FolderKey>, PageError>()?;
+                self.page_read(page)
+            }
+            ArchiveStep::Resolve(requested) => {
+                let pinned = result.child::<Pinned, EntryStatus>()?;
+                self.claim_resolved(requested, pinned)
+            }
+            ArchiveStep::Read(placed) => match result.child::<GetObjectResult, GetObjectError>()? {
+                Ok(read) => self.write_entry(placed, read.blob),
+                // A version that cannot be opened is reported and takes no path.
+                Err(error) => {
+                    self.add_file(Some(placed.version), read_status(&error))?;
+                    self.next_claim()
                 }
-            };
-            let request = ListRequest {
-                bucket: bucket.to_string(),
-                prefix: Some(listing.prefix.clone()),
-                delimiter: None,
-                cursor: listing.cursor.take(),
-                limit: FOLDER_PAGE,
-                partial: true,
-            };
-            let list = ObjectPageOperation::<FolderKey>::new(
-                scope.node,
-                scope.access.clone(),
-                info,
-                Some(caller),
-                request,
-            );
-            match drive(list, scope.context).await {
-                Ok(page) => {
-                    let ranges = page.stale_ranges.into_iter().chain(page.unavailable_ranges);
-                    for range in ranges {
-                        if listing.ranges.insert(range.clone()) {
-                            report.add(folder_row(bucket, &listing.prefix, Some(range)));
-                        }
-                    }
-                    let keys = page.objects.iter().map(|object| object.key().to_string());
-                    self.buffer.extend(keys);
-                    listing.done = page.next_cursor.is_none();
-                    listing.cursor = page.next_cursor;
+            },
+            ArchiveStep::Entry(placed) => {
+                let JobEvent::ZipCounted { zip, result } = job_event(result)? else {
+                    return Err(unexpected_job().into());
+                };
+                self.zip = zip;
+                match result {
+                    Ok(size) => self.entry_written(placed, size),
+                    Err(ZipFailure::Source { message, .. }) => Err(SelectionError::Stream(message)),
+                    Err(ZipFailure::Sink(_) | ZipFailure::Stopped) => Err(SelectionError::Write),
                 }
-                // The rest of the folder cannot be listed, so the folder is reported once.
-                Err(_) => {
-                    report.add(folder_row(bucket, &listing.prefix, None));
-                    listing.done = true;
-                }
+            }
+            ArchiveStep::Report => {
+                let JobEvent::ZipWritten { zip, result } = job_event(result)? else {
+                    return Err(unexpected_job().into());
+                };
+                self.zip = zip;
+                result.map_err(|_| SelectionError::Write)?;
+                self.step = ArchiveStep::Close;
+                Ok(Next::Call(job_call(JobEffect::ZipClose(self.zip()?))))
+            }
+            ArchiveStep::Close => {
+                let JobEvent::ZipClosed(closed) = job_event(result)? else {
+                    return Err(unexpected_job().into());
+                };
+                closed.map_err(|_| SelectionError::Write)?;
+                Ok(Next::Done(std::mem::take(&mut self.report)))
             }
         }
     }
-}
 
-/// Whether the caller may list `prefix`, as the bucket's own listing requires.
-async fn may_list<R: MemberReader>(
-    scope: &ArchiveScope<'_, R>,
-    auth: &AuthContext,
-    (bucket, info): (&str, &BucketInfo),
-    prefix: &str,
-) -> Result<(), EntryStatus> {
-    let ids = (scope.node.realm_id, info.group_id, scope.node.node_id);
-    let path = listing_path(ids, bucket, Some(prefix));
-    authorization(scope, auth, &path).await
-}
-
-async fn authorization<R>(
-    scope: &ArchiveScope<'_, R>,
-    auth: &AuthContext,
-    path: &str,
-) -> Result<(), EntryStatus> {
-    let extras = PolicyRequestExtras::rest();
-    let read = &Permission::READ;
-    match drive(
-        AuthorizeOperation::new(scope.node.realm_id, auth, path, read, extras),
-        scope.context,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
-            Err(EntryStatus::Denied)
-        }
-        Err(AuthorizeError::Storage(_) | AuthorizeError::CheckFailed(_)) => {
-            Err(EntryStatus::Unavailable)
-        }
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
+
+#[derive(Debug, PartialEq)]
+enum ResolveStep {
+    Access,
+    Member,
+    Route,
+    Head,
+}
+
+type ResolveTurn = Result<Next<Pinned>, EntryStatus>;
 
 /// The exact version `requested` names for the caller, or the one current now. A distributed
 /// bucket's key is read where its S3 GET would be, so a current version is the coordinator's.
-async fn resolve<R: MemberReader>(
-    scope: &ArchiveScope<'_, R>,
-    auth: &AuthContext,
-    (bucket, info): (&str, &BucketInfo),
-    key: &str,
+#[derive(Debug, PartialEq)]
+struct ResolveKeyOperation {
+    node: PageNode,
+    auth: AuthContext,
+    expiry: u64,
+    bucket: String,
+    info: BucketInfo,
+    key: String,
     requested: Option<Ulid>,
 ) -> Result<Pinned, EntryStatus> {
     let (realm_id, node_id) = (scope.node.realm_id, scope.node.node_id);
