@@ -26,7 +26,6 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::import::upload_store::write_rocrate_upload;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -447,8 +446,9 @@ async fn seed_upload(
         expires_at_ms,
         claimed_by: None,
     };
-    write_rocrate_upload(&state.get_ctx(), &record)
+    aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()), &state.get_ctx())
         .await
+        .map_err(|error| error.0)
         .unwrap();
 }
 

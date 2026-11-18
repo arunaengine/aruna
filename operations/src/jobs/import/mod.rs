@@ -11,7 +11,6 @@ pub mod upload;
 pub mod upload_store;
 
 use upload::UploadClaimError;
-use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
 
 use crate::jobs::export::archive::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};
@@ -409,13 +408,7 @@ async fn acquire_source(
             })
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = claim_rocrate_upload(
-                &ctx.driver,
-                *upload_id,
-                spec.auth_context.user_id,
-                ctx.job_id,
-                aruna_core::time::unix_timestamp_millis(),
-            )
+            let record = crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(*upload_id, spec.auth_context.user_id, ctx.job_id, aruna_core::time::unix_timestamp_millis()), &ctx.driver, &*upload_id.to_bytes())
             .await
             .map_err(|error| match error {
                 UploadClaimError::Storage(message) => ImportFailure::Retryable(message),
@@ -1312,8 +1305,9 @@ async fn cleanup_source(
             .await
             .map_err(ImportFailure::Retryable)?;
         if let Some(upload_id) = input.upload_id {
-            delete_rocrate_upload(&ctx.driver, upload_id, ctx.job_id)
+            crate::driver::drive(crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, ctx.job_id), &ctx.driver)
                 .await
+                .map_err(|error| error.0)
                 .map_err(ImportFailure::Retryable)?;
         }
     }

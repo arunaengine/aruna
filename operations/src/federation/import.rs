@@ -29,7 +29,6 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::drive_retry;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
-use crate::jobs::import::upload_store::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
 use crate::jobs::store::query::find_dedup_plan;
 use crate::jobs::store::state::read_job_record;
@@ -237,8 +236,9 @@ async fn stale_upload(
     import_key: &str,
     upload_id: Ulid,
 ) -> Result<bool, ImportError> {
-    let upload = load_rocrate_upload(context, upload_id)
+    let upload = crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), context)
         .await
+        .map_err(|error| error.0)
         .map_err(ImportError::Storage)?;
     let now = aruna_core::time::unix_timestamp_millis();
     if upload.is_some() {
@@ -332,8 +332,9 @@ async fn check_bound(
     let stored = read_import(context, upload_id)
         .await?
         .ok_or_else(|| ImportError::Storage("upload binding without record".to_string()))?;
-    let upload = load_rocrate_upload(context, upload_id)
+    let upload = crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), context)
         .await
+        .map_err(|error| error.0)
         .map_err(ImportError::Storage)?;
     if !same_transfer(&stored, upload.as_ref(), intent, grant) {
         return Err(ImportError::Conflict);
@@ -779,8 +780,9 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::jobs::import::upload_store::write_rocrate_upload(&context, &live)
+        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(live.clone()), &context)
             .await
+            .map_err(|error| error.0)
             .unwrap();
         let mut record = record();
         record.grant.payload.artifact_blake3 = hex::encode(live.blake3);
