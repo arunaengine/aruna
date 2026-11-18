@@ -104,6 +104,9 @@ pub struct PersistedTaskTimer {
     pub due_unix_millis: u64,
 }
 
+/// The message of the error a task effect gets on a node without a task handler.
+pub const NO_TASK_HANDLE: &str = "task handle unavailable";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskEffect {
     ResetTimer { key: TaskKey, after: Duration },

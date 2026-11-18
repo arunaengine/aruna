@@ -877,7 +877,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_resumes_rewrite() {
-        use crate::blob::migration::queue::{RECHECK, process_transitions};
+        use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::jobs::key_wake::read_row;
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
         use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
@@ -961,7 +961,15 @@ mod tests {
                 txn_id: None,
             })
             .await;
-        assert_eq!(process_transitions(&context).await.unwrap(), Some(RECHECK));
+        assert_eq!(
+            crate::driver::drive(
+                ProcessTransitionsOperation::new(context.node_and_realm()),
+                &context
+            )
+            .await
+            .unwrap(),
+            Some(RECHECK)
+        );
         let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
             .await
             .unwrap()
@@ -1024,7 +1032,12 @@ mod tests {
         );
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
         assert!(duration < RECHECK);
-        process_transitions(&context).await.unwrap();
+        crate::driver::drive(
+            ProcessTransitionsOperation::new(context.node_and_realm()),
+            &context,
+        )
+        .await
+        .unwrap();
         let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
             .await
             .unwrap()

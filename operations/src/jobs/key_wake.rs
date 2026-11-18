@@ -8,7 +8,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
-use crate::blob::migration::queue::resume_transitions;
+use crate::blob::migration::queue::ResumeTransitionsOperation;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::driver::{DriverContext, drive};
@@ -62,10 +62,16 @@ pub async fn wake_unlocked(
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
     let queued = super::remote_key::queue_wakes(context, key).await;
     super::remote_key::arm_delivery(context).await;
-    let mut resumed = resume_transitions(context, key).await;
+    let resume = async || {
+        let resume = ResumeTransitionsOperation::new(key);
+        drive(resume, context)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let mut resumed = resume().await;
     let promoted = drive(PromoteUnlockedOperation::new(key, origin, limits), context).await;
     if !matches!(promoted, Ok(0)) {
-        resumed = resumed.and(resume_transitions(context, key).await);
+        resumed = resumed.and(resume().await);
     }
     // Copies waiting for this source key run after promotion, so pending sources are hashed.
     let wake = crate::replication::parking::WakeParkedOperation::new(key, now_ms);

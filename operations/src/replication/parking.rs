@@ -714,6 +714,17 @@ mod tests {
     use crate::testing::test_context;
     use aruna_storage::StorageHandle;
 
+    async fn process_transitions(
+        context: &crate::driver::DriverContext,
+    ) -> Result<Option<Duration>, String> {
+        let process = crate::blob::migration::queue::ProcessTransitionsOperation::new(
+            context.node_and_realm(),
+        );
+        crate::driver::drive(process, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Parks through the operation at the current time, as the drain does.
     async fn park_job(
         context: &DriverContext,
@@ -1443,12 +1454,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            crate::blob::migration::queue::process_transitions(&context)
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(process_transitions(&context).await.unwrap(), None);
         assert!(!key_unlocked(&context, old).await);
         release_tx.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), None);
@@ -1610,9 +1616,7 @@ mod tests {
             });
             let mut interrupted = context.clone();
             interrupted.storage_handle = proxy;
-            let error = crate::blob::migration::queue::process_transitions(&interrupted)
-                .await
-                .unwrap_err();
+            let error = process_transitions(&interrupted).await.unwrap_err();
             assert!(error.contains("injected retirement wake"));
 
             let mut parked = 0;
@@ -1669,9 +1673,7 @@ mod tests {
 
             let mut unavailable = interrupted.clone();
             unavailable.task_handle = Some(aruna_tasks::TaskHandle::inactive());
-            let error = crate::blob::migration::queue::process_transitions(&unavailable)
-                .await
-                .unwrap_err();
+            let error = process_transitions(&unavailable).await.unwrap_err();
             assert!(error.contains("task scheduler unavailable"));
             drop(unavailable);
             for (space, expected) in [
@@ -1691,12 +1693,7 @@ mod tests {
                         if value.as_ref() == expected.as_slice()
                 ));
             }
-            assert_eq!(
-                crate::blob::migration::queue::process_transitions(&interrupted)
-                    .await
-                    .unwrap(),
-                None
-            );
+            assert_eq!(process_transitions(&interrupted).await.unwrap(), None);
             drop(interrupted);
             actor.join().unwrap();
             for (row, original) in &jobs {
