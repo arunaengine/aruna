@@ -26,10 +26,9 @@ use tokio::sync::Mutex;
 use crate::device::sync::pull::ForwardPullOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::attempt::{read_crate_status, read_local_crate};
 use crate::jobs::store::state::read_job_record;
-use crate::jobs::workflow::run_crate::record_crate;
+use crate::jobs::workflow::run_crate::RecordCrateOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 
 /// One publish at a time, so a repeated request cannot mint a second crate.
@@ -162,13 +161,11 @@ pub async fn publish_run(
     if let Some(JobResultPayload::Execution { outputs, .. }) = &mut published.result {
         *outputs = copies.clone();
     }
-    match record_crate(context, input.job_id, &published, spec, saved_id).await {
-        JobRunOutcome::Succeeded(_) => {}
-        JobRunOutcome::Failed(error) | JobRunOutcome::Deferred(error) => {
-            return Err(PublishRunError::Crate(error.message));
-        }
-        _ => return Err(PublishRunError::Crate("interrupted".to_string())),
-    }
+    let serving = context.node_and_realm();
+    let record = RecordCrateOperation::new(input.job_id, &published, spec, saved_id, serving);
+    drive(record, context)
+        .await
+        .map_err(|error| PublishRunError::Crate(error.message))?;
     let run_crate = read_crate_status(context, input.job_id)
         .await
         .map_err(PublishRunError::Unavailable)?

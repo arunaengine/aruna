@@ -1561,7 +1561,7 @@ async fn crate_write_idempotent() {
         range_turns: Default::default(),
         handlers: Default::default(),
     };
-    let outcome = super::run_crate::write_run_crate(&ctx, job_id).await;
+    let outcome = crate::tasks::job_runner::write_run_crate(&ctx, job_id).await;
     match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
             assert_eq!(resource, "already-there");

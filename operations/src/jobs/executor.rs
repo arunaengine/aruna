@@ -207,10 +207,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::WriteRunCrate { for_job } => {
-            Box::pin(crate::jobs::workflow::run_crate::write_run_crate(
-                ctx, *for_job,
-            ))
-            .await
+            Box::pin(crate::tasks::job_runner::write_run_crate(ctx, *for_job)).await
         }
         JobPayload::TerminalCleanup {
             for_job,

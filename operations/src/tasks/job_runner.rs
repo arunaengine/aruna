@@ -43,6 +43,7 @@ use crate::jobs::submit::schedule_drain_effect;
 use crate::jobs::workflow::purge::{
     PurgeRun, PurgeStop, PurgeTurn, PurgeTurnOperation, fence_error,
 };
+use crate::jobs::workflow::run_crate::{WriteRunCrateOperation, crate_outcome};
 use crate::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::fence_store::AcquireFenceOperation;
 
@@ -573,4 +574,10 @@ pub async fn run_storage_purge(
         Err(PurgeEnd::Interrupted) => JobRunOutcome::Interrupted,
         Err(PurgeEnd::Failed(error)) => JobRunOutcome::Failed(error),
     }
+}
+
+/// Runs the run-crate obligation of a finished execution job.
+pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
+    let write = WriteRunCrateOperation::new(for_job, ctx.driver.node_and_realm());
+    crate_outcome(Box::pin(drive(write, &ctx.driver)).await)
 }
