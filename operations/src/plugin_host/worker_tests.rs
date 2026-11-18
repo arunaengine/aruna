@@ -24,9 +24,9 @@ use aruna_core::plugin_runs::{
     MAX_ATTEMPTS, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent, SourceKind,
 };
 use aruna_core::plugins::PublishedPlugin;
-use aruna_plugins::InvokeError;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
+use aruna_plugins::{InvokeError, Trigger};
 use std::time::Duration;
 use ulid::Ulid;
 
