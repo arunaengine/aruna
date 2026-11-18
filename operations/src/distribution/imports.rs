@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::purge::clear_prefix;
+use super::purge_steps::DropResumeOperation;
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::connectors::list_connectors::{ListSourceInput, ListSourceOperation};
@@ -100,8 +100,13 @@ fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes(), &job_id.to_bytes()].concat()
 }
 
-fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
+pub(super) fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
     [JOBS_PREFIX, &transfer_id.to_bytes()].concat()
+}
+
+/// The prefix of the rows that resume the imports of a transfer.
+pub(super) fn resume_prefix(transfer_id: Ulid) -> Vec<u8> {
+    [RESUME_PREFIX, &transfer_id.to_bytes()].concat()
 }
 
 /// Keeps the open imports of `bucket` and where each stands, before the range of `transfer_id`
@@ -151,16 +156,9 @@ pub(crate) async fn fenced_imports(
 
 /// Drops what [`keep_resume`] kept for `transfer_id` once the transfer is no longer open.
 pub(crate) async fn drop_resume(context: &DriverContext, transfer_id: Ulid) -> Result<(), String> {
-    let key: Key = jobs_key(transfer_id).into();
-    if read_value(context, NODE_STATE_KEYSPACE, key.clone())
-        .await?
-        .is_none()
-    {
-        return Ok(());
-    }
-    let prefix = [RESUME_PREFIX, &transfer_id.to_bytes()].concat();
-    clear_prefix(context, NODE_STATE_KEYSPACE, prefix).await?;
-    delete(context, key).await
+    drive(DropResumeOperation::new(transfer_id), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// A staging job of this node as it hands it over to a member of the set its bucket is bound
