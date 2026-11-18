@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE,
@@ -39,9 +40,7 @@ use ulid::Ulid;
 
 use crate::blob::migration::misplaced::KeyRule;
 use crate::connectors::repository::source_connector_key;
-use crate::connectors::resolver::{
-    ResolveBindingInput, ResolveBindingOperation, SourceResolutionError,
-};
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 

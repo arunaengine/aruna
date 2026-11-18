@@ -528,9 +528,12 @@ async fn s3_finds_copies() {
     let named = format!("old/{id}_sample.faa.gz");
     assert!(copy.backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
-    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
-        .await
-        .unwrap();
+    let unified = drive(
+        UnifyOperation::new(bucket, found.clone(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(unified, Unified::Done);
     assert_eq!(duplicates(&context).await.keys, 0);
     // The storage keeps no versions; the file named by the id goes all the same.
@@ -693,9 +696,12 @@ async fn s3_replaces_copies() {
     assert_eq!((page.keys, page.entries.len()), (0, 0));
     // A cleanup found before the overwrite leaves the new version's file alone.
     let bucket = (BUCKET, context.group_id);
-    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
-        .await
-        .unwrap();
+    let unified = drive(
+        UnifyOperation::new(bucket, found.clone(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(unified, Unified::Changed);
     assert_eq!(run_import(&context, 0xE5).await, (0, 2, 0));
     assert_eq!(current(&context, "old/a.txt").await, replaced);
@@ -776,9 +782,12 @@ async fn s3_unifies_uploads() {
     let named = format!("x.txt~{upload}");
     assert!(found.copies[0].backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
-    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
-        .await
-        .unwrap();
+    let unified = drive(
+        UnifyOperation::new(bucket, found.clone(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(unified, Unified::Done);
     assert_eq!(duplicates(&context).await.keys, 0);
     drive(
@@ -888,9 +897,12 @@ async fn s3_keeps_changed() {
     };
     place(&context, "old/a.txt", b"other byte").await;
     let bucket = (BUCKET, context.group_id);
-    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
-        .await
-        .unwrap();
+    let unified = drive(
+        UnifyOperation::new(bucket, found.clone(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(unified, Unified::Changed);
     drive(
         ProcessCleanupOperation::new(CleanupNode {

@@ -22,8 +22,10 @@ use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
 use super::list::{
-    MAX_PAGE_BYTES, MAX_PAGE_RANGES, elements, incomplete, range_query, timestamp, unreachable,
+    MAX_PAGE_BYTES, MAX_PAGE_RANGES, incomplete, range_query, timestamp, unreachable,
 };
+use aruna_core::outbound::xml_elements;
+
 use super::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
@@ -176,7 +178,7 @@ impl ArunaS3Service {
         };
         let url_encoded = url_of(input);
         let mut part = UploadsPart::default();
-        for entry in elements(&body, "Upload") {
+        for entry in xml_elements(&body, "Upload") {
             let Some(key) = xml_field(entry, "Key") else {
                 continue;
             };
@@ -196,7 +198,7 @@ impl ArunaS3Service {
                 },
             ));
         }
-        part.prefixes = (elements(&body, "CommonPrefixes").into_iter())
+        part.prefixes = (xml_elements(&body, "CommonPrefixes").into_iter())
             .filter_map(|entry| xml_field(entry, "Prefix"))
             .collect();
         if xml_field(&body, "IsTruncated").as_deref() == Some("true") {

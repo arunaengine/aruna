@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use aruna_core::outbound::RangeRefusal;
-use aruna_core::outbound::{RangeAccess, RangeAnswer, RangeEntry, RangeListing, RangePage};
+use aruna_core::outbound::{
+    RangeAccess, RangeAnswer, RangeEntry, RangeListing, RangePage, xml_elements, xml_field,
+};
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Delegation, Payload, SignedDelegation, request_digest,
 };
@@ -296,7 +298,7 @@ fn s3_answer(
 
 /// A member's S3 listing body as one page.
 fn s3_page(body: &str) -> RangePage {
-    let objects = (elements(body, "Contents").into_iter())
+    let objects = (xml_elements(body, "Contents").into_iter())
         .filter_map(|entry| {
             Some(RangeEntry {
                 key: xml_field(entry, "Key")?,
@@ -307,7 +309,7 @@ fn s3_page(body: &str) -> RangePage {
             })
         })
         .collect();
-    let prefixes = (elements(body, "CommonPrefixes").into_iter())
+    let prefixes = (xml_elements(body, "CommonPrefixes").into_iter())
         .filter_map(|entry| xml_field(entry, "Prefix"))
         .collect();
     RangePage {
@@ -316,29 +318,6 @@ fn s3_page(body: &str) -> RangePage {
         next: xml_field(body, "NextContinuationToken"),
         stale_ranges: Vec::new(),
     }
-}
-
-/// The XML elements `tag` of a listing body.
-fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    body.split(open.as_str())
-        .skip(1)
-        .filter_map(|part| part.split(close.as_str()).next())
-        .collect()
-}
-
-/// The text between `<tag>` and `</tag>`, with basic entities decoded.
-fn xml_field(body: &str, tag: &str) -> Option<String> {
-    let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
-    let end = start + body.get(start..)?.find(&format!("</{tag}>"))?;
-    let text = body.get(start..end)?;
-    Some(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
 }
 
 #[cfg(test)]

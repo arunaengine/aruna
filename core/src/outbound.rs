@@ -173,6 +173,29 @@ pub enum RangeAnswer {
     Refused(RangeRefusal),
 }
 
+/// The XML elements `tag` of an S3 answer body.
+pub fn xml_elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    body.split(open.as_str())
+        .skip(1)
+        .filter_map(|part| part.split(close.as_str()).next())
+        .collect()
+}
+
+/// The text between `<tag>` and `</tag>` of an S3 answer body, with basic entities decoded.
+pub fn xml_field(body: &str, tag: &str) -> Option<String> {
+    let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = start + body.get(start..)?.find(&format!("</{tag}>"))?;
+    let text = body.get(start..end)?;
+    Some(
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
 /// One request of a plugin connection, with any secret already added.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionCall {

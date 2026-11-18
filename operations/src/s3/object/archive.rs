@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 
 use aruna_core::errors::ConversionError;
+use aruna_core::outbound::RangeEntry;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -26,13 +27,15 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::list::ListedObject;
 use crate::s3::object::pages::{
-    Caller, ListRequest, PageObject, PageScope, RangeRelay, listing_path, object_page,
+    Caller, ListRequest, ObjectPageOperation, PageNode, PageObject, listing_path,
 };
+use crate::s3::object::range_list::MemberAccess;
 use crate::s3::object::read::GetRoutedOperation;
 use aruna_core::archive_path::safe_zip_path;
 
@@ -165,11 +168,41 @@ pub struct MemberCall<'a> {
 
 /// Reads a distributed bucket's key where an S3 GET of the caller would be answered: a current
 /// version at the range's coordinator, a pinned one at any holder of its records.
-pub trait MemberReader: RangeRelay {
+pub trait MemberReader: Sync {
     fn member_read(
         &self,
         call: MemberCall<'_>,
     ) -> impl Future<Output = Result<MemberRead, EntryStatus>> + Send;
+}
+
+/// What an archive needs of this node, and how it reaches the other members of a bucket.
+pub struct ArchiveScope<'a, R> {
+    pub context: &'a DriverContext,
+    pub node: PageNode,
+    pub access: MemberAccess,
+    pub reader: &'a R,
+}
+
+/// A key a folder listing named.
+#[derive(Debug, PartialEq)]
+struct FolderKey(String);
+
+impl From<&ListedObject> for FolderKey {
+    fn from(object: &ListedObject) -> Self {
+        Self(object.head.key.clone())
+    }
+}
+
+impl From<RangeEntry> for FolderKey {
+    fn from(entry: RangeEntry) -> Self {
+        Self(entry.key)
+    }
+}
+
+impl PageObject for FolderKey {
+    fn key(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A version pinned for writing: its bytes when another member already sent them, and the
@@ -247,7 +280,7 @@ fn folders(path: &str) -> impl Iterator<Item = &str> {
 /// then the report. Each key is resolved and its version pinned only when the writer reaches it.
 /// A failure inside an entry ends the archive with an error instead of a silent gap.
 pub async fn write_selection<R: MemberReader, W: tokio::io::AsyncWrite + Unpin>(
-    scope: &PageScope<'_, R>,
+    scope: &ArchiveScope<'_, R>,
     caller: Caller<'_>,
     entries: Vec<SelectionEntry>,
     writer: W,
@@ -321,7 +354,7 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
     /// Merges the bucket's explicit files into its folder listings in key order.
     async fn write_bucket<R: MemberReader>(
         &mut self,
-        scope: &PageScope<'_, R>,
+        scope: &ArchiveScope<'_, R>,
         caller: Caller<'_>,
         bucket: &str,
         picks: Vec<SelectionEntry>,
@@ -406,7 +439,7 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
     /// Writes each distinct version the claims on `key` resolve to, once.
     async fn write_key<R: MemberReader>(
         &mut self,
-        scope: &PageScope<'_, R>,
+        scope: &ArchiveScope<'_, R>,
         auth: &AuthContext,
         (bucket, info): (&str, &BucketInfo),
         key: &str,
@@ -442,7 +475,7 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
     /// reported by its status and takes no path.
     async fn write_object<R: MemberReader>(
         &mut self,
-        scope: &PageScope<'_, R>,
+        scope: &ArchiveScope<'_, R>,
         auth: &AuthContext,
         (bucket, info): (&str, &BucketInfo),
         key: &str,
@@ -462,7 +495,7 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
             group_id: info.group_id,
             user_identity: auth.user_id,
             realm_id: auth.realm_id,
-            node_id: scope.node_id,
+            node_id: scope.node.node_id,
         };
         let restrictions = auth.path_restrictions.clone();
         let blob = match blob {
@@ -544,7 +577,7 @@ impl FolderWalk {
     /// The next listed key; ranges a page could not list from current records are reported.
     async fn peek<R: MemberReader>(
         &mut self,
-        scope: &PageScope<'_, R>,
+        scope: &ArchiveScope<'_, R>,
         caller: Caller<'_>,
         (bucket, info): (&str, &BucketInfo),
         report: &mut Report,
@@ -574,7 +607,14 @@ impl FolderWalk {
                 limit: FOLDER_PAGE,
                 partial: true,
             };
-            match object_page(scope, info, Some(caller), request).await {
+            let list = ObjectPageOperation::<FolderKey>::new(
+                scope.node,
+                scope.access.clone(),
+                info,
+                Some(caller),
+                request,
+            );
+            match drive(list, scope.context).await {
                 Ok(page) => {
                     let ranges = page.stale_ranges.into_iter().chain(page.unavailable_ranges);
                     for range in ranges {
@@ -599,25 +639,25 @@ impl FolderWalk {
 
 /// Whether the caller may list `prefix`, as the bucket's own listing requires.
 async fn may_list<R: MemberReader>(
-    scope: &PageScope<'_, R>,
+    scope: &ArchiveScope<'_, R>,
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
     prefix: &str,
 ) -> Result<(), EntryStatus> {
-    let ids = (scope.realm_id, info.group_id, scope.node_id);
+    let ids = (scope.node.realm_id, info.group_id, scope.node.node_id);
     let path = listing_path(ids, bucket, Some(prefix));
     authorization(scope, auth, &path).await
 }
 
 async fn authorization<R>(
-    scope: &PageScope<'_, R>,
+    scope: &ArchiveScope<'_, R>,
     auth: &AuthContext,
     path: &str,
 ) -> Result<(), EntryStatus> {
     let extras = PolicyRequestExtras::rest();
     let read = &Permission::READ;
     match drive(
-        AuthorizeOperation::new(scope.realm_id, auth, path, read, extras),
+        AuthorizeOperation::new(scope.node.realm_id, auth, path, read, extras),
         scope.context,
     )
     .await
@@ -635,13 +675,13 @@ async fn authorization<R>(
 /// The exact version `requested` names for the caller, or the one current now. A distributed
 /// bucket's key is read where its S3 GET would be, so a current version is the coordinator's.
 async fn resolve<R: MemberReader>(
-    scope: &PageScope<'_, R>,
+    scope: &ArchiveScope<'_, R>,
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
     key: &str,
     requested: Option<Ulid>,
 ) -> Result<Pinned, EntryStatus> {
-    let (realm_id, node_id) = (scope.realm_id, scope.node_id);
+    let (realm_id, node_id) = (scope.node.realm_id, scope.node.node_id);
     let path = object_permission_path(realm_id, info.group_id, node_id, bucket, key);
     // A denied caller learns nothing about whether the key exists.
     authorization(scope, auth, &path).await?;
@@ -654,7 +694,7 @@ async fn resolve<R: MemberReader>(
             key,
             version: requested,
         };
-        match scope.relay.member_read(call).await? {
+        match scope.reader.member_read(call).await? {
             MemberRead::Remote {
                 version,
                 blob,

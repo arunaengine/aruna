@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::node_state::NodeUrlsOperation;
+use aruna_core::outbound::xml_field;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -353,20 +354,6 @@ fn unreachable_error(forward: &Forward, reach: &str) -> S3Error {
     );
     error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
     error
-}
-
-/// The text between `<tag>` and `</tag>` of an S3 error body, with basic entities decoded.
-pub(super) fn xml_field(body: &str, tag: &str) -> Option<String> {
-    let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
-    let end = start + body.get(start..)?.find(&format!("</{tag}>"))?;
-    let text = body.get(start..end)?;
-    Some(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
 }
 
 /// The coordinator's refusal as this node's answer; a denial says why node globs help.

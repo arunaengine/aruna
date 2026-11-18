@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::link::link_error;
 use super::{ArunaS3Service, URL_ENCODE_SET};
 use crate::s3::checksum::{ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
@@ -12,15 +13,18 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BlobHeadKey;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;
-use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::list::{
     ListBucketInput as LOV2I, ListContinuationToken, decode_list_token, encode_list_token,
 };
 use aruna_operations::s3::object::versions::{ListVersionsItem, ListVersionsResult};
-use aruna_operations::s3::object::visible::{HiddenCursor, NextPage, VisibleError, visible_page};
+use aruna_operations::s3::object::visible::{
+    HiddenCursor, LinkShows, ListingKeys, NextPage, RecordSource, VisibleError,
+    VisiblePageOperation,
+};
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     ChecksumType, CommonPrefix, DeleteMarkerEntry, ETag, EncodingType, Initiator,
@@ -31,6 +35,32 @@ use s3s::dto::{
 };
 use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
+
+/// The keys an S3 caller may list: inside its scope, and what its share session may read.
+#[derive(Debug, PartialEq)]
+struct ListedKeys {
+    scope: Option<SubpathScope>,
+    access: Option<BucketAccess>,
+}
+
+impl ListedKeys {
+    fn reads(&self, key: &str) -> bool {
+        (self.access.as_ref()).is_none_or(|access| access.allows(Some(key), &Permission::READ))
+    }
+}
+
+impl ListingKeys for ListedKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|scope| scope.allows_key(key))
+            && self.reads(key)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        (self.scope.as_ref()).is_none_or(|scope| scope.allows_prefix(prefix)) && self.reads(prefix)
+    }
+}
 
 /// One page of a shared object listing before protocol-specific mapping.
 pub(super) struct ObjectListingPage {
@@ -121,37 +151,30 @@ impl ArunaS3Service {
         input: LOV2I,
         (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
-        (scope, access): (Option<&SubpathScope>, Option<&BucketAccess>),
+        (scope, access): (Option<&SubpathScope>, Option<BucketAccess>),
         (bounds, hidden): (Option<(String, Option<String>)>, Option<HiddenCursor>),
     ) -> S3Result<ObjectListingPage> {
-        let bucket = input.bucket.clone();
-        let reads =
-            |key: &str| access.is_none_or(|access| access.allows(Some(key), &Permission::READ));
-        let groups =
-            |prefix: &str| scope.is_none_or(|scope| scope.allows_prefix(prefix)) && reads(prefix);
-        let listed = visible_page(
-            self.state.as_ref(),
-            input,
-            (hidden, bounds),
-            |object: &ListedObject| {
-                let object = object.clone();
-                let bucket = &bucket;
-                Box::pin(async move {
-                    if !scope.is_none_or(|scope| scope.allows_key(&object.head.key))
-                        || !reads(&object.head.key)
-                    {
-                        return Ok(false);
-                    }
-                    self.link_listable(reader, bucket, &object).await
-                })
+        let rule = LinkShows {
+            keys: ListedKeys {
+                scope: scope.cloned(),
+                access,
             },
-            groups,
-        );
-        let page = listed.await.map_err(|error| match error {
-            VisibleError::List(error) => error.into_s3_error(),
-            VisibleError::Shows(error) => error,
-            VisibleError::Cursor => s3_error!(InternalError, "The listing cursor was not sealed"),
-        })?;
+            caller: self.listing_caller(reader, &input.bucket).await,
+            realm_id: self.realm_id,
+            node: self.link_node(),
+        };
+        let source = RecordSource { bounds };
+        let list = VisiblePageOperation::new(source, rule, input, hidden);
+        let page = drive(list, &self.state)
+            .await
+            .map_err(|error| match error {
+                VisibleError::List(error) => error.into_s3_error(),
+                VisibleError::Shows(error) => link_error(error),
+                VisibleError::Cursor => {
+                    s3_error!(InternalError, "The listing cursor was not sealed")
+                }
+                VisibleError::Io(error) => s3_error!(InternalError, "{error}"),
+            })?;
         let (continuation_token, sealed) = match page.next {
             Some(NextPage::After(token)) => (Some(token), None),
             Some(NextPage::Sealed(sealed)) => (None, Some(sealed)),

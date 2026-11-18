@@ -1,38 +1,47 @@
 //! Lists a bucket's objects a caller may see, page by page; a distributed bucket is merged across
-//! its key ranges in key order, each range listed here or by a holder through a relay (D12).
+//! its key ranges in key order, each range listed here or by a holder (D12).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
+use aruna_core::operation::Operation;
+use aruna_core::outbound::{RangeEntry, RangePage, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, KeyRange,
+    DistributionBinding, DistributionMember, DistributionView, KeyRange,
 };
-use aruna_core::structs::storage::link::LinkTarget;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::BucketAccess;
-use crate::auth::request_authorization::BucketAccessOperation;
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use crate::distribution::guard::GuardError;
-use crate::distribution::routing::bound_view;
-use crate::distribution::routing::local_fence;
-use crate::driver::{DriverContext, drive};
-use crate::s3::object::link::{LinkCaller, LinkNode, TargetVisibleOperation};
+use crate::distribution::routing::{bound_view, local_fence};
+use crate::s3::object::link::{LinkCaller, LinkError, LinkNode};
 use crate::s3::object::list::{
-    ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+    ListedObject,
+};
+use crate::s3::object::range_list::{
+    MemberAccess, RangeListError, RangeListOperation, RangeQuery, RangeTarget,
 };
 use crate::s3::object::visible::{
-    HiddenCursor, Listed, Lister, NextPage, VisibleError, after_entry, is_sealed, open_cursor,
-    visible_from, visible_page,
+    HiddenCursor, LinkShows, ListFailure, ListSource, Listed, ListingKeys, NextPage, RecordSource,
+    ShowRule, Shown, VisibleError, VisiblePage, VisiblePageOperation, after_entry, is_sealed,
+    open_cursor,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -41,7 +50,7 @@ const MAX_PAGE_RANGES: usize = 64;
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// One listing request as the merge needs it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ListRequest {
     pub bucket: String,
     pub prefix: Option<String>,
@@ -54,7 +63,7 @@ pub struct ListRequest {
 }
 
 /// One page of shown objects in key order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObjectPage<O> {
     pub objects: Vec<O>,
     pub prefixes: Vec<String>,
@@ -78,52 +87,35 @@ impl<O> Default for ObjectPage<O> {
 }
 
 /// A listed object as the transport shows it.
-pub trait PageObject: for<'a> From<&'a ListedObject> + Send {
+pub trait PageObject:
+    for<'a> From<&'a ListedObject> + From<RangeEntry> + Send + Debug + PartialEq + 'static
+{
     fn key(&self) -> &str;
 }
 
-/// The listing of one range by one holder.
-pub struct RangeCall<'a> {
-    pub set_id: Ulid,
-    pub node_id: NodeId,
-    pub range: &'a KeyRange,
-    pub request: &'a ListRequest,
-    pub cursor: Option<&'a str>,
-    /// Lists that member's copy while the coordinator cannot.
-    pub copy: bool,
-}
-
-/// Asks another member for one range's page with the caller's credential.
-pub trait RangeRelay: Sync {
-    type Object: PageObject;
-    type Error: Send;
-    /// The holder's page, or `None` when it did not answer, so another holder may be asked.
-    fn list_range(
-        &self,
-        call: RangeCall<'_>,
-    ) -> impl Future<Output = Result<Option<ObjectPage<Self::Object>>, Self::Error>> + Send;
-    /// Whether a holder's refusal is its own fault, so a copy may list instead.
-    fn is_fault(error: &Self::Error) -> bool;
-    /// Whether this node also checks the caller on each entry other members list, as for a
-    /// share visit, whose downloads this node authorizes on its own path.
-    fn checks_here(&self) -> bool {
-        false
-    }
-}
-
-/// What a listing runs with: this node, its records and the relay to other members.
-pub struct PageScope<'a, R> {
-    pub context: &'a DriverContext,
+/// This node as a listing needs it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageNode {
     pub realm_id: RealmId,
     pub node_id: NodeId,
-    pub relay: &'a R,
+    /// The ids delegations are signed under.
+    pub ids: Option<(NodeId, RealmId)>,
+}
+
+impl PageNode {
+    fn local(&self) -> (NodeId, RealmId) {
+        (self.node_id, self.realm_id)
+    }
 }
 
 /// A caller and the expiry of its bearer, which bounds delegated reads on its behalf.
 pub type Caller<'a> = (&'a AuthContext, u64);
 
-#[derive(Debug, Error)]
-pub enum PageError<E> {
+/// A caller an operation keeps.
+type OwnedCaller = (AuthContext, u64);
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PageError {
     #[error("the cursor is not a next_cursor of this listing")]
     Cursor,
     #[error(
@@ -136,16 +128,42 @@ pub enum PageError<E> {
     #[error("{0}")]
     Internal(String),
     #[error("a holder refused the listing")]
-    Relay(E),
+    Relay(RangeRefusal),
 }
 
-impl<E> PageError<E> {
+impl PageError {
     fn internal(error: impl std::fmt::Display) -> Self {
         Self::Internal(error.to_string())
     }
+
+    /// Whether a failed range listing is the holders' fault, so a copy may list instead.
+    fn holder_fault(&self) -> bool {
+        match self {
+            Self::Unanswered { .. } => true,
+            Self::Relay(refusal) => refusal.status >= 500,
+            _ => false,
+        }
+    }
 }
 
-type PageResult<O, E> = Result<ObjectPage<O>, PageError<E>>;
+impl From<IoError> for PageError {
+    fn from(error: IoError) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<RangeListError> for PageError {
+    fn from(error: RangeListError) -> Self {
+        match error {
+            RangeListError::Refused(refusal) => Self::Relay(refusal),
+            RangeListError::Cursor => Self::Cursor,
+            RangeListError::Failed(reason) => Self::Internal(reason),
+        }
+    }
+}
+
+type PageResult<O> = Result<ObjectPage<O>, PageError>;
+type PageTurn<O> = Result<Next<ObjectPage<O>>, PageError>;
 
 /// Where a merged page continues: after a listed key or common prefix, at the first key of a
 /// range when a page visited its bound of ranges before any entry, or inside the range at
@@ -166,20 +184,20 @@ pub enum Resume {
     },
 }
 
-pub fn encode_resume<E>(resume: &Resume) -> Result<String, PageError<E>> {
+pub fn encode_resume(resume: &Resume) -> Result<String, PageError> {
     cursor::encode_value(resume).map_err(PageError::internal)
 }
 
-pub fn decode_resume<E>(cursor: &str) -> Result<Resume, PageError<E>> {
+pub fn decode_resume(cursor: &str) -> Result<Resume, PageError> {
     cursor::decode_value(cursor).map_err(|_| PageError::Cursor)
 }
 
 /// The token that resumes a local listing after `key`, or past the whole `group`.
-pub fn resume_token<E>(
+pub fn resume_token(
     bucket: &str,
     key: &str,
     group: Option<&str>,
-) -> Result<ListContinuationToken, PageError<E>> {
+) -> Result<ListContinuationToken, PageError> {
     let last_key =
         BlobHeadKey::object_prefix(bucket, group.unwrap_or(key)).map_err(PageError::internal)?;
     Ok(ListContinuationToken {
@@ -200,56 +218,32 @@ pub fn listing_path(
     }
 }
 
-/// One page of `info`'s objects on this node: local for an ordinary bucket, merged across the
-/// key ranges of a distributed one. With a caller, only what that caller may read shows.
-pub async fn object_page<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    info: &BucketInfo,
-    caller: Option<Caller<'_>>,
-    request: ListRequest,
-) -> PageResult<R::Object, R::Error> {
-    match info.distribution.as_ref() {
-        Some(binding) => merged_page(scope, (info, caller), binding, request).await,
-        None => {
-            let (token, hidden) = local_token(&request)?;
-            local_part(scope, (info, caller), &request, (token, None, hidden), None).await
-        }
-    }
-}
-
-/// One page of the range `bounds` names, for a listing another member relays here.
-pub async fn range_page<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, caller): (&BucketInfo, Option<Caller<'_>>),
-    request: &ListRequest,
-    start_after: Option<String>,
-    bounds: (String, Option<String>),
-) -> PageResult<R::Object, R::Error> {
-    let (token, hidden) = local_token(request)?;
-    let position = (token, start_after, hidden);
-    local_part(scope, (info, caller), request, position, Some(bounds)).await
-}
-
 /// The local listing position a cursor of an unmerged listing names.
-fn local_token<E>(
+fn local_token(
     request: &ListRequest,
-) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError<E>> {
-    if let Some(cursor) = request.cursor.as_deref().filter(|cursor| is_sealed(cursor)) {
+) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+    position_of(&request.bucket, request.cursor.as_deref())
+}
+
+fn position_of(
+    bucket: &str,
+    cursor: Option<&str>,
+) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+    if let Some(cursor) = cursor.filter(|cursor| is_sealed(cursor)) {
         let hidden = open_cursor(cursor).ok_or(PageError::Cursor)?;
         return Ok((None, Some(hidden)));
     }
-    match request.cursor.as_deref().map(decode_resume).transpose()? {
-        Some(Resume::After { key, group }) => Ok((
-            Some(resume_token(&request.bucket, &key, group.as_deref())?),
-            None,
-        )),
+    match cursor.map(decode_resume).transpose()? {
+        Some(Resume::After { key, group }) => {
+            Ok((Some(resume_token(bucket, &key, group.as_deref())?), None))
+        }
         Some(Resume::From(_) | Resume::Hidden { .. }) => Err(PageError::Cursor),
         None => Ok((None, None)),
     }
 }
 
 /// The cursor of a local listing that stopped after `token`.
-pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
+pub fn after_cursor(token: ListContinuationToken) -> Result<String, PageError> {
     let key = BlobHeadKey::from_bytes(&token.last_key)
         .map_err(PageError::internal)?
         .key;
@@ -257,134 +251,295 @@ pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError
     encode_resume(&Resume::After { key, group })
 }
 
-/// One page of `info`'s objects from this node's records, inside `bounds` when given. For a
-/// caller, a key or prefix shows only when the caller may read it, a link only with its
-/// target, and a prefix only once an entry below it shows.
-async fn local_part<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, caller): (&BucketInfo, Option<Caller<'_>>),
+fn list_input(
     request: &ListRequest,
-    (token, start_after, hidden): (
-        Option<ListContinuationToken>,
-        Option<String>,
-        Option<HiddenCursor>,
-    ),
-    bounds: Option<(String, Option<String>)>,
-) -> PageResult<R::Object, R::Error> {
-    let input = ListBucketInput {
+    group_id: Ulid,
+    token: Option<ListContinuationToken>,
+    start_after: Option<String>,
+) -> ListBucketInput {
+    ListBucketInput {
         bucket: request.bucket.clone(),
-        group_id: info.group_id,
+        group_id,
         continuation_token: token,
         max_keys: Some(request.limit),
         prefix: request.prefix.clone().filter(|prefix| !prefix.is_empty()),
-        delimiter: request
-            .delimiter
-            .clone()
-            .filter(|delimiter| !delimiter.is_empty()),
+        delimiter: (request.delimiter.clone()).filter(|delimiter| !delimiter.is_empty()),
         start_after,
-    };
-    if let Some(caller) = caller {
-        return shown_part(scope, (info, caller), (input, hidden), bounds).await;
     }
-    let operation = match bounds {
-        Some((lower, upper)) => ListBucketOperation::new(input).with_bounds(lower, upper),
-        None => ListBucketOperation::new(input),
-    };
-    let result = drive(operation, scope.context)
-        .await
-        .map_err(PageError::internal)?;
-    Ok(ObjectPage {
-        objects: result.objects.iter().map(R::Object::from).collect(),
-        prefixes: result.common_prefixes,
-        next_cursor: result.continuation_token.map(after_cursor).transpose()?,
-        ..ObjectPage::default()
-    })
 }
 
-/// The page of a local listing a caller may see; a page that stopped among hidden entries
-/// carries a sealed cursor.
-async fn shown_part<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, (auth, expiry)): (&BucketInfo, Caller<'_>),
-    (input, hidden): (ListBucketInput, Option<HiddenCursor>),
-    bounds: Option<(String, Option<String>)>,
-) -> PageResult<R::Object, R::Error> {
-    let (realm_id, node_id, context) = (scope.realm_id, scope.node_id, scope.context);
-    let ids = (realm_id, info.group_id, node_id);
-    let access = drive(
-        BucketAccessOperation::new(auth, ids, &input.bucket),
-        context,
-    )
-    .await
-    .map_err(PageError::internal)?;
-    // The bearer's expiry bounds a delegated HEAD of a target on another node.
-    let caller = LinkCaller {
-        auth: auth.clone(),
-        credential: (String::new(), info.group_id, expiry),
-    };
-    let link_node = LinkNode {
-        local: node_id,
-        ids: context.node_and_realm(),
-    };
-    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
-    let page = visible_page(
-        context,
-        input,
-        (hidden, bounds),
-        |object: &ListedObject| {
-            let object = object.clone();
-            let (access, caller) = (&access, &caller);
-            Box::pin(async move {
-                if !access.allows(Some(&object.head.key), &Permission::READ) {
-                    return Ok(false);
-                }
-                match object
-                    .link
-                    .as_ref()
-                    .map(|link| LinkTarget::of(link, realm_id))
-                {
-                    None => Ok(true),
-                    Some(Some(target)) => {
-                        let visible = TargetVisibleOperation::new(caller, &target, link_node);
-                        drive(visible, context).await
-                    }
-                    Some(None) => Ok(false),
-                }
-            })
-        },
-        readable,
-    );
-    let page = page.await.map_err(|error| match error {
+fn visible_failure<E: std::fmt::Display, L: std::fmt::Display>(
+    error: VisibleError<E, L>,
+) -> PageError {
+    match error {
         VisibleError::List(error) => PageError::internal(error),
         VisibleError::Shows(error) => PageError::internal(error),
         VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
-    })?;
+        VisibleError::Io(error) => PageError::internal(error),
+    }
+}
+
+fn shown_page<O, T>(page: VisiblePage<T>, map: impl Fn(T) -> O) -> PageResult<O> {
     let next_cursor = match page.next {
         Some(NextPage::After(token)) => Some(after_cursor(token)?),
         Some(NextPage::Sealed(sealed)) => Some(sealed),
         None => None,
     };
     Ok(ObjectPage {
-        objects: page.objects.iter().map(R::Object::from).collect(),
+        objects: page.objects.into_iter().map(map).collect(),
         prefixes: page.prefixes,
         next_cursor,
         ..ObjectPage::default()
     })
 }
 
-/// One range at one member, listed through the relay for a page this node checks again.
-struct MemberRange<'a, R> {
-    relay: &'a R,
-    call: (Ulid, NodeId, bool),
-    range: &'a KeyRange,
+/// The keys a caller's loaded rules allow.
+#[derive(Debug, PartialEq)]
+struct AccessKeys(Arc<BucketAccess>);
+
+impl ListingKeys for AccessKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.0.allows(Some(key), &Permission::READ)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        self.allows(prefix)
+    }
 }
 
-impl<R: RangeRelay> Lister for MemberRange<'_, R> {
-    type Object = R::Object;
-    type Error = PageError<R::Error>;
+#[derive(Debug, PartialEq)]
+enum LocalStep {
+    Access,
+    Listed,
+    Visible,
+}
 
-    async fn list(&self, input: &ListBucketInput) -> Result<Listed<R::Object>, Self::Error> {
-        let (set_id, node_id, copy) = self.call;
+/// One page of a bucket's objects from this node's records, inside bounds when given. A caller
+/// sees only the keys and link targets it may read, and a prefix once an entry below it shows;
+/// a page that stopped among hidden entries carries a sealed cursor.
+#[derive(Debug, PartialEq)]
+struct LocalPartOperation<O> {
+    node: PageNode,
+    group_id: Ulid,
+    caller: Option<OwnedCaller>,
+    input: Option<ListBucketInput>,
+    hidden: Option<HiddenCursor>,
+    bounds: Option<(String, Option<String>)>,
+    step: LocalStep,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> LocalPartOperation<O> {
+    fn new(
+        node: PageNode,
+        (group_id, caller): (Ulid, Option<OwnedCaller>),
+        input: ListBucketInput,
+        (hidden, bounds): (Option<HiddenCursor>, Option<(String, Option<String>)>),
+    ) -> Self {
+        Self {
+            node,
+            group_id,
+            caller,
+            input: Some(input),
+            hidden,
+            bounds,
+            step: LocalStep::Listed,
+            object: PhantomData,
+        }
+    }
+
+    fn input(&mut self) -> Result<ListBucketInput, IoError> {
+        self.input.take().ok_or(IoError::Unfinished)
+    }
+
+    fn list_all(&mut self) -> PageTurn<O> {
+        let list = ListBucketOperation::new(self.input()?);
+        let list = match self.bounds.take() {
+            Some((lower, upper)) => list.with_bounds(lower, upper),
+            None => list,
+        };
+        self.step = LocalStep::Listed;
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn list_visible(&mut self, access: BucketAccess) -> PageTurn<O> {
+        let (auth, expiry) = self.caller.take().ok_or(IoError::Unfinished)?;
+        let node = self.node;
+        // The bearer's expiry bounds a delegated HEAD of a target on another node.
+        let rule = LinkShows {
+            keys: AccessKeys(Arc::new(access)),
+            caller: LinkCaller {
+                auth,
+                credential: (String::new(), self.group_id, expiry),
+            },
+            realm_id: node.realm_id,
+            node: LinkNode {
+                local: node.node_id,
+                ids: node.ids,
+            },
+        };
+        let source = RecordSource {
+            bounds: self.bounds.take(),
+        };
+        let page = VisiblePageOperation::new(source, rule, self.input()?, self.hidden.take());
+        self.step = LocalStep::Visible;
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl<O: PageObject> Operation for LocalPartOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> PageTurn<O> {
+        let Some((auth, _)) = &self.caller else {
+            return self.list_all();
+        };
+        let node = self.node;
+        let ids = (node.realm_id, self.group_id, node.node_id);
+        let bucket = &self.input.as_ref().ok_or(IoError::Unfinished)?.bucket;
+        let access = BucketAccessOperation::new(auth, ids, bucket);
+        self.step = LocalStep::Access;
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        match self.step {
+            LocalStep::Access => {
+                let access = result.child::<BucketAccess, AuthorizeError>()?;
+                self.list_visible(access.map_err(PageError::internal)?)
+            }
+            LocalStep::Listed => {
+                let listed = result.child::<ListBucketResult, ListBucketError>()?;
+                let listed = listed.map_err(PageError::internal)?;
+                let next_cursor = listed.continuation_token.map(after_cursor).transpose()?;
+                Ok(Next::Done(ObjectPage {
+                    objects: listed.objects.iter().map(O::from).collect(),
+                    prefixes: listed.common_prefixes,
+                    next_cursor,
+                    ..ObjectPage::default()
+                }))
+            }
+            LocalStep::Visible => {
+                let page = result
+                    .child::<VisiblePage<ListedObject>, VisibleError<LinkError, ListBucketError>>(
+                    )?;
+                let page = page.map_err(visible_failure)?;
+                Ok(Next::Done(shown_page(page, |object| O::from(&object))?))
+            }
+        }
+    }
+}
+
+fn range_page_of<O: PageObject>(page: RangePage) -> ObjectPage<O> {
+    ObjectPage {
+        objects: page.objects.into_iter().map(O::from).collect(),
+        prefixes: page.prefixes,
+        next_cursor: page.next,
+        stale_ranges: page.stale_ranges,
+        unavailable_ranges: Vec::new(),
+    }
+}
+
+/// One range at one member, for a listing this node checks again.
+#[derive(Clone, Debug, PartialEq)]
+struct MemberCall {
+    local: (NodeId, RealmId),
+    target: RangeTarget,
+    access: MemberAccess,
+}
+
+/// The position after the last entry of a page in key order.
+fn last_entry<O: PageObject>(bucket: &str, page: &ObjectPage<O>) -> Option<ListContinuationToken> {
+    let objects = page.objects.iter().map(|object| (object.key(), false));
+    let groups = page.prefixes.iter().map(|group| (group.as_str(), true));
+    let (name, group) = objects.chain(groups).max()?;
+    Some(after_entry(bucket, name, group))
+}
+
+/// One page from one member as a listing source sees it. A member that hid its whole page goes
+/// on from its own sealed cursor.
+#[derive(Debug, PartialEq)]
+struct MemberPageOperation<O> {
+    member: MemberCall,
+    request: ListRequest,
+    position: Option<ListContinuationToken>,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> MemberPageOperation<O> {
+    fn call(&self) -> IoCall {
+        let request = &self.request;
+        let query = RangeQuery {
+            bucket: request.bucket.clone(),
+            prefix: request.prefix.clone(),
+            delimiter: request.delimiter.clone(),
+            limit: request.limit,
+            cursor: request.cursor.clone(),
+        };
+        let member = self.member.clone();
+        IoCall::child(RangeListOperation::new(
+            member.local,
+            member.target,
+            query,
+            member.access,
+        ))
+    }
+}
+
+impl<O: PageObject> Operation for MemberPageOperation<O> {
+    type Output = Listed<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> Result<Next<Listed<O>>, PageError> {
+        if let Some(position) = self.position.take() {
+            self.request.cursor = Some(after_cursor(position)?);
+        }
+        Ok(Next::Call(self.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Listed<O>>, PageError> {
+        let target = &self.member.target;
+        let unanswered = PageError::Unanswered {
+            range_id: target.range.range_id,
+            set_id: target.set_id,
+        };
+        let page = result.child::<Option<RangePage>, RangeListError>()??;
+        let page = range_page_of::<O>(page.ok_or(unanswered)?);
+        let shown = !page.objects.is_empty() || !page.prefixes.is_empty();
+        let bucket = &self.request.bucket;
+        let next = match page.next_cursor.clone() {
+            Some(next) if is_sealed(&next) && !shown => {
+                self.request.cursor = Some(next);
+                return Ok(Next::Call(self.call()));
+            }
+            Some(next) if is_sealed(&next) => last_entry(bucket, &page),
+            Some(next) => match decode_resume(&next)? {
+                Resume::After { key, group } => Some(resume_token(bucket, &key, group.as_deref())?),
+                Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
+            },
+            None => None,
+        };
+        Ok(Next::Done(Listed {
+            objects: page.objects,
+            prefixes: page.prefixes,
+            next,
+        }))
+    }
+}
+
+/// One member as a source of the pages this node checks again.
+#[derive(Debug, PartialEq)]
+struct MemberSource<O> {
+    member: MemberCall,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> ListSource for MemberSource<O> {
+    type Object = O;
+    type Error = PageError;
+
+    fn call(&self, input: &ListBucketInput) -> IoCall {
         let request = ListRequest {
             bucket: input.bucket.clone(),
             prefix: input.prefix.clone(),
@@ -393,396 +548,659 @@ impl<R: RangeRelay> Lister for MemberRange<'_, R> {
             limit: (input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS),
             partial: false,
         };
-        let mut cursor = input
-            .continuation_token
-            .clone()
-            .map(after_cursor)
-            .transpose()?;
-        loop {
-            let call = RangeCall {
-                set_id,
-                node_id,
-                range: self.range,
-                request: &request,
-                cursor: cursor.as_deref(),
-                copy,
-            };
-            let unanswered = PageError::Unanswered {
-                range_id: self.range.range_id,
-                set_id,
-            };
-            let page = self
-                .relay
-                .list_range(call)
-                .await
-                .map_err(PageError::Relay)?;
-            let page = page.ok_or(unanswered)?;
-            let shown = !page.objects.is_empty() || !page.prefixes.is_empty();
-            // A member that hid its whole page goes on from its own sealed cursor.
-            let next = match page.next_cursor.clone() {
-                Some(next) if is_sealed(&next) && !shown => {
-                    cursor = Some(next);
-                    continue;
-                }
-                Some(next) if is_sealed(&next) => last_entry(&request.bucket, &page),
-                Some(next) => match decode_resume(&next)? {
-                    Resume::After { key, group } => {
-                        Some(resume_token(&request.bucket, &key, group.as_deref())?)
-                    }
-                    Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
-                },
-                None => None,
-            };
-            return Ok(Listed {
-                objects: page.objects,
-                prefixes: page.prefixes,
-                next,
-            });
-        }
+        IoCall::child(MemberPageOperation::<O> {
+            member: self.member.clone(),
+            request,
+            position: input.continuation_token.clone(),
+            object: PhantomData,
+        })
     }
 
-    fn key(object: &R::Object) -> &str {
+    fn take(&self, result: IoResult) -> Result<Listed<O>, ListFailure<PageError>> {
+        let page = result.child::<Listed<O>, PageError>()?;
+        page.map_err(ListFailure::Source)
+    }
+
+    fn key(object: &O) -> &str {
         object.key()
     }
 }
 
-/// The position after the last entry of `page` in key order.
-fn last_entry<O: PageObject>(bucket: &str, page: &ObjectPage<O>) -> Option<ListContinuationToken> {
-    let objects = page.objects.iter().map(|object| (object.key(), false));
-    let groups = page.prefixes.iter().map(|group| (group.as_str(), true));
-    let (name, group) = objects.chain(groups).max()?;
-    Some(after_entry(bucket, name, group))
+/// Shows the keys this node's own rules allow the caller, whatever a member listed.
+#[derive(Debug, PartialEq)]
+struct CheckedKeys<O> {
+    keys: AccessKeys,
+    object: PhantomData<O>,
 }
 
-/// One range's page as this node's own rules show it to the caller, read from `node_id`:
-/// a key shows when `access` allows it, a common prefix once a key below it does, and a page
-/// that stops among hidden entries ends with this node's sealed cursor.
-async fn checked_part<R: RangeRelay>(
-    relay: &R,
-    (access, group_id): (&BucketAccess, Ulid),
-    (set_id, node_id, range, copy): (Ulid, NodeId, &KeyRange, bool),
-    (request, cursor): (&ListRequest, Option<&str>),
-) -> Result<ObjectPage<R::Object>, PageError<R::Error>> {
-    let (token, hidden) = match cursor {
-        Some(cursor) if is_sealed(cursor) => (
-            None,
-            Some(open_cursor::<HiddenCursor>(cursor).ok_or(PageError::Cursor)?),
-        ),
-        Some(cursor) => match decode_resume(cursor)? {
-            Resume::After { key, group } => (
-                Some(resume_token(&request.bucket, &key, group.as_deref())?),
-                None,
-            ),
-            Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
-        },
-        None => (None, None),
-    };
-    let input = ListBucketInput {
-        bucket: request.bucket.clone(),
-        group_id,
-        continuation_token: token,
-        max_keys: Some(request.limit),
-        prefix: request.prefix.clone().filter(|prefix| !prefix.is_empty()),
-        delimiter: (request.delimiter.clone()).filter(|delimiter| !delimiter.is_empty()),
-        start_after: None,
-    };
-    let lister = MemberRange {
-        relay,
-        call: (set_id, node_id, copy),
-        range,
-    };
-    let shows = |object: &R::Object| {
-        let shown = access.allows(Some(object.key()), &Permission::READ);
-        Box::pin(async move { Ok::<bool, std::convert::Infallible>(shown) })
-            as futures_util::future::BoxFuture<'static, _>
-    };
-    let groups = |prefix: &str| access.allows(Some(prefix), &Permission::READ);
-    let page = visible_from(&lister, input, hidden, shows, groups).await;
-    let page = page.map_err(|error| match error {
-        VisibleError::List(error) => error,
-        VisibleError::Shows(never) => match never {},
-        VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
-    })?;
-    let next_cursor = match page.next {
-        Some(NextPage::After(token)) => Some(after_cursor(token)?),
-        Some(NextPage::Sealed(sealed)) => Some(sealed),
-        None => None,
-    };
-    Ok(ObjectPage {
-        objects: page.objects,
-        prefixes: page.prefixes,
-        next_cursor,
-        ..ObjectPage::default()
-    })
+impl<O: PageObject> ShowRule for CheckedKeys<O> {
+    type Object = O;
+    type Error = IoError;
+
+    fn shows(&self, object: &O) -> Shown {
+        Shown::Decided(self.keys.allows(object.key()))
+    }
+
+    fn answered(&self, _: IoResult) -> Result<Result<bool, IoError>, IoError> {
+        Err(IoError::Unfinished)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        self.keys.groups(prefix)
+    }
 }
 
-/// One range's page from a holder of the range, with the holder that answered; only a range
-/// nobody answers ends the page. With `checks`, this node checks the caller on each entry too.
-async fn remote_part<R: RangeRelay>(
-    relay: &R,
-    (binding, holders, checks): (
-        &DistributionBinding,
-        Vec<NodeId>,
-        Option<(&BucketAccess, Ulid)>,
-    ),
-    (range, copy): (&KeyRange, bool),
-    (request, cursor): (&ListRequest, Option<String>),
-) -> Result<(ObjectPage<R::Object>, NodeId), PageError<R::Error>> {
-    for node_id in holders {
-        if let Some(checks) = checks {
-            let call = (binding.set_id, node_id, range, copy);
-            match checked_part(relay, checks, call, (request, cursor.as_deref())).await {
-                Ok(page) => return Ok((page, node_id)),
-                Err(PageError::Unanswered { .. }) => continue,
-                Err(error) => return Err(error),
-            }
+type CheckedPage<O> = VisiblePageOperation<MemberSource<O>, CheckedKeys<O>>;
+
+/// This node's own check of what another member lists for the caller.
+type Checks = (Arc<BucketAccess>, Ulid);
+
+/// One range's page from the first of its holders that answers, with that holder; only a range
+/// nobody answers fails. With `checks`, this node checks the caller on each entry too.
+#[derive(Debug, PartialEq)]
+struct RemotePartOperation<O> {
+    node: PageNode,
+    access: MemberAccess,
+    set_id: Ulid,
+    range: KeyRange,
+    copy: bool,
+    holders: VecDeque<NodeId>,
+    checks: Option<Checks>,
+    request: ListRequest,
+    cursor: Option<String>,
+    asked: Option<NodeId>,
+    object: PhantomData<O>,
+}
+
+type RemotePart<O> = (ObjectPage<O>, NodeId);
+type RemoteTurn<O> = Result<Next<RemotePart<O>>, PageError>;
+
+impl<O: PageObject> RemotePartOperation<O> {
+    fn member(&self, node_id: NodeId) -> MemberCall {
+        MemberCall {
+            local: self.node.local(),
+            target: RangeTarget {
+                set_id: self.set_id,
+                node_id,
+                range: self.range.clone(),
+                copy: self.copy,
+            },
+            access: self.access.clone(),
         }
-        let call = RangeCall {
-            set_id: binding.set_id,
-            node_id,
-            range,
-            request,
-            cursor: cursor.as_deref(),
-            copy,
+    }
+
+    fn checked_call(
+        &self,
+        node_id: NodeId,
+        (access, group_id): &Checks,
+    ) -> Result<IoCall, PageError> {
+        let (token, hidden) = position_of(&self.request.bucket, self.cursor.as_deref())?;
+        let input = list_input(&self.request, *group_id, token, None);
+        let source = MemberSource {
+            member: self.member(node_id),
+            object: PhantomData,
         };
-        if let Some(page) = relay.list_range(call).await.map_err(PageError::Relay)? {
-            return Ok((page, node_id));
-        }
+        let rule = CheckedKeys {
+            keys: AccessKeys(access.clone()),
+            object: PhantomData,
+        };
+        let page: CheckedPage<O> = VisiblePageOperation::new(source, rule, input, hidden);
+        Ok(IoCall::child(page))
     }
-    Err(PageError::Unanswered {
-        range_id: range.range_id,
-        set_id: binding.set_id,
-    })
+
+    fn ask_next(&mut self) -> RemoteTurn<O> {
+        let Some(node_id) = self.holders.pop_front() else {
+            return Err(PageError::Unanswered {
+                range_id: self.range.range_id,
+                set_id: self.set_id,
+            });
+        };
+        self.asked = Some(node_id);
+        let call = match &self.checks {
+            Some(checks) => self.checked_call(node_id, checks)?,
+            None => {
+                let request = &self.request;
+                let query = RangeQuery {
+                    bucket: request.bucket.clone(),
+                    prefix: request.prefix.clone(),
+                    delimiter: request.delimiter.clone(),
+                    limit: request.limit,
+                    cursor: self.cursor.clone(),
+                };
+                let member = self.member(node_id);
+                IoCall::child(RangeListOperation::new(
+                    member.local,
+                    member.target,
+                    query,
+                    member.access,
+                ))
+            }
+        };
+        Ok(Next::Call(call))
+    }
 }
 
-/// Whether a failed range listing is the holders' fault, so a copy may list instead.
-fn holder_fault<R: RangeRelay>(error: &PageError<R::Error>) -> bool {
-    match error {
-        PageError::Unanswered { .. } => true,
-        PageError::Relay(error) => R::is_fault(error),
-        _ => false,
+impl<O: PageObject> Operation for RemotePartOperation<O> {
+    type Output = RemotePart<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> RemoteTurn<O> {
+        self.ask_next()
     }
+
+    fn next(&mut self, result: IoResult) -> RemoteTurn<O> {
+        let node_id = self.asked.ok_or(IoError::Unfinished)?;
+        if self.checks.is_some() {
+            let page = result.child::<VisiblePage<O>, VisibleError<IoError, PageError>>()?;
+            return match page {
+                Ok(page) => Ok(Next::Done((shown_page(page, |object| object)?, node_id))),
+                Err(VisibleError::List(PageError::Unanswered { .. })) => self.ask_next(),
+                Err(VisibleError::List(error)) => Err(error),
+                Err(VisibleError::Shows(error) | VisibleError::Io(error)) => Err(error.into()),
+                Err(VisibleError::Cursor) => {
+                    Err(PageError::Internal("listing cursor not sealed".into()))
+                }
+            };
+        }
+        match result.child::<Option<RangePage>, RangeListError>()?? {
+            Some(page) => Ok(Next::Done((range_page_of(page), node_id))),
+            None => self.ask_next(),
+        }
+    }
+}
+
+/// The range a merged page is working on.
+#[derive(Debug, PartialEq)]
+struct MergeRange {
+    range: KeyRange,
+    sub: ListRequest,
+    start: Option<(String, Option<String>)>,
+    resumed: Option<(NodeId, bool, String)>,
+    local: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum MergeStep {
+    Access,
+    View,
+    Fence,
+    Local,
+    /// The coordinator; on its fault this member's copy or another lists instead.
+    Primary(Option<String>),
+    Copy(bool),
 }
 
 /// One merged page over every range of a distributed bucket under the prefix.
-async fn merged_page<R: RangeRelay>(
-    scope: &PageScope<'_, R>,
-    (info, caller): (&BucketInfo, Option<Caller<'_>>),
-    binding: &DistributionBinding,
+#[derive(Debug, PartialEq)]
+struct MergedPageOperation<O> {
+    node: PageNode,
+    access: MemberAccess,
+    info: BucketInfo,
+    binding: DistributionBinding,
+    caller: Option<OwnedCaller>,
     request: ListRequest,
-) -> PageResult<R::Object, R::Error> {
-    let (context, relay) = (scope.context, scope.relay);
-    // A relay whose downloads this node authorizes has this node check every remote entry.
-    let access = match caller.filter(|_| relay.checks_here()) {
-        Some((auth, _)) => {
-            let ids = (scope.realm_id, info.group_id, scope.node_id);
-            let access = drive(
-                BucketAccessOperation::new(auth, ids, &request.bucket),
-                context,
-            )
-            .await;
-            Some(access.map_err(PageError::internal)?)
-        }
-        None => None,
-    };
-    let checks = access.as_ref().map(|access| (access, info.group_id));
-    let view = drive(bound_view(binding), context).await?;
-    let snapshot = view.snapshot();
-    let fence = drive(local_fence(binding.set_id), context).await?;
-    let resume = request.cursor.as_deref().map(decode_resume).transpose()?;
-    // A sealed position resumes its range at the member that sealed it.
-    let (after, from, mut resumed, hidden_group) = match &resume {
-        Some(Resume::After { key, group }) => {
-            (Some((key.clone(), group.clone())), None, None, None)
-        }
-        Some(Resume::From(lower)) => (None, Some(lower.clone()), None, None),
-        Some(Resume::Hidden {
-            lower,
+    checks: Option<Checks>,
+    view: Option<DistributionView>,
+    fence: Option<LocalFence>,
+    ranges: VecDeque<KeyRange>,
+    after: Option<(String, Option<String>)>,
+    resumed: Option<(NodeId, bool, String)>,
+    page: ObjectPage<O>,
+    last_group: Option<String>,
+    last_key: Option<String>,
+    first: bool,
+    bytes: usize,
+    visited: usize,
+    skipped: bool,
+    current: Option<MergeRange>,
+    step: MergeStep,
+}
+
+impl<O: PageObject> MergedPageOperation<O> {
+    fn new(
+        node: PageNode,
+        access: MemberAccess,
+        (info, binding): (BucketInfo, DistributionBinding),
+        caller: Option<OwnedCaller>,
+        request: ListRequest,
+    ) -> Self {
+        Self {
             node,
-            copy,
-            cursor,
-            group,
-        }) => (
-            None,
-            Some(lower.clone()),
-            Some((*node, *copy, cursor.clone())),
-            group.clone(),
-        ),
-        None => (None, None, None, None),
-    };
-    let prefix = request.prefix.clone().unwrap_or_default();
-    let mut page = ObjectPage::default();
-    let mut last_group = (after.as_ref().and_then(|(_, group)| group.clone())).or(hidden_group);
-    let mut last_key = after.as_ref().map(|(key, _)| key.clone());
-    let ranges = snapshot.listed_ranges(&prefix).into_iter().filter(|range| {
-        let past = after.as_ref().is_none_or(|(key, group)| {
-            let entry = group.as_deref().unwrap_or(key);
-            range.upper.as_deref().is_none_or(|upper| entry < upper)
-        });
-        past && from
-            .as_deref()
-            .is_none_or(|from| range.lower.as_str() >= from)
-    });
-    let mut first = true;
-    let mut bytes = 0usize;
-    // After a skipped range the next page starts at the next range, never before the skip.
-    let mut skipped = false;
-    for (visited, range) in ranges.enumerate() {
-        let listed = page.objects.len() + page.prefixes.len();
-        let remaining = request.limit.saturating_sub(listed);
-        if remaining == 0 || visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES {
+            access,
+            info,
+            binding,
+            caller,
+            request,
+            checks: None,
+            view: None,
+            fence: None,
+            ranges: VecDeque::new(),
+            after: None,
+            resumed: None,
+            page: ObjectPage::default(),
+            last_group: None,
+            last_key: None,
+            first: true,
+            bytes: 0,
+            visited: 0,
+            skipped: false,
+            current: None,
+            step: MergeStep::View,
+        }
+    }
+
+    fn read_view(&mut self) -> PageTurn<O> {
+        self.step = MergeStep::View;
+        Ok(Next::Call(IoCall::child(bound_view(&self.binding))))
+    }
+
+    fn view(&self) -> Result<&DistributionView, IoError> {
+        self.view.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    /// A sealed position resumes its range at the member that sealed it.
+    fn plan(&mut self) -> PageTurn<O> {
+        let resume = (self.request.cursor.as_deref())
+            .map(decode_resume)
+            .transpose()?;
+        let (after, from, resumed, hidden_group) = match resume {
+            Some(Resume::After { key, group }) => (Some((key, group)), None, None, None),
+            Some(Resume::From(lower)) => (None, Some(lower), None, None),
+            Some(Resume::Hidden {
+                lower,
+                node,
+                copy,
+                cursor,
+                group,
+            }) => (None, Some(lower), Some((node, copy, cursor)), group),
+            None => (None, None, None, None),
+        };
+        let prefix = self.request.prefix.clone().unwrap_or_default();
+        let ranges = (self.view()?.snapshot().listed_ranges(&prefix).into_iter())
+            .filter(|range| {
+                let past = after.as_ref().is_none_or(|(key, group)| {
+                    let entry = group.as_deref().unwrap_or(key);
+                    range.upper.as_deref().is_none_or(|upper| entry < upper)
+                });
+                past && from
+                    .as_deref()
+                    .is_none_or(|from| range.lower.as_str() >= from)
+            })
+            .cloned()
+            .collect();
+        self.ranges = ranges;
+        self.last_group = (after.as_ref().and_then(|(_, group)| group.clone())).or(hidden_group);
+        self.last_key = after.as_ref().map(|(key, _)| key.clone());
+        self.after = after;
+        self.resumed = resumed;
+        self.next_range()
+    }
+
+    fn finish(&mut self) -> PageTurn<O> {
+        Ok(Next::Done(std::mem::take(&mut self.page)))
+    }
+
+    fn next_range(&mut self) -> PageTurn<O> {
+        let Some(range) = self.ranges.pop_front() else {
+            return self.finish();
+        };
+        let visited = self.visited;
+        self.visited += 1;
+        let listed = self.page.objects.len() + self.page.prefixes.len();
+        let remaining = self.request.limit.saturating_sub(listed);
+        if remaining == 0 || visited == MAX_PAGE_RANGES || self.bytes >= MAX_PAGE_BYTES {
             // A page that listed nothing continues at this range, never at its own start.
-            let next = match last_key.as_ref().filter(|_| listed > 0 && !skipped) {
+            let next = match self
+                .last_key
+                .as_ref()
+                .filter(|_| listed > 0 && !self.skipped)
+            {
                 Some(key) => Resume::After {
                     key: key.clone(),
-                    group: last_group.clone().filter(|group| group >= key),
+                    group: self.last_group.clone().filter(|group| group >= key),
                 },
                 None => Resume::From(range.lower.clone()),
             };
-            page.next_cursor = Some(encode_resume(&next)?);
-            return Ok(page);
+            self.page.next_cursor = Some(encode_resume(&next)?);
+            return self.finish();
         }
-        let start = match (first, &after) {
-            (true, Some((key, group))) => Some((key.clone(), group.clone())),
-            _ => None,
-        };
-        first = false;
+        let start = if self.first { self.after.clone() } else { None };
+        self.first = false;
         let sub = ListRequest {
             limit: remaining,
             cursor: None,
-            ..request.clone()
+            ..self.request.clone()
         };
-        let resumed = resumed.take();
+        let resumed = self.resumed.take();
         // A copy may be behind its coordinator, so a range resumed at one is marked stale.
         if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
-            page.stale_ranges.push(range.range_id.to_string());
+            self.page.stale_ranges.push(range.range_id.to_string());
         }
+        let snapshot = self.view()?.snapshot();
+        let fence = self.fence.as_ref().ok_or(IoError::Unfinished)?;
         let local = match &resumed {
-            Some((node, ..)) => *node == scope.node_id,
-            None => snapshot.lists_locally(binding.member_id, range, &fence),
+            Some((node, ..)) => *node == self.node.node_id,
+            None => snapshot.lists_locally(self.binding.member_id, &range, fence),
         };
-        let remote = match (local, &resumed) {
-            (true, _) => None,
+        let holders = self.others(snapshot.list_holder(&range).into_iter().collect());
+        let resume_at = resumed.clone();
+        // The full position, so a common prefix is skipped as a whole.
+        let cursor = (start.clone())
+            .map(|(key, group)| encode_resume(&Resume::After { key, group }))
+            .transpose()?;
+        self.current = Some(MergeRange {
+            range,
+            sub,
+            start,
+            resumed,
+            local,
+        });
+        match (local, resume_at) {
+            (true, _) => self.list_here(),
             (false, Some((node, copy, cursor))) => {
-                let asked = (&sub, Some(cursor.clone()));
-                let holder = (binding, vec![*node], checks);
-                let part = remote_part(relay, holder, (range, *copy), asked).await;
-                Some(part.map(|part| (part, *copy)))
+                self.list_remote(vec![node], copy, Some(cursor), MergeStep::Copy(copy))
             }
             (false, None) => {
-                // The full position, so a common prefix is skipped as a whole.
-                let cursor = (start.clone())
-                    .map(|(key, group)| encode_resume(&Resume::After { key, group }))
-                    .transpose()?;
-                let others = |members: Vec<&DistributionMember>| {
-                    (members.into_iter())
-                        .filter(|member| member.member_id != binding.member_id)
-                        .map(|member| member.node_id)
-                        .collect()
-                };
-                let holders = others(snapshot.list_holder(range).into_iter().collect());
-                let asked = (&sub, cursor.clone());
-                match remote_part(relay, (binding, holders, checks), (range, false), asked).await {
-                    Ok(part) => Some(Ok((part, false))),
-                    // The coordinator cannot answer, so this member's copy or another lists.
-                    Err(error) if holder_fault::<R>(&error) => {
-                        page.stale_ranges.push(range.range_id.to_string());
-                        let here = (snapshot.record_holders(range).iter())
-                            .any(|member| member.member_id == binding.member_id);
-                        match here {
-                            true => None,
-                            false => {
-                                let copies = others(snapshot.copy_holders(range));
-                                let asked = (&sub, cursor);
-                                let part = remote_part(
-                                    relay,
-                                    (binding, copies, checks),
-                                    (range, true),
-                                    asked,
-                                );
-                                Some(part.await.map(|part| (part, true)))
-                            }
-                        }
-                    }
-                    Err(error) => Some(Err(error)),
-                }
+                let step = MergeStep::Primary(cursor.clone());
+                self.list_remote(holders, false, cursor, step)
             }
+        }
+    }
+
+    fn others(&self, members: Vec<&DistributionMember>) -> Vec<NodeId> {
+        (members.into_iter())
+            .filter(|member| member.member_id != self.binding.member_id)
+            .map(|member| member.node_id)
+            .collect()
+    }
+
+    fn current(&self) -> Result<&MergeRange, IoError> {
+        self.current.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn list_remote(
+        &mut self,
+        holders: Vec<NodeId>,
+        copy: bool,
+        cursor: Option<String>,
+        step: MergeStep,
+    ) -> PageTurn<O> {
+        let current = self.current()?;
+        let part = RemotePartOperation::<O> {
+            node: self.node,
+            access: self.access.clone(),
+            set_id: self.binding.set_id,
+            range: current.range.clone(),
+            copy,
+            holders: holders.into(),
+            checks: self.checks.clone(),
+            request: current.sub.clone(),
+            cursor,
+            asked: None,
+            object: PhantomData,
         };
-        // A partial listing keeps what it collected and goes on past a range no holder served.
-        let remote = match remote {
-            Some(Err(PageError::Unanswered { .. } | PageError::Relay(_))) if request.partial => {
-                let range_id = range.range_id.to_string();
-                page.stale_ranges.retain(|stale| *stale != range_id);
-                page.unavailable_ranges.push(range_id);
-                skipped = true;
-                continue;
-            }
-            Some(part) => Some(part?),
-            None => None,
-        };
-        let (part, lister, copy) = match remote {
-            Some(((part, lister), copy)) => (part, lister, copy),
-            None => {
-                let token = (start.as_ref())
-                    .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))
-                    .transpose()?;
-                let hidden = (resumed.as_ref())
-                    .map(|(_, _, cursor)| open_cursor(cursor).ok_or(PageError::Cursor))
-                    .transpose()?;
-                let bounds = Some((range.lower.clone(), range.upper.clone()));
-                let position = (token, None, hidden);
-                let part = local_part(scope, (info, caller), &sub, position, bounds).await?;
-                // Listing here instead of the coordinator lists this member's copy.
-                let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
-                (part, scope.node_id, copy)
-            }
-        };
-        skipped = false;
+        self.step = step;
+        Ok(Next::Call(IoCall::child(part)))
+    }
+
+    fn list_here(&mut self) -> PageTurn<O> {
+        let current = self.current()?;
+        let bucket = &self.request.bucket;
+        let token = (current.start.as_ref())
+            .map(|(key, group)| resume_token(bucket, key, group.as_deref()))
+            .transpose()?;
+        let hidden = (current.resumed.as_ref())
+            .map(|(_, _, cursor)| open_cursor(cursor).ok_or(PageError::Cursor))
+            .transpose()?;
+        let range = &current.range;
+        let bounds = Some((range.lower.clone(), range.upper.clone()));
+        let input = list_input(&current.sub, self.info.group_id, token, None);
+        let who = (self.info.group_id, self.caller.clone());
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        self.step = MergeStep::Local;
+        Ok(Next::Call(IoCall::child(part)))
+    }
+
+    /// A partial listing keeps what it collected and goes on past a range no holder served.
+    fn range_failed(&mut self, error: PageError) -> PageTurn<O> {
+        if !self.request.partial
+            || !matches!(error, PageError::Unanswered { .. } | PageError::Relay(_))
+        {
+            return Err(error);
+        }
+        let range_id = self.current()?.range.range_id.to_string();
+        self.page.stale_ranges.retain(|stale| *stale != range_id);
+        self.page.unavailable_ranges.push(range_id);
+        self.skipped = true;
+        self.next_range()
+    }
+
+    fn coordinator_failed(&mut self, error: PageError, cursor: Option<String>) -> PageTurn<O> {
+        if !error.holder_fault() {
+            return self.range_failed(error);
+        }
+        let range = self.current()?.range.clone();
+        self.page.stale_ranges.push(range.range_id.to_string());
+        let snapshot = self.view()?.snapshot();
+        let here = (snapshot.record_holders(&range).iter())
+            .any(|member| member.member_id == self.binding.member_id);
+        if here {
+            return self.list_here();
+        }
+        let copies = self.others(snapshot.copy_holders(&range));
+        self.list_remote(copies, true, cursor, MergeStep::Copy(true))
+    }
+
+    fn apply(&mut self, part: ObjectPage<O>, lister: NodeId, copy: bool) -> PageTurn<O> {
+        self.skipped = false;
+        let current = self.current.take().ok_or(IoError::Unfinished)?;
         // A range that stopped among hidden entries goes on from its member's cursor.
         if let Some(cursor) = part.next_cursor.clone().filter(|cursor| is_sealed(cursor)) {
             let next = Resume::Hidden {
-                lower: range.lower.clone(),
+                lower: current.range.lower,
                 node: lister,
                 copy,
                 cursor,
-                group: last_group.clone(),
+                group: self.last_group.clone(),
             };
-            page.next_cursor = Some(encode_resume(&next)?);
-            return Ok(page);
+            self.page.next_cursor = Some(encode_resume(&next)?);
+            return self.finish();
         }
         let keys = (part.objects.iter().map(PageObject::key))
             .chain(part.prefixes.iter().map(String::as_str));
-        bytes += keys.map(str::len).sum::<usize>();
+        self.bytes += keys.map(str::len).sum::<usize>();
         for group in part.prefixes {
-            if last_group.as_deref() == Some(group.as_str()) {
+            if self.last_group.as_deref() == Some(group.as_str()) {
                 continue;
             }
-            if last_key.as_deref().is_none_or(|key| group.as_str() > key) {
-                last_key = Some(group.clone());
+            if self
+                .last_key
+                .as_deref()
+                .is_none_or(|key| group.as_str() > key)
+            {
+                self.last_key = Some(group.clone());
             }
-            last_group = Some(group.clone());
-            page.prefixes.push(group);
+            self.last_group = Some(group.clone());
+            self.page.prefixes.push(group);
         }
         if let Some(object) = part.objects.last()
-            && last_key.as_deref().is_none_or(|key| object.key() > key)
+            && self
+                .last_key
+                .as_deref()
+                .is_none_or(|key| object.key() > key)
         {
-            last_key = Some(object.key().to_string());
+            self.last_key = Some(object.key().to_string());
         }
-        page.objects.extend(part.objects);
+        self.page.objects.extend(part.objects);
         // The range's own position, which also moves on when nothing in it was shown.
         if part.next_cursor.is_some() {
-            page.next_cursor = part.next_cursor;
-            break;
+            self.page.next_cursor = part.next_cursor;
+            return self.finish();
+        }
+        self.next_range()
+    }
+}
+
+impl<O: PageObject> Operation for MergedPageOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    /// A listing whose downloads this node authorizes has this node check every remote entry.
+    fn first(&mut self) -> PageTurn<O> {
+        let checked = matches!(self.access, MemberAccess::Delegated(_));
+        let Some((auth, _)) = self.caller.as_ref().filter(|_| checked) else {
+            return self.read_view();
+        };
+        let ids = (self.node.realm_id, self.info.group_id, self.node.node_id);
+        let access = BucketAccessOperation::new(auth, ids, &self.request.bucket);
+        self.step = MergeStep::Access;
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        match std::mem::replace(&mut self.step, MergeStep::Local) {
+            MergeStep::Access => {
+                let access = result.child::<BucketAccess, AuthorizeError>()?;
+                let access = access.map_err(PageError::internal)?;
+                self.checks = Some((Arc::new(access), self.info.group_id));
+                self.read_view()
+            }
+            MergeStep::View => {
+                self.view = Some(result.child::<DistributionView, GuardError>()??);
+                self.step = MergeStep::Fence;
+                Ok(Next::Call(IoCall::child(local_fence(self.binding.set_id))))
+            }
+            MergeStep::Fence => {
+                self.fence = Some(result.child::<LocalFence, GuardError>()??);
+                self.plan()
+            }
+            MergeStep::Local => {
+                let part = result.child::<ObjectPage<O>, PageError>()??;
+                // Listing here instead of the coordinator lists this member's copy.
+                let current = self.current()?;
+                let copy = (current.resumed.as_ref()).map_or(!current.local, |(_, copy, _)| *copy);
+                self.apply(part, self.node.node_id, copy)
+            }
+            MergeStep::Primary(cursor) => match result.child::<RemotePart<O>, PageError>()? {
+                Ok((part, lister)) => self.apply(part, lister, false),
+                Err(error) => self.coordinator_failed(error, cursor),
+            },
+            MergeStep::Copy(copy) => match result.child::<RemotePart<O>, PageError>()? {
+                Ok((part, lister)) => self.apply(part, lister, copy),
+                Err(error) => self.range_failed(error),
+            },
         }
     }
-    Ok(page)
+}
+
+/// What an [`ObjectPageOperation`] lists.
+#[derive(Debug, PartialEq)]
+enum PageKind {
+    /// Local for an ordinary bucket, merged across the key ranges of a distributed one.
+    Whole,
+    /// One range another member relays here.
+    Range {
+        start_after: Option<String>,
+        bounds: (String, Option<String>),
+    },
+}
+
+/// One page of a bucket's objects on this node. With a caller, only what that caller may read
+/// shows.
+#[derive(Debug, PartialEq)]
+pub struct ObjectPageOperation<O> {
+    node: PageNode,
+    access: MemberAccess,
+    info: BucketInfo,
+    caller: Option<OwnedCaller>,
+    request: ListRequest,
+    kind: PageKind,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> ObjectPageOperation<O> {
+    pub fn new(
+        node: PageNode,
+        access: MemberAccess,
+        info: &BucketInfo,
+        caller: Option<Caller<'_>>,
+        request: ListRequest,
+    ) -> Self {
+        Self {
+            node,
+            access,
+            info: info.clone(),
+            caller: caller.map(|(auth, expiry)| (auth.clone(), expiry)),
+            request,
+            kind: PageKind::Whole,
+            object: PhantomData,
+        }
+    }
+
+    /// One page of the range `bounds` names, for a listing another member relays here.
+    pub fn for_range(
+        mut self,
+        start_after: Option<String>,
+        bounds: (String, Option<String>),
+    ) -> Self {
+        self.kind = PageKind::Range {
+            start_after,
+            bounds,
+        };
+        self
+    }
+
+    fn local(
+        &mut self,
+        start_after: Option<String>,
+        bounds: Option<(String, Option<String>)>,
+    ) -> Result<IoCall, PageError> {
+        let (token, hidden) = local_token(&self.request)?;
+        let group_id = self.info.group_id;
+        let input = list_input(&self.request, group_id, token, start_after);
+        let who = (group_id, self.caller.take());
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        Ok(IoCall::child(part))
+    }
+}
+
+impl<O: PageObject> Operation for ObjectPageOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> PageTurn<O> {
+        let kind = std::mem::replace(&mut self.kind, PageKind::Whole);
+        let call = match (kind, self.info.distribution.clone()) {
+            (
+                PageKind::Range {
+                    start_after,
+                    bounds,
+                },
+                _,
+            ) => self.local(start_after, Some(bounds))?,
+            (PageKind::Whole, None) => self.local(None, None)?,
+            (PageKind::Whole, Some(binding)) => {
+                let merged = MergedPageOperation::<O>::new(
+                    self.node,
+                    self.access.clone(),
+                    (self.info.clone(), binding),
+                    self.caller.take(),
+                    self.request.clone(),
+                );
+                IoCall::child(merged)
+            }
+        };
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        Ok(Next::Done(result.child::<ObjectPage<O>, PageError>()??))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Error = PageError<()>;
 
     #[test]
     fn resume_round_trips() {
@@ -790,14 +1208,14 @@ mod tests {
             key: "a/b".to_string(),
             group: Some("a/".to_string()),
         };
-        let encoded = encode_resume::<()>(&after).unwrap();
-        assert_eq!(decode_resume::<()>(&encoded).unwrap(), after);
+        let encoded = encode_resume(&after).unwrap();
+        assert_eq!(decode_resume(&encoded).unwrap(), after);
         let from = Resume::From("m".to_string());
-        let encoded = encode_resume::<()>(&from).unwrap();
-        assert_eq!(decode_resume::<()>(&encoded).unwrap(), from);
+        let encoded = encode_resume(&from).unwrap();
+        assert_eq!(decode_resume(&encoded).unwrap(), from);
         assert!(matches!(
-            decode_resume::<()>("not a cursor"),
-            Err(Error::Cursor)
+            decode_resume("not a cursor"),
+            Err(PageError::Cursor)
         ));
     }
 
@@ -809,7 +1227,7 @@ mod tests {
             prefix: None,
             delimiter: Some("/".to_string()),
             cursor: Some(
-                encode_resume::<()>(&Resume::After {
+                encode_resume(&Resume::After {
                     key: "d/".to_string(),
                     group: Some("d/".to_string()),
                 })
@@ -818,18 +1236,111 @@ mod tests {
             limit: 5,
             partial: false,
         };
-        let token = local_token::<()>(&request).unwrap().0.unwrap();
+        let token = local_token(&request).unwrap().0.unwrap();
         assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
         let from = ListRequest {
-            cursor: Some(encode_resume::<()>(&Resume::From("m".to_string())).unwrap()),
+            cursor: Some(encode_resume(&Resume::From("m".to_string())).unwrap()),
             ..request
         };
-        assert!(local_token::<()>(&from).is_err());
+        assert!(local_token(&from).is_err());
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Key(String);
+
+    impl From<&ListedObject> for Key {
+        fn from(object: &ListedObject) -> Self {
+            Self(object.head.key.clone())
+        }
+    }
+
+    impl From<RangeEntry> for Key {
+        fn from(entry: RangeEntry) -> Self {
+            Self(entry.key)
+        }
+    }
+
+    impl PageObject for Key {
+        fn key(&self) -> &str {
+            &self.0
+        }
+    }
+
+    fn step_info() -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    fn step_node() -> PageNode {
+        PageNode {
+            realm_id: RealmId::from_bytes([1; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            ids: None,
+        }
+    }
+
+    fn step_request(cursor: Option<&str>) -> ListRequest {
+        ListRequest {
+            bucket: "b".to_string(),
+            prefix: None,
+            delimiter: None,
+            cursor: cursor.map(str::to_string),
+            limit: 5,
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn foreign_cursor_refused() {
+        let access = MemberAccess::Bearer(None);
+        let request = step_request(Some("not a cursor"));
+        let mut page =
+            ObjectPageOperation::<Key>::new(step_node(), access, &step_info(), None, request);
+        assert_eq!(page.first(), Err(PageError::Cursor));
+    }
+
+    #[test]
+    fn plain_listing_children() {
+        let access = MemberAccess::Bearer(None);
+        let request = step_request(None);
+        let mut page =
+            ObjectPageOperation::<Key>::new(step_node(), access, &step_info(), None, request);
+        assert!(matches!(page.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let done: PageResult<Key> = Ok(ObjectPage::default());
+        let outcome = aruna_core::calls::ChildOutcome::new(done);
+        assert_eq!(
+            page.next(IoResult::Child(outcome)),
+            Ok(Next::Done(ObjectPage::default()))
+        );
+    }
+
+    #[test]
+    fn holder_faults_told() {
+        let refusal = |status| {
+            PageError::Relay(RangeRefusal {
+                node_id: step_node().node_id,
+                status,
+                code: None,
+                message: String::new(),
+            })
+        };
+        assert!(refusal(503).holder_fault());
+        assert!(!refusal(403).holder_fault());
+        assert!(!PageError::Cursor.holder_fault());
     }
 
     #[test]
     fn resumes_past_group() {
-        let token = resume_token::<()>("bucket", "d/x", Some("d/")).unwrap();
+        let token = resume_token("bucket", "d/x", Some("d/")).unwrap();
         assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
         let head = BlobHeadKey::from_bytes(&token.last_key).unwrap();
         assert_eq!(head.key, "d/");

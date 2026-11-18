@@ -27,7 +27,7 @@ use super::ArunaS3Service;
 use super::object::object_range_request;
 use crate::s3::error::IntoS3Error;
 
-fn link_error(error: LinkError) -> s3s::S3Error {
+pub(super) fn link_error(error: LinkError) -> s3s::S3Error {
     match error {
         LinkError::Denied => s3_error!(AccessDenied, "The link target may not be read"),
         LinkError::NotFound => s3_error!(NoSuchKey, "The link target does not exist."),
@@ -49,8 +49,7 @@ impl ArunaS3Service {
             session: None,
         };
         if let Some(job_id) = credential_job_id(&access.access_key)
-            && let Ok(Some(record)) =
-                crate::job_service::read_job_record(&self.state, job_id).await
+            && let Ok(Some(record)) = crate::job_service::read_job_record(&self.state, job_id).await
             && record.created_by == access.user_identity
             && record.workspace_bucket.as_deref() == Some(bucket)
         {
@@ -60,7 +59,7 @@ impl ArunaS3Service {
     }
 
     /// This node as a link read needs it.
-    fn link_node(&self) -> LinkNode {
+    pub(super) fn link_node(&self) -> LinkNode {
         LinkNode {
             local: self.node_id,
             ids: self.state.node_and_realm(),
@@ -215,30 +214,20 @@ impl ArunaS3Service {
 }
 
 impl ArunaS3Service {
-    /// Whether a listed entry may show: every entry but a link whose target the reader may not
-    /// read. A request without a credential reads as the Everyone principal.
-    pub(super) async fn link_listable(
+    /// Whom a listing follows links for. A request without a credential reads as the Everyone
+    /// principal, and as no credential expires, only the delegation's lifetime bounds a HEAD.
+    pub(super) async fn listing_caller(
         &self,
         reader: Option<&UserAccess>,
         bucket: &str,
-        object: &aruna_operations::s3::object::list::ListedObject,
-    ) -> S3Result<bool> {
-        let Some(binding) = object.link.as_ref() else {
-            return Ok(true);
-        };
-        let Some(target) = LinkTarget::of(binding, self.realm_id) else {
-            return Ok(false);
-        };
-        let caller = match reader {
+    ) -> LinkCaller {
+        match reader {
             Some(access) => self.link_caller(access, bucket).await,
-            // No credential expires, so only the delegation's own lifetime bounds a remote HEAD.
             None => LinkCaller {
                 auth: AuthContext::anonymous(self.realm_id),
                 credential: (String::new(), ulid::Ulid::nil(), u64::MAX),
             },
-        };
-        let visible = TargetVisibleOperation::new(&caller, &target, self.link_node());
-        drive(visible, &self.state).await.map_err(link_error)
+        }
     }
 }
 

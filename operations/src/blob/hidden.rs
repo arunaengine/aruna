@@ -18,7 +18,7 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::{
     JobId, JobRecord, JobResultPayload, RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
 };
-use aruna_core::structs::storage::blob::{BackendLocation, HiddenBlobEntry, HiddenBlobKey};
+use aruna_core::structs::storage::blob::{HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{
     ATTACHMENT_NAMESPACE, Attachment, CACHE_NAMESPACE, CacheEntry, attachment_key,
 };
@@ -889,6 +889,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
+    use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::execution::job::{

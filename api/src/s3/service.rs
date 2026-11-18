@@ -795,7 +795,7 @@ impl S3 for ArunaS3Service {
                         input,
                         (owner, Some(&user_access)),
                         url_encoded,
-                        (scope.as_ref(), access.as_ref()),
+                        (scope.as_ref(), access),
                         (bounds, hidden),
                     )
                     .await?;

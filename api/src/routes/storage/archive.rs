@@ -14,10 +14,9 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::s3::object::archive::{
-    EntryStatus, MemberCall, MemberRead, MemberReader, SelectionEntry, validate_selection,
-    write_selection,
+    ArchiveScope, EntryStatus, MemberCall, MemberRead, MemberReader, SelectionEntry,
+    validate_selection, write_selection,
 };
-use aruna_operations::s3::object::pages::PageScope;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
@@ -39,7 +38,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
 use crate::routes::shares::rfc3339;
-use crate::routes::storage::objects::BearerRelay;
+use crate::routes::storage::objects::{bearer_access, page_node};
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
@@ -140,16 +139,16 @@ fn archive_response(
 ) -> Response {
     let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
-        let relay = BearerRelay {
+        let reader = BearerReader {
             state: &state,
             bearer: bearer.as_ref(),
         };
         let context = state.get_ctx();
-        let scope = PageScope {
+        let scope = ArchiveScope {
             context: context.as_ref(),
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-            relay: &relay,
+            node: page_node(&state),
+            access: bearer_access(bearer.as_ref()),
+            reader: &reader,
         };
         let expiry = bearer.as_ref().map_or(0, ValidatedBearer::expires_at_secs);
         write_selection(&scope, (&auth, expiry), entries, writer).await
@@ -356,8 +355,14 @@ pub async fn download_link(
     Ok(archive_response(state, caller, link.entries, permit))
 }
 
+/// Reads the keys other members serve for the holder of a verified bearer token.
+struct BearerReader<'a> {
+    state: &'a ServerState,
+    bearer: Option<&'a ValidatedBearer>,
+}
+
 // Distributed keys are read through the S3 forwarding, with the delegation the S3 GET route sends.
-impl MemberReader for BearerRelay<'_> {
+impl MemberReader for BearerReader<'_> {
     async fn member_read(&self, call: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
         let state = self.state;
         let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());

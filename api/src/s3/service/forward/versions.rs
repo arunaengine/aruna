@@ -18,9 +18,10 @@ use s3s::dto::{
 use s3s::{S3Result, s3_error};
 use ulid::Ulid;
 
-use super::list::{MAX_PAGE_BYTES, MAX_PAGE_RANGES, e_tag, elements, range_query, timestamp};
+use super::list::{MAX_PAGE_BYTES, MAX_PAGE_RANGES, e_tag, range_query, timestamp};
 use super::xml_field;
 use crate::s3::service::ArunaS3Service;
+use aruna_core::outbound::xml_elements;
 
 /// The entries one range answered for a version listing, raw positions included.
 #[derive(Default)]
@@ -134,7 +135,7 @@ impl ArunaS3Service {
             .await?;
         let url_encoded = url_of(input);
         let mut part = VersionsPart::default();
-        for entry in elements(&body, "Version") {
+        for entry in xml_elements(&body, "Version") {
             let Some(key) = xml_field(entry, "Key") else {
                 continue;
             };
@@ -155,7 +156,7 @@ impl ArunaS3Service {
                 },
             ));
         }
-        for entry in elements(&body, "DeleteMarker") {
+        for entry in xml_elements(&body, "DeleteMarker") {
             let Some(key) = xml_field(entry, "Key") else {
                 continue;
             };
@@ -170,7 +171,7 @@ impl ArunaS3Service {
                 },
             ));
         }
-        part.prefixes = (elements(&body, "CommonPrefixes").into_iter())
+        part.prefixes = (xml_elements(&body, "CommonPrefixes").into_iter())
             .filter_map(|entry| xml_field(entry, "Prefix"))
             .collect();
         if xml_field(&body, "IsTruncated").as_deref() == Some("true") {

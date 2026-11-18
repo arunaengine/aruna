@@ -47,22 +47,23 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::relay::{
-    ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
+    UploadStream, counted_blob, listing_refusal, member_error, share_access, share_listing,
+    upload_error,
 };
 use super::{ShareModeBody, log_event, rfc3339};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
-use crate::lookup::bucket_info;
+use crate::lookup::{ObjectOutput, bucket_info};
 use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
-use crate::routes::storage::objects::page_error;
+use crate::routes::storage::objects::{page_error, page_node};
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
+use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries per listing page when the visitor names no limit.
@@ -497,20 +498,17 @@ pub(crate) async fn list_below(
         limit,
         partial: false,
     };
-    let relay = ShareRelay {
-        state,
-        user: share_access(state, link, (auth, info), visit_end),
-    };
-    let context = state.get_ctx();
-    let scope = PageScope {
-        context: context.as_ref(),
-        realm_id: state.get_realm_id(),
-        node_id: state.get_node_id(),
-        relay: &relay,
-    };
-    let page = pages::object_page(&scope, info, Some((auth, visit_end)), request).await;
+    let list = ObjectPageOperation::<ObjectOutput>::new(
+        page_node(state),
+        share_listing(state, link, (auth, info), visit_end),
+        info,
+        Some((auth, visit_end)),
+        request,
+    );
+    let page = drive(list, &state.get_ctx()).await;
     let page = page.map_err(|error| match error {
         PageError::Unanswered { .. } => range_unavailable("cannot be listed"),
+        PageError::Relay(refusal) => listing_refusal(refusal),
         error => page_error(error),
     })?;
     let relative = |key: &str| key.strip_prefix(root).map(str::to_string);

@@ -5,8 +5,6 @@
 
 use super::*;
 use crate::driver::DriverContext;
-use crate::s3::object::list::ListedObject;
-use crate::s3::object::pages::{ObjectPage, RangeCall};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::tests::access::seed_access;
 use crate::tests::staging::{create_test_bucket, setup_driver_context};
@@ -21,33 +19,6 @@ const BUCKET: &str = "selection";
 
 /// Ordinary buckets only: no other member is ever asked.
 struct NoRelay;
-
-struct Listed(String);
-
-impl From<&ListedObject> for Listed {
-    fn from(object: &ListedObject) -> Self {
-        Self(object.head.key.clone())
-    }
-}
-
-impl PageObject for Listed {
-    fn key(&self) -> &str {
-        &self.0
-    }
-}
-
-impl RangeRelay for NoRelay {
-    type Object = Listed;
-    type Error = ();
-
-    async fn list_range(&self, _: RangeCall<'_>) -> Result<Option<ObjectPage<Listed>>, ()> {
-        Ok(None)
-    }
-
-    fn is_fault(_: &()) -> bool {
-        true
-    }
-}
 
 impl MemberReader for NoRelay {
     async fn member_read(&self, _: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
@@ -135,11 +106,15 @@ impl Fixture {
         entries: Vec<SelectionEntry>,
         writer: W,
     ) -> Result<Report, SelectionError> {
-        let scope = PageScope {
+        let scope = ArchiveScope {
             context: self.context(),
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            relay: &NoRelay,
+            node: PageNode {
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                ids: self.context().node_and_realm(),
+            },
+            access: MemberAccess::Bearer(None),
+            reader: &NoRelay,
         };
         write_selection(&scope, (&self.auth, u64::MAX), entries, writer).await
     }
