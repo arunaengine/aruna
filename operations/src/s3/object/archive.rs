@@ -3,22 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::archive::zip_entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 
+use aruna_core::archive_path::safe_zip_path;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
+use aruna_core::jobs::{ByteStream, JobEffect, JobEvent, ZipFailure, ZipWork};
+use aruna_core::operation::Operation;
 use aruna_core::outbound::RangeEntry;
-use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::group_backend::valid_bucket;
-use async_zip::base::write::ZipFileWriter;
-use bytes::Bytes;
-use futures_util::StreamExt;
-use futures_util::io::{AsyncWrite, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -26,18 +26,21 @@ use ulid::Ulid;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::distribution::guard::GuardError;
 use crate::distribution::routing::route_read;
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectError, GetObjectInput};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use crate::s3::object::list::ListedObject;
+use crate::s3::object::member_read::{MemberCaller, MemberKey, MemberRead, MemberReadOperation};
 use crate::s3::object::pages::{
-    Caller, ListRequest, ObjectPageOperation, PageNode, PageObject, listing_path,
+    Caller, ListRequest, ObjectPage, ObjectPageOperation, PageError, PageNode, PageObject,
+    listing_path,
 };
 use crate::s3::object::range_list::MemberAccess;
 use crate::s3::object::read::GetRoutedOperation;
-use aruna_core::archive_path::safe_zip_path;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
 pub const REPORT_PATH: &str = "_report.json";
@@ -82,6 +85,13 @@ pub enum EntryStatus {
     /// Written from this node's copy of a range while its coordinator could not answer, so it
     /// may be behind.
     Stale,
+}
+
+/// A failed read counts as an entry that cannot be served now.
+impl From<IoError> for EntryStatus {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
 }
 
 /// One entry that is not in the archive at its own path: a file, a folder, or a key range of a
@@ -142,47 +152,6 @@ impl Report {
     }
 }
 
-type Blob = BackendStream<Result<Bytes, StreamError>>;
-
-/// Where a member of a distributed bucket reads a key for the caller.
-pub enum MemberRead {
-    /// This node reads its own records; `Some` names a range its copy serves while the
-    /// coordinator cannot, so the version may be behind.
-    Local(Option<Ulid>),
-    /// The member that serves the key answered with this version and its bytes.
-    Remote {
-        version: Ulid,
-        blob: Blob,
-        stale: Option<Ulid>,
-    },
-}
-
-/// One key of a distributed bucket the archive reads for its caller.
-pub struct MemberCall<'a> {
-    pub auth: &'a AuthContext,
-    pub bucket: &'a str,
-    pub info: &'a BucketInfo,
-    pub key: &'a str,
-    pub version: Option<Ulid>,
-}
-
-/// Reads a distributed bucket's key where an S3 GET of the caller would be answered: a current
-/// version at the range's coordinator, a pinned one at any holder of its records.
-pub trait MemberReader: Sync {
-    fn member_read(
-        &self,
-        call: MemberCall<'_>,
-    ) -> impl Future<Output = Result<MemberRead, EntryStatus>> + Send;
-}
-
-/// What an archive needs of this node, and how it reaches the other members of a bucket.
-pub struct ArchiveScope<'a, R> {
-    pub context: &'a DriverContext,
-    pub node: PageNode,
-    pub access: MemberAccess,
-    pub reader: &'a R,
-}
-
 /// A key a folder listing named.
 #[derive(Debug, PartialEq)]
 struct FolderKey(String);
@@ -207,13 +176,14 @@ impl PageObject for FolderKey {
 
 /// A version pinned for writing: its bytes when another member already sent them, and the
 /// range whose copy here answered for a coordinator that could not.
+#[derive(Debug, PartialEq)]
 struct Pinned {
     version: Ulid,
-    blob: Option<Blob>,
+    blob: Option<ByteStream>,
     stale: Option<Ulid>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum SelectionError {
     #[error("a selection names at least one file or folder")]
     Empty,
@@ -223,6 +193,8 @@ pub enum SelectionError {
     Stream(String),
     #[error("the archive could not be written; its reader may have gone away")]
     Write,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// A selection with at least one entry, each of a valid bucket name.
@@ -237,7 +209,7 @@ pub fn validate_selection(entries: &[SelectionEntry]) -> Result<(), SelectionErr
 }
 
 /// The archive paths written so far and their folders, so every new path stays apart from them.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct WrittenPaths {
     files: HashSet<String>,
     folders: HashSet<String>,
@@ -276,35 +248,6 @@ fn folders(path: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Writes every selected entry, bucket by bucket in request order and key by key in key order,
-/// then the report. Each key is resolved and its version pinned only when the writer reaches it.
-/// A failure inside an entry ends the archive with an error instead of a silent gap.
-pub async fn write_selection<R: MemberReader, W: tokio::io::AsyncWrite + Unpin>(
-    scope: &ArchiveScope<'_, R>,
-    caller: Caller<'_>,
-    entries: Vec<SelectionEntry>,
-    writer: W,
-) -> Result<Report, SelectionError> {
-    validate_selection(&entries)?;
-    let mut archive = Archive {
-        zip: ZipFileWriter::with_tokio(writer),
-        paths: WrittenPaths::default(),
-        report: Report::default(),
-    };
-    for (bucket, picks) in by_bucket(entries) {
-        archive.write_bucket(scope, caller, &bucket, picks).await?;
-    }
-    let report = serde_json::to_vec_pretty(&archive.report)
-        .map_err(|error| SelectionError::Stream(error.to_string()))?;
-    let now = aruna_core::time::unix_timestamp_millis();
-    let mut zip = archive.zip;
-    zip.write_entry_whole(zip_entry(REPORT_PATH, now), &report)
-        .await
-        .map_err(|_| SelectionError::Write)?;
-    zip.close().await.map_err(|_| SelectionError::Write)?;
-    Ok(archive.report)
-}
-
 /// The entries of each bucket, buckets in the order the request first names them.
 fn by_bucket(entries: Vec<SelectionEntry>) -> Vec<(String, Vec<SelectionEntry>)> {
     let mut order: Vec<(String, Vec<SelectionEntry>)> = Vec::new();
@@ -318,12 +261,6 @@ fn by_bucket(entries: Vec<SelectionEntry>) -> Vec<(String, Vec<SelectionEntry>)>
         order[at].1.push(entry);
     }
     order
-}
-
-struct Archive<W> {
-    zip: ZipFileWriter<W>,
-    paths: WrittenPaths,
-    report: Report,
 }
 
 fn file_row(bucket: &str, key: &str, version: Option<Ulid>, status: EntryStatus) -> ReportRow {
@@ -350,16 +287,204 @@ fn folder_row(bucket: &str, prefix: &str, range_id: Option<String>) -> ReportRow
     }
 }
 
-impl<W: AsyncWrite + Unpin> Archive<W> {
-    /// Merges the bucket's explicit files into its folder listings in key order.
-    async fn write_bucket<R: MemberReader>(
+/// The folders of one bucket, listed one after another a page at a time.
+#[derive(Debug, Default, PartialEq)]
+struct FolderWalk {
+    folders: VecDeque<String>,
+    current: Option<FolderListing>,
+    buffer: VecDeque<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct FolderListing {
+    prefix: String,
+    cursor: Option<String>,
+    done: bool,
+    /// Ranges already reported for this folder.
+    ranges: HashSet<String>,
+}
+
+/// The key being written: its claims still to resolve and the versions already written.
+#[derive(Debug, PartialEq)]
+struct KeyWork {
+    key: String,
+    claims: VecDeque<Option<Ulid>>,
+    written: Vec<Ulid>,
+}
+
+/// The bucket being written: its explicit files merged into its folder listings in key order.
+#[derive(Debug, PartialEq)]
+struct BucketWork {
+    name: String,
+    info: BucketInfo,
+    files: VecDeque<(String, Option<Ulid>)>,
+    /// Folders whose listing right is still to check.
+    prefixes: VecDeque<String>,
+    walk: FolderWalk,
+    key: Option<KeyWork>,
+}
+
+/// A pinned version and where it goes in the archive.
+#[derive(Debug, PartialEq)]
+struct Placed {
+    version: Ulid,
+    path: String,
+    renamed: bool,
+    stale: Option<Ulid>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ArchiveStep {
+    Bucket(String, Vec<SelectionEntry>),
+    Folder(String),
+    Page,
+    Resolve(Option<Ulid>),
+    Read(Placed),
+    Entry(Placed),
+    Report,
+    Close,
+}
+
+type ArchiveTurn = Result<Next<Report>, SelectionError>;
+
+fn job_call(effect: JobEffect) -> IoCall {
+    Effect::Job(effect).into()
+}
+
+fn job_event(result: IoResult) -> Result<JobEvent, IoError> {
+    match result.event()? {
+        Event::Job(event) => Ok(event),
+        other => Err(IoError::Unexpected {
+            expected: "Event::Job",
+            got: other.label(),
+        }),
+    }
+}
+
+fn unexpected_job() -> IoError {
+    IoError::Unexpected {
+        expected: "the archive event of the running step",
+        got: "another job event",
+    }
+}
+
+/// The entry status of a failed permission check.
+fn access_status(answer: Result<(), AuthorizeError>) -> Result<(), EntryStatus> {
+    match answer {
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            Err(EntryStatus::Denied)
+        }
+        Err(AuthorizeError::Storage(_) | AuthorizeError::CheckFailed(_)) => {
+            Err(EntryStatus::Unavailable)
+        }
+    }
+}
+
+fn read_check(realm_id: RealmId, auth: &AuthContext, path: &str) -> IoCall {
+    let extras = PolicyRequestExtras::rest();
+    let check = AuthorizeOperation::new(realm_id, auth, path, &Permission::READ, extras);
+    IoCall::child(check)
+}
+
+/// Starts an archive: its writer for [`WriteSelectionOperation`] and the stream of its bytes.
+#[derive(Debug, PartialEq)]
+pub struct OpenArchiveOperation;
+
+impl Operation for OpenArchiveOperation {
+    type Output = (ZipWork, ByteStream);
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+        Ok(Next::Call(job_call(JobEffect::OpenZip)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
+        match job_event(result)? {
+            JobEvent::ZipOpened { zip, stream } => Ok(Next::Done((zip, stream))),
+            _ => Err(unexpected_job()),
+        }
+    }
+}
+
+/// Writes every selected entry into `zip`, bucket by bucket in request order and key by key in
+/// key order, then the report. Each key is resolved and its version pinned only when the writer
+/// reaches it. A failure inside an entry ends the archive with an error, never a silent gap.
+#[derive(Debug, PartialEq)]
+pub struct WriteSelectionOperation {
+    zip: Option<ZipWork>,
+    node: PageNode,
+    access: MemberAccess,
+    caller: (AuthContext, u64),
+    entries: Vec<SelectionEntry>,
+    buckets: VecDeque<(String, Vec<SelectionEntry>)>,
+    bucket: Option<BucketWork>,
+    paths: WrittenPaths,
+    report: Report,
+    now_ms: u64,
+    step: ArchiveStep,
+}
+
+impl WriteSelectionOperation {
+    pub fn new(
+        zip: ZipWork,
+        node: PageNode,
+        access: MemberAccess,
+        (auth, expiry): Caller<'_>,
+        entries: Vec<SelectionEntry>,
+    ) -> Self {
+        Self {
+            zip: Some(zip),
+            node,
+            access,
+            caller: (auth.clone(), expiry),
+            entries,
+            buckets: VecDeque::new(),
+            bucket: None,
+            paths: WrittenPaths::default(),
+            report: Report::default(),
+            now_ms: 0,
+            step: ArchiveStep::Report,
+        }
+    }
+
+    fn zip(&mut self) -> Result<ZipWork, IoError> {
+        self.zip.take().ok_or(IoError::Unfinished)
+    }
+
+    fn work(&mut self) -> Result<&mut BucketWork, IoError> {
+        self.bucket.as_mut().ok_or(IoError::Unfinished)
+    }
+
+    /// The bucket and key being written.
+    fn names(&self) -> Result<(String, String), IoError> {
+        let work = self.bucket.as_ref().ok_or(IoError::Unfinished)?;
+        let key = work.key.as_ref().ok_or(IoError::Unfinished)?;
+        Ok((work.name.clone(), key.key.clone()))
+    }
+
+    fn add_file(&mut self, version: Option<Ulid>, status: EntryStatus) -> Result<(), IoError> {
+        let (bucket, key) = self.names()?;
+        self.report.add(file_row(&bucket, &key, version, status));
+        Ok(())
+    }
+
+    fn next_bucket(&mut self) -> ArchiveTurn {
+        self.bucket = None;
+        let Some((name, picks)) = self.buckets.pop_front() else {
+            return self.write_report();
+        };
+        let get = GetBucketOperation::new(name.clone());
+        self.step = ArchiveStep::Bucket(name, picks);
+        Ok(Next::Call(IoCall::child(get)))
+    }
+
+    fn bucket_read(
         &mut self,
-        scope: &ArchiveScope<'_, R>,
-        caller: Caller<'_>,
-        bucket: &str,
-        picks: Vec<SelectionEntry>,
-    ) -> Result<(), SelectionError> {
-        let info = match drive(GetBucketOperation::new(bucket.to_string()), scope.context).await {
+        (name, picks): (String, Vec<SelectionEntry>),
+        info: Result<BucketInfo, GetBucketError>,
+    ) -> ArchiveTurn {
+        let info = match info {
             Ok(info) => info,
             Err(error) => {
                 let status = match error {
@@ -370,13 +495,13 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
                     let mut row = match pick {
                         SelectionEntry::File {
                             key, version_id, ..
-                        } => file_row(bucket, &key, version_id, status),
-                        SelectionEntry::Folder { prefix, .. } => folder_row(bucket, &prefix, None),
+                        } => file_row(&name, &key, version_id, status),
+                        SelectionEntry::Folder { prefix, .. } => folder_row(&name, &prefix, None),
                     };
                     row.status = status;
                     self.report.add(row);
                 }
-                return Ok(());
+                return self.next_bucket();
             }
         };
         let (mut files, mut prefixes) = (Vec::new(), Vec::new());
@@ -392,47 +517,69 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
         files.dedup();
         prefixes.sort();
         prefixes.dedup();
-        let mut walk = FolderWalk::default();
-        for prefix in prefixes {
-            // A denied folder is never enumerated; one inside a listed folder adds nothing.
-            if let Err(status) = may_list(scope, caller.0, (bucket, &info), &prefix).await {
-                self.report.add(ReportRow {
-                    status,
-                    ..folder_row(bucket, &prefix, None)
-                });
-                continue;
-            }
-            if !walk
-                .folders
-                .back()
-                .is_some_and(|kept| prefix.starts_with(kept.as_str()))
-            {
-                walk.folders.push_back(prefix);
-            }
-        }
-        let mut files = files.into_iter().peekable();
-        loop {
-            let listed = walk
-                .peek(scope, caller, (bucket, &info), &mut self.report)
-                .await;
-            let key = match (listed, files.peek()) {
-                (None, None) => return Ok(()),
-                (Some(listed), Some((file, _))) => listed.min(file.clone()),
-                (Some(listed), None) => listed,
-                (None, Some((file, _))) => file.clone(),
+        self.bucket = Some(BucketWork {
+            name,
+            info,
+            files: files.into(),
+            prefixes: prefixes.into(),
+            walk: FolderWalk::default(),
+            key: None,
+        });
+        self.next_folder()
+    }
+
+    /// Checks the next folder as the bucket's own listing requires.
+    fn next_folder(&mut self) -> ArchiveTurn {
+        let node = self.node;
+        let work = self.work()?;
+        let Some(prefix) = work.prefixes.pop_front() else {
+            return self.advance();
+        };
+        let ids = (node.realm_id, work.info.group_id, node.node_id);
+        let path = listing_path(ids, &work.name, Some(&prefix));
+        let check = read_check(node.realm_id, &self.caller.0, &path);
+        self.step = ArchiveStep::Folder(prefix);
+        Ok(Next::Call(check))
+    }
+
+    /// A denied folder is never enumerated; one inside a listed folder adds nothing.
+    fn folder_checked(&mut self, prefix: String, status: Result<(), EntryStatus>) -> ArchiveTurn {
+        let work = self.work()?;
+        if let Err(status) = status {
+            let row = ReportRow {
+                status,
+                ..folder_row(&work.name, &prefix, None)
             };
-            let mut claims = Vec::new();
-            if walk.buffer.front() == Some(&key) {
-                walk.buffer.pop_front();
-                claims.push(None);
+            self.report.add(row);
+            return self.next_folder();
+        }
+        let folders = &mut work.walk.folders;
+        if !(folders.back()).is_some_and(|kept| prefix.starts_with(kept.as_str())) {
+            folders.push_back(prefix);
+        }
+        self.next_folder()
+    }
+
+    /// Goes on with the next listed key or explicit file, listing a page when none is known.
+    fn advance(&mut self) -> ArchiveTurn {
+        loop {
+            let walk = &mut self.work()?.walk;
+            if let Some(key) = walk.buffer.front() {
+                let key = key.clone();
+                return self.take_key(Some(key));
             }
-            while let Some((_, version)) = files.next_if(|(file, _)| *file == key) {
-                claims.push(version);
+            if (walk.current.as_ref()).is_some_and(|listing| !listing.done) {
+                return self.list_page();
             }
-            claims.sort();
-            claims.dedup();
-            self.write_key(scope, caller.0, (bucket, &info), &key, claims)
-                .await?;
+            let Some(prefix) = walk.folders.pop_front() else {
+                return self.take_key(None);
+            };
+            walk.current = Some(FolderListing {
+                prefix,
+                cursor: None,
+                done: false,
+                ranges: HashSet::new(),
+            });
         }
     }
 
