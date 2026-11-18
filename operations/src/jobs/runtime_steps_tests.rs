@@ -81,7 +81,7 @@ fn status(active: bool) -> UnlockStatus {
         active,
         unlocked_at: std::time::SystemTime::UNIX_EPOCH,
         remaining: None,
-        session_remaining: None,
+        max_remaining: None,
     }
 }
 
