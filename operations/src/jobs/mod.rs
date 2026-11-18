@@ -17,6 +17,7 @@ pub mod import;
 mod import_listing;
 pub mod key_wake;
 pub mod lifecycle;
+pub mod local_run;
 pub mod metadata_class;
 pub mod output_record;
 pub mod persistent_id;

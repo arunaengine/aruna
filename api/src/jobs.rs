@@ -16,9 +16,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::{
-    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
-};
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
@@ -26,6 +23,9 @@ use aruna_operations::jobs::command::{
 };
 use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
 use aruna_operations::jobs::lifecycle::routing::session_job;
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::service::read_owned_job;
 use aruna_operations::jobs::session::SessionOperation;

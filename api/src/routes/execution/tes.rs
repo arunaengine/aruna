@@ -22,11 +22,11 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
-use aruna_operations::device::compute::{LocalExecutionConfig, LocalRunOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::lifecycle::routing::family_report;
+use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
