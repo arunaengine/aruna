@@ -6,7 +6,9 @@
 use std::sync::OnceLock;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{done, read_row};
@@ -181,6 +183,24 @@ pub fn document_state(replica: &ReplicaRecord, entries: &[&PublishEntry]) -> Doc
 
 pub(crate) fn replica_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub(crate) fn replica_read(document_id: Ulid) -> StorageEffect {
+    StorageEffect::Read {
+        key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
+        key: replica_key(document_id),
+        txn_id: None,
+    }
+}
+
+/// The replica a read answer holds; an absent, unreadable or undecodable row is none.
+pub(crate) fn read_answer(event: &Event) -> Option<ReplicaRecord> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => ReplicaRecord::from_bytes(bytes).ok(),
+        _ => None,
+    }
 }
 
 pub(crate) fn replica_entry(

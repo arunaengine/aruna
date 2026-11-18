@@ -504,7 +504,9 @@ impl OperationsTaskHandler {
         match drive(
             PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
             &bulk,
-        ).await {
+        )
+        .await
+        {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;

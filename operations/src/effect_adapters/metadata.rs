@@ -15,16 +15,15 @@ use std::future::{Future, ready};
 use std::pin::Pin;
 use tokio::time::{Instant, timeout};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::forward::read::dataset_summary;
-use crate::metadata::forward::write::{
-    route_metadata_create, route_metadata_delete, route_metadata_update,
-};
+use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
 use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
 use crate::metadata::update_document::UpdateDocumentMutation;
 
@@ -89,7 +88,9 @@ async fn routed_write(
                 payload: CreateDocumentPayload::RoCrate { jsonld },
             });
             let token = Some(AuthToken::internal(owner));
-            Box::pin(route_metadata_create(operation, context, token)).await?;
+            let local = context.net_handle.as_ref().map(|net| net.node_id());
+            let route = RouteCreateOperation::new(operation, local, token);
+            Box::pin(drive(route, context.as_ref())).await?;
         }
         HarvestWrite::Update {
             actor,

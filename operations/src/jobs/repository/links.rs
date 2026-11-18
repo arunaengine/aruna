@@ -581,4 +581,4 @@ impl Operation for SettleCheckOperation {
 
 #[cfg(test)]
 #[path = "links_tests.rs"]
-pub(crate) mod tests;
+mod tests;

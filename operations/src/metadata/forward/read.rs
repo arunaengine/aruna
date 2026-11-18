@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
+use crate::document_repository::GetConfigOperation;
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
@@ -19,7 +19,6 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;

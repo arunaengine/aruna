@@ -319,8 +319,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::RegisterInterest { .. }
         | NetEffect::RetractInterest(_)
         | NetEffect::ReplaceInterest(_)
-        | NetEffect::UpdateRealmInterest { .. }
-        | NetEffect::WatchHolders { .. } => {
+        | NetEffect::UpdateRealmInterest { .. } => {
             NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
         }
     }
@@ -678,7 +677,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::RetractInterest(_) => "retract_interest",
         NetEffect::ReplaceInterest(_) => "replace_interest",
         NetEffect::UpdateRealmInterest { .. } => "update_realm_interest",
-        NetEffect::WatchHolders { .. } => "watch_holders",
     }
 }
 

@@ -149,8 +149,7 @@ impl Operation for ReadAccessOperation {
         if self.scopes.is_empty() {
             return Ok(Next::Done(ReadAccess::default()));
         }
-        let policies = PolicyBulkOperation::new(self.scopes.iter().copied())
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        let policies = PolicyBulkOperation::new(self.scopes.iter().copied());
         let mut members = vec![member(policies)];
         if let Some(auth) = self.rules_auth().cloned() {
             let groups = self.scopes.iter().map(|(_, group_id)| *group_id);

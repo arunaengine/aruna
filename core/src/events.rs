@@ -525,8 +525,6 @@ pub enum NetEvent {
     HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
-    /// This node and the holders its watch interest matches; none without a net handle.
-    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
 }
 
 /// What peers said about topics this node lacks.
@@ -1036,7 +1034,6 @@ impl Event {
                     WatchHolders,
                     Heartbeat,
                     Recorded,
-                    WatchHolders,
                 }
             ),
             Event::Metadata(event) => event.label(),

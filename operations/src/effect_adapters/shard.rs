@@ -2,17 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::document::DocumentNetEvent;
 use aruna_core::effects::{ShardMembership, ShardNetEffect};
 use aruna_core::events::{Event, GenesisProbe, NetEvent, ShardNetEvent};
 use aruna_net::NetHandle;
 use tracing::debug;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::sync::reconcile::SyncTopicsOperation;
 
 pub(super) async fn dispatch_shard(effect: ShardNetEffect, context: &DriverContext) -> Event {
     let answer = match &context.net_handle {
         None => ShardNetEvent::NoNetwork,
-        Some(net) => run_effect(effect, net).await,
+        Some(net) => run_effect(effect, net, context).await,
     };
     Event::Net(NetEvent::Shard(Box::new(answer)))
 }
@@ -21,7 +23,11 @@ fn outcome<E: std::fmt::Display>(result: Result<(), E>) -> ShardNetEvent {
     ShardNetEvent::Outcome(result.map_err(|error| error.to_string()))
 }
 
-async fn run_effect(effect: ShardNetEffect, net: &NetHandle) -> ShardNetEvent {
+async fn run_effect(
+    effect: ShardNetEffect,
+    net: &NetHandle,
+    context: &DriverContext,
+) -> ShardNetEvent {
     match effect {
         ShardNetEffect::Existing(topics) => ShardNetEvent::Existing(
             (topics.into_iter())
@@ -60,11 +66,15 @@ async fn run_effect(effect: ShardNetEffect, net: &NetHandle) -> ShardNetEvent {
                 unreachable: probe.unreachable,
             })
         }
-        ShardNetEffect::Pull { topics, peers } => ShardNetEvent::Pulled {
-            node_id: net.node_id(),
-            realm_id: *net.realm_id(),
-            sync: Box::new(net.sync_document_topics(topics, peers).await),
-        },
+        ShardNetEffect::Pull { topics, peers } => {
+            let sync = SyncTopicsOperation::new(*net.realm_id(), topics, peers);
+            let synced = Box::pin(drive(sync, context)).await;
+            ShardNetEvent::Pulled {
+                node_id: net.node_id(),
+                realm_id: *net.realm_id(),
+                sync: Box::new(DocumentNetEvent::reconciled(synced)),
+            }
+        }
         ShardNetEffect::EnsureLocal(topics) => outcome(net.ensure_local_topics(&topics).await),
         ShardNetEffect::EnsureShared { topics, peers } => {
             outcome(net.ensure_sync_topics(&topics, peers).await)

@@ -23,7 +23,6 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
 use aruna_core::UserId;

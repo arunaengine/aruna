@@ -18,7 +18,6 @@ use super::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
-use crate::realm::load_config::load_realm_config;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;

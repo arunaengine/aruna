@@ -38,8 +38,6 @@ pub(super) const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
 const MAX_PROBES: usize = 64;
-/// Rows one read of a job's open lanes returns: a checkpoint and a bound per lane, and one more.
-pub(super) const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
 
 /// One open lane: its checkpoint and the exclusive target key it stops before.
 pub(super) type Lane = (u64, StagingJobCheckpoint, Option<String>);

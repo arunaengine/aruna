@@ -12,7 +12,6 @@ use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::placement::process_placements::load_realm_config;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
@@ -36,7 +35,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
-use crate::driver::drive;
 use crate::forward::authorize::ForwardAuthError;
 use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::forward_auth_error;
@@ -306,7 +304,7 @@ pub async fn add_identifiers_routed(
     auth: AuthContext,
 ) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
     let add = async || {
-        let record = load_document_record(context.as_ref(), document_id)
+        let record = drive(DocumentRecordOperation::new(document_id), context.as_ref())
             .await
             .map_err(|error| {
                 MetadataApiError::Internal(format!("metadata registry read failed: {error:?}"))
@@ -653,7 +651,7 @@ pub(crate) async fn apply_forwarded_pid(
     if minting_subject.is_some_and(|minted_by| minted_by != auth.user_id) {
         return forward_auth_error(ForwardAuthError::Forbidden);
     }
-    let record = match load_document_record(context.as_ref(), document_id).await {
+    let record = match drive(DocumentRecordOperation::new(document_id), context.as_ref()).await {
         Ok(record) => record,
         Err(error) => return reject(format!("metadata registry read failed: {error:?}")),
     };

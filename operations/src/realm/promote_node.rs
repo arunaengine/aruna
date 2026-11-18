@@ -230,8 +230,12 @@ fn handoff_outcome(
             "unexpected answer {}",
             transport_message_kind(&other)
         ))),
-        Err(PeerRequestError::NotSent(error)) => Err(PromoteNodeError::Unreachable(error)),
-        Err(PeerRequestError::Failed(error)) => Err(PromoteNodeError::KeyUncertain(error)),
+        Err(PeerRequestError::NotSent(error)) => {
+            Err(PromoteNodeError::Unreachable(error.to_string()))
+        }
+        Err(PeerRequestError::Failed(error)) => {
+            Err(PromoteNodeError::KeyUncertain(error.to_string()))
+        }
         Err(PeerRequestError::TimedOut) => Err(PromoteNodeError::KeyUncertain(
             "no answer before the deadline".to_string(),
         )),
@@ -356,7 +360,9 @@ mod tests {
             Err(PromoteNodeError::KeyUncertain(_))
         ));
         assert!(matches!(
-            handoff_outcome(Err(PeerRequestError::NotSent("no route".to_string()))),
+            handoff_outcome(Err(PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+            "no route".to_string(),
+        )))),
             Err(PromoteNodeError::Unreachable(_))
         ));
         let refused = MetadataTransportMessage::RealmKeyStored {

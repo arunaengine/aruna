@@ -1103,7 +1103,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
         Effect::Net(NetEffect::ReplaceInterest(_)) => "replace_interest",
         Effect::Net(NetEffect::UpdateRealmInterest { .. }) => "update_realm_interest",
-        Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",

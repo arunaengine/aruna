@@ -33,7 +33,8 @@ use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation}
 use crate::jobs::executor::JobRunOutcome;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::imports::shared::{SharedRule, shares_folder};
+use crate::s3::imports::folders::shares_folder;
+use crate::s3::imports::shared::SharedRule;
 
 /// Rule rows one page of the group's rules reads.
 const RULE_PAGE: usize = 256;

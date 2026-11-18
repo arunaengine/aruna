@@ -500,7 +500,7 @@ mod tests {
                 route.placement,
                 1,
             ),
-            &crate::driver::DriverContext::for_storage(ctx.storage_handle.clone()),
+            &crate::driver::DriverContext::storage_only(ctx.storage_handle.clone()),
         )
         .await
         .expect("the departing holder closes the fence");

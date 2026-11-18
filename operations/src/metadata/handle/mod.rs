@@ -252,7 +252,7 @@ impl AuthValidationState {
             linked_realm: self.realm_id,
             keys: Some(self.issuer_keys.clone()),
         };
-        let context = DriverContext::for_storage(self.storage_handle.clone());
+        let context = DriverContext::storage_only(self.storage_handle.clone());
         drive(DecodeTokenOperation::new(token, checks), &context).await
     }
 

@@ -6,7 +6,6 @@
 pub mod client;
 pub mod incoming;
 pub(crate) mod manifest;
-pub mod protocol;
 pub(crate) mod pull;
 pub mod recovery;
 pub mod restore;

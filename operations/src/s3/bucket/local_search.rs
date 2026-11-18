@@ -102,7 +102,7 @@ impl LocalBucketSearch {
             return self.decide_hits();
         }
         self.step = LocalStep::LoadPolicies;
-        let load = PolicyBulkOperation::new(pending)?;
+        let load = PolicyBulkOperation::new(pending);
         Ok(Next::Call(IoCall::child(load)))
     }
 
@@ -144,9 +144,9 @@ impl LocalBucketSearch {
         let realm_id = self.input.realm_id;
         AuthorizeOperation::new(
             realm_id,
-            AuthContext::anonymous(realm_id),
-            bucket_permission_path(realm_id, hit.group_id, hit.node_id, &hit.bucket),
-            Permission::READ,
+            &AuthContext::anonymous(realm_id),
+            &bucket_permission_path(realm_id, hit.group_id, hit.node_id, &hit.bucket),
+            &Permission::READ,
             PolicyRequestExtras::operation("s3.ListBuckets"),
         )
     }

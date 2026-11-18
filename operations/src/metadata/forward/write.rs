@@ -33,7 +33,6 @@ use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::notifications::watch::origin::EmitEventOperation;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
@@ -55,7 +54,6 @@ use ulid::Ulid;
 
 use super::read::device_replica;
 use crate::document_repository::GetConfigOperation;
-use crate::driver::drive;
 use crate::forward::authorize::AuthorizeCreateOperation;
 use crate::forward::authorize::CreateScope;
 use crate::forward::authorize::ForwardAuthError;

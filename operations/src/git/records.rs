@@ -335,7 +335,7 @@ mod tests {
         // The departing holder reported the bucket drained at this write's generation.
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
-            &crate::driver::DriverContext::for_storage(context.storage_handle.clone()),
+            &crate::driver::DriverContext::storage_only(context.storage_handle.clone()),
         )
         .await
         .expect("close");

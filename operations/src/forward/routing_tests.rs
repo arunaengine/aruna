@@ -113,7 +113,9 @@ fn create_miss_undeliverable() {
 fn unsent_tries_next() {
     let mut operation = walk(&[node(1), node(2)], &delete());
     operation.first().unwrap();
-    let unsent = failed_answer(node(1), PeerRequestError::NotSent("no route".to_string()));
+    let unsent = failed_answer(node(1), PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+            "no route".to_string(),
+        )));
     assert_eq!(asked(operation.next(unsent)), node(2));
 }
 
@@ -121,7 +123,9 @@ fn unsent_tries_next() {
 fn possible_send_stops() {
     // A holder that may have applied the write is never followed by a replay.
     for error in [
-        PeerRequestError::Failed("reset".to_string()),
+        PeerRequestError::Failed(aruna_core::metadata::MetadataError::Backend(
+            "reset".to_string(),
+        )),
         PeerRequestError::TimedOut,
     ] {
         let mut operation = walk(&[node(1), node(2)], &delete());

@@ -1950,7 +1950,7 @@ mod tests {
 
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
-            &crate::driver::DriverContext::for_storage(storage.clone()),
+            &crate::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .expect("the departing holder closes the fence");
@@ -2006,7 +2006,7 @@ mod tests {
 
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 3),
-            &crate::driver::DriverContext::for_storage(storage.clone()),
+            &crate::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
@@ -2014,14 +2014,14 @@ mod tests {
         // A stale re-close never reopens the bucket.
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 2),
-            &crate::driver::DriverContext::for_storage(storage.clone()),
+            &crate::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
         assert_eq!(stored().await, 3);
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
-            &crate::driver::DriverContext::for_storage(storage.clone()),
+            &crate::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
@@ -2033,7 +2033,7 @@ mod tests {
                     crate::placement::process_transitions::CloseFenceOperation::new(
                         realm_id, placement, 5,
                     ),
-                    &crate::driver::DriverContext::for_storage(storage.clone()),
+                    &crate::driver::DriverContext::storage_only(storage.clone()),
                 )
                 .await
             },
@@ -2042,7 +2042,7 @@ mod tests {
                     crate::placement::process_transitions::CloseFenceOperation::new(
                         realm_id, placement, 6,
                     ),
-                    &crate::driver::DriverContext::for_storage(storage.clone()),
+                    &crate::driver::DriverContext::storage_only(storage.clone()),
                 )
                 .await
             },
@@ -2077,7 +2077,7 @@ mod tests {
 
         crate::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
-            &crate::driver::DriverContext::for_storage(storage.clone()),
+            &crate::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();

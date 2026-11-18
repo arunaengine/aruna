@@ -533,9 +533,9 @@ impl AdmitMemberOperation {
         let path = bucket_permission_path(realm_id, group_id, node_id, &snapshot.config.bucket);
         let check = AuthorizeOperation::new(
             self.auth.realm_id,
-            self.auth.clone(),
-            path,
-            Permission::WRITE,
+            &self.auth,
+            &path,
+            &Permission::WRITE,
             PolicyRequestExtras::operation("s3.CreateBucket"),
         );
         self.step = AdmitStep::Authorize;

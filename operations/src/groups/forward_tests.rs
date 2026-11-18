@@ -59,7 +59,9 @@ fn forwarding() -> ForwardGroupOperation {
 fn unsent_tries_next() {
     let mut operation = forwarding();
     let peer = operation.asked.unwrap();
-    let failed = peer_failed(peer, PeerRequestError::NotSent("no route".to_string()));
+    let failed = peer_failed(peer, PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+            "no route".to_string(),
+        )));
     assert!(matches!(
         operation.next(failed),
         Ok(Next::Call(IoCall::Effect(_)))
@@ -71,7 +73,9 @@ fn unsent_tries_next() {
 fn sent_failure_stops() {
     // The ingress may have created the group, so no other one is asked.
     for error in [
-        PeerRequestError::Failed("cut".to_string()),
+        PeerRequestError::Failed(aruna_core::metadata::MetadataError::Backend(
+            "cut".to_string(),
+        )),
         PeerRequestError::TimedOut,
     ] {
         let mut operation = forwarding();
@@ -88,7 +92,9 @@ fn every_peer_unreachable() {
     let mut operation = forwarding();
     for _ in 0..2 {
         let peer = operation.asked.unwrap();
-        let failed = peer_failed(peer, PeerRequestError::NotSent("no route".to_string()));
+        let failed = peer_failed(peer, PeerRequestError::NotSent(aruna_core::metadata::MetadataError::Backend(
+            "no route".to_string(),
+        )));
         let turn = operation.next(failed);
         if operation.asked.is_none() {
             assert_eq!(turn, Err(ForwardGroupError::Unavailable));

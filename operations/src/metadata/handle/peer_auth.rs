@@ -187,7 +187,7 @@ pub(super) async fn replay_authority(
     };
     let cutoff = drive(
         UserCutoffOperation::new(auth.realm_id, &auth.user_id),
-        &DriverContext::for_storage(storage_handle.clone()),
+        &DriverContext::storage_only(storage_handle.clone()),
     )
     .await
     .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;

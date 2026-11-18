@@ -54,7 +54,7 @@ impl PeerAuthState {
             linked_realm: None,
             keys: None,
         };
-        let context = DriverContext::for_storage(self.storage.clone());
+        let context = DriverContext::storage_only(self.storage.clone());
         drive(DecodeTokenOperation::new(token, checks), &context).await
     }
 }
