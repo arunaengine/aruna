@@ -82,8 +82,7 @@ pub async fn publish_run(
     input: PublishRunInput,
 ) -> Result<PublishedRun, PublishRunError> {
     let _publishing = PUBLISHING.lock().await;
-    let storage = &context.storage_handle;
-    let record = read_job_record(storage, input.job_id, None)
+    let record = read_job_record(context, input.job_id, None)
         .await
         .map_err(PublishRunError::Unavailable)?
         .ok_or(PublishRunError::NotFound)?;
@@ -96,7 +95,7 @@ pub async fn publish_run(
     if !record.state.is_terminal() {
         return Err(PublishRunError::NotFinished);
     }
-    let status = read_crate_status(storage, input.job_id)
+    let status = read_crate_status(context, input.job_id)
         .await
         .map_err(PublishRunError::Unavailable)?;
     let saved_id = match &status {
@@ -170,7 +169,7 @@ pub async fn publish_run(
         }
         _ => return Err(PublishRunError::Crate("interrupted".to_string())),
     }
-    let run_crate = read_crate_status(storage, input.job_id)
+    let run_crate = read_crate_status(context, input.job_id)
         .await
         .map_err(PublishRunError::Unavailable)?
         .ok_or(PublishRunError::NotFound)?;
@@ -187,7 +186,7 @@ pub async fn local_run_crate(
     owner: UserId,
 ) -> Result<serde_json::Value, PublishRunError> {
     // The owner is kept with the crate, so it stays readable after the job is pruned.
-    let local = read_local_crate(&context.storage_handle, job_id)
+    let local = read_local_crate(context, job_id)
         .await
         .map_err(PublishRunError::Unavailable)?
         .filter(|local| local.owner == owner)

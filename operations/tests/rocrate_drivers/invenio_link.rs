@@ -145,7 +145,7 @@ pub(super) async fn attach(
 }
 
 pub(super) async fn current(fixture: &Fixture, link: &RepositoryLink) -> (RepositoryLink, bool) {
-    list_links(&fixture.context.storage_handle, link.document_id)
+    list_links(&fixture.context, link.document_id)
         .await
         .unwrap()
         .into_iter()
@@ -201,26 +201,22 @@ pub(super) async fn run_push(
         .0
         .active_job
         .ok_or("no running push")?;
-    let record = aruna_operations::jobs::store::state::read_job_record(
-        &fixture.context.storage_handle,
-        job_id,
-        None,
-    )
-    .await?
-    .ok_or("push job missing")?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+            .await?
+            .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
         return Err("push job is not an export".into());
     };
     let ctx = claim_context(fixture, job_id, record.payload).await?;
     let outcome = Box::pin(run_export_job(&ctx, &spec)).await;
     // Ends the job like the runtime, so the per-user active job limit frees up.
-    let storage = &fixture.context.storage_handle;
     let now = unix_timestamp_millis();
     match &outcome {
         JobRunOutcome::Succeeded(result) => {
             let progress = record.progress.clone();
             complete_job(
-                storage,
+                &fixture.context,
                 job_id,
                 ctx.claim_token,
                 result.clone(),
@@ -230,7 +226,14 @@ pub(super) async fn run_push(
             .await?;
         }
         JobRunOutcome::Failed(error) => {
-            fail_job(storage, job_id, ctx.claim_token, error.clone(), now).await?;
+            fail_job(
+                &fixture.context,
+                job_id,
+                ctx.claim_token,
+                error.clone(),
+                now,
+            )
+            .await?;
         }
         _ => {}
     }
@@ -302,19 +305,19 @@ pub(super) async fn run_registration(
     for_job: JobId,
     created_by: UserId,
 ) -> Result<AuthContext, Box<dyn std::error::Error>> {
-    let storage = &fixture.context.storage_handle;
     let key = format!("identifiers/{for_job}");
     let (job_id, _) = aruna_operations::jobs::store::query::find_dedup_plan(
-        storage,
+        &fixture.context,
         created_by,
         key.as_bytes(),
         None,
     )
     .await?
     .ok_or("no registration queued")?;
-    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
-        .await?
-        .ok_or("registration job missing")?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+            .await?
+            .ok_or("registration job missing")?;
     let JobPayload::RegisterIdentifiers(spec) = record.payload.clone() else {
         return Err("queued job is not a registration".into());
     };
@@ -421,14 +424,11 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .0
         .active_job
         .ok_or("no push")?;
-    let pusher = aruna_operations::jobs::store::state::read_job_record(
-        &fixture.context.storage_handle,
-        push_job,
-        None,
-    )
-    .await?
-    .ok_or("push job missing")?
-    .created_by;
+    let pusher =
+        aruna_operations::jobs::store::state::read_job_record(&fixture.context, push_job, None)
+            .await?
+            .ok_or("push job missing")?
+            .created_by;
     succeeded(run_push(&fixture, &link).await?);
     let (published, _) = current(&fixture, &link).await;
     assert!(published.remote.published && published.remote.draft_id.is_none());
@@ -684,14 +684,7 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = claim_context(&fixture, filler, payload).await?;
     let error = aruna_core::structs::execution::job::JobError::retryable("freed".to_string());
     let now = unix_timestamp_millis();
-    fail_job(
-        &fixture.context.storage_handle,
-        filler,
-        ctx.claim_token,
-        error,
-        now,
-    )
-    .await?;
+    fail_job(&fixture.context, filler, ctx.claim_token, error, now).await?;
     due_now(&fixture, &link).await?;
     drain(&fixture).await?;
     let (started, queued) = current(&fixture, &link).await;
@@ -992,7 +985,8 @@ async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
         }
         // The job is cancelled before it runs, so its runner never settles the link.
         let storage = &fixture.context.storage_handle;
-        let cancelled = set_cancel_requested(storage, job_id, unix_timestamp_millis()).await?;
+        let cancelled =
+            set_cancel_requested(&fixture.context, job_id, unix_timestamp_millis()).await?;
         assert!(matches!(cancelled, CancelRequestOutcome::Cancelled(_)));
         let key = link.link_id.to_bytes().to_vec();
         let Event::Storage(StorageEvent::ReadResult {
@@ -1057,8 +1051,7 @@ async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
 
     due_now(&fixture, &link).await?;
     drain(&fixture).await?;
-    let storage = &fixture.context.storage_handle;
-    assert!(list_links(storage, doc_id(1)).await?.is_empty());
+    assert!(list_links(&fixture.context, doc_id(1)).await?.is_empty());
     assert!(!has_row(&fixture, LINK_SECRET_KEYSPACE, &link).await);
     assert!(!has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
     assert!(server.state.lock().unwrap().records.is_empty());
@@ -1116,7 +1109,7 @@ async fn paged_links_unlinked() -> Result<(), Box<dyn std::error::Error>> {
         due_now(&fixture, link).await?;
     }
     drain(&fixture).await?;
-    assert!(list_links(storage, doc_id(1)).await?.is_empty());
+    assert!(list_links(&fixture.context, doc_id(1)).await?.is_empty());
     for link in &links {
         assert!(!has_row(&fixture, LINK_SECRET_KEYSPACE, link).await);
         assert!(!has_row(&fixture, LINK_QUEUE_KEYSPACE, link).await);

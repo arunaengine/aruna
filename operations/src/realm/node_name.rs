@@ -5,13 +5,14 @@
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -20,10 +21,9 @@ use aruna_core::structs::identity::realm::{
     MAX_NODE_NAME, NodeCoordinates, NodePlace, RealmConfigDocument, RealmId, normalize_node_name,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
 
@@ -84,29 +84,12 @@ pub struct NodeNameConfig {
     pub scope: NameScope,
 }
 
+/// Checks who may name the node, then writes the change in a write transaction that reruns
+/// after a lost conflict, since a background config write can win its commit.
 #[derive(Debug, PartialEq)]
 pub struct NodeNameOperation {
     config: NodeNameConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: NodeNameState,
-    output: Option<Result<NodeDisplay, NodeNameError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum NodeNameState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteState {
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteConflicts,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -133,8 +116,6 @@ pub enum NodeNameError {
     EmptyChange,
     #[error("node {node_id} is not a node the caller may name")]
     UnknownNode { node_id: NodeId },
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -145,14 +126,115 @@ pub enum NodeNameError {
     },
 }
 
+impl From<IoError> for NodeNameError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "NodeName".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type NameTurn = Result<Next<NodeDisplay>, NodeNameError>;
+
 impl NodeNameOperation {
     pub fn new(config: NodeNameConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: NodeNameState::Init,
-            output: None,
+            authorized: false,
+        }
+    }
+
+    /// The write transaction of the checked change.
+    #[cfg(test)]
+    fn write(&self) -> NameWrite {
+        NameWrite::new(Arc::new(self.config.clone()))
+    }
+
+    fn change(&mut self) -> Next<NodeDisplay> {
+        self.authorized = true;
+        let config = Arc::new(self.config.clone());
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || NameWrite::new(Arc::clone(&config));
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(child))
+    }
+}
+
+impl Operation for NodeNameOperation {
+    type Output = NodeDisplay;
+    type Error = NodeNameError;
+
+    fn first(&mut self) -> NameTurn {
+        let auth = &self.config.auth_context;
+        // An owner names its device for itself, so a delegated token cannot.
+        let foreign = auth.realm_id != self.config.actor.realm_id
+            || (self.config.scope == NameScope::Owner && auth.path_restrictions.is_some());
+        if foreign {
+            return Err(NodeNameError::Unauthorized);
+        }
+        normalize_change(&mut self.config.change)?;
+        if self.config.scope == NameScope::Owner {
+            return Ok(self.change());
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> NameTurn {
+        if self.authorized {
+            return result.child::<NodeDisplay, NodeNameError>()?.map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => Ok(self.change()),
+            Ok(false) => Err(NodeNameError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(error = %error, "Node name authorization check failed");
+                Err(NodeNameError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// What the name write transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+}
+
+/// Reads the realm config and its admin state, then stores the changed names and places and
+/// their queued admin events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct NameWrite {
+    config: Arc<NodeNameConfig>,
+    stage: Stage,
+    shown: Option<NodeDisplay>,
+    deletes: Vec<(KeySpace, Key)>,
+}
+
+impl NameWrite {
+    fn new(config: Arc<NodeNameConfig>) -> Self {
+        Self {
+            config,
+            stage: Stage::Read,
+            shown: None,
+            deletes: Vec::new(),
         }
     }
 
@@ -162,43 +244,11 @@ impl NodeNameOperation {
         }
     }
 
-    fn begin_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = NodeNameState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = NodeNameState::ReadCurrent;
-        let document = DocumentTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&self.admin_target()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_name_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, NodeNameError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(NodeNameError::MissingTransaction);
-        };
+    ) -> NameTurn {
         let Some(document_value) = document_value else {
             return Err(NodeNameError::ConfigMissing);
         };
@@ -282,194 +332,63 @@ impl NodeNameOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(shown));
-        self.state = NodeNameState::WriteState {
-            stale_conflict_deletes: stale_conflict_deletes(
-                previous_state.as_ref(),
-                Some(&reducer_state),
-            ),
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.shown = Some(shown);
+        self.deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(NodeNameError::MissingTransaction);
-        };
-        self.state = NodeNameState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: NodeNameError) -> Effects {
-        let cleanup = self.abort();
-        self.state = NodeNameState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(NodeNameError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> NameTurn {
+        let output = self.shown.take().ok_or(NodeNameError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for NodeNameOperation {
+impl Operation for NameWrite {
     type Output = NodeDisplay;
     type Error = NodeNameError;
 
-    fn start(&mut self) -> Effects {
-        let auth = &self.config.auth_context;
-        // An owner names its device for itself, so a delegated token cannot.
-        let foreign = auth.realm_id != self.config.actor.realm_id
-            || (self.config.scope == NameScope::Owner && auth.path_restrictions.is_some());
-        if foreign {
-            return self.fail(NodeNameError::Unauthorized);
-        }
-        if let Err(error) = normalize_change(&mut self.config.change) {
-            return self.fail(error);
-        }
-        if self.config.scope == NameScope::Owner {
-            return self.begin_transaction();
-        }
-        self.state = NodeNameState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            NodeNameState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => self.begin_transaction(),
-                        Ok(false) => self.fail(NodeNameError::Unauthorized),
-                        Err(AuthorizationError::StorageError(error)) => {
-                            self.fail(NodeNameError::StorageError(error))
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "Node name authorization check failed");
-                            self.fail(NodeNameError::Unauthorized)
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", other.label()),
-            },
-            NodeNameState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            NodeNameState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    match self.emit_name_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            NodeNameState::WriteState {
-                stale_conflict_deletes,
-            } => {
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(NodeNameError::MissingTransaction);
-                        };
-                        if stale_conflict_deletes.is_empty() {
-                            return self.emit_commit();
-                        }
-                        self.state = NodeNameState::DeleteConflicts;
-                        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
+    }
+
+    fn first(&mut self) -> NameTurn {
+        let document = DocumentTarget::RealmConfig {
+            realm_id: self.config.actor.realm_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.admin_target()),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> NameTurn {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = values::<2>(result)?;
+                self.emit_name_write(document, reducer)
             }
-            NodeNameState::DeleteConflicts => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", other.label()),
-            },
-            NodeNameState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = NodeNameState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) if self.attempts < COMMIT_ATTEMPTS => {
-                    self.txn_id = None;
-                    self.begin_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", other.label()),
-            },
-            NodeNameState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = NodeNameState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = NodeNameState::Finish;
-                    smallvec![]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            NodeNameState::Finish | NodeNameState::Error | NodeNameState::Init => {
-                smallvec![]
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes))))
             }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, NodeNameState::Finish | NodeNameState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(NodeNameError::NotFinished);
-        }
-        self.output.unwrap_or(Err(NodeNameError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
 }
@@ -495,79 +414,38 @@ fn normalize_change(change: &mut NodeChange) -> Result<(), NodeNameError> {
 #[derive(Debug, PartialEq)]
 pub struct ReadNamesOperation {
     realm_id: RealmId,
-    done: bool,
-    output: Option<Result<NodeDisplays, NodeNameError>>,
 }
 
 impl ReadNamesOperation {
     pub fn new(realm_id: RealmId) -> Self {
-        Self {
-            realm_id,
-            done: false,
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, output: Result<NodeDisplays, NodeNameError>) -> Effects {
-        self.done = true;
-        self.output = Some(output);
-        smallvec![]
+        Self { realm_id }
     }
 }
 
-impl EffectOperation for ReadNamesOperation {
+impl Operation for ReadNamesOperation {
     type Output = NodeDisplays;
     type Error = NodeNameError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<NodeDisplays>, NodeNameError> {
         let target = AdminDocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
-            key: reducer_state_key(&target),
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(vec![(
+            DOCUMENT_STATE_KEYSPACE.to_string(),
+            reducer_state_key(&target),
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.done {
-            return smallvec![];
-        }
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let displays = value
-                    .map(|bytes| decode_reducer_state(&bytes).map_err(ConversionError::from))
-                    .transpose()
-                    .map(|state| {
-                        let displays = state.map(|state| NodeDisplays {
-                            names: state.materialized_node_names(),
-                            places: state.materialized_node_places(),
-                        });
-                        displays.unwrap_or_default()
-                    })
-                    .map_err(NodeNameError::from);
-                self.finish(displays)
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-            other => self.finish(Err(NodeNameError::UnexpectedEvent {
-                state: "ReadState".to_string(),
-                expected: "storage read result",
-                got: other.label(),
-            })),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(NodeNameError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<NodeDisplays>, NodeNameError> {
+        let [value] = values::<1>(result)?;
+        let state = value
+            .map(|bytes| decode_reducer_state(&bytes).map_err(ConversionError::from))
+            .transpose()?;
+        let displays = state.map(|state| NodeDisplays {
+            names: state.materialized_node_names(),
+            places: state.materialized_node_places(),
+        });
+        Ok(Next::Done(displays.unwrap_or_default()))
     }
 }
 

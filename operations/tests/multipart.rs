@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
     S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
@@ -35,6 +35,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
+    CompleteUploadResult,
 };
 use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
@@ -1416,23 +1417,43 @@ async fn delete_removes_metadata() {
     );
 }
 
+/// Answers `effect` from storage, running a sub-operation inline; `None` for any other effect.
+async fn answer(context: &TestContext, effect: Effect) -> Option<Event> {
+    match effect {
+        Effect::Storage(effect) => Some(
+            context
+                .driver
+                .storage_handle
+                .send_storage_effect(effect)
+                .await,
+        ),
+        Effect::SubOperation(mut child) => {
+            let mut queue: VecDeque<Effect> = child.start().into_iter().collect();
+            while let Some(effect) = queue.pop_front() {
+                let event = Box::pin(answer(context, effect)).await?;
+                if child.is_complete() {
+                    break;
+                }
+                queue.extend(child.step(event));
+            }
+            Some(child.finalize())
+        }
+        _ => None,
+    }
+}
+
 // Runs a completion up to the blob compose and abandons it there, the way a
 // dropped request future does: the record stays `Completing`.
 async fn stall_completion(
     context: &TestContext,
     input: CompleteUploadInput,
-) -> CompleteUploadOperation {
-    let mut operation = CompleteUploadOperation::new(input);
+) -> impl EffectOperation<Output = CompleteUploadResult, Error = CompleteUploadError> {
+    let mut operation = CompleteUploadOperation::new(input).into_machine();
     let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
-        let Effect::Storage(effect) = effect else {
+        let Some(event) = answer(context, effect).await else {
             break;
         };
-        let event = context
-            .driver
-            .storage_handle
-            .send_storage_effect(effect)
-            .await;
         if operation.is_complete() {
             break;
         }
@@ -1441,23 +1462,11 @@ async fn stall_completion(
     operation
 }
 
-// Runs the effects a deadline's abort emits, so the record is left as production
+// Runs the calls a deadline's abort makes, so the record is left as production
 // would leave it.
-async fn run_abort(context: &TestContext, operation: &mut CompleteUploadOperation) {
-    let mut queue: VecDeque<Effect> = operation.abort().into_iter().collect();
-    while let Some(effect) = queue.pop_front() {
-        let Effect::Storage(effect) = effect else {
-            continue;
-        };
-        let event = context
-            .driver
-            .storage_handle
-            .send_storage_effect(effect)
-            .await;
-        if operation.is_complete() {
-            break;
-        }
-        queue.extend(operation.step(event));
+async fn run_abort(context: &TestContext, operation: &mut impl EffectOperation) {
+    for effect in operation.abort() {
+        answer(context, effect).await;
     }
 }
 

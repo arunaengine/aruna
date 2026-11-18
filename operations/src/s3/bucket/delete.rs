@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -18,7 +18,8 @@ use aruna_core::keyspaces::{
     UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
@@ -36,9 +37,8 @@ use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
@@ -47,8 +47,6 @@ use aruna_core::time::unix_timestamp_millis;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {
-    Init,
-    StartTransaction,
     ReadBucket,
     CheckCurrentObjects,
     CheckVersions,
@@ -68,9 +66,6 @@ pub enum DeleteBucketState {
     /// Reads the group members whose notices about the bucket go with it.
     ReadMembers,
     QueueNotices,
-    CommitTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -83,27 +78,24 @@ pub enum DeleteBucketError {
     NotFound,
     #[error("Bucket is not empty")]
     NotEmpty,
-    #[error("Transaction id missing")]
-    TransactionMissing,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: DeleteBucketState,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
     #[error("DeleteBucket failed")]
     DeleteBucketFailed,
-    #[error("operation did not finish")]
-    NotFinished,
 }
+
+impl From<IoError> for DeleteBucketError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn = Result<Next<()>, DeleteBucketError>;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteBucketOperation {
     bucket: String,
     state: DeleteBucketState,
-    txn_id: Option<TxnId>,
     group_id: Option<GroupId>,
     /// The incarnation of the bucket, whose delete trail goes with it.
     incarnation: u128,
@@ -121,7 +113,6 @@ pub struct DeleteBucketOperation {
     /// This node and its realm, set when the group members' notices about the bucket go too.
     notices: Option<(NodeId, RealmId)>,
     notified: bool,
-    output: Option<Result<(), DeleteBucketError>>,
 }
 
 impl DeleteBucketOperation {
@@ -130,8 +121,7 @@ impl DeleteBucketOperation {
     pub fn new(bucket: String) -> Self {
         Self {
             bucket,
-            state: DeleteBucketState::Init,
-            txn_id: None,
+            state: DeleteBucketState::ReadBucket,
             group_id: None,
             incarnation: 0,
             usage_update: None,
@@ -144,7 +134,6 @@ impl DeleteBucketOperation {
             member: None,
             notices: None,
             notified: false,
-            output: None,
         }
     }
 
@@ -171,277 +160,135 @@ impl DeleteBucketOperation {
         })
     }
 
-    fn emit_error(&mut self, error: DeleteBucketError) -> Effects {
-        self.state = DeleteBucketState::Error;
-        self.output = Some(Err(error));
-        self.abort()
+    fn call(&mut self, state: DeleteBucketState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn handle_init(&mut self) -> Effects {
-        self.state = DeleteBucketState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            });
+    fn page(
+        &mut self,
+        state: DeleteBucketState,
+        space: &str,
+        prefix: impl Into<Key>,
+        (after, limit): (Option<Key>, usize),
+    ) -> Turn {
+        let page = IoCall::Page {
+            space: space.to_string(),
+            prefix: prefix.into(),
+            after,
+            limit,
         };
-
-        self.txn_id = Some(txn_id);
-        self.state = DeleteBucketState::ReadBucket;
-        let key: Key = self.bucket.as_bytes().into();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
-                (BUCKET_CREATION_KEYSPACE.to_string(), key),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        self.call(state, page)
     }
 
-    fn handle_bucket_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn handle_bucket_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let mut values = values.into_iter();
         let (value, creation) = (values.next().flatten(), values.next().flatten());
-
-        let Some(value) = value else {
-            return self.emit_error(DeleteBucketError::NotFound);
-        };
-        match BucketInfo::from_bytes(value.as_ref()) {
-            Ok(info) if !self.member_matches(&info) => {
-                return self.emit_error(DeleteBucketError::NotFound);
-            }
-            Ok(info) => {
-                self.group_id = Some(info.group_id);
-                self.incarnation = incarnation(creation.as_deref());
-            }
-            Err(err) => return self.emit_error(err.into()),
+        let value = value.ok_or(DeleteBucketError::NotFound)?;
+        let info = BucketInfo::from_bytes(value.as_ref())?;
+        if !self.member_matches(&info) {
+            return Err(DeleteBucketError::NotFound);
         }
-
-        let prefix = match BlobHeadKey::bucket_prefix(&self.bucket) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        self.state = DeleteBucketState::CheckCurrentObjects;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: Self::SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+        self.group_id = Some(info.group_id);
+        self.incarnation = incarnation(creation.as_deref());
+        let prefix = BlobHeadKey::bucket_prefix(&self.bucket)?;
+        let limit = (None, Self::SCAN_LIMIT);
+        let state = DeleteBucketState::CheckCurrentObjects;
+        self.page(state, BLOB_HEAD_KEYSPACE, prefix, limit)
     }
 
-    fn objects_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-
+    fn objects_checked(&mut self, values: Vec<(Key, Value)>) -> Turn {
         if !values.is_empty() {
-            return self.emit_error(DeleteBucketError::NotEmpty);
+            return Err(DeleteBucketError::NotEmpty);
         }
-
-        let prefix = match VersionKey::bucket_prefix(&self.bucket) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        self.state = DeleteBucketState::CheckVersions;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: Self::SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+        let prefix = VersionKey::bucket_prefix(&self.bucket)?;
+        let limit = (None, Self::SCAN_LIMIT);
+        let state = DeleteBucketState::CheckVersions;
+        self.page(state, BLOB_VERSIONS_KEYSPACE, prefix, limit)
     }
 
-    fn handle_versions_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-
+    fn handle_versions_checked(&mut self, values: Vec<(Key, Value)>) -> Turn {
         if !values.is_empty() {
-            return self.emit_error(DeleteBucketError::NotEmpty);
+            return Err(DeleteBucketError::NotEmpty);
         }
-
-        self.state = DeleteBucketState::CheckMultipartUploads;
+        let state = DeleteBucketState::CheckMultipartUploads;
         // A member bucket's open uploads are all in its set's upload inventory.
         if let Some(member) = self.member.as_ref() {
-            return smallvec![Effect::Storage(StorageEffect::Iter {
-                key_space: UPLOAD_INVENTORY_KEYSPACE.to_string(),
-                prefix: Some(member.set_id.to_bytes().to_vec().into()),
-                start: None,
-                limit: 1,
-                txn_id: self.txn_id,
-            })];
+            let prefix = member.set_id.to_bytes().to_vec();
+            return self.page(state, UPLOAD_INVENTORY_KEYSPACE, prefix, (None, 1));
         }
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
+        self.page(state, UPLOAD_KEYSPACE, Vec::new(), (None, usize::MAX))
     }
 
-    fn uploads_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-
+    fn uploads_checked(&mut self, values: Vec<(Key, Value)>) -> Turn {
         if self.member.is_some() && !values.is_empty() {
-            return self.emit_error(DeleteBucketError::NotEmpty);
+            return Err(DeleteBucketError::NotEmpty);
         }
         for (_, value) in values {
             let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
                 continue;
             };
             if upload.bucket == self.bucket {
-                return self.emit_error(DeleteBucketError::NotEmpty);
+                return Err(DeleteBucketError::NotEmpty);
             }
         }
-
         self.scan_relationships(false, None)
     }
 
-    fn scan_relationships(&mut self, incoming: bool, start: Option<Key>) -> Effects {
-        self.state = if incoming {
-            DeleteBucketState::ScanInRelationships
-        } else {
-            DeleteBucketState::ScanOutRelationships
+    fn scan_relationships(&mut self, incoming: bool, start: Option<Key>) -> Turn {
+        let (state, space) = match incoming {
+            true => (
+                DeleteBucketState::ScanInRelationships,
+                RELATIONSHIP_IN_KEYSPACE,
+            ),
+            false => (
+                DeleteBucketState::ScanOutRelationships,
+                RELATIONSHIP_OUT_KEYSPACE,
+            ),
         };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: if incoming {
-                RELATIONSHIP_IN_KEYSPACE.to_string()
-            } else {
-                RELATIONSHIP_OUT_KEYSPACE.to_string()
-            },
-            prefix: Some(sync_relationship_prefix(&self.bucket).into()),
-            start: start.map(aruna_core::effects::IterStart::After),
-            limit: Self::SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+        let prefix = sync_relationship_prefix(&self.bucket);
+        self.page(state, space, prefix, (start, Self::SCAN_LIMIT))
     }
 
-    fn handle_relationship_scan(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
+    fn handle_relationship_scan(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
         let incoming = self.state == DeleteBucketState::ScanInRelationships;
-        let key_space = if incoming {
-            RELATIONSHIP_IN_KEYSPACE
-        } else {
-            RELATIONSHIP_OUT_KEYSPACE
+        let key_space = match incoming {
+            true => RELATIONSHIP_IN_KEYSPACE,
+            false => RELATIONSHIP_OUT_KEYSPACE,
         };
         for (key, value) in values {
-            let relationship = match SyncRelationship::from_bytes(&value) {
-                Ok(relationship)
-                    if key.as_ref()
-                        == sync_relationship_key(&self.bucket, relationship.id).as_slice() =>
-                {
-                    relationship
-                }
-                Ok(_) => {
-                    return self.emit_error(
-                        ConversionError::FromStrError(
-                            "sync relationship key does not match payload".to_string(),
-                        )
-                        .into(),
-                    );
-                }
-                Err(error) => return self.emit_error(error.into()),
-            };
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            if key.as_ref() != sync_relationship_key(&self.bucket, relationship.id).as_slice() {
+                let mismatch = "sync relationship key does not match payload".to_string();
+                return Err(ConversionError::FromStrError(mismatch).into());
+            }
             self.relationship_deletes.push((key_space.to_string(), key));
-            if !self
-                .relationships
-                .iter()
-                .any(|existing| existing.id == relationship.id)
-            {
+            if !(self.relationships.iter()).any(|existing| existing.id == relationship.id) {
                 self.relationships.push(relationship);
             }
         }
-        if let Some(start) = next_start_after {
+        if let Some(start) = next {
             return self.scan_relationships(incoming, Some(start));
         }
         if !incoming {
             return self.scan_relationships(true, None);
         }
-
-        if !self.relationships.is_empty() {
-            let writes = match self
-                .relationships
-                .iter()
-                .map(|relationship| mirror_delete_entry(relationship, unix_timestamp_millis()))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(writes) => writes,
-                Err(error) => return self.emit_error(error.into()),
-            };
-            self.state = DeleteBucketState::WriteRepairs;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: self.txn_id,
-            })];
+        if self.relationships.is_empty() {
+            return self.read_encryption();
         }
-
-        self.read_encryption()
+        let writes = (self.relationships.iter())
+            .map(|relationship| mirror_delete_entry(relationship, unix_timestamp_millis()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.call(DeleteBucketState::WriteRepairs, IoCall::Write(writes))
     }
 
-    fn read_encryption(&mut self) -> Effects {
-        self.state = DeleteBucketState::ReadEncryption;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+    fn read_encryption(&mut self) -> Turn {
+        let read = read_row(BUCKET_ENCRYPTION_KEYSPACE, self.bucket.as_bytes().to_vec());
+        self.call(DeleteBucketState::ReadEncryption, read)
     }
 
-    fn encryption_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
-        match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => self.bucket_id = settings.bucket_id,
-            Err(error) => return self.emit_error(error.into()),
-        }
+    fn encryption_read(&mut self, value: Option<Value>) -> Turn {
+        self.bucket_id = BucketEncryption::from_row(value.as_deref())?.bucket_id;
         self.key_spaces = vec![
             KEY_COPY_KEYSPACE,
             BUCKET_HOLDER_KEYSPACE,
@@ -450,95 +297,57 @@ impl DeleteBucketOperation {
         self.scan_key_rows(None)
     }
 
-    fn scan_key_rows(&mut self, start: Option<Key>) -> Effects {
+    fn scan_key_rows(&mut self, start: Option<Key>) -> Turn {
         let (Some(bucket_id), Some(key_space)) = (self.bucket_id, self.key_spaces.last()) else {
             return self.scan_links(None);
         };
-        self.state = DeleteBucketState::ScanKeyRows;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(bucket_id.to_bytes().to_vec().into()),
-            start: start.map(aruna_core::effects::IterStart::After),
-            limit: Self::SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+        let (space, prefix) = (*key_space, bucket_id.to_bytes().to_vec());
+        let state = DeleteBucketState::ScanKeyRows;
+        self.page(state, space, prefix, (start, Self::SCAN_LIMIT))
     }
 
-    fn key_rows_scanned(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-        let Some(&key_space) = self.key_spaces.last() else {
-            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
-        };
+    fn key_rows_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        let key_space = self.key_spaces.last().copied();
+        let key_space = key_space.ok_or(DeleteBucketError::DeleteBucketFailed)?;
         for (key, value) in values {
             // A node-managed key also leaves its node vault row.
             if key_space == BUCKET_KEY_KEYSPACE {
-                match BucketKeyRecord::from_bytes(value.as_ref()) {
-                    Ok(record) => {
-                        let entries = record.vault_entry.into_iter();
-                        let vault = entries.map(|id| VaultEntry::new(VaultPurpose::BucketKey, id));
-                        self.key_deletes
-                            .extend(vault.map(|entry| {
-                                (NODE_VAULT_KEYSPACE.to_string(), entry.key().into())
-                            }));
-                    }
-                    Err(error) => return self.emit_error(error.into()),
-                }
+                let record = BucketKeyRecord::from_bytes(value.as_ref())?;
+                let entries = record.vault_entry.into_iter();
+                let vault = entries.map(|id| VaultEntry::new(VaultPurpose::BucketKey, id));
+                let vault =
+                    vault.map(|entry| (NODE_VAULT_KEYSPACE.to_string(), entry.key().into()));
+                self.key_deletes.extend(vault);
             }
             self.key_deletes.push((key_space.to_string(), key));
         }
-        if next_start_after.is_none() {
+        if next.is_none() {
             self.key_spaces.pop();
         }
-        self.scan_key_rows(next_start_after)
+        self.scan_key_rows(next)
     }
 
-    fn scan_links(&mut self, start: Option<Key>) -> Effects {
-        let Some(group_id) = self.group_id else {
-            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
-        };
-        self.state = DeleteBucketState::ScanLinks;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            prefix: Some(group_id.to_bytes().to_vec().into()),
-            start: start.map(aruna_core::effects::IterStart::After),
-            limit: Self::SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+    fn scan_links(&mut self, start: Option<Key>) -> Turn {
+        let group_id = self.group_id.ok_or(DeleteBucketError::DeleteBucketFailed)?;
+        let prefix = group_id.to_bytes().to_vec();
+        let state = DeleteBucketState::ScanLinks;
+        self.page(
+            state,
+            BACKEND_IMPORT_KEYSPACE,
+            prefix,
+            (start, Self::SCAN_LIMIT),
+        )
     }
 
-    fn links_scanned(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
+    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
         for (_, value) in values {
-            match BackendImport::from_bytes(&value) {
-                Ok(rule) if rule.bucket == self.bucket && rule.mapped_bucket().is_some() => {
-                    self.links.push(rule);
-                }
-                Ok(_) => {}
-                Err(error) => return self.emit_error(error.into()),
+            let rule = BackendImport::from_bytes(&value)?;
+            if rule.bucket == self.bucket && rule.mapped_bucket().is_some() {
+                self.links.push(rule);
             }
         }
-        if next_start_after.is_some() {
-            return self.scan_links(next_start_after);
+        if next.is_some() {
+            return self.scan_links(next);
         }
         if self.links.is_empty() {
             return self.delete_bucket_records();
@@ -546,35 +355,23 @@ impl DeleteBucketOperation {
         let mut backends: Vec<_> = self.links.iter().map(|rule| rule.backend_id).collect();
         backends.sort_unstable();
         backends.dedup();
-        self.state = DeleteBucketState::ReadStorages;
         let reads = backends.into_iter().map(|backend_id| {
             let key = crate::groups::backends::backend_key(backend_id);
             (STORAGE_BACKEND_KEYSPACE.to_string(), key)
         });
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: reads.collect(),
-            txn_id: self.txn_id,
-        })]
+        self.call(
+            DeleteBucketState::ReadStorages,
+            IoCall::Read(reads.collect()),
+        )
     }
 
     /// Drops the links with a removal mark for their rows. A provider bucket that Aruna created
     /// on a `delete_empty` storage turns `deleting`, and its mark deletes it once it is empty.
-    fn storages_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn storages_read(&mut self, values: Vec<Option<Value>>) -> Turn {
         let mut writes: Vec<(String, Key, Value)> = Vec::new();
         let mut providers = Vec::new();
-        for (_, value) in values {
-            let Some(value) = value else { continue };
-            let mut record = match GroupStorage::from_bytes(&value) {
-                Ok(record) => record,
-                Err(error) => return self.emit_error(error.into()),
-            };
+        for value in values.into_iter().flatten() {
+            let mut record = GroupStorage::from_bytes(&value)?;
             let links = self
                 .links
                 .iter()
@@ -597,10 +394,7 @@ impl DeleteBucketOperation {
                     bucket,
                 });
             }
-            match crate::groups::backends::record_writes(&record) {
-                Ok(rows) => writes.extend(rows),
-                Err(error) => return self.emit_error(error.into()),
-            }
+            writes.extend(crate::groups::backends::record_writes(&record)?);
         }
         for rule in &self.links {
             let mark: Key = rule.import_id.to_bytes().to_vec().into();
@@ -612,25 +406,17 @@ impl DeleteBucketOperation {
                 bucket: rule.bucket.clone(),
                 cleanup: cleanup.cloned(),
             };
-            let value = match removal.to_bytes() {
-                Ok(value) => value,
-                Err(error) => return self.emit_error(error.into()),
-            };
+            let value = removal.to_bytes()?;
             writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, value.into()));
             self.key_deletes
                 .push((BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()));
             self.key_deletes
                 .push((IMPORT_DISCOVERY_KEYSPACE.to_string(), rule.key()));
         }
-        self.state = DeleteBucketState::WriteLinks;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        self.call(DeleteBucketState::WriteLinks, IoCall::Write(writes))
     }
 
-    fn delete_bucket_records(&mut self) -> Effects {
-        self.state = DeleteBucketState::DeleteBucket;
+    fn delete_bucket_records(&mut self) -> Turn {
         let bucket = self.bucket.as_bytes().to_vec();
         let mut deletes = vec![
             (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
@@ -661,114 +447,63 @@ impl DeleteBucketOperation {
         }
         deletes.append(&mut self.relationship_deletes);
         deletes.append(&mut self.key_deletes);
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: self.txn_id,
-        })]
+        self.call(DeleteBucketState::DeleteBucket, IoCall::Delete(deletes))
     }
 
-    fn handle_repairs_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: (event).label(),
-            });
+    fn handle_bucket_deleted(&mut self) -> Turn {
+        let group_id = self.group_id.ok_or(DeleteBucketError::DeleteBucketFailed)?;
+        let delta = UsageDelta {
+            buckets: -1,
+            ..Default::default()
         };
-        self.read_encryption()
-    }
-
-    fn handle_bucket_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(DeleteBucketError::TransactionMissing);
-        };
-        let Some(group_id) = self.group_id else {
-            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
-        };
-
-        let mut update = UsageCounterUpdate::for_group(
-            group_id,
-            UsageDelta {
-                buckets: -1,
-                ..Default::default()
-            },
-        );
-        self.state = DeleteBucketState::UpdateUsage;
-        let effects = update.start(txn_id);
+        let mut update = UsageCounterUpdate::for_group(group_id, delta);
+        let call = update.start_calls().into_call();
         self.usage_update = Some(update);
-        effects
+        self.call(DeleteBucketState::UpdateUsage, call)
     }
 
-    fn handle_usage_update(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(DeleteBucketError::TransactionMissing);
-        };
-        let Some(update) = self.usage_update.as_mut() else {
-            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.queue_trail(txn_id),
-            Err(err) => self.emit_error(err.into()),
+    fn handle_usage_update(&mut self, result: IoResult) -> Turn {
+        let update = self.usage_update.as_mut();
+        let update = update.ok_or(DeleteBucketError::DeleteBucketFailed)?;
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.queue_trail(),
         }
     }
 
     /// A bucket created again under the name must not meet this one's deletes; the cleanup
     /// queue drops them, a page at a time, and only those made until now.
-    fn queue_trail(&mut self, txn_id: TxnId) -> Effects {
-        let Some(group_id) = self.group_id else {
-            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
-        };
-        let row = ulid::Ulid::generate();
+    fn queue_trail(&mut self) -> Turn {
+        let group_id = self.group_id.ok_or(DeleteBucketError::DeleteBucketFailed)?;
         let work = BlobCleanupWork::DropTrail {
             group_id,
             bucket: Some(self.bucket.clone()),
             incarnation: self.incarnation,
         };
-        let value = match work.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        self.state = DeleteBucketState::QueueTrail;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: row.to_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            ulid::Ulid::generate().to_bytes().to_vec().into(),
+            work.to_bytes()?.into(),
+        );
+        self.call(DeleteBucketState::QueueTrail, IoCall::Write(vec![row]))
     }
 
-    fn read_members(&mut self, txn_id: TxnId) -> Effects {
+    fn read_members(&mut self) -> Turn {
         let Some(group_id) = self.group_id.filter(|_| self.notices.is_some()) else {
-            return self.commit(txn_id);
+            return self.deleted();
         };
-        self.state = DeleteBucketState::ReadMembers;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key: group_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
+        let read = read_row(AUTH_KEYSPACE, group_id.to_bytes().to_vec());
+        self.call(DeleteBucketState::ReadMembers, read)
     }
 
-    fn queue_notices(&mut self, value: Option<Value>, txn_id: TxnId) -> Effects {
+    fn queue_notices(&mut self, value: Option<Value>) -> Turn {
         let (Some((node_id, realm_id)), Some(group_id)) = (self.notices, self.group_id) else {
-            return self.commit(txn_id);
+            return self.deleted();
         };
-        let members = match value
+        let document = value
             .map(|value| GroupAuthorizationDocument::from_bytes(&value))
-            .transpose()
-        {
-            Ok(document) => document.map(|document| group_members(&document, realm_id)),
-            Err(error) => return self.emit_error(error.into()),
-        };
+            .transpose()?;
+        let members = document.map(|document| group_members(&document, realm_id));
         let mut writes = Vec::new();
         for member in members.unwrap_or_default() {
             let kind = NotificationKind::BucketDeleted {
@@ -783,161 +518,107 @@ impl DeleteBucketOperation {
                 kind,
                 outbox_id.timestamp_ms(),
             );
-            match outbox_write_entry(&NotificationOutboxRecord { outbox_id, record }) {
-                Ok(entry) => writes.push(entry),
-                Err(error) => return self.emit_error(error.into()),
-            }
+            writes.push(outbox_write_entry(&NotificationOutboxRecord {
+                outbox_id,
+                record,
+            })?);
         }
         if writes.is_empty() {
-            return self.commit(txn_id);
+            return self.deleted();
         }
         self.notified = true;
-        self.state = DeleteBucketState::QueueNotices;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.call(DeleteBucketState::QueueNotices, IoCall::Write(writes))
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = DeleteBucketState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(DeleteBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = None;
-        self.state = DeleteBucketState::Finish;
-        self.output = Some(Ok(()));
-        let mut effects = smallvec![schedule_snapshot_publish()];
+    /// The wakes that follow the commit.
+    fn deleted(&mut self) -> Turn {
+        let mut calls: Vec<IoCall> = vec![schedule_snapshot_publish().into()];
         if self.notified {
-            effects.push(schedule_drain_effect());
+            calls.push(schedule_drain_effect().into());
         }
         // The registry frees the slots of the deleted bucket id; nothing can read it any more.
         if let Some(bucket_id) = self.bucket_id {
-            effects.push(Effect::Blob(BlobEffect::LockKey {
+            let lock = BlobEffect::LockKey {
                 bucket_id,
                 session: None,
-            }));
+            };
+            calls.push(Effect::Blob(lock).into());
         }
+        let wake = |key| {
+            let after = std::time::Duration::ZERO;
+            IoCall::from(Effect::Task(TaskEffect::ShortenTimer { key, after }))
+        };
         if !self.relationships.is_empty() {
-            effects.push(Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::DrainMirrorRepair,
-                after: std::time::Duration::ZERO,
-            }));
+            calls.push(wake(TaskKey::DrainMirrorRepair));
         }
         // The import schedule purges the object rows of the removed links.
         if !self.links.is_empty() {
-            effects.push(Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::RunBackendImports,
-                after: std::time::Duration::ZERO,
-            }));
+            calls.push(wake(TaskKey::RunBackendImports));
         }
-        effects
+        Ok(Next::Then { output: (), calls })
     }
 }
 
-impl EffectOperation for DeleteBucketOperation {
+impl Operation for DeleteBucketOperation {
     type Output = ();
     type Error = DeleteBucketError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Turn {
+        let key: Key = self.bucket.as_bytes().into();
+        let reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_CREATION_KEYSPACE.to_string(), key),
+        ];
+        self.call(DeleteBucketState::ReadBucket, IoCall::Read(reads))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
+    fn next(&mut self, result: IoResult) -> Turn {
         match self.state {
-            DeleteBucketState::Init => self.handle_init(),
-            DeleteBucketState::StartTransaction => self.handle_transaction_started(event),
-            DeleteBucketState::ReadBucket => self.handle_bucket_read(event),
-            DeleteBucketState::CheckCurrentObjects => self.objects_checked(event),
-            DeleteBucketState::CheckVersions => self.handle_versions_checked(event),
-            DeleteBucketState::CheckMultipartUploads => self.uploads_checked(event),
+            DeleteBucketState::ReadBucket => self.handle_bucket_read(result.values()?),
+            DeleteBucketState::CheckCurrentObjects => self.objects_checked(result.page()?.0),
+            DeleteBucketState::CheckVersions => self.handle_versions_checked(result.page()?.0),
+            DeleteBucketState::CheckMultipartUploads => self.uploads_checked(result.page()?.0),
             DeleteBucketState::ScanOutRelationships | DeleteBucketState::ScanInRelationships => {
-                self.handle_relationship_scan(event)
+                let (rows, next) = result.page()?;
+                self.handle_relationship_scan(rows, next)
             }
-            DeleteBucketState::WriteRepairs => self.handle_repairs_written(event),
-            DeleteBucketState::ReadEncryption => self.encryption_read(event),
-            DeleteBucketState::ScanKeyRows => self.key_rows_scanned(event),
-            DeleteBucketState::ScanLinks => self.links_scanned(event),
-            DeleteBucketState::ReadStorages => self.storages_read(event),
-            DeleteBucketState::WriteLinks => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    self.delete_bucket_records()
-                }
-                received => self.emit_error(DeleteBucketError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                    received: received.label(),
-                }),
-            },
-            DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
-            DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
-            DeleteBucketState::QueueTrail => match (event, self.txn_id) {
-                (Event::Storage(StorageEvent::WriteResult { .. }), Some(txn_id)) => {
-                    self.read_members(txn_id)
-                }
-                (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::WriteResult)",
-                    received: (event).label(),
-                }),
-            },
-            DeleteBucketState::ReadMembers => match (event, self.txn_id) {
-                (Event::Storage(StorageEvent::ReadResult { value, .. }), Some(txn_id)) => {
-                    self.queue_notices(value, txn_id)
-                }
-                (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::ReadResult)",
-                    received: (event).label(),
-                }),
-            },
-            DeleteBucketState::QueueNotices => match (event, self.txn_id) {
-                (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(txn_id)) => {
-                    self.commit(txn_id)
-                }
-                (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                    received: (event).label(),
-                }),
-            },
-            DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
-            DeleteBucketState::Finish => smallvec![],
-            DeleteBucketState::Error => smallvec![],
+            DeleteBucketState::WriteRepairs => {
+                result.done()?;
+                self.read_encryption()
+            }
+            DeleteBucketState::ReadEncryption => self.encryption_read(result.value()?),
+            DeleteBucketState::ScanKeyRows => {
+                let (rows, next) = result.page()?;
+                self.key_rows_scanned(rows, next)
+            }
+            DeleteBucketState::ScanLinks => {
+                let (rows, next) = result.page()?;
+                self.links_scanned(rows, next)
+            }
+            DeleteBucketState::ReadStorages => self.storages_read(result.values()?),
+            DeleteBucketState::WriteLinks => {
+                result.done()?;
+                self.delete_bucket_records()
+            }
+            DeleteBucketState::DeleteBucket => {
+                result.done()?;
+                self.handle_bucket_deleted()
+            }
+            DeleteBucketState::UpdateUsage => self.handle_usage_update(result),
+            DeleteBucketState::QueueTrail => {
+                result.done()?;
+                self.read_members()
+            }
+            DeleteBucketState::ReadMembers => self.queue_notices(result.value()?),
+            DeleteBucketState::QueueNotices => {
+                result.done()?;
+                self.deleted()
+            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            DeleteBucketState::Finish | DeleteBucketState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(DeleteBucketError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -1028,84 +709,68 @@ mod link_tests {
         record.to_bytes().unwrap().into()
     }
 
-    fn empty() -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        })
+    fn empty() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
     }
 
-    fn written() -> Event {
-        Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
+    fn call(turn: Turn) -> IoCall {
+        match turn {
+            Ok(Next::Call(call)) => call,
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    /// Whether `calls` wake the task `key`.
+    fn wakes(calls: &[IoCall], key: TaskKey) -> bool {
+        calls.iter().any(|call| {
+            matches!(call, IoCall::Effect(effect)
+                if matches!(&**effect, Effect::Task(TaskEffect::ShortenTimer { key: woken, .. })
+                    if *woken == key))
         })
     }
 
     /// Deletes bucket `x` linked to `team-a-x`; answers the link writes, the deletes and the
-    /// effects after the commit.
-    type Deleted = (Vec<(String, Key, Value)>, Vec<(String, Key)>, Effects);
+    /// calls after the commit.
+    type Deleted = (Vec<(String, Key, Value)>, Vec<(String, Key)>, Vec<IoCall>);
 
     fn delete(mode: &str) -> Deleted {
-        let txn_id = TxnId::default();
         let mut operation = DeleteBucketOperation::new("x".to_string());
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), Some(bucket())),
-                (Key::from(Vec::new()), None),
-            ],
-        }));
+        operation.first().unwrap();
+        let read = IoResult::Values(vec![Some(bucket()), None]);
+        operation.next(read).unwrap();
         for _ in 0..5 {
-            operation.step(empty());
+            operation.next(empty()).unwrap();
         }
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
+        operation.next(IoResult::Values(vec![None])).unwrap();
         let link = (rule().key(), rule().to_bytes().unwrap().into());
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![link],
-            next_start_after: None,
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(Vec::new()), Some(storage(mode)))],
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the link writes, got {effects:?}");
+        let rows = vec![link];
+        operation.next(IoResult::Page { rows, next: None }).unwrap();
+        let read = IoResult::Values(vec![Some(storage(mode))]);
+        let IoCall::Write(writes) = call(operation.next(read)) else {
+            panic!("expected the link writes");
         };
-        let writes = writes.clone();
-        let effects = operation.step(written());
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("expected the deletes, got {effects:?}");
+        let IoCall::Delete(deletes) = call(operation.next(IoResult::Done)) else {
+            panic!("expected the deletes");
         };
-        let deletes = deletes.clone();
-        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(written());
-        let effects = operation.step(written());
+        operation.next(IoResult::Done).unwrap();
+        operation.next(IoResult::Done).unwrap();
         // The bucket's delete trail is queued for removal with the delete.
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the trail drop, got {effects:?}");
+        let IoCall::Write(trail) = call(operation.next(IoResult::Done)) else {
+            panic!("expected the trail drop");
+        };
+        let [(key_space, _, value)] = trail.as_slice() else {
+            panic!("expected one trail row, got {trail:?}");
         };
         assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
         let work = BlobCleanupWork::from_bytes(value).unwrap();
         assert!(matches!(work, BlobCleanupWork::DropTrail { bucket: Some(ref b), .. } if b == "x"));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert_eq!(operation.finalize(), Ok(()));
-        (writes, deletes, effects)
+        let Ok(Next::Then { calls, .. }) = operation.next(IoResult::Done) else {
+            panic!("expected the end of the delete");
+        };
+        (writes, deletes, calls)
     }
 
     /// Members of the serving realm each get one bucket deletion record, drained after commit.
@@ -1127,30 +792,24 @@ mod link_tests {
             user_id: first,
             realm_id: realm,
         };
-        let txn_id = TxnId::default();
         let mut operation =
             DeleteBucketOperation::new("x".to_string()).purge_notices(Some((node_id, realm)));
-        operation.txn_id = Some(txn_id);
         operation.group_id = Some(GROUP);
         operation.state = DeleteBucketState::QueueTrail;
 
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
-        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
-        else {
-            panic!("expected the group read, got {effects:?}");
+        let IoCall::Read(reads) = call(operation.next(IoResult::Done)) else {
+            panic!("expected the group read");
+        };
+        let [(key_space, key)] = reads.as_slice() else {
+            panic!("expected one read, got {reads:?}");
         };
         assert_eq!(
             (key_space.as_str(), key.as_ref()),
             (AUTH_KEYSPACE, &GROUP.to_bytes()[..])
         );
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: key.clone(),
-            value: Some(document.to_bytes(&actor).unwrap().into()),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the outbox rows, got {effects:?}");
+        let document = Some(document.to_bytes(&actor).unwrap().into());
+        let IoCall::Write(writes) = call(operation.next(IoResult::Values(vec![document]))) else {
+            panic!("expected the outbox rows");
         };
         let mut recipients: Vec<UserId> = writes
             .iter()
@@ -1167,18 +826,11 @@ mod link_tests {
             .collect();
         recipients.sort();
         assert_eq!(recipients, vec![first, second]);
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        );
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(effects.contains(&schedule_drain_effect()), "{effects:?}");
-        assert_eq!(operation.finalize(), Ok(()));
+        let Ok(Next::Then { calls, .. }) = operation.next(IoResult::Done) else {
+            panic!("expected the end of the delete");
+        };
+        let drain = IoCall::from(schedule_drain_effect());
+        assert!(calls.contains(&drain), "{calls:?}");
     }
 
     /// The provider bucket the link's removal mark still has to delete.
@@ -1192,7 +844,7 @@ mod link_tests {
 
     #[test]
     fn deletes_empty_provider() {
-        let (writes, deletes, effects) = delete("delete_empty");
+        let (writes, deletes, calls) = delete("delete_empty");
         assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
         assert!(deletes.contains(&(IMPORT_DISCOVERY_KEYSPACE.to_string(), rule().key())));
         let marker = (RENAME_MOVE_KEYSPACE.to_string(), b"x".to_vec().into());
@@ -1213,13 +865,7 @@ mod link_tests {
             bucket: "team-a-x".to_string(),
         };
         assert_eq!(mark_cleanup(&writes), Some(cleanup));
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::RunBackendImports,
-                ..
-            })
-        )));
+        assert!(wakes(&calls, TaskKey::RunBackendImports));
     }
 
     #[test]
@@ -1363,38 +1009,23 @@ mod test {
             distribution: Some(binding.clone()),
         };
         let mut operation = DeleteBucketOperation::new("spire".to_string()).bound_to(binding);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([7; 16]),
-        }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"spire".to_vec().into(),
-                    Some(info.to_bytes().unwrap().into()),
-                ),
-                (b"spire".to_vec().into(), None),
-            ],
-        }));
-        let empty = || {
-            Event::Storage(StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            })
+        operation.first().unwrap();
+        let read = IoResult::Values(vec![Some(info.to_bytes().unwrap().into()), None]);
+        operation.next(read).unwrap();
+        let empty = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
         };
-        operation.step(empty());
-        let effects = operation.step(empty());
+        operation.next(empty()).unwrap();
+        let turn = operation.next(empty());
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, limit: 1, prefix: Some(_), .. })]
-                if key_space == UPLOAD_INVENTORY_KEYSPACE
+            turn,
+            Ok(Next::Call(IoCall::Page { space, limit: 1, .. }))
+                if space == UPLOAD_INVENTORY_KEYSPACE
         ));
-        let row = (vec![3; 20].into(), Vec::new().into());
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![row],
-            next_start_after: None,
-        }));
-        assert_eq!(operation.output, Some(Err(DeleteBucketError::NotEmpty)));
+        let rows = vec![(vec![3; 20].into(), Vec::new().into())];
+        let turn = operation.next(IoResult::Page { rows, next: None });
+        assert_eq!(turn.err(), Some(DeleteBucketError::NotEmpty));
     }
 
     #[tokio::test]
@@ -1504,15 +1135,14 @@ mod test {
         let mut operation = DeleteBucketOperation::new("bucket".to_string());
         let bucket_id = Ulid::generate();
         operation.bucket_id = Some(bucket_id);
-        operation.state = DeleteBucketState::CommitTransaction;
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::generate(),
-        }));
-        let lock = Effect::Blob(BlobEffect::LockKey {
+        let Ok(Next::Then { calls, .. }) = operation.deleted() else {
+            panic!("expected the end of the delete");
+        };
+        let lock = IoCall::from(Effect::Blob(BlobEffect::LockKey {
             bucket_id,
             session: None,
-        });
-        assert!(effects.contains(&lock), "{effects:?}");
+        }));
+        assert!(calls.contains(&lock), "{calls:?}");
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
     ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
-    ProfileValidationStatus, is_rocrate_specification,
+    ProfileValidationStatus,
 };
 use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

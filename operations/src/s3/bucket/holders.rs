@@ -7,15 +7,14 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::VaultQuery;
-use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
+use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 
 /// How long one key directory lookup may wait for the holders of a user's vault.
 const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);
@@ -66,15 +65,16 @@ impl LookupKeysOperation {
             query: VaultQuery::Keys,
             deadline: KEY_LOOKUP_DEADLINE,
         };
-        let read = ReadVaultOperation::new(config);
-        Next::Call(IoCall::Child(boxed_suboperation(read, |result| {
-            let lookup = match result {
-                Ok(VaultRecords::Keys(keys)) if keys.is_empty() => KeyLookup::Missing,
-                Ok(VaultRecords::Keys(keys)) => KeyLookup::Keys(keys),
-                Ok(VaultRecords::Heads(_)) | Err(_) => KeyLookup::Unavailable,
-            };
-            Event::SubOperation(SubOperationEvent::KeysLooked { lookup })
-        })))
+        Next::Call(IoCall::child(ReadVaultOperation::new(config)))
+    }
+}
+
+/// A failed or odd answer counts as unavailable, never as a user without keys.
+fn lookup_of(result: Result<VaultRecords, ReadVaultError>) -> KeyLookup {
+    match result {
+        Ok(VaultRecords::Keys(keys)) if keys.is_empty() => KeyLookup::Missing,
+        Ok(VaultRecords::Keys(keys)) => KeyLookup::Keys(keys),
+        Ok(VaultRecords::Heads(_)) | Err(_) => KeyLookup::Unavailable,
     }
 }
 
@@ -87,15 +87,13 @@ impl Operation for LookupKeysOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Lookups>, LookupError> {
-        let event = result.event()?;
-        let (Some(user_id), Event::SubOperation(SubOperationEvent::KeysLooked { lookup })) =
-            (self.asked.take(), event)
-        else {
-            let got = "an event other than the asked key lookup";
-            let expected = "SubOperationEvent::KeysLooked";
+        let looked = result.child::<VaultRecords, ReadVaultError>()?;
+        let Some(user_id) = self.asked.take() else {
+            let got = "a key lookup nobody asked for";
+            let expected = "the asked key lookup";
             return Err(IoError::Unexpected { expected, got }.into());
         };
-        self.lookups.insert(user_id, lookup);
+        self.lookups.insert(user_id, lookup_of(looked));
         Ok(self.ask_next())
     }
 }
@@ -105,6 +103,7 @@ mod tests {
     use super::*;
     use crate::testing::test_context;
     use crate::tests::s3::test_storage;
+    use aruna_core::calls::ChildOutcome;
     use ulid::Ulid;
 
     fn user(seed: u8) -> UserId {
@@ -115,10 +114,16 @@ mod tests {
         iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
-    fn looked(lookup: KeyLookup) -> IoResult {
-        IoResult::Event(Box::new(Event::SubOperation(
-            SubOperationEvent::KeysLooked { lookup },
-        )))
+    fn looked(result: Result<VaultRecords, ReadVaultError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn no_keys() -> Result<VaultRecords, ReadVaultError> {
+        Ok(VaultRecords::Keys(Vec::new()))
+    }
+
+    fn unanswered() -> Result<VaultRecords, ReadVaultError> {
+        Err(ReadVaultError::Unavailable("down".to_string()))
     }
 
     #[test]
@@ -129,9 +134,9 @@ mod tests {
             operation.first(),
             Ok(Next::Call(IoCall::Child(_)))
         ));
-        let next = operation.next(looked(KeyLookup::Missing));
+        let next = operation.next(looked(no_keys()));
         assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
-        let Ok(Next::Done(lookups)) = operation.next(looked(KeyLookup::Unavailable)) else {
+        let Ok(Next::Done(lookups)) = operation.next(looked(unanswered())) else {
             panic!("expected the lookups");
         };
         assert_eq!(lookups.get(&user(1)), Some(&KeyLookup::Missing));
@@ -148,7 +153,7 @@ mod tests {
     fn rejects_unasked_answer() {
         // An answer nobody asked for is refused.
         let mut fresh = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), [user(1)]);
-        assert!(fresh.next(looked(KeyLookup::Missing)).is_err());
+        assert!(fresh.next(looked(no_keys())).is_err());
         let mut asking = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), [user(1)]);
         let _ = asking.first();
         assert!(asking.next(IoResult::Done).is_err());

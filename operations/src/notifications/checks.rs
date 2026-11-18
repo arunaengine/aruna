@@ -4,7 +4,6 @@
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
@@ -483,44 +482,23 @@ pub(crate) fn batch_realm(records: &[NotificationRecord]) -> Result<RealmId, Str
 
 // The recipient realm is peer-asserted; an empty DeliverBatch has no record to
 // derive it from and must be rejected before any indexing.
-pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, String> {
-    match message {
-        NotificationTransportMessage::DeliverBatch { records } => batch_realm(records),
-        NotificationTransportMessage::List { recipient, .. }
-        | NotificationTransportMessage::UnreadCount { recipient }
-        | NotificationTransportMessage::MarkRead { recipient, .. } => Ok(recipient.realm_id),
-        NotificationTransportMessage::CreateWatch { owner, .. }
-        | NotificationTransportMessage::DeleteWatch { owner, .. }
-        | NotificationTransportMessage::ListWatches { owner } => Ok(owner.realm_id),
-        NotificationTransportMessage::DeliverWatchEvents { events } => {
-            let Some(first) = events.first() else {
-                return Err("empty batch".to_string());
-            };
-            if events.len() > EVENT_BATCH_SIZE {
-                return Err(format!(
-                    "watch event batch count {} exceeds cap {}",
-                    events.len(),
-                    EVENT_BATCH_SIZE
-                ));
-            }
-            let realm_id = first.realm_id;
-            if events.iter().any(|event| event.realm_id != realm_id) {
-                return Err("mixed-realm batch".to_string());
-            }
-            Ok(realm_id)
-        }
-        NotificationTransportMessage::DeliverAck { .. }
-        | NotificationTransportMessage::ListResult { .. }
-        | NotificationTransportMessage::UnreadCountResult { .. }
-        | NotificationTransportMessage::MarkReadResult { .. }
-        | NotificationTransportMessage::Reject(_)
-        | NotificationTransportMessage::WatchCreated { .. }
-        | NotificationTransportMessage::WatchDeleted
-        | NotificationTransportMessage::WatchList { .. }
-        | NotificationTransportMessage::WatchEventsAck { .. } => {
-            Err("unexpected notification control message".to_string())
-        }
+/// The one realm of a watch event batch within the batch cap.
+pub(crate) fn events_realm(events: &[WatchEvent]) -> Result<RealmId, String> {
+    let Some(first) = events.first() else {
+        return Err("empty batch".to_string());
+    };
+    if events.len() > EVENT_BATCH_SIZE {
+        return Err(format!(
+            "watch event batch count {} exceeds cap {}",
+            events.len(),
+            EVENT_BATCH_SIZE
+        ));
     }
+    let realm_id = first.realm_id;
+    if events.iter().any(|event| event.realm_id != realm_id) {
+        return Err("mixed-realm batch".to_string());
+    }
+    Ok(realm_id)
 }
 
 /// The stored realm config when `peer` may speak for the realm: only sync-eligible

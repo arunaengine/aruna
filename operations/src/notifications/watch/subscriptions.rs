@@ -1,94 +1,27 @@
-//! Creates and deletes the durable watch subscriptions on the holder node after the owner's
-//! READ check.
+//! Tests the durable watch subscriptions: the store, the per-owner cap and the listings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-};
-use aruna_core::structs::identity::auth::AuthContext;
-use ulid::Ulid;
-
-use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::authorization::evaluate_watch_creation;
-use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::records::{
-    WatchSubscriptionError, validated_subscription, watch_delete_replication,
-    watch_upsert_replication,
-};
-use crate::notifications::watch::store::StoreWatchOperation;
-
-/// The one holder-side create path, used by both the local API arm and the holder
-/// RPC. A proxying peer's assertion is not authority, so the holder re-derives
-/// the permission path and checks READ before any durable write.
-pub(crate) async fn create_holder_watch(
-    context: &DriverContext,
-    local_node_id: aruna_core::NodeId,
-    owner: UserId,
-    path_prefix: String,
-    event_mask: WatchEventMask,
-    authorization: WatchAuthorizationBinding,
-    now_ms: u64,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription =
-        validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
-    match evaluate_watch_creation(
-        context,
-        owner.realm_id,
-        &AuthContext {
-            user_id: owner,
-            realm_id: owner.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        &subscription.path_prefix,
-        subscription.event_mask,
-    )
-    .await
-    .map_err(WatchSubscriptionError::Storage)?
-    {
-        WatchAuthorization::Authorized => {}
-        WatchAuthorization::Denied(reason) => {
-            return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
-        }
-        WatchAuthorization::Unavailable(error) => {
-            return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
-        }
-    }
-    let replication = watch_upsert_replication(local_node_id, &subscription)?;
-    let store = StoreWatchOperation::create(subscription.clone(), Some(replication));
-    drive(store, context).await?;
-    Ok(subscription)
-}
-
-pub(crate) async fn delete_holder_watch(
-    context: &DriverContext,
-    local_node_id: aruna_core::NodeId,
-    owner: UserId,
-    watch_id: Ulid,
-    now_ms: u64,
-) -> Result<(), WatchSubscriptionError> {
-    let replication = watch_delete_replication(local_node_id, owner, watch_id, now_ms);
-    let store = StoreWatchOperation::delete(owner, watch_id, Some(replication));
-    drive(store, context).await.map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
     use crate::notifications::watch::listing::{
         ListWatchesOperation, SUBSCRIPTION_PAGE_LIMIT, WatchScope,
     };
+    use crate::notifications::watch::records::WatchSubscriptionError;
     use crate::notifications::watch::records::decode_stored_subscription;
+    use crate::tests::notifications::create_holder_watch;
     use crate::tests::notifications::{create_local_watch, delete_local_watch};
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::watch_write_entry;
     use aruna_core::structs::execution::notification_watch::WATCH_USER_CAP;
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    };
     use aruna_storage::StorageHandle;
+    use ulid::Ulid;
 
     async fn list_scope(
         storage: &StorageHandle,

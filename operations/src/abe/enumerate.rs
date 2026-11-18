@@ -13,22 +13,22 @@ const HEADS: usize = 1024;
 impl KeyOperation {
     /// Scans the current objects under `prefix` outside the transaction: a later write is never
     /// covered, so it need not conflict.
-    pub(super) fn list_heads(&mut self, prefix: &str) -> Effects {
+    pub(super) fn list_heads(&mut self, prefix: &str) -> KeyTurn {
         let Ok(start) = BlobHeadKey::object_prefix(&self.bucket, prefix) else {
             return self.fail(AbeError::Scope);
         };
         self.state = State::Heads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: Some(start.into()),
-            start: None,
+        let scan = IoCall::Page {
+            space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: start.into(),
+            after: None,
             limit: HEADS + 1,
-            txn_id: None,
-        })]
+        };
+        Ok(Next::Call(StagedCall::Outside(scan).into_call()))
     }
 
     /// Keeps the objects the recipient may read; more than one grant may name is refused.
-    pub(super) fn heads_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn heads_read(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let full = values.len() > HEADS;
         let mut heads = Vec::new();
         for (row, value) in values.into_iter().take(HEADS) {
@@ -64,9 +64,9 @@ impl KeyOperation {
     }
 
     /// Replaces each version id with its envelope id; versions without an envelope drop out.
-    pub(super) fn writes_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    pub(super) fn writes_read(&mut self, values: Vec<Option<Value>>) -> KeyTurn {
         let listed = std::mem::take(&mut self.listed);
-        for ((key, _), (_, id)) in listed.into_iter().zip(values) {
+        for ((key, _), id) in listed.into_iter().zip(values) {
             if let Some(id) = id.and_then(|id| <[u8; 16]>::try_from(id.as_ref()).ok()) {
                 self.listed.push((key, Ulid::from_bytes(id)));
             }
@@ -84,12 +84,12 @@ impl KeyOperation {
     }
 
     /// Groups the writes of the current parameters by their envelope epoch, one scope each.
-    pub(super) fn envelopes_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    pub(super) fn envelopes_read(&mut self, values: Vec<Option<Value>>) -> KeyTurn {
         let Some(parameters) = self.snapshot.as_ref().map(|s| s.parameters.clone()) else {
             return self.fail(KeyError::Missing);
         };
         let mut groups: BTreeMap<u64, Vec<(String, Ulid)>> = BTreeMap::new();
-        for ((key, id), (_, value)) in std::mem::take(&mut self.listed).into_iter().zip(values) {
+        for ((key, id), value) in std::mem::take(&mut self.listed).into_iter().zip(values) {
             let Some(Ok(envelope)) = value.map(|v| ObjectEnvelope::from_bytes(&v)) else {
                 continue;
             };
@@ -112,14 +112,13 @@ impl KeyOperation {
         self.read_keys()
     }
 
-    fn batch(&mut self, reads: Vec<(String, Key)>) -> Effects {
+    fn batch(&mut self, reads: Vec<(String, Key)>) -> KeyTurn {
         if reads.is_empty() {
             return self.envelopes_read(Vec::new());
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })]
+        Ok(Next::Call(
+            StagedCall::Outside(IoCall::Read(reads)).into_call(),
+        ))
     }
 }
 
@@ -128,6 +127,7 @@ mod tests {
     use super::*;
     use crate::auth::permission_rules::{CollectedRole, PermissionRules};
     use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::realm::RealmId;
@@ -208,10 +208,19 @@ mod tests {
         (row.into(), pointer.to_bytes().unwrap().into())
     }
 
-    fn read_keys(effects: &Effects) -> usize {
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] => reads.len(),
-            _ => panic!("one batch read: {effects:?}"),
+    /// The rows one read outside the transaction asks for.
+    fn read_keys(turn: KeyTurn) -> usize {
+        let Ok(Next::Call(IoCall::Child(mut child))) = turn else {
+            panic!("one outside read");
+        };
+        match child.start().as_slice() {
+            [
+                Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: None,
+                }),
+            ] => reads.len(),
+            other => panic!("one batch read: {other:?}"),
         }
     }
 
@@ -223,21 +232,14 @@ mod tests {
         let values = (heads.iter().enumerate())
             .map(|(index, key)| head(key, index as u8 + 1))
             .collect();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }));
-        assert_eq!(read_keys(&effects), 2);
+        let turn = operation.next(IoResult::Page {
+            rows: values,
+            next: None,
+        });
+        assert_eq!(read_keys(turn), 2);
         let write = Ulid::from_bytes([11; 16]);
-        let values = vec![
-            (
-                Key::from(Vec::new()),
-                Some(write.to_bytes().to_vec().into()),
-            ),
-            (Key::from(Vec::new()), None),
-        ];
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        assert_eq!(read_keys(&effects), 1);
+        let values = vec![Some(write.to_bytes().to_vec().into()), None];
+        assert_eq!(read_keys(operation.next(IoResult::Values(values))), 1);
         let parameters = operation.snapshot.as_ref().unwrap().parameters.clone();
         let plan = EnvelopePlan {
             parameters,
@@ -247,11 +249,8 @@ mod tests {
             bucket_public: [3; 32],
         };
         let (envelope, _) = create_envelope(plan).unwrap();
-        let values = vec![(
-            Key::from(Vec::new()),
-            Some(envelope.to_bytes().unwrap().into()),
-        )];
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let values = vec![Some(envelope.to_bytes().unwrap().into())];
+        operation.next(IoResult::Values(values)).unwrap();
         // One scope of the write's own epoch waits for the recipient's keys.
         assert_eq!(operation.state, State::Keys);
         let scope = KeyScope::Writes(vec![("foo/a".into(), write)]);
@@ -267,12 +266,11 @@ mod tests {
         let values = (0..=MAX_WRITES)
             .map(|index| head(&format!("foo/{index}"), index as u8 + 1))
             .collect();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Err(KeyError::Bound(1)));
+        let turn = operation.next(IoResult::Page {
+            rows: values,
+            next: None,
+        });
+        assert_eq!(turn, Err(KeyError::Bound(1)));
     }
 
     #[test]
@@ -424,27 +422,26 @@ mod tests {
         stale.request_id = Ulid::from_bytes([2; 16]);
         stale.bucket = "other".into();
         let values = vec![grant_row(&request), grant_row(&stale)];
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: values.clone(),
-            next_start_after: None,
-        }));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("one delete batch: {effects:?}");
+        let turn = operation.next(IoResult::Page {
+            rows: values.clone(),
+            next: None,
+        });
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("one delete batch: {turn:?}");
         };
         assert_eq!(
             deletes,
-            &vec![(ABE_GRANT_KEYSPACE.to_string(), values[1].0.clone())]
+            vec![(ABE_GRANT_KEYSPACE.to_string(), values[1].0.clone())]
         );
         assert_eq!(operation.result, Some(KeyResult::Grants(Vec::new(), None)));
         // The human session still lists it.
         let (mut operation, _) = assistant(KeyAction::Grants(None));
         operation.auth.session = None;
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: values[..1].to_vec(),
-            next_start_after: None,
-        }));
-        let Some(KeyResult::Grants(grants, None)) = &operation.result else {
+        let turn = operation.next(IoResult::Page {
+            rows: values[..1].to_vec(),
+            next: None,
+        });
+        let Ok(Next::Done(KeyResult::Grants(grants, None))) = turn else {
             panic!("a grant page");
         };
         assert_eq!(grants.len(), 1);
@@ -458,24 +455,21 @@ mod tests {
         operation.scopes = vec![scope];
         operation.groups = vec![2];
         let open = (request.key().into(), request.to_bytes().unwrap().into());
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![open],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
+        let turn = operation.next(IoResult::Page {
+            rows: vec![open],
+            next: None,
+        });
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
         assert!(operation.deletes.is_empty());
         assert_eq!(operation.state, State::Reuse);
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![grant_row(&request)],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::Abe(_))]
-        ));
+        let turn = operation.next(IoResult::Page {
+            rows: vec![grant_row(&request)],
+            next: None,
+        });
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("an issuance");
+        };
+        assert!(matches!(*effect, Effect::Blob(BlobEffect::Abe(_))));
         assert!(operation.deletes.is_empty());
     }
 }

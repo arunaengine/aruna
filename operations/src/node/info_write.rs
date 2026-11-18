@@ -12,7 +12,7 @@ use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::{
@@ -292,8 +292,8 @@ impl Operation for InfoWriteOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     /// Three attempts in all, as the publishers' own retry had.
@@ -392,7 +392,10 @@ mod state_machine_tests {
     fn seed_writes_row() {
         let seeded = document(1);
         let mut operation = InfoWriteOperation::seed(REALM, seeded.clone());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(operation.first(), written(&seeded));
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
     }

@@ -4,12 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -277,7 +279,8 @@ pub(super) type SpooledCopy = (BackendLocation, [u8; 32], u64);
 #[derive(Debug, PartialEq)]
 enum SpoolStep {
     Init,
-    Resolve(ResolveBindingOperation),
+    /// The binding resolves as a child; its result comes back as a child event.
+    Resolve,
     Read,
     Spool,
     Drop,
@@ -391,27 +394,26 @@ impl EffectOperation for SpoolSourceOperation {
         let BlobVersionState::Reference { source, .. } = &self.plan.version.state else {
             return self.finish(Err(spool_error("the version is no reference")));
         };
-        let mut resolve = ResolveBindingOperation::new(ResolveBindingInput {
+        let resolve = ResolveBindingOperation::new(ResolveBindingInput {
             source: source.clone(),
             group_id: Some(self.keep.group_id),
         });
-        let effects = resolve.start();
-        self.step = SpoolStep::Resolve(resolve);
-        effects
+        self.step = SpoolStep::Resolve;
+        let child = boxed_suboperation(resolve, |result| Event::Child(ChildOutcome::new(result)));
+        smallvec![Effect::SubOperation(child)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match (std::mem::replace(&mut self.step, SpoolStep::Finish), event) {
-            (SpoolStep::Resolve(mut resolve), event) => {
-                let effects = resolve.step(event);
-                if !resolve.is_complete() {
-                    self.step = SpoolStep::Resolve(resolve);
-                    return effects;
+            (SpoolStep::Resolve, Event::Child(outcome)) => {
+                match outcome.take::<ResolvedSourceAccess, SourceResolutionError>() {
+                    Some(Ok(access)) => self.read(access),
+                    Some(Err(error)) => self.finish(Err(spool_error(error.to_string()))),
+                    None => self.finish(Err(spool_error("unexpected answer to the resolve"))),
                 }
-                match resolve.finalize() {
-                    Ok(access) => self.read(access),
-                    Err(error) => self.finish(Err(spool_error(error.to_string()))),
-                }
+            }
+            (SpoolStep::Resolve, _) => {
+                self.finish(Err(spool_error("unexpected answer to the resolve")))
             }
             (
                 SpoolStep::Read,
@@ -460,10 +462,7 @@ impl EffectOperation for SpoolSourceOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match &mut self.step {
-            SpoolStep::Resolve(resolve) => resolve.abort(),
-            _ => smallvec![],
-        }
+        smallvec![]
     }
 }
 
@@ -597,14 +596,15 @@ mod tests {
     }
 
     fn spooled(size: u64) -> (BackendLocation, [u8; 32], u64) {
-        use aruna_core::structs::storage::blob::BackendRef;
+        use aruna_core::structs::storage::blob::{BackendRef, HIDDEN_BLOB_PREFIX};
         use aruna_core::structs::storage::format::StoredFormat;
+        let namespace = Ulid::from_bytes([5; 16]);
         let location = BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "aruna".to_string(),
-            backend_path: "hidden/one".to_string(),
+            backend_path: format!("{HIDDEN_BLOB_PREFIX}/{namespace}/one"),
             ulid: Ulid::from_bytes([8; 16]),
             format: StoredFormat::default(),
             created_by: keep().user_id,

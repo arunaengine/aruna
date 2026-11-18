@@ -4,20 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::notifications::outbox_record::schedule_drain_effect;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -27,14 +24,12 @@ pub enum RestartNoticeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("the restart notice did not finish")]
-    NotFinished,
+}
+
+impl From<IoError> for RestartNoticeError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 /// A bucket whose last recorded session was unlocked before the restart, with the generations
@@ -48,25 +43,11 @@ pub struct RestartedBucket {
     pub holders: Vec<UserId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NoticeStep {
-    Init,
-    StartTransaction,
-    WriteRows,
-    Commit,
-    ScheduleDrain,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, PartialEq)]
 pub struct RestartNoticeOperation {
     node_id: NodeId,
     boot_id: Ulid,
     buckets: Vec<RestartedBucket>,
-    step: NoticeStep,
-    txn_id: Option<TxnId>,
-    output: Option<Result<(), RestartNoticeError>>,
 }
 
 /// An id stable for one boot and subject, so a retried startup rewrites the same rows.
@@ -89,16 +70,7 @@ impl RestartNoticeOperation {
             node_id,
             boot_id,
             buckets,
-            step: NoticeStep::Init,
-            txn_id: None,
-            output: None,
         }
-    }
-
-    fn fail(&mut self, error: impl Into<RestartNoticeError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.step = NoticeStep::Error;
-        self.abort()
     }
 
     fn audit(&self, bucket: &RestartedBucket, generation: u64) -> BucketAuditRecord {
@@ -147,98 +119,46 @@ impl RestartNoticeOperation {
         }
     }
 
-    fn write(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
+    fn rows(&self) -> Result<Vec<(String, Key, Value)>, RestartNoticeError> {
         let mut writes = Vec::new();
         for bucket in &self.buckets {
             for generation in &bucket.generations {
                 let record = self.audit(bucket, *generation);
-                match record.to_bytes() {
-                    Ok(value) => writes.push((
-                        BUCKET_AUDIT_KEYSPACE.to_string(),
-                        record.key().into(),
-                        value.into(),
-                    )),
-                    Err(error) => return self.fail(error),
-                }
+                let value = record.to_bytes()?.into();
+                writes.push((
+                    BUCKET_AUDIT_KEYSPACE.to_string(),
+                    record.key().into(),
+                    value,
+                ));
             }
             for holder in &bucket.holders {
-                match outbox_write_entry(&self.notice(bucket, *holder)) {
-                    Ok(entry) => writes.push(entry),
-                    Err(error) => return self.fail(error),
-                }
+                writes.push(outbox_write_entry(&self.notice(bucket, *holder))?);
             }
         }
-        self.step = NoticeStep::WriteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        Ok(writes)
     }
 }
 
-impl EffectOperation for RestartNoticeOperation {
+impl Operation for RestartNoticeOperation {
     type Output = ();
     type Error = RestartNoticeError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<()>, RestartNoticeError> {
         if self.buckets.is_empty() {
-            self.output = Some(Ok(()));
-            self.step = NoticeStep::Finish;
-            return smallvec![];
+            return Ok(Next::Done(()));
         }
-        self.step = NoticeStep::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        Ok(Next::Call(IoCall::Write(self.rows()?)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (NoticeStep::Finish | NoticeStep::Error, _) => smallvec![],
-            // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
-            (NoticeStep::ScheduleDrain, Event::Task(_)) => {
-                self.output = Some(Ok(()));
-                self.step = NoticeStep::Finish;
-                smallvec![]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
-            (
-                NoticeStep::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => self.write(txn_id),
-            (NoticeStep::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(RestartNoticeError::NotFinished);
-                };
-                self.step = NoticeStep::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (NoticeStep::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
-                if Some(txn_id) == self.txn_id =>
-            {
-                self.txn_id = None;
-                self.step = NoticeStep::ScheduleDrain;
-                smallvec![schedule_drain_effect()]
-            }
-            (state, received) => self.fail(RestartNoticeError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, RestartNoticeError> {
+        result.done()?;
+        // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
+        let calls = vec![schedule_drain_effect().into()];
+        Ok(Next::Then { output: (), calls })
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.step, NoticeStep::Finish | NoticeStep::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RestartNoticeError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -247,8 +167,6 @@ mod tests {
     use super::*;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::task::{TaskEvent, TaskKey};
-    use std::time::Duration;
 
     fn user(seed: u8) -> UserId {
         UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
@@ -267,14 +185,9 @@ mod tests {
     }
 
     fn rows(operation: &mut RestartNoticeOperation) -> Vec<(String, Vec<u8>, Vec<u8>)> {
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from_bytes([7; 16]),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = &effects[..] else {
-            panic!("expected one batch write, got {effects:?}");
+        let Ok(Next::Call(IoCall::Write(writes))) = operation.first() else {
+            panic!("expected one write");
         };
-        assert!(txn_id.is_some());
         writes
             .iter()
             .map(|(space, key, value)| (space.clone(), key.to_vec(), value.to_vec()))
@@ -306,22 +219,13 @@ mod tests {
         assert_eq!(notices[0].record.kind.name(), "bucket_locked_by_restart");
         assert_eq!(notices[0].record.created_at_ms, 1_000);
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::from_bytes([7; 16]),
-        }));
-        assert_eq!(effects[..], [schedule_drain_effect()]);
-        operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainNotificationOutbox,
-            after: Duration::ZERO,
-        }));
-        assert_eq!(operation.finalize(), Ok(()));
+        // The drain is woken once the rows are committed.
+        let drain = vec![schedule_drain_effect().into()];
+        let then = Next::Then {
+            output: (),
+            calls: drain,
+        };
+        assert_eq!(operation.next(IoResult::Done), Ok(then));
     }
 
     #[test]
@@ -337,16 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_write_aborts() {
-        let mut operation = operation(1_000);
-        rows(&mut operation);
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("disk".to_string()),
-        }));
-        assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert!(operation.finalize().is_err());
+    fn nothing_writes_nothing() {
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation = RestartNoticeOperation::new(node_id, Ulid::nil(), Vec::new());
+        assert_eq!(operation.first(), Ok(Next::Done(())));
     }
 }

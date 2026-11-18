@@ -6,13 +6,14 @@
 use super::*;
 use crate::driver::drive;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::rows::{decode, page_result, values_result};
-use crate::plugins::runs::{TimerRow, list_runs, read_run, read_timer};
+use crate::plugins::rows::{StoreError, decode, page_result, read_call, values, values_result};
+use crate::plugins::runs::{TimerRow, list_runs, read_run};
 use crate::plugins::worker::tests::installed;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::plugin_runs::RUNS_QUEUED;
 use aruna_core::plugin_runs::SourceKind;
+use aruna_core::plugin_runs::{RUNS_QUEUED, timer_key};
 
 const HOUR: u64 = 3600 * 1000;
 
@@ -145,7 +146,7 @@ fn trigger_indexes_kept() {
 }
 
 #[test]
-fn timer_occurrences() {
+fn plans_timer_occurrences() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let plan = |now_ms| enqueue_timer(&install, "every".into(), 10, now_ms);
     // Before the first interval since activation nothing is due.
@@ -183,4 +184,29 @@ fn timer_occurrences() {
     };
     assert_eq!(rows.len(), 3);
     assert_eq!(queued.next(IoResult::Done).unwrap(), Next::Done(true));
+}
+
+/// The timer row of an install, if its timer ran before.
+fn read_timer(install_id: Ulid) -> ReadTimer {
+    ReadTimer(timer_key(install_id))
+}
+
+#[derive(Debug, PartialEq)]
+struct ReadTimer(Vec<u8>);
+
+impl Operation for ReadTimer {
+    type Output = Option<TimerRow>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.0.clone(),
+        )])))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let [found] = values::<1>(answer)?;
+        Ok(Next::Done(found.map(|bytes| decode(&bytes)).transpose()?))
+    }
 }

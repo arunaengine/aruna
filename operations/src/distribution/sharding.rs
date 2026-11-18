@@ -74,13 +74,15 @@ pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
     if let Some(net) = context.net_handle.as_ref() {
         let cursor = (REFRESH_CURSOR.lock().ok()).and_then(|mut cursor| cursor.take());
         let (realm_id, now) = (*net.realm_id(), std::time::SystemTime::now());
-        let pass =
-            RefreshRangesOperation::new(realm_id, net.node_id(), now, cursor.unwrap_or_default());
+        let cursor = cursor.unwrap_or_default();
+        let began = cursor.record.clone();
+        let pass = RefreshRangesOperation::new(realm_id, net.node_id(), now, cursor);
         let (busy, cursor) = match drive(pass, context).await {
             Ok(pass) => (pass.busy, pass.cursor),
             Err(error) => {
                 warn!(%error, "The periodic source refresh could not run");
-                let record = error.record;
+                // A runner failure names no cursor; the next pass resumes where this one began.
+                let record = error.record.or(began);
                 (
                     false,
                     RefreshCursor {

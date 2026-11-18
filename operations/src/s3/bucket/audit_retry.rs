@@ -541,12 +541,14 @@ mod tests {
 
     #[test]
     fn stores_in_transaction() {
-        let key = retry_timer(&record());
+        // Each `record()` gets a new event id, so the timer and its rows share one record.
+        let record = record();
+        let key = retry_timer(&record);
         let mut operation = StoreAuditOperation::new(key.clone());
         let write = Effect::Storage(StorageEffect::Write {
             key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-            key: record().key().into(),
-            value: record().to_bytes().unwrap().into(),
+            key: record.key().into(),
+            value: record.to_bytes().unwrap().into(),
             txn_id: Some(txn()),
         });
         let delete = Effect::Storage(StorageEffect::Delete {
@@ -579,13 +581,13 @@ mod tests {
     #[test]
     fn store_errors_abort() {
         // Before the commit an open transaction is aborted; a failed commit has none left.
-        let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
+        let abort = || Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
         let mut starting = store_after(Vec::new());
         assert!(starting.step(storage_error()).is_empty());
         let mut writing = store_after(vec![started()]);
-        assert_eq!(writing.step(storage_error()).as_slice(), [abort.clone()]);
+        assert_eq!(writing.step(storage_error()).as_slice(), [abort()]);
         let mut deleting = store_after(vec![started(), written()]);
-        assert_eq!(deleting.step(storage_error()).as_slice(), [abort]);
+        assert_eq!(deleting.step(storage_error()).as_slice(), [abort()]);
         let mut committing = store_after(vec![started(), written(), deleted()]);
         assert!(committing.step(storage_error()).is_empty());
         for operation in [starting, writing, deleting, committing] {
@@ -598,14 +600,14 @@ mod tests {
 
     #[test]
     fn store_rejects_events() {
-        let phases: Vec<Vec<Event>> = vec![
-            Vec::new(),
-            vec![started()],
-            vec![started(), written()],
-            vec![started(), written(), deleted()],
+        let phases: [fn() -> Vec<Event>; 4] = [
+            Vec::new,
+            || vec![started()],
+            || vec![started(), written()],
+            || vec![started(), written(), deleted()],
         ];
         for (index, phase) in phases.into_iter().enumerate() {
-            let make = || store_after(phase.clone());
+            let make = || store_after(phase());
             let refused = rejects_events(make, sample_events, |event| {
                 let expected = [
                     matches!(

@@ -6,9 +6,6 @@
 use super::*;
 use crate::s3::bucket::key::rows::authority_rows;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, EncryptionMode, GrantState, HolderOrigin,
@@ -292,6 +289,8 @@ fn lost_outcome_counts() {
 #[test]
 fn unresolved_restart_notified() {
     use crate::s3::restart_notice::RestartNoticeOperation;
+    use aruna_core::calls::{IoCall, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::structs::execution::notification::NotificationOutboxRecord;
 
@@ -322,15 +321,9 @@ fn unresolved_restart_notified() {
         assert_eq!(found[0].generations, [1]);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let mut notice = RestartNoticeOperation::new(node, Ulid::from_parts(NOW, 1), found);
-        notice.start();
-        let effects = notice.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([7; 16]),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
-        else {
+        let Ok(Next::Call(IoCall::Write(writes))) = notice.first() else {
             panic!("restart writes missing")
         };
-        assert!(txn_id.is_some());
         assert_eq!(writes.len(), 2);
         let (space, _, value) = &writes[0];
         assert_eq!(space, BUCKET_AUDIT_KEYSPACE);

@@ -11,8 +11,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{EffectOperation, HoldScope, Runnable};
-use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::operation::SubOperation;
+use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 use aruna_core::time::unix_timestamp_millis;
@@ -1331,9 +1331,9 @@ async fn drive_machine<O: EffectOperation>(
     result
 }
 
-/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it waits a backoff
-/// seeded by `seed` and reruns, at most `conflict_retries` times. The same seed gives the same
-/// waits; distinct seeds spread conflicting writers out.
+/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it builds the next
+/// attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`, finish or fail.
+/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
 pub async fn drive_retry<O, K>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
@@ -1342,23 +1342,53 @@ pub async fn drive_retry<O, K>(
 where
     O: Runnable<K>,
 {
-    retry_machine(move || build().into_machine(), context, seed).await
+    retry_machine(move || build().into_machine(), context, seed, None).await
+}
+
+/// [`drive_retry`] with every attempt and backoff under one wall-clock deadline, as
+/// [`drive_until`] runs one attempt.
+pub async fn drive_retry_until<O, K>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    let build = move || build().into_machine();
+    retry_machine(build, context, seed, Some(deadline)).await
 }
 
 async fn retry_machine<O: EffectOperation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<O::Output, O::Error> {
-    let mut attempt = 0;
+    let mut operation = build();
+    let mut attempt: u32 = 0;
     loop {
-        match drive_machine(build(), context).await {
-            Err(error) if O::is_conflict(&error) && attempt < O::conflict_retries() => {
-                let wait = conflict_backoff(usize::try_from(attempt).unwrap_or(usize::MAX), seed);
-                tokio::time::sleep(wait).await;
-                attempt += 1;
-            }
+        let result = match deadline {
+            Some(deadline) => machine_until(operation, context, deadline).await,
+            None => drive_machine(operation, context).await,
+        };
+        let error = match result {
+            Err(error) if O::is_conflict(&error) => error,
             result => return result,
+        };
+        attempt = attempt.saturating_add(1);
+        operation = build();
+        match operation.on_conflict(attempt) {
+            AfterConflict::Rerun => {
+                let index = usize::try_from(attempt - 1).unwrap_or(usize::MAX);
+                let wake = tokio::time::Instant::now() + conflict_backoff(index, seed);
+                // A backoff past the deadline ends there; the next attempt then expires at once.
+                tokio::time::sleep_until(deadline.map_or(wake, |deadline| deadline.min(wake)))
+                    .await;
+            }
+            AfterConflict::Finish(output) => return Ok(output),
+            AfterConflict::Fail => return Err(error),
         }
     }
 }
@@ -1368,9 +1398,10 @@ mod test {
     use crate::driver::{
         DeadlineAbort, DriverContext, GroupEnd, GroupRun, HangLimits, Instant,
         MAX_TRACKED_TRANSACTIONS, MemberStop, ParentRun, TransactionEffect, TransactionState,
-        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_until, extend_unblocked,
-        run_all, run_window,
+        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until,
+        extend_unblocked, run_all, run_window,
     };
+    use aruna_core::calls::{IoError, IoResult, Next};
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
     };
@@ -1379,7 +1410,9 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{EffectOperation, HoldScope, boxed_suboperation};
+    use aruna_core::operation::{
+        AfterConflict, EffectOperation, HoldScope, Operation, boxed_suboperation,
+    };
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -1693,6 +1726,27 @@ mod test {
         (directory, context)
     }
 
+    /// A net without relays or discovery: a relay connection's timers read the real clock, so
+    /// they spin forever once paused time passes their deadline.
+    fn local_net() -> aruna_net::NetConfig {
+        aruna_net::NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            discovery_method: aruna_net::DiscoveryMethod::None,
+            relay_method: aruna_net::RelayMethod::None,
+            ..aruna_net::NetConfig::default()
+        }
+    }
+
+    /// Holds paused time still until dropped, so only `advance` moves it: a running blocking task
+    /// stops auto-advance, which would pass deadlines while storage threads answer.
+    fn manual_clock() -> std::sync::mpsc::Sender<()> {
+        let (hold, release) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = release.recv();
+        });
+        hold
+    }
+
     /// Storage, a file system blob backend and a net handle in one temporary folder.
     async fn net_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
@@ -1700,10 +1754,9 @@ mod test {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -1998,10 +2051,9 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -2030,6 +2082,7 @@ mod test {
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
         tokio::time::pause();
+        let _clock = manual_clock();
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = DeadlineOperation {
             state: 0,
@@ -2422,6 +2475,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
+        let _clock = manual_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2466,6 +2520,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
+        let _clock = manual_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2764,10 +2819,9 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -3321,16 +3375,92 @@ mod test {
     async fn retry_reruns_conflict() {
         let context = bare_context();
         let conflict = Err(StorageError::TransactionConflict);
+        // The hook of the attempt after the last run is asked too, so one more is built.
         assert_eq!(retried::<3>(&context, 2).await, (Ok(2), 3));
         assert_eq!(
             retried::<3>(&context, usize::MAX).await,
-            (conflict.clone(), 4)
+            (conflict.clone(), 5)
         );
         assert_eq!(
             retried::<5>(&context, usize::MAX).await,
-            (conflict.clone(), 6)
+            (conflict.clone(), 7)
         );
-        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 1));
+        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 2));
+    }
+
+    /// Loses a conflict until its hook sets `recheck`; finishes on the attempt `finish_at`.
+    #[derive(Debug, PartialEq)]
+    struct Rechecking {
+        recheck: bool,
+        finish_at: Option<u32>,
+    }
+
+    impl Operation for Rechecking {
+        type Output = &'static str;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+            match self.recheck {
+                true => Ok(Next::Done("rechecked")),
+                false => Err(IoError::Conflict),
+            }
+        }
+
+        fn next(&mut self, _: IoResult) -> Result<Next<Self::Output>, IoError> {
+            Err(IoError::Conflict)
+        }
+
+        fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
+            if self.finish_at == Some(attempt) {
+                return AfterConflict::Finish("finished");
+            }
+            self.recheck = attempt >= 2;
+            AfterConflict::Rerun
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conflict_hook_decides() {
+        let context = bare_context();
+        for (finish_at, expected) in [(None, ("rechecked", 3)), (Some(1), ("finished", 2))] {
+            let mut built = 0;
+            let build = || {
+                built += 1;
+                Rechecking {
+                    recheck: false,
+                    finish_at,
+                }
+            };
+            let result = drive_retry(build, &context, &[7u8; 16]).await;
+            assert_eq!((result, built), (Ok(expected.0), expected.1));
+        }
+    }
+
+    /// Under a deadline the hook still reruns a lost conflict; a backoff past the deadline
+    /// ends the retries there.
+    #[tokio::test(start_paused = true)]
+    async fn retry_until_deadline() {
+        let context = bare_context();
+        let mut built = 0;
+        let build = || {
+            built += 1;
+            Rechecking {
+                recheck: false,
+                finish_at: None,
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let result = drive_retry_until(build, &context, &[7u8; 16], deadline).await;
+        assert_eq!((result, built), (Ok("rechecked"), 3));
+
+        let past = tokio::time::Instant::now();
+        let build = || Conflicted::<3> {
+            attempt: 0,
+            conflicts: usize::MAX,
+        };
+        let result = drive_retry_until(build, &context, &[7u8; 16], past).await;
+        assert!(result.is_err());
+        assert_eq!(tokio::time::Instant::now(), past);
     }
 
     /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a
@@ -3342,6 +3472,7 @@ mod test {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
         started: Arc<tokio::sync::Notify>,
         gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        delay: Option<Duration>,
         finish: bool,
         done: bool,
     }
@@ -3354,6 +3485,7 @@ mod test {
                 log: log.clone(),
                 started: Arc::default(),
                 gate: None,
+                delay: None,
                 finish: true,
                 done: false,
             }
@@ -3377,6 +3509,9 @@ mod test {
         fn start(&mut self) -> aruna_core::types::Effects {
             self.log.lock().unwrap().push(self.name);
             self.started.notify_one();
+            if let Some(after) = self.delay {
+                return smallvec::smallvec![Effect::Delay(after)];
+            }
             let Some(gate) = self.gate.take() else {
                 self.done = self.finish;
                 return smallvec::smallvec![];
@@ -3423,9 +3558,9 @@ mod test {
     async fn scope_waits_holder() {
         let (_directory, context) = net_context().await;
         let log = Arc::default();
-        let (open, gate) = tokio::sync::oneshot::channel();
         let mut first = Holding::new("first", &log);
-        first.gate = Some(gate);
+        // Outlasts the hour below; no adapter limit ends a delay, unlike a spool's idle timeout.
+        first.delay = Some(Duration::from_secs(7200));
         let first_started = first.started.clone();
         let task_context = context.clone();
         let first_task = tokio::spawn(async move { drive(first, &task_context).await });
@@ -3443,12 +3578,12 @@ mod test {
         // before the clock jumps an hour.
         tokio::time::pause();
         tokio::time::sleep(Duration::from_secs(3600)).await;
-        tokio::time::resume();
         assert_eq!(*log.lock().unwrap(), ["first", "other"]);
 
-        open.send(()).unwrap();
+        // Paused time runs on to the end of the first run's delay.
         assert_eq!(first_task.await.unwrap(), Ok(()));
         assert_eq!(second_task.await.unwrap(), Ok(()));
+        tokio::time::resume();
         assert_eq!(*log.lock().unwrap(), ["first", "other", "second"]);
         assert!(reconcile_free(&context));
     }

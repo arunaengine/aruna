@@ -7,13 +7,14 @@ use crate::driver::drive;
 use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,
-    verify_node_origin,
+    validate_watch_events, verify_node_origin,
 };
 use crate::notifications::client::{
     HolderRequestOperation, RemoteError, delivered, events_delivered, listed, marked_read,
     unread_counted, watch_created, watch_deleted, watches_listed,
 };
 use crate::notifications::inbox::UpsertInboxOperation;
+use crate::notifications::mark_read::MARK_MAX_IDS;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
@@ -23,8 +24,11 @@ use crate::realm::load_config::load_realm_config;
 use crate::sync::incoming::initialize_incoming_fixture;
 use crate::tests::notifications::create_local_watch;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::execution::job::user_dedup_key;
@@ -38,11 +42,12 @@ use aruna_core::structs::execution::notification_watch::{
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
+use byteview::ByteView;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -347,7 +352,7 @@ fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> Notifi
 async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
     let key = format!("webhook/{}", record.notification_id);
     let key = user_dedup_key(record.recipient, &key);
-    find_dedup_plan(&node.context.storage_handle, record.recipient, &key, None)
+    find_dedup_plan(&node.context, record.recipient, &key, None)
         .await
         .expect("dedup read")
         .is_some()

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
@@ -202,8 +202,8 @@ impl Operation for ExpireRows {
     type Output = Rows;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Rows>, StoreError> {
@@ -374,8 +374,8 @@ impl Operation for Apply {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {

@@ -142,7 +142,7 @@ pub async fn cached_keys(
             Some(sealed) => *sealed,
             None => {
                 let row = bucket.as_bytes().to_vec();
-                let row = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row)
+                let row = read_row(context, BUCKET_ENCRYPTION_KEYSPACE, row)
                     .await
                     .map_err(ViewError::Unavailable)?;
                 let settings = BucketEncryption::from_row(row.as_deref())

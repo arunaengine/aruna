@@ -115,9 +115,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::distribution::accounting::{
         Charge, RangeAccount, account_key, generation_key, pending_key,

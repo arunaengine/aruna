@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
@@ -18,17 +18,17 @@ use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, J
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
 use super::link_store::{change_link, document_links, ensure_lineage, read_link};
 use super::links::{
-    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, id_key, schedule_drain,
+    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation, id_key,
+    queue_row, schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
@@ -91,22 +91,12 @@ pub(crate) async fn queue_rows(
     Ok(rows)
 }
 
-fn queue_row(
-    link_id: Ulid,
-    entry: &LinkQueueEntry,
-) -> Result<(String, Key, Value), ConversionError> {
-    Ok((
-        LINK_QUEUE_KEYSPACE.to_string(),
-        id_key(link_id),
-        ByteView::from(postcard::to_allocvec(entry)?),
-    ))
-}
-
 async fn scan_queue(
-    storage: &StorageHandle,
+    context: &DriverContext,
     start: Option<Key>,
 ) -> Result<(Vec<(Key, Value)>, Option<Key>), LinkError> {
-    match storage
+    match context
+        .storage_handle
         .send_storage_effect(StorageEffect::Iter {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             prefix: None,
@@ -128,18 +118,17 @@ async fn scan_queue(
 /// Runs every due check and returns the wait until the next one.
 pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration>, LinkError> {
     let now = unix_timestamp_millis();
-    let storage = &context.storage_handle;
     let mut next = None;
     let mut start = None;
     loop {
-        let (values, next_start) = scan_queue(storage, start).await?;
+        let (values, next_start) = scan_queue(context, start).await?;
         for (key, value) in values {
             let parsed = <[u8; 16]>::try_from(key.as_ref())
                 .ok()
                 .zip(postcard::from_bytes::<LinkQueueEntry>(&value).ok());
             let Some((link_id, entry)) = parsed else {
                 warn!(key = ?key.to_vec(), "Deleting malformed link queue entry");
-                delete_entry(storage, key).await?;
+                delete_entry(context, key).await?;
                 continue;
             };
             if entry.due_at_ms > now {
@@ -155,7 +144,7 @@ pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration
                 }
             };
             if let Some(retry_at) = retry_at {
-                settle_entry(storage, link_id, &value, Some(retry_at)).await?;
+                settle_entry(context, link_id, &value, Some(retry_at)).await?;
                 next = min_due_at(next, retry_at);
             }
         }
@@ -175,15 +164,14 @@ async fn check_link(
     queued: &Value,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
-    let storage = &context.storage_handle;
     let local = context.net_handle.as_ref().map(|net| net.node_id());
-    let drop_entry = async || drop_unchanged(storage, link_id, queued).await;
-    let link = match read_link(storage, entry.document_id, link_id).await? {
+    let drop_entry = async || drop_unchanged(context, link_id, queued).await;
+    let link = match read_link(context, entry.document_id, link_id).await? {
         Some(link) if local.is_none_or(|n| n == link.owner_node) => link,
         _ => return drop_entry().await,
     };
     // A deleted dataset takes its links and their sealed tokens along; remote records stay.
-    if document_gone(storage, entry.document_id).await? {
+    if document_gone(&context.storage_handle, entry.document_id).await? {
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
@@ -192,7 +180,7 @@ async fn check_link(
     }
     // A paused link still settles its push, for example one cancelled while queued.
     if let Some(job_id) = link.active_job.filter(|_| link.pull().is_none()) {
-        let record = read_job_record(storage, job_id, None)
+        let record = read_job_record(context, job_id, None)
             .await
             .map_err(LinkError::Unexpected)?;
         return match record {
@@ -241,10 +229,9 @@ async fn settle_stale(
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
     // A push that finished remotely but failed to record it still counts as pushed.
-    let checkpoint =
-        crate::jobs::export::archive::stored_checkpoint(&context.storage_handle, job_id)
-            .await
-            .map_err(LinkError::Unexpected)?;
+    let checkpoint = crate::jobs::export::archive::stored_checkpoint(context, job_id)
+        .await
+        .map_err(LinkError::Unexpected)?;
     let pushed = checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.pushed_outcome());
@@ -272,7 +259,7 @@ async fn settle_stale(
     change_link(context, link, change).await?;
     // A cancelled push skips its change; the next change queues a new check.
     if cancelled {
-        return drop_unchanged(&context.storage_handle, link.link_id, queued).await;
+        return drop_unchanged(context, link.link_id, queued).await;
     }
     Ok(Some(unix_timestamp_millis()))
 }
@@ -314,7 +301,7 @@ pub async fn start_push(
     ensure_holder(context, link).await?;
     // A failed link runs again only if no enabled link follows its lineage the other way.
     if matches!(link.status, LinkStatus::Failed { .. }) {
-        Box::pin(ensure_lineage(&context.storage_handle, link)).await?;
+        Box::pin(ensure_lineage(context, link)).await?;
     }
     let owner = context
         .net_handle
@@ -399,106 +386,33 @@ async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<boo
 
 /// Deletes the queued check unless a change rewrote it since `queued` was read.
 async fn drop_unchanged(
-    storage: &StorageHandle,
+    context: &DriverContext,
     link_id: Ulid,
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
-    settle_entry(storage, link_id, queued, None)
+    settle_entry(context, link_id, queued, None)
         .await
         .map(|_| None)
 }
 
-/// Deletes the queued check, or with `retry_at` moves it there. A change written since `queued`
-/// was read stays, due no later than `retry_at`; a removed check stays removed.
+/// Deletes the queued check, or with `retry_at` moves it there; see [`SettleCheckOperation`].
 async fn settle_entry(
-    storage: &StorageHandle,
+    context: &DriverContext,
     link_id: Ulid,
     queued: &Value,
     retry_at: Option<u64>,
 ) -> Result<(), LinkError> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    };
-    let result = settle_in(storage, link_id, queued, retry_at, txn_id).await;
-    if result.is_err() {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-    }
-    match result {
+    let operation = SettleCheckOperation::new(link_id, queued.clone(), retry_at);
+    match drive(operation, context).await {
         // A conflicting write queued a newer change; its check runs later.
         Err(LinkError::Storage(StorageError::TransactionConflict)) => Ok(()),
         result => result,
     }
 }
 
-async fn settle_in(
-    storage: &StorageHandle,
-    link_id: Ulid,
-    queued: &Value,
-    retry_at: Option<u64>,
-    txn_id: TxnId,
-) -> Result<(), LinkError> {
-    let current = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: LINK_QUEUE_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    };
-    let unchanged = current.as_ref() == Some(queued);
-    let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
-    let effect = match (current.as_ref(), retry_at) {
-        (Some(_), None) if unchanged => StorageEffect::Delete {
-            key_space: LINK_QUEUE_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: Some(txn_id),
-        },
-        (Some(current), Some(retry_at)) => {
-            let base = if unchanged { None } else { entry(current) };
-            let Some(mut next) = base.clone().or_else(|| entry(queued)) else {
-                return Err(LinkError::Unexpected("unreadable link queue entry".into()));
-            };
-            next.due_at_ms = base.map_or(retry_at, |base| base.due_at_ms.min(retry_at));
-            let (key_space, key, value) = queue_row(link_id, &next)?;
-            StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: Some(txn_id),
-            }
-        }
-        _ => StorageEffect::AbortTransaction { txn_id },
-    };
-    let aborting = matches!(effect, StorageEffect::AbortTransaction { .. });
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
-        Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(other.label().to_string())),
-    }
-}
-
-async fn delete_entry(storage: &StorageHandle, key: Key) -> Result<(), LinkError> {
-    match storage
+async fn delete_entry(context: &DriverContext, key: Key) -> Result<(), LinkError> {
+    match context
+        .storage_handle
         .send_storage_effect(StorageEffect::Delete {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             key,
@@ -512,8 +426,9 @@ async fn delete_entry(storage: &StorageHandle, key: Key) -> Result<(), LinkError
     }
 }
 
-async fn write_row(storage: &StorageHandle, row: (String, Key, Value)) -> Result<(), LinkError> {
-    match storage
+async fn write_row(context: &DriverContext, row: (String, Key, Value)) -> Result<(), LinkError> {
+    match context
+        .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: row.0,
             key: row.1,
@@ -539,27 +454,26 @@ pub async fn queue_deleted(context: &DriverContext, graph_iri: &str) -> Result<(
     let Some(document_id) = document_id else {
         return Ok(());
     };
-    let storage = &context.storage_handle;
-    let rows = queue_rows(storage, [document_id]).await?;
+    let rows = queue_rows(&context.storage_handle, [document_id]).await?;
     if rows.is_empty() {
         return Ok(());
     }
     for row in rows {
-        write_row(storage, row).await?;
+        write_row(context, row).await?;
     }
     if let Some(task_handle) = &context.task_handle {
-        restore_link_timer(storage, task_handle).await;
+        restore_link_timer(context, task_handle).await;
     }
     Ok(())
 }
 
 /// Arms the drain for the earliest queued check; the queue itself is the durable state.
-pub async fn restore_link_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub async fn restore_link_timer(context: &DriverContext, task_handle: &TaskHandle) {
     let now = unix_timestamp_millis();
     let mut next = None;
     let mut start = None;
     loop {
-        let Ok((values, next_start)) = scan_queue(storage, start).await else {
+        let Ok((values, next_start)) = scan_queue(context, start).await else {
             warn!("Failed to scan the repository link queue");
             return;
         };
@@ -588,8 +502,9 @@ mod tests {
     use super::*;
     use aruna_storage::FjallStorage;
 
-    async fn stored(storage: &StorageHandle, link_id: Ulid) -> Option<LinkQueueEntry> {
-        match storage
+    async fn stored(context: &DriverContext, link_id: Ulid) -> Option<LinkQueueEntry> {
+        match context
+            .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: LINK_QUEUE_KEYSPACE.to_string(),
                 key: id_key(link_id),
@@ -608,6 +523,7 @@ mod tests {
     async fn retry_keeps_newer() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let (link_id, document_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
         let entry = |due_at_ms, first_at_ms| LinkQueueEntry {
             document_id,
@@ -616,30 +532,30 @@ mod tests {
             settle_only: false,
         };
         let queued = queue_row(link_id, &entry(100, 90)).unwrap();
-        write_row(&storage, queued.clone()).await.unwrap();
+        write_row(&context, queued.clone()).await.unwrap();
 
-        settle_entry(&storage, link_id, &queued.2, Some(500))
+        settle_entry(&context, link_id, &queued.2, Some(500))
             .await
             .unwrap();
-        assert_eq!(stored(&storage, link_id).await, Some(entry(500, 90)));
+        assert_eq!(stored(&context, link_id).await, Some(entry(500, 90)));
 
         // A change queued while the check ran keeps its earlier due time.
         let newer = queue_row(link_id, &entry(200, 150)).unwrap();
-        write_row(&storage, newer).await.unwrap();
-        settle_entry(&storage, link_id, &queued.2, Some(500))
+        write_row(&context, newer).await.unwrap();
+        settle_entry(&context, link_id, &queued.2, Some(500))
             .await
             .unwrap();
-        assert_eq!(stored(&storage, link_id).await, Some(entry(200, 150)));
-        settle_entry(&storage, link_id, &queued.2, None)
+        assert_eq!(stored(&context, link_id).await, Some(entry(200, 150)));
+        settle_entry(&context, link_id, &queued.2, None)
             .await
             .unwrap();
-        assert_eq!(stored(&storage, link_id).await, Some(entry(200, 150)));
+        assert_eq!(stored(&context, link_id).await, Some(entry(200, 150)));
 
         // A check removed meanwhile, for example by a started push, stays removed.
-        delete_entry(&storage, id_key(link_id)).await.unwrap();
-        settle_entry(&storage, link_id, &queued.2, Some(500))
+        delete_entry(&context, id_key(link_id)).await.unwrap();
+        settle_entry(&context, link_id, &queued.2, Some(500))
             .await
             .unwrap();
-        assert_eq!(stored(&storage, link_id).await, None);
+        assert_eq!(stored(&context, link_id).await, None);
     }
 }

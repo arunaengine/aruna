@@ -5,14 +5,13 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
@@ -28,7 +27,7 @@ pub(crate) const PRUNE_PAGE_SIZE: usize = 512;
 pub(crate) const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
 pub(crate) const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {
     pub expired: usize,
     pub capped: usize,
@@ -53,8 +52,6 @@ impl NotificationPruneOutcome {
 pub enum PruneError {
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error("pruning outlived deletion times failed: {0}")]
-    Cutoff(String),
     #[error(transparent)]
     Io(IoError),
 }
@@ -69,7 +66,7 @@ impl From<IoError> for PruneError {
 }
 
 /// One due row of the prune index and the two inbox rows it may name; only one class matches.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Candidate {
     index: Key,
     direct: Key,
@@ -77,13 +74,13 @@ struct Candidate {
 }
 
 /// Where a phase continues after its current page.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Scan {
     next: Option<Key>,
     stopped: bool,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum PruneState {
     #[default]
     IndexPage,
@@ -107,7 +104,7 @@ type Turn = Result<Next<NotificationPruneOutcome>, PruneError>;
 
 /// One prune run: the due rows of the prune index (at most four pages of them), then a sweep of
 /// the inbox for expired and over-cap transient rows, then a sweep of outlived deletion times.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneNotificationsOperation {
     now_ms: u64,
     page_size: usize,
@@ -324,15 +321,7 @@ impl PruneNotificationsOperation {
             now_ms: self.now_ms,
             deleting: false,
         };
-        // A conflict leaves the outlived times to the next sweep.
-        let child = boxed_suboperation(child, |result| {
-            let result = match result {
-                Ok(()) | Err(IoError::Conflict) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            };
-            Event::SubOperation(SubOperationEvent::CutoffsPruned { result })
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::child(child)))
     }
 
     fn cutoff_after(&mut self, next: Option<Key>) -> Turn {
@@ -367,11 +356,12 @@ impl Operation for PruneNotificationsOperation {
             (PruneState::InboxPage, IoResult::Page { rows, next }) => self.inbox_page(rows, next),
             (PruneState::InboxDelete { next }, IoResult::Done) => self.inbox_after(next),
             (PruneState::CutoffPage, IoResult::Page { rows, next }) => self.cutoff_page(rows, next),
-            (
-                PruneState::Cutoff { next },
-                IoResult::Event(Event::SubOperation(SubOperationEvent::CutoffsPruned { result })),
-            ) => {
-                result.map_err(PruneError::Cutoff)?;
+            // A conflict leaves the outlived times to the next sweep.
+            (PruneState::Cutoff { next }, result) => {
+                match result.child::<(), IoError>()? {
+                    Ok(()) | Err(IoError::Conflict) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 self.cutoff_after(next)
             }
             (_, other) => Err(unexpected("a prune page, read, delete or cutoff", &other).into()),
@@ -414,8 +404,8 @@ impl Operation for CutoffPruneOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -459,7 +449,7 @@ impl RestorePruneOperation {
         self.state = RestoreState::Arm;
         let key = TaskKey::PruneNotifications;
         let arm = TaskEffect::ShortenTimer { key, after };
-        Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
+        Ok(Next::Call(IoCall::from(Effect::Task(arm))))
     }
 
     fn scanned(&mut self, rows: Vec<(Key, Value)>) -> Result<Next<()>, IoError> {
@@ -498,7 +488,9 @@ impl Operation for RestorePruneOperation {
         match (&self.state, result) {
             (RestoreState::Scan, IoResult::Page { rows, .. }) => self.scanned(rows),
             (RestoreState::Delete, IoResult::Done) => self.arm(Duration::ZERO),
-            (RestoreState::Arm, IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. }))) => {
+            (RestoreState::Arm, IoResult::Event(event))
+                if matches!(*event, Event::Task(TaskEvent::TimerScheduled { .. })) =>
+            {
                 Ok(Next::Done(()))
             }
             (_, other) => Err(unexpected("a prune index page, delete or timer", &other)),
@@ -512,6 +504,8 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context, record, temp_storage, user};
     use aruna_core::UserId;
+    use aruna_core::effects::{IterStart, StorageEffect};
+    use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_core::time::unix_timestamp_millis;
@@ -1054,10 +1048,8 @@ mod call_tests {
         Value::from(0u64.to_be_bytes().to_vec())
     }
 
-    fn pruned(result: Result<(), String>) -> IoResult {
-        IoResult::Event(Event::SubOperation(SubOperationEvent::CutoffsPruned {
-            result,
-        }))
+    fn pruned(result: Result<(), IoError>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
     }
 
     #[test]
@@ -1131,10 +1123,18 @@ mod call_tests {
     fn cutoff_failure_fails() {
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
         operation.state = PruneState::Cutoff { next: None };
+        let failed = pruned(Err(IoError::Storage(StorageError::Timeout)));
         assert_eq!(
-            operation.next(pruned(Err("timeout".to_string()))),
-            Err(PruneError::Cutoff("timeout".to_string()))
+            operation.next(failed),
+            Err(PruneError::Storage(StorageError::Timeout))
         );
+        // A conflict leaves the outlived times to the next sweep.
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.state = PruneState::Cutoff { next: None };
+        assert!(matches!(
+            operation.next(pruned(Err(IoError::Conflict))),
+            Ok(Next::Done(_))
+        ));
         assert_eq!(
             PruneError::from(IoError::Storage(StorageError::Timeout)),
             PruneError::Storage(StorageError::Timeout)
@@ -1156,7 +1156,10 @@ mod call_tests {
             now_ms: NOW_MS,
             deleting: false,
         };
-        assert!(cutoff.transaction());
+        assert_eq!(
+            cutoff.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(matches!(cutoff.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2));
         let renewed = Value::from(NOW_MS.to_be_bytes().to_vec());
         assert_eq!(
@@ -1174,7 +1177,7 @@ mod call_tests {
         let mut operation = RestorePruneOperation::new(NOW_MS);
         let malformed = (Key::from(vec![1, 2]), Value::from(Vec::new()));
         let arm = |after| {
-            Ok(Next::Call(IoCall::Effect(Effect::Task(
+            Ok(Next::Call(IoCall::from(Effect::Task(
                 TaskEffect::ShortenTimer {
                     key: TaskKey::PruneNotifications,
                     after,
@@ -1199,7 +1202,7 @@ mod call_tests {
             after: Duration::ZERO,
         });
         assert_eq!(
-            operation.next(IoResult::Event(scheduled)),
+            operation.next(IoResult::Event(Box::new(scheduled))),
             Ok(Next::Done(()))
         );
 
@@ -1209,6 +1212,6 @@ mod call_tests {
             key: None,
             message: "closed".to_string(),
         });
-        assert!(empty.next(IoResult::Event(failed)).is_err());
+        assert!(empty.next(IoResult::Event(Box::new(failed))).is_err());
     }
 }

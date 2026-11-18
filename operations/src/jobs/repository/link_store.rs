@@ -50,7 +50,7 @@ pub async fn change_link(
         _ => None,
     };
     if let Some(enabled) = enabled {
-        Box::pin(ensure_lineage(&context.storage_handle, enabled)).await?;
+        Box::pin(ensure_lineage(context, enabled)).await?;
     }
     if let LinkChange::Accept(state) = &change
         && let Some(record) = state.latest.as_ref().filter(|record| record.published)
@@ -92,11 +92,11 @@ async fn register_accepted(
 
 /// One lineage cannot have an enabled push link and an enabled pull link on one dataset.
 pub(super) async fn ensure_lineage(
-    storage: &StorageHandle,
+    context: &DriverContext,
     link: &RepositoryLink,
 ) -> Result<(), LinkError> {
     let pulls = link.pull().is_some();
-    let conflict = list_links(storage, link.document_id)
+    let conflict = list_links(context, link.document_id)
         .await?
         .into_iter()
         .any(|(other, _)| {
@@ -120,10 +120,10 @@ async fn send(storage: &StorageHandle, effect: StorageEffect) -> Result<Event, L
 
 /// The document's links with whether each still has a push check queued.
 pub async fn list_links(
-    storage: &StorageHandle,
+    context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Vec<(RepositoryLink, bool)>, LinkError> {
-    let links = document_links(storage, document_id).await?;
+    let links = document_links(&context.storage_handle, document_id).await?;
     let reads = links
         .iter()
         .map(|link| (LINK_QUEUE_KEYSPACE.to_string(), id_key(link.link_id)))
@@ -132,7 +132,7 @@ pub async fn list_links(
         return Ok(Vec::new());
     }
     let event = send(
-        storage,
+        &context.storage_handle,
         StorageEffect::BatchRead {
             reads,
             txn_id: None,
@@ -186,12 +186,12 @@ pub(crate) async fn document_links(
 }
 
 pub async fn read_link(
-    storage: &StorageHandle,
+    context: &DriverContext,
     document_id: Ulid,
     link_id: Ulid,
 ) -> Result<Option<RepositoryLink>, LinkError> {
     let event = send(
-        storage,
+        &context.storage_handle,
         StorageEffect::Read {
             key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
             key: ByteView::from(link_key(document_id, link_id)),
@@ -208,11 +208,11 @@ pub async fn read_link(
 }
 
 pub(crate) async fn read_secret(
-    storage: &StorageHandle,
+    context: &DriverContext,
     link_id: Ulid,
 ) -> Result<Option<RepositoryCredential>, LinkError> {
     let event = send(
-        storage,
+        &context.storage_handle,
         StorageEffect::Read {
             key_space: LINK_SECRET_KEYSPACE.to_string(),
             key: id_key(link_id),

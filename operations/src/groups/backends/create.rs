@@ -5,21 +5,24 @@
 use super::validation::{GroupBackendError, check_import_root, validate_backend_input};
 use super::{RecordReadError, record_writes};
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::groups::fence::GroupWriteOperation;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateBackendInput {
@@ -53,13 +56,10 @@ impl std::fmt::Debug for CreateBackendInput {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreateState {
-    Init,
     Probe,
     WriteRecords,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -88,6 +88,18 @@ pub enum CreateBackendError {
     },
 }
 
+impl From<IoError> for CreateBackendError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            _ => Self::Failed,
+        }
+    }
+}
+
+type CreateTurn = Result<Next<GroupStorage>, CreateBackendError>;
+
 /// Registers a tenant write backend. The credentials are proved against the
 /// endpoint before either record is stored, so a broken backend never lands.
 #[derive(Debug, PartialEq)]
@@ -96,41 +108,43 @@ pub struct CreateBackendOperation {
     state: CreateState,
     record: Option<GroupStorage>,
     secret: Option<GroupStorageSecret>,
-    output: Option<Result<GroupStorage, CreateBackendError>>,
 }
 
 impl CreateBackendOperation {
     pub fn new(input: CreateBackendInput) -> Self {
         Self {
             input,
-            state: CreateState::Init,
+            state: CreateState::Probe,
             record: None,
             secret: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: CreateBackendError) -> Effects {
-        self.state = CreateState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    /// The guarded write of both records, with the secret sealed into the node vault.
+    fn group_write(&self) -> Result<GroupWriteOperation, CreateBackendError> {
+        let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
+            return Err(CreateBackendError::Failed);
+        };
+        let writes = record_writes(record)?;
+        let entry = GroupStorageSecret::vault_entry(record.backend_id);
+        let write = GroupWriteOperation::new(self.input.group_id, writes);
+        Ok(write.with_secret(entry, secret.to_secret()?))
     }
+}
 
-    fn handle_init(&mut self) -> Effects {
-        let normalized = match validate_backend_input(
+impl Operation for CreateBackendOperation {
+    type Output = GroupStorage;
+    type Error = CreateBackendError;
+
+    fn first(&mut self) -> CreateTurn {
+        let normalized = validate_backend_input(
             &self.input.name,
             self.input.kind,
             &self.input.public_config,
             &self.input.secret_config,
-        ) {
-            Ok(normalized) => normalized,
-            Err(error) => return self.fail(error.into()),
-        };
+        )?;
         let (kind, roots) = (self.input.kind, &self.input.import_roots);
-        if let Err(error) = check_import_root(kind, &normalized.public, self.input.group_id, roots)
-        {
-            return self.fail(error.into());
-        }
+        check_import_root(kind, &normalized.public, self.input.group_id, roots)?;
 
         let now = SystemTime::now();
         let backend_id = Ulid::generate();
@@ -159,99 +173,49 @@ impl CreateBackendOperation {
         });
         self.record = Some(record);
         self.secret = Some(secret);
-        smallvec![effect]
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
-    fn handle_probe(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::GroupBackendChecked) => {}
-            Event::Blob(BlobEvent::Error(error)) => {
-                return self.fail(CreateBackendError::Unreachable(error));
-            }
-            received => {
-                return self.fail(CreateBackendError::InvalidStateEvent {
-                    state: "Probe",
-                    expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
-                    received,
-                });
-            }
-        }
-
-        let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
-            return self.fail(CreateBackendError::Failed);
-        };
-        let writes = match record_writes(record) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
-        let secret_bytes = match secret.to_secret() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-
-        self.state = CreateState::WriteRecords;
-        smallvec![crate::groups::fence::write_group_secret(
-            self.input.group_id,
-            writes,
-            GroupStorageSecret::vault_entry(record.backend_id),
-            secret_bytes,
-        )]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        if let Err(error) = crate::groups::fence::group_write_result(event) {
-            return self.fail(error.into());
-        }
-        let Some(record) = self.record.clone() else {
-            return self.fail(CreateBackendError::Failed);
-        };
-        self.state = CreateState::Finish;
-        self.output = Some(Ok(record));
-        smallvec![]
-    }
-}
-
-impl EffectOperation for CreateBackendOperation {
-    type Output = GroupStorage;
-    type Error = CreateBackendError;
-
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> CreateTurn {
         match self.state {
-            CreateState::Init => self.handle_init(),
-            CreateState::Probe => self.handle_probe(event),
-            CreateState::WriteRecords => self.handle_written(event),
-            CreateState::Finish | CreateState::Error => smallvec![],
+            CreateState::Probe => {
+                let IoResult::Event(event) = result else {
+                    return Err(CreateBackendError::Failed);
+                };
+                match *event {
+                    Event::Blob(BlobEvent::GroupBackendChecked) => {}
+                    Event::Blob(BlobEvent::Error(error)) => {
+                        return Err(CreateBackendError::Unreachable(error));
+                    }
+                    received => {
+                        return Err(CreateBackendError::InvalidStateEvent {
+                            state: "Probe",
+                            expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
+                            received,
+                        });
+                    }
+                }
+                self.state = CreateState::WriteRecords;
+                Ok(Next::Call(IoCall::child(self.group_write()?)))
+            }
+            CreateState::WriteRecords => {
+                result.child::<(), GroupWriteError>()??;
+                let record = self.record.clone().ok_or(CreateBackendError::Failed)?;
+                Ok(Next::Done(record))
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, CreateState::Finish | CreateState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(result) => result,
-            None => Err(CreateBackendError::Failed),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::{CreateBackendError, CreateBackendInput, CreateBackendOperation};
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::{
         GroupBackendKind, GroupStorage, GroupStorageSecret,
@@ -278,34 +242,38 @@ mod pure_tests {
         }
     }
 
+    fn probed() -> CreateBackendOperation {
+        let mut operation = CreateBackendOperation::new(input());
+        operation.first().unwrap();
+        operation
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
     #[test]
     fn probes_before_writing() {
         // A backend that cannot be written to must never reach storage.
         let mut operation = CreateBackendOperation::new(input());
 
-        let effects = operation.start();
-        let mut formatted = vec![format!("{effects:?} {operation:?}")];
-
+        let probe = operation.first();
+        let mut formatted = vec![format!("{probe:?} {operation:?}")];
+        let Ok(Next::Call(IoCall::Effect(effect))) = probe else {
+            panic!("expected the probe");
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::CheckGroupBackend { .. })]
+            *effect,
+            Effect::Blob(BlobEffect::CheckGroupBackend { .. })
         ));
 
-        let mut effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
-        formatted.push(format!("{effects:?} {operation:?}"));
-        let [Effect::SubOperation(write)] = effects.as_mut_slice() else {
-            panic!("expected a guarded group write");
-        };
-        write.start();
-        write.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([7; 16]),
-        }));
-        let effects = write.step(Event::Storage(StorageEvent::ReadResult {
-            key: input().group_id.to_bytes().into(),
-            value: None,
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
+        let written = operation.next(event(Event::Blob(BlobEvent::GroupBackendChecked)));
+        formatted.push(format!("{written:?} {operation:?}"));
+        assert!(matches!(written, Ok(Next::Call(IoCall::Child(_)))));
+        let mut write = operation.group_write().unwrap();
+        write.first().unwrap();
+        let Ok(Next::Call(IoCall::Write(writes))) = write.next(IoResult::Values(vec![None])) else {
+            panic!("expected one batch write");
         };
         assert_eq!(
             writes
@@ -318,16 +286,16 @@ mod pure_tests {
         assert!(!stored.public_config.contains_key("access_key_id"));
 
         // The secret goes into the node vault inside the same transaction.
-        let effects = write.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
-        }));
-        let [Effect::Storage(StorageEffect::VaultWrite { entry, txn_id, .. })] = effects.as_slice()
-        else {
-            panic!("expected a vault write, got {effects:?}")
+        let seal = write.next(IoResult::Done);
+        formatted.push(format!("{seal:?} {write:?}"));
+        let Ok(Next::Call(IoCall::Effect(seal))) = seal else {
+            panic!("expected a vault write");
         };
-        assert_eq!(*entry, GroupStorageSecret::vault_entry(stored.backend_id));
-        assert_eq!(*txn_id, Some(Ulid::from_bytes([7; 16])));
-        formatted.push(format!("{effects:?} {write:?}"));
+        let Effect::Storage(StorageEffect::VaultWrite { entry, txn_id, .. }) = *seal else {
+            panic!("expected a vault write");
+        };
+        assert_eq!(entry, GroupStorageSecret::vault_entry(stored.backend_id));
+        assert_eq!(txn_id, None);
         for text in formatted {
             assert!(!text.contains("canary"), "{text}");
         }
@@ -335,17 +303,11 @@ mod pure_tests {
 
     #[test]
     fn probe_failure_aborts() {
-        let mut operation = CreateBackendOperation::new(input());
-        operation.start();
-
-        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+        let failed = Event::Blob(BlobEvent::Error(BlobError::WriteError(
             "denied".to_string(),
-        ))));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
+        )));
         assert!(matches!(
-            operation.finalize(),
+            probed().next(event(failed)),
             Err(CreateBackendError::Unreachable(_))
         ));
     }
@@ -355,27 +317,19 @@ mod pure_tests {
         let mut input = input();
         input.secret_config.remove("secret_access_key");
         let mut operation = CreateBackendOperation::new(input);
-
-        let effects = operation.start();
-
-        assert!(effects.is_empty());
         assert!(matches!(
-            operation.finalize(),
+            operation.first(),
             Err(CreateBackendError::Invalid(_))
         ));
     }
 
     #[test]
     fn rejects_unexpected_event() {
-        let mut operation = CreateBackendOperation::new(input());
-        operation.start();
-
-        operation.step(Event::Storage(StorageEvent::WriteResult {
+        let other = Event::Storage(StorageEvent::WriteResult {
             key: b"x".to_vec().into(),
-        }));
-
+        });
         assert!(matches!(
-            operation.finalize(),
+            probed().next(event(other)),
             Err(CreateBackendError::InvalidStateEvent { .. })
         ));
     }

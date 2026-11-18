@@ -6,17 +6,15 @@ use std::collections::BTreeMap;
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
     InboxWriteOutcome, NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
     notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
 };
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
 use crate::notifications::unexpected;
@@ -87,12 +85,10 @@ type Turn = Result<Next<InboxWriteOutcome>, InboxError>;
 
 /// Idempotent holder-local upsert that skips stored keys, so a duplicate keeps a mark-read. A
 /// bucket deletion removes its bucket's notices and keeps its time to drop late ones. It runs
-/// in its own transaction, or in the caller's open one, which the caller commits and retries.
+/// in one write transaction, its own or that of an operation that runs its calls.
 #[derive(Debug, PartialEq)]
 pub struct UpsertInboxOperation {
     records: Vec<NotificationRecord>,
-    /// The caller's transaction; `None` when the runner opens and ends one.
-    outer_txn: Option<TxnId>,
     state: UpsertState,
     kept: Vec<usize>,
     purges: Vec<usize>,
@@ -105,18 +101,8 @@ pub struct UpsertInboxOperation {
 
 impl UpsertInboxOperation {
     pub fn new(records: Vec<NotificationRecord>) -> Self {
-        Self::build(records, None)
-    }
-
-    /// Upserts inside the caller's open transaction; the caller commits and retries.
-    pub fn within(records: Vec<NotificationRecord>, txn_id: TxnId) -> Self {
-        Self::build(records, Some(txn_id))
-    }
-
-    fn build(records: Vec<NotificationRecord>, outer_txn: Option<TxnId>) -> Self {
         Self {
             records,
-            outer_txn,
             state: UpsertState::default(),
             kept: Vec::new(),
             purges: Vec::new(),
@@ -126,33 +112,6 @@ impl UpsertInboxOperation {
             counts: Vec::new(),
             outcome: InboxWriteOutcome::default(),
         }
-    }
-
-    /// The storage call, in the caller's transaction when there is one.
-    fn call(&self, call: IoCall) -> Turn {
-        let Some(txn_id) = self.outer_txn else {
-            return Ok(Next::Call(call));
-        };
-        let txn_id = Some(txn_id);
-        let effect = match call {
-            IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id },
-            IoCall::Page {
-                space,
-                prefix,
-                after,
-                limit,
-            } => StorageEffect::Iter {
-                key_space: space,
-                prefix: Some(prefix),
-                start: after.map(IterStart::After),
-                limit,
-                txn_id,
-            },
-            IoCall::Write(writes) => StorageEffect::BatchWrite { writes, txn_id },
-            IoCall::Delete(deletes) => StorageEffect::BatchDelete { deletes, txn_id },
-            other => return Ok(Next::Call(other)),
-        };
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(effect))))
     }
 
     fn read_cutoffs(&mut self) -> Turn {
@@ -178,7 +137,7 @@ impl UpsertInboxOperation {
             return self.next_purge(0);
         }
         self.state = UpsertState::ReadCutoffs { checked };
-        self.call(IoCall::Read(reads))
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn keep(&mut self, at: usize, cutoff: Option<u64>) {
@@ -191,12 +150,12 @@ impl UpsertInboxOperation {
     }
 
     fn scan(&self, scan: &InboxScan, limit: usize) -> Turn {
-        self.call(IoCall::Page {
+        Ok(Next::Call(IoCall::Page {
             space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
             prefix: notification_inbox_prefix(scan.recipient),
             after: scan.next.clone(),
             limit,
-        })
+        }))
     }
 
     fn next_purge(&mut self, at: usize) -> Turn {
@@ -260,7 +219,7 @@ impl UpsertInboxOperation {
             .map(|(key, _)| (space(), key.clone()))
             .collect();
         self.state = UpsertState::ReadTimes { times };
-        self.call(IoCall::Read(reads))
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn write_times(&mut self, times: Vec<(Key, u64)>, values: Vec<Option<Value>>) -> Turn {
@@ -276,7 +235,7 @@ impl UpsertInboxOperation {
             return self.delete_rows();
         }
         self.state = UpsertState::WriteTimes;
-        self.call(IoCall::Write(writes))
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn delete_rows(&mut self) -> Turn {
@@ -285,7 +244,7 @@ impl UpsertInboxOperation {
             return self.read_existing();
         }
         self.state = UpsertState::DeleteRows;
-        self.call(IoCall::Delete(deletes))
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
     fn read_existing(&mut self) -> Turn {
@@ -304,7 +263,7 @@ impl UpsertInboxOperation {
             })
             .collect();
         self.state = UpsertState::ReadExisting;
-        self.call(IoCall::Read(reads))
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn plan_writes(&mut self, values: Vec<Option<Value>>) -> Turn {
@@ -396,33 +355,7 @@ impl UpsertInboxOperation {
             return Ok(Next::Done(std::mem::take(&mut self.outcome)));
         }
         self.state = UpsertState::WriteRows;
-        self.call(IoCall::Write(writes))
-    }
-}
-
-/// The plain result of a storage effect run in the caller's transaction.
-fn plain(result: IoResult) -> Result<IoResult, InboxError> {
-    let IoResult::Event(Event::Storage(event)) = result else {
-        return Ok(result);
-    };
-    match event {
-        StorageEvent::BatchReadResult { values } => Ok(IoResult::Values(
-            values.into_iter().map(|(_, value)| value).collect(),
-        )),
-        StorageEvent::IterResult {
-            values,
-            next_start_after,
-        } => Ok(IoResult::Page {
-            rows: values,
-            next: next_start_after,
-        }),
-        StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. } => {
-            Ok(IoResult::Done)
-        }
-        StorageEvent::Error { error } => Err(IoError::Storage(error).into()),
-        other => {
-            Err(unexpected("a storage result", &IoResult::Event(Event::Storage(other))).into())
-        }
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -438,7 +371,7 @@ impl Operation for UpsertInboxOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
-        match (std::mem::take(&mut self.state), plain(result)?) {
+        match (std::mem::take(&mut self.state), result) {
             (UpsertState::ReadCutoffs { checked }, IoResult::Values(values)) => {
                 for (at, value) in checked.into_iter().zip(values) {
                     self.keep(at, stored_time(value.as_ref()));
@@ -465,8 +398,8 @@ impl Operation for UpsertInboxOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        self.outer_txn.is_none()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -488,6 +421,8 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::tests::notifications::{context, record, temp_storage, user};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
@@ -824,8 +759,6 @@ mod call_tests {
     use super::*;
     use crate::tests::notifications::{record, user};
 
-    const TXN: TxnId = TxnId::from_parts(5, 5);
-
     fn notice() -> NotificationRecord {
         record(user(1, 2), NotificationClass::Direct, 1_000)
     }
@@ -842,7 +775,10 @@ mod call_tests {
     fn upsert_success_calls() {
         let record = notice();
         let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
-        assert!(upsert.transaction());
+        assert_eq!(
+            upsert.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let space = NOTIFICATION_INBOX_KEYSPACE.to_string();
         assert_eq!(
             upsert.first(),
@@ -872,28 +808,6 @@ mod call_tests {
             panic!("done");
         };
         assert_eq!((outcome.written, outcome.held), (0, vec![record]));
-    }
-
-    #[test]
-    fn within_caller_transaction() {
-        let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
-        assert!(!upsert.transaction());
-        assert!(matches!(
-            upsert.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(
-                StorageEffect::BatchRead {
-                    txn_id: Some(TXN),
-                    ..
-                }
-            ))))
-        ));
-        let conflict = Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        });
-        assert_eq!(
-            upsert.next(IoResult::Event(conflict)),
-            Err(InboxError::Conflict)
-        );
     }
 
     #[test]

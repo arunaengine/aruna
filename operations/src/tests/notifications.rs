@@ -5,11 +5,8 @@
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::protocol::MetadataReadError;
 use crate::notifications::inbox::UpsertInboxOperation;
-use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;
-use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -69,39 +66,6 @@ pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]
     assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
-/// Management nodes that open every setting with a fixed secret and count the requests. A node
-/// without a secret is unreachable.
-#[derive(Default)]
-pub(crate) struct CannedPeers {
-    pub secrets: std::collections::HashMap<aruna_core::NodeId, SecretBytes>,
-    pub opens: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl SettingPeers for CannedPeers {
-    async fn open(
-        &self,
-        node: aruna_core::NodeId,
-        _target: DocumentTarget,
-        _bytes: Vec<u8>,
-    ) -> Result<SecretBytes, MetadataReadError> {
-        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.secrets
-            .get(&node)
-            .cloned()
-            .ok_or(MetadataReadError::Unavailable)
-    }
-}
-
-/// Peers where every manager opens settings with `secret`.
-pub(crate) fn opening(secret: &[u8]) -> CannedPeers {
-    let secret = SecretBytes::new(secret.to_vec());
-    CannedPeers {
-        secrets: managers().map(|node| (node, secret.clone())).into(),
-        ..Default::default()
-    }
-}
-
 /// Stores one register write of a setting on this node, as a local write or sync would.
 pub(crate) async fn store_setting(
     storage: &StorageHandle,
@@ -120,6 +84,30 @@ pub(crate) async fn store_setting(
 /// Three management nodes, in config order.
 pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+}
+
+/// Creates a watch on this node as its holder, with the owner's READ check and replication.
+pub(crate) async fn create_holder_watch(
+    context: &DriverContext,
+    local_node_id: aruna_core::NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    authorization: aruna_core::structs::execution::notification_watch::WatchAuthorizationBinding,
+    now_ms: u64,
+) -> Result<
+    aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let watch = (path_prefix, event_mask);
+    let create = crate::notifications::watch::store::CreateWatchOperation::new(
+        local_node_id,
+        owner,
+        watch,
+        authorization,
+        now_ms,
+    )?;
+    drive(create, context).await
 }
 
 /// Stores a watch of `owner` on this node without authorization or replication.
@@ -155,4 +143,15 @@ pub(crate) async fn delete_local_watch(
     let store =
         crate::notifications::watch::store::StoreWatchOperation::delete(owner, watch_id, None);
     drive(store, &context(storage)).await.map(|_| ())
+}
+
+/// A delivery from `node_id(2)` to `node_id(1)`, which holds the inbox of `user(1, 2)`.
+pub(crate) fn peer_input() -> crate::notifications::deliver::DeliverInput {
+    use crate::tests::locations::node_id;
+    crate::notifications::deliver::DeliverInput {
+        peer: node_id(2),
+        local: node_id(1),
+        local_realm: user(1, 2).realm_id,
+        now_ms: 1_000,
+    }
 }

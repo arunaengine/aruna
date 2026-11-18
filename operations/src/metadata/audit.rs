@@ -1568,11 +1568,13 @@ mod tests {
         let realm_id = RealmId([3u8; 32]);
         let group_id = Ulid::from_bytes([4u8; 16]);
         let document_id = Ulid::from_bytes([5u8; 16]);
-        let after = Some(vec![7u8; AUDIT_KEY_BYTES]);
-        let mut operation =
-            LocalPageOperation::new(realm_id, group_id, Some(document_id), after.clone(), 0);
         let mut prefix = group_id.to_bytes().to_vec();
         prefix.extend_from_slice(&document_id.to_bytes());
+        let mut cursor = prefix.clone();
+        cursor.resize(AUDIT_KEY_BYTES, 7);
+        let after = Some(cursor);
+        let mut operation =
+            LocalPageOperation::new(realm_id, group_id, Some(document_id), after.clone(), 0);
         assert_eq!(
             operation.first(),
             Ok(Next::Call(IoCall::Page {

@@ -4,6 +4,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -33,7 +34,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
-use aruna_core::{MetaResourceId, StructuredId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;

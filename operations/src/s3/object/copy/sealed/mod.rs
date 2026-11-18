@@ -8,21 +8,24 @@ use crate::blob::records::{
 };
 use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
+    AddedVersion, InventoryChange, StagedCall, entry_of, outside_answer, stamp_head, stamp_version,
+    version_written,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
 use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::abe_rekey::RekeyProgress;
-use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
+use crate::s3::object::put::abe::{abe_reads, envelope_write, keyed, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -31,9 +34,10 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -52,8 +56,7 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -95,6 +98,12 @@ pub enum SealedCopyError {
     UsageRebuilding,
 }
 
+impl From<IoError> for SealedCopyError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 /// One same-bucket copy of a sealed version, described by what HEAD returned for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedCopyInput {
@@ -126,14 +135,13 @@ pub struct SealedCopyResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
-    Init,
     ReadBucket,
     Gate,
     Record,
     ReadAbe,
-    ReadEnvelope,
+    /// Reads the complete envelope with this write id.
+    ReadEnvelope([u8; 16]),
     CreateEnvelope,
-    Start,
     Fence,
     Drift,
     ReadSource,
@@ -149,9 +157,27 @@ enum Step {
     Register,
     Quota,
     Usage,
-    Commit,
-    Finish,
-    Error,
+}
+
+type Turn = Result<Next<SealedCopyResult>, SealedCopyError>;
+
+/// A read before the transaction, which stays closed until the publication fence.
+fn outside(call: IoCall) -> IoCall {
+    StagedCall::Outside(call).into_call()
+}
+
+/// A write effect or write call finished.
+fn written(result: IoResult) -> Result<(), SealedCopyError> {
+    match result {
+        IoResult::Done => Ok(()),
+        IoResult::Event(event) => match *event {
+            Event::Storage(
+                StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
+            ) => Ok(()),
+            _ => Err(SealedCopyError::InvalidState),
+        },
+        _ => Err(SealedCopyError::InvalidState),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,12 +186,10 @@ pub struct SealedCopyOperation {
     step: Step,
     /// Destination of this node; absent fails every governed copy closed.
     gate_context: Option<GateContext>,
-    gate: Option<PolicyGateOperation>,
     /// What the gate decided on, read again inside the transaction.
     gated: Option<GatedBucket>,
     /// The bucket default joined with the source refs, stored on the copy.
     refs: Vec<PlacementPolicyRef>,
-    txn_id: Option<TxnId>,
     version_id: Ulid,
     version: Option<BlobVersion>,
     existing: Option<CurrentVersionPointer>,
@@ -188,19 +212,16 @@ pub struct SealedCopyOperation {
     /// Written instead of an envelope while the bucket is locked.
     pending: Option<PendingCopy>,
     envelope_bytes: u64,
-    output: Option<Result<SealedCopyResult, SealedCopyError>>,
 }
 
 impl SealedCopyOperation {
     pub fn new(input: SealedCopyInput) -> Self {
         Self {
             input,
-            step: Step::Init,
+            step: Step::ReadBucket,
             gate_context: None,
-            gate: None,
             gated: None,
             refs: Vec::new(),
-            txn_id: None,
             version_id: Ulid::generate(),
             version: None,
             existing: None,
@@ -217,7 +238,6 @@ impl SealedCopyOperation {
             envelope: None,
             pending: None,
             envelope_bytes: 0,
-            output: None,
         }
     }
 
@@ -231,10 +251,7 @@ impl SealedCopyOperation {
     }
 
     /// Gates the bucket default joined with the source refs before the transaction, like a write.
-    fn bucket_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
+    fn bucket_read(&mut self, value: Option<Value>) -> Turn {
         let bucket = value
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
@@ -251,32 +268,16 @@ impl SealedCopyOperation {
         let group_id = Some(self.input.group_id);
         match write_gate(self.gate_context.as_ref(), &self.refs, group_id)? {
             None => self.read_abe(),
-            Some(mut gate) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
+            Some(gate) => {
                 self.step = Step::Gate;
-                match complete {
-                    true => self.finish_gate(),
-                    false => Ok(effects),
-                }
+                Ok(Next::Call(IoCall::child(gate)))
             }
         }
     }
 
-    fn gate_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let gate = self.gate.as_mut().ok_or(SealedCopyError::InvalidState)?;
-        let effects = gate.step(event);
-        match gate.is_complete() {
-            true => self.finish_gate(),
-            false => Ok(effects),
-        }
-    }
-
-    fn finish_gate(&mut self) -> Result<Effects, SealedCopyError> {
-        let gate = self.gate.take().ok_or(SealedCopyError::InvalidState)?;
-        let outcome = gate.finalize().map_err(PolicyGateError::from)?;
-        gate_decision(outcome)?;
+    fn gate_checked(&mut self, result: IoResult) -> Turn {
+        let outcome = result.child::<PolicyGateOutcome, ReadPolicyError>()?;
+        gate_decision(outcome.map_err(PolicyGateError::from)?)?;
         self.read_abe()
     }
 
@@ -312,17 +313,18 @@ impl SealedCopyOperation {
 
     /// Reads the source's envelope or pending copy row and the admitted parameters and epoch.
     /// Only the coordinator of the destination key's range writes the copy.
-    fn read_abe(&mut self) -> Result<Effects, SealedCopyError> {
+    fn read_abe(&mut self) -> Turn {
         match self.binding.as_ref() {
             Some(binding) => {
+                let read = outside(record_read(binding).into());
                 self.step = Step::Record;
-                Ok(smallvec![record_read(binding)])
+                Ok(Next::Call(read))
             }
             None => self.read_abe_rows(),
         }
     }
 
-    fn record_checked(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+    fn record_checked(&mut self, event: Event) -> Turn {
         let binding = self.binding.as_ref().ok_or(SealedCopyError::InvalidState)?;
         let authority = record_authority(binding, &self.input.dest_key, event)?;
         self.epoch = authority.epoch;
@@ -330,7 +332,7 @@ impl SealedCopyOperation {
         self.read_abe_rows()
     }
 
-    fn read_abe_rows(&mut self) -> Result<Effects, SealedCopyError> {
+    fn read_abe_rows(&mut self) -> Turn {
         let Some(key) = self.input.location.format.bucket_key() else {
             return Ok(self.begin());
         };
@@ -344,17 +346,11 @@ impl SealedCopyOperation {
         ];
         reads.extend(abe_reads(key));
         self.step = Step::ReadAbe;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })])
+        Ok(Next::Call(outside(IoCall::Read(reads))))
     }
 
     /// A source without any envelope leaves the copy without one, as before.
-    fn abe_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
+    fn abe_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
         let [(_, id), (_, pending), parameters @ ..] = values.as_slice() else {
             return Err(SealedCopyError::InvalidState);
         };
@@ -367,25 +363,19 @@ impl SealedCopyOperation {
         self.admitted = Some((parameters, epoch));
         if let Some(id) = id {
             let id = <[u8; 16]>::try_from(id.as_ref()).map_err(|_| abe(AbeError::Context))?;
-            self.step = Step::ReadEnvelope;
-            return Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: ABE_ENVELOPE_KEYSPACE.to_string(),
-                key: id.to_vec().into(),
-                txn_id: None,
-            })]);
+            self.step = Step::ReadEnvelope(id);
+            let read = read_row(ABE_ENVELOPE_KEYSPACE, id.to_vec());
+            return Ok(Next::Call(outside(read)));
         }
         // A pending source passes on the complete envelope it names.
         let pending = pending.as_deref().ok_or(SealedCopyError::InvalidState)?;
         self.create_envelope(PendingCopy::from_bytes(pending).map_err(abe)?.source)
     }
 
-    fn envelope_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
+    fn envelope_read(&mut self, id: [u8; 16], value: Option<Value>) -> Turn {
         let envelope = ObjectEnvelope::from_bytes(value.as_deref().ok_or(abe(AbeError::Pending))?)
             .map_err(abe)?;
-        if envelope.context.write_id.to_bytes().as_slice() != key.as_ref()
+        if envelope.context.write_id.to_bytes() != id
             || envelope.context.object_key != self.input.source_key
         {
             return Err(abe(AbeError::Context));
@@ -394,24 +384,25 @@ impl SealedCopyOperation {
     }
 
     /// Asks for the copy's own envelope; a locked bucket leaves the copy pending on `source`.
-    fn create_envelope(&mut self, source: ObjectEnvelope) -> Result<Effects, SealedCopyError> {
+    fn create_envelope(&mut self, source: ObjectEnvelope) -> Turn {
         let (parameters, epoch) = self.admitted.clone().ok_or(SealedCopyError::InvalidState)?;
         if source.context.parameters != parameters {
             return Err(abe(AbeError::Parameters));
         }
         self.step = Step::CreateEnvelope;
         self.source_envelope = Some(source.clone());
-        Ok(smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
-            AbeEffect::Copy {
-                source,
-                epoch,
-                write_id: Ulid::generate(),
-                object_key: self.input.dest_key.clone(),
-            }
-        )))])
+        let copy = AbeEffect::Copy {
+            source,
+            epoch,
+            write_id: Ulid::generate(),
+            object_key: self.input.dest_key.clone(),
+        };
+        Ok(Next::Call(
+            Effect::Blob(BlobEffect::Abe(Box::new(copy))).into(),
+        ))
     }
 
-    fn envelope_created(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+    fn envelope_created(&mut self, event: Event) -> Turn {
         let Event::Blob(event) = event else {
             return Err(SealedCopyError::InvalidState);
         };
@@ -432,15 +423,15 @@ impl SealedCopyOperation {
         Ok(self.begin())
     }
 
-    fn begin(&mut self) -> Effects {
-        self.step = Step::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    /// The publication fence is the first read of the transaction.
+    fn begin(&mut self) -> Next<SealedCopyResult> {
+        self.step = Step::Fence;
+        let fence = publication_read(&self.input.bucket, self.authority.as_ref(), None);
+        Next::Call(fence.into())
     }
 
     /// The default and subject the gate admitted must still hold when the copy commits.
-    fn drift_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+    fn drift_read(&mut self, event: Event) -> Turn {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return Err(SealedCopyError::InvalidState);
         };
@@ -451,16 +442,6 @@ impl SealedCopyOperation {
         }
         gated.check_subject(subject.as_ref())?;
         self.read_source()
-    }
-
-    fn fail(&mut self, error: impl Into<SealedCopyError>) -> Effects {
-        self.step = Step::Error;
-        self.output = Some(Err(error.into()));
-        self.abort()
-    }
-
-    fn txn(&self) -> Result<TxnId, SealedCopyError> {
-        self.txn_id.ok_or(SealedCopyError::InvalidState)
     }
 
     fn dest_version(&self) -> VersionKey {
@@ -478,7 +459,7 @@ impl SealedCopyOperation {
     }
 
     /// Reads the exact source version and the destination head in the transaction.
-    fn read_source(&mut self) -> Result<Effects, SealedCopyError> {
+    fn read_source(&mut self) -> Turn {
         let source = VersionKey::new(
             &self.input.bucket,
             &self.input.source_key,
@@ -486,24 +467,18 @@ impl SealedCopyOperation {
         );
         let head = BlobHeadKey::new(&self.input.bucket, &self.input.dest_key);
         self.step = Step::ReadSource;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    BLOB_VERSIONS_KEYSPACE.to_string(),
-                    source.to_bytes()?.into()
-                ),
-                (BLOB_HEAD_KEYSPACE.to_string(), head.to_bytes()?.into()),
-            ],
-            txn_id: self.txn_id,
-        })])
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                source.to_bytes()?.into(),
+            ),
+            (BLOB_HEAD_KEYSPACE.to_string(), head.to_bytes()?.into()),
+        ])))
     }
 
     /// The new version keeps the source's content state, known or pending, on the same archive.
-    fn source_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
-        let [(_, source), (_, head)] =
+    fn source_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [source, head] =
             <[_; 2]>::try_from(values).map_err(|_| SealedCopyError::InvalidState)?;
         let source = source.ok_or(SealedCopyError::NoSuchVersion)?;
         let source = BlobVersion::from_bytes(source.as_ref())?;
@@ -557,17 +532,13 @@ impl SealedCopyOperation {
         };
         let key = VersionKey::new(&self.input.bucket, &self.input.dest_key, pointer.version_id);
         self.step = Step::ReadLiveness;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.to_bytes()?.into(),
-            txn_id: self.txn_id,
-        })])
+        Ok(Next::Call(read_row(
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes()?,
+        )))
     }
 
-    fn liveness_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
+    fn liveness_read(&mut self, value: Option<Value>) -> Turn {
         let head = value
             .map(|value| BlobVersion::from_bytes(value.as_ref()))
             .transpose()?;
@@ -578,35 +549,28 @@ impl SealedCopyOperation {
         self.write_head()
     }
 
-    fn write_head(&mut self) -> Result<Effects, SealedCopyError> {
+    fn write_head(&mut self) -> Turn {
         let pointer = CurrentVersionPointer::next_for(self.existing.as_ref(), self.version_id)?;
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.epoch);
         self.head = Some(pointer.clone());
         self.step = Step::WriteHead;
-        Ok(smallvec![write_head_effect(
-            &self.alias_context(),
-            pointer,
-            self.txn_id
-        )?])
+        let write = write_head_effect(&self.alias_context(), pointer, None)?;
+        Ok(Next::Call(write.into()))
     }
 
     /// A known content hash gets its path index; a pending archive has none yet.
-    fn write_index(&mut self) -> Result<Effects, SealedCopyError> {
+    fn write_index(&mut self) -> Turn {
         let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
         let Some(hash) = version.state.blob_hash().copied() else {
             return self.write_version();
         };
         self.step = Step::WriteIndex;
         let context = self.alias_context();
-        Ok(smallvec![add_index_effect(
-            &context,
-            hash,
-            self.version_id,
-            self.txn_id
-        )?])
+        let write = add_index_effect(&context, hash, self.version_id, None)?;
+        Ok(Next::Call(write.into()))
     }
 
-    fn write_version(&mut self) -> Result<Effects, SealedCopyError> {
+    fn write_version(&mut self) -> Turn {
         let version = self.version.take().ok_or(SealedCopyError::InvalidState)?;
         let generation = self.head.as_ref().map_or(0, |head| head.generation);
         let version = stamp_version(version, self.binding.as_ref(), generation, self.epoch);
@@ -617,22 +581,22 @@ impl SealedCopyOperation {
             self.version_id,
             unix_timestamp_millis(),
         );
-        let effect = write_version_effect(&self.dest_version(), &version, self.txn_id)?;
+        let effect = write_version_effect(&self.dest_version(), &version, None)?;
         let effect = journaled(effect, &uploaded)?;
         self.version = Some(version);
         self.step = Step::WriteVersion;
-        Ok(smallvec![effect])
+        Ok(Next::Call(effect.into()))
     }
 
     /// The new version owns the archive too, so neither alias frees it while the other lives.
-    fn write_owner(&mut self) -> Result<Effects, SealedCopyError> {
+    fn write_owner(&mut self) -> Turn {
         let owner = CopyOwner::new(self.archive(), self.dest_version());
         self.step = Step::WriteOwner;
-        Ok(smallvec![owner_write_effect(&owner, self.txn_id)?])
+        Ok(Next::Call(owner_write_effect(&owner, None)?.into()))
     }
 
     /// Fences the copy's own envelope or writes its pending row; a source without either skips.
-    fn publish_envelope(&mut self) -> Result<Effects, SealedCopyError> {
+    fn publish_envelope(&mut self) -> Turn {
         if let Some(pending) = &self.pending {
             let key = copy_row(
                 pending.source.context.parameters.key.bucket_id,
@@ -641,12 +605,8 @@ impl SealedCopyOperation {
             let value = pending.to_bytes().map_err(abe)?;
             self.envelope_bytes = value.len() as u64;
             self.step = Step::WriteEnvelope;
-            return Ok(smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: ABE_COPY_KEYSPACE.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: self.txn_id,
-            })]);
+            let row = (ABE_COPY_KEYSPACE.to_string(), key.into(), value.into());
+            return Ok(Next::Call(IoCall::Write(vec![row])));
         }
         let Some(envelope) = &self.envelope else {
             return self.register();
@@ -655,17 +615,11 @@ impl SealedCopyOperation {
         let mut reads = vec![(BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into())];
         reads.extend(abe_reads(envelope.context.parameters.key));
         self.step = Step::FenceAbe;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// A raise or rotation since the envelope was made refuses the copy, like a stale write.
-    fn abe_fenced(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
+    fn abe_fenced(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
         let [(_, settings), anchors @ ..] = values.as_slice() else {
             return Err(SealedCopyError::InvalidState);
         };
@@ -679,33 +633,31 @@ impl SealedCopyOperation {
         envelope.anchored(&parameters, epoch).map_err(abe)?;
         let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
         let limit = RoCrateLimits::default().metadata_bytes;
-        let rows = (&version.metadata, limit, self.txn_id);
+        let rows = (&version.metadata, limit, None);
         let (effect, charge) =
             envelope_write(envelope, &self.dest_version(), &self.input.location, rows)
                 .map_err(abe)?;
         self.envelope_bytes = charge;
         self.step = Step::WriteEnvelope;
-        Ok(smallvec![effect])
+        Ok(Next::Call(effect.into()))
     }
 
     /// The alias reuses the old object key, so a re-key pass of its prefix starts again.
-    fn read_rekey(&mut self) -> Result<Effects, SealedCopyError> {
-        let Some(key) = self.input.location.format.bucket_key() else {
+    fn rekey_key(&self) -> Option<Key> {
+        let key = self.input.location.format.bucket_key()?;
+        Some(key.bucket_id.to_bytes().to_vec().into())
+    }
+
+    fn read_rekey(&mut self) -> Turn {
+        let Some(key) = self.rekey_key() else {
             return self.register();
         };
         self.step = Step::ReadRekey;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: ABE_REKEY_KEYSPACE.to_string(),
-            key: key.bucket_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })])
+        Ok(Next::Call(read_row(ABE_REKEY_KEYSPACE, key)))
     }
 
-    fn rekey_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
-            return Err(SealedCopyError::InvalidState);
-        };
-        let Some(value) = value else {
+    fn rekey_read(&mut self, value: Option<Value>) -> Turn {
+        let (Some(key), Some(value)) = (self.rekey_key(), value) else {
             return self.register();
         };
         let mut progress: RekeyProgress =
@@ -717,16 +669,12 @@ impl SealedCopyOperation {
         progress.rekeyed = 0;
         let value = postcard::to_allocvec(&progress).map_err(|_| abe(AbeError::Context))?;
         self.step = Step::ResetRekey;
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: ABE_REKEY_KEYSPACE.to_string(),
-            key,
-            value: value.into(),
-            txn_id: self.txn_id,
-        })])
+        let row = (ABE_REKEY_KEYSPACE.to_string(), key, value.into());
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
     /// Registers the copy like any write, so governed reads find this node's copy of it.
-    fn register(&mut self) -> Result<Effects, SealedCopyError> {
+    fn register(&mut self) -> Turn {
         let subject_generation = self
             .gated
             .as_ref()
@@ -740,14 +688,13 @@ impl SealedCopyOperation {
             subject_generation: subject_generation.unwrap_or_default(),
             registered_at_ms: self.version_id.timestamp_ms(),
         };
-        let effect = register_effect(registration, self.txn_id)?;
+        let effect = register_effect(registration, None)?;
         self.step = Step::Register;
-        Ok(smallvec![effect])
+        Ok(Next::Call(effect.into()))
     }
 
     /// The copy adds a logical object but no physical bytes: the archive is already credited.
-    fn start_quota(&mut self) -> Result<Effects, SealedCopyError> {
-        let txn_id = self.txn()?;
+    fn start_quota(&mut self) -> Turn {
         let added = self.input.size.saturating_add(self.envelope_bytes);
         let delta = UsageDelta {
             objects: i128::from(!self.was_live),
@@ -768,9 +715,9 @@ impl SealedCopyOperation {
                     self.input.realm_id,
                 );
                 self.step = Step::Quota;
-                let effects = gate.start(txn_id);
+                let call = gate.start_calls();
                 self.quota = Some(gate);
-                Ok(effects)
+                Ok(Next::Call(call))
             }
             None => self.start_usage(),
         }
@@ -788,11 +735,10 @@ impl SealedCopyOperation {
         version_written(self.binding.as_ref(), &self.input.dest_key, added, true)
     }
 
-    fn quota_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let txn_id = self.txn()?;
+    fn quota_step(&mut self, result: IoResult) -> Turn {
         let gate = self.quota.as_mut().ok_or(SealedCopyError::InvalidState)?;
-        if let Some(effects) = gate.step(event, txn_id)? {
-            return Ok(effects);
+        if let Some(call) = gate.step_calls(result)? {
+            return Ok(Next::Call(call));
         }
         if gate.is_rebuilding() {
             return Err(SealedCopyError::UsageRebuilding);
@@ -804,88 +750,26 @@ impl SealedCopyOperation {
         self.start_usage()
     }
 
-    fn start_usage(&mut self) -> Result<Effects, SealedCopyError> {
-        let txn_id = self.txn()?;
+    fn copied(&self) -> Turn {
+        Ok(Next::Done(SealedCopyResult {
+            version_id: self.version_id,
+        }))
+    }
+
+    fn start_usage(&mut self) -> Turn {
         let update = self.usage.as_mut().ok_or(SealedCopyError::InvalidState)?;
         if update.is_noop() {
-            return self.commit();
+            return self.copied();
         }
         self.step = Step::Usage;
-        Ok(update.start(txn_id))
+        Ok(Next::Call(update.start_calls().into_call()))
     }
 
-    fn usage_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let txn_id = self.txn()?;
+    fn usage_step(&mut self, result: IoResult) -> Turn {
         let update = self.usage.as_mut().ok_or(SealedCopyError::InvalidState)?;
-        match update.step(event, txn_id)? {
-            Some(effects) => Ok(effects),
-            None => self.commit(),
-        }
-    }
-
-    fn commit(&mut self) -> Result<Effects, SealedCopyError> {
-        let txn_id = self.txn()?;
-        self.step = Step::Commit;
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction { txn_id }
-        )])
-    }
-
-    fn advance(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
-        let written = matches!(event, Event::Storage(StorageEvent::WriteResult { .. }));
-        match (self.step, event) {
-            (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.step = Step::Fence;
-                let authority = self.authority.as_ref();
-                Ok(smallvec![publication_read(
-                    &self.input.bucket,
-                    authority,
-                    self.txn_id
-                )])
-            }
-            (Step::ReadBucket, event) => self.bucket_read(event),
-            (Step::Gate, event) => self.gate_step(event),
-            (Step::Record, event) => self.record_checked(event),
-            (Step::ReadAbe, event) => self.abe_read(event),
-            (Step::ReadEnvelope, event) => self.envelope_read(event),
-            (Step::CreateEnvelope, event) => self.envelope_created(event),
-            (Step::Fence, event) => {
-                let (bucket, key) = (&self.input.bucket, &self.input.dest_key);
-                check_publication(event, bucket, key, self.authority.as_ref())?;
-                self.step = Step::Drift;
-                Ok(smallvec![drift_reads(&self.input.bucket, self.txn_id)])
-            }
-            (Step::Drift, event) => self.drift_read(event),
-            (Step::ReadSource, event) => self.source_read(event),
-            (Step::ReadLiveness, event) => self.liveness_read(event),
-            (Step::WriteHead, _) if written => self.write_index(),
-            (Step::WriteIndex, _) if written => self.write_version(),
-            // The version commits with its journal rows in one batch.
-            (Step::WriteVersion, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.write_owner()
-            }
-            (Step::WriteOwner, _) if written => self.publish_envelope(),
-            (Step::FenceAbe, event) => self.abe_fenced(event),
-            (Step::WriteEnvelope, Event::Storage(StorageEvent::WriteResult { .. }))
-            | (Step::WriteEnvelope, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.read_rekey()
-            }
-            (Step::ReadRekey, event) => self.rekey_read(event),
-            (Step::ResetRekey, _) if written => self.register(),
-            (Step::Register, _) if written => self.start_quota(),
-            (Step::Quota, event) => self.quota_step(event),
-            (Step::Usage, event) => self.usage_step(event),
-            (Step::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.step = Step::Finish;
-                self.output = Some(Ok(SealedCopyResult {
-                    version_id: self.version_id,
-                }));
-                Ok(smallvec![])
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            _ => Err(SealedCopyError::InvalidState),
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.copied(),
         }
     }
 }
@@ -894,39 +778,71 @@ fn abe(error: AbeError) -> SealedCopyError {
     SealedCopyError::Blob(error.into())
 }
 
-impl EffectOperation for SealedCopyOperation {
+impl Operation for SealedCopyOperation {
     type Output = SealedCopyResult;
     type Error = SealedCopyError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         self.step = Step::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: None,
-        })]
+        let read = read_row(S3_BUCKET_KEYSPACE, self.input.bucket.as_bytes().to_vec());
+        Ok(Next::Call(outside(read)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.advance(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+    fn next(&mut self, result: IoResult) -> Turn {
+        match self.step {
+            Step::ReadBucket => self.bucket_read(outside_answer(result)?.value()?),
+            Step::Gate => self.gate_checked(result),
+            Step::Record => self.record_checked(outside_answer(result)?.event()?),
+            Step::ReadAbe => self.abe_read(keyed(&outside_answer(result)?.values()?)),
+            Step::ReadEnvelope(id) => self.envelope_read(id, outside_answer(result)?.value()?),
+            Step::CreateEnvelope => self.envelope_created(result.event()?),
+            Step::Fence => {
+                let (bucket, key) = (&self.input.bucket, &self.input.dest_key);
+                check_publication(result.event()?, bucket, key, self.authority.as_ref())?;
+                self.step = Step::Drift;
+                Ok(Next::Call(drift_reads(&self.input.bucket, None).into()))
+            }
+            Step::Drift => self.drift_read(result.event()?),
+            Step::ReadSource => self.source_read(result.values()?),
+            Step::ReadLiveness => self.liveness_read(result.value()?),
+            Step::WriteHead => {
+                written(result)?;
+                self.write_index()
+            }
+            Step::WriteIndex => {
+                written(result)?;
+                self.write_version()
+            }
+            // The version commits with its journal rows in one batch.
+            Step::WriteVersion => {
+                written(result)?;
+                self.write_owner()
+            }
+            Step::WriteOwner => {
+                written(result)?;
+                self.publish_envelope()
+            }
+            Step::FenceAbe => self.abe_fenced(keyed(&result.values()?)),
+            Step::WriteEnvelope => {
+                written(result)?;
+                self.read_rekey()
+            }
+            Step::ReadRekey => self.rekey_read(result.value()?),
+            Step::ResetRekey => {
+                written(result)?;
+                self.register()
+            }
+            Step::Register => {
+                written(result)?;
+                self.start_quota()
+            }
+            Step::Quota => self.quota_step(result),
+            Step::Usage => self.usage_step(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.step, Step::Finish | Step::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SealedCopyError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

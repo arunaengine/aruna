@@ -25,8 +25,8 @@ use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
 
-use super::limiter::retried;
 use super::manifest::lasting_head;
+use super::retried;
 use super::walk::{
     PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
     record_failure, source_permission_path,
@@ -268,22 +268,16 @@ async fn connector_chunk(
     if !source_allowed(ctx, spec, source_permission_path(spec, path)).await? {
         return Err(ChunkFailure::Lasting("table read denied".to_string()));
     }
-    let stop = (&ctx.cancel, &ctx.shutdown);
     let observation = match read.observation.clone() {
         Some(observation) => observation,
         None => {
-            let head = || {
-                drive(
-                    HeadSourceOperation::new(HeadSourceInput {
-                        group_id: spec.group_id,
-                        connector_id: spec.connector_id,
-                        source_path: path.to_string(),
-                    }),
-                    &ctx.driver,
-                )
+            let input = HeadSourceInput {
+                group_id: spec.group_id,
+                connector_id: spec.connector_id,
+                source_path: path.to_string(),
             };
-            let transient = |error: &_| (!lasting_head(error)).then(|| format!("{error}"));
-            match retried(stop, spec, transient, head).await {
+            let transient = |error: &_| !lasting_head(error);
+            match retried(ctx, spec, input, HeadSourceOperation::new, transient).await {
                 Ok(head) => head.metadata,
                 Err(error) if lasting_head(&error) => {
                     return Err(ChunkFailure::Lasting(format!("table unavailable: {error}")));
@@ -345,21 +339,15 @@ async fn open_source(
     observation: &SourceMetadata,
     range: Option<std::ops::Range<u64>>,
 ) -> Result<BackendStream<Result<Bytes, StreamError>>, ChunkFailure> {
-    let stop = (&ctx.cancel, &ctx.shutdown);
-    let source = || {
-        drive(
-            ReadSourceOperation::new(ReadSourceInput {
-                group_id: spec.group_id,
-                connector_id: spec.connector_id,
-                source_path: path.to_string(),
-                range: range.clone(),
-                expected: Some(observation.clone()),
-            }),
-            &ctx.driver,
-        )
+    let input = ReadSourceInput {
+        group_id: spec.group_id,
+        connector_id: spec.connector_id,
+        source_path: path.to_string(),
+        range,
+        expected: Some(observation.clone()),
     };
-    let transient = |error: &ReadSourceError| (!lasting_read(error)).then(|| error.to_string());
-    match retried(stop, spec, transient, source).await {
+    let transient = |error: &ReadSourceError| !lasting_read(error);
+    match retried(ctx, spec, input, ReadSourceOperation::new, transient).await {
         Ok(result) if result.metadata.compare(observation) == ObservationMatch::Changed => {
             Err(ChunkFailure::Changed)
         }
@@ -865,7 +853,7 @@ fn lasting_put(error: &PutObjectError) -> bool {
         | Put::ConversionError(_) => true,
         Put::QuotaGateError(error) => match error {
             QuotaGateError::ConversionError(_) => true,
-            QuotaGateError::UnexpectedEvent(_) => false,
+            QuotaGateError::UnexpectedEvent(_) | QuotaGateError::Io(_) => false,
         },
         Put::RoutingFailed(error) => match error {
             RoutingError::BackendFull(_) => false,

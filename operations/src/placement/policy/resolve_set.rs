@@ -4,18 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PolicyResolution};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use std::collections::BTreeMap;
+use thiserror::Error;
+use tracing::debug;
 use ulid::Ulid;
 
-use super::cache::PolicyCacheStats;
 use super::read::ReadPolicyError;
-use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation};
+use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
+
+/// Each policy and whether it resolved, by policy id.
+pub type Resolutions = BTreeMap<Ulid, PolicyResolution>;
 
 /// How an unresolvable ref is treated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,15 +30,21 @@ pub enum ResolveMode {
     Lenient,
 }
 
-/// What one fed event produced.
-#[derive(Debug, PartialEq)]
-pub enum ResolveStep {
-    Pending(Effects),
-    /// Every ref has an outcome.
-    Done,
-    Failed(PlacementPolicyRef, ReadPolicyError),
+#[derive(Debug, Error, PartialEq)]
+pub enum PolicySetError {
+    /// In strict mode, the first ref that could not be authenticated.
+    #[error("placement policy {} could not be resolved: {source}", policy_ref.policy_id)]
+    Unresolved {
+        policy_ref: PlacementPolicyRef,
+        source: ReadPolicyError,
+    },
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
+type SetTurn = Result<Next<Resolutions>, PolicySetError>;
+
+/// Resolves every distinct ref, one resolve child after another.
 #[derive(Debug, PartialEq)]
 pub struct PolicySetResolver {
     realm_id: RealmId,
@@ -46,9 +54,7 @@ pub struct PolicySetResolver {
     /// Reversed, so the next ref pops off the end.
     remaining: Vec<PlacementPolicyRef>,
     current: Option<PlacementPolicyRef>,
-    resolver: Option<ResolvePolicyOperation>,
-    resolved: BTreeMap<Ulid, PolicyResolution>,
-    stats: PolicyCacheStats,
+    resolved: Resolutions,
 }
 
 impl PolicySetResolver {
@@ -70,94 +76,60 @@ impl PolicySetResolver {
             mode,
             remaining,
             current: None,
-            resolver: None,
             resolved: BTreeMap::new(),
-            stats: PolicyCacheStats::default(),
         }
     }
 
-    pub fn start(&mut self) -> ResolveStep {
+    fn next_ref(&mut self) -> SetTurn {
+        let Some(policy_ref) = self.remaining.pop() else {
+            return Ok(Next::Done(std::mem::take(&mut self.resolved)));
+        };
+        self.current = Some(policy_ref);
+        Ok(Next::Call(IoCall::child(ResolvePolicyOperation::new(
+            ResolvePolicyConfig {
+                realm_id: self.realm_id,
+                policy_ref,
+                local_node_id: self.local_node_id,
+                now_ms: self.now_ms,
+            },
+        ))))
+    }
+}
+
+impl Operation for PolicySetResolver {
+    type Output = Resolutions;
+    type Error = PolicySetError;
+
+    fn first(&mut self) -> SetTurn {
         self.next_ref()
     }
 
-    pub fn step(&mut self, event: Event) -> ResolveStep {
-        let Some(resolver) = self.resolver.as_mut() else {
-            return ResolveStep::Done;
-        };
-        let effects = resolver.step(event);
-        if !resolver.is_complete() {
-            return ResolveStep::Pending(effects);
-        }
-        let (Some(resolver), Some(policy_ref)) = (self.resolver.take(), self.current.take()) else {
-            return ResolveStep::Done;
-        };
-        match resolver.finalize() {
-            Ok(resolved) => {
-                self.stats.merge(resolved.stats);
-                self.resolved.insert(
-                    policy_ref.policy_id,
-                    PolicyResolution::Known(resolved.policy),
-                );
-                self.next_ref()
+    /// In lenient mode a failed resolve counts as unresolved, so it blocks instead of allowing.
+    fn next(&mut self, result: IoResult) -> SetTurn {
+        let policy_ref = self.current.take().ok_or(IoError::Unfinished)?;
+        let resolution = match result.child::<ResolvedPolicy, ReadPolicyError>()? {
+            Ok(resolved) => PolicyResolution::Known(resolved.policy),
+            Err(source) if self.mode == ResolveMode::Strict => {
+                return Err(PolicySetError::Unresolved { policy_ref, source });
             }
-            Err(error) => match self.mode {
-                ResolveMode::Strict => ResolveStep::Failed(policy_ref, error),
-                ResolveMode::Lenient => {
-                    self.resolved
-                        .insert(policy_ref.policy_id, PolicyResolution::Unresolved);
-                    self.next_ref()
-                }
-            },
-        }
-    }
-
-    pub fn resolutions(&self) -> &BTreeMap<Ulid, PolicyResolution> {
-        &self.resolved
-    }
-
-    pub fn into_resolutions(self) -> BTreeMap<Ulid, PolicyResolution> {
-        self.resolved
-    }
-
-    pub fn stats(&self) -> PolicyCacheStats {
-        self.stats
-    }
-
-    pub fn abort(&mut self) -> Effects {
-        match self.resolver.as_mut() {
-            Some(resolver) => resolver.abort(),
-            None => smallvec![],
-        }
-    }
-
-    fn next_ref(&mut self) -> ResolveStep {
-        let Some(policy_ref) = self.remaining.pop() else {
-            return ResolveStep::Done;
+            Err(error) => {
+                debug!(error = %error, "Placement policy stayed unresolved");
+                PolicyResolution::Unresolved
+            }
         };
-        let mut resolver = ResolvePolicyOperation::new(ResolvePolicyConfig {
-            realm_id: self.realm_id,
-            policy_ref,
-            local_node_id: self.local_node_id,
-            now_ms: self.now_ms,
-        });
-        let effects = resolver.start();
-        self.current = Some(policy_ref);
-        self.resolver = Some(resolver);
-        ResolveStep::Pending(effects)
+        self.resolved.insert(policy_ref.policy_id, resolution);
+        self.next_ref()
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{PolicySetResolver, ResolveMode, ResolveStep};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::id::NodeId;
-    use aruna_core::structs::identity::realm::RealmId;
+    use super::super::read::PolicySource;
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::placement::policy::{
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PolicyResolution, VerifiedPolicy,
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use byteview::ByteView;
-    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -182,15 +154,18 @@ mod pure_tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    fn cached(policy: &VerifiedPolicy) -> Event {
-        let entry = super::super::cache::PolicyCacheEntry::verified(
-            &crate::tests::policy::signed_document(realm(), policy, 1),
-            10,
-        );
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(ByteView::from(entry.to_bytes().expect("entry encodes"))),
-        })
+    fn resolved(policy: &VerifiedPolicy) -> IoResult {
+        let resolved = ResolvedPolicy {
+            policy: policy.clone(),
+            source: PolicySource::Cached,
+            stats: Default::default(),
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(resolved)))
+    }
+
+    fn unavailable() -> IoResult {
+        let error = ReadPolicyError::Unavailable("no holder answered".to_string());
+        IoResult::Child(ChildOutcome::new(Err::<ResolvedPolicy, _>(error)))
     }
 
     fn resolver(refs: &[PlacementPolicyRef], mode: ResolveMode) -> PolicySetResolver {
@@ -199,48 +174,23 @@ mod pure_tests {
 
     #[test]
     fn resolves_every_ref() {
-        let first = policy(1);
-        let second = policy(2);
-        let mut resolver = resolver(
-            &[first.policy_ref(), second.policy_ref()],
-            ResolveMode::Strict,
-        );
-        assert!(matches!(resolver.start(), ResolveStep::Pending(_)));
+        // Each distinct ref is resolved once, in ref order.
+        let (first, second) = (policy(1), policy(2));
+        let refs = [second.policy_ref(), first.policy_ref(), first.policy_ref()];
+        let mut resolver = resolver(&refs, ResolveMode::Strict);
+        assert!(matches!(resolver.first(), Ok(Next::Call(IoCall::Child(_)))));
         assert!(matches!(
-            resolver.step(cached(&first)),
-            ResolveStep::Pending(_)
+            resolver.next(resolved(&first)),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
+        let Ok(Next::Done(resolutions)) = resolver.next(resolved(&second)) else {
+            panic!("expected every ref resolved");
+        };
+        assert_eq!(resolutions.len(), 2);
         assert!(matches!(
-            resolver.step(crate::tests::policy::authority(realm())),
-            ResolveStep::Pending(_)
-        ));
-        assert!(matches!(
-            resolver.step(cached(&second)),
-            ResolveStep::Pending(_)
-        ));
-        assert_eq!(
-            resolver.step(crate::tests::policy::authority(realm())),
-            ResolveStep::Done
-        );
-
-        assert_eq!(resolver.resolutions().len(), 2);
-        assert!(matches!(
-            resolver.resolutions().get(&first.policy().policy_id),
+            resolutions.get(&first.policy().policy_id),
             Some(PolicyResolution::Known(_))
         ));
-    }
-
-    /// Cache miss followed by a realm view this node cannot read.
-    fn drive_miss(resolver: &mut PolicySetResolver) -> ResolveStep {
-        resolver.start();
-        resolver.step(Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: None,
-        }));
-        let key = ByteView::from(Vec::new());
-        resolver.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), None), (key.clone(), None), (key, None)],
-        }))
     }
 
     #[test]
@@ -248,19 +198,30 @@ mod pure_tests {
         // An administrative mutation may not store a ref it could not verify.
         let policy = policy(1);
         let mut resolver = resolver(&[policy.policy_ref()], ResolveMode::Strict);
-
-        assert!(matches!(drive_miss(&mut resolver), ResolveStep::Failed(..)));
+        resolver.first().unwrap();
+        assert!(matches!(
+            resolver.next(unavailable()),
+            Err(PolicySetError::Unresolved { policy_ref, .. }) if policy_ref == policy.policy_ref()
+        ));
     }
 
     #[test]
     fn lenient_records_unresolved() {
         let policy = policy(1);
         let mut resolver = resolver(&[policy.policy_ref()], ResolveMode::Lenient);
-
-        assert_eq!(drive_miss(&mut resolver), ResolveStep::Done);
+        resolver.first().unwrap();
+        let Ok(Next::Done(resolutions)) = resolver.next(unavailable()) else {
+            panic!("a lenient resolve ends with every ref recorded");
+        };
         assert_eq!(
-            resolver.resolutions().get(&policy.policy().policy_id),
+            resolutions.get(&policy.policy().policy_id),
             Some(&PolicyResolution::Unresolved)
         );
+    }
+
+    #[test]
+    fn empty_set_ends() {
+        let mut resolver = resolver(&[], ResolveMode::Lenient);
+        assert_eq!(resolver.first(), Ok(Next::Done(BTreeMap::new())));
     }
 }

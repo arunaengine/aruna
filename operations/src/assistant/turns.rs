@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    BUDGET_CAP, ChatStoreError, TURN_CAP, decode_heads, head_key, heads_page, live_head,
-    read_head, turn_key, turns_page,
+    BUDGET_CAP, ChatStoreError, TURN_CAP, decode_heads, head_key, heads_page, live_head, read_head,
+    turn_key, turns_page,
 };
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::{
     AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
@@ -60,7 +60,12 @@ impl Operation for ReadChatOperation {
             after.saturating_add(1).max(head.first_seq)
         });
         self.turns = true;
-        Ok(Next::Call(turns_page(self.user_id, &self.chat_id, from, usize::MAX)))
+        Ok(Next::Call(turns_page(
+            self.user_id,
+            &self.chat_id,
+            from,
+            usize::MAX,
+        )))
     }
 }
 
@@ -116,7 +121,10 @@ impl WriteTurnOperation {
 
     fn head(&mut self, head: AssistantChatHead) -> Result<Next<AssistantChatHead>, ChatStoreError> {
         // A revision from an older read means another browser wrote in between.
-        if self.expected_revision.is_some_and(|expected| expected != head.revision) {
+        if self
+            .expected_revision
+            .is_some_and(|expected| expected != head.revision)
+        {
             return Err(ChatStoreError::StaleTurn {
                 next_seq: head.next_seq,
             });
@@ -252,7 +260,7 @@ impl Operation for WriteTurnOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }

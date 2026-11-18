@@ -11,7 +11,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
 use aruna_core::structs::identity::realm::RealmId;
@@ -43,13 +43,11 @@ pub enum NodeSecretError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for NodeSecretError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
@@ -169,7 +167,13 @@ impl NodeSecretOperation {
     fn send(&mut self) -> Next<Option<SecretRecord>> {
         match self.queue.pop_front() {
             Some(call) => Next::Call(call),
-            None => Next::Done(self.result.take().flatten()),
+            // The notice rows are committed; a missed timer leaves them to the next drain.
+            None => Next::Then {
+                output: self.result.take().flatten(),
+                calls: (self.notices.then(schedule_drain_effect).into_iter())
+                    .map(IoCall::from)
+                    .collect(),
+            },
         }
     }
 }
@@ -209,13 +213,8 @@ impl Operation for NodeSecretOperation {
         Ok(self.send())
     }
 
-    fn transaction(&self) -> bool {
-        true
-    }
-
-    /// The notice rows are committed; a missed timer leaves them to the next drain.
-    fn after_commit(&mut self) -> Option<Effect> {
-        std::mem::take(&mut self.notices).then(schedule_drain_effect)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

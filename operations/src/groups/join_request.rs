@@ -3,24 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::epoch_due::DueMarks;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::join_request::{
     JoinDecision, JoinDecisionKind, JoinRequest, JoinRequestState, valid_message,
 };
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
+use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -28,9 +31,7 @@ use aruna_core::structs::execution::notification::{NotificationOutboxRecord, Res
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
@@ -88,103 +89,129 @@ pub enum GroupJoinError {
     Reducer(#[from] AdminDocumentError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum State {
-    Init,
-    Auth,
-    Begin,
-    Read,
-    Write,
-    Delete,
-    Fence,
-    Commit,
-    Schedule,
-    Notify,
-    Done,
-    Failed,
+impl From<IoError> for GroupJoinError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::UnexpectedEvent,
+        }
+    }
 }
 
+/// Checks a deciding owner, then applies the join step in a write transaction that reruns after a
+/// lost conflict, since background writes touch the same rows.
 #[derive(Debug, PartialEq)]
 pub struct GroupJoinOperation {
     input: GroupJoinInput,
-    state: State,
-    txn_id: Option<TxnId>,
-    fence: aruna_core::placement::fence::WriteFence,
-    deletes: Vec<(KeySpace, Key)>,
-    changed: bool,
-    notifications: bool,
-    deny: bool,
-    conflicts: u8,
-    output: Option<Result<JoinRequestState, GroupJoinError>>,
+    authorized: bool,
 }
 
 impl GroupJoinOperation {
     pub fn new(input: GroupJoinInput) -> Self {
         Self {
             input,
-            state: State::Init,
-            txn_id: None,
-            fence: Default::default(),
-            deletes: Vec::new(),
-            changed: false,
-            notifications: false,
-            deny: false,
-            conflicts: 0,
-            output: None,
+            authorized: false,
         }
     }
 
-    /// A conflicted commit already discarded its transaction, so the retry starts
-    /// from the input alone and rereads every row, including the realm config.
-    fn restart_after_conflict(&mut self) -> Effects {
-        *self = Self {
-            conflicts: self.conflicts + 1,
-            ..Self::new(self.input.clone())
-        };
-        self.start()
+    fn change(&mut self) -> Next<JoinRequestState> {
+        self.authorized = true;
+        let input = self.input.clone();
+        let seed = self.input.actor.user_id.to_bytes();
+        let build = move || JoinWrite::new(input.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(child))
     }
+}
 
-    fn fail(&mut self, error: GroupJoinError) -> Effects {
-        let effects = self.abort();
-        self.output = Some(Err(error));
-        self.state = State::Failed;
-        effects
-    }
+impl Operation for GroupJoinOperation {
+    type Output = JoinRequestState;
+    type Error = GroupJoinError;
 
-    fn begin(&mut self) -> Effects {
-        self.state = State::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = State::Read;
-        let group_key: Key = self.input.group_id.to_bytes().to_vec().into();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (GROUP_KEYSPACE.into(), group_key.clone()),
-                (AUTH_KEYSPACE.into(), group_key),
-                (
-                    DOCUMENT_STATE_KEYSPACE.into(),
-                    reducer_state_key(&AdminDocumentTarget::Group {
-                        group_id: self.input.group_id
-                    })
+    fn first(&mut self) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        if self.input.auth.path_restrictions.is_some()
+            || self.input.actor.user_id.is_nil()
+            || self.input.auth.user_id != self.input.actor.user_id
+            || self.input.auth.realm_id != self.input.actor.realm_id
+        {
+            return Err(GroupJoinError::Unauthorized);
+        }
+        if !matches!(self.input.action, JoinAction::Decide { .. }) {
+            return Ok(self.change());
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.input.auth.clone(),
+                path: format!(
+                    "/{}/g/{}/admin/users/**",
+                    self.input.actor.realm_id, self.input.group_id
                 ),
-                (
-                    REALM_CONFIG_KEYSPACE.into(),
-                    self.input.actor.realm_id.as_bytes().to_vec().into()
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+                required_permission: Permission::WRITE,
+            },
+        ))))
     }
 
-    fn mutate(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, GroupJoinError> {
-        let [(_, group), (_, auth), (_, reducer), (_, config)] = values.as_slice() else {
-            return Err(GroupJoinError::UnexpectedEvent);
-        };
+    fn next(&mut self, result: IoResult) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        if self.authorized {
+            return result
+                .child::<JoinRequestState, GroupJoinError>()?
+                .map(Next::Done);
+        }
+        if !result.child::<bool, AuthorizationError>()?? {
+            return Err(GroupJoinError::Unauthorized);
+        }
+        Ok(self.change())
+    }
+}
+
+/// What the join transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+    Fence,
+    Marks,
+}
+
+/// Reads the group's documents and applies the join step in one write transaction, with the
+/// bucket fence and, when a DENY role is newly assigned, the group's epoch marks.
+#[derive(Debug, PartialEq)]
+struct JoinWrite {
+    input: GroupJoinInput,
+    stage: Stage,
+    fence: WriteFence,
+    deletes: Vec<(KeySpace, Key)>,
+    notifications: bool,
+    deny: bool,
+    result: Option<JoinRequestState>,
+    marks: DueMarks,
+}
+
+impl JoinWrite {
+    fn new(input: GroupJoinInput) -> Self {
+        let marks = DueMarks::new(Some(input.group_id), input.now_ms);
+        Self {
+            input,
+            stage: Stage::Read,
+            fence: Default::default(),
+            deletes: Vec::new(),
+            notifications: false,
+            deny: false,
+            result: None,
+            marks,
+        }
+    }
+
+    fn mutate(
+        &mut self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        let [group, auth, reducer, config] =
+            <[_; 4]>::try_from(values).map_err(|_| GroupJoinError::UnexpectedEvent)?;
         let group = Group::from_bytes(group.as_deref().ok_or(GroupJoinError::NotFound)?)?;
         let mut auth = GroupAuthorizationDocument::from_bytes(
             auth.as_deref().ok_or(GroupJoinError::NotFound)?,
@@ -221,8 +248,7 @@ impl GroupJoinOperation {
                 if let Some(existing) = requests.iter().find(|entry| {
                     entry.request.user_id == self.input.actor.user_id && entry.decision.is_none()
                 }) {
-                    self.output = Some(Ok(existing.clone()));
-                    return Ok(self.commit());
+                    return Ok(Next::Done(existing.clone()));
                 }
                 let message = normalized(message);
                 if !valid_message(&message) {
@@ -257,8 +283,7 @@ impl GroupJoinOperation {
                     if decision.kind != kind {
                         return Err(GroupJoinError::Conflict);
                     }
-                    self.output = Some(Ok(existing.clone()));
-                    return Ok(self.commit());
+                    return Ok(Next::Done(existing.clone()));
                 }
                 let role_ids = if *approve {
                     let roles = if role_ids.is_empty() {
@@ -309,8 +334,7 @@ impl GroupJoinOperation {
                     if decision.kind != JoinDecisionKind::Withdrawn {
                         return Err(GroupJoinError::Conflict);
                     }
-                    self.output = Some(Ok(existing.clone()));
-                    return Ok(self.commit());
+                    return Ok(Next::Done(existing.clone()));
                 }
                 AdminDocumentOperation::GroupJoinDecided {
                     decision: JoinDecision {
@@ -380,11 +404,13 @@ impl GroupJoinOperation {
         )
         .fenced_at(self.fence.generation(&group.realm_id, &placement));
         self.deletes = stale_conflict_deletes(previous.as_ref(), Some(&state));
-        self.output = Some(Ok(state
-            .join_requests()
-            .into_iter()
-            .find(|entry| entry.request.request_id == request_id)
-            .ok_or(GroupJoinError::NotFound)?));
+        self.result = Some(
+            state
+                .join_requests()
+                .into_iter()
+                .find(|entry| entry.request.request_id == request_id)
+                .ok_or(GroupJoinError::NotFound)?,
+        );
         let mut writes = vec![
             (
                 AUTH_KEYSPACE.into(),
@@ -404,37 +430,36 @@ impl GroupJoinOperation {
                 },
             )?);
         }
-        self.changed = true;
-        self.state = State::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id
-        })])
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn fence(&mut self) -> Effects {
+    fn after_writes(&mut self) -> Result<Next<JoinRequestState>, GroupJoinError> {
         if self.fence.is_empty() {
-            return self.commit();
+            return self.after_fence();
         }
-        self.state = State::Fence;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: self.txn_id
-        })]
+        self.stage = Stage::Fence;
+        Ok(Next::Call(IoCall::Read(self.fence.reads())))
     }
 
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(GroupJoinError::UnexpectedEvent);
-        };
-        self.state = State::Commit;
+    fn after_fence(&mut self) -> Result<Next<JoinRequestState>, GroupJoinError> {
         if self.deny {
-            return smallvec![crate::auth::epoch_due::mark_due(
-                Some(self.input.group_id),
-                txn_id
-            )];
+            self.stage = Stage::Marks;
+            return Ok(Next::Call(self.marks.first()));
         }
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.finish()
+    }
+
+    /// Wakes the document outbox drain after the commit, and the notification drain when a
+    /// request notified the owners; a failed timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        let output = self.result.take().ok_or(GroupJoinError::NotFinished)?;
+        let mut calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        if self.notifications {
+            let notices = crate::notifications::outbox_record::schedule_drain_effect();
+            calls.push(IoCall::Effect(Box::new(notices)));
+        }
+        Ok(Next::Then { output, calls })
     }
 }
 
@@ -445,145 +470,67 @@ fn normalized(value: &Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-impl EffectOperation for GroupJoinOperation {
+impl Operation for JoinWrite {
     type Output = JoinRequestState;
     type Error = GroupJoinError;
 
-    fn start(&mut self) -> Effects {
-        if self.state != State::Init {
-            return self.fail(GroupJoinError::UnexpectedEvent);
-        }
-        if self.input.auth.path_restrictions.is_some()
-            || self.input.actor.user_id.is_nil()
-            || self.input.auth.user_id != self.input.actor.user_id
-            || self.input.auth.realm_id != self.input.actor.realm_id
-        {
-            return self.fail(GroupJoinError::Unauthorized);
-        }
-        if matches!(self.input.action, JoinAction::Decide { .. }) {
-            self.state = State::Auth;
-            return smallvec![Effect::SubOperation(boxed_suboperation(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: self.input.auth.clone(),
-                    path: format!(
-                        "/{}/g/{}/admin/users/**",
-                        self.input.actor.realm_id, self.input.group_id
-                    ),
-                    required_permission: Permission::WRITE,
-                }),
-                |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
-            ))];
-        }
-        self.begin()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if error == StorageError::TransactionConflict
-                && self.state == State::Commit
-                && self.conflicts < super::CONFLICT_RETRIES
-            {
-                return self.restart_after_conflict();
-            }
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
+    fn conflict_retries() -> u32 {
+        u32::from(super::CONFLICT_RETRIES)
+    }
+
+    fn first(&mut self) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        let group_key: Key = self.input.group_id.to_bytes().to_vec().into();
+        let target = AdminDocumentTarget::Group {
+            group_id: self.input.group_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![
+            (GROUP_KEYSPACE.into(), group_key.clone()),
+            (AUTH_KEYSPACE.into(), group_key),
+            (DOCUMENT_STATE_KEYSPACE.into(), reducer_state_key(&target)),
             (
-                State::Auth,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => self.begin(),
-                Ok(false) => self.fail(GroupJoinError::Unauthorized),
-                Err(error) => self.fail(error.into()),
+                REALM_CONFIG_KEYSPACE.into(),
+                self.input.actor.realm_id.as_bytes().to_vec().into(),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<JoinRequestState>, GroupJoinError> {
+        match self.stage {
+            Stage::Read => match result {
+                IoResult::Values(values) => self.mutate(values),
+                _ => Err(GroupJoinError::UnexpectedEvent),
             },
-            (State::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.read(txn_id)
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
             }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                match self.mutate(values) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.after_writes()
+            }
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(GroupJoinError::UnexpectedEvent);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(GroupJoinError::PlacementFenced);
                 }
+                self.after_fence()
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                if self.deletes.is_empty() {
-                    return self.fence();
-                }
-                self.state = State::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: std::mem::take(&mut self.deletes),
-                    txn_id: self.txn_id
-                })]
-            }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => self.fence(),
-            (State::Fence, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                if !self.fence.admits(&values) {
-                    return self.fail(GroupJoinError::PlacementFenced);
-                }
-                self.commit()
-            }
-            (
-                State::Commit,
-                event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
-            ) if self.deny => {
-                self.deny = false;
-                match self
-                    .txn_id
-                    .and_then(|id| crate::auth::epoch_due::marked(&event, id))
-                {
-                    Some(Ok(effects)) => effects,
-                    Some(Err(error)) => self.fail(error.into()),
-                    None => self.fail(GroupJoinError::UnexpectedEvent),
-                }
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
-                if Some(txn_id) == self.txn_id && !self.deny =>
-            {
-                self.txn_id = None;
-                if self.changed {
-                    self.state = State::Schedule;
-                    smallvec![schedule_drain_effect()]
-                } else {
-                    self.state = State::Done;
-                    smallvec![]
-                }
-            }
-            (
-                State::Schedule,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                if self.notifications {
-                    self.state = State::Notify;
-                    smallvec![crate::notifications::outbox_record::schedule_drain_effect()]
-                } else {
-                    self.state = State::Done;
-                    smallvec![]
-                }
-            }
-            (
-                State::Notify,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                self.state = State::Done;
-                smallvec![]
-            }
-            _ => self.fail(GroupJoinError::UnexpectedEvent),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Done | State::Failed)
-    }
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(GroupJoinError::NotFinished);
-        }
-        self.output.ok_or(GroupJoinError::NotFinished)?
-    }
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            Stage::Marks => match self.marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            },
         }
     }
 }
@@ -593,6 +540,7 @@ mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminRoleDefinition;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::reducer::AdminDocumentState;
@@ -600,66 +548,32 @@ mod pure_tests {
 
     #[test]
     fn retries_commit_conflict() {
+        // A lost commit reruns the whole join step, rereading every row, up to the retry bound.
+        let conflict = GroupJoinError::from(IoError::Conflict);
+        assert!(JoinWrite::is_conflict(&conflict));
+        assert_eq!(
+            JoinWrite::conflict_retries(),
+            u32::from(crate::groups::CONFLICT_RETRIES)
+        );
         let realm_id = RealmId::from_bytes([8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
             user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
             realm_id,
         };
-        let input = GroupJoinInput {
+        let mut restricted = GroupJoinOperation::new(GroupJoinInput {
             auth: AuthContext {
                 user_id: actor.user_id,
                 realm_id,
-                path_restrictions: None,
+                path_restrictions: Some(Vec::new()),
                 session: None,
             },
             actor,
             group_id: Ulid::from_bytes([5; 16]),
             action: JoinAction::Request { message: None },
             now_ms: 3,
-        };
-        let conflict = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            })
-        };
-        let mut operation = GroupJoinOperation::new(input.clone());
-        let commit = |operation: &mut GroupJoinOperation| {
-            operation.state = State::Commit;
-            operation.txn_id = Some(TxnId::generate());
-            operation.changed = true;
-            operation.deny = true;
-            operation.step(conflict())
-        };
-
-        for _ in 0..crate::groups::CONFLICT_RETRIES {
-            let effects = commit(&mut operation);
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            ));
-            assert_eq!(operation.state, State::Begin);
-            assert!(operation.txn_id.is_none() && !operation.changed && !operation.deny);
-        }
-        commit(&mut operation);
-        assert_eq!(
-            operation.finalize(),
-            Err(GroupJoinError::Storage(StorageError::TransactionConflict))
-        );
-
-        // Before the commit the transaction is still open, so a conflict aborts it.
-        let mut operation = GroupJoinOperation::new(input);
-        let txn_id = TxnId::generate();
-        operation.state = State::Write;
-        operation.txn_id = Some(txn_id);
-        let effects = operation.step(conflict());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
-        ));
-        assert_eq!(operation.state, State::Failed);
+        });
+        assert_eq!(restricted.first(), Err(GroupJoinError::Unauthorized));
     }
 
     #[test]
@@ -728,7 +642,7 @@ mod pure_tests {
             )
             .unwrap();
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        let mut operation = GroupJoinOperation::new(GroupJoinInput {
+        let mut checked = GroupJoinOperation::new(GroupJoinInput {
             actor: actor.clone(),
             auth: AuthContext {
                 user_id: actor.user_id,
@@ -745,32 +659,18 @@ mod pure_tests {
             },
             now_ms: 2,
         });
+        assert!(matches!(checked.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let allowed = ChildOutcome::new(Ok::<bool, AuthorizationError>(true));
         assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::SubOperation(_)]
+            checked.next(IoResult::Child(allowed)),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        let txn_id = Ulid::from_bytes([6; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let values = vec![
-            (
-                group_id.to_bytes().to_vec().into(),
-                Some(group.to_bytes(&actor).unwrap().into()),
-            ),
-            (
-                group_id.to_bytes().to_vec().into(),
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-            ),
-            (
-                reducer_state_key(&reducer.target),
-                Some(reducer_state_entry(&reducer).unwrap().2),
-            ),
-            (
-                realm_id.as_bytes().to_vec().into(),
-                Some(config.to_bytes(&actor).unwrap().into()),
-            ),
+        let mut operation = JoinWrite::new(checked.input.clone());
+        let values: Vec<Option<Value>> = vec![
+            Some(group.to_bytes(&actor).unwrap().into()),
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(reducer_state_entry(&reducer).unwrap().2),
+            Some(config.to_bytes(&actor).unwrap().into()),
         ];
         let requestor = Actor {
             user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
@@ -788,26 +688,13 @@ mod pure_tests {
             action: JoinAction::Request { message: None },
             now_ms: 3,
         };
-        let mut request_operation = GroupJoinOperation::new(input.clone());
-        request_operation.start();
-        let request_txn = Ulid::from_bytes([9; 16]);
-        request_operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: request_txn,
-        }));
-        let request_effects =
-            request_operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: values.clone(),
-            }));
-        let [
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(notification_txn),
-            }),
-        ] = request_effects.as_slice()
-        else {
+        let mut request_operation = JoinWrite::new(input.clone());
+        assert_eq!(request_operation.transaction(), TransactionMode::Write);
+        request_operation.first().unwrap();
+        let request_turn = request_operation.next(IoResult::Values(values.clone()));
+        let Ok(Next::Call(IoCall::Write(writes))) = request_turn else {
             panic!("request must write one atomic batch");
         };
-        assert_eq!(*notification_txn, request_txn);
         let notifications: Vec<_> = writes
             .iter()
             .filter(|(space, _, _)| space == aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE)
@@ -819,7 +706,7 @@ mod pure_tests {
             matches!(notification.record.kind, aruna_core::structs::execution::notification::NotificationKind::GroupJoinRequested { group_id: notified_group, actor_user_id, .. } if notified_group == group_id && actor_user_id == requestor.user_id)
         );
         let mut duplicate_values = values.clone();
-        duplicate_values[2].1 = Some(
+        duplicate_values[2] = Some(
             writes
                 .iter()
                 .find(|(space, _, _)| space == DOCUMENT_STATE_KEYSPACE)
@@ -827,35 +714,18 @@ mod pure_tests {
                 .2
                 .clone(),
         );
-        let mut duplicate = GroupJoinOperation::new(input);
-        duplicate.start();
-        duplicate.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: request_txn,
-        }));
-        let duplicate_effects = duplicate.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: duplicate_values,
-        }));
+        // A repeated request finds its open request and writes nothing.
+        let mut duplicate = JoinWrite::new(input);
+        duplicate.first().unwrap();
         assert!(matches!(
-            duplicate_effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+            duplicate.next(IoResult::Values(duplicate_values)),
+            Ok(Next::Done(_))
         ));
-        let aborted = request_operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
-        assert!(
-            matches!(aborted.as_slice(), [Effect::Storage(StorageEffect::AbortTransaction { txn_id })] if *txn_id == request_txn)
-        );
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        let [
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(write_txn),
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected one atomic batch: {effects:?}");
+        operation.first().unwrap();
+        let turn = operation.next(IoResult::Values(values));
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected one atomic batch: {turn:?}");
         };
-        assert_eq!(*write_txn, txn_id);
         let value = |space: &str| {
             &writes
                 .iter()
@@ -879,16 +749,6 @@ mod pure_tests {
         assert!(
             matches!(outbox.event, DocumentOutboxEvent::AdminOperation { event, .. }
         if matches!(event.op, AdminDocumentOperation::GroupJoinDecided { .. }))
-        );
-        assert!(!operation.is_complete());
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
-        assert!(matches!(effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })] if *aborted == txn_id));
-        assert_eq!(
-            operation.finalize(),
-            Err(GroupJoinError::Storage(StorageError::TransactionConflict))
         );
     }
 
@@ -954,67 +814,36 @@ mod pure_tests {
             },
             now_ms: 2,
         };
-        let mut values = vec![
-            (
-                group_id.to_bytes().to_vec().into(),
-                Some(group.to_bytes(&actor).unwrap().into()),
-            ),
-            (
-                group_id.to_bytes().to_vec().into(),
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-            ),
-            (
-                reducer_state_key(&reducer.target),
-                Some(reducer_state_entry(&reducer).unwrap().2),
-            ),
-            (
-                realm_id.as_bytes().to_vec().into(),
-                Some(config.to_bytes(&actor).unwrap().into()),
-            ),
+        let mut values: Vec<Option<Value>> = vec![
+            Some(group.to_bytes(&actor).unwrap().into()),
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(reducer_state_entry(&reducer).unwrap().2),
+            Some(config.to_bytes(&actor).unwrap().into()),
         ];
-        let txn_id = Ulid::from_bytes([16; 16]);
-        let decide = |values: Vec<(Key, Option<Value>)>| {
-            let mut operation = GroupJoinOperation::new(input.clone());
-            operation.start();
-            operation.step(Event::SubOperation(
-                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-            ));
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            (operation, effects)
+        let decide = |values: Vec<Option<Value>>| {
+            let mut operation = JoinWrite::new(input.clone());
+            operation.first().unwrap();
+            let turn = operation.next(IoResult::Values(values));
+            (operation, turn)
         };
-        let (mut operation, effects) = decide(values.clone());
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one atomic batch: {effects:?}");
+        let (mut operation, turn) = decide(values.clone());
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected one atomic batch: {turn:?}");
         };
-        let writes = writes.clone();
-        let mut effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        if let [Effect::Storage(StorageEffect::BatchDelete { .. })] = effects.as_slice() {
-            effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
+        let mut turn = operation.next(IoResult::Done);
+        if let Ok(Next::Call(IoCall::Delete(_))) = turn {
+            turn = operation.next(IoResult::Done);
         }
 
-        // The newly assigned DENY role marks epochs due before the approval commits.
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let marked = SubOperationEvent::EpochsMarked { result: Ok(()) };
-        let effects = operation.step(Event::SubOperation(marked));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
-        ));
+        // The newly assigned DENY role marks epochs due inside the approval's transaction.
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
 
-        // A duplicate decision keeps its plain commit fast path.
+        // A duplicate decision writes nothing.
         for (slot, space) in [(1, AUTH_KEYSPACE), (2, DOCUMENT_STATE_KEYSPACE)] {
             let written = writes.iter().find(|(keyspace, _, _)| keyspace == space);
-            values[slot].1 = Some(written.unwrap().2.clone());
+            values[slot] = Some(written.unwrap().2.clone());
         }
-        let (_, effects) = decide(values);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
+        let (_, turn) = decide(values);
+        assert!(matches!(turn, Ok(Next::Done(_))));
     }
 }

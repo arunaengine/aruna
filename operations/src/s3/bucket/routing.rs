@@ -2,12 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::groups::storage_routing::{GroupInputsOperation, refuse_folder};
+use crate::groups::storage_routing::{GroupInputsError, GroupInputsOperation, refuse_folder};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::routing::{
@@ -123,27 +122,18 @@ impl Operation for PutRoutingOperation {
     fn first(&mut self) -> PutStep {
         // A `Group` target is checked against the ids the bucket's own group
         // registered, so a rule can never name another tenant's backend.
-        let load = boxed_suboperation(GroupInputsOperation::new(self.group_id), |result| {
-            Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
-                result: result.map_err(|error| error.to_string()),
-            })
-        });
-        Ok(Next::Call(IoCall::Child(load)))
+        let load = GroupInputsOperation::new(self.group_id);
+        Ok(Next::Call(IoCall::child(load)))
     }
 
     fn next(&mut self, result: IoResult) -> PutStep {
         match self.state {
-            PutRoutingState::LoadInputs => match result.event()? {
-                Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) => {
-                    let inputs = result.map_err(PutRoutingError::InputsUnavailable)?;
-                    self.inputs_loaded(inputs)
-                }
-                other => Err(IoError::Unexpected {
-                    expected: "SubOperationEvent::GroupRoutingLoaded",
-                    got: other.label(),
-                }
-                .into()),
-            },
+            PutRoutingState::LoadInputs => {
+                let loaded = result.child::<GroupRoutingInputs, GroupInputsError>()?;
+                let inputs = loaded
+                    .map_err(|error| PutRoutingError::InputsUnavailable(error.to_string()))?;
+                self.inputs_loaded(inputs)
+            }
             PutRoutingState::ReadBucket => self.bucket_read(result.value()?),
             PutRoutingState::WriteBucket => {
                 result.done()?;
@@ -152,8 +142,8 @@ impl Operation for PutRoutingOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -212,8 +202,8 @@ mod pure_tests {
     use super::{
         GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation, PutStep,
     };
-    use aruna_core::calls::{IoCall, IoResult, Next};
-    use aruna_core::events::{Event, SubOperationEvent};
+    use crate::groups::storage_routing::GroupInputsError;
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
@@ -237,8 +227,8 @@ mod pure_tests {
     }
 
     fn inputs_answer(inputs: GroupRoutingInputs) -> IoResult {
-        let loaded = SubOperationEvent::GroupRoutingLoaded { result: Ok(inputs) };
-        IoResult::Event(Box::new(Event::SubOperation(loaded)))
+        let loaded: Result<_, GroupInputsError> = Ok(inputs);
+        IoResult::Child(ChildOutcome::new(loaded))
     }
 
     /// Replays the loader child with the ids the group owns.
@@ -280,7 +270,10 @@ mod pure_tests {
     fn writes_bucket_rules() {
         let rules = vec![rule(RoutingTarget::Class("cold".to_string()))];
         let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules.clone());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(reads_bucket(&loaded(&mut operation, BTreeSet::new())));
 
         let turn = operation.next(read(Some(&bucket())));

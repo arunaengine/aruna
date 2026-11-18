@@ -660,3 +660,20 @@ async fn feeds_head_changes() {
     let row = feed().await.expect("a removed head is fed");
     assert_eq!(decode_feed(&row).unwrap(), None);
 }
+
+/// An outside read runs as its own child run; its answer comes back from the child or, from a
+/// driver that ran it itself, as the plain answer.
+#[test]
+fn outside_reads_child() {
+    use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult};
+    let read = || IoCall::Read(Vec::new());
+    assert_eq!(StagedCall::InTransaction(read()).into_call(), read());
+    assert!(matches!(
+        StagedCall::Outside(read()).into_call(),
+        IoCall::Child(_)
+    ));
+    let answered: Result<IoResult, IoError> = Ok(IoResult::Values(vec![None]));
+    let child = IoResult::Child(ChildOutcome::new(answered));
+    assert_eq!(outside_answer(child), Ok(IoResult::Values(vec![None])));
+    assert_eq!(outside_answer(IoResult::Done), Ok(IoResult::Done));
+}

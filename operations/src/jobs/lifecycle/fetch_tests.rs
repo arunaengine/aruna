@@ -43,12 +43,12 @@ fn ask(
     peer: NodeId,
     timeout: Duration,
 ) -> Next<(Option<NodeId>, Vec<JobRecordFrame>)> {
-    Next::Call(IoCall::Effect(Effect::Net(NetEffect::MetadataRequest(
-        Box::new(MetadataRequestEffect {
+    Next::Call(IoCall::Effect(Box::new(Effect::Net(
+        NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
             peer,
             frame: frame(family),
             timeout,
-        }),
+        })),
     ))))
 }
 
@@ -57,13 +57,13 @@ fn answer(
     elapsed: u64,
     result: Result<MetadataTransportMessage, PeerRequestError>,
 ) -> IoResult {
-    IoResult::Event(Event::Net(NetEvent::MetadataAnswer(Box::new(
+    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
         MetadataAnswer {
             peer,
             elapsed: Duration::from_secs(elapsed),
             result: result.map(|message| encode_message(&message).expect("reply encodes")),
         },
-    ))))
+    )))))
 }
 
 fn spec_record(family: &Family) -> JobRecordFrame {

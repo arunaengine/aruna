@@ -19,10 +19,9 @@ struct Script {
     seen: Vec<IoResult>,
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
-    transaction: bool,
+    mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
-    after: Vec<Effect>,
 }
 
 impl Script {
@@ -59,16 +58,12 @@ impl Operation for Script {
         self.scope
     }
 
-    fn transaction(&self) -> bool {
-        self.transaction
+    fn transaction(&self) -> TransactionMode {
+        self.mode
     }
 
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
-    }
-
-    fn after_commit(&mut self) -> Option<Effect> {
-        (!self.after.is_empty()).then(|| self.after.remove(0))
     }
 }
 
@@ -78,16 +73,17 @@ fn script(calls: Vec<IoCall>) -> Script {
         seen: Vec::new(),
         on_member: None,
         scope: None,
-        transaction: false,
+        mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
-        after: Vec::new(),
     }
 }
 
-/// The runner's machine for `script`, in one transaction or not.
+/// The runner's machine for `script`, in one write transaction or not.
 fn run(mut script: Script, transaction: bool) -> CallRun<Script> {
-    script.transaction = transaction;
+    if transaction {
+        script.mode = TransactionMode::Write;
+    }
     CallRun::new(script)
 }
 
@@ -136,40 +132,31 @@ fn effects_join_transaction() {
 }
 
 #[test]
-fn sends_after_commit() {
-    // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
-    let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut script = script(vec![IoCall::Write(write)]);
-    let wake = || {
-        Effect::Task(TaskEffect::ResetTimer {
-            key: TaskKey::DrainNotificationOutbox,
-            after: Duration::ZERO,
-        })
+fn snapshot_joins_reads() {
+    // In a read snapshot only passed-through reads join; a delete keeps running on its own.
+    let delete = |txn_id| StorageEffect::Delete {
+        key_space: "rows".to_string(),
+        key: key("b"),
+        txn_id,
     };
-    let sync = || Effect::Storage(StorageEffect::SyncAll);
-    script.after = vec![wake(), sync()];
-    let mut operation = run(script, true);
-    operation.start();
-    operation.step(started());
-    let written = StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
+    let read = |txn_id| StorageEffect::Read {
+        key_space: "rows".to_string(),
+        key: key("a"),
+        txn_id,
     };
-    operation.step(Event::Storage(written));
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
-    assert_eq!(
-        operation.step(Event::Storage(committed)).as_slice(),
-        &[wake()]
-    );
-    assert!(!operation.is_complete());
-    let refused = TaskEvent::Error {
-        key: None,
-        message: "timer refused".to_string(),
-    };
-    assert_eq!(operation.step(Event::Task(refused)).as_slice(), &[sync()]);
-    let synced = Event::Storage(StorageEvent::SyncAllFinished);
-    assert!(operation.step(synced).is_empty());
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
+    let calls = vec![
+        IoCall::Effect(Box::new(storage(delete(None)))),
+        IoCall::Effect(Box::new(storage(read(None)))),
+    ];
+    let mut procedure = script(calls);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    assert_eq!(operation.start().as_slice(), &[storage(delete(None))]);
+    let deleted = StorageEvent::DeleteResult { key: key("b") };
+    let start = storage(StorageEffect::StartTransaction { read: true });
+    assert_eq!(operation.step(Event::Storage(deleted)).as_slice(), &[start]);
+    let effects = operation.step(started());
+    assert_eq!(effects.as_slice(), &[storage(read(Some(txn())))]);
 }
 
 #[test]
@@ -223,6 +210,79 @@ fn transaction_commits_outcome() {
         operation.finalize(),
         Ok(vec![IoResult::Values(vec![None]), IoResult::Done])
     );
+}
+
+#[test]
+fn snapshot_reads_only() {
+    let write = vec![("rows".to_string(), key("b"), key("1"))];
+    let page = IoCall::Page {
+        space: "rows".to_string(),
+        prefix: key("p/"),
+        after: None,
+        limit: 10,
+    };
+    let mut procedure = script(vec![read_a(), IoCall::Write(write.clone()), page]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    let start = storage(StorageEffect::StartTransaction { read: true });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let read = StorageEffect::BatchRead {
+        reads: vec![("rows".to_string(), key("a"))],
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(read)]);
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let write = StorageEffect::BatchWrite {
+        writes: write,
+        txn_id: None,
+    };
+    assert_eq!(
+        effects.as_slice(),
+        &[storage(write)],
+        "writes run on their own"
+    );
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    let iter = StorageEffect::Iter {
+        key_space: "rows".to_string(),
+        prefix: Some(key("p/")),
+        start: None,
+        limit: 10,
+        txn_id: Some(txn()),
+    };
+    assert_eq!(
+        operation.step(Event::Storage(written)).as_slice(),
+        &[storage(iter)]
+    );
+    let page = StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    };
+    let commit = StorageEffect::CommitTransaction { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(page)).as_slice(),
+        &[storage(commit)]
+    );
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    assert!(operation.step(Event::Storage(committed)).is_empty());
+    assert!(matches!(operation.finalize(), Ok(seen) if seen.len() == 3));
+
+    // Counter additions need a write transaction.
+    let counters = IoCall::AddCounters {
+        space: "counters".to_string(),
+        deltas: Vec::new(),
+    };
+    let mut procedure = script(vec![counters]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    assert!(operation.start().is_empty());
+    let refused = IoError::Unexpected {
+        expected: "a transaction",
+        got: "IoCall::AddCounters",
+    };
+    assert_eq!(operation.finalize(), Err(refused));
 }
 
 #[test]
@@ -455,6 +515,9 @@ fn conflict_marks_retry() {
     let full = IoError::Storage(StorageError::QueueFull);
     assert!(!CallRun::<Script>::is_conflict(&full));
     assert_eq!(CallRun::<Script>::conflict_retries(), 3);
+    let mut fresh = run(script(Vec::new()), true);
+    assert_eq!(fresh.on_conflict(3), AfterConflict::Rerun);
+    assert_eq!(fresh.on_conflict(4), AfterConflict::Fail);
 }
 
 #[test]
@@ -517,6 +580,20 @@ fn child_refuses_type() {
     assert_eq!(IoResult::Done.child::<u8, IoError>(), Err(refused));
     let failed = IoResult::Child(ChildOutcome::new::<u8, IoError>(Err(IoError::Aborted)));
     assert_eq!(failed.child::<u8, IoError>(), Ok(Err(IoError::Aborted)));
+}
+
+// A child output that is only `Send`, like a stream, still travels and compares.
+#[test]
+fn child_carries_send() {
+    let outcome = || ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(4)));
+    assert_eq!(outcome(), outcome());
+    let other = ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(5)));
+    assert_ne!(outcome(), other);
+    let result = IoResult::Child(outcome()).child::<std::cell::Cell<u8>, IoError>();
+    assert_eq!(
+        result.map(|value| value.map(std::cell::Cell::into_inner)),
+        Ok(Ok(4))
+    );
 }
 
 #[test]

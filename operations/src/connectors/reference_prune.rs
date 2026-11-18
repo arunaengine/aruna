@@ -7,19 +7,18 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::rows;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -114,61 +113,26 @@ impl Operation for RestorePruneOperation {
 /// whether queued work remains; the first failed page ends the run with its error.
 #[derive(Debug, PartialEq)]
 pub struct PruneReferencesOperation {
-    state: PruneState,
     rows: VecDeque<(Key, Value)>,
-    page: Option<PrunePageOperation>,
     remaining: bool,
-    output: Option<Result<bool, PruneError>>,
+    listed: bool,
 }
 
 impl PruneReferencesOperation {
     pub fn new() -> Self {
         Self {
-            state: PruneState::Init,
             rows: VecDeque::new(),
-            page: None,
             remaining: false,
-            output: None,
+            listed: false,
         }
     }
 
-    fn next_page(&mut self) -> Effects {
+    fn next_page(&mut self) -> Next<bool> {
         match self.rows.pop_front() {
             Some((connector, cursor)) => {
-                self.state = PruneState::Page;
-                self.page
-                    .insert(PrunePageOperation::new(connector, cursor))
-                    .start()
+                Next::Call(IoCall::child(PrunePageOperation::new(connector, cursor)))
             }
-            None => {
-                self.state = PruneState::Finish;
-                self.output = Some(Ok(self.remaining));
-                smallvec![]
-            }
-        }
-    }
-
-    fn fail(&mut self, error: PruneError) -> Effects {
-        self.state = PruneState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn step_page(&mut self, event: Event) -> Effects {
-        let Some(page) = self.page.as_mut() else {
-            return self.fail(PruneError::NotFinished);
-        };
-        let effects = page.step(event);
-        if !page.is_complete() {
-            return effects;
-        }
-        match self.page.take().map(PrunePageOperation::finalize) {
-            Some(Ok(queued)) => {
-                self.remaining |= queued;
-                self.next_page()
-            }
-            Some(Err(error)) => self.fail(error),
-            None => self.fail(PruneError::NotFinished),
+            None => Next::Done(self.remaining),
         }
     }
 }
@@ -179,46 +143,33 @@ impl Default for PruneReferencesOperation {
     }
 }
 
-impl EffectOperation for PruneReferencesOperation {
+impl Operation for PruneReferencesOperation {
     type Output = bool;
     type Error = PruneError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PruneState::Queue;
-        smallvec![queue_read(PRUNE_CONNECTORS)]
+    fn first(&mut self) -> Result<Next<bool>, PruneError> {
+        let read = queue_read(PRUNE_CONNECTORS);
+        Ok(Next::Call(IoCall::Effect(Box::new(read))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (PruneState::Queue, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.remaining = values.len() == PRUNE_CONNECTORS;
-                self.rows = values.into();
-                self.next_page()
-            }
-            (PruneState::Queue, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(error.into())
-            }
-            (PruneState::Page, event) => self.step_page(event),
-            (state, event) => self.fail(PruneError::UnexpectedEvent {
-                state,
-                received: event.label(),
-            }),
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, PruneError> {
+        if self.listed {
+            self.remaining |= result.child::<bool, PruneError>()??;
+            return Ok(self.next_page());
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PruneState::Finish | PruneState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PruneError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.page.as_mut() {
-            Some(page) => page.abort(),
-            None => smallvec![],
-        }
+        let event = rows::event(result)?;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            let expected = "StorageEvent::IterResult";
+            return Err(IoError::Unexpected {
+                expected,
+                got: event.label(),
+            }
+            .into());
+        };
+        self.listed = true;
+        self.remaining = values.len() == PRUNE_CONNECTORS;
+        self.rows = values.into();
+        Ok(self.next_page())
     }
 }
 
@@ -228,39 +179,23 @@ pub enum PruneError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {state:?}: {received}")]
-    UnexpectedEvent {
-        state: PruneState,
-        received: &'static str,
-    },
-    #[error("connector reference pruning did not finish")]
-    NotFinished,
     #[error("connector reference pruning was not scheduled: {0}")]
     Schedule(String),
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for PruneError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PruneState {
-    Init,
+/// The call a page prune waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Rows,
+    Versions,
     Queue,
-    Page,
-    StartTransaction,
-    ReadRows,
-    ReadVersions,
-    WriteQueue,
-    DeleteRows,
-    Commit,
-    Abort,
-    Finish,
-    Error,
+    Delete,
 }
 
 /// Prunes one page of one queued connector's stale rows in a transaction. A live reference
@@ -270,13 +205,11 @@ pub enum PruneState {
 struct PrunePageOperation {
     queue_key: Key,
     cursor: Value,
-    state: PruneState,
-    txn_id: Option<TxnId>,
+    stage: Stage,
     rows: Vec<Key>,
     next: Option<Key>,
     deletes: Vec<(KeySpace, Key)>,
     queued: bool,
-    output: Option<Result<bool, PruneError>>,
 }
 
 impl PrunePageOperation {
@@ -284,137 +217,31 @@ impl PrunePageOperation {
         Self {
             queue_key,
             cursor,
-            state: PruneState::Init,
-            txn_id: None,
+            stage: Stage::Rows,
             rows: Vec::new(),
             next: None,
             deletes: Vec::new(),
             queued: false,
-            output: None,
         }
     }
 
-    fn txn(&self) -> Result<TxnId, PruneError> {
-        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
+    fn delete_rows(&mut self) -> Next<bool> {
+        self.stage = Stage::Delete;
+        Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes)))
     }
 
-    fn fail(&mut self, error: PruneError) -> Effects {
-        self.output = Some(Err(error));
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PruneState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = PruneState::Error;
-                smallvec![]
-            }
-        }
-    }
-
-    fn delete_rows(&mut self, txn_id: TxnId) -> Effects {
-        self.state = PruneState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn step_inner(&mut self, event: Event) -> Result<Effects, PruneError> {
-        match (self.state, event) {
-            (
-                PruneState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                let Ok(connector) = <[u8; 16]>::try_from(self.queue_key.as_ref()) else {
-                    // A malformed queue row names no connector and is only removed.
-                    let queue_row = (CONNECTOR_PRUNE_KEYSPACE.to_string(), self.queue_key.clone());
-                    self.deletes.push(queue_row);
-                    return Ok(self.delete_rows(txn_id));
-                };
-                self.state = PruneState::ReadRows;
-                let cursor = std::mem::take(&mut self.cursor);
-                Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
-                    prefix: Some(ByteView::from(connector.to_vec())),
-                    start: (!cursor.is_empty()).then_some(IterStart::After(cursor)),
-                    limit: PRUNE_PAGE,
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (
-                PruneState::ReadRows,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                self.rows = values.into_iter().map(|(row, _)| row).collect();
-                self.next = next_start_after;
-                let reads = self
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        let version_key = row.get(ROW_PREFIX..).unwrap_or_default();
-                        (
-                            BLOB_VERSIONS_KEYSPACE.to_string(),
-                            ByteView::from(version_key.to_vec()),
-                        )
-                    })
-                    .collect();
-                self.state = PruneState::ReadVersions;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: Some(self.txn()?),
-                })])
-            }
-            (
-                PruneState::ReadVersions,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.plan_page(values),
-            (PruneState::WriteQueue, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                Ok(self.delete_rows(self.txn()?))
-            }
-            (PruneState::DeleteRows, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.state = PruneState::Commit;
-                let txn_id = self.txn()?;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction { txn_id }
-                )])
-            }
-            (PruneState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = PruneState::Finish;
-                self.output = Some(Ok(self.queued));
-                Ok(smallvec![])
-            }
-            (PruneState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                // A failed commit leaves no transaction to abort.
-                self.txn_id = None;
-                Err(error.into())
-            }
-            (PruneState::Abort, Event::Storage(_)) => {
-                self.state = PruneState::Error;
-                Ok(smallvec![])
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(PruneError::UnexpectedEvent {
-                state,
-                received: event.label(),
-            }),
-        }
+    fn queue_row(&self) -> (KeySpace, Key) {
+        (CONNECTOR_PRUNE_KEYSPACE.to_string(), self.queue_key.clone())
     }
 
     /// Stale rows up to the first live reference are deleted; the queue row moves on when more
     /// rows follow and no live reference was met, else it is deleted.
-    fn plan_page(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, PruneError> {
-        let txn_id = self.txn()?;
+    fn plan_page(&mut self, values: Vec<Option<Value>>) -> Result<Next<bool>, PruneError> {
         let connector_id = <[u8; 16]>::try_from(self.queue_key.as_ref())
             .map(Ulid::from_bytes)
             .map_err(|_| StorageError::InvalidEffect)?;
         let mut live = false;
-        for (row, (_, value)) in std::mem::take(&mut self.rows).into_iter().zip(values) {
+        for (row, value) in std::mem::take(&mut self.rows).into_iter().zip(values) {
             let version = value
                 .map(|value| BlobVersion::from_bytes(value.as_ref()))
                 .transpose()?;
@@ -428,61 +255,69 @@ impl PrunePageOperation {
         self.queued = !live && self.next.is_some();
         match self.next.take().filter(|_| self.queued) {
             Some(next) => {
-                let (key_space, key, value) = prune_queue_write(connector_id, next);
-                self.state = PruneState::WriteQueue;
-                Ok(smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space,
-                    key,
-                    value,
-                    txn_id: Some(txn_id),
-                })])
+                self.stage = Stage::Queue;
+                let write = prune_queue_write(connector_id, next);
+                Ok(Next::Call(IoCall::Write(vec![write])))
             }
             None => {
-                let queue_row = (CONNECTOR_PRUNE_KEYSPACE.to_string(), self.queue_key.clone());
-                self.deletes.push(queue_row);
-                Ok(self.delete_rows(txn_id))
+                self.deletes.push(self.queue_row());
+                Ok(self.delete_rows())
             }
         }
     }
 }
 
-impl EffectOperation for PrunePageOperation {
+impl Operation for PrunePageOperation {
     type Output = bool;
     type Error = PruneError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PruneState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<bool>, PruneError> {
+        let Ok(connector) = <[u8; 16]>::try_from(self.queue_key.as_ref()) else {
+            // A malformed queue row names no connector and is only removed.
+            self.deletes.push(self.queue_row());
+            return Ok(self.delete_rows());
+        };
+        let cursor = std::mem::take(&mut self.cursor);
+        Ok(Next::Call(IoCall::Page {
+            space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+            prefix: ByteView::from(connector.to_vec()),
+            after: (!cursor.is_empty()).then_some(cursor),
+            limit: PRUNE_PAGE,
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if matches!(self.state, PruneState::Finish | PruneState::Error) {
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PruneState::Finish | PruneState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PruneError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PruneState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, PruneError> {
+        match self.stage {
+            Stage::Rows => {
+                let (values, next) = rows::page(result)?;
+                self.rows = values.into_iter().map(|(row, _)| row).collect();
+                self.next = next;
+                let reads = (self.rows.iter())
+                    .map(|row| {
+                        let version_key = row.get(ROW_PREFIX..).unwrap_or_default();
+                        (
+                            BLOB_VERSIONS_KEYSPACE.to_string(),
+                            ByteView::from(version_key.to_vec()),
+                        )
+                    })
+                    .collect();
+                self.stage = Stage::Versions;
+                Ok(Next::Call(IoCall::Read(reads)))
             }
-            None => smallvec![],
+            Stage::Versions => self.plan_page(rows::all_values(result)?),
+            Stage::Queue => {
+                rows::done(result)?;
+                Ok(self.delete_rows())
+            }
+            Stage::Delete => {
+                rows::done(result)?;
+                Ok(Next::Done(self.queued))
+            }
         }
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -491,9 +326,7 @@ mod tests {
     use super::*;
     use crate::connectors::repository::{connector_reference_key, connector_reference_write};
     use crate::driver::{DriverContext, drive};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -566,23 +399,14 @@ mod tests {
             ByteView::from(b"short".to_vec()),
             ByteView::from(Vec::new()),
         );
-        operation.start();
-        let txn_id = Ulid::from_bytes([1; 16]);
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
+        let first = operation.first();
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+            &first,
+            Ok(Next::Call(IoCall::Delete(deletes)))
                 if deletes.len() == 1 && deletes[0].0 == CONNECTOR_PRUNE_KEYSPACE
         ));
-        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert_eq!(operation.finalize(), Ok(false));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(false)));
     }
 
     // Queued stale rows are pruned page by page until the queue row is gone; a live reference
@@ -647,42 +471,18 @@ mod tests {
         })
     }
 
-    fn storage_error() -> Event {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        })
-    }
-
-    fn started(seed: u8) -> Event {
-        Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([seed; 16]),
-        })
-    }
-
-    fn page_iter(seed: u8) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
-            prefix: Some(ByteView::from(vec![seed; 16])),
-            start: None,
-            limit: PRUNE_PAGE,
-            txn_id: Some(Ulid::from_bytes([seed; 16])),
-        })
-    }
-
-    fn begin() -> Effect {
-        Effect::Storage(StorageEffect::StartTransaction { read: false })
+    fn page_done(result: Result<bool, PruneError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
     // An empty queue finishes at once with no work left.
     #[test]
     fn empty_queue_finishes() {
         let mut operation = PruneReferencesOperation::new();
-        check_trace(
-            &mut operation,
-            &[queue_read(PRUNE_CONNECTORS)],
-            vec![(iter_result(Vec::new()), Vec::new())],
-        );
-        assert_eq!(operation.finalize(), Ok(false));
+        let read = Next::Call(IoCall::Effect(Box::new(queue_read(PRUNE_CONNECTORS))));
+        assert_eq!(operation.first(), Ok(read));
+        let listed = operation.next(IoResult::Event(Box::new(iter_result(Vec::new()))));
+        assert_eq!(listed, Ok(Next::Done(false)));
     }
 
     // Each queued connector gets its own page, one after another, and a full queue read
@@ -690,116 +490,30 @@ mod tests {
     #[test]
     fn pages_run_ordered() {
         let mut operation = PruneReferencesOperation::new();
+        operation.first().unwrap();
         let rows: Vec<_> = (1..=PRUNE_CONNECTORS as u8).map(queued_row).collect();
-        check_trace(
-            &mut operation,
-            &[queue_read(PRUNE_CONNECTORS)],
-            vec![
-                (iter_result(rows), vec![begin()]),
-                (started(1), vec![page_iter(1)]),
-            ],
-        );
-        let empty = |seed: u8| {
-            vec![
-                iter_result(Vec::new()),
-                Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }),
-                Event::Storage(StorageEvent::BatchDeleteResult {
-                    entries: Vec::new(),
-                }),
-                Event::Storage(StorageEvent::TransactionCommitted {
-                    txn_id: Ulid::from_bytes([seed; 16]),
-                }),
-            ]
-        };
+        let mut next = operation.next(IoResult::Event(Box::new(iter_result(rows))));
         for seed in 1..=PRUNE_CONNECTORS as u8 {
-            let mut last = Effects::new();
-            for event in empty(seed) {
-                last = operation.step(event);
-            }
-            if seed < PRUNE_CONNECTORS as u8 {
-                assert_eq!(last.as_slice(), [begin()], "page {seed} starts the next");
-                assert_eq!(
-                    operation.step(started(seed + 1)).as_slice(),
-                    [page_iter(seed + 1)]
-                );
-            } else {
-                assert!(last.is_empty());
-            }
+            assert!(
+                matches!(next, Ok(Next::Call(IoCall::Child(_)))),
+                "page {seed} runs as a child"
+            );
+            next = operation.next(page_done(Ok(false)));
         }
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(true));
+        assert_eq!(next, Ok(Next::Done(true)));
     }
 
-    // A failed queue read and a failed page both end the run with their error; a failed page
-    // first aborts its transaction.
+    // A failed page ends the run with its error.
     #[test]
     fn failures_end_run() {
         let mut operation = PruneReferencesOperation::new();
-        operation.start();
-        assert!(operation.step(storage_error()).is_empty());
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-
-        let mut operation = PruneReferencesOperation::new();
-        operation.start();
-        operation.step(iter_result(vec![queued_row(1)]));
-        operation.step(started(1));
-        let aborted = operation.step(storage_error());
-        assert_eq!(
-            aborted.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: Ulid::from_bytes([1; 16])
-            })]
-        );
-        assert!(!operation.is_complete());
-        let txn_id = Ulid::from_bytes([1; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-    }
-
-    // Events outside the expected set are refused, before start and while reading the queue.
-    #[test]
-    fn rejects_unexpected() {
-        let refusals = rejects_events(PruneReferencesOperation::new, sample_events, |_| false);
-        assert_eq!(refusals.len(), sample_events().len());
-        let refusals = rejects_events(
-            || {
-                let mut operation = PruneReferencesOperation::new();
-                operation.start();
-                operation
-            },
-            sample_events,
-            |event| {
-                matches!(
-                    event,
-                    Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-                )
-            },
-        );
-        assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
-    }
-
-    // Abort aborts the running page's transaction and nothing before it.
-    #[test]
-    fn abort_cleans_page() {
-        let mut operation = PruneReferencesOperation::new();
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        operation.step(iter_result(vec![queued_row(1)]));
-        operation.step(started(1));
-        let txn_id = Ulid::from_bytes([1; 16]);
-        check_abort(
-            &mut operation,
-            &[Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-        );
-    }
-
-    #[test]
-    fn rejects_early_finalize() {
-        rejects_finalize(PruneReferencesOperation::new());
-        let mut operation = PruneReferencesOperation::new();
-        operation.start();
-        rejects_finalize(operation);
+        operation.first().unwrap();
+        let rows = vec![queued_row(1), queued_row(2)];
+        operation
+            .next(IoResult::Event(Box::new(iter_result(rows))))
+            .unwrap();
+        let failed = operation.next(page_done(Err(StorageError::Timeout.into())));
+        assert_eq!(failed, Err(StorageError::Timeout.into()));
     }
 
     // The restore schedules pruning only while a queue row exists; a failed timer is reported.

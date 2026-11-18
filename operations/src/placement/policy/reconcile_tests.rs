@@ -4,13 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::errors::StorageError;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::placement::record::NodePlacementEntry;
 
 use super::*;
 use crate::tests::policy::{admin_user, realm_view};
-use aruna_core::calls::{IoCall, IoResult, Next};
 
 fn node() -> NodeId {
     iroh::SecretKey::from_bytes(&[5u8; 32]).public()
@@ -31,42 +29,45 @@ fn entry(draining: bool) -> NodePlacementEntry {
     }
 }
 
-fn read(value: Option<Value>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value,
-    })
+fn read(value: Option<Value>) -> IoResult {
+    IoResult::Values(vec![value])
 }
 
 /// The stored realm config, with this node placed as `entry` or not at all.
-fn config(entry: Option<NodePlacementEntry>) -> Event {
+fn config(entry: Option<NodePlacementEntry>) -> IoResult {
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 2);
     config.placement_map.extend(entry);
     let (config, _) = realm_view(&config, admin_user(realm_id()));
     read(Some(config))
 }
 
-fn config_read() -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: REALM_CONFIG_KEYSPACE.to_string(),
-        key: realm_id().as_bytes().to_vec().into(),
-        txn_id: None,
-    })
+fn config_read() -> SyncTurn {
+    let row = (
+        REALM_CONFIG_KEYSPACE.to_string(),
+        Key::from(realm_id().as_bytes().to_vec()),
+    );
+    Ok(Next::Call(IoCall::Read(vec![row])))
 }
 
 fn sync(trigger: SubjectTrigger) -> SubjectSyncOperation {
     SubjectSyncOperation::new(realm_id(), node(), trigger, 1_000)
 }
 
-/// The scan the operation starts as its child, as its first effects.
-fn scan_start(observed: PlacementSubject, mode: SubjectScanMode) -> Vec<Effect> {
-    let mut scan = SubjectScanOperation::new(SubjectScanConfig {
+/// Checks that the operation runs the scan child under `observed` in `mode`.
+fn scans(
+    operation: &SubjectSyncOperation,
+    turn: SyncTurn,
+    observed: PlacementSubject,
+    mode: SubjectScanMode,
+) {
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let config = SubjectScanConfig {
         realm_id: realm_id(),
         observed,
         mode,
         now_ms: 1_000,
-    });
-    scan.start().into_vec()
+    };
+    assert_eq!(operation.state, SyncState::Scan(config));
 }
 
 #[test]
@@ -74,50 +75,28 @@ fn placed_node_revalidates() {
     // An observed change of a placed node rescans under its new subject.
     let mode = SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition);
     let mut operation = sync(SubjectTrigger::Observe);
-    check_trace(
-        &mut operation,
-        &[config_read()],
-        vec![(
-            config(Some(entry(false))),
-            scan_start(storage_subject(&entry(false), 1), mode),
-        )],
-    );
-    assert!(!operation.is_complete());
+    assert_eq!(operation.first(), config_read());
+    let turn = operation.next(config(Some(entry(false))));
+    scans(&operation, turn, storage_subject(&entry(false), 1), mode);
 }
 
 #[test]
 fn draining_node_departs() {
-    // A draining node departs, and the scan's own answers finish the operation.
+    // A draining node departs, and the scan's answer finishes the operation.
     let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    let effects = operation.step(config(Some(entry(true))));
+    operation.first().unwrap();
+    let turn = operation.next(config(Some(entry(true))));
     let subject = storage_subject(&entry(true), 1);
+    scans(&operation, turn, subject, SubjectScanMode::Depart);
+    let result = SubjectScanResult {
+        generation: 1,
+        ..SubjectScanResult::default()
+    };
+    let scanned = IoResult::Child(ChildOutcome::new(Ok::<_, SubjectScanError>(result.clone())));
     assert_eq!(
-        effects.into_vec(),
-        scan_start(subject.clone(), SubjectScanMode::Depart)
+        operation.next(scanned),
+        Ok(Next::Done(Some((SubjectScanMode::Depart, result))))
     );
-    // Departing blocks the unchanged record first, then records an empty inventory.
-    let stored = NodeSubjectRecord::seed(subject).expect("subject is valid");
-    let effects = operation.step(read(Some(stored.to_bytes().unwrap().into())));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { key_space, .. })] if key_space == NODE_SUBJECT_KEYSPACE
-    ));
-    let written = Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-    });
-    assert!(
-        !operation.step(written).is_empty(),
-        "the inventory scan starts"
-    );
-    let empty = Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    });
-    assert!(operation.step(empty).is_empty());
-    let (mode, result) = operation.finalize().unwrap().expect("a scan ran");
-    assert_eq!(mode, SubjectScanMode::Depart);
-    assert_eq!(result.generation, 1);
 }
 
 #[test]
@@ -125,13 +104,17 @@ fn removed_node_departs() {
     // A node the realm no longer places departs under the subject it advertised.
     let advertised = NodeSubjectRecord::seed(storage_subject(&entry(false), 4)).unwrap();
     let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    let effects = operation.step(config(None));
-    assert_eq!(effects.into_vec(), vec![local_read()]);
-    let effects = operation.step(read(Some(advertised.to_bytes().unwrap().into())));
+    operation.first().unwrap();
     assert_eq!(
-        effects.into_vec(),
-        scan_start(advertised.subject, SubjectScanMode::Depart)
+        operation.next(config(None)),
+        Ok(Next::Call(IoCall::Read(vec![local_row()])))
+    );
+    let turn = operation.next(read(Some(advertised.to_bytes().unwrap().into())));
+    scans(
+        &operation,
+        turn,
+        advertised.subject,
+        SubjectScanMode::Depart,
     );
 }
 
@@ -140,20 +123,17 @@ fn nothing_to_scan() {
     // No config, no entry on reconcile, or no advertised subject: nothing is scanned.
     let mode = SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin);
     let mut operation = sync(SubjectTrigger::Reconcile(mode));
-    operation.start();
-    assert!(operation.step(read(None)).is_empty());
-    assert_eq!(operation.finalize(), Ok(None));
+    operation.first().unwrap();
+    assert_eq!(operation.next(read(None)), Ok(Next::Done(None)));
 
     let mut operation = sync(SubjectTrigger::Reconcile(mode));
-    operation.start();
-    assert!(operation.step(config(None)).is_empty());
-    assert_eq!(operation.finalize(), Ok(None));
+    operation.first().unwrap();
+    assert_eq!(operation.next(config(None)), Ok(Next::Done(None)));
 
     let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    operation.step(config(None));
-    assert!(operation.step(read(None)).is_empty());
-    assert_eq!(operation.finalize(), Ok(None));
+    operation.first().unwrap();
+    operation.next(config(None)).unwrap();
+    assert_eq!(operation.next(read(None)), Ok(Next::Done(None)));
 }
 
 #[test]
@@ -161,61 +141,47 @@ fn reconcile_keeps_mode() {
     // A reconcile scans a placed node in the mode it was asked for.
     let mode = SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin);
     let mut operation = sync(SubjectTrigger::Reconcile(mode));
-    operation.start();
-    let effects = operation.step(config(Some(entry(true))));
-    assert_eq!(
-        effects.into_vec(),
-        scan_start(storage_subject(&entry(true), 1), mode)
-    );
+    operation.first().unwrap();
+    let turn = operation.next(config(Some(entry(true))));
+    scans(&operation, turn, storage_subject(&entry(true), 1), mode);
 }
 
 #[test]
 fn read_failures_fail() {
-    // A storage error or an undecodable row fails the operation without effects.
-    let error = Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    });
+    // An answer that is not a read, an undecodable row or a failed scan fails the operation.
     let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    assert!(operation.step(error).is_empty());
-    assert_eq!(
-        operation.finalize(),
-        Err(SubjectScanError::InvalidEvent("ReadRealmConfig"))
-    );
-    let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    operation.step(config(None));
-    assert!(operation.step(read(Some(vec![0xff; 3].into()))).is_empty());
+    operation.first().unwrap();
     assert!(matches!(
-        operation.finalize(),
+        operation.next(IoResult::Done),
+        Err(SubjectScanError::Io(_))
+    ));
+    let mut operation = sync(SubjectTrigger::Observe);
+    operation.first().unwrap();
+    operation.next(config(None)).unwrap();
+    assert!(matches!(
+        operation.next(read(Some(vec![0xff; 3].into()))),
         Err(SubjectScanError::Conversion(_))
     ));
-}
-
-#[test]
-fn rejects_unexpected_events() {
-    // Before start every event fails the subject sync, without effects.
-    let make = || sync(SubjectTrigger::Observe);
-    for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(
-            error,
-            SubjectScanError::InvalidEvent("SubjectSync"),
-            "{label}"
-        );
-    }
+    let mut operation = sync(SubjectTrigger::Observe);
+    operation.first().unwrap();
+    operation.next(config(Some(entry(false)))).unwrap();
+    let failed = SubjectScanError::InvalidEvent("Clear");
+    let scanned = IoResult::Child(ChildOutcome::new(Err::<SubjectScanResult, _>(failed)));
+    assert_eq!(
+        operation.next(scanned),
+        Err(SubjectScanError::InvalidEvent("Clear"))
+    );
 }
 
 #[test]
 fn reads_local_subject() {
     // One read of the advertised record; the answer is that record, or none.
     let advertised = NodeSubjectRecord::seed(storage_subject(&entry(false), 2)).unwrap();
-    let row = (
-        NODE_SUBJECT_KEYSPACE.to_string(),
-        Key::from(NODE_SUBJECT_KEY.to_vec()),
-    );
     let mut operation = LocalSubjectOperation::new();
-    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+    assert_eq!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Read(vec![local_row()])))
+    );
     let stored = IoResult::Values(vec![Some(advertised.to_bytes().unwrap().into())]);
     assert_eq!(operation.next(stored), Ok(Next::Done(Some(advertised))));
     let mut operation = LocalSubjectOperation::new();
@@ -242,13 +208,4 @@ fn local_read_failures() {
         operation.next(IoResult::Done),
         Err(SubjectScanError::InvalidEvent("ReadLocalSubject"))
     );
-}
-
-#[test]
-fn abort_and_finalize() {
-    // Choosing the subject only reads: abort has nothing to clean up, and an early finalize fails.
-    let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
 }

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{
     ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
     SourceKind, gap_key, outbox_key, source_key,
@@ -140,8 +140,8 @@ impl Operation for MatchPage {
     type Output = usize;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<usize>, StoreError> {

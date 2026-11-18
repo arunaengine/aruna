@@ -6,10 +6,9 @@
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::realm_vault::{RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::rows;
@@ -24,12 +23,9 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{Applied, ChangeError, Managers, SecretChange, apply_change, widening_notices};
-use crate::notifications::outbox_record::schedule_drain_effect as notice_drain_effect;
+use super::{Applied, ChangeError, Managers, SecretChange, apply_change, drains, widening_notices};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
-    new_identified_record, outbox_write_entry, schedule_drain_effect,
-};
+use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 use aruna_core::placement::target_placement_ref;
 
 /// One realm secret change, with the time and write id it uses.
@@ -58,13 +54,11 @@ pub enum RealmSecretError {
     ConfigMissing,
     #[error("this node is not a realm management node")]
     NotManagementNode,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for RealmSecretError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
@@ -88,8 +82,6 @@ enum Stage {
 pub struct RealmSecretOperation {
     input: RealmChange,
     stage: Stage,
-    /// Whether the outbox drain and the notice drain still wait for the commit.
-    drain: bool,
     notices: bool,
     result: Option<Option<SecretRecord>>,
 }
@@ -99,7 +91,6 @@ impl RealmSecretOperation {
         Self {
             input,
             stage: Stage::Read,
-            drain: false,
             notices: false,
             result: None,
         }
@@ -256,7 +247,6 @@ impl RealmSecretOperation {
             writes.extend(notices);
         }
         self.result = Some(applied.info);
-        self.drain = true;
         self.stage = Stage::Write(deletes);
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -296,21 +286,16 @@ impl Operation for RealmSecretOperation {
             }
             Stage::Delete => {
                 rows::done(result)?;
-                Ok(Next::Done(self.result.take().flatten()))
+                Ok(Next::Then {
+                    output: self.result.take().flatten(),
+                    calls: drains(self.notices),
+                })
             }
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
-    }
-
-    /// The outbox drain, then the notice drain; a missed timer leaves the rows to the next drain.
-    fn after_commit(&mut self) -> Option<Effect> {
-        if std::mem::take(&mut self.drain) {
-            return Some(schedule_drain_effect());
-        }
-        std::mem::take(&mut self.notices).then(notice_drain_effect)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

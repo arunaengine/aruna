@@ -4,12 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{
-    BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE,
-};
+use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, DELETE_CLAIM_KEYSPACE};
 use aruna_core::structs::storage::backend_import::{claim_key, version_key};
-use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
-use aruna_core::types::Value;
 
 impl CompleteUploadOperation {
     /// Only Aruna's own linked upload with a known backend version may give way: without the
@@ -24,7 +20,7 @@ impl CompleteUploadOperation {
     }
 
     /// Reads the key's current version in the finalize transaction, before the usual lookup.
-    pub(super) fn read_current(&mut self) -> Option<Effects> {
+    pub(super) fn read_current(&mut self) -> Option<Turn> {
         if !self.dedups() {
             return None;
         }
@@ -33,66 +29,36 @@ impl CompleteUploadOperation {
         let Ok(head) = head.to_bytes() else {
             return Some(self.check_hash_lookup());
         };
-        self.state = CompleteUploadState::ReadDedupHead;
-        Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key: head.into(),
-            txn_id: self.txn_id,
-        })])
+        let read = read_row(BLOB_HEAD_KEYSPACE, head);
+        Some(self.call(CompleteUploadState::ReadDedupHead, read))
     }
 
-    pub(super) fn dedup_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteUploadError::InvalidOperationState);
-        };
-        let Some(written) = self.composed_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
-        };
+    pub(super) fn dedup_read(&mut self, value: Option<Value>) -> Turn {
+        let written = self.composed_location.clone();
+        let written = written.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         match (&self.state, value) {
             (CompleteUploadState::ReadDedupHead, Some(value)) => {
-                let pointer = match CurrentVersionPointer::from_bytes(&value) {
-                    Ok(pointer) => pointer,
-                    Err(error) => return self.schedule_error(error.into()),
-                };
+                let pointer = CurrentVersionPointer::from_bytes(&value)?;
                 let key = VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id);
-                match key.to_bytes() {
-                    Ok(key) => {
-                        self.state = CompleteUploadState::ReadDedupVersion;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                            key: key.into(),
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    Err(error) => self.schedule_error(error.into()),
-                }
+                let read = read_row(BLOB_VERSIONS_KEYSPACE, key.to_bytes()?);
+                self.call(CompleteUploadState::ReadDedupVersion, read)
             }
             (CompleteUploadState::ReadDedupVersion, Some(value)) => {
-                let version = match BlobVersion::from_bytes(&value) {
-                    Ok(version) => version,
-                    Err(error) => return self.schedule_error(error.into()),
-                };
+                let version = BlobVersion::from_bytes(&value)?;
                 let same = version.blob_hash().map(|hash| &hash[..]) == written.get_blake3()
                     && version.blob_backend() == Some(&written.backend);
-                let plain = |key: &BlobLocationKey| {
-                    matches!(
-                        key.encoding,
-                        aruna_core::structs::storage::format::EncodingClass::Plain { .. }
-                    )
-                };
+                let plain =
+                    |key: &BlobLocationKey| matches!(key.encoding, EncodingClass::Plain { .. });
                 match version.location_key().filter(|key| same && plain(key)) {
                     Some(key) => {
-                        self.state = CompleteUploadState::ReadDedupLocation;
-                        smallvec![blob_location_read(&key, self.txn_id)]
+                        let read = read_row(BLOB_LOCATIONS_KEYSPACE, key.to_bytes());
+                        self.call(CompleteUploadState::ReadDedupLocation, read)
                     }
                     None => self.check_hash_lookup(),
                 }
             }
             (CompleteUploadState::ReadDedupLocation, Some(value)) => {
-                let existing = match BackendLocation::from_bytes(&value) {
-                    Ok(existing) => existing,
-                    Err(error) => return self.schedule_error(error.into()),
-                };
+                let existing = BackendLocation::from_bytes(&value)?;
                 let usable = existing.is_external()
                     && !existing.staging
                     && !existing.partial
@@ -101,18 +67,13 @@ impl CompleteUploadOperation {
                     return self.check_hash_lookup();
                 }
                 // The kept file's backend version decides a same-path reuse and its claim.
-                self.state = CompleteUploadState::ReadDedupProvider;
-                self.final_location = Some(existing.clone());
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BACKEND_VERSION_KEYSPACE.to_string(),
-                    key: version_key(existing.ulid),
-                    txn_id: self.txn_id,
-                })]
+                let read = read_row(BACKEND_VERSION_KEYSPACE, version_key(existing.ulid));
+                self.final_location = Some(existing);
+                self.call(CompleteUploadState::ReadDedupProvider, read)
             }
             (CompleteUploadState::ReadDedupProvider, value) => {
-                let Some(kept) = self.final_location.clone() else {
-                    return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
-                };
+                let kept = self.final_location.clone();
+                let kept = kept.ok_or(CompleteUploadError::CompleteUploadFailed)?;
                 let other = value.map(|value| String::from_utf8_lossy(&value).into_owned());
                 // At the same path only another backend version of it is another file.
                 let other_bytes = other.is_some() && other != self.plain_version;
@@ -124,22 +85,14 @@ impl CompleteUploadOperation {
                     return self.reuse(written, kept);
                 };
                 // A version a release is deleting takes no new reader.
-                match claim_key(&kept, &other) {
-                    Ok(claim) => {
-                        self.state = CompleteUploadState::ReadDedupClaim;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
-                            key: claim,
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    Err(error) => self.schedule_error(error.into()),
-                }
+                let read = read_row(DELETE_CLAIM_KEYSPACE, claim_key(&kept, &other)?);
+                self.call(CompleteUploadState::ReadDedupClaim, read)
             }
-            (CompleteUploadState::ReadDedupClaim, None) => match self.final_location.clone() {
-                Some(kept) => self.reuse(written, kept),
-                None => self.schedule_error(CompleteUploadError::CompleteUploadFailed),
-            },
+            (CompleteUploadState::ReadDedupClaim, None) => {
+                let kept = self.final_location.clone();
+                let kept = kept.ok_or(CompleteUploadError::CompleteUploadFailed)?;
+                self.reuse(written, kept)
+            }
             (CompleteUploadState::ReadDedupClaim, Some(_)) => {
                 self.final_location = None;
                 self.check_hash_lookup()
@@ -148,7 +101,7 @@ impl CompleteUploadOperation {
         }
     }
 
-    fn reuse(&mut self, written: BackendLocation, existing: BackendLocation) -> Effects {
+    fn reuse(&mut self, written: BackendLocation, existing: BackendLocation) -> Turn {
         self.dedup = Some(written);
         self.final_location = Some(existing);
         self.write_blob_location()

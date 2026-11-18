@@ -15,7 +15,7 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key, release_marker};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -191,20 +191,31 @@ pub fn release_row_effect(
     version: &BlobVersion,
     txn_id: Option<TxnId>,
 ) -> Result<Option<Effect>, ConversionError> {
+    let writes = release_rows(version_key, version)?;
+    Ok(
+        (!writes.is_empty()).then_some(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id,
+        })),
+    )
+}
+
+/// The rows of [`release_row_effect`]: none for a version without a release tag.
+pub fn release_rows(
+    version_key: &VersionKey,
+    version: &BlobVersion,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
     let Some(pointer) = ReleasePointer::of(&version_key.key, &version.metadata) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let space = BUCKET_RELEASE_KEYSPACE.to_string();
     let key = release_key(&version_key.bucket, version_key.version_id).into();
     let marker = release_marker(&version_key.bucket).into();
     let id = version_key.version_id.to_bytes().to_vec().into();
-    Ok(Some(Effect::Storage(StorageEffect::BatchWrite {
-        writes: vec![
-            (space.clone(), key, pointer.to_bytes()?.into()),
-            (space, marker, id),
-        ],
-        txn_id,
-    })))
+    Ok(vec![
+        (space.clone(), key, pointer.to_bytes()?.into()),
+        (space, marker, id),
+    ])
 }
 
 pub fn delete_version_effect(

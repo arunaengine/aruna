@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -296,8 +296,8 @@ impl Operation for MaterializeEntryOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -326,7 +326,10 @@ mod tests {
     #[test]
     fn writes_then_commits() {
         let mut materialize = materialize();
-        assert!(materialize.transaction());
+        assert_eq!(
+            materialize.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(matches!(
             materialize.first(),
             Ok(Next::Call(IoCall::Effect(_)))

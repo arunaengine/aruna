@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
@@ -88,13 +88,17 @@ enum PageState {
 
 type Step = Result<Next<PageProgress>, BootstrapError>;
 
-/// Advances one cursor by one page in one transaction: the cursor and the page's jobs commit
-/// together, so a crash repeats at most the last page.
+/// Advances one cursor by one page. The pending jobs and the page are read outside any
+/// transaction, so live writes into the range never conflict it; the cursor and the page's jobs
+/// commit together in a child that checks the cursor is unchanged, so a crash repeats at most
+/// the last page.
 #[derive(Debug, PartialEq)]
 pub struct BootstrapPage {
     config: PageConfig,
     state: PageState,
     cursor: BootstrapCursor,
+    /// The cursor row as read, which the store checks before it writes.
+    seen: Option<Value>,
     progress: Option<PageProgress>,
 }
 
@@ -105,6 +109,7 @@ impl BootstrapPage {
             config,
             state: PageState::ReadCursor,
             cursor,
+            seen: None,
             progress: None,
         }
     }
@@ -115,6 +120,7 @@ impl BootstrapPage {
     }
 
     fn accept_cursor(&mut self, value: Option<Value>) -> Step {
+        self.seen = value.clone();
         if let Some(stored) = value
             .map(|value| BootstrapCursor::from_bytes(&value))
             .transpose()?
@@ -135,24 +141,19 @@ impl BootstrapPage {
         let reads = (self.cursor.pending.iter())
             .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), Key::from(key.clone())))
             .collect();
-        // Outside the transaction, as before: a delivered job's delete never conflicts it.
-        let read = StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(read)))))
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn accept_pending(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
-        if values.iter().any(|(_, value)| value.is_some()) {
+    fn accept_pending(&mut self, values: Vec<Option<Value>>) -> Step {
+        if values.iter().any(Option::is_some) {
             return Ok(Next::Done(PageProgress::Waiting));
         }
         self.cursor.pending.clear();
         self.next_page()
     }
 
-    /// Reads the next page outside the transaction: live writes into the range never conflict
-    /// a page, because the comparator orders whatever arrives twice.
+    /// Reads the next page; live writes into the range never conflict a page, because the
+    /// comparator orders whatever arrives twice.
     fn next_page(&mut self) -> Step {
         if self.cursor.walked {
             self.cursor.done = true;
@@ -226,13 +227,16 @@ impl BootstrapPage {
 
     fn write(&mut self, mut writes: Vec<(String, Key, Value)>) -> Step {
         let cursor = self.cursor.to_bytes()?;
-        writes.push((
-            BOOTSTRAP_KEYSPACE.to_string(),
-            self.key().into(),
-            cursor.into(),
-        ));
+        let key: Key = self.key().into();
+        writes.push((BOOTSTRAP_KEYSPACE.to_string(), key.clone(), cursor.into()));
         self.state = PageState::Write;
-        Ok(Next::Call(IoCall::Write(writes)))
+        let store = StorePageOperation {
+            key,
+            seen: self.seen.take(),
+            writes,
+            written: false,
+        };
+        Ok(Next::Call(IoCall::child(store)))
     }
 
     fn storage_answer(result: IoResult) -> Result<StorageEvent, BootstrapError> {
@@ -260,10 +264,7 @@ impl Operation for BootstrapPage {
     fn next(&mut self, result: IoResult) -> Step {
         match self.state {
             PageState::ReadCursor => self.accept_cursor(result.value()?),
-            PageState::ReadPending => match Self::storage_answer(result)? {
-                StorageEvent::BatchReadResult { values } => self.accept_pending(values),
-                other => Err(unexpected("StorageEvent::BatchReadResult", other)),
-            },
+            PageState::ReadPending => self.accept_pending(result.values()?),
             PageState::ReadPage => match Self::storage_answer(result)? {
                 StorageEvent::IterResult {
                     values,
@@ -272,15 +273,47 @@ impl Operation for BootstrapPage {
                 other => Err(unexpected("StorageEvent::IterResult", other)),
             },
             PageState::Write => {
-                result.done()?;
+                result.child::<(), BootstrapError>()??;
                 let progress = self.progress.ok_or(IoError::Unfinished)?;
                 Ok(Next::Done(progress))
             }
         }
     }
+}
 
-    fn transaction(&self) -> bool {
-        true
+/// Writes a page's jobs and its cursor in one transaction, while the cursor row is still the
+/// one the page was read from; another run that moved it meanwhile makes this a conflict.
+#[derive(Debug, PartialEq)]
+struct StorePageOperation {
+    key: Key,
+    seen: Option<Value>,
+    writes: Vec<(String, Key, Value)>,
+    written: bool,
+}
+
+impl Operation for StorePageOperation {
+    type Output = ();
+    type Error = BootstrapError;
+
+    fn first(&mut self) -> Result<Next<()>, BootstrapError> {
+        let read = (BOOTSTRAP_KEYSPACE.to_string(), self.key.clone());
+        Ok(Next::Call(IoCall::Read(vec![read])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, BootstrapError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if result.value()? != self.seen {
+            return Err(IoError::Conflict.into());
+        }
+        self.written = true;
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

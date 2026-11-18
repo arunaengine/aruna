@@ -329,7 +329,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
     use aruna_storage::StorageHandle;
 
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::DriverContext;
     use crate::s3::object::metadata_drain::{
         jobs_exist, process_batch, refresh_with_context, settle_job,
     };

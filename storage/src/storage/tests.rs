@@ -36,6 +36,8 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         secret_key: std::sync::Arc::new(std::sync::OnceLock::new()),
         vault_key: std::sync::Arc::new(std::sync::OnceLock::new()),
         database: std::sync::Arc::new(std::sync::OnceLock::new()),
+        realm_keys: std::sync::Arc::new(std::sync::OnceLock::new()),
+        range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     (handle, super::StorageReceivers { foreground, bulk })
 }
@@ -557,6 +559,8 @@ fn worker_exit_latches() {
         secret_key: _,
         vault_key: _,
         database: _,
+        realm_keys: _,
+        range_indexes: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));

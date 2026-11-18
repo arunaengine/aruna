@@ -9,14 +9,12 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
-use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
-use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmitNotificationsError {
@@ -40,12 +38,11 @@ pub struct EmitNotificationsInput {
     pub records: Vec<NotificationRecord>,
 }
 
-/// Writes the records as outbox rows in one batch, then schedules the outbox drain. A failed
-/// schedule is logged: the drain's own re-arm or the next emission picks the rows up.
+/// Writes the records as outbox rows in one batch, then schedules the outbox drain after it. A
+/// failed schedule is logged: the drain's own re-arm or the next emission picks the rows up.
 #[derive(Debug, PartialEq)]
 pub struct EmitNotificationsOperation {
     writes: Vec<(KeySpace, Key, Value)>,
-    scheduling: bool,
 }
 
 impl EmitNotificationsOperation {
@@ -63,10 +60,7 @@ impl EmitNotificationsOperation {
                 Err(error) => warn!(%error, "Skipping unserializable notification outbox row"),
             }
         }
-        Self {
-            writes,
-            scheduling: false,
-        }
+        Self { writes }
     }
 }
 
@@ -82,19 +76,11 @@ impl Operation for EmitNotificationsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, Self::Error> {
-        match (self.scheduling, result) {
-            (false, IoResult::Done) => {
-                self.scheduling = true;
-                Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
-            }
-            (true, IoResult::Event(Event::Task(event))) => {
-                if let TaskEvent::Error { message, .. } = event {
-                    warn!(message = %message, "Failed to schedule notification outbox drain after emit");
-                }
-                Ok(Next::Done(()))
-            }
-            (_, other) => Err(unexpected("an outbox write or a drain schedule", &other).into()),
-        }
+        result.done()?;
+        Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::from(schedule_drain_effect())],
+        })
     }
 }
 
@@ -114,6 +100,7 @@ pub(crate) fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Eff
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::notifications::unexpected;
     use crate::tests::notifications::{context_with_storage, record, user};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -121,7 +108,7 @@ mod tests {
     use aruna_core::structs::execution::notification::{
         NotificationClass, notification_outbox_key,
     };
-    use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+    use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
@@ -205,39 +192,26 @@ mod tests {
         assert!(read_outbox_rows(&context).await.is_empty());
     }
 
-    /// The rows are written, then the drain is scheduled; a failed schedule still succeeds.
+    /// The rows are written, then the drain is scheduled after them.
     #[test]
     fn write_then_schedule() {
-        for answer in [
-            TaskEvent::TimerScheduled {
-                key: TaskKey::DrainNotificationOutbox,
-                after: Duration::ZERO,
-            },
-            TaskEvent::Error {
-                key: None,
-                message: "scheduler unavailable".to_string(),
-            },
-        ] {
-            let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-                records: vec![make_record(1, 2)],
-            });
-            assert!(matches!(
-                operation.first(),
-                Ok(Next::Call(IoCall::Write(writes))) if writes.len() == 1
-            ));
-            match operation.next(IoResult::Done) {
-                Ok(Next::Call(IoCall::Effect(Effect::Task(TaskEffect::ResetTimer {
-                    key,
-                    after,
-                })))) => {
-                    assert_eq!(key, TaskKey::DrainNotificationOutbox);
-                    assert_eq!(after, Duration::ZERO);
-                }
-                other => panic!("expected a drain schedule, got {other:?}"),
-            }
-            let answer = IoResult::Event(Event::Task(answer));
-            assert_eq!(operation.next(answer), Ok(Next::Done(())));
-        }
+        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+            records: vec![make_record(1, 2)],
+        });
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Write(writes))) if writes.len() == 1
+        ));
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Then {
+                output: (),
+                calls: vec![IoCall::from(Effect::Task(TaskEffect::ResetTimer {
+                    key: TaskKey::DrainNotificationOutbox,
+                    after: Duration::ZERO,
+                }))],
+            })
+        );
     }
 
     // A storage failure must not reach the parent as a successful emission.
@@ -277,7 +251,7 @@ mod tests {
 
         fn next(&mut self, result: IoResult) -> Result<Next<Event>, IoError> {
             match result {
-                IoResult::Event(event) => Ok(Next::Done(event)),
+                IoResult::Event(event) => Ok(Next::Done(*event)),
                 other => Err(unexpected("the emit event", &other)),
             }
         }

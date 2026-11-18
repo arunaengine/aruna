@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::storage::blob::{
+    BlobVersion, BucketInfo, VersionKey, object_permission_path,
+};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 
@@ -867,6 +871,7 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
             },
         ),
         range_turns: Default::default(),
+        handlers: Default::default(),
     }
 }
 

@@ -65,10 +65,9 @@ use aruna_core::metadata::AuthToken;
 /// once the outcome is recorded so it is not retried forever on a permanent error.
 pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
     let context = ctx.driver.as_ref();
-    let storage = &context.storage_handle;
 
     // A re-driven crate job returns a previously recorded outcome without recreating it.
-    let saved_id = match read_crate_status(storage, for_job).await {
+    let saved_id = match read_crate_status(&context, for_job).await {
         Ok(Some(RunCrateStatus::Written { resource })) => {
             return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
         }
@@ -86,7 +85,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         }
     };
 
-    let parent = match read_job_record(storage, for_job, None).await {
+    let parent = match read_job_record(&context, for_job, None).await {
         Ok(Some(record)) => record,
         Ok(None) => {
             // Parent pruned before the crate ran; nothing to write.
@@ -139,8 +138,7 @@ async fn keep_local_crate(
     spec: &ExecutionSpec,
 ) -> Result<(), String> {
     let context = ctx.driver.as_ref();
-    let storage = &context.storage_handle;
-    let launch = read_launch_record(storage, parent).await?;
+    let launch = read_launch_record(&context, parent).await?;
     let realm_id = ctx.driver.serving_realm(parent.created_by.realm_id);
     let jsonld = build_crate_jsonld(
         parent,
@@ -153,7 +151,7 @@ async fn keep_local_crate(
         owner: parent.created_by,
         jsonld,
     };
-    put_local_crate(storage, parent.job_id, &local).await
+    put_local_crate(&context, parent.job_id, &local).await
 }
 
 /// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
@@ -180,7 +178,6 @@ pub(crate) async fn record_crate(
     saved_id: Option<Ulid>,
 ) -> JobRunOutcome {
     let context = driver.as_ref();
-    let storage = &context.storage_handle;
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
@@ -205,7 +202,7 @@ pub(crate) async fn record_crate(
     };
     if saved_id.is_none()
         && let Err(error) =
-            put_crate_status(storage, for_job, &RunCrateStatus::Minted { document_id }).await
+            put_crate_status(&context, for_job, &RunCrateStatus::Minted { document_id }).await
     {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
@@ -263,7 +260,7 @@ pub(crate) async fn record_crate(
         let status = RunCrateStatus::Denied {
             message: "metadata write access denied".to_string(),
         };
-        if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
+        if let Err(error) = put_outcome(&context, for_job, parent, spec, &status, None).await {
             return JobRunOutcome::Failed(JobError::retryable(format!(
                 "run crate status write failed: {error}"
             )));
@@ -282,7 +279,7 @@ pub(crate) async fn record_crate(
         }
     };
     let realm_id = driver.serving_realm(parent.created_by.realm_id);
-    let launch = match read_launch_record(storage, parent).await {
+    let launch = match read_launch_record(&context, parent).await {
         Ok(launch) => launch,
         Err(error) => {
             return JobRunOutcome::Failed(JobError::retryable(format!(
@@ -334,7 +331,7 @@ pub(crate) async fn record_crate(
             }
         }
     };
-    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
+    if let Err(error) = put_outcome(&context, for_job, parent, spec, &status, None).await {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
         )));
@@ -368,9 +365,7 @@ async fn record_written(
     let status = RunCrateStatus::Written {
         resource: resource.clone(),
     };
-    let storage = &driver.storage_handle;
-    if let Err(error) =
-        put_outcome(storage, for_job, parent, spec, &status, Some(document_id)).await
+    if let Err(error) = put_outcome(driver, for_job, parent, spec, &status, Some(document_id)).await
     {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
@@ -381,14 +376,14 @@ async fn record_written(
 
 /// Records the final crate status with the run link; a link the receipt wrote keeps its family.
 async fn put_outcome(
-    storage: &aruna_storage::storage::StorageHandle,
+    context: &DriverContext,
     for_job: JobId,
     parent: &JobRecord,
     spec: &ExecutionSpec,
     status: &RunCrateStatus,
     run_crate: Option<Ulid>,
 ) -> Result<(), String> {
-    let known = read_run_link(storage, for_job).await?;
+    let known = read_run_link(context, for_job).await?;
     let link = RunLink {
         family: known.as_ref().and_then(|link| link.family),
         logical_job_id: known.and_then(|link| link.logical_job_id),
@@ -396,7 +391,7 @@ async fn put_outcome(
         created_by: parent.created_by,
         run_crate,
     };
-    put_crate_outcome(storage, for_job, status, &link).await
+    put_crate_outcome(context, for_job, status, &link).await
 }
 
 fn is_transient(error: &MetadataWriteError) -> bool {

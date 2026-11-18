@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
@@ -90,8 +90,8 @@ impl Operation for AddIdentifiersOperation {
     type Output = (PersistentIdMapping, bool);
     type Error = PersistentIdError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> AddTurn {
@@ -200,7 +200,10 @@ pub(crate) mod tests {
     fn writes_with_index() {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
-        assert!(op.transaction());
+        assert_eq!(
+            op.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(op.first(), Ok(Next::Call(mapping_call(document_id))));
         let Ok(Next::Call(IoCall::Write(writes))) = op.next(stored(&mapping(document_id))) else {
             panic!("expected one write");
