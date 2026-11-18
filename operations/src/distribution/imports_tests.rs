@@ -73,7 +73,11 @@ fn unknown_job_missing() {
 }
 
 fn fetch(jobs: Vec<JobId>) -> FetchImportsOperation {
-    let range = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]), transfer());
+    let range = (
+        Ulid::from_bytes([1; 16]),
+        Ulid::from_bytes([2; 16]),
+        transfer(),
+    );
     FetchImportsOperation::new(range, node(1), node(2), jobs)
 }
 

@@ -205,14 +205,14 @@ fn state_of(result: IoResult) -> DeviceSyncState {
 
 /// The device's sync state.
 #[derive(Debug, Default, PartialEq)]
-pub struct ReadSyncStateOperation;
+pub struct SyncStateOperation;
 
-/// The read of the sync state; see [`ReadSyncStateOperation`].
-pub fn read_sync_state() -> ReadSyncStateOperation {
-    ReadSyncStateOperation
+/// The read of the sync state; see [`SyncStateOperation`].
+pub fn read_sync_state() -> SyncStateOperation {
+    SyncStateOperation
 }
 
-impl Operation for ReadSyncStateOperation {
+impl Operation for SyncStateOperation {
     type Output = DeviceSyncState;
     type Error = IoError;
 
@@ -244,7 +244,9 @@ impl Operation for PublishEntriesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<PublishEntry>>, IoError> {
-        let rows = result.child::<Vec<Value>, ScanRowsError>()?.unwrap_or_default();
+        let rows = result
+            .child::<Vec<Value>, ScanRowsError>()?
+            .unwrap_or_default();
         Ok(Next::Done(
             (rows.iter())
                 .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok())
@@ -393,7 +395,9 @@ impl Operation for SyncStatusOperation {
                 self.next_folder()
             }
             ViewStep::Bases => {
-                let bases = result.child::<Vec<SyncBase>, FolderError>()?.unwrap_or_default();
+                let bases = result
+                    .child::<Vec<SyncBase>, FolderError>()?
+                    .unwrap_or_default();
                 let folder = self.current.take().ok_or(IoError::Unfinished)?;
                 let pending = (self.uploads.get(&folder.folder_id).copied()).unwrap_or_default();
                 self.datasets.push(dataset_row(&folder, &bases, pending));
@@ -417,7 +421,7 @@ enum RunStep {
 /// Starts one sync pass: drain the publish queue, drain the upload outbox, refresh every
 /// selected replica. Idempotent while a pass is still in flight.
 #[derive(Debug, PartialEq)]
-pub struct StartSyncRunOperation {
+pub struct SyncRunOperation {
     now_ms: u64,
     step: RunStep,
     state: DeviceSyncState,
@@ -425,9 +429,9 @@ pub struct StartSyncRunOperation {
     timers: VecDeque<TaskKey>,
 }
 
-/// The start of one sync pass; see [`StartSyncRunOperation`].
-pub fn start_sync_run() -> StartSyncRunOperation {
-    StartSyncRunOperation {
+/// The start of one sync pass; see [`SyncRunOperation`].
+pub fn start_sync_run() -> SyncRunOperation {
+    SyncRunOperation {
         now_ms: unix_timestamp_millis(),
         step: RunStep::State,
         state: DeviceSyncState::default(),
@@ -441,7 +445,7 @@ pub fn start_sync_run() -> StartSyncRunOperation {
     }
 }
 
-impl StartSyncRunOperation {
+impl SyncRunOperation {
     fn next_claim(&mut self) -> Result<Next<bool>, IoError> {
         if let Some((entry, state)) = self.failed.pop_front() {
             self.step = RunStep::Claim;
@@ -477,7 +481,7 @@ impl StartSyncRunOperation {
     }
 }
 
-impl Operation for StartSyncRunOperation {
+impl Operation for SyncRunOperation {
     type Output = bool;
     type Error = IoError;
 
@@ -534,14 +538,14 @@ impl Operation for StartSyncRunOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use std::sync::Arc;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
     use crate::device::sync_note::{NoteSyncOperation, SyncNote};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
+    use std::sync::Arc;
 
     fn replica(state: ReplicaState) -> ReplicaRecord {
         let mut replica = ReplicaRecord::new(
@@ -731,11 +735,26 @@ mod tests {
         let now = unix_timestamp_millis();
         let note = |note| crate::driver::drive(NoteSyncOperation::new(note, now), &context);
         note(SyncNote::Contact).await.unwrap();
-        assert!(drive(read_sync_state(), &context).await.unwrap().realm_reachable(now));
+        assert!(
+            drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
         note(SyncNote::Failure).await.unwrap();
-        assert!(!drive(read_sync_state(), &context).await.unwrap().realm_reachable(now));
+        assert!(
+            !drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
         note(SyncNote::Contact).await.unwrap();
-        assert!(drive(read_sync_state(), &context).await.unwrap().realm_reachable(now));
+        assert!(
+            drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
     }
 
     #[tokio::test]

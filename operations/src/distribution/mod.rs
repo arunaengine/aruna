@@ -16,8 +16,8 @@ mod fence_row;
 pub mod forward;
 pub mod guard;
 pub mod handoff;
-pub mod here;
 pub mod held;
+pub mod here;
 pub(crate) mod import_start;
 pub(crate) mod imports;
 #[cfg(test)]

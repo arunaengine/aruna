@@ -400,7 +400,11 @@ impl SetScope {
             statement,
         };
         let ids = Some((self.local, self.realm_id));
-        IoCall::child(StateOperation::new(ids, self.snapshot.root.publisher, claim))
+        IoCall::child(StateOperation::new(
+            ids,
+            self.snapshot.root.publisher,
+            claim,
+        ))
     }
 
     /// An unreachable publisher keeps the fence; the statement is sent again next pass.
@@ -571,9 +575,7 @@ impl SetWorkOperation {
         let scope = self.scope.clone().ok_or(IoError::Unfinished)?;
         Ok(Next::Call(match part {
             Part::Leave => IoCall::child(LeaveOperation::new(scope, self.budget)),
-            Part::HandOver(open) => {
-                IoCall::child(HandOverOperation::new(scope, open, self.budget))
-            }
+            Part::HandOver(open) => IoCall::child(HandOverOperation::new(scope, open, self.budget)),
             Part::TakeOver(open) => {
                 let sweep = self.sweeps.get(&open.transfer_id).cloned();
                 IoCall::child(TakeOverOperation::new(scope, open, self.budget, sweep))
@@ -998,7 +1000,10 @@ impl HandOverOperation {
             true => None,
             false => Some(postcard::to_allocvec(&jobs).map_err(failed)?),
         };
-        if import_cursor.as_ref().is_some_and(|jobs| jobs.len() > MAX_CURSOR_BYTES) {
+        if import_cursor
+            .as_ref()
+            .is_some_and(|jobs| jobs.len() > MAX_CURSOR_BYTES)
+        {
             return self.waiting();
         }
         let range = self.range()?;
@@ -1044,8 +1049,7 @@ impl Operation for HandOverOperation {
                 // Where each open import stands is kept before the fence, for the new
                 // coordinator.
                 if fenced.is_none_or(|fenced| fenced.transfer_id != self.open.transfer_id) {
-                    let keep =
-                        KeepResumeOperation::new(self.scope.bucket(), self.open.transfer_id);
+                    let keep = KeepResumeOperation::new(self.scope.bucket(), self.open.transfer_id);
                     self.step = HandStep::Keep;
                     return Ok(Next::Call(IoCall::child(keep)));
                 }
@@ -1072,7 +1076,8 @@ impl Operation for HandOverOperation {
             HandStep::Owes => match result.child::<bool, RecordError>()?.map_err(failed)? {
                 true => self.waiting(),
                 false => {
-                    let read = RangeCountersOperation::new(self.scope.set_id, self.range()?.range_id);
+                    let read =
+                        RangeCountersOperation::new(self.scope.set_id, self.range()?.range_id);
                     self.step = HandStep::Counters;
                     Ok(Next::Call(IoCall::child(read)))
                 }
@@ -1241,7 +1246,9 @@ impl Operation for TakeOverOperation {
 
     fn next(&mut self, result: IoResult) -> Working {
         match self.step {
-            TakeStep::Counters => self.counted(result.child::<Option<RangeCounters>, PurgeError>()??),
+            TakeStep::Counters => {
+                self.counted(result.child::<Option<RangeCounters>, PurgeError>()??)
+            }
             TakeStep::Roots => {
                 let outcome = result.child::<RootsOutcome, RootsError>()?;
                 self.checked(outcome.map_err(failed)?)
@@ -1570,9 +1577,9 @@ impl Operation for UnbindOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use std::sync::Arc;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use std::sync::Arc;
 
     #[test]
     fn unadmitted_bucket_deleted() {

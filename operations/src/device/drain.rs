@@ -385,7 +385,11 @@ async fn publish_edit(
 
 /// Records that the realm has seen one of this replica's edits.
 async fn settle_edit(context: &Arc<DriverContext>, document_id: Ulid) {
-    let Some(mut replica) = drive(read_replica(document_id), context).await.ok().flatten() else {
+    let Some(mut replica) = drive(read_replica(document_id), context)
+        .await
+        .ok()
+        .flatten()
+    else {
         return;
     };
     replica.pending_edits = replica.pending_edits.saturating_sub(1);

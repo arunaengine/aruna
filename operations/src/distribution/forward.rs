@@ -146,12 +146,11 @@ impl Operation for PeerCallerOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, MemberRefusal> {
         let Some(auth) = self.auth.take() else {
-            let auth = (result.child::<AuthContext, PeerAuthRefusal>()?).map_err(|error| {
-                match error {
+            let auth =
+                (result.child::<AuthContext, PeerAuthRefusal>()?).map_err(|error| match error {
                     PeerAuthRefusal::Unauthorized => SyncRefusal::Unauthorized,
                     PeerAuthRefusal::Unavailable(_) => SyncRefusal::Unavailable,
-                }
-            })?;
+                })?;
             let read = realm_config(auth.realm_id);
             self.auth = Some(auth);
             return Ok(Next::Call(read));
@@ -375,9 +374,7 @@ impl Operation for ServePublishOperation {
                 Some(config) if is_sync_eligible(&config, self.peer) => self.publish(),
                 Some(_) => accepted(Err(PublishRefusal::Unauthorized)),
             },
-            ServeStep::Publish => {
-                accepted(result.child::<DistributionRevision, PublishRefusal>()?)
-            }
+            ServeStep::Publish => accepted(result.child::<DistributionRevision, PublishRefusal>()?),
         }
     }
 }
@@ -443,7 +440,9 @@ impl Operation for ServeAdmissionOperation {
     fn next(&mut self, result: IoResult) -> Served {
         let Some((snapshot, member_id, sizes)) = self.admission.take() else {
             let admitted = result.child::<SignedStatement, MemberRefusal>()?;
-            return Ok(Next::Done(self.answer(admitted.map_err(|refused| refused.0))));
+            return Ok(Next::Done(
+                self.answer(admitted.map_err(|refused| refused.0)),
+            ));
         };
         match result.child::<AuthContext, MemberRefusal>()? {
             Ok(auth) => {
@@ -619,11 +618,8 @@ impl AdmitMemberOperation {
         // A member never admitted holds nothing, so its bucket goes and a new create may use
         // the name.
         let snapshot = &self.signed.snapshot;
-        let remove = RemoveMemberOperation::new(
-            &snapshot.config.bucket,
-            snapshot.set_id(),
-            self.member_id,
-        );
+        let remove =
+            RemoveMemberOperation::new(&snapshot.config.bucket, snapshot.set_id(), self.member_id);
         self.refused = Some(refusal);
         self.step = AdmitStep::Remove;
         Ok(Next::Call(IoCall::child(remove)))
@@ -639,8 +635,7 @@ impl Operation for AdmitMemberOperation {
         if self.auth.realm_id != realm_id {
             return Err(SyncRefusal::Unauthorized.into());
         }
-        (self.signed.verify(realm_id))
-            .map_err(|error| SyncRefusal::Invalid(error.to_string()))?;
+        (self.signed.verify(realm_id)).map_err(|error| SyncRefusal::Invalid(error.to_string()))?;
         Ok(Next::Call(realm_config(realm_id)))
     }
 

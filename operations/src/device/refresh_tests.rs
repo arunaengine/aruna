@@ -24,7 +24,12 @@ fn owner() -> UserId {
 
 fn replica() -> ReplicaRecord {
     let (document_id, group_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([1; 16]));
-    ReplicaRecord::new(document_id, group_id, "notes".to_string(), ReplicaOrigin::Realm)
+    ReplicaRecord::new(
+        document_id,
+        group_id,
+        "notes".to_string(),
+        ReplicaOrigin::Realm,
+    )
 }
 
 fn config() -> RealmConfigDocument {
@@ -74,7 +79,10 @@ fn asks_peer(next: &Refreshing) -> bool {
 fn plan_needs_owner() {
     let ids = Some((node(1), realm()));
     assert_eq!(RefreshPlan::of(ids, Some(config())), Some(plan()));
-    assert_eq!(RefreshPlan::of(Some((node(3), realm())), Some(config())), None);
+    assert_eq!(
+        RefreshPlan::of(Some((node(3), realm())), Some(config())),
+        None
+    );
     assert_eq!(RefreshPlan::of(ids, None), None);
     assert_eq!(RefreshPlan::of(None, Some(config())), None);
 }

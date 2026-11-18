@@ -184,7 +184,7 @@ fn pages_until_budget() {
 
 // A stale page and a lost commit read the cursor again until the budget runs out.
 #[test]
-fn conflicts_restart_then_pause() {
+fn conflicts_restart_pause() {
     let read = Ok(Next::Call(read_cursor(&config(1))));
     let mut run = at_page(1);
     assert_eq!(run.next(page_end(Ok(PageEnd::Stale))), read);
@@ -225,10 +225,7 @@ fn page_merges_sample() {
         rows: Vec::new(),
         next: None,
     };
-    let count = read_row(
-        RANGE_COUNTER_KEYSPACE,
-        sample_count_key(set(), range_id()),
-    );
+    let count = read_row(RANGE_COUNTER_KEYSPACE, sample_count_key(set(), range_id()));
     assert_eq!(page.next(sampled), Ok(Next::Call(count)));
     let counted = RangeCounters {
         sampled: 2,

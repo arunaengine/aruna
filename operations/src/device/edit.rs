@@ -318,7 +318,10 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         return 0;
     };
     let mut replayed = 0usize;
-    for entry in drive(read_publish_entries(), context).await.unwrap_or_default() {
+    for entry in drive(read_publish_entries(), context)
+        .await
+        .unwrap_or_default()
+    {
         let PublishKind::Edit { batch, .. } = &entry.kind else {
             continue;
         };
@@ -362,8 +365,8 @@ mod tests {
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
-    use crate::driver::drive;
     use crate::driver::DriverContext;
+    use crate::driver::drive;
     use crate::metadata::MetadataHandle;
     use crate::tests::device::record;
     use aruna_core::UserId;
@@ -537,7 +540,11 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(drive(crate::device::replica_store::store_replica(&read), &context).await.is_ok());
+        assert!(
+            drive(crate::device::replica_store::store_replica(&read), &context)
+                .await
+                .is_ok()
+        );
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,
@@ -554,12 +561,16 @@ mod tests {
 
         assert!(update(Some(false)).await.is_err());
         assert!(
-            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
+            drive(crate::device::sync_status::read_publish_entries(), &context)
+                .await
+                .unwrap_or_default()
                 .is_empty()
         );
         update(None).await.expect("a plain edit queues locally");
         assert_eq!(
-            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
+            drive(crate::device::sync_status::read_publish_entries(), &context)
+                .await
+                .unwrap_or_default()
                 .len(),
             1
         );
@@ -583,7 +594,9 @@ mod tests {
             .expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
-            drive(crate::device::sync_status::read_publish_entries(), &context).await.unwrap_or_default()
+            drive(crate::device::sync_status::read_publish_entries(), &context)
+                .await
+                .unwrap_or_default()
                 .into_iter()
                 .filter_map(|entry| match entry.kind {
                     PublishKind::Edit { batch, .. } => Some(*batch),

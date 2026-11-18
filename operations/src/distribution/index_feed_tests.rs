@@ -14,9 +14,7 @@ use crate::distribution::test_store::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_index::{KeyChange, KeyQuery, MetaTerms};
-use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE};
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::inventory::HeadEntry;
 use aruna_core::structs::storage::distribution::inventory::head_position;

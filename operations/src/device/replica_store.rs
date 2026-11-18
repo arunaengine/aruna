@@ -31,14 +31,17 @@ impl Operation for ReadReplicaOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<Option<ReplicaRecord>>, IoError> {
-        let read = read_row(DEVICE_REPLICA_KEYSPACE, replica_key(self.document_id).to_vec());
+        let read = read_row(
+            DEVICE_REPLICA_KEYSPACE,
+            replica_key(self.document_id).to_vec(),
+        );
         Ok(Next::Call(StagedCall::Outside(read).into_call()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<ReplicaRecord>>, IoError> {
         let stored = outside_answer(result).and_then(|read| read.value());
-        let replica = (stored.ok().flatten())
-            .and_then(|value| ReplicaRecord::from_bytes(&value).ok());
+        let replica =
+            (stored.ok().flatten()).and_then(|value| ReplicaRecord::from_bytes(&value).ok());
         Ok(Next::Done(replica))
     }
 }
@@ -91,7 +94,10 @@ impl Operation for DeleteReplicaOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
-        let row = (DEVICE_REPLICA_KEYSPACE.to_string(), replica_key(self.document_id));
+        let row = (
+            DEVICE_REPLICA_KEYSPACE.to_string(),
+            replica_key(self.document_id),
+        );
         Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 
@@ -119,8 +125,8 @@ mod tests {
     use super::*;
     use crate::device::replica::{ReplicaOrigin, replica_key, replica_size};
     use crate::driver::drive;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
 
     // A graph stays counted after its replica row goes: nothing removes it locally yet.
@@ -147,13 +153,22 @@ mod tests {
             drive(cache_usage(), &context).await,
             Ok(replica_size(&held) + 4_000)
         );
-        assert!(drive(delete_replica(held.document_id), &context).await.is_ok());
+        assert!(
+            drive(delete_replica(held.document_id), &context)
+                .await
+                .is_ok()
+        );
         assert_eq!(drive(cache_usage(), &context).await, Ok(4_000));
     }
 
     fn replica() -> ReplicaRecord {
         let (document_id, group_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([1; 16]));
-        ReplicaRecord::new(document_id, group_id, "notes".to_string(), ReplicaOrigin::Realm)
+        ReplicaRecord::new(
+            document_id,
+            group_id,
+            "notes".to_string(),
+            ReplicaOrigin::Realm,
+        )
     }
 
     // A row that cannot be read or decoded counts as a document this device does not hold.
@@ -179,7 +194,10 @@ mod tests {
         assert_eq!(store.first(), Ok(Next::Call(IoCall::Write(vec![row]))));
         assert_eq!(store.next(IoResult::Done), Ok(Next::Done(())));
         let mut delete = delete_replica(held.document_id);
-        let row = (DEVICE_REPLICA_KEYSPACE.to_string(), replica_key(held.document_id));
+        let row = (
+            DEVICE_REPLICA_KEYSPACE.to_string(),
+            replica_key(held.document_id),
+        );
         assert_eq!(delete.first(), Ok(Next::Call(IoCall::Delete(vec![row]))));
         assert_eq!(delete.next(IoResult::Done), Ok(Next::Done(())));
     }

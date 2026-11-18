@@ -99,15 +99,15 @@ fn folder_uploads(folder_id: Ulid) -> FolderRowsOperation<SyncUpload> {
 
 /// One row that must decode; absent or unreadable it is not found.
 #[derive(Debug, PartialEq)]
-pub struct ReadFolderRowOperation<T> {
+pub struct FolderRowOperation<T> {
     space: &'static str,
     key: Key,
     row: PhantomData<T>,
 }
 
 /// One bound folder.
-pub fn read_bound(folder_id: Ulid) -> ReadFolderRowOperation<SyncedFolder> {
-    ReadFolderRowOperation {
+pub fn read_bound(folder_id: Ulid) -> FolderRowOperation<SyncedFolder> {
+    FolderRowOperation {
         space: SYNCED_FOLDER_KEYSPACE,
         key: folder_key(folder_id),
         row: PhantomData,
@@ -115,15 +115,15 @@ pub fn read_bound(folder_id: Ulid) -> ReadFolderRowOperation<SyncedFolder> {
 }
 
 /// One entry of a folder.
-pub fn read_entry(folder_id: Ulid, relative: &str) -> ReadFolderRowOperation<SyncBase> {
-    ReadFolderRowOperation {
+pub fn read_entry(folder_id: Ulid, relative: &str) -> FolderRowOperation<SyncBase> {
+    FolderRowOperation {
         space: SYNC_BASE_KEYSPACE,
         key: base_key(folder_id, relative),
         row: PhantomData,
     }
 }
 
-impl<T: FolderRow> Operation for ReadFolderRowOperation<T> {
+impl<T: FolderRow> Operation for FolderRowOperation<T> {
     type Output = T;
     type Error = FolderError;
 

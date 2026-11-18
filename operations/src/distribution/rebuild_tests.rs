@@ -221,7 +221,10 @@ fn begins_active_rebuilds() {
 fn begins_nothing_empty() {
     let mut begin = BeginRebuildsOperation::new(8, (2, 64));
     begin.first().unwrap();
-    assert_eq!(begin.next(accounts_page(Vec::new(), false)), Ok(Next::Done(0)));
+    assert_eq!(
+        begin.next(accounts_page(Vec::new(), false)),
+        Ok(Next::Done(0))
+    );
 
     let mut begin = BeginRebuildsOperation::new(8, (2, 64));
     begin.first().unwrap();
@@ -257,7 +260,7 @@ fn begin_step_advances() {
 
 // A stale step and a lost commit read the account again until the budget runs out.
 #[test]
-fn conflicts_restart_then_pause() {
+fn conflicts_restart_pause() {
     let mut run = RebuildOperation::new(config(2, 1));
     run.first().unwrap();
     run.next(account_value(&fresh())).unwrap();

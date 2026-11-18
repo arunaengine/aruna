@@ -12,12 +12,12 @@ use aruna_core::structs::storage::distribution::{
 };
 use ulid::Ulid;
 
+pub use super::route_query::RouteOperation;
 use super::route_query::{
     Bound, Decide, Interval, coordinator_of, copied_interval, fence_row, held_view, interval,
     listed_interval, listed_tags, new_tag, range_coordinated, range_holders, range_kept,
     range_readers, read_route, record_read, upload_held, write_route,
 };
-pub use super::route_query::RouteOperation;
 use crate::distribution::guard::authority_reads;
 
 /// A question of one bound set, answered with `T`.

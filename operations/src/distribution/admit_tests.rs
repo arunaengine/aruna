@@ -507,10 +507,8 @@ async fn concurrent_admissions_conflict() {
 fn first_read(config: &AdmitConfig, member: Ulid) -> IoResult {
     let creation = 42u128.to_be_bytes().to_vec();
     let info = bound_info(set_id(), member, 42);
-    let mut values: Vec<Option<Value>> = vec![
-        Some(info.to_bytes().unwrap().into()),
-        Some(creation.into()),
-    ];
+    let mut values: Vec<Option<Value>> =
+        vec![Some(info.to_bytes().unwrap().into()), Some(creation.into())];
     values.extend(config.ranges.iter().map(|_| None));
     values.push(None);
     IoResult::Values(values)

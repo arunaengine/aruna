@@ -464,7 +464,11 @@ pub struct AddProgressOperation {
 
 impl AddProgressOperation {
     /// `has_indexes` tells whether this node runs range indexes at all.
-    pub(super) fn new(status: DistributionStatus, local: Option<NodeId>, has_indexes: bool) -> Self {
+    pub(super) fn new(
+        status: DistributionStatus,
+        local: Option<NodeId>,
+        has_indexes: bool,
+    ) -> Self {
         Self {
             status,
             local,
@@ -508,7 +512,8 @@ impl AddProgressOperation {
         };
         self.status.copies_counted = counted;
         for (index, range) in self.status.ranges.iter_mut().enumerate() {
-            let Some(config) = (snapshot.config.ranges.iter()).find(|r| r.range_id == range.range_id)
+            let Some(config) =
+                (snapshot.config.ranges.iter()).find(|r| r.range_id == range.range_id)
             else {
                 continue;
             };
@@ -521,10 +526,8 @@ impl AddProgressOperation {
                 })
                 .collect();
             if range.coordinator == member_id {
-                self.fills.extend((0..range.fills.len()).map(|fill| FillSlot {
-                    range: index,
-                    fill,
-                }));
+                self.fills
+                    .extend((0..range.fills.len()).map(|fill| FillSlot { range: index, fill }));
             }
         }
         self.next_fill()

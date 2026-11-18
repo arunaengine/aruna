@@ -113,7 +113,10 @@ fn pages_past_future() {
     let next = drain.next(page(&[99], Some(99))).unwrap();
     assert!(matches!(next, Next::Call(IoCall::Child(_))));
     assert_eq!(drain.next, None);
-    assert_eq!(drain.next(page(&[], None)), Ok(Next::Done(DrainOutcome::Idle)));
+    assert_eq!(
+        drain.next(page(&[], None)),
+        Ok(Next::Done(DrainOutcome::Idle))
+    );
 }
 
 // A page that cannot be read defers the pass, whatever earlier pages forwarded.

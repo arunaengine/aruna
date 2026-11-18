@@ -347,8 +347,8 @@ impl Operation for ForwardUploadOperation {
         match self.step {
             UploadStep::Folder => {
                 let stored = outside_answer(result).and_then(|read| read.value());
-                let folder = (stored.ok().flatten())
-                    .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
+                let folder =
+                    (stored.ok().flatten()).and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
                 self.foldered(folder)
             }
             UploadStep::Drop => {
@@ -464,10 +464,10 @@ impl Operation for SettleUploadOperation {
         match self.step {
             SettleStep::Rows => {
                 let mut rows = result.values()?.into_iter();
-                let current = (rows.next().flatten())
-                    .and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
-                let held = (rows.next().flatten())
-                    .and_then(|bytes| SyncUpload::from_bytes(&bytes).ok());
+                let current =
+                    (rows.next().flatten()).and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
+                let held =
+                    (rows.next().flatten()).and_then(|bytes| SyncUpload::from_bytes(&bytes).ok());
                 let base = settled_base(&self.upload, &self.ack, current);
                 let (folder_id, relative) = (self.upload.folder_id, &self.upload.relative);
                 let row = base_entry(folder_id, relative, &base).map_err(|_| {
@@ -869,10 +869,7 @@ mod tests {
         };
         store(&context, &newer).await;
 
-        assert_eq!(
-            forward(&context, entry).await,
-            ForwardOutcome::Settled
-        );
+        assert_eq!(forward(&context, entry).await, ForwardOutcome::Settled);
         assert_eq!(stored(&context, &newer).await.state, newer.state);
     }
 

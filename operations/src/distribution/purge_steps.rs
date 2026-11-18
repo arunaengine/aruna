@@ -1220,9 +1220,8 @@ enum ClearState {
 type ClearNext = Result<Next<(Purged, usize)>, PurgeError>;
 
 /// Deletes what this node keeps of a set besides its bucket, at most `pages` pages per run from
-/// a durable cursor, and outputs what is left of the budget; the fence row stays with
-/// `keep_fence`. Once `bucket` is bound to the set by another binding than `clearing`, the rows
-/// are that member's and the clear ends.
+/// a durable cursor; the fence row stays with `keep_fence`. Once another binding than `clearing`
+/// holds `bucket`, the rows are that member's and the clear ends.
 #[derive(Debug, PartialEq)]
 pub(super) struct ClearSetOperation {
     set_id: Ulid,

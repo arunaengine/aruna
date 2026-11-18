@@ -6,10 +6,10 @@
 use std::sync::OnceLock;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::rows::{done, read_row};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
@@ -389,7 +389,10 @@ impl Operation for CacheUsageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, ReplicaScanError> {
         let Some(counted) = self.graphs else {
             return Ok(match self.replicas.next(result)? {
-                Next::Done(replicas) | Next::Then { output: replicas, .. } => {
+                Next::Done(replicas)
+                | Next::Then {
+                    output: replicas, ..
+                } => {
                     self.graphs = Some(replicas.iter().map(replica_size).sum());
                     Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, None))
                 }

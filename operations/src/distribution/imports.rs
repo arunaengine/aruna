@@ -218,7 +218,9 @@ impl KeepResumeOperation {
         };
         self.current = Some((job_id, spec));
         self.step = KeepStep::Checkpoint;
-        Ok(Next::Call(IoCall::child(ReadCheckpointOperation::new(job_id))))
+        Ok(Next::Call(IoCall::child(ReadCheckpointOperation::new(
+            job_id,
+        ))))
     }
 }
 
@@ -402,8 +404,8 @@ impl Operation for StagingSpecOperation {
         match self.step {
             SpecStep::Resume => {
                 let stored = value(result)?.ok_or(MetadataReadError::NotFound)?;
-                let job: FencedJob = postcard::from_bytes(&stored)
-                    .map_err(|_| MetadataReadError::Unavailable)?;
+                let job: FencedJob =
+                    postcard::from_bytes(&stored).map_err(|_| MetadataReadError::Unavailable)?;
                 let bucket = GetBucketOperation::new(job.spec.bucket.clone());
                 self.job = Some(job);
                 self.step = SpecStep::Bucket;
@@ -499,7 +501,11 @@ impl FetchImportsOperation {
     }
 
     fn job(&mut self) -> Result<JobId, IoError> {
-        self.kept()?.pending.first().copied().ok_or(IoError::Unfinished)
+        self.kept()?
+            .pending
+            .first()
+            .copied()
+            .ok_or(IoError::Unfinished)
     }
 
     /// Asks for the next pending job, or writes what is kept once none is left.

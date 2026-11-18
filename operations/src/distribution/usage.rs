@@ -22,7 +22,6 @@ mod tests {
     };
     use crate::driver::{DriverContext, drive};
     use crate::replication::members::BoundRecordOperation;
-    use std::collections::BTreeMap;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
@@ -30,12 +29,13 @@ mod tests {
     };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionSnapshot;
     use aruna_core::structs::storage::distribution::accounting::{
         Charge, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
     };
-    use aruna_core::structs::storage::distribution::DistributionSnapshot;
     use aruna_core::structs::storage::usage::UsageCounters;
     use aruna_core::types::{GroupId, Value};
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
     /// What this member holds of `bucket`'s set as copies: every range with an account here, one
@@ -197,7 +197,10 @@ mod tests {
             txn_id: None,
         };
         handle.send_storage_effect(write).await;
-        let (_, _, held) = drive(held_ranges("spire"), &context).await.unwrap().unwrap();
+        let (_, _, held) = drive(held_ranges("spire"), &context)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(held.len(), 1, "member 1 holds the lower shard only");
         assert_eq!(sum_held(&held).unwrap().objects, 4);
         assert!(held[0].complete);

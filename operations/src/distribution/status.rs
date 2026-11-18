@@ -9,9 +9,9 @@ use ulid::Ulid;
 pub use super::here::node_reach;
 use super::here::{heard, here};
 pub use super::status_view::{
-    AddProgressOperation, CopyStatus, DeletionStatus, DistributionStatus, FillProgress,
-    FillStatus, LifecycleStatus, MemberStatus, RangeStatus, Reach, ReadStatusOperation,
-    ReadViewOperation, StatusError, TransferStatus, heartbeat_reach, summarize,
+    AddProgressOperation, CopyStatus, DeletionStatus, DistributionStatus, FillProgress, FillStatus,
+    LifecycleStatus, MemberStatus, RangeStatus, Reach, ReadStatusOperation, ReadViewOperation,
+    StatusError, TransferStatus, heartbeat_reach, summarize,
 };
 use crate::driver::DriverContext;
 

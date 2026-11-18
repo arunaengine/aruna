@@ -256,7 +256,12 @@ pub fn transfer_range(
     set_id: Ulid,
     (range_id, to, role): (Ulid, Ulid, TransferRole),
 ) -> ChangeOperation<DistributionRevision> {
-    change(context, caller, set_id, Change::Transfer(range_id, to, role))
+    change(
+        context,
+        caller,
+        set_id,
+        Change::Transfer(range_id, to, role),
+    )
 }
 
 /// Adds a copy of one range on a ready `copy` member, then admits the member again under the

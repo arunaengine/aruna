@@ -271,9 +271,8 @@ enum AdmitStep {
 }
 
 /// Admits unadmitted members against `sizes`, where a range no admitted member holds is empty,
-/// and activates the set once all are in; a failure keeps it pending, a capacity refusal drops
-/// the empty bucket. A member with a new copy is admitted again; `accepted` must be reached
-/// first.
+/// and activates the set once all are in; a failure keeps it pending. A member with a new copy
+/// is admitted again, once this node's record reached `accepted`.
 #[derive(Debug, PartialEq)]
 pub struct AdmitPendingOperation {
     here: Here,
@@ -331,7 +330,10 @@ impl AdmitPendingOperation {
     }
 
     fn local(&self) -> Result<NodeId, CreateError> {
-        self.here.ids.map(|(local, _)| local).ok_or_else(no_transport)
+        self.here
+            .ids
+            .map(|(local, _)| local)
+            .ok_or_else(no_transport)
     }
 
     fn read_view(&mut self) -> Admitting {
@@ -438,15 +440,16 @@ impl AdmitPendingOperation {
     }
 
     /// The statement of the member just asked, from its node or from this one.
-    fn statement(&mut self, result: IoResult) -> Result<Result<SignedStatement, SyncRefusal>, IoError> {
+    fn statement(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Result<SignedStatement, SyncRefusal>, IoError> {
         let Some(node_id) = self.asked.take() else {
             let admitted = result.child::<SignedStatement, MemberRefusal>()?;
             return Ok(admitted.map_err(|refused| refused.0));
         };
         Ok(match peer_answer(result)? {
-            Ok(MetadataTransportMessage::AdmittedMember { result }) => {
-                result.map(|signed| *signed)
-            }
+            Ok(MetadataTransportMessage::AdmittedMember { result }) => result.map(|signed| *signed),
             Ok(_) => Err(SyncRefusal::Invalid(
                 "unexpected admission answer".to_string(),
             )),
@@ -481,7 +484,9 @@ impl AdmitPendingOperation {
         let snapshot = self.snapshot()?;
         let required = (snapshot.config.ranges.iter())
             .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas));
-        let all_in = required.into_iter().all(|member| self.admitted.contains(member));
+        let all_in = required
+            .into_iter()
+            .all(|member| self.admitted.contains(member));
         if snapshot.phase == SetPhase::Active || !all_in {
             let active = snapshot.phase == SetPhase::Active;
             return Ok(self.report(active, None));
@@ -540,12 +545,12 @@ impl Operation for AdmitPendingOperation {
                 self.record(submitted.map_err(|refusal| refusal.to_string()))?;
                 self.admit_next()
             }
-            AdmitStep::Activate => {
-                Ok(match result.child::<DistributionRevision, PublishRefusal>()? {
+            AdmitStep::Activate => Ok(
+                match result.child::<DistributionRevision, PublishRefusal>()? {
                     Ok(_) => self.report(true, None),
                     Err(refusal) => self.report(false, Some(refusal.to_string())),
-                })
-            }
+                },
+            ),
         }
     }
 }

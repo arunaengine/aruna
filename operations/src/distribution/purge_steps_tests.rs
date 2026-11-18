@@ -211,7 +211,7 @@ fn clear_walks_keyspaces() {
 
 // A finished clear drops the fence row too unless it is kept.
 #[test]
-fn finished_clear_drops_fence() {
+fn clear_drops_fence() {
     let mut clear = clear_set(None);
     clear.cursor.step = u8::try_from(CLEARED.len() + 1).unwrap();
     assert!(matches!(clear.turn(), Ok(Next::Call(IoCall::Read(_)))));

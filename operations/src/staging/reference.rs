@@ -1575,7 +1575,7 @@ mod tests {
     // A new head writes its rows one by one, updates usage and wakes the snapshot publisher
     // after the commit.
     #[test]
-    fn new_head_wakes_publisher() {
+    fn head_wakes_publisher() {
         let mut operation = at_head();
         let absent = IoResult::Values(vec![None]);
         assert!(matches!(

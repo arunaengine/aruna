@@ -112,7 +112,10 @@ fn walked(walk: Walk, rebuild: &Rebuild) -> &Cursor {
 /// One page read of `walk`, from its cursor in `account` up to `end`.
 fn walk_read(config: &RebuildConfig, walk: Walk, account: &RangeAccount, end: IterEnd) -> IoCall {
     let (lower, _) = range_interval(config.set_id, &account.lower, account.upper.as_deref());
-    let cursor = account.rebuild.as_ref().map(|rebuild| walked(walk, rebuild));
+    let cursor = account
+        .rebuild
+        .as_ref()
+        .map(|rebuild| walked(walk, rebuild));
     let start = match cursor {
         Some(Cursor::At(position)) => IterStart::After(position.clone().into()),
         _ => IterStart::At(lower.into()),
@@ -155,7 +158,10 @@ enum StepKind {
 #[derive(Clone, Debug, PartialEq)]
 enum StepEnd {
     /// The account moved on; `page` tells whether a page of the budget was spent.
-    Advanced { account: RangeAccount, page: bool },
+    Advanced {
+        account: RangeAccount,
+        page: bool,
+    },
     Finished(RebuildOutcome),
     /// The committed account differs from the one this step was planned against.
     Stale,
@@ -309,8 +315,8 @@ impl RebuildStepOperation {
             (None, false, Some(probe_end)) => Cursor::At(probe_end),
         };
         let mut account = self.account.clone();
-        let rebuild = (account.rebuild.as_mut())
-            .ok_or(self.invalid("the rebuild ended during a page"))?;
+        let rebuild =
+            (account.rebuild.as_mut()).ok_or(self.invalid("the rebuild ended during a page"))?;
         let generation = rebuild.generation;
         match walk {
             Walk::Versions => rebuild.versions = cursor,
@@ -490,9 +496,7 @@ impl Operation for RebuildOperation {
                     self.advance(account)
                 }
                 Ok(StepEnd::Finished(outcome)) => Ok(Next::Done(outcome)),
-                Ok(StepEnd::Stale) | Err(RebuildError::Io(IoError::Conflict)) => {
-                    Ok(self.restart())
-                }
+                Ok(StepEnd::Stale) | Err(RebuildError::Io(IoError::Conflict)) => Ok(self.restart()),
                 Err(error) => Err(error),
             },
         }
@@ -585,14 +589,12 @@ impl Operation for BeginRebuildsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<usize>, BeginRebuildsError> {
         match self.current.take() {
-            Some((set_id, range_id)) => {
-                match result.child::<RebuildOutcome, RebuildError>()? {
-                    Ok(_) => self.begun += 1,
-                    Err(error) => {
-                        warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
-                    }
+            Some((set_id, range_id)) => match result.child::<RebuildOutcome, RebuildError>()? {
+                Ok(_) => self.begun += 1,
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
                 }
-            }
+            },
             None => {
                 let rows = self.pages.take(result)?;
                 self.read_page(rows);

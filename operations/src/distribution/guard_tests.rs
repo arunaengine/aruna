@@ -188,7 +188,9 @@ async fn uploads_follow_authority() {
     store_record(&handle, snapshot.set_id(), bytes).await;
     let own = binding(&snapshot, 1, 5);
     let upload = Ulid::from_bytes([4; 16]);
-    let tag = drive(upload_tag(&own, "a", upload), &context).await.unwrap();
+    let tag = drive(upload_tag(&own, "a", upload), &context)
+        .await
+        .unwrap();
     assert_eq!(tag.range_id, snapshot.config.ranges[0].range_id);
     assert_eq!(drive(upload_route(&own, "a", &tag), &context).await, Ok(()));
     assert!(matches!(
@@ -221,7 +223,10 @@ async fn replicas_take_reads() {
     store_record(&handle, snapshot.set_id(), bytes).await;
     let replica = binding(&snapshot, 2, 5);
     let lower = snapshot.config.ranges[0].range_id;
-    assert_eq!(drive(delegated_read(&replica, lower, "a"), &context).await, Ok(()));
+    assert_eq!(
+        drive(delegated_read(&replica, lower, "a"), &context).await,
+        Ok(())
+    );
     assert!(matches!(
         drive(delegated_range(&replica, lower, "a"), &context).await,
         Err(GuardError::NotCoordinator { .. })
@@ -279,7 +284,10 @@ async fn fenced_coordinator_refuses() {
         Ok(false)
     );
     let upper = Some((snapshot.config.ranges[1].range_id, secret(2).public()));
-    assert_eq!(drive(read_coordinator(&own, "x"), &context).await, Ok(upper));
+    assert_eq!(
+        drive(read_coordinator(&own, "x"), &context).await,
+        Ok(upper)
+    );
 }
 
 // A replica answers reads and listings of a range its coordinator cannot serve.

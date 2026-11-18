@@ -169,7 +169,10 @@ fn outside_read(key_space: &str, key: Vec<u8>) -> IoCall {
 
 /// The row an outside read found; an absent, unreadable row is none.
 fn outside_row(result: IoResult) -> Option<Value> {
-    outside_answer(result).and_then(|read| read.value()).ok().flatten()
+    outside_answer(result)
+        .and_then(|read| read.value())
+        .ok()
+        .flatten()
 }
 
 fn realm_key(realm_id: RealmId) -> Vec<u8> {
@@ -286,11 +289,9 @@ enum FetchStep {
     Membership,
 }
 
-/// Fetches the realm-wide documents and installs them on this device. The budget bounds the
-/// questions to the realm, so a realm nobody answers for costs that much once and the stored
-/// copy keeps serving until the next attempt. The install is deliberately outside the budget:
-/// half of it would leave the device with a configuration and an authorization document from
-/// two ages.
+/// Fetches the realm-wide documents and installs them on this device. The budget bounds only
+/// the questions: a silent realm costs that much once and the stored copy keeps serving, and
+/// half an install would leave documents of two ages.
 #[derive(Debug, PartialEq)]
 pub struct FetchDocumentsOperation {
     ids: NodeRealm,
@@ -447,7 +448,10 @@ impl FetchDocumentsOperation {
             (None, Some(behind)) => {
                 let (rebase, attempts) = rebase_after(plan.marker.behind);
                 if !rebase {
-                    debug!(attempts, "Every realm node answered below this device's marker");
+                    debug!(
+                        attempts,
+                        "Every realm node answered below this device's marker"
+                    );
                     let marker = RealmMarker {
                         clock: plan.marker.clock.clone(),
                         behind: attempts,
@@ -789,7 +793,9 @@ impl InstallDocumentsOperation {
         };
         self.config = Some(config);
         self.step = InstallStep::Documents;
-        Ok(Next::Call(IoCall::child(WriteDocumentsOperation::new(writes))))
+        Ok(Next::Call(IoCall::child(WriteDocumentsOperation::new(
+            writes,
+        ))))
     }
 
     fn document_writes(
@@ -815,8 +821,8 @@ impl InstallDocumentsOperation {
             };
             writes.extend(group_writes);
         }
-        let mut encoded = |key_space: &str, bytes: Result<Vec<u8>, postcard::Error>, what: &str| {
-            match bytes {
+        let mut encoded =
+            |key_space: &str, bytes: Result<Vec<u8>, postcard::Error>, what: &str| match bytes {
                 Ok(bytes) => {
                     let (space, key) = realm_row(key_space, realm_id);
                     writes.push((space, key, Value::from(bytes)));
@@ -826,8 +832,7 @@ impl InstallDocumentsOperation {
                     warn!(what, "Fetched realm documents could not be stored");
                     false
                 }
-            }
-        };
+            };
         let urls = postcard::to_allocvec(&documents.management_urls);
         let places = postcard::to_allocvec(&documents.node_places);
         let names = postcard::to_allocvec(&documents.node_names);
@@ -967,8 +972,7 @@ impl Operation for InstalledGroupsOperation {
             let groups = std::mem::take(&mut self.groups);
             let documents = (groups.into_iter().zip(rows))
                 .filter_map(|(group, row)| {
-                    let authorization =
-                        GroupAuthorizationDocument::from_bytes(&row?).ok()?;
+                    let authorization = GroupAuthorizationDocument::from_bytes(&row?).ok()?;
                     Some(DeviceGroupDocuments {
                         group,
                         authorization,
@@ -991,7 +995,9 @@ impl Operation for InstalledGroupsOperation {
                 })
             })
             .collect();
-        Ok(Next::Call(StagedCall::Outside(IoCall::Read(reads)).into_call()))
+        Ok(Next::Call(
+            StagedCall::Outside(IoCall::Read(reads)).into_call(),
+        ))
     }
 }
 
@@ -1181,7 +1187,9 @@ impl Operation for InstalledDisplaysOperation {
             realm_row(NODE_NAME_KEYSPACE, self.realm_id),
             realm_row(NODE_PLACE_KEYSPACE, self.realm_id),
         ];
-        Ok(Next::Call(StagedCall::Outside(IoCall::Read(reads)).into_call()))
+        Ok(Next::Call(
+            StagedCall::Outside(IoCall::Read(reads)).into_call(),
+        ))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<NodeDisplays>, IoError> {
@@ -1211,7 +1219,9 @@ mod tests {
     }
 
     async fn realm_removed(context: &Arc<DriverContext>, realm_id: RealmId) -> bool {
-        drive(super::realm_removed(realm_id), context).await.unwrap()
+        drive(super::realm_removed(realm_id), context)
+            .await
+            .unwrap()
     }
 
     async fn install_documents(
@@ -1246,15 +1256,16 @@ mod tests {
         row.map(|bytes| bytes.as_ref().to_vec())
     }
 
-    async fn write_batch(
-        context: &Arc<DriverContext>,
-        writes: Vec<(String, Key, Value)>,
-    ) -> bool {
-        drive(WriteDocumentsOperation::new(writes), context).await.is_ok()
+    async fn write_batch(context: &Arc<DriverContext>, writes: Vec<(String, Key, Value)>) -> bool {
+        drive(WriteDocumentsOperation::new(writes), context)
+            .await
+            .is_ok()
     }
 
     async fn installed_displays(context: &Arc<DriverContext>, realm_id: RealmId) -> NodeDisplays {
-        drive(super::installed_displays(realm_id), context).await.unwrap()
+        drive(super::installed_displays(realm_id), context)
+            .await
+            .unwrap()
     }
 
     async fn installed_group_docs(context: &Arc<DriverContext>) -> Vec<DeviceGroupDocuments> {

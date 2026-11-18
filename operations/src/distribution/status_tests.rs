@@ -330,7 +330,9 @@ fn lag_failure_ends() {
     let status = plain_status(&view());
     let mut add = AddProgressOperation::new(status.clone(), local(), false);
     add.first().unwrap();
-    assert!(is_child(add.next(child(Ok::<_, StatusError>(Some(view()))))));
+    assert!(is_child(
+        add.next(child(Ok::<_, StatusError>(Some(view()))))
+    ));
     let failed = Err::<(LagMap, bool), _>(RecordError::NotFinished);
     assert_eq!(add.next(child(failed)), Ok(Next::Done(status)));
 }
@@ -355,7 +357,9 @@ fn adds_copies_fills() {
     status.ranges[1].fills = vec![fill(8)];
     let mut add = AddProgressOperation::new(status, local(), false);
     add.first().unwrap();
-    assert!(is_child(add.next(child(Ok::<_, StatusError>(Some(source))))));
+    assert!(is_child(
+        add.next(child(Ok::<_, StatusError>(Some(source))))
+    ));
     let owed = CopyLag {
         pending: 4,
         oldest_ms: None,
@@ -406,12 +410,17 @@ fn unread_cursor_empty() {
     }];
     let mut add = AddProgressOperation::new(status, local(), false);
     add.first().unwrap();
-    assert!(is_child(add.next(child(Ok::<_, StatusError>(Some(view()))))));
+    assert!(is_child(
+        add.next(child(Ok::<_, StatusError>(Some(view()))))
+    ));
     let lag = Ok::<_, RecordError>((LagMap::new(), false));
     assert!(is_child(add.next(child(lag))));
     let failed = Err::<Option<BootstrapCursor>, _>(BootstrapError::Io(timeout()));
     let Ok(Next::Done(done)) = add.next(child(failed)) else {
         panic!("expected the status");
     };
-    assert_eq!(done.ranges[0].fills[0].progress, Some(FillProgress::default()));
+    assert_eq!(
+        done.ranges[0].fills[0].progress,
+        Some(FillProgress::default())
+    );
 }

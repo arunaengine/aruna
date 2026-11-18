@@ -46,7 +46,10 @@ fn filters_entries() {
     ];
     let next = Some(Key::from(entry_key("b")));
     let listed = list_named.next(page(rows, next.clone()));
-    assert_eq!(listed, Ok(Next::Done((vec![("a".to_string(), synced)], next))));
+    assert_eq!(
+        listed,
+        Ok(Next::Done((vec![("a".to_string(), synced)], next)))
+    );
 }
 
 // Counters add the base rows of every page, then every queued upload.
@@ -68,7 +71,7 @@ fn counts_rows() {
 
 // An absent or unreadable row is not found.
 #[test]
-fn missing_row_not_found() {
+fn missing_row_absent() {
     let mut read = read_entry(folder_id(), "a");
     read.first().unwrap();
     let answer = IoResult::Values(vec![None]);
@@ -78,7 +81,7 @@ fn missing_row_not_found() {
 
 // With no folder bound there are no transfers to look for.
 #[test]
-fn no_folders_no_transfers() {
+fn empty_without_folders() {
     let mut list = list_transfers();
     assert!(matches!(list.first(), Ok(Next::Call(IoCall::Child(_)))));
     let none = Ok::<Vec<SyncedFolder>, FolderError>(Vec::new());

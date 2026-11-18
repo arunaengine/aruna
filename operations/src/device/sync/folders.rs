@@ -40,16 +40,16 @@ use crate::staging::offered_directory::{
     OfferedDirectoryError, WithdrawOfferInput, check_root, read_bucket, withdraw_offer,
 };
 
+pub use super::folder_reads::{
+    folder_counters, list_actions, list_entries, list_folders, list_transfers, read_bound,
+    read_entry,
+};
 use super::repository::{
     MAX_SYNCED_FOLDERS, SyncUpload, folder_bucket, folder_entry, folder_key, key_path, scan_folder,
     scan_folders,
 };
 use super::rows::{
     abort_txn, commit_txn, delete_rows, read_value, scan_page, start_txn, sync_all, write_rows,
-};
-pub use super::folder_reads::{
-    folder_counters, list_actions, list_entries, list_folders, list_transfers, read_bound,
-    read_entry,
 };
 use super::{ReconcileFolderError, request_versions};
 
@@ -274,7 +274,12 @@ pub(crate) async fn finish_binding(
                 }
             })
             .await?;
-            drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
+            drive(
+                ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders),
+                context,
+            )
+            .await
+            .ok();
             Ok(active)
         }
         Err(
@@ -438,7 +443,12 @@ pub async fn request_sync(
     folder: &SyncedFolder,
 ) -> Result<(), FolderError> {
     check_root(context, &folder.root).await?;
-    drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
+    drive(
+        ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders),
+        context,
+    )
+    .await
+    .ok();
     Ok(())
 }
 
@@ -519,7 +529,12 @@ pub async fn unbind_folder(
         })
     })
     .await?;
-    drive(ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders), context).await.ok();
+    drive(
+        ArmTimerOperation::new(TaskKey::ReconcileSyncedFolders),
+        context,
+    )
+    .await
+    .ok();
     Ok(())
 }
 
@@ -1480,7 +1495,9 @@ mod tests {
                 "{target:?}"
             );
             assert_eq!(
-                drive(read_bound(folder_id), &context).await.map(|row| row.state),
+                drive(read_bound(folder_id), &context)
+                    .await
+                    .map(|row| row.state),
                 Ok(FolderState::Deleting)
             );
         }
@@ -1507,7 +1524,9 @@ mod tests {
             reserve_binding(&context, &second)
         );
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
-        let bound = drive(list_folders(), &context).await.expect("the folders list");
+        let bound = drive(list_folders(), &context)
+            .await
+            .expect("the folders list");
         assert_eq!(bound.len(), 1);
         assert_eq!(
             reserve_binding(&context, &first).await,

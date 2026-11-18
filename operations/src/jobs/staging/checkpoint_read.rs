@@ -52,8 +52,8 @@ impl Operation for ReadCheckpointOperation {
             let Some(row) = value(result)? else {
                 return Ok(Next::Done(None));
             };
-            let main = postcard::from_bytes(&row)
-                .map_err(|error| CheckpointError(error.to_string()))?;
+            let main =
+                postcard::from_bytes(&row).map_err(|error| CheckpointError(error.to_string()))?;
             self.main = Some(main);
             return Ok(Next::Call(IoCall::Page {
                 space: STAGING_STATE_KEYSPACE.to_string(),
@@ -107,8 +107,14 @@ mod tests {
         let mut read = ReadCheckpointOperation::new(job());
         read.first().unwrap();
         let main = IoResult::Values(vec![Some(row(&checkpoint(10)))]);
-        assert!(matches!(read.next(main), Ok(Next::Call(IoCall::Page { .. }))));
-        let lane = (Key::from(checkpoint_key(job(), Some(0))), row(&checkpoint(5)));
+        assert!(matches!(
+            read.next(main),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let lane = (
+            Key::from(checkpoint_key(job(), Some(0))),
+            row(&checkpoint(5)),
+        );
         let page = IoResult::Page {
             rows: vec![lane],
             next: None,

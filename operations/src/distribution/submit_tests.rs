@@ -28,7 +28,14 @@ fn statement() -> Statement {
     let (snapshot, _) = record(true);
     let signer = snapshot.member(member(1)).unwrap();
     let range = &snapshot.config.ranges[0];
-    Statement::split(realm(), snapshot.set_id(), signer, snapshot.number, range, "f")
+    Statement::split(
+        realm(),
+        snapshot.set_id(),
+        signer,
+        snapshot.number,
+        range,
+        "f",
+    )
 }
 
 fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -85,7 +92,10 @@ fn wakes_waiting_bootstrap() {
     let mut waiting = publish();
     assert!(matches!(waiting.first(), Ok(Next::Call(IoCall::Child(_)))));
     let done = child(Ok::<_, PublishError>(revision()));
-    assert!(matches!(waiting.next(done), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        waiting.next(done),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let woken = waiting.next(page(1));
     assert_eq!(
         woken,
@@ -102,7 +112,7 @@ fn wakes_waiting_bootstrap() {
 
 // A failed look for waiting sets never undoes the committed change.
 #[test]
-fn failed_look_keeps_revision() {
+fn failed_look_keeps() {
     let mut publish = publish();
     publish.first().unwrap();
     publish
@@ -140,7 +150,10 @@ fn submits_to_publisher() {
     let mut lost = SubmitOperation::new(ids(), node(2), signed);
     lost.first().unwrap();
     let silent = answer(Err(PeerRequestError::TimedOut));
-    assert!(matches!(lost.next(silent), Err(PublishRefusal::Unavailable(_))));
+    assert!(matches!(
+        lost.next(silent),
+        Err(PublishRefusal::Unavailable(_))
+    ));
 }
 
 // A forwarded admin request needs the caller's bearer token.
@@ -161,7 +174,10 @@ fn admin_needs_bearer() {
         DistributionRequest::Activate,
     );
     assert!(matches!(sent.first(), Ok(Next::Call(IoCall::Effect(_)))));
-    assert_eq!(sent.next(accepted(Ok(revision()))), Ok(Next::Done(revision())));
+    assert_eq!(
+        sent.next(accepted(Ok(revision()))),
+        Ok(Next::Done(revision()))
+    );
 }
 
 // Signing failures and refusals are reported, so each caller logs them its own way.
@@ -186,5 +202,8 @@ fn states_signed_claims() {
     assert!(matches!(submit, Ok(Next::Call(IoCall::Child(_)))));
     let refusal = PublishRefusal::Forbidden;
     let refused = child(Err::<(), _>(refusal.clone()));
-    assert_eq!(taken.next(refused), Ok(Next::Done(Stated::Refused(refusal))));
+    assert_eq!(
+        taken.next(refused),
+        Ok(Next::Done(Stated::Refused(refusal)))
+    );
 }

@@ -331,7 +331,9 @@ struct ProbeWalk {
 enum Probe {
     Ask(NodeId),
     /// One group ended; `covered` tells whether a member of it answered.
-    GroupEnd { covered: bool },
+    GroupEnd {
+        covered: bool,
+    },
 }
 
 impl ProbeWalk {

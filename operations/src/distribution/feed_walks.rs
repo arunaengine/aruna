@@ -36,9 +36,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::charged_ranges::{
-    HeldRange, HeldRanges, HeldRangesOperation, UsageError, sum_held,
-};
+use super::charged_ranges::{HeldRange, HeldRanges, HeldRangesOperation, UsageError, sum_held};
 use crate::metadata::call_results::page_rows;
 
 /// The open end of a range in its range index key.
@@ -1421,10 +1419,7 @@ impl Operation for RangeProgressOperation {
         Ok(Next::Call(IoCall::child(held)))
     }
 
-    fn next(
-        &mut self,
-        result: IoResult,
-    ) -> Result<Next<BTreeMap<Ulid, IndexProgress>>, FeedError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<BTreeMap<Ulid, IndexProgress>>, FeedError> {
         match self.step {
             ProgressStep::Held => {
                 let held = result.child::<Option<HeldRanges>, UsageError>()?;
@@ -1436,7 +1431,9 @@ impl Operation for RangeProgressOperation {
                     return Ok(Next::Done(BTreeMap::new()));
                 }
                 self.set_id = binding.set_id;
-                let keys = held.iter().map(|range| state_key(binding.set_id, range.range_id));
+                let keys = held
+                    .iter()
+                    .map(|range| state_key(binding.set_id, range.range_id));
                 let read = batch_read(SEARCH_INDEX_KEYSPACE, keys.collect::<Vec<_>>());
                 self.held = held;
                 self.step = ProgressStep::States;
@@ -1479,7 +1476,12 @@ mod tests {
     }
 
     fn read(values: Vec<Option<Vec<u8>>>) -> IoResult {
-        IoResult::Values(values.into_iter().map(|value| value.map(Value::from)).collect())
+        IoResult::Values(
+            values
+                .into_iter()
+                .map(|value| value.map(Value::from))
+                .collect(),
+        )
     }
 
     fn record_value(searching: bool) -> Option<Vec<u8>> {
@@ -1540,7 +1542,7 @@ mod tests {
 
     // A lost settle commit leaves the rows for the next pass; another failure fails the walk.
     #[test]
-    fn settle_conflict_counts_nothing() {
+    fn settle_conflict_ignored() {
         let settling = || {
             let mut walk = FeedWalk::new(rows(vec![(vec![1], vec![0xFF])]));
             walk.first().unwrap();
@@ -1593,7 +1595,10 @@ mod tests {
         let mut walk = OpenWalk::new(page());
         walk.first().unwrap();
         walk.next(read(vec![None])).unwrap();
-        assert_eq!(walk.next(read(vec![record_value(false)])), Ok(Next::Done(0)));
+        assert_eq!(
+            walk.next(read(vec![record_value(false)])),
+            Ok(Next::Done(0))
+        );
     }
 
     // A state row without a live account loses its index and its row; the walk then moves on.
@@ -1630,7 +1635,7 @@ mod tests {
 
     // A building range writes its cursor and keeps the walk at the row before it.
     #[test]
-    fn build_stays_at_range() {
+    fn build_keeps_range() {
         let (set_id, range_id) = (Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
         let key = state_key(set_id, range_id);
         let building = IndexState::Building {
@@ -1680,7 +1685,7 @@ mod tests {
 
     // An index failure fails a state walk.
     #[test]
-    fn index_failure_fails_walk() {
+    fn index_failure_fails() {
         let key = state_key(Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
         let ready = IndexState::Ready { generation: 2 }.to_bytes().unwrap();
         let page = rows(vec![(key, ready)]);
@@ -1786,12 +1791,19 @@ mod tests {
     fn progress_read() -> (RangeProgressOperation, Ulid) {
         let (snapshot, _) = searched();
         let set_id = snapshot.set_id();
-        let bound = (binding(&snapshot, 1, 5), snapshot, vec![held(1, 7), held(2, 8)]);
+        let bound = (
+            binding(&snapshot, 1, 5),
+            snapshot,
+            vec![held(1, 7), held(2, 8)],
+        );
         let mut read = RangeProgressOperation::new("spire");
         assert!(is_child(read.first()));
         let keys = [1, 2].map(|seed| state_key(set_id, Ulid::from_bytes([seed; 16])));
         let found = read.next(child(Ok::<_, UsageError>(Some(bound))));
-        assert_eq!(found, Ok(Next::Call(batch_read(SEARCH_INDEX_KEYSPACE, keys))));
+        assert_eq!(
+            found,
+            Ok(Next::Call(batch_read(SEARCH_INDEX_KEYSPACE, keys)))
+        );
         (read, set_id)
     }
 
