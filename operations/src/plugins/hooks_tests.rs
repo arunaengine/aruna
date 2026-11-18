@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugin_host::outbound::tests::leaks;
+use crate::plugin_host::connection_tests::leaks;
 use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;

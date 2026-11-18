@@ -24,6 +24,8 @@ mod imports;
 pub mod limits;
 #[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(feature = "runtime")]
+mod supervisor;
 
 #[cfg(feature = "runtime")]
 pub use host::Limit;
@@ -33,5 +35,7 @@ pub use host::wit::aruna::plugin::types::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{CompileError, Compiled, Invocation, InvokeError, Runtime};
+#[cfg(feature = "runtime")]
+pub use supervisor::Supervisor;
 #[cfg(feature = "runtime")]
 pub use tokio_util::sync::CancellationToken;

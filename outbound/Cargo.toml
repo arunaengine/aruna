@@ -13,7 +13,10 @@ rust-version.workspace = true
 [dependencies]
 aruna-core = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }

@@ -3,7 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::injection::OutgoingRequest;
+use aruna_core::operation::Operation;
+use aruna_core::outbound::{
+    ConnectionAnswer, ConnectionCall, ConnectionError, OutboundEffect, OutboundEvent,
+};
 use aruna_core::secrets::header_name;
 use aruna_plugins::broker::{ErrorKind, Field, HostError, Response};
 use aruna_plugins::connection::{Method, relative_path};
@@ -162,6 +169,38 @@ pub(crate) fn stored_whole(reply: &str) -> Result<Response, HostError> {
 
 fn invalid(why: &str) -> HostError {
     HostError::new(ErrorKind::Invalid, why)
+}
+
+/// Sends one request of a plugin connection and answers what the service said.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SendConnection(Option<ConnectionCall>);
+
+impl SendConnection {
+    pub(crate) fn new(request: OutgoingRequest, body: Vec<u8>) -> Self {
+        Self(Some(ConnectionCall { request, body }))
+    }
+}
+
+impl Operation for SendConnection {
+    type Output = ConnectionAnswer;
+    type Error = ConnectionError;
+
+    fn first(&mut self) -> Result<Next<ConnectionAnswer>, ConnectionError> {
+        let call = self.0.take().ok_or(IoError::Unfinished)?;
+        let effect = OutboundEffect::Connection(Box::new(call));
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Outbound(
+            effect,
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ConnectionAnswer>, ConnectionError> {
+        let Event::Outbound(OutboundEvent::ConnectionAnswered { result }) = result.event()? else {
+            let expected = "OutboundEvent::ConnectionAnswered";
+            let got = "another event";
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        Ok(Next::Done(result?))
+    }
 }
 
 #[cfg(test)]

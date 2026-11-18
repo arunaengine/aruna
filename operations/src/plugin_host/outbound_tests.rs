@@ -6,35 +6,50 @@
 use crate::driver::drive;
 use std::sync::{Arc, Mutex};
 
+use aruna_core::egress::EgressPolicy;
+use aruna_core::injection::OutgoingRequest;
+use aruna_core::outbound::{ConnectionAnswer, ConnectionCall, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_core::secrets::ResponseExposure;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_outbound::{ConnectionSender, OutboundHandle};
+use async_trait::async_trait;
 use ulid::Ulid;
 
-use super::*;
-use crate::plugin_host::worker::tests::{connected, install_artifact, worker};
+use crate::driver::DriverContext;
+use crate::plugin_host::worker::tests::{connected, install_artifact, worker_on};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, read_run};
 
 /// Answers every request with `answer` and records what it was asked.
 pub(crate) struct Fake {
-    pub answer: Answer,
+    pub answer: ConnectionAnswer,
     pub asked: Mutex<Vec<(OutgoingRequest, Vec<u8>)>>,
 }
 
 #[async_trait]
-impl Outbound for Fake {
-    async fn send(&self, request: OutgoingRequest, body: Vec<u8>) -> Result<Answer, SendError> {
-        self.asked.lock().unwrap().push((request, body));
+impl ConnectionSender for Fake {
+    async fn send(&self, call: ConnectionCall) -> Result<ConnectionAnswer, ConnectionError> {
+        self.asked.lock().unwrap().push((call.request, call.body));
         Ok(self.answer.clone())
+    }
+}
+
+/// `ctx` with connection requests going to `sender`.
+pub(crate) fn with_sender(ctx: &DriverContext, sender: Arc<dyn ConnectionSender>) -> DriverContext {
+    let (http, policy) = (reqwest::Client::new(), EgressPolicy::loopback());
+    let outbound = OutboundHandle::with_connections(http, policy, sender);
+    DriverContext {
+        outbound_handle: Some(outbound),
+        ..ctx.clone()
     }
 }
 
 pub(crate) fn fake(status: u16, body: &str) -> Arc<Fake> {
     Arc::new(Fake {
-        answer: Answer {
+        answer: ConnectionAnswer {
             status,
             headers: vec![(
                 "location".to_string(),
@@ -50,7 +65,7 @@ pub(crate) fn fake(status: u16, body: &str) -> Arc<Fake> {
 pub(crate) async fn probe(
     fixture: &Fixture,
     install: &PluginInstall,
-    outbound: Arc<dyn Outbound>,
+    outbound: Arc<dyn ConnectionSender>,
     input: serde_json::Value,
 ) -> aruna_core::plugin_runs::PluginRun {
     let mut run = queued(install.install_id, 1);
@@ -62,8 +77,7 @@ pub(crate) async fn probe(
         input: input.to_string(),
     };
     drive(admit(run.clone()), &fixture.ctx).await.unwrap();
-    let worker = worker(fixture);
-    worker.use_outbound(outbound);
+    let worker = worker_on(&with_sender(&fixture.ctx, outbound), fixture);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
     drive(read_run(install.install_id, run.run_id), &fixture.ctx)
@@ -128,10 +142,10 @@ async fn sends_to_admitted() {
 struct Oversized(Mutex<usize>);
 
 #[async_trait]
-impl Outbound for Oversized {
-    async fn send(&self, _: OutgoingRequest, _: Vec<u8>) -> Result<Answer, SendError> {
+impl ConnectionSender for Oversized {
+    async fn send(&self, _: ConnectionCall) -> Result<ConnectionAnswer, ConnectionError> {
         *self.0.lock().unwrap() += 1;
-        Err(SendError::TooLarge { status: 201 })
+        Err(ConnectionError::TooLarge { status: 201 })
     }
 }
 
@@ -168,8 +182,8 @@ async fn oversized_rerun() {
         run,
     };
     let sender = Arc::new(Oversized(Mutex::new(0)));
-    let ctx = Arc::new(fixture.ctx.clone());
-    let broker = RunBroker::new(ctx, scope).with_outbound(sender.clone());
+    let ctx = Arc::new(with_sender(&fixture.ctx, sender.clone()));
+    let broker = RunBroker::new(ctx, scope);
     let cx = CallContext {
         run: "run".to_string(),
         install: install.install_id.to_string(),
@@ -209,7 +223,8 @@ async fn undeclared_method() {
         run,
     };
     let sender = fake(200, "{}");
-    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_outbound(sender.clone());
+    let ctx = Arc::new(with_sender(&fixture.ctx, sender.clone()));
+    let broker = RunBroker::new(ctx, scope);
     let cx = CallContext {
         run: "run".to_string(),
         install: install.install_id.to_string(),
@@ -274,8 +289,8 @@ async fn injects_without_showing() {
         "call": "send", "connection": "api", "method": "POST", "path": "records", "body": {"a": 1}
     });
     hold_keys(&fixture.ctx);
-    let worker = worker(&fixture);
-    let done = probe_with(&fixture, &install, (&worker, sender.clone()), input).await;
+    let worker = worker_on(&with_sender(&fixture.ctx, sender.clone()), &fixture);
+    let done = probe_with(&fixture, &install, &worker, input).await;
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let (request, _) = sender.asked.lock().unwrap()[0].clone();
     let auth = (request.headers.iter()).find(|(name, _)| name == "authorization");
@@ -298,7 +313,7 @@ async fn injects_without_showing() {
 async fn probe_with(
     fixture: &Fixture,
     install: &PluginInstall,
-    (worker, outbound): (&Arc<crate::plugin_host::worker::Worker>, Arc<Fake>),
+    worker: &Arc<crate::plugin_host::worker::Worker>,
     input: serde_json::Value,
 ) -> aruna_core::plugin_runs::PluginRun {
     let mut run = queued(install.install_id, 1);
@@ -310,7 +325,6 @@ async fn probe_with(
         input: input.to_string(),
     };
     drive(admit(run.clone()), &fixture.ctx).await.unwrap();
-    worker.use_outbound(outbound);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
     drive(read_run(install.install_id, run.run_id), &fixture.ctx)
@@ -330,8 +344,8 @@ async fn narrowed_rules_refuse() {
         "call": "send", "connection": "api", "method": "POST", "path": "records"
     });
     hold_keys(&fixture.ctx);
-    let worker = worker(&fixture);
-    let mut run = probe_with(&fixture, &install, (&worker, sender.clone()), input).await;
+    let worker = worker_on(&with_sender(&fixture.ctx, sender.clone()), &fixture);
+    let mut run = probe_with(&fixture, &install, &worker, input).await;
     assert_eq!(run.state, RunState::Succeeded, "{:?}", run.message);
     // An admin narrows the rule by hand: a retry refuses the settled call instead of filtering
     // its stored reply, and never sends it again.
@@ -398,7 +412,7 @@ async fn whole_answers_gated() {
             run,
         };
         let sender = fake(200, r#"{"id":1}"#);
-        let broker = RunBroker::new(ctx, scope).with_outbound(sender);
+        let broker = RunBroker::new(Arc::new(with_sender(&ctx, sender)), scope);
         let install = &install;
         async move {
             let cx = CallContext {
@@ -487,7 +501,7 @@ async fn canaries_stay_hidden() {
     // The destination echoes the token in a readable field and in a header.
     let echo = format!(r#"{{"id":7,"meta":{{"name":"Bearer {TOKEN}"}}}}"#);
     let sender = Arc::new(Fake {
-        answer: Answer {
+        answer: ConnectionAnswer {
             status: 200,
             headers: vec![("x-echo".to_string(), format!("Bearer {TOKEN}"))],
             body: echo.into_bytes(),
@@ -498,8 +512,8 @@ async fn canaries_stay_hidden() {
         "call": "send", "connection": "api", "method": "POST", "path": "records", "body": {}
     });
     hold_keys(&fixture.ctx);
-    let worker = worker(&fixture);
-    let done = probe_with(&fixture, &install, (&worker, sender), input).await;
+    let worker = worker_on(&with_sender(&fixture.ctx, sender), &fixture);
+    let done = probe_with(&fixture, &install, &worker, input).await;
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     // Run records, guest log lines, intents and audit rows hold no form of the value; the scan
     // does find what is stored, such as the plugin's name.

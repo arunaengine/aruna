@@ -16,12 +16,15 @@ use crate::plugins::install::InstallError;
 
 pub mod broker;
 pub mod jobs;
-pub mod outbound;
 pub(crate) mod peer;
 pub mod plugin_work;
 pub mod repair;
 mod transfers;
 pub mod worker;
+
+#[cfg(test)]
+#[path = "outbound_tests.rs"]
+pub(crate) mod connection_tests;
 
 /// This node as a plugin request sees it; a node without a network serves none.
 pub(crate) fn serving_node(ctx: &DriverContext) -> Option<ServingNode> {

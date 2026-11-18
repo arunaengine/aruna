@@ -1115,7 +1115,8 @@ impl Event {
                     MailSent,
                     Backoff,
                     Answered,
-                    MailRefreshed
+                    MailRefreshed,
+                    ConnectionAnswered
                 }
             ),
         }

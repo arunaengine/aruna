@@ -787,8 +787,11 @@ pub(crate) mod test {
         };
         let policy = EgressPolicy::loopback();
         let blob = BlobHandler::with_egress(config, storage_handle, net_handle, policy).await;
+        let blob = blob.unwrap();
+        let (http, policy) = blob.repository_client();
         DriverContext {
-            blob_handle: Some(blob.unwrap()),
+            blob_handle: Some(blob),
+            outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
             ..context.clone()
         }
     }

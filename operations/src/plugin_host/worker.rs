@@ -3,59 +3,45 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{
-    EVENTS_QUEUED, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
-};
+use aruna_core::plugin_runs::{Decisions, EVENTS_QUEUED, EventBatch, PluginRun};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::permission::{Grant, Permission};
-use aruna_plugins::{
-    CancellationToken, Field, Invocation, Runtime, Trigger, WatchEvent, WebhookDelivery,
-    WebhookRequest,
-};
+use aruna_plugins::{CancellationToken, Supervisor};
 use aruna_tasks::shutdown::Shutdown;
-use tokio_util::task::TaskTracker;
 use tracing::warn;
-use ulid::Ulid;
 
 use super::broker::RunBroker;
 use super::jobs::{retire_work, settle_work};
-use super::outbound::Outbound;
 use super::{read_config, ready_artifact};
 use crate::driver::{DriverContext, drive};
-use crate::plugins::check::{CallError, CheckCall, RunScope};
+use crate::plugins::attempt::{
+    AttemptStart, BeginAttempt, ClaimRuns, ClaimedRuns, FinishRun, invocation, revocation,
+};
+use crate::plugins::check::RunScope;
 use crate::plugins::cleanup::sweep_events;
 use crate::plugins::clock::{AskClock, ClockReading, SKEW_MARGIN_MS, local_start};
 use crate::plugins::decide::{DecideBatch, prune_seen};
 use crate::plugins::dispatch::EnqueueTimers;
 use crate::plugins::finished::DueCompletions;
 use crate::plugins::forward::{Backoff, CollectOutbox, REQUEST_BYTES, SendEvents, apply};
-use crate::plugins::grants::{parse_grants, patterns_for, short_path};
-use crate::plugins::intents::open_intent;
 use crate::plugins::journal::JOURNAL_PAGE;
 use crate::plugins::journal::prune_journal;
 use crate::plugins::lifecycle::{match_targets, targets};
 use crate::plugins::marks::SweepMarks;
-use crate::plugins::matcher::{MatchJournal, event_trigger};
+use crate::plugins::matcher::MatchJournal;
 use crate::plugins::prune::{PruneAudit, prune_hooks};
-use crate::plugins::receiver::{eligible, lost_reason};
+use crate::plugins::receiver::lost_reason;
 use crate::plugins::replay::{PlanReplay, ReplayPlan, RunReplays, StartReplay};
 use crate::plugins::rows::StoreError;
-use crate::plugins::runs::{
-    Ended, PruneRuns, RunError, TICK, conclude, ended, read_run, save_run, unfinished,
-};
+use crate::plugins::runs::{Ended, PruneRuns, RunError, TICK, ended};
 use crate::plugins::waiting::RecheckWaiting;
 use crate::plugins::work::prune_work;
 use crate::realm::mutate_placement::node_kind;
-use aruna_core::plugin_runs::{Decisions, EventBatch};
 
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;
@@ -64,26 +50,16 @@ const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
 const SETTLE_MS: u64 = 30 * 1000;
 
-/// The node service that owns the plugin runtime and the runs it executes.
+/// The node service that runs the queued runs under the plugin supervisor.
 pub struct Worker {
     ctx: Arc<DriverContext>,
     realm_id: RealmId,
     local: NodeId,
-    runtime: Runtime,
-    /// The budget of each run.
-    limits: Limits,
-    /// Runs executing now, with their install and cancel token.
-    running: Mutex<HashMap<Ulid, (Ulid, CancellationToken)>>,
-    /// Why a running guest was cancelled, by run.
-    reasons: Mutex<HashMap<Ulid, &'static str>>,
+    supervisor: Supervisor,
     /// When each receiver of forwarded events is tried again.
     backoff: tokio::sync::Mutex<Backoff>,
-    /// Sends connection requests instead of the node's egress client, in tests.
-    outbound: Mutex<Option<Arc<dyn Outbound>>>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
-    tasks: TaskTracker,
-    stopping: CancellationToken,
 }
 
 impl Worker {
@@ -103,33 +79,21 @@ impl Worker {
         config: RuntimeConfig,
         limits: Limits,
     ) -> Result<Arc<Self>, String> {
-        let runtime = Runtime::new(config).map_err(|error| error.to_string())?;
+        let supervisor = Supervisor::new(config, limits).map_err(|error| error.to_string())?;
         Ok(Arc::new(Self {
             ctx,
             realm_id,
             local,
-            runtime,
-            limits,
-            running: Mutex::new(HashMap::new()),
-            reasons: Mutex::new(HashMap::new()),
+            supervisor,
             backoff: tokio::sync::Mutex::default(),
-            outbound: Mutex::new(None),
             rechecked: AtomicU64::new(0),
-            tasks: TaskTracker::new(),
-            stopping: CancellationToken::new(),
         }))
-    }
-
-    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<Ulid, (Ulid, CancellationToken)>> {
-        self.running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Queues due timer occurrences, then starts the due runs of the active installs this node
     /// receives, at most `RUNS_PARALLEL` per install. A `running` run no task runs starts again.
     pub async fn claim(self: &Arc<Self>, now_ms: u64) -> Result<usize, String> {
-        if self.stopping.is_cancelled() {
+        if self.supervisor.stopping() {
             return Ok(0);
         }
         let config = read_config(&self.ctx, self.realm_id)
@@ -163,45 +127,21 @@ impl Worker {
                 warn!(%error, "Could not recheck waiting plugin events");
             }
         }
-        let queued = drive(unfinished(), &self.ctx)
-            .await
-            .map_err(|error| error.to_string())?;
-        let here = eligible(&config, self.local);
-        let mut started = 0;
-        for (install_id, run_id) in queued {
-            if self.running().contains_key(&run_id) {
-                continue;
-            }
-            let Some(install) =
-                (config.installs.iter()).find(|install| install.install_id == install_id)
-            else {
-                self.drop_run(install_id, run_id, now_ms).await?;
-                continue;
-            };
-            let busy = (self.running().values())
-                .filter(|(install, _)| *install == install_id)
-                .count();
-            let ready = install.receiver == self.local && install.state == InstallState::Active;
-            if !ready || !here || busy >= RUNS_PARALLEL {
-                continue;
-            }
-            let mut run = drive(read_run(install_id, run_id), &self.ctx)
-                .await
-                .map_err(|error| error.to_string())?;
-            if run.due_ms > now_ms || run.state.finished() {
-                continue;
-            }
-            run.state = RunState::Running;
-            run.attempts += 1;
-            self.save(&run).await.map_err(|error| error.to_string())?;
-            let cancel = CancellationToken::new();
-            self.running().insert(run_id, (install_id, cancel.clone()));
+        let active = self.supervisor.active();
+        let claim = ClaimRuns::new(Arc::new(config), self.local, active, now_ms);
+        let claimed = drive(claim, &self.ctx).await;
+        let ClaimedRuns { runs, failure } = claimed.map_err(|error| error.to_string())?;
+        let started = runs.len();
+        for run in runs {
+            let cancel = self.supervisor.admit(run.run_id, run.install_id);
             let worker = self.clone();
-            self.tasks
+            self.supervisor
                 .spawn(async move { worker.execute(run, cancel).await });
-            started += 1;
         }
-        Ok(started)
+        match failure {
+            Some(error) => Err(error.to_string()),
+            None => Ok(started),
+        }
     }
 
     /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
@@ -223,13 +163,6 @@ impl Worker {
         Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
     }
 
-    /// Sends connection requests through `outbound` instead of the node's egress client.
-    pub fn use_outbound(&self, outbound: Arc<dyn Outbound>) {
-        if let Ok(mut held) = self.outbound.lock() {
-            *held = Some(outbound);
-        }
-    }
-
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
     async fn forward(
         &self,
@@ -246,68 +179,20 @@ impl Worker {
         decided.map_err(|error| format!("{error:?}"))
     }
 
-    /// Cancels the running guests of installs that were paused or removed, or of every install
-    /// while this node can no longer run installs; other changes apply at the next call.
+    /// Cancels the running guests of installs that may no longer run.
     fn revoke(&self, config: &RealmConfigDocument) {
-        let lost = lost_reason(config, self.local);
-        let running = self.running();
-        for (run_id, (install_id, cancel)) in running.iter() {
-            let install =
-                (config.installs.iter()).find(|install| install.install_id == *install_id);
-            let reason = match install {
-                None => Some("the install was removed"),
-                Some(install) if install.state == InstallState::Removing => {
-                    Some("the install was removed")
-                }
-                Some(_) if lost.is_some() => lost,
-                Some(install) if install.paused => Some("the install was paused"),
-                Some(_) => None,
-            };
-            if let Some(reason) = reason {
-                self.reasons().insert(*run_id, reason);
-                cancel.cancel();
-            }
-        }
-    }
-
-    fn reasons(&self) -> std::sync::MutexGuard<'_, HashMap<Ulid, &'static str>> {
-        self.reasons
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Ends a queued run whose install is gone, unless its intents decide otherwise.
-    async fn drop_run(&self, install_id: Ulid, run_id: Ulid, now_ms: u64) -> Result<(), String> {
-        let mut run = drive(read_run(install_id, run_id), &self.ctx)
-            .await
-            .map_err(|error| error.to_string())?;
-        let open = drive(open_intent(run_id), &self.ctx).await;
-        let ended = Ended::Cancelled("the install was removed".to_string());
-        conclude(&mut run, ended, false, open, now_ms);
-        self.save(&run).await.map_err(|error| error.to_string())
-    }
-
-    /// Writes the run; one that ended leaves the queue in the same transaction.
-    async fn save(&self, run: &PluginRun) -> Result<(), RunError> {
-        Ok(drive(save_run(run)?, &self.ctx).await?)
+        let reason = |install_id| revocation(config, self.local, install_id);
+        self.supervisor.revoke(reason);
     }
 
     /// Stops claiming, cancels every running guest and waits until each attempt ended.
     pub async fn stop(&self) {
-        self.stopping.cancel();
-        for (_, cancel) in self.running().values() {
-            cancel.cancel();
-        }
-        self.tasks.close();
-        self.tasks.wait().await;
-        self.runtime.close();
+        self.supervisor.stop().await;
     }
 
     /// Waits until the attempts started so far ended.
     pub async fn settle(&self) {
-        self.tasks.close();
-        self.tasks.wait().await;
-        self.tasks.reopen();
+        self.supervisor.settle().await;
     }
 
     async fn execute(self: Arc<Self>, mut run: PluginRun, cancel: CancellationToken) {
@@ -316,53 +201,27 @@ impl Worker {
             local: self.local,
             run: run.clone(),
         };
-        let mut broker = RunBroker::new(self.ctx.clone(), scope);
-        let outbound = self.outbound.lock().ok().and_then(|held| held.clone());
-        if let Some(outbound) = outbound {
-            broker = broker.with_outbound(outbound);
-        }
-        let broker = Arc::new(broker);
+        let broker = Arc::new(RunBroker::new(self.ctx.clone(), scope));
         let ended = self.attempt(&run, broker.clone(), cancel).await;
+        let run_id = run.run_id;
         if matches!(ended, Ended::Stopped) {
-            self.running().remove(&run.run_id);
+            self.supervisor.finish(run_id);
             return;
         }
         run.log = broker.take_log();
-        let ended = scrub_ended(&broker, ended);
-        let now = unix_timestamp_millis();
-        let open = drive(open_intent(run.run_id), &self.ctx).await;
-        let ended = match ended {
+        let ended = match scrub_ended(&broker, ended) {
             Ended::Cancelled(message) => {
-                let reason = self.reasons().remove(&run.run_id);
+                let reason = self.supervisor.take_reason(run_id);
                 Ended::Cancelled(reason.map_or(message, str::to_string))
             }
             other => other,
         };
-        conclude(&mut run, ended, broker.changed(), open, now);
-        if let Err(error) = self.save(&run).await {
-            warn!(run = %run.run_id, %error, "Could not save a finished plugin run");
+        let now = unix_timestamp_millis();
+        let finish = FinishRun::new(run, ended, broker.changed(), now);
+        if let Err(error) = drive(finish, &self.ctx).await {
+            warn!(run = %run_id, %error, "Could not save a finished plugin run");
         }
-        self.reasons().remove(&run.run_id);
-        self.running().remove(&run.run_id);
-    }
-
-    /// The trigger check again for an event run's path before each attempt, so a grant removed
-    /// after admission cancels the run before the guest sees the event.
-    async fn event_allowed(&self, run: &PluginRun, event: &SourceEvent) -> Result<(), Ended> {
-        let scope = RunScope {
-            realm_id: self.realm_id,
-            local: self.local,
-            run: run.clone(),
-        };
-        let needs = event_trigger(event.kind).needs();
-        let target = needs.map(|permission| (permission, event.path.as_str()));
-        match drive(CheckCall::new(&scope, target), &self.ctx).await {
-            Ok(_) => Ok(()),
-            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
-                Err(Ended::Retry(error.message))
-            }
-            Err(CallError(error)) => Err(Ended::Cancelled(error.message)),
-        }
+        self.supervisor.finish(run_id);
     }
 
     async fn attempt(
@@ -371,93 +230,28 @@ impl Worker {
         broker: Arc<RunBroker>,
         cancel: CancellationToken,
     ) -> Ended {
-        let config = match read_config(&self.ctx, self.realm_id).await {
-            Ok(config) => config,
-            Err(error) => return Ended::Retry(error.to_string()),
+        let begin = BeginAttempt::new((self.realm_id, self.local), run);
+        let AttemptStart { config, install } = match drive(begin, &self.ctx).await {
+            Ok(start) => start,
+            Err(ended) => return ended,
         };
-        let Some(install) = config
-            .installs
-            .iter()
-            .find(|install| install.install_id == run.install_id)
-        else {
-            return Ended::Cancelled("the install was removed".into());
-        };
-        if let RunTrigger::Event(event) = &run.trigger
-            && let Err(refused) = self.event_allowed(run, event).await
-        {
-            return refused;
-        }
         let local = Some(self.local);
         let mut assembled = match ready_artifact(&self.ctx, &config, &run.digest, local).await {
             Ok(assembled) => assembled,
             Err(error) => return Ended::Retry(format!("the artifact is not available: {error}")),
         };
         // The artifact's memory stays reserved until it is compiled.
-        let compiled = self
-            .runtime
-            .prepare(std::mem::take(&mut assembled.bytes))
-            .await;
+        let bytes = std::mem::take(&mut assembled.bytes);
+        let compiled = self.supervisor.compile(bytes).await;
         drop(assembled);
         let compiled = match compiled {
             Ok(compiled) => compiled,
             Err(error) => return Ended::Retry(format!("the artifact does not compile: {error}")),
         };
-        let call = invocation(run, (install, self.local), self.limits, cancel);
-        let invoked = self.runtime.invoke(&compiled, call, broker).await;
-        ended(invoked, self.stopping.is_cancelled())
-    }
-}
-
-/// The handler call of a run: its saved invocation and the install's grants. An event's object on
-/// this node is named by its short `bucket/key` path; `path` keeps the permission path.
-fn invocation(
-    run: &PluginRun,
-    (install, local): (&PluginInstall, NodeId),
-    limits: Limits,
-    cancel: CancellationToken,
-) -> Invocation {
-    let grants = parse_grants(&install.grants);
-    let permissions: BTreeSet<Permission> = (Permission::ALL.into_iter())
-        .filter(|permission| !patterns_for(&grants, *permission).is_empty())
-        .collect();
-    // A service's grant path ends in the connection's name.
-    let connections = (grants.get(&Grant::Services).into_iter().flatten())
-        .filter_map(|path| path.rsplit('/').next().map(str::to_string))
-        .collect();
-    let trigger = match &run.trigger {
-        RunTrigger::Manual { input, .. } => Trigger::Manual(input.clone()),
-        RunTrigger::Timer { occurrence_ms } => Trigger::Timer(*occurrence_ms),
-        RunTrigger::Event(event) => Trigger::Event(WatchEvent {
-            kind: event.kind.name().into(),
-            path: event.path.clone(),
-            resource: short_path(&event.resource, (install, local)),
-            revision: event.revision.clone(),
-        }),
-        RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
-            delivery_id: hook.delivery_id.clone(),
-            request: WebhookRequest {
-                method: hook.method.clone(),
-                query: hook.query.clone(),
-                headers: (hook.headers.iter())
-                    .map(|(name, value)| Field {
-                        name: name.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-                body: hook.body.clone(),
-            },
-        }),
-    };
-    Invocation {
-        run: run.run_id.to_string(),
-        install: run.install_id.to_string(),
-        group: install.group_id.to_string(),
-        settings: run.settings.clone(),
-        trigger,
-        permissions,
-        connections,
-        limits,
-        cancel,
+        let limits = self.supervisor.limits();
+        let call = invocation(run, (&install, self.local), limits, cancel);
+        let invoked = self.supervisor.invoke(&compiled, call, broker).await;
+        ended(invoked, self.supervisor.stopping())
     }
 }
 
