@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::jobs::family_report;
 use aruna_core::NodeId;
 use aruna_core::jobs::JobKind;
 use aruna_core::node_state::ReadInfoOperation;
@@ -24,7 +25,6 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::routing::family_report;
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
     delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
