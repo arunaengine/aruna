@@ -562,7 +562,6 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
 
 pub mod access;
 pub mod publish;
-pub mod read;
 pub mod view;
 
 #[cfg(test)]

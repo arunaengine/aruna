@@ -17,10 +17,10 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::release::RangeMembers;
 use serde_json::json;
 
-use super::read::load_access;
+use super::access::LoadAccessOperation;
 use super::*;
 use crate::distribution::test_record::{binding, record, secret};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 const BUCKET: &str = "bakta-db";
 
@@ -139,7 +139,9 @@ async fn operation(
         bucket: BUCKET,
         info: &info,
     };
-    let access = load_access(&fixture.context, scope, auth).await.unwrap();
+    let access = drive(LoadAccessOperation::new(scope, auth), &fixture.context)
+        .await
+        .unwrap();
     ReleaseMembersOperation::new(MembersConfig {
         realm_id: fixture.realm_id,
         node_id: fixture.node_id,
