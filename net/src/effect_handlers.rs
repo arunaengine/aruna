@@ -304,11 +304,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
                 "topic peers must be set by the operations runner".to_string(),
             )))
         }
-        NetEffect::AuthorizeWritePeer { .. } => {
-            NetEvent::WritePeerChecked(Err(aruna_core::events::WritePeerRefusal::Unavailable(
-                "peer checks must be dispatched by the operations runner".to_string(),
-            )))
-        }
         NetEffect::RevocationClaims(_) => NetEvent::RevocationClaims(Err(
             "token checks must be dispatched by the operations runner".to_string(),
         )),
@@ -671,7 +666,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Shard(_) => "shard",
         NetEffect::EnsureTopics { .. } => "ensure_topics",
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
-        NetEffect::AuthorizeWritePeer { .. } => "authorize_write_peer",
         NetEffect::RevocationClaims(_) => "revocation_claims",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",

@@ -523,8 +523,6 @@ pub enum NetEvent {
     TopicPeers(Result<(), TopicPeerError>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
-    /// The caller a forwarded credential names, or why the peer may not act for it.
-    WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
     /// The verified claims of a token named for revocation, or why it is invalid.
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// The end of a routed harvest metadata write.
@@ -578,13 +576,6 @@ pub enum ShardNetEvent {
 pub enum TopicPeerError {
     NoNetwork,
     Failed(String),
-}
-
-/// Why a forwarded credential was not accepted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WritePeerRefusal {
-    Unauthorized,
-    Unavailable(String),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -1038,7 +1029,6 @@ impl Event {
                     Shard,
                     TopicPeers,
                     DeletePlanSigned,
-                    WritePeerChecked,
                     RevocationClaims,
                     Notification,
                     InboxWoken,

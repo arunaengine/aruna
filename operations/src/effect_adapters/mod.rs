@@ -114,10 +114,6 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::Shard(effect)) => {
             Box::pin(shard::dispatch_shard(*effect, context)).await
         }
-        Effect::Net(NetEffect::AuthorizeWritePeer { peer, auth_token }) => {
-            let auth_token = auth_token.map(|token| *token);
-            Box::pin(metadata::dispatch_peer_check(peer, auth_token, context)).await
-        }
         Effect::Net(NetEffect::RevocationClaims(token)) => {
             Box::pin(metadata::dispatch_revocation_claims(*token, context)).await
         }
