@@ -480,3 +480,168 @@ impl Operation for PublishDeletionOperation {
         Ok(Next::Call(IoCall::child(publish)))
     }
 }
+
+#[derive(Debug, PartialEq)]
+enum CancelStep {
+    Alias,
+    Projection(JobFamilyId),
+    Authority(Box<CancelTarget>),
+    Publish(Box<CancelTarget>),
+    Local(Box<JobProjection>),
+    Stop(Vec<NodeId>),
+}
+
+/// What a cancel of one family found.
+#[derive(Debug, PartialEq)]
+struct CancelTarget {
+    family: JobFamilyId,
+    projection: JobProjection,
+    spec: LogicalJobSpec,
+}
+
+/// Cancels one external job through its family; `None` means the alias names no family here, so
+/// the caller keeps its ordinary local cancellation. Every known active execution is asked to
+/// stop; a partitioned one may still finish and stays visible as a late completion.
+#[derive(Debug, PartialEq)]
+pub struct CancelFamilyOperation {
+    auth: AuthContext,
+    job_id: JobId,
+    token: Option<AuthToken>,
+    serving: ServingNode,
+    now_ms: u64,
+    step: CancelStep,
+}
+
+type CancelNext = Result<Next<Option<()>>, JobRouteError>;
+
+impl CancelFamilyOperation {
+    pub fn new(
+        auth: &AuthContext,
+        job_id: JobId,
+        token: Option<AuthToken>,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            job_id,
+            token,
+            serving,
+            now_ms,
+            step: CancelStep::Alias,
+        }
+    }
+
+    fn projected(&mut self, family: JobFamilyId, read: Option<FamilyView>) -> CancelNext {
+        let Some((projected, spec)) = read else {
+            return Ok(Next::Done(None));
+        };
+        // Cancel authority is a decision: a truncated projection proves nothing.
+        decidable(&projected)?;
+        let projection = projected
+            .projection
+            .ok_or_else(|| unavailable("job family has no projection"))?;
+        let target = Box::new(CancelTarget {
+            family,
+            projection,
+            spec,
+        });
+        // The submitter is checked by every holder again; a group admin's permission is
+        // checked here and the signature is that statement.
+        if self.auth.user_id == target.spec.created_by {
+            return self.publish(target, CancelAuthority::Submitter);
+        }
+        let (local, _) = self.serving.ok_or(JobRouteError::Forbidden)?;
+        let check = GroupWriteOperation::new(&self.auth, target.spec.group_id, local);
+        self.step = CancelStep::Authority(target);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn publish(&mut self, target: Box<CancelTarget>, authority: CancelAuthority) -> CancelNext {
+        let publish = PublishCancelOperation::new(
+            target.spec.clone(),
+            &self.auth,
+            authority,
+            self.serving,
+            self.now_ms,
+        );
+        self.step = CancelStep::Publish(target);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+
+    fn stop_next(&mut self, mut executors: Vec<NodeId>) -> CancelNext {
+        let (Some(token), Some((local, realm_id))) = (self.token.clone(), self.serving) else {
+            return Ok(Next::Done(Some(())));
+        };
+        // A local execution has no network cancel: the local runs were flagged already.
+        let Some(executor) = executors.pop().filter(|executor| *executor != local) else {
+            return match executors.is_empty() {
+                true => Ok(Next::Done(Some(()))),
+                false => self.stop_next(executors),
+            };
+        };
+        let request = JobRequest::Cancel {
+            auth_token: token,
+            job_id: self.job_id,
+        };
+        let route = JobRouteOperation::new(realm_id, local, self.job_id, Some(request))
+            .with_responder(Some(executor));
+        self.step = CancelStep::Stop(executors);
+        Ok(Next::Call(IoCall::child(route)))
+    }
+}
+
+impl Operation for CancelFamilyOperation {
+    type Output = Option<()>;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> CancelNext {
+        Ok(Next::Call(IoCall::child(AliasFamilyOperation::new(
+            self.job_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> CancelNext {
+        match std::mem::replace(&mut self.step, CancelStep::Alias) {
+            CancelStep::Alias => {
+                let Some(family) = result.child::<Option<JobFamilyId>, JobRouteError>()?? else {
+                    return Ok(Next::Done(None));
+                };
+                self.step = CancelStep::Projection(family);
+                let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            CancelStep::Projection(family) => {
+                let read = result.child::<Option<FamilyView>, JobRouteError>()??;
+                self.projected(family, read)
+            }
+            CancelStep::Authority(target) => match result.child::<bool, IoError>()? {
+                Ok(true) => self.publish(target, CancelAuthority::GroupAdmin),
+                Ok(false) | Err(_) => Err(JobRouteError::Forbidden),
+            },
+            CancelStep::Publish(target) => {
+                result.child::<(), JobRouteError>()??;
+                let local = CancelLocalRunsOperation::new(target.family, self.serving, self.now_ms);
+                self.step = CancelStep::Local(Box::new(target.projection));
+                Ok(Next::Call(IoCall::child(local)))
+            }
+            CancelStep::Local(projection) => {
+                let _ = result.child::<(), IoError>()?;
+                let mut executors: Vec<NodeId> = projection
+                    .executions
+                    .iter()
+                    .filter(|execution| !execution.state.is_terminal())
+                    .map(|execution| execution.executor_node_id)
+                    .collect();
+                executors.reverse();
+                self.stop_next(executors)
+            }
+            CancelStep::Stop(executors) => {
+                if let Err(error) = result.child::<JobRouteOutcome, JobRouteError>()? {
+                    warn!(error = %error, "Cancel delivery to an executor failed");
+                }
+                self.stop_next(executors)
+            }
+        }
+    }
+}
