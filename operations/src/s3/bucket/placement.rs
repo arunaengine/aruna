@@ -4,23 +4,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::calls::ChildOutcome;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::permission_check;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{
@@ -47,18 +45,12 @@ pub struct BucketPlacementDefault {
     pub generation: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PutPlacementState {
-    Init,
     Authorize,
     AuthorizeGroup,
     Resolve,
-    StartTransaction,
-    ReadBucket,
-    WriteBucket,
-    CommitTransaction,
-    Finish,
-    Error,
+    Write,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -91,54 +83,58 @@ pub enum PutPlacementError {
     /// counter fails the write instead of silently reusing its value.
     #[error("bucket default generation is exhausted")]
     GenerationExhausted,
-    #[error("no transaction found")]
-    NoTransactionFound,
-    #[error("unexpected event in state {state}")]
-    InvalidStateEvent { state: &'static str },
+    #[error("the policy refs could not be read: {0}")]
+    Resolve(IoError),
 }
 
-/// Sets the bucket default ref set and advances `placement_policy_generation`
-/// in the same transaction, so a write that read an older default is detectable.
+impl From<IoError> for PutPlacementError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type PlacementTurn = Result<Next<BucketPlacementDefault>, PutPlacementError>;
+
+/// Sets the bucket default ref set after checking the caller and every ref.
 #[derive(Debug, PartialEq)]
 pub struct PutPlacementOperation {
     input: PutPlacementInput,
     state: PutPlacementState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<BucketPlacementDefault, PutPlacementError>>,
 }
 
 impl PutPlacementOperation {
     pub fn new(input: PutPlacementInput) -> Self {
         Self {
             input,
-            state: PutPlacementState::Init,
-            txn_id: None,
-            output: None,
+            state: PutPlacementState::Authorize,
         }
     }
 
-    fn bucket_key(&self) -> Key {
-        self.input.bucket.as_bytes().to_vec().into()
+    fn call(&mut self, state: PutPlacementState, call: IoCall) -> PlacementTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            PutPlacementState::Init => "Init",
-            PutPlacementState::Authorize => "Authorize",
-            PutPlacementState::AuthorizeGroup => "AuthorizeGroup",
-            PutPlacementState::Resolve => "Resolve",
-            PutPlacementState::StartTransaction => "StartTransaction",
-            PutPlacementState::ReadBucket => "ReadBucket",
-            PutPlacementState::WriteBucket => "WriteBucket",
-            PutPlacementState::CommitTransaction => "CommitTransaction",
-            PutPlacementState::Finish => "Finish",
-            PutPlacementState::Error => "Error",
-        }
+    fn authorize(&mut self, state: PutPlacementState, path: String) -> PlacementTurn {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.input.auth_context.clone(),
+            path,
+            required_permission: Permission::WRITE,
+        });
+        self.call(state, IoCall::child(check))
+    }
+
+    /// A failed check counts as a denial.
+    fn allowed(result: Result<bool, AuthorizationError>) -> Result<bool, PutPlacementError> {
+        result.map_err(|error| {
+            warn!(error = %error, "Bucket placement authorization check failed");
+            PutPlacementError::Unauthorized
+        })
     }
 
     /// Every ref is authenticated before it can become a default; an empty set
     /// clears the default and needs no resolution.
-    fn resolve_refs(&mut self) -> Effects {
+    fn resolve_refs(&mut self) -> PlacementTurn {
         let resolver = PolicySetResolver::new(
             self.input.auth_context.realm_id,
             self.input.local_node_id,
@@ -146,240 +142,65 @@ impl PutPlacementOperation {
             ResolveMode::Strict,
             &self.input.policies,
         );
-        self.state = PutPlacementState::Resolve;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            resolver,
-            |result| { Event::Child(ChildOutcome::new(result)) }
-        ))]
+        self.call(PutPlacementState::Resolve, IoCall::child(resolver))
     }
 
-    fn after_resolve(&mut self, result: Result<Resolutions, PolicySetError>) -> Effects {
-        match result {
-            Ok(resolved) => {
-                if let Some(policy_id) = foreign_owner(&resolved, self.input.group_id) {
-                    return self.fail(PutPlacementError::ForeignPolicy { policy_id });
-                }
-                self.state = PutPlacementState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
+    fn resolved(&mut self, result: Result<Resolutions, PolicySetError>) -> PlacementTurn {
+        let resolved = match result {
+            Ok(resolved) => resolved,
             Err(PolicySetError::Unresolved { policy_ref, source }) => {
-                self.fail(PutPlacementError::PolicyUnavailable {
+                return Err(PutPlacementError::PolicyUnavailable {
                     policy_id: policy_ref.policy_id,
                     source,
-                })
+                });
             }
-            Err(PolicySetError::Io(_)) => self.invalid_event(),
+            Err(PolicySetError::Io(error)) => return Err(PutPlacementError::Resolve(error)),
+        };
+        if let Some(policy_id) = foreign_owner(&resolved, self.input.group_id) {
+            return Err(PutPlacementError::ForeignPolicy { policy_id });
         }
-    }
-
-    fn authorize(&self, path: String) -> Effects {
-        smallvec![permission_check(
-            self.input.auth_context.clone(),
-            path,
-            Permission::WRITE,
-        )]
-    }
-
-    fn fail(&mut self, error: PutPlacementError) -> Effects {
-        self.state = PutPlacementState::Error;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn invalid_event(&mut self) -> Effects {
-        let state = self.state_name();
-        self.fail(PutPlacementError::InvalidStateEvent { state })
-    }
-
-    fn finish(&mut self, default: BucketPlacementDefault) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(PutPlacementError::NoTransactionFound);
+        let write = WriteDefault {
+            input: self.input.clone(),
+            written: None,
         };
-        self.output = Some(Ok(default));
-        self.state = PutPlacementState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_bucket_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.invalid_event();
-        };
-        let Some(value) = value else {
-            return self.fail(PutPlacementError::NoSuchBucket);
-        };
-        let current = match BucketInfo::from_bytes(value.as_ref()) {
-            Ok(current) => current,
-            Err(error) => return self.fail(error.into()),
-        };
-        if current.group_id != self.input.group_id {
-            return self.fail(PutPlacementError::GroupMismatch);
-        }
-        if let Some(expected) = self.input.expected_generation
-            && expected != current.placement_policy_generation
-        {
-            return self.fail(PutPlacementError::GenerationConflict {
-                expected,
-                current: current.placement_policy_generation,
-            });
-        }
-        let generation = current.placement_policy_generation;
-        let previous = current.placement_policies.clone();
-        let updated = match current.with_policies(self.input.policies.clone()) {
-            Ok(updated) => updated,
-            Err(error) => return self.fail(error.into()),
-        };
-        // An unchanged default is not a change: replay must not inflate the
-        // generation and supersede runs that stored the same refs.
-        if updated.placement_policies == previous {
-            return self.finish(BucketPlacementDefault {
-                policies: previous,
-                generation,
-            });
-        }
-        match generation.checked_add(1) {
-            Some(next) => self.write_default(updated, next),
-            None => self.fail(PutPlacementError::GenerationExhausted),
-        }
-    }
-
-    fn write_default(&mut self, mut updated: BucketInfo, generation: u64) -> Effects {
-        updated.placement_policy_generation = generation;
-        let policies = updated.placement_policies.clone();
-        let value = match updated.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.output = Some(Ok(BucketPlacementDefault {
-            policies,
-            generation,
-        }));
-        self.state = PutPlacementState::WriteBucket;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.bucket_key(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        self.call(PutPlacementState::Write, IoCall::child(write))
     }
 }
 
-impl EffectOperation for PutPlacementOperation {
+impl Operation for PutPlacementOperation {
     type Output = BucketPlacementDefault;
     type Error = PutPlacementError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PutPlacementState::Authorize;
-        self.authorize(policy_admin_path(self.input.auth_context.realm_id))
+    fn first(&mut self) -> PlacementTurn {
+        let path = policy_admin_path(self.input.auth_context.realm_id);
+        self.authorize(PutPlacementState::Authorize, path)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone().into());
-        }
+    fn next(&mut self, result: IoResult) -> PlacementTurn {
         match self.state {
-            PutPlacementState::Init => self.start(),
             PutPlacementState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.invalid_event();
-                };
-                match allowed {
-                    Ok(true) => self.resolve_refs(),
-                    // A group administrator governs that group's own buckets.
-                    Ok(false) => {
-                        self.state = PutPlacementState::AuthorizeGroup;
-                        self.authorize(group_admin_path(
-                            self.input.auth_context.realm_id,
-                            self.input.group_id,
-                        ))
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Bucket placement authorization check failed");
-                        self.fail(PutPlacementError::Unauthorized)
-                    }
+                if Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    return self.resolve_refs();
                 }
+                // A group administrator governs that group's own buckets.
+                let realm_id = self.input.auth_context.realm_id;
+                let path = group_admin_path(realm_id, self.input.group_id);
+                self.authorize(PutPlacementState::AuthorizeGroup, path)
             }
             PutPlacementState::AuthorizeGroup => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.invalid_event();
-                };
-                match allowed {
-                    Ok(true) => self.resolve_refs(),
-                    Ok(false) => self.fail(PutPlacementError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Bucket placement authorization check failed");
-                        self.fail(PutPlacementError::Unauthorized)
-                    }
+                match Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    true => self.resolve_refs(),
+                    false => Err(PutPlacementError::Unauthorized),
                 }
             }
             PutPlacementState::Resolve => {
-                let Event::Child(outcome) = event else {
-                    return self.invalid_event();
-                };
-                match outcome.take::<Resolutions, PolicySetError>() {
-                    Some(result) => self.after_resolve(result),
-                    None => self.invalid_event(),
-                }
+                self.resolved(result.child::<Resolutions, PolicySetError>()?)
             }
-            PutPlacementState::StartTransaction => {
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.invalid_event();
-                };
-                self.txn_id = Some(txn_id);
-                self.state = PutPlacementState::ReadBucket;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: self.bucket_key(),
-                    txn_id: Some(txn_id),
-                })]
+            PutPlacementState::Write => {
+                let default = result.child::<BucketPlacementDefault, PutPlacementError>()??;
+                Ok(Next::Done(default))
             }
-            PutPlacementState::ReadBucket => self.handle_bucket_read(event),
-            PutPlacementState::WriteBucket => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.invalid_event();
-                };
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(PutPlacementError::NoTransactionFound);
-                };
-                self.state = PutPlacementState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            PutPlacementState::CommitTransaction => {
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.invalid_event();
-                };
-                self.txn_id = None;
-                self.state = PutPlacementState::Finish;
-                smallvec![]
-            }
-            PutPlacementState::Finish => smallvec![],
-            PutPlacementState::Error => self.abort(),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PutPlacementState::Finish | PutPlacementState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(result) => result,
-            None => Err(PutPlacementError::InvalidStateEvent { state: "Finish" }),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut effects: Effects = smallvec![];
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -395,23 +216,97 @@ impl EffectOperation for PutPlacementOperation {
     }
 }
 
+/// Stores the default ref set and advances `placement_policy_generation` in one transaction,
+/// so a write that read an older default is detectable.
+#[derive(Debug, PartialEq)]
+struct WriteDefault {
+    input: PutPlacementInput,
+    written: Option<BucketPlacementDefault>,
+}
+
+impl WriteDefault {
+    fn bucket_key(&self) -> Key {
+        self.input.bucket.as_bytes().to_vec().into()
+    }
+
+    fn bucket_read(&mut self, value: Option<Value>) -> PlacementTurn {
+        let value = value.ok_or(PutPlacementError::NoSuchBucket)?;
+        let current = BucketInfo::from_bytes(value.as_ref())?;
+        if current.group_id != self.input.group_id {
+            return Err(PutPlacementError::GroupMismatch);
+        }
+        let generation = current.placement_policy_generation;
+        if let Some(expected) = self.input.expected_generation
+            && expected != generation
+        {
+            return Err(PutPlacementError::GenerationConflict {
+                expected,
+                current: generation,
+            });
+        }
+        let previous = current.placement_policies.clone();
+        let mut updated = current.with_policies(self.input.policies.clone())?;
+        // An unchanged default is not a change: replay must not inflate the
+        // generation and supersede runs that stored the same refs.
+        if updated.placement_policies == previous {
+            return Ok(Next::Done(BucketPlacementDefault {
+                policies: previous,
+                generation,
+            }));
+        }
+        let generation = generation
+            .checked_add(1)
+            .ok_or(PutPlacementError::GenerationExhausted)?;
+        updated.placement_policy_generation = generation;
+        let row = (
+            S3_BUCKET_KEYSPACE.to_string(),
+            self.bucket_key(),
+            updated.to_bytes()?.into(),
+        );
+        self.written = Some(BucketPlacementDefault {
+            policies: updated.placement_policies,
+            generation,
+        });
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+impl Operation for WriteDefault {
+    type Output = BucketPlacementDefault;
+    type Error = PutPlacementError;
+
+    fn first(&mut self) -> PlacementTurn {
+        Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, self.bucket_key())))
+    }
+
+    fn next(&mut self, result: IoResult) -> PlacementTurn {
+        match self.written.take() {
+            Some(written) => {
+                result.done()?;
+                Ok(Next::Done(written))
+            }
+            None => self.bucket_read(result.value()?),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
-    use super::{PutPlacementError, PutPlacementInput, PutPlacementOperation};
+    use super::*;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::events::Event;
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
     use std::time::UNIX_EPOCH;
-    use ulid::Ulid;
 
     fn group_id() -> Ulid {
         Ulid::from_bytes([2u8; 16])
@@ -454,11 +349,8 @@ mod pure_tests {
         }
     }
 
-    fn operation(
-        policies: &[VerifiedPolicy],
-        expected_generation: Option<u64>,
-    ) -> PutPlacementOperation {
-        PutPlacementOperation::new(PutPlacementInput {
+    fn input(policies: &[VerifiedPolicy], expected_generation: Option<u64>) -> PutPlacementInput {
+        PutPlacementInput {
             bucket: "bucket".to_string(),
             group_id: group_id(),
             policies: policies.iter().map(VerifiedPolicy::policy_ref).collect(),
@@ -471,40 +363,46 @@ mod pure_tests {
             },
             local_node_id: node_id(),
             now_ms: 1_000,
-        })
+        }
     }
 
-    fn authorized(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
-            allowed: Ok(allowed),
-        })
+    fn authorized(allowed: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)))
     }
 
-    /// Drives authorization and ref resolution up to the open transaction.
-    fn started(operation: &mut PutPlacementOperation, policies: &[VerifiedPolicy]) {
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(crate::tests::policy::resolved_set(policies));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
+    fn resolved(policies: &[VerifiedPolicy]) -> IoResult {
+        let Event::Child(outcome) = crate::tests::policy::resolved_set(policies) else {
+            panic!("expected a child outcome");
+        };
+        IoResult::Child(outcome)
     }
 
-    fn read(bucket: &BucketInfo) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(bucket.to_bytes().expect("bucket encodes").into()),
-        })
+    fn is_child(turn: &PlacementTurn) -> bool {
+        matches!(turn, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    /// The write transaction of `policies`, answered with `bucket`.
+    fn written(
+        policies: &[VerifiedPolicy],
+        expected_generation: Option<u64>,
+        bucket: &BucketInfo,
+    ) -> (WriteDefault, PlacementTurn) {
+        let mut write = WriteDefault {
+            input: input(policies, expected_generation),
+            written: None,
+        };
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        assert!(matches!(write.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let value = bucket.to_bytes().expect("bucket encodes").into();
+        let turn = write.next(IoResult::Values(vec![Some(value)]));
+        (write, turn)
     }
 
     #[test]
     fn bumps_generation_once() {
         let policies = vec![policy(6), policy(1)];
-        let mut operation = operation(&policies, Some(3));
-        started(&mut operation, &policies);
-        let effects = operation.step(read(&stored(Vec::new())));
-
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        let (mut write, turn) = written(&policies, Some(3), &stored(Vec::new()));
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
             panic!("expected one bucket write");
         };
         let written = BucketInfo::from_bytes(value.as_ref()).expect("bucket decodes");
