@@ -42,6 +42,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::s3::object::get::ObjectInfo;
@@ -63,7 +64,6 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::TempDir;
 use ulid::Ulid;
-use aruna_operations::auth::request_authorization::AuthorizeOperation;
 
 struct TestState {
     _storage_dir: TempDir,
@@ -2365,12 +2365,30 @@ async fn object_path_decides() {
     };
 
     assert!(
-        drive(AuthorizeOperation::new(service.realm_id, &auth_context, &object_path("imaging/scan-a"), &Permission::READ, PolicyRequestExtras::operation("s3.GetObject")), &service.state)
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("imaging/scan-a"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
+        )
         .await
         .is_ok()
     );
     assert!(
-        drive(AuthorizeOperation::new(service.realm_id, &auth_context, &object_path("sequencing/reads"), &Permission::READ, PolicyRequestExtras::operation("s3.GetObject")), &service.state)
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("sequencing/reads"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
+        )
         .await
         .is_err()
     );

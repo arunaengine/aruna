@@ -135,7 +135,10 @@ fn checks_saved_grant() {
     let mut valid = GrantValidOperation::new(&grant(realm, None, u64::MAX), &user);
     valid.stamp(FIXED_NOW * 1000);
     valid.first().unwrap();
-    assert!(matches!(valid.next(config_row(&config)), Ok(Next::Done(true))));
+    assert!(matches!(
+        valid.next(config_row(&config)),
+        Ok(Next::Done(true))
+    ));
     let mut expired = GrantValidOperation::new(&grant(realm, None, 1), &user);
     expired.stamp(FIXED_NOW * 1000);
     assert!(matches!(expired.first(), Ok(Next::Done(false))));
@@ -291,7 +294,7 @@ fn linked_login_checked() {
 }
 
 #[test]
-fn cutoff_denies_either_id() {
+fn cutoff_denies_ids() {
     // A cutoff of the user or of the linked login ends the session.
     let minted = linked_token();
     for cut in [minted.via, minted.local] {

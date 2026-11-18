@@ -59,7 +59,10 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
     // A realm that limits a device's concurrent requests gets no more uploads at once.
-    let in_flight = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let in_flight = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .and_then(|config| config.quota.device_concurrent_pulls)
         .map_or(UPLOADS_IN_FLIGHT, |limit| {
             UPLOADS_IN_FLIGHT.min(limit as usize)

@@ -67,7 +67,11 @@ pub async fn drain_publish_queue(context: &Arc<DriverContext>) -> DrainOutcome {
     };
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return DrainOutcome::Deferred;
     };
 

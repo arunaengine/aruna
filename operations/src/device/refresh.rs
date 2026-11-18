@@ -87,7 +87,10 @@ async fn refresh_plan(context: &Arc<DriverContext>) -> Option<RefreshPlan> {
     let net_handle = context.net_handle.as_ref()?;
     context.metadata_handle.as_ref()?;
     let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()?;
     let owner = node_kind(&config, net_handle.node_id()).and_then(|kind| kind.owner())?;
     Some(RefreshPlan {
         realm_id,

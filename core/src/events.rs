@@ -534,12 +534,16 @@ pub enum ShardNetEvent {
     NoNetwork,
     Existing(std::collections::BTreeSet<irokle::TopicId>),
     /// How many topics could not be reopened.
-    Reopened { failed: usize },
+    Reopened {
+        failed: usize,
+    },
     Closed(Result<bool, String>),
     Outcome(Result<(), String>),
     Probed(GenesisProbe),
     /// Whether what the pull brought was applied.
-    Pulled { applied: bool },
+    Pulled {
+        applied: bool,
+    },
     Flag(bool),
     Facts {
         holder: NodeId,

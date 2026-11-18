@@ -618,8 +618,7 @@ mod tests {
         // A realm shared by two groups is read once, all from one snapshot.
         let realm_id = RealmId([3u8; 32]);
         let (first, second) = (Ulid::from_bytes([4u8; 16]), Ulid::from_bytes([5u8; 16]));
-        let mut operation =
-            PolicyBulkOperation::new([(realm_id, first), (realm_id, second)]);
+        let mut operation = PolicyBulkOperation::new([(realm_id, first), (realm_id, second)]);
         assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
         let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
             panic!("expected one read");

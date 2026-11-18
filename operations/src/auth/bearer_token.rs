@@ -213,7 +213,8 @@ impl Operation for LinkedOwnerOperation {
             .map(|bytes| User::from_bytes(&bytes))
             .transpose()
             .map_err(unreadable)?;
-        let active = user.is_some_and(|user| !user.is_deactivated() && user.linked_login(&self.via));
+        let active =
+            user.is_some_and(|user| !user.is_deactivated() && user.linked_login(&self.via));
         Ok(Next::Done(active.then_some(owner)))
     }
 }
@@ -333,7 +334,8 @@ pub struct DecodeTokenOperation {
 
 impl std::fmt::Debug for DecodeTokenOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DecodeTokenOperation").finish_non_exhaustive()
+        f.debug_struct("DecodeTokenOperation")
+            .finish_non_exhaustive()
     }
 }
 
@@ -388,7 +390,10 @@ impl DecodeTokenOperation {
 
     /// Applies the issuing realm's revocations and the cutoffs of both ids.
     fn config_read(&mut self, config: Option<RealmConfigDocument>) -> DecodeTurn {
-        let claims = self.claims.take().ok_or(ArunaBearerError::RevocationUnavailable)?;
+        let claims = self
+            .claims
+            .take()
+            .ok_or(ArunaBearerError::RevocationUnavailable)?;
         let config = config.ok_or(ArunaBearerError::TokenRevoked)?;
         let now = now_secs(self.now_ms);
         if config.token_revoked(&bearer_token_hash(&self.token), now) {

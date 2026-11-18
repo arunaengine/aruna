@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::{PolicySignEvent, VaultSignEvent};
-use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::identity::group_delete::{GroupDeletePlan, GroupDeleteProof};
+use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
 
 /// Signs one publication claim. A claim naming another publisher is refused, so no operation can

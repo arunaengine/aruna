@@ -420,5 +420,5 @@ impl Operation for GroupRulesOperation {
 }
 
 #[cfg(test)]
-#[path = "request_authorization_tests.rs"]
+#[path = "authorization_tests.rs"]
 mod operation_tests;

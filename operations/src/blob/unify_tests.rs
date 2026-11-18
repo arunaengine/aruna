@@ -100,9 +100,12 @@ async fn twins(context: &DriverContext, key: &str, at: u64) -> (BackendLocation,
 
 async fn load(context: &DriverContext) -> BucketAccess {
     let auth = access(context).await;
-    BucketAccess::load(context, &auth, (realm(), group(), node(4)), BUCKET)
-        .await
-        .unwrap()
+    let load = crate::auth::request_authorization::BucketAccessOperation::new(
+        &auth,
+        (realm(), group(), node(4)),
+        BUCKET,
+    );
+    crate::driver::drive(load, context).await.unwrap()
 }
 
 #[tokio::test]

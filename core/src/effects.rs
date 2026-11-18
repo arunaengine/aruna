@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::structs::placement::transition::ProofClaim;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::placement::transition::ProofClaim;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 

@@ -122,7 +122,7 @@ fn either_neither_denied() {
 }
 
 #[test]
-fn public_document_skips_roles() {
+fn public_skips_roles() {
     let extras = PolicyRequestExtras::rest();
     let realm_id = auth().realm_id;
     let public = AuthorizeDocumentOperation::new(realm_id, &auth(), ("/d", true), extras.clone());
@@ -132,7 +132,7 @@ fn public_document_skips_roles() {
 }
 
 #[test]
-fn anonymous_group_rules_empty() {
+fn anonymous_rules_empty() {
     let group = Ulid::from_bytes([3; 16]);
     let mut operation = GroupRulesOperation::new(None, [group]);
     assert_eq!(
@@ -147,7 +147,10 @@ fn failed_group_hidden() {
     let (first, second) = (Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
     let auth = auth();
     let mut operation = GroupRulesOperation::new(Some(&auth), [second, first, first]);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let failed: Result<PermissionRules, AuthorizationError> =
         Err(AuthorizationError::GroupNotFound);
     let turn = operation.next(IoResult::Child(ChildOutcome::new(failed)));

@@ -6,13 +6,13 @@ use crate::error::CliError;
 use aruna::config::load;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::calls::Next;
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-use aruna_core::calls::Next;
-use aruna_core::operation::Operation;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks,
@@ -463,7 +463,9 @@ impl DoctorValidationState {
     fn decode(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
         let checks = TokenChecks {
             trust: IssuerTrust::Listed(self.trusted_realms.iter().copied().collect()),
-            revocation: RevocationCheck::Listed(self.revoked_token_hashes.iter().cloned().collect()),
+            revocation: RevocationCheck::Listed(
+                self.revoked_token_hashes.iter().cloned().collect(),
+            ),
             linked_realm: None,
             keys: None,
         };

@@ -264,11 +264,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
                 "topic peers must be set by the operations runner".to_string(),
             )))
         }
-        NetEffect::AuthorizeWritePeer { .. } => NetEvent::WritePeerChecked(Err(
-            aruna_core::events::WritePeerRefusal::Unavailable(
+        NetEffect::AuthorizeWritePeer { .. } => {
+            NetEvent::WritePeerChecked(Err(aruna_core::events::WritePeerRefusal::Unavailable(
                 "peer checks must be dispatched by the operations runner".to_string(),
-            ),
-        )),
+            )))
+        }
         NetEffect::RevocationClaims(_) => NetEvent::RevocationClaims(Err(
             "token checks must be dispatched by the operations runner".to_string(),
         )),

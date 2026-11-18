@@ -25,12 +25,12 @@ use super::create::{CreateError, CreationReport, admit_pending, send_admin};
 use super::forward::PublishRefusal;
 use super::sharding::{range_sample, split_point};
 use super::status::{Reach, node_reach, read_view};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::metadata::AuthToken;
-use crate::driver::drive;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 /// The caller of an admin change: its own token context and, for a remote publisher, the
 /// bearer token forwarded there.
@@ -210,7 +210,10 @@ pub async fn join_member(
 ) -> Result<CreationReport, CreateError> {
     let (local, snapshot) = head(context, set_id).await?;
     let realm_id = caller.0.realm_id;
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| CreateError::Invalid("the realm configuration is not available".into()))?;
     if !is_sync_eligible(&config, input.node_id) {
         return Err(CreateError::Invalid(format!(
