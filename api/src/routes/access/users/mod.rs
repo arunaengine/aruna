@@ -23,7 +23,6 @@ use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_core::user::validation::email_hash;
-use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
@@ -65,6 +64,7 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -782,7 +782,7 @@ async fn get_token(
                 .map_or(SessionKind::Portal, |session| session.kind);
             // Renewal keeps the primary login time, so it never makes a login look fresh.
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
-            let claims = decode_bearer_token(state.as_ref(), token)
+            let claims = state.decode_token(token)
                 .await
                 .map_err(|_| ServerError::Unauthorized)?;
             let restrictions = aruna_ctx.path_restrictions;
@@ -1168,16 +1168,12 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::auth::policy_load::enforce_policies(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        &aruna_operations::auth::request_policy::policy_request_with(
+    drive(EnforcePolicyOperation::new(state.get_realm_id(), aruna_operations::auth::request_policy::policy_request_with(
             &path,
             &Permission::READ,
             Some(auth),
             aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
-        ),
-    )
+        ).clone()), &state.get_ctx())
     .await
     .map_err(|error| match error {
         aruna_operations::auth::error::PolicyEnforcementError::Denied { .. } => {

@@ -88,7 +88,7 @@ use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
 use aruna_operations::auth::error::AuthorizeError;
-use aruna_operations::auth::request_authorization::{BucketAccess, authorize};
+use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
@@ -166,6 +166,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{Instrument, debug, error, warn};
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
+use aruna_operations::auth::enforcement::PolicyLoadOperation;
 
 const URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -324,14 +327,7 @@ impl ArunaS3Service {
                 continue;
             };
             let path = object_permission_path(self.realm_id, group_id, self.node_id, bucket, &key);
-            match authorize(
-                &self.state,
-                self.realm_id,
-                &anonymous,
-                &path,
-                &Permission::READ,
-                extras.clone(),
-            )
+            match drive(AuthorizeOperation::new(self.realm_id, &anonymous, &path, &Permission::READ, extras.clone()), &self.state)
             .await
             {
                 Ok(_) => entries.push(IndexEntry {
@@ -739,12 +735,7 @@ impl S3 for ArunaS3Service {
             .and_then(|delegated| delegated.share.as_ref());
         let access = match shared {
             Some(auth) => Some(
-                BucketAccess::load(
-                    &self.state,
-                    auth,
-                    (self.realm_id, group_id, self.node_id),
-                    &bucket,
-                )
+                drive(BucketAccessOperation::new(auth, (self.realm_id, group_id, self.node_id), &bucket), &self.state)
                 .await
                 .map_err(|error| s3_error!(InternalError, "{error}"))?,
             ),
@@ -2974,11 +2965,7 @@ impl S3 for ArunaS3Service {
 
         // DeleteObjects has no object key in its path: load the realm and
         // group policy sets once and decide every entry against them.
-        let policy_evaluator = aruna_operations::auth::enforcement::PolicyEvaluator::load(
-            &self.state,
-            self.realm_id,
-            Some(user_access.group_id),
-        )
+        let policy_evaluator = drive(PolicyLoadOperation::new(self.realm_id, Some(user_access.group_id)), &self.state)
         .await
         .map_err(|_| s3_error!(AccessDenied, "Request denied by policy"))?;
 

@@ -24,10 +24,7 @@ use aruna_core::structs::storage::distribution::delegation::{
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
 use aruna_operations::auth::error::AuthorizeError;
-use aruna_operations::auth::policy_load::enforce_policies;
-use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::distribution::accept_delegation::DelegateError;
 use aruna_operations::distribution::delegate::accept_delegation;
@@ -55,6 +52,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
 use zeroize::Zeroizing;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
+use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
+use aruna_operations::auth::bearer_token::UserCutoffOperation;
 
 tokio::task_local! {
     /// The session token hash of the request being verified, which selects its signing secret.
@@ -293,14 +294,7 @@ impl S3Access for AuthProvider {
 
         // DeleteObjects checks its body keys in the handler after these credential checks.
         if cx.s3_op().name() != "DeleteObjects" {
-            match authorize(
-                self.driver_ctx.as_ref(),
-                self.realm_id,
-                &auth_context,
-                &path,
-                &required_permission,
-                extras.clone(),
-            )
+            match drive(AuthorizeOperation::new(self.realm_id, &auth_context, &path, &required_permission, extras.clone()), self.driver_ctx.as_ref())
             .await
             {
                 Ok(()) => {}
@@ -822,14 +816,7 @@ impl AuthProvider {
             issued_by: *delegation.issuer.as_bytes(),
             revoked_at: None,
         };
-        let authorized = authorize(
-            self.driver_ctx.as_ref(),
-            self.realm_id,
-            &auth_context,
-            &path,
-            &required,
-            extras.clone(),
-        )
+        let authorized = drive(AuthorizeOperation::new(self.realm_id, &auth_context, &path, &required, extras.clone()), self.driver_ctx.as_ref())
         .await;
         match authorized {
             Ok(()) => {}
@@ -881,14 +868,7 @@ impl AuthProvider {
         let path = object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
         let extras = request_extras(cx, cx.s3_op().name());
-        authorize(
-            self.driver_ctx.as_ref(),
-            self.realm_id,
-            &AuthContext::anonymous(self.realm_id),
-            &path,
-            &Permission::READ,
-            extras.clone(),
-        )
+        drive(AuthorizeOperation::new(self.realm_id, &AuthContext::anonymous(self.realm_id), &path, &Permission::READ, extras.clone()), self.driver_ctx.as_ref())
         .await
         .map_err(map_authorize_error)?;
 
@@ -968,7 +948,7 @@ impl AuthProvider {
             .strip_prefix(SESSION_ACCESS_PREFIX)
             .unwrap_or(access_key_id);
         let issued = ulid::Ulid::from_string(key_id).map_or(0, |id| id.timestamp_ms() / 1000);
-        let cutoff = realm_user_cutoff(&self.driver_ctx.storage_handle, self.realm_id, user_id)
+        let cutoff = drive(UserCutoffOperation::new(self.realm_id, user_id), &self.driver_ctx)
             .await
             .map_err(|_| s3_error!(ServiceUnavailable, "Revocation state is unavailable"))?;
         if cutoff.is_some_and(|cutoff| issued < cutoff) {
@@ -1006,7 +986,7 @@ impl AuthProvider {
 
     /// Denies every key of an account this realm's replicated record marks deactivated.
     async fn check_status(&self, user_id: &UserId) -> S3Result<()> {
-        match account_deactivated(&self.driver_ctx.storage_handle, user_id).await {
+        match drive(AccountDeactivatedOperation::new(user_id), &self.driver_ctx).await {
             Ok(false) => Ok(()),
             Ok(true) => Err(s3_error!(AccessDenied, "Account is deactivated")),
             Err(_) => Err(s3_error!(
@@ -1164,11 +1144,7 @@ impl AuthProvider {
         }
         // The ordinary path enforces policies after RBAC, so an admitted
         // listing runs them too instead of skipping the verdict.
-        enforce_policies(
-            self.driver_ctx.as_ref(),
-            self.realm_id,
-            &policy_request_with(path, &Permission::READ, Some(auth_context), extras),
-        )
+        drive(EnforcePolicyOperation::new(self.realm_id, policy_request_with(path, &Permission::READ, Some(auth_context), extras).clone()), self.driver_ctx.as_ref())
         .await
         .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))?;
 

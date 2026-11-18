@@ -346,7 +346,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
-    use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_claims};
+    use aruna_operations::auth::bearer_token::validate_bearer_claims;
     use aruna_operations::auth::error::ArunaBearerError;
     use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -673,32 +673,6 @@ mod tests {
         ));
     }
 
-    /// Judges claims at a fixed instant and trusts every realm.
-    struct FixedClock(u64);
-
-    #[async_trait::async_trait]
-    impl ArunaValidationState for FixedClock {
-        async fn is_token_revoked(&self, _: &RealmId, _: &str) -> Result<bool, ArunaBearerError> {
-            Ok(false)
-        }
-
-        async fn user_cutoff(
-            &self,
-            _: &RealmId,
-            _: &UserId,
-        ) -> Result<Option<u64>, ArunaBearerError> {
-            Ok(None)
-        }
-
-        async fn is_trusted_realm(&self, _: &RealmId) -> bool {
-            true
-        }
-
-        fn now_secs(&self) -> u64 {
-            self.0
-        }
-    }
-
     #[tokio::test]
     async fn session_lasts_hours() {
         // With an injected clock a federated session ends 8 hours after the login, not later.
@@ -718,9 +692,10 @@ mod tests {
         assert_eq!(created.session.expires_at, now + 8 * 3600);
         let claims = handle_token(&state, created.token.expose()).await.unwrap();
         assert_eq!((claims.iat, claims.exp), (now, now + 8 * 3600));
-        let last = validate_bearer_claims(&FixedClock(claims.exp), &claims).await;
+        let trusted = std::collections::HashSet::from([state.get_realm_id()]);
+        let last = validate_bearer_claims(&trusted, claims.exp, &claims);
         assert!(last.is_ok());
-        let after = validate_bearer_claims(&FixedClock(claims.exp + 1), &claims).await;
+        let after = validate_bearer_claims(&trusted, claims.exp + 1, &claims);
         assert!(matches!(after, Err(ArunaBearerError::Expired)));
     }
 }

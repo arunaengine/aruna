@@ -19,6 +19,8 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::driver::drive;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(get_running_jobs))
@@ -201,7 +203,7 @@ async fn may_read(
         return permission_granted(state, auth, path, Permission::READ).await;
     };
     let context = state.get_ctx();
-    let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
+    let access = drive(BucketAccessOperation::new(auth, (realm_id, group_id, node_id), bucket), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     // A prefix shows only when the caller may read every key the job may touch below it.

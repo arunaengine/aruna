@@ -32,6 +32,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
+use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IdInput {
@@ -724,9 +725,7 @@ async fn authorize_document(
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
-    aruna_operations::auth::request_authorization::authorize_document(
-        &context, realm_id, auth, document, extras,
-    )
+    drive(AuthorizeDocumentOperation::new(realm_id, auth, document, extras), &context)
     .await
     .map_err(crate::auth::map_authorize_error)
 }

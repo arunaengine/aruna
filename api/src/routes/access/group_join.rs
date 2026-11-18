@@ -9,7 +9,6 @@ use crate::server::state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::auth::error::PolicyEnforcementError;
-use aruna_operations::auth::policy_load::enforce_policies;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::join_request::{
@@ -26,6 +25,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -149,11 +149,7 @@ async fn authorize_join(
         ),
         None => format!("/{}/admin/u/{}/join-requests", auth.realm_id, auth.user_id),
     };
-    enforce_policies(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        &policy_request_with(&path, &permission, Some(auth), PolicyRequestExtras::rest()),
-    )
+    drive(EnforcePolicyOperation::new(state.get_realm_id(), policy_request_with(&path, &permission, Some(auth), PolicyRequestExtras::rest()).clone()), &state.get_ctx())
     .await
     .map_err(|error| match error {
         PolicyEnforcementError::Denied { .. } => ServerError::Forbidden,

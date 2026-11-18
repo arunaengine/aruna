@@ -10,7 +10,6 @@ use crate::s3::util::{location_sse, sse_header, stored_encrypted};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
-use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
@@ -22,6 +21,7 @@ use s3s::dto::{
 };
 use s3s::{S3Response, S3Result, s3_error};
 use std::time::SystemTime;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 
 impl ArunaS3Service {
     /// Resolves the source bucket and authorizes a read there, because the auth
@@ -47,20 +47,13 @@ impl ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        authorize(
-            &self.state,
-            self.realm_id,
-            &source_auth_context,
-            &object_permission_path(
+        drive(AuthorizeOperation::new(self.realm_id, &source_auth_context, &object_permission_path(
                 self.realm_id,
                 source_bucket_info.group_id,
                 self.node_id,
                 &source_bucket,
                 source_key,
-            ),
-            &Permission::READ,
-            extras,
-        )
+            ), &Permission::READ, extras), &self.state)
         .await
         .map_err(map_authorize_error)?;
 

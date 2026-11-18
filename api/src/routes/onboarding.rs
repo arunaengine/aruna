@@ -17,7 +17,6 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
-use aruna_operations::auth::policy_load::enforce_policies;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
@@ -54,6 +53,7 @@ use url::Url;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 const SECRET_TTL_SECS: u64 = 3600;
 /// Policy operation name device enrollment is evaluated under.
@@ -232,7 +232,7 @@ async fn enforce_enrollment_policies(
         PolicyRequestExtras::operation(ENROLL_DEVICE_OPERATION),
     );
     // Fail closed: a denial and unreadable policy state both refuse.
-    enforce_policies(&state.get_ctx(), realm_id, &request)
+    drive(EnforcePolicyOperation::new(realm_id, request.clone()), &state.get_ctx())
         .await
         .map_err(|_| ServerError::Forbidden)
 }

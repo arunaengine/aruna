@@ -40,6 +40,7 @@ use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
@@ -736,9 +737,7 @@ pub async fn delete_preview(
     let context = state.get_ctx();
     // Only keys the caller may read are counted, listed or named by a cursor.
     let scope_of = (auth.realm_id, info.group_id, state.get_node_id());
-    let access = aruna_operations::auth::request_authorization::BucketAccess::load(
-        &context, &auth, scope_of, &bucket,
-    )
+    let access = drive(BucketAccessOperation::new(&auth, scope_of, &bucket), &context)
     .await
     .map_err(|_| ServerError::Forbidden)?;
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);

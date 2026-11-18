@@ -20,6 +20,8 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use aruna_operations::driver::drive;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 mod compute;
 mod context;
@@ -239,7 +241,7 @@ pub(crate) async fn authorize_self(
         Some(auth),
         extras,
     );
-    aruna_operations::auth::policy_load::enforce_policies(&state.get_ctx(), realm_id, &request)
+    drive(EnforcePolicyOperation::new(realm_id, request.clone()), &state.get_ctx())
         .await
         .map_err(|_| crate::error::ServerError::Forbidden)
 }

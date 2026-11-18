@@ -19,8 +19,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
-    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
-    realm_user_cutoff,
+    DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -35,12 +34,10 @@ use aruna_operations::realm::claim_admin::{
 };
 use aruna_wire::address::client_host_url;
 use aruna_wire::info::PortalStatus;
-use async_trait::async_trait;
 use ed25519_dalek::Signer;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
-use jsonwebtoken::DecodingKey;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -672,7 +669,29 @@ impl ServerState {
     }
 
     pub async fn issuer_cache_len(&self) -> usize {
-        self.identity.issuer_keys.len().await
+        self.identity.issuer_keys.len()
+    }
+
+    async fn token_checks(&self, revocation: RevocationCheck) -> TokenChecks {
+        let trusted = self.identity.trusted_realms_list.read().await;
+        TokenChecks {
+            trust: IssuerTrust::Listed(trusted.iter().copied().collect()),
+            revocation,
+            linked_realm: Some(self.get_realm_id()),
+            keys: Some(self.identity.issuer_keys.clone()),
+        }
+    }
+
+    /// Verifies a bearer token against this node's realms and the issuer's revocations.
+    pub async fn decode_token(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = self.token_checks(RevocationCheck::Realm).await;
+        drive(DecodeTokenOperation::new(token, checks), &self.driver_ctx).await
+    }
+
+    /// Verifies a token that may already be revoked, so revoking it again is authorized.
+    pub async fn decode_revoked(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = self.token_checks(RevocationCheck::Skipped).await;
+        drive(DecodeTokenOperation::new(token, checks), &self.driver_ctx).await
     }
 
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
@@ -694,53 +713,6 @@ impl ServerState {
         self.identity
             .claim_initial_admin(self.driver_ctx.as_ref(), auth)
             .await
-    }
-}
-
-#[async_trait]
-impl ArunaValidationState for ServerState {
-    async fn is_token_revoked(
-        &self,
-        realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        // The issuing realm's replicated config is the only revocation
-        // authority; it is expiry-bounded, so the durable set stays limited.
-        realm_token_revoked(&self.driver_ctx.storage_handle, *realm_id, token_hash).await
-    }
-
-    async fn user_cutoff(
-        &self,
-        realm_id: &RealmId,
-        user_id: &UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        realm_user_cutoff(&self.driver_ctx.storage_handle, *realm_id, user_id).await
-    }
-
-    async fn linked_owner(
-        &self,
-        realm_id: &RealmId,
-        via: &UserId,
-    ) -> Result<Option<UserId>, ArunaBearerError> {
-        if *realm_id != self.get_realm_id() {
-            return Ok(None);
-        }
-        realm_linked_owner(&self.driver_ctx.storage_handle, via).await
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.identity
-            .trusted_realms_list
-            .read()
-            .await
-            .contains(realm_id)
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        self.identity.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
 

@@ -64,6 +64,7 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -884,13 +885,7 @@ pub(crate) async fn ensure_group_admin(
     let realm_id = auth.realm_id;
     let group_admin = format!("/{realm_id}/g/{group_id}/admin");
     let realm_admin = format!("/{realm_id}/admin/groups");
-    aruna_operations::auth::request_authorization::authorize_either(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        auth,
-        (&group_admin, &realm_admin),
-        &Permission::WRITE,
-    )
+    drive(AuthorizeEitherOperation::new(state.get_realm_id(), auth, (&group_admin, &realm_admin), &Permission::WRITE), &state.get_ctx())
     .await
     .map_err(crate::auth::map_authorize_error)
 }

@@ -15,7 +15,6 @@ use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,
@@ -87,7 +86,7 @@ pub(crate) async fn bearer_auth_time(
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Option<u64>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let claims = decode_bearer_token(state, bearer.as_str())
+    let claims = state.decode_token(bearer.as_str())
         .await
         .map_err(|_| ServerError::Unauthorized)?;
     Ok(claims.auth_time)

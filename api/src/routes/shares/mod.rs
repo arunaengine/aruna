@@ -13,7 +13,6 @@ use aruna_core::structs::storage::share::{
 };
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::error::AuthorizeError;
-use aruna_operations::auth::policy_load::enforce_policies;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::shares::lifecycle::{
@@ -38,6 +37,7 @@ use crate::auth::map_authorize_error;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 mod dataset;
 mod relay;
@@ -332,7 +332,7 @@ async fn share_policies(
     }));
     let permission = required_permission(request.mode.into());
     let policy = policy_request_with(path, &permission, Some(auth), extras);
-    enforce_policies(&state.get_ctx(), state.get_realm_id(), &policy)
+    drive(EnforcePolicyOperation::new(state.get_realm_id(), policy.clone()), &state.get_ctx())
         .await
         .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
 }

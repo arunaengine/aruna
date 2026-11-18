@@ -56,6 +56,7 @@ use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::s3::bucket::release::read::release_members;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -977,7 +978,7 @@ pub async fn get_bucket_runs(
         .await
         .map_err(hidden)?;
     let context = state.get_ctx();
-    let access = BucketAccess::load(&context, &auth, (realm_id, info.group_id, node_id), &bucket)
+    let access = drive(BucketAccessOperation::new(&auth, (realm_id, info.group_id, node_id), &bucket), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     // A file the caller may not read, as a listing hides it, names no run.
