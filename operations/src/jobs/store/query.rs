@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::row_calls;
-use super::store_call::RowBatch;
 use super::*;
 use crate::driver::drive;
 
@@ -95,16 +94,6 @@ pub async fn first_schedule_entry(
 
 pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
     drive(row_calls::insert_job(record), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-pub(super) async fn batch_write(
-    context: &DriverContext,
-    writes: JobWrites,
-    _txn_id: Option<TxnId>,
-) -> Result<(), String> {
-    drive(RowBatch::write(Ok(writes)), context)
         .await
         .map_err(|error| error.to_string())
 }

@@ -434,7 +434,7 @@ impl Operation for FirstScheduleOperation {
 }
 
 /// Parks the claimed job unless it settled or a cancel was requested meanwhile.
-fn park_mutation(
+pub(super) fn park_mutation(
     token: Ulid,
     now_ms: u64,
 ) -> impl FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Clone + Send + 'static {

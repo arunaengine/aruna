@@ -2,8 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::attempt::*;
+use super::control_mutation::ControlChange;
+use super::query::*;
+use super::state::*;
+use super::store_call::RowBatch;
 use super::*;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::MintPersistentSpec;
@@ -19,6 +27,35 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::tempdir;
+
+/// The stored value of one row.
+async fn read_raw(
+    context: &DriverContext,
+    key_space: &str,
+    key: Key,
+    txn_id: Option<TxnId>,
+) -> Result<Option<Value>, String> {
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key,
+        txn_id,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        other => Err(other.label().to_string()),
+    }
+}
+
+/// Writes rows as they are, without any of the store's own checks.
+async fn batch_write(
+    context: &DriverContext,
+    writes: JobWrites,
+    _txn_id: Option<TxnId>,
+) -> Result<(), String> {
+    drive(RowBatch::write(Ok(writes)), context)
+        .await
+        .map_err(|error| error.to_string())
+}
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
     let dir = tempdir().expect("temp dir");
@@ -2771,7 +2808,11 @@ fn control_changes_with_job() {
         ByteView::from(vec![1]),
     );
     let change = MutateControlOperation::new(id, vec![extra], &mut bump);
-    let (changed, control) = run_in_memory(change, &mut rows).expect("control changed");
+    let ControlChange {
+        record: changed,
+        control,
+        ..
+    } = run_in_memory(change, &mut rows).expect("control changed");
     assert_eq!(changed.updated_at_ms, 4_000);
     assert_eq!(
         control.controller_generation,
