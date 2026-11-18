@@ -44,7 +44,7 @@ pub async fn with_job_host<F: Future>(host: Arc<dyn JobHost>, future: F) -> F::O
     JOB_HOST.scope(host, future).await
 }
 
-fn current_host() -> Option<Arc<dyn JobHost>> {
+pub(super) fn current_host() -> Option<Arc<dyn JobHost>> {
     JOB_HOST.try_with(Arc::clone).ok()
 }
 

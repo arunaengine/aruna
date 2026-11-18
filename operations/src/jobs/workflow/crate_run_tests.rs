@@ -166,7 +166,7 @@ fn record(saved_id: Option<Ulid>) -> RecordCrateOperation {
 
 fn meta_id() -> MetaResourceId {
     let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
-    MetaResourceId::from_parts(1, handle, BucketId::new(9).unwrap()).unwrap()
+    MetaResourceId::from_parts(1, handle, BucketId::new(9).unwrap(), 1).unwrap()
 }
 
 fn allowed(allowed: bool) -> IoResult {

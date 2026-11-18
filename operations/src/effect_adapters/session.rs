@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::session::{SessionAnswer, SessionEffect, SessionEvent, SessionRequest};
+use aruna_core::compute::session::{
+    SessionAnswer, SessionEffect, SessionEvent, SessionLedger, SessionRequest,
+};
 use aruna_core::stream::BackendStream;
 use futures_util::stream;
 use tokio::sync::broadcast::Receiver;
@@ -74,6 +76,17 @@ pub(super) async fn dispatch_session(
         SessionRequest::ListScratch { path } => body(session.list_scratch(&path).await),
         SessionRequest::ReadScratch { path, limit } => {
             body(session.read_scratch(&path, 0, limit).await)
+        }
+        SessionRequest::Ledger => SessionAnswer::Ledger(SessionLedger {
+            inputs: session.inventory(),
+            pending: session.pending(),
+            touched: session.touched(),
+        }),
+        SessionRequest::Close => {
+            if let Some(registry) = context.compute_handle.as_ref() {
+                registry.sessions().close(&session);
+            }
+            SessionAnswer::Done
         }
     }
 }
