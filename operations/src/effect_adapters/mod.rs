@@ -22,6 +22,14 @@ use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
 use aruna_core::task::TaskEvent;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
+
+/// Children that run beside their caller at once; a caller finding no slot starts none.
+const BACKGROUND_CHILDREN: usize = 8;
+
+static BACKGROUND_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(BACKGROUND_CHILDREN)));
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -157,7 +165,7 @@ async fn dispatch_unboxed(
             }
         }
         Effect::Background(child) => {
-            let slot = crate::distribution::pull::fill_slot();
+            let slot = BACKGROUND_SLOTS.clone().try_acquire_owned().ok();
             let started = slot.is_some();
             if let Some(slot) = slot {
                 let context = context.clone();

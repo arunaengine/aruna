@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_holder_reads_config() {
+    fn checked_holder_config() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let mut holder =
             AskHolderOperation::new(node(), "token", "db", ask()).infrastructure_only(realm_id);
