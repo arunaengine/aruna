@@ -1567,7 +1567,10 @@ pub enum MetadataEvent {
     },
     /// The verdict of a structure or Profile check, or why there is none.
     ProfileChecked {
-        report: Result<Box<crate::profile_shapes::ProfileShaclReport>, crate::profile_shapes::ProfileShaclError>,
+        report: Result<
+            Box<crate::profile_shapes::ProfileShaclReport>,
+            crate::profile_shapes::ProfileShaclError,
+        >,
     },
     Error {
         graph_iri: Option<String>,
@@ -1606,6 +1609,18 @@ pub enum MetadataError {
     /// A batch depends on events this replica has not merged yet; it applies once they arrive.
     #[error("metadata causal dependencies missing: {0}")]
     MissingDependencies(String),
+}
+
+/// A storage failure keeps its kind and a lost conflict is the storage conflict; any other runner
+/// failure is a backend failure.
+impl From<crate::calls::IoError> for MetadataError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Storage(error) => Self::Storage(error),
+            crate::calls::IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Backend(other.to_string()),
+        }
+    }
 }
 
 impl MetadataError {

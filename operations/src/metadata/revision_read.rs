@@ -219,9 +219,13 @@ impl RawDisplayOperation {
         match turn {
             Next::Call(call) => Ok(Next::Call(call)),
             Next::Wait => Ok(Next::Wait),
-            Next::Done((status, revision)) | Next::Then { output: (status, revision), .. } => {
-                Ok(Next::Done(revision.map(|revision| displayed(status, revision))))
-            }
+            Next::Done((status, revision))
+            | Next::Then {
+                output: (status, revision),
+                ..
+            } => Ok(Next::Done(
+                revision.map(|revision| displayed(status, revision)),
+            )),
         }
     }
 }
@@ -361,10 +365,16 @@ mod call_tests {
 
     #[test]
     fn display_marks_projection() {
-        let exact = displayed(Some(status(4, MaterializationState::Materialized)), revision(4));
+        let exact = displayed(
+            Some(status(4, MaterializationState::Materialized)),
+            revision(4),
+        );
         assert_eq!(exact.projection_state, MaterializationState::Materialized);
         assert_eq!(exact.projected_event_id, Some(Ulid::from_bytes([4; 16])));
-        let behind = displayed(Some(status(3, MaterializationState::Materialized)), revision(4));
+        let behind = displayed(
+            Some(status(3, MaterializationState::Materialized)),
+            revision(4),
+        );
         assert_eq!(behind.projected_event_id, None);
         let missing = displayed(None, revision(4));
         assert_eq!(missing.projection_state, MaterializationState::Pending);

@@ -41,7 +41,8 @@ impl GraphHandle {
                 return MetadataEvent::ProfileChecked { report };
             }
             MetadataEffect::CheckProfile { shapes, jsonld } => {
-                let report = self.run_profile_shacl(move |engine| engine.evaluate(&shapes, &jsonld));
+                let report =
+                    self.run_profile_shacl(move |engine| engine.evaluate(&shapes, &jsonld));
                 let report = report.await.map(Box::new);
                 return MetadataEvent::ProfileChecked { report };
             }
@@ -58,7 +59,9 @@ impl GraphHandle {
                 revision,
                 shapes,
             } => {
-                self.inner.profiles.insert(profile_id, revision, Arc::new(shapes));
+                self.inner
+                    .profiles
+                    .insert(profile_id, revision, Arc::new(shapes));
                 return MetadataEvent::ProfileShapes { shapes: None };
             }
             effect => effect,

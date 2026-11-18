@@ -2,23 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
-use aruna_core::metadata::{
-    MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
-    ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
-    ProfileValidationStatus,
+use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::keyspaces::{
+    DOCUMENT_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE, VALIDATION_STATUS_KEYSPACE,
 };
-use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, MetadataRawRevision, MetadataValidationViolation,
+    ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
+    ProfileValidationState, ProfileValidationStatus,
+};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::profile_shapes::{
+    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+};
+use aruna_core::rows::{done, read_row, value};
+use aruna_core::storage_entries::{
+    metadata_document_key, profile_validation_entry, profile_validation_key, raw_revision_key,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis as now_ms;
-use aruna_core::types::{GroupId, TxnId};
+use aruna_core::types::GroupId;
 use craqle::ShaclValidationResult;
 use oxrdf::{Dataset, NamedNode, NamedOrBlankNode, Term};
 use ulid::Ulid;
@@ -27,17 +34,15 @@ use super::rules::{
     DCTERMS_CONFORMS_TO, DX_PROFILE, EVALUATOR_NAME, data_graph, has_type, not_profiled_status,
     objects, profile_tags, stale_status, submission_profile_tag,
 };
-use crate::driver::DriverContext;
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::forward::read::export_profile_routed;
-use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::call_results::effect_event;
+use crate::metadata::forward::profile_export::ProfileExportOperation;
+use crate::metadata::protocol::MetadataReadError;
+use crate::metadata::raw_events::{RawReadError, RawRevisionState};
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
-use aruna_core::profile_shapes::{
-    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
-};
-use aruna_graph::GraphHandle;
+use crate::metadata::revision_read::{RawStateOperation, RawViewOperation, RawViewOutput};
+use crate::storage_read::StorageReadError;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";
@@ -103,7 +108,7 @@ pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
     "sh:group (annotation)",
 ];
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct ResolvedProfile {
     /// Absent for a built-in Profile, which no registry row defines.
     id: Option<Ulid>,
@@ -153,23 +158,6 @@ pub(crate) fn equivalent_profile_iris(iri: &str) -> Vec<String> {
     )
 }
 
-pub(crate) async fn validate_submission(
-    context: &DriverContext,
-    document_id: Ulid,
-    group_id: GroupId,
-    jsonld: &str,
-) -> Result<ProfileValidationStatus, MetadataError> {
-    match assess_write(context, document_id, ProfileScope::Group(group_id), jsonld).await {
-        Ok(verdict) => write_verdict(verdict),
-        // An untagged crate never depended on the evaluator, so a node without
-        // one keeps accepting it instead of refusing every write.
-        Err(error) if untagged_without_evaluator(&error, jsonld) => {
-            Ok(not_profiled_status(document_id))
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn untagged_without_evaluator(error: &MetadataError, jsonld: &str) -> bool {
     matches!(
         error,
@@ -194,87 +182,6 @@ fn write_verdict(
     Ok(verdict.status)
 }
 
-/// Profile verdict only. The write path uses `assess_write`, which also carries
-/// the structural findings; a render is never rejected and skips them.
-async fn assess_submission(
-    context: &DriverContext,
-    document_id: Ulid,
-    scope: ProfileScope,
-    jsonld: &str,
-) -> Result<ProfileValidationStatus, MetadataError> {
-    let (data, root) = data_graph(jsonld)?;
-    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
-        return Ok(not_profiled_status(document_id));
-    };
-    Ok(
-        evaluate_tagged(context, document_id, scope, &requested_iri, jsonld)
-            .await?
-            .status,
-    )
-}
-
-/// The full verdict a create or replace enforces: Profile findings plus the
-/// structural findings, which an untagged crate only gets from a bare
-/// structural pass.
-async fn assess_write(
-    context: &DriverContext,
-    document_id: Ulid,
-    scope: ProfileScope,
-    jsonld: &str,
-) -> Result<MetadataProfilePreview, MetadataError> {
-    let (data, root) = data_graph(jsonld)?;
-    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
-        let metadata = evaluator_handle(context, None)?;
-        let structural = metadata
-            .preview_crate_structure(jsonld.to_string())
-            .await
-            .map_err(|error| shacl_failure(error, None))?;
-        return Ok(MetadataProfilePreview {
-            status: not_profiled_status(document_id),
-            structural_violations: structural
-                .into_iter()
-                .map(MetadataValidationViolation::from)
-                .collect(),
-        });
-    };
-    evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await
-}
-
-async fn evaluate_tagged(
-    context: &DriverContext,
-    document_id: Ulid,
-    scope: ProfileScope,
-    requested_iri: &str,
-    jsonld: &str,
-) -> Result<MetadataProfilePreview, MetadataError> {
-    let profile = resolve_profile(context, requested_iri, scope).await?;
-    let metadata = evaluator_handle(context, Some(&profile.revision))?;
-    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
-    Ok(MetadataProfilePreview {
-        status: profiled_status(document_id, &profile, assessment.findings),
-        structural_violations: assessment.structural,
-    })
-}
-
-/// Profile verdict for a merged render. A merge is never rejected, so an
-/// evaluator that cannot answer reports stale rather than failing the job.
-pub(crate) async fn assess_render(
-    context: &DriverContext,
-    document_id: Ulid,
-    group_id: GroupId,
-    jsonld: &str,
-) -> ProfileValidationStatus {
-    match assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await {
-        Ok(status) => status,
-        Err(MetadataError::ProfileValidation(findings)) => {
-            let mut status = stale_status(document_id, "profile_unavailable");
-            status.findings = findings;
-            status
-        }
-        Err(error) => stale_status(document_id, &error.to_string()),
-    }
-}
-
 /// Findings that make a document invalid, and so keep the render undisplayed.
 pub(crate) fn violation_count(status: &ProfileValidationStatus) -> u32 {
     if status.state != ProfileValidationState::Invalid {
@@ -291,7 +198,7 @@ pub(crate) fn violation_count(status: &ProfileValidationStatus) -> u32 {
 }
 
 /// The verdict a create or replace would enforce for an unsaved draft.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct MetadataProfilePreview {
     pub status: ProfileValidationStatus,
     pub structural_violations: Vec<MetadataValidationViolation>,
@@ -304,75 +211,9 @@ impl MetadataProfilePreview {
     }
 }
 
-/// Validates a draft without reading or writing any stored document. Without a
-/// group only public Profiles resolve, exactly as a foreign group's write would.
-pub async fn preview_submission(
-    context: &DriverContext,
-    group_id: Option<GroupId>,
-    jsonld: &str,
-) -> Result<MetadataProfilePreview, MetadataError> {
-    assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
-}
-
-/// Evaluates a crate against the Profile `iri` whether or not the crate names it, and stores
-/// nothing. Built-in and public Profiles resolve; structural crate violations are findings too.
-pub async fn check_profile(
-    context: &DriverContext,
-    iri: &str,
-    jsonld: &str,
-) -> Result<ProfileValidationStatus, MetadataError> {
-    let preview =
-        evaluate_tagged(context, Ulid::nil(), ProfileScope::PublicOnly, iri, jsonld).await?;
-    let mut status = preview.status;
-    if !preview.structural_violations.is_empty() {
-        status.state = ProfileValidationState::Invalid;
-    }
-    status
-        .findings
-        .extend(preview.structural_violations.into_iter().map(|violation| {
-            ProfileValidationFinding {
-                code: violation.code,
-                severity: ProfileValidationSeverity::Violation,
-                focus_node: Some(violation.entity_id.unwrap_or_else(|| "./".into())),
-                path: Some(violation.pointer).filter(|pointer| !pointer.is_empty()),
-                rule: "structural".into(),
-                message: violation.message,
-                profile_revision: status.profile_revision.clone(),
-                completeness: ProfileValidationCompleteness::Complete,
-            }
-        }));
-    Ok(status)
-}
-
 struct ProfileAssessment {
     findings: Vec<ProfileValidationFinding>,
     structural: Vec<MetadataValidationViolation>,
-}
-
-async fn evaluate_profile(
-    metadata: &GraphHandle,
-    profile: &ResolvedProfile,
-    jsonld: &str,
-) -> Result<ProfileAssessment, MetadataError> {
-    let shapes = ProfileShapes {
-        graph_iri: profile.shapes_graph_iri.clone(),
-        sources: profile.shapes.clone(),
-    };
-    match metadata
-        .evaluate_profile_shapes(shapes, jsonld.to_string())
-        .await
-    {
-        Ok(report) => Ok(shacl_assessment(report, &profile.revision)),
-        Err(ProfileShaclError::Unsupported { rule, message }) => Ok(ProfileAssessment {
-            findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
-            structural: Vec::new(),
-        }),
-        Err(ProfileShaclError::Limit { message }) => Ok(ProfileAssessment {
-            findings: vec![limit_finding(message, &profile.revision)],
-            structural: Vec::new(),
-        }),
-        Err(error) => Err(shacl_failure(error, Some(&profile.revision))),
-    }
 }
 
 fn shacl_assessment(report: ProfileShaclReport, profile_revision: &str) -> ProfileAssessment {
@@ -467,20 +308,6 @@ fn single_profile_tag(
     }
 }
 
-fn evaluator_handle<'a>(
-    context: &'a DriverContext,
-    profile_revision: Option<&str>,
-) -> Result<&'a GraphHandle, MetadataError> {
-    match context.graph_handle.as_ref() {
-        Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
-        _ => Err(unavailable_error(
-            "validator_unavailable",
-            "the profile evaluator is unavailable; retry or remove the Profile tag",
-            profile_revision,
-        )),
-    }
-}
-
 fn shacl_failure(error: ProfileShaclError, profile_revision: Option<&str>) -> MetadataError {
     match error {
         ProfileShaclError::InvalidInput { message } => MetadataError::InvalidInput(message),
@@ -496,6 +323,7 @@ fn profiled_status(
     document_id: Ulid,
     profile: &ResolvedProfile,
     findings: Vec<ProfileValidationFinding>,
+    validated_at_ms: u64,
 ) -> ProfileValidationStatus {
     let invalid = findings
         .iter()
@@ -520,7 +348,7 @@ fn profiled_status(
         profile_iri: Some(profile.requested_iri.clone()),
         profile_revision: Some(profile.revision.clone()),
         evaluator: EVALUATOR_NAME.to_string(),
-        validated_at_ms: Some(now_ms()),
+        validated_at_ms: Some(validated_at_ms),
         findings,
         completeness,
         stale_reason: None,
@@ -528,330 +356,796 @@ fn profiled_status(
     }
 }
 
-pub async fn load_validation_status(
-    context: &DriverContext,
+/// The verdict a create or replace enforces. An untagged crate never depended on the evaluator,
+/// so a node without one keeps accepting it instead of refusing every write.
+pub(crate) fn submission_verdict(
+    assessed: Result<MetadataProfilePreview, MetadataError>,
     document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<ProfileValidationStatus>, MetadataError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: VALIDATION_STATUS_KEYSPACE.to_string(),
-            key: profile_validation_key(document_id),
-            txn_id,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    match assessed {
+        Ok(verdict) => write_verdict(verdict),
+        Err(error) if untagged_without_evaluator(&error, jsonld) => {
+            Ok(not_profiled_status(document_id))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Profile verdict for a merged render. A merge is never rejected, so an evaluator that cannot
+/// answer reports stale rather than failing the job.
+pub(crate) fn render_verdict(
+    assessed: Result<MetadataProfilePreview, MetadataError>,
+    document_id: Ulid,
+) -> ProfileValidationStatus {
+    match assessed {
+        Ok(preview) => preview.status,
+        Err(MetadataError::ProfileValidation(findings)) => {
+            let mut status = stale_status(document_id, "profile_unavailable");
+            status.findings = findings;
+            status
+        }
+        Err(error) => stale_status(document_id, &error.to_string()),
+    }
+}
+
+/// The status of an explicit Profile check; structural crate violations are findings too.
+pub fn profile_verdict(preview: MetadataProfilePreview) -> ProfileValidationStatus {
+    let mut status = preview.status;
+    if !preview.structural_violations.is_empty() {
+        status.state = ProfileValidationState::Invalid;
+    }
+    status
+        .findings
+        .extend(preview.structural_violations.into_iter().map(|violation| {
+            ProfileValidationFinding {
+                code: violation.code,
+                severity: ProfileValidationSeverity::Violation,
+                focus_node: Some(violation.entity_id.unwrap_or_else(|| "./".into())),
+                path: Some(violation.pointer).filter(|pointer| !pointer.is_empty()),
+                rule: "structural".into(),
+                message: violation.message,
+                profile_revision: status.profile_revision.clone(),
+                completeness: ProfileValidationCompleteness::Complete,
+            }
+        }));
+    status
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AssessStage {
+    /// Running the structural pass of an untagged crate.
+    Structure,
+    /// Reading the registry row of a registered Profile.
+    Registry,
+    /// Looking for the Profile revision's shapes in this node's cache.
+    Cached,
+    /// Fetching the Profile revision from a holder.
+    Export,
+    /// Keeping the fetched shapes.
+    Store,
+    /// Evaluating the crate against the shapes.
+    Evaluate,
+}
+
+/// Assesses one crate against the Profile it names, or a given Profile: the Profile findings,
+/// plus the structural findings a write enforces. Built-in Profiles answer from embedded
+/// shapes; a registered one is fetched from a holder once per revision and cached.
+#[derive(Debug, PartialEq)]
+pub struct ProfileAssessOperation {
+    local_node: Option<NodeId>,
+    document_id: Ulid,
+    scope: ProfileScope,
+    jsonld: String,
+    /// The Profile the crate is checked against even when it names none.
+    forced: Option<String>,
+    /// Whether an untagged crate gets the bare structural pass a write enforces.
+    structural: bool,
+    stage: AssessStage,
+    requested_iri: String,
+    registered: Option<MetadataRegistryRecord>,
+    profile: Option<ResolvedProfile>,
+    now_ms: u64,
+}
+
+type AssessTurn = Result<Next<MetadataProfilePreview>, MetadataError>;
+
+impl ProfileAssessOperation {
+    fn new(
+        local_node: Option<NodeId>,
+        document_id: Ulid,
+        scope: ProfileScope,
+        jsonld: String,
+        structural: bool,
+    ) -> Self {
+        Self {
+            local_node,
+            document_id,
+            scope,
+            jsonld,
+            forced: None,
+            structural,
+            stage: AssessStage::Evaluate,
+            requested_iri: String::new(),
+            registered: None,
+            profile: None,
+            now_ms: 0,
+        }
+    }
+
+    /// The verdict a create or replace of `document_id` in `group_id` enforces.
+    pub fn write(
+        local_node: Option<NodeId>,
+        document_id: Ulid,
+        group_id: GroupId,
+        jsonld: String,
+    ) -> Self {
+        Self::new(
+            local_node,
+            document_id,
+            ProfileScope::Group(group_id),
+            jsonld,
+            true,
+        )
+    }
+
+    /// The verdict a write would enforce for an unsaved draft. Without a group only public
+    /// Profiles resolve, exactly as a foreign group's write would.
+    pub fn preview(local_node: Option<NodeId>, group_id: Option<GroupId>, jsonld: String) -> Self {
+        Self::new(local_node, Ulid::nil(), group_id.into(), jsonld, true)
+    }
+
+    /// The Profile verdict of a merged render, which skips the structural findings.
+    pub(crate) fn render(
+        local_node: Option<NodeId>,
+        document_id: Ulid,
+        group_id: GroupId,
+        jsonld: String,
+    ) -> Self {
+        Self::new(
+            local_node,
+            document_id,
+            ProfileScope::Group(group_id),
+            jsonld,
+            false,
+        )
+    }
+
+    /// Checks a crate against the Profile `iri` whether or not the crate names it. Built-in and
+    /// public Profiles resolve; nothing is stored.
+    pub fn against(local_node: Option<NodeId>, iri: &str, jsonld: String) -> Self {
+        let mut operation = Self::new(
+            local_node,
+            Ulid::nil(),
+            ProfileScope::PublicOnly,
+            jsonld,
+            true,
+        );
+        operation.forced = Some(iri.to_string());
+        operation
+    }
+
+    fn resolve(&mut self, requested_iri: String) -> AssessTurn {
+        if let Some(shapes) = builtin_shapes(&requested_iri) {
+            let profile = ResolvedProfile {
+                id: None,
+                requested_iri: requested_iri.clone(),
+                revision: BUILTIN_REVISION.to_string(),
+                shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
+                shapes: shapes.iter().map(|shapes| shapes.to_string()).collect(),
+            };
+            return self.evaluate(profile);
+        }
+        let Some(profile_id) = profile_from_iri(&requested_iri) else {
+            return Err(profile_not_registered(&requested_iri));
+        };
+        self.requested_iri = requested_iri;
+        self.stage = AssessStage::Registry;
+        Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(
+            profile_id,
+        ))))
+    }
+
+    fn registry_read(&mut self, result: IoResult) -> AssessTurn {
+        let record = match result.child::<Option<MetadataRegistryRecord>, StorageReadError>()? {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(profile_not_registered(&self.requested_iri)),
+            Err(_) => {
+                return Err(unavailable_error(
+                    "profile_unavailable",
+                    "the registered Profile is temporarily unavailable; retry or remove the Profile tag",
+                    None,
+                ));
+            }
+        };
+        if record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+            || !self.scope.may_use(&record)
+        {
+            return Err(profile_not_registered(&self.requested_iri));
+        }
+        let cached = MetadataEffect::CachedShapes {
+            profile_id: record.document_id,
+            revision: record.last_event_id,
+        };
+        self.registered = Some(record);
+        self.stage = AssessStage::Cached;
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
+            cached,
+        )))))
+    }
+
+    fn registered(&self) -> Result<&MetadataRegistryRecord, MetadataError> {
+        self.registered
+            .as_ref()
+            .ok_or_else(|| MetadataError::Backend("the Profile row is missing".to_string()))
+    }
+
+    fn registered_profile(&self, shapes: Vec<String>) -> Result<ResolvedProfile, MetadataError> {
+        let record = self.registered()?;
+        let revision = record.last_event_id;
+        Ok(ResolvedProfile {
+            id: Some(record.document_id),
+            requested_iri: self.requested_iri.clone(),
+            revision: revision.to_string(),
+            shapes_graph_iri: format!("{}#shapes/{revision}", record.graph_iri),
+            shapes,
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+    }
+
+    fn cached_read(&mut self, result: IoResult) -> AssessTurn {
+        // A node without the graph store keeps no shapes and fetches every time.
+        if let Event::Metadata(MetadataEvent::ProfileShapes {
+            shapes: Some(shapes),
+        }) = effect_event(result)?
+        {
+            let profile = self.registered_profile(shapes)?;
+            return self.evaluate(profile);
+        }
+        let record = self.registered()?;
+        let export = ProfileExportOperation::new(
+            self.local_node,
+            record.realm_id,
+            record.document_id,
+            record.last_event_id,
+        );
+        self.stage = AssessStage::Export;
+        Ok(Next::Call(IoCall::child(export)))
+    }
+
+    fn export_read(&mut self, result: IoResult) -> AssessTurn {
+        let record = self.registered()?.clone();
+        let revision = record.last_event_id;
+        let pinned = revision.to_string();
+        let exported = result
+            .child::<ExportMetadataResult, MetadataReadError>()?
+            .map_err(|_| {
+                unavailable_error(
+                    "profile_unavailable",
+                    "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
+                    Some(&pinned),
+                )
+            })?;
+        let ExportMetadataResult::Raw {
+            record: holder_record,
+            raw,
+            ..
+        } = exported
+        else {
+            return Err(unavailable_error(
+                "profile_unavailable",
+                "the registered Profile revision cannot be read; retry or remove the Profile tag",
+                Some(&pinned),
+            ));
+        };
+        // Usability was decided from the registry row, so the holder copy is only fenced on
+        // identity and revision here.
+        if holder_record.document_id != record.document_id
+            || holder_record.last_event_id != revision
+            || raw.revision.winning_event_id != revision
+        {
+            return Err(unavailable_error(
+                "profile_unavailable",
+                "the registered Profile revision is changing; retry or remove the Profile tag",
+                Some(&pinned),
+            ));
+        }
+        let (profile_data, profile_root) = data_graph(&raw.revision.jsonld).map_err(|_| {
+            unavailable_error(
+                "profile_unavailable",
+                "the registered Profile cannot be read; retry or remove the Profile tag",
+                Some(&pinned),
+            )
+        })?;
+        if !has_type(&profile_data, &profile_root, DX_PROFILE) {
+            return Err(profile_not_registered(&self.requested_iri));
+        }
+        let shapes = profile_shapes(&profile_data)
+            .map_err(|message| unavailable_error("profile_unavailable", &message, Some(&pinned)))?;
+        self.profile = Some(self.registered_profile(shapes.clone())?);
+        self.stage = AssessStage::Store;
+        let store = MetadataEffect::CacheShapes {
+            profile_id: record.document_id,
+            revision,
+            shapes,
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
+            store,
+        )))))
+    }
+
+    fn evaluate(&mut self, profile: ResolvedProfile) -> AssessTurn {
+        let check = MetadataEffect::CheckProfile {
+            shapes: ProfileShapes {
+                graph_iri: profile.shapes_graph_iri.clone(),
+                sources: profile.shapes.clone(),
+            },
+            jsonld: self.jsonld.clone(),
+        };
+        self.profile = Some(profile);
+        self.stage = AssessStage::Evaluate;
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
+            check,
+        )))))
+    }
+
+    fn evaluated(&mut self, result: IoResult) -> AssessTurn {
+        let profile = self
+            .profile
+            .take()
+            .ok_or_else(|| MetadataError::Backend("the Profile is missing".to_string()))?;
+        let assessment = match checked(effect_event(result)?, Some(&profile.revision))? {
+            Ok(report) => shacl_assessment(report, &profile.revision),
+            Err(ProfileShaclError::Unsupported { rule, message }) => ProfileAssessment {
+                findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
+                structural: Vec::new(),
+            },
+            Err(ProfileShaclError::Limit { message }) => ProfileAssessment {
+                findings: vec![limit_finding(message, &profile.revision)],
+                structural: Vec::new(),
+            },
+            Err(error) => return Err(shacl_failure(error, Some(&profile.revision))),
+        };
+        Ok(Next::Done(MetadataProfilePreview {
+            status: profiled_status(self.document_id, &profile, assessment.findings, self.now_ms),
+            structural_violations: assessment.structural,
+        }))
+    }
+
+    fn structure_checked(&mut self, result: IoResult) -> AssessTurn {
+        let report =
+            checked(effect_event(result)?, None)?.map_err(|error| shacl_failure(error, None))?;
+        Ok(Next::Done(MetadataProfilePreview {
+            status: not_profiled_status(self.document_id),
+            structural_violations: report
+                .structural
+                .into_iter()
+                .map(MetadataValidationViolation::from)
+                .collect(),
+        }))
+    }
+}
+
+/// The report of a structure or Profile check. A node without the graph store has no evaluator.
+fn checked(
+    event: Event,
+    profile_revision: Option<&str>,
+) -> Result<Result<ProfileShaclReport, ProfileShaclError>, MetadataError> {
+    match event {
+        Event::Metadata(MetadataEvent::ProfileChecked { report }) => {
+            Ok(report.map(|report| *report))
+        }
+        Event::Metadata(MetadataEvent::Error { .. }) => Err(unavailable_error(
+            "validator_unavailable",
+            "the profile evaluator is unavailable; retry or remove the Profile tag",
+            profile_revision,
+        )),
+        other => Err(MetadataError::Backend(format!(
+            "unexpected profile check answer: {}",
+            other.label()
+        ))),
+    }
+}
+
+impl Operation for ProfileAssessOperation {
+    type Output = MetadataProfilePreview;
+    type Error = MetadataError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> AssessTurn {
+        if let Some(iri) = self.forced.clone() {
+            return self.resolve(iri);
+        }
+        let (data, root) = data_graph(&self.jsonld)?;
+        if let Some(requested_iri) = single_profile_tag(&data, &root)? {
+            return self.resolve(requested_iri);
+        }
+        if !self.structural {
+            return Ok(Next::Done(MetadataProfilePreview {
+                status: not_profiled_status(self.document_id),
+                structural_violations: Vec::new(),
+            }));
+        }
+        self.stage = AssessStage::Structure;
+        let check = MetadataEffect::CheckStructure {
+            jsonld: self.jsonld.clone(),
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
+            check,
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> AssessTurn {
+        match self.stage {
+            AssessStage::Structure => self.structure_checked(result),
+            AssessStage::Registry => self.registry_read(result),
+            AssessStage::Cached => self.cached_read(result),
+            AssessStage::Export => self.export_read(result),
+            AssessStage::Store => {
+                effect_event(result)?;
+                let profile = self
+                    .profile
+                    .take()
+                    .ok_or_else(|| MetadataError::Backend("the Profile is missing".to_string()))?;
+                self.evaluate(profile)
+            }
+            AssessStage::Evaluate => self.evaluated(result),
+        }
+    }
+}
+
+/// Reads the stored validation status of one document.
+#[derive(Debug, PartialEq)]
+pub struct StoredStatusOperation {
+    document_id: Ulid,
+}
+
+impl StoredStatusOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self { document_id }
+    }
+}
+
+impl Operation for StoredStatusOperation {
+    type Output = Option<ProfileValidationStatus>;
+    type Error = MetadataError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, MetadataError> {
+        let key = profile_validation_key(self.document_id);
+        Ok(Next::Call(read_row(VALIDATION_STATUS_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, MetadataError> {
+        let status = value(result)?
             .map(|value| {
                 postcard::from_bytes(&value)
                     .map_err(aruna_core::errors::ConversionError::from)
                     .map_err(|error| MetadataError::Backend(error.to_string()))
             })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected profile validation status read: {}",
-            other.label()
-        ))),
+            .transpose()?;
+        Ok(Next::Done(status))
     }
 }
 
-pub async fn current_validation_status(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<ProfileValidationStatus, MetadataError> {
-    let Some(mut status) = load_validation_status(context, record.document_id, None).await? else {
-        return Ok(stale_status(
-            record.document_id,
-            "validation_status_missing",
-        ));
-    };
-    if !validation_is_current(context, record, &status).await? {
-        status.state = ProfileValidationState::Stale;
-        status.completeness = ProfileValidationCompleteness::Incomplete;
-        status.stale_reason = Some("dataset_revision_changed".to_string());
-        return Ok(status);
-    }
-    // A built-in Profile carries no id, so no registry row can age it out.
-    let pinned = status.profile_id.zip(status.profile_revision.clone());
-    if let Some((profile_id, validated_revision)) = pinned {
-        match drive(DocumentRecordOperation::new(profile_id), context)
-            .await
-            .map_err(map_registry_error)
-        {
-            Ok(Some(profile)) if profile.last_event_id.to_string() == validated_revision => {}
-            Ok(Some(_)) => {
-                status.state = ProfileValidationState::Stale;
-                status.completeness = ProfileValidationCompleteness::Incomplete;
-                status.stale_reason = Some("profile_revision_changed".to_string());
-            }
-            Ok(None) => {
-                status.state = ProfileValidationState::Stale;
-                status.completeness = ProfileValidationCompleteness::Incomplete;
-                status.stale_reason = Some("profile_not_registered".to_string());
-            }
-            Err(_) => {
-                status.state = ProfileValidationState::Stale;
-                status.completeness = ProfileValidationCompleteness::Incomplete;
-                status.stale_reason = Some("profile_unavailable".to_string());
-            }
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StatusStage {
+    Stored,
+    Digest,
+    Profile,
+}
+
+/// The document's validation status, marked stale when the document moved on since, or when its
+/// registered Profile changed or is gone. A built-in Profile carries no id, so nothing ages it.
+#[derive(Debug, PartialEq)]
+pub struct ValidationStatusOperation {
+    record: MetadataRegistryRecord,
+    stage: StatusStage,
+    status: Option<ProfileValidationStatus>,
+}
+
+type StatusTurn = Result<Next<ProfileValidationStatus>, MetadataError>;
+
+impl ValidationStatusOperation {
+    pub fn new(record: MetadataRegistryRecord) -> Self {
+        Self {
+            record,
+            stage: StatusStage::Stored,
+            status: None,
         }
     }
-    Ok(status)
-}
 
-/// A merged document's status is bound to the render it validated, because a
-/// merge can leave the displayed revision behind the newest event. A status
-/// written before the first merge still carries only its event id.
-async fn validation_is_current(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-    status: &ProfileValidationStatus,
-) -> Result<bool, MetadataError> {
-    let Some(digest) = status.dataset_digest else {
-        return Ok(status.dataset_revision == record.last_event_id);
-    };
-    let current = crate::metadata::raw_revision::load_raw_digest(context, record.document_id)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    Ok(current == Some(digest))
-}
-
-pub async fn revalidate_current(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<ProfileValidationStatus, MetadataError> {
-    let raw = load_raw_revision(context, record.document_id, None)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?
-        .ok_or(MetadataError::GraphNotFound)?;
-    let Some(digest) = raw.dataset_digest else {
-        return Err(MetadataError::Backend(
-            "metadata raw revision has no dataset digest to fence on".to_string(),
-        ));
-    };
-    let merged = merged_jsonld(&raw).map(str::to_owned);
-    let mut status = match merged.as_deref() {
-        Some(jsonld) => assess_render(context, record.document_id, record.group_id, jsonld).await,
-        None => {
-            assess_submission(
-                context,
-                record.document_id,
-                ProfileScope::Group(record.group_id),
-                &raw.jsonld,
-            )
-            .await?
-        }
-    };
-    status.dataset_revision = raw.winning_event_id;
-    status.dataset_digest = Some(digest);
-    let mut owner = context
-        .storage_handle
-        .start_transaction(false)
-        .await
-        .map_err(MetadataError::Storage)?;
-    let txn_id = owner.id().ok_or_else(|| {
-        MetadataError::Backend("profile revalidation transaction is missing".to_string())
-    })?;
-    let fenced = parse_registry_read(
-        context
-            .storage_handle
-            .send_effect(read_document_registry(record.document_id, Some(txn_id)))
-            .await,
-    )
-    .map_err(map_registry_error)?;
-    let fenced_raw = load_raw_revision(context, record.document_id, Some(txn_id))
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let fenced_digest = fenced_raw.as_ref().and_then(|raw| raw.dataset_digest);
-    let fenced_merged = fenced_raw.as_ref().and_then(merged_jsonld);
-    if fenced.is_none() || fenced_digest != Some(digest) || fenced_merged != merged.as_deref() {
-        let _ = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        owner.finish();
-        return Err(MetadataError::Backend(
-            "metadata revision changed during profile revalidation; retry".to_string(),
-        ));
+    fn take_status(&mut self) -> Result<ProfileValidationStatus, MetadataError> {
+        self.status
+            .take()
+            .ok_or_else(|| MetadataError::Backend("the validation status is missing".to_string()))
     }
-    let (key_space, key, value) = profile_validation_entry(&status)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(MetadataError::Backend(format!(
-                "unexpected profile validation status write: {}",
-                other.label()
+
+    /// A merged document's status is bound to the render it validated, because a merge can
+    /// leave the displayed revision behind the newest event. A status written before the first
+    /// merge still carries only its event id.
+    fn stored_read(&mut self, result: IoResult) -> StatusTurn {
+        let stored = result.child::<Option<ProfileValidationStatus>, MetadataError>()??;
+        let Some(status) = stored else {
+            return Ok(Next::Done(stale_status(
+                self.record.document_id,
+                "validation_status_missing",
             )));
+        };
+        let has_digest = status.dataset_digest.is_some();
+        let current = status.dataset_revision == self.record.last_event_id;
+        self.status = Some(status);
+        if has_digest {
+            self.stage = StatusStage::Digest;
+            return Ok(Next::Call(IoCall::child(RawStateOperation::new(
+                self.record.document_id,
+            ))));
+        }
+        self.after_current(current)
+    }
+
+    fn digest_read(&mut self, result: IoResult) -> StatusTurn {
+        let state = result
+            .child::<Option<RawRevisionState>, RawReadError>()?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let digest = state
+            .and_then(|state| state.revision)
+            .and_then(|revision| revision.dataset_digest);
+        let current = self.status.as_ref().is_some_and(|status| {
+            status.dataset_digest.is_some() && status.dataset_digest == digest
+        });
+        self.after_current(current)
+    }
+
+    fn after_current(&mut self, current: bool) -> StatusTurn {
+        let mut status = self.take_status()?;
+        if !current {
+            mark_stale(&mut status, "dataset_revision_changed");
+            return Ok(Next::Done(status));
+        }
+        let Some(profile_id) = status
+            .profile_id
+            .filter(|_| status.profile_revision.is_some())
+        else {
+            return Ok(Next::Done(status));
+        };
+        self.status = Some(status);
+        self.stage = StatusStage::Profile;
+        Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(
+            profile_id,
+        ))))
+    }
+
+    fn profile_read(&mut self, result: IoResult) -> StatusTurn {
+        let mut status = self.take_status()?;
+        let validated = status.profile_revision.clone().unwrap_or_default();
+        match result.child::<Option<MetadataRegistryRecord>, StorageReadError>()? {
+            Ok(Some(profile)) if profile.last_event_id.to_string() == validated => {}
+            Ok(Some(_)) => mark_stale(&mut status, "profile_revision_changed"),
+            Ok(None) => mark_stale(&mut status, "profile_not_registered"),
+            Err(_) => mark_stale(&mut status, "profile_unavailable"),
+        }
+        Ok(Next::Done(status))
+    }
+}
+
+fn mark_stale(status: &mut ProfileValidationStatus, reason: &str) {
+    status.state = ProfileValidationState::Stale;
+    status.completeness = ProfileValidationCompleteness::Incomplete;
+    status.stale_reason = Some(reason.to_string());
+}
+
+impl Operation for ValidationStatusOperation {
+    type Output = ProfileValidationStatus;
+    type Error = MetadataError;
+
+    fn first(&mut self) -> StatusTurn {
+        Ok(Next::Call(IoCall::child(StoredStatusOperation::new(
+            self.record.document_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> StatusTurn {
+        match self.stage {
+            StatusStage::Stored => self.stored_read(result),
+            StatusStage::Digest => self.digest_read(result),
+            StatusStage::Profile => self.profile_read(result),
         }
     }
-    owner.unknown();
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            owner.finish();
-            Ok(status)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RevalidateStage {
+    Raw,
+    Assess,
+    Commit,
+}
+
+/// Validates the document's displayed revision again and stores the verdict, fenced on that
+/// revision: a document that moved on meanwhile is refused for a retry.
+#[derive(Debug, PartialEq)]
+pub struct RevalidateOperation {
+    local_node: Option<NodeId>,
+    record: MetadataRegistryRecord,
+    stage: RevalidateStage,
+    raw: Option<MetadataRawRevision>,
+}
+
+impl RevalidateOperation {
+    pub fn new(local_node: Option<NodeId>, record: MetadataRegistryRecord) -> Self {
+        Self {
+            local_node,
+            record,
+            stage: RevalidateStage::Raw,
+            raw: None,
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected profile revalidation commit: {}",
-            other.label()
-        ))),
     }
+
+    fn raw_read(&mut self, result: IoResult) -> StatusTurn {
+        let (_, raw) = result
+            .child::<RawViewOutput, RawReadError>()?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let raw = raw.ok_or(MetadataError::GraphNotFound)?;
+        if raw.dataset_digest.is_none() {
+            return Err(MetadataError::Backend(
+                "metadata raw revision has no dataset digest to fence on".to_string(),
+            ));
+        }
+        let assess = match merged_jsonld(&raw) {
+            Some(jsonld) => ProfileAssessOperation::render(
+                self.local_node,
+                self.record.document_id,
+                self.record.group_id,
+                jsonld.to_string(),
+            ),
+            None => ProfileAssessOperation::new(
+                self.local_node,
+                self.record.document_id,
+                ProfileScope::Group(self.record.group_id),
+                raw.jsonld.clone(),
+                false,
+            ),
+        };
+        self.raw = Some(raw);
+        self.stage = RevalidateStage::Assess;
+        Ok(Next::Call(IoCall::child(assess)))
+    }
+
+    fn assessed(&mut self, result: IoResult) -> StatusTurn {
+        let raw = self
+            .raw
+            .take()
+            .ok_or_else(|| MetadataError::Backend("the raw revision is missing".to_string()))?;
+        let assessed = result.child::<MetadataProfilePreview, MetadataError>()?;
+        let mut status = match merged_jsonld(&raw) {
+            Some(_) => render_verdict(assessed, self.record.document_id),
+            None => assessed?.status,
+        };
+        status.dataset_revision = raw.winning_event_id;
+        status.dataset_digest = raw.dataset_digest;
+        let commit = RevalidateCommitOperation {
+            document_id: self.record.document_id,
+            merged: merged_jsonld(&raw).map(str::to_owned),
+            digest: raw.dataset_digest,
+            status,
+            stage: CommitStage::Fence,
+        };
+        self.stage = RevalidateStage::Commit;
+        Ok(Next::Call(IoCall::child(commit)))
+    }
+}
+
+impl Operation for RevalidateOperation {
+    type Output = ProfileValidationStatus;
+    type Error = MetadataError;
+
+    fn first(&mut self) -> StatusTurn {
+        Ok(Next::Call(IoCall::child(RawViewOperation::revision(
+            self.record.document_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> StatusTurn {
+        match self.stage {
+            RevalidateStage::Raw => self.raw_read(result),
+            RevalidateStage::Assess => self.assessed(result),
+            RevalidateStage::Commit => Ok(Next::Done(
+                result.child::<ProfileValidationStatus, MetadataError>()??,
+            )),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CommitStage {
+    Fence,
+    /// Reading the raw revision again inside the transaction, the way the first read did.
+    Raw(RawViewOperation),
+    Write,
+}
+
+/// Stores a revalidated status in one write transaction, after re-reading the registry row and
+/// the raw revision it was computed for.
+#[derive(Debug, PartialEq)]
+pub struct RevalidateCommitOperation {
+    document_id: Ulid,
+    merged: Option<String>,
+    digest: Option<[u8; 32]>,
+    status: ProfileValidationStatus,
+    stage: CommitStage,
+}
+
+impl RevalidateCommitOperation {
+    fn raw_turn(&mut self, turn: Next<RawViewOutput>) -> StatusTurn {
+        let raw = match turn {
+            Next::Call(call) => return Ok(Next::Call(call)),
+            Next::Wait => return Ok(Next::Wait),
+            Next::Done((_, raw))
+            | Next::Then {
+                output: (_, raw), ..
+            } => raw,
+        };
+        let digest = raw.as_ref().and_then(|raw| raw.dataset_digest);
+        let merged = raw.as_ref().and_then(merged_jsonld);
+        if digest != self.digest || merged != self.merged.as_deref() {
+            return Err(revision_changed());
+        }
+        let row = profile_validation_entry(&self.status)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        self.stage = CommitStage::Write;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+impl Operation for RevalidateCommitOperation {
+    type Output = ProfileValidationStatus;
+    type Error = MetadataError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> StatusTurn {
+        let key = metadata_document_key(self.document_id);
+        Ok(Next::Call(read_row(DOCUMENT_INDEX_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> StatusTurn {
+        match &mut self.stage {
+            CommitStage::Fence => {
+                if value(result)?.is_none() {
+                    return Err(revision_changed());
+                }
+                let mut view = RawViewOperation::revision(self.document_id);
+                let turn = view
+                    .first()
+                    .map_err(|error| MetadataError::Backend(error.to_string()))?;
+                self.stage = CommitStage::Raw(view);
+                self.raw_turn(turn)
+            }
+            CommitStage::Raw(view) => {
+                let turn = view
+                    .next(result)
+                    .map_err(|error| MetadataError::Backend(error.to_string()))?;
+                self.raw_turn(turn)
+            }
+            CommitStage::Write => {
+                done(result)?;
+                Ok(Next::Done(self.status.clone()))
+            }
+        }
+    }
+}
+
+fn revision_changed() -> MetadataError {
+    MetadataError::Backend(
+        "metadata revision changed during profile revalidation; retry".to_string(),
+    )
 }
 
 fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
     raw.merged.as_ref().map(|merged| merged.jsonld.as_str())
-}
-
-/// A built-in Profile answers from the embedded shapes; everything else has to
-/// be registered in the realm.
-async fn resolve_profile(
-    context: &DriverContext,
-    requested_iri: &str,
-    scope: ProfileScope,
-) -> Result<ResolvedProfile, MetadataError> {
-    match builtin_shapes(requested_iri) {
-        Some(shapes) => Ok(ResolvedProfile {
-            id: None,
-            requested_iri: requested_iri.to_string(),
-            revision: BUILTIN_REVISION.to_string(),
-            shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
-            shapes: shapes.iter().map(|shapes| shapes.to_string()).collect(),
-        }),
-        None => resolve_registered_profile(context, requested_iri, scope).await,
-    }
-}
-
-async fn resolve_registered_profile(
-    context: &DriverContext,
-    requested_iri: &str,
-    scope: ProfileScope,
-) -> Result<ResolvedProfile, MetadataError> {
-    let Some(profile_id) = profile_from_iri(requested_iri) else {
-        return Err(profile_not_registered(requested_iri));
-    };
-    let record = match drive(DocumentRecordOperation::new(profile_id), context)
-        .await
-        .map_err(map_registry_error)
-    {
-        Ok(Some(record)) => record,
-        Ok(None) => return Err(profile_not_registered(requested_iri)),
-        Err(_) => {
-            return Err(unavailable_error(
-                "profile_unavailable",
-                "the registered Profile is temporarily unavailable; retry or remove the Profile tag",
-                None,
-            ));
-        }
-    };
-    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id)
-        || !scope.may_use(&record)
-    {
-        return Err(profile_not_registered(requested_iri));
-    }
-    let revision = record.last_event_id;
-    let resolved = |shapes: Vec<String>| ResolvedProfile {
-        id: Some(profile_id),
-        requested_iri: requested_iri.to_string(),
-        revision: revision.to_string(),
-        shapes_graph_iri: format!("{}#shapes/{revision}", record.graph_iri),
-        shapes,
-    };
-    let pinned = revision.to_string();
-    if let Some(shapes) = cached_shapes(context, profile_id, revision) {
-        return Ok(resolved(shapes.as_ref().clone()));
-    }
-    let exported = export_profile_routed(&Arc::new(context.clone()), record.realm_id, profile_id, revision)
-        .await
-        .map_err(|_| {
-            unavailable_error(
-                "profile_unavailable",
-                "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
-                Some(&pinned),
-            )
-        })?;
-    let ExportMetadataResult::Raw {
-        record: holder_record,
-        raw,
-        ..
-    } = exported
-    else {
-        return Err(unavailable_error(
-            "profile_unavailable",
-            "the registered Profile revision cannot be read; retry or remove the Profile tag",
-            Some(&pinned),
-        ));
-    };
-    // Usability was decided from the registry row above, so the holder copy is
-    // only fenced on identity and revision here.
-    if holder_record.document_id != record.document_id
-        || holder_record.last_event_id != revision
-        || raw.revision.winning_event_id != revision
-    {
-        return Err(unavailable_error(
-            "profile_unavailable",
-            "the registered Profile revision is changing; retry or remove the Profile tag",
-            Some(&pinned),
-        ));
-    }
-    let raw = raw.revision;
-    let (profile_data, profile_root) = data_graph(&raw.jsonld).map_err(|_| {
-        unavailable_error(
-            "profile_unavailable",
-            "the registered Profile cannot be read; retry or remove the Profile tag",
-            Some(&pinned),
-        )
-    })?;
-    if !has_type(&profile_data, &profile_root, DX_PROFILE) {
-        return Err(profile_not_registered(requested_iri));
-    }
-    let shapes = profile_shapes(&profile_data)
-        .map_err(|message| unavailable_error("profile_unavailable", &message, Some(&pinned)))?;
-    cache_shapes(context, profile_id, revision, &shapes);
-    Ok(resolved(shapes))
-}
-
-fn cached_shapes(
-    context: &DriverContext,
-    profile_id: Ulid,
-    revision: Ulid,
-) -> Option<Arc<Vec<String>>> {
-    context
-        .metadata_handle
-        .as_ref()?
-        .profile_cache()
-        .get(profile_id, revision)
-}
-
-fn cache_shapes(context: &DriverContext, profile_id: Ulid, revision: Ulid, shapes: &[String]) {
-    if let Some(metadata) = context.metadata_handle.as_ref() {
-        metadata
-            .profile_cache()
-            .insert(profile_id, revision, Arc::new(shapes.to_vec()));
-    }
-}
-
-fn map_registry_error(error: StorageReadError) -> MetadataError {
-    match error {
-        StorageReadError::Storage(error) => error.into(),
-        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
-    }
 }
 
 fn profile_from_iri(iri: &str) -> Option<Ulid> {
@@ -1242,114 +1536,329 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn keys_status_digest() {
-        // A merge can leave the displayed revision behind the newest event, so
-        // freshness follows the render's digest, not the event id.
-        use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
+    fn digest_record() -> MetadataRegistryRecord {
         use aruna_core::structs::identity::realm::RealmId;
-        use aruna_core::structs::placement::record::PlacementRef;
-        use aruna_storage::FjallStorage;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let group_id = Ulid::from_parts(1, 1);
         let document_id = Ulid::from_parts(1, 2);
-        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let record = MetadataRegistryRecord {
+        MetadataRegistryRecord {
             realm_id,
-            group_id,
+            group_id: Ulid::from_parts(1, 1),
             document_id,
             document_path: "datasets/digest".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
-            permission_path: MetadataRegistryRecord::permission_path_for(
-                &realm_id,
-                group_id,
-                "datasets/digest",
-                document_id,
-            ),
-            placement: PlacementRef::NIL,
-            holder_node_ids: vec![node_id],
+            permission_path: String::new(),
+            placement: Default::default(),
+            holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
             establishing_event_id: Ulid::from_parts(1, 3),
             last_event_id: Ulid::from_parts(2, 3),
-        };
-        let event = MetadataEventRecord {
-            event_id: record.last_event_id,
-            record: record.clone(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 4), realm_id),
-            node_id,
-            payload: MetadataEventPayload::UpsertDataEntity {
+        }
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn raw_state(digest: [u8; 32]) -> RawRevisionState {
+        RawRevisionState {
+            base: None,
+            last_event_id: Ulid::from_parts(2, 3),
+            revision: Some(MetadataRawRevision {
                 jsonld: "{}".to_string(),
-            },
-            occurred_at_ms: 1,
+                winning_event_id: Ulid::from_parts(2, 3),
+                context_digest: [1; 32],
+                dataset_digest: Some(digest),
+                merged: None,
+            }),
+            merged: true,
+        }
+    }
+
+    #[test]
+    fn keys_status_digest() {
+        // A merge can leave the displayed revision behind the newest event, so freshness
+        // follows the render's digest, not the event id.
+        let record = digest_record();
+        let status_of = |digest: Option<[u8; 32]>, revision: Ulid| {
+            let mut status = not_profiled_status(record.document_id);
+            status.dataset_revision = revision;
+            status.dataset_digest = digest;
+            status
         };
-        let render = serde_json::json!({
-            "@context": "https://w3id.org/ro/crate/1.2/context",
-            "@graph": [{ "@id": "./", "@type": "Dataset", "name": "merged" }]
-        })
-        .to_string();
-
+        let run = |stored: ProfileValidationStatus, state: Option<RawRevisionState>| {
+            let mut operation = ValidationStatusOperation::new(record.clone());
+            assert!(matches!(
+                operation.first(),
+                Ok(Next::Call(IoCall::Child(_)))
+            ));
+            let turn = operation.next(child(Ok::<_, MetadataError>(Some(stored))));
+            match turn {
+                Ok(Next::Call(IoCall::Child(_))) => {
+                    operation.next(child(Ok::<_, RawReadError>(state)))
+                }
+                other => other,
+            }
+        };
         // A status written before the first merge still keys on its event id.
-        let mut status = not_profiled_status(document_id);
-        status.dataset_revision = record.last_event_id;
-        assert!(
-            validation_is_current(&context, &record, &status)
-                .await
-                .unwrap()
+        let Ok(Next::Done(current)) = run(status_of(None, record.last_event_id), None) else {
+            panic!("expected the status");
+        };
+        assert_eq!(current.state, ProfileValidationState::NotProfiled);
+        let Ok(Next::Done(stale)) = run(status_of(Some([9; 32]), record.last_event_id), None)
+        else {
+            panic!("expected the status");
+        };
+        assert_eq!(
+            stale.stale_reason.as_deref(),
+            Some("dataset_revision_changed")
         );
-        status.dataset_digest = Some([9u8; 32]);
-        assert!(
-            !validation_is_current(&context, &record, &status)
-                .await
-                .unwrap()
-        );
+        let Ok(Next::Done(merged)) = run(
+            status_of(Some([9; 32]), Ulid::from_parts(1, 3)),
+            Some(raw_state([9; 32])),
+        ) else {
+            panic!("expected the status");
+        };
+        assert_eq!(merged.state, ProfileValidationState::NotProfiled);
+    }
 
-        let plan = crate::metadata::raw_revision::prepare_merged_event(
-            &context,
-            &event,
-            render,
-            0,
-            &mut crate::metadata::raw_revision::RawStateCache::default(),
-        )
-        .await
-        .expect("merged raw state");
-        let (key_space, key, value) = plan.state_write.clone();
-        assert!(matches!(
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space,
-                    key,
-                    value,
-                    txn_id: None,
-                })
-                .await,
-            Event::Storage(StorageEvent::WriteResult { .. })
+    #[test]
+    fn missing_status_stale() {
+        let mut operation = ValidationStatusOperation::new(digest_record());
+        operation.first().unwrap();
+        let Ok(Next::Done(status)) = operation.next(child(Ok::<_, MetadataError>(None))) else {
+            panic!("expected the status");
+        };
+        assert_eq!(
+            status.stale_reason.as_deref(),
+            Some("validation_status_missing")
+        );
+    }
+
+    #[test]
+    fn profile_ages_status() {
+        let record = digest_record();
+        let profile_id = Ulid::from_parts(8, 8);
+        let mut stored = not_profiled_status(record.document_id);
+        stored.dataset_revision = record.last_event_id;
+        stored.profile_id = Some(profile_id);
+        stored.profile_revision = Some(Ulid::from_parts(9, 9).to_string());
+        let run = |profile: Result<Option<MetadataRegistryRecord>, StorageReadError>| {
+            let mut operation = ValidationStatusOperation::new(record.clone());
+            operation.first().unwrap();
+            operation
+                .next(child(Ok::<_, MetadataError>(Some(stored.clone()))))
+                .unwrap();
+            match operation.next(child(profile)) {
+                Ok(Next::Done(status)) => status.stale_reason,
+                other => panic!("expected the status, got {other:?}"),
+            }
+        };
+        let mut profile = digest_record();
+        profile.last_event_id = Ulid::from_parts(9, 9);
+        assert_eq!(run(Ok(Some(profile.clone()))), None);
+        profile.last_event_id = Ulid::from_parts(10, 10);
+        assert_eq!(
+            run(Ok(Some(profile))).as_deref(),
+            Some("profile_revision_changed")
+        );
+        assert_eq!(run(Ok(None)).as_deref(), Some("profile_not_registered"));
+        let failed = StorageReadError::Storage(aruna_core::errors::StorageError::Timeout);
+        assert_eq!(run(Err(failed)).as_deref(), Some("profile_unavailable"));
+    }
+
+    #[test]
+    fn untagged_checks_structure() {
+        let jsonld = crate_with_tag(None);
+        let mut write =
+            ProfileAssessOperation::write(None, Ulid::nil(), Ulid::nil(), jsonld.clone());
+        let Ok(Next::Call(IoCall::Effect(check))) = write.first() else {
+            panic!("expected the structural pass");
+        };
+        assert_eq!(
+            *check,
+            Effect::Metadata(MetadataEffect::CheckStructure {
+                jsonld: jsonld.clone()
+            })
+        );
+        let report = ProfileShaclReport {
+            results: Vec::new(),
+            structural: Vec::new(),
+        };
+        let answer = event(Event::Metadata(MetadataEvent::ProfileChecked {
+            report: Ok(Box::new(report)),
+        }));
+        let Ok(Next::Done(preview)) = write.next(answer) else {
+            panic!("expected the verdict");
+        };
+        assert!(preview.accepted());
+
+        // A render skips the structural pass of an untagged crate.
+        let mut render = ProfileAssessOperation::render(None, Ulid::nil(), Ulid::nil(), jsonld);
+        assert!(matches!(render.first(), Ok(Next::Done(_))));
+    }
+
+    #[test]
+    fn missing_evaluator_unavailable() {
+        let jsonld = crate_with_tag(None);
+        let mut write =
+            ProfileAssessOperation::write(None, Ulid::nil(), Ulid::nil(), jsonld.clone());
+        write.first().unwrap();
+        let missing = event(Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        }));
+        let refused = write.next(missing);
+        assert!(untagged_without_evaluator(
+            refused.as_ref().unwrap_err(),
+            &jsonld
         ));
+        let status = submission_verdict(refused.map(|_| unreachable!()), Ulid::nil(), &jsonld);
+        assert_eq!(status, Ok(not_profiled_status(Ulid::nil())));
+    }
 
-        status.dataset_digest = plan
-            .revision
-            .as_ref()
-            .and_then(|revision| revision.dataset_digest);
-        assert!(status.dataset_digest.is_some());
-        assert!(
-            validation_is_current(&context, &record, &status)
-                .await
-                .unwrap()
+    #[test]
+    fn builtin_evaluates_shapes() {
+        let mut check =
+            ProfileAssessOperation::against(None, CRATE_PROFILE_IRI, crate_with_tag(None));
+        check.stamp(42);
+        let Ok(Next::Call(IoCall::Effect(effect))) = check.first() else {
+            panic!("expected the Profile check");
+        };
+        assert!(matches!(
+            *effect,
+            Effect::Metadata(MetadataEffect::CheckProfile { .. })
+        ));
+        let report = ProfileShaclReport {
+            results: vec![result(
+                "MinCountConstraintComponent",
+                "Violation",
+                Some("name"),
+            )],
+            structural: vec![craqle::CrateViolation {
+                code: "missing_root_data_entity",
+                message: "missing root".to_string(),
+                pointer: String::new(),
+                entity_id: None,
+            }],
+        };
+        let answer = event(Event::Metadata(MetadataEvent::ProfileChecked {
+            report: Ok(Box::new(report)),
+        }));
+        let Ok(Next::Done(preview)) = check.next(answer) else {
+            panic!("expected the verdict");
+        };
+        assert_eq!(preview.status.validated_at_ms, Some(42));
+        let status = profile_verdict(preview);
+        assert_eq!(status.state, ProfileValidationState::Invalid);
+        assert_eq!(status.findings.len(), 2);
+    }
+
+    #[test]
+    fn registered_uses_cache() {
+        // A cached revision skips the fetch; a miss fetches the Profile and keeps its shapes.
+        let mut profile = digest_record();
+        let profile_id = profile_id();
+        profile.document_id = profile_id;
+        profile.graph_iri = MetadataRegistryRecord::graph_iri_for(profile_id);
+        let iri = profile_public_iri(profile_id);
+        let start = || {
+            let mut check = ProfileAssessOperation::preview(None, None, crate_with_tag(Some(&iri)));
+            assert!(matches!(check.first(), Ok(Next::Call(IoCall::Child(_)))));
+            let cached = check.next(child(Ok::<_, StorageReadError>(Some(profile.clone()))));
+            let Ok(Next::Call(IoCall::Effect(effect))) = cached else {
+                panic!("expected the cache lookup");
+            };
+            assert_eq!(
+                *effect,
+                Effect::Metadata(MetadataEffect::CachedShapes {
+                    profile_id,
+                    revision: profile.last_event_id,
+                })
+            );
+            check
+        };
+        let mut hit = start();
+        let shapes = event(Event::Metadata(MetadataEvent::ProfileShapes {
+            shapes: Some(vec!["shape".to_string()]),
+        }));
+        assert!(matches!(
+            hit.next(shapes),
+            Ok(Next::Call(IoCall::Effect(effect))) if matches!(*effect, Effect::Metadata(MetadataEffect::CheckProfile { .. }))
+        ));
+        let mut miss = start();
+        let none = event(Event::Metadata(MetadataEvent::ProfileShapes {
+            shapes: None,
+        }));
+        assert!(matches!(miss.next(none), Ok(Next::Call(IoCall::Child(_)))));
+        let refused = child(Err::<ExportMetadataResult, _>(
+            MetadataReadError::Unavailable,
+        ));
+        let Err(MetadataError::ProfileValidation(findings)) = miss.next(refused) else {
+            panic!("expected the unavailable Profile");
+        };
+        assert_eq!(findings[0].code, "profile_unavailable");
+    }
+
+    #[test]
+    fn private_profile_unregistered() {
+        let mut profile = digest_record();
+        profile.public = false;
+        profile.document_id = profile_id();
+        profile.graph_iri = MetadataRegistryRecord::graph_iri_for(profile_id());
+        let iri = profile_public_iri(profile_id());
+        let mut check = ProfileAssessOperation::preview(None, None, crate_with_tag(Some(&iri)));
+        check.first().unwrap();
+        let Err(MetadataError::ProfileValidation(findings)) =
+            check.next(child(Ok::<_, StorageReadError>(Some(profile))))
+        else {
+            panic!("expected the refusal");
+        };
+        assert_eq!(findings[0].code, "profile_not_registered");
+    }
+
+    #[test]
+    fn revalidate_fences_revision() {
+        let record = digest_record();
+        let mut status = not_profiled_status(record.document_id);
+        status.dataset_digest = Some([9; 32]);
+        let commit = || RevalidateCommitOperation {
+            document_id: record.document_id,
+            merged: None,
+            digest: Some([9; 32]),
+            status: status.clone(),
+            stage: CommitStage::Fence,
+        };
+        let mut gone = commit();
+        assert_eq!(gone.transaction(), TransactionMode::Write);
+        gone.first().unwrap();
+        assert_eq!(
+            gone.next(IoResult::Values(vec![None])),
+            Err(revision_changed())
         );
+
+        let mut moved = commit();
+        moved.first().unwrap();
+        let row = Some(postcard::to_allocvec(&record).unwrap().into());
+        let Ok(Next::Call(IoCall::Read(_))) = moved.next(IoResult::Values(vec![row])) else {
+            panic!("expected the raw revision read");
+        };
+    }
+
+    fn profile_id() -> Ulid {
+        let handle = PlacementHandle::new(1).unwrap();
+        MetaResourceId::from_parts(2, handle, BucketId::new(1).unwrap(), 2)
+            .unwrap()
+            .as_ulid()
     }
 
     #[test]

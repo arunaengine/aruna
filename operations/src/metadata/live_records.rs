@@ -18,8 +18,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId, Value};
-use ulid::Ulid;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::metadata::call_results::read_values;
 
@@ -396,7 +396,9 @@ mod call_tests {
         let row = Some(postcard::to_allocvec(&stored).unwrap().into());
         assert_eq!(
             read.next(IoResult::Values(vec![row])),
-            Ok(Next::Call(IoCall::Read(lifecycle_reads(std::slice::from_ref(&stored)))))
+            Ok(Next::Call(IoCall::Read(lifecycle_reads(
+                std::slice::from_ref(&stored)
+            ))))
         );
         assert_eq!(
             read.next(IoResult::Values(vec![None, None])),
@@ -408,10 +410,16 @@ mod call_tests {
         let row = Some(postcard::to_allocvec(&stored).unwrap().into());
         deleted.next(IoResult::Values(vec![row])).unwrap();
         let graph = Some(postcard::to_allocvec(&tombstone(&stored)).unwrap().into());
-        assert_eq!(deleted.next(IoResult::Values(vec![graph, None])), Ok(Next::Done(None)));
+        assert_eq!(
+            deleted.next(IoResult::Values(vec![graph, None])),
+            Ok(Next::Done(None))
+        );
 
         let mut missing = LiveRecordOperation::new(stored.document_id);
         missing.first().unwrap();
-        assert_eq!(missing.next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        assert_eq!(
+            missing.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
     }
 }

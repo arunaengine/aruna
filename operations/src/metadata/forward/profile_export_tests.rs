@@ -71,7 +71,10 @@ fn local_serves_profile() {
     let mut local = ProfileLocalOperation::new(realm(), profile_id(), revision());
     assert!(matches!(local.first(), Ok(Next::Call(IoCall::Child(_)))));
     let found = child(Ok::<_, LiveRecordsError>(Some(record())));
-    assert!(matches!(local.next(found), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        local.next(found),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let raw = child(Ok::<_, RawReadError>(Some(view(revision()))));
     assert_eq!(local.next(raw), Ok(Next::Done(served())));
 }
@@ -114,7 +117,9 @@ fn missing_config_unavailable() {
     let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let mut export = ProfileExportOperation::new(Some(node), realm(), profile_id(), revision());
     export.first().unwrap();
-    let config = child(Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound));
+    let config = child(Err::<RealmConfigDocument, _>(
+        GetConfigError::DocumentNotFound,
+    ));
     assert_eq!(export.next(config), Err(MetadataReadError::Unavailable));
 }
 
@@ -126,7 +131,9 @@ fn peer_answers_collect() {
     let mut export = ProfileExportOperation::new(Some(node), realm(), profile_id(), revision());
     export.stage = ExportStage::Peers;
     export.holder_count = 2;
-    export.answers.push((node, Err(MetadataReadError::NotFound)));
+    export
+        .answers
+        .push((node, Err(MetadataReadError::NotFound)));
     let answer = MetadataTransportMessage::ExportAnswer {
         result: Ok(Box::new(served())),
     };
