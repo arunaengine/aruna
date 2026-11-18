@@ -5,7 +5,7 @@
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::usage::upload_count;
-use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
+use crate::s3::write_cleanup::{WriteCleanup, record_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -391,9 +391,9 @@ impl DeleteRecords {
     }
 
     fn delete_records(&mut self) -> Turn<()> {
-        let delete = delete_records_effect(self.input.upload_id, &self.parts, None)?;
+        let deletes = record_rows(self.input.upload_id, &self.parts)?;
         self.step = DeleteStep::DeleteRecords;
-        Ok(Next::Call(delete.into()))
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
     fn cleanup_records(&mut self) -> Turn<()> {
@@ -434,7 +434,7 @@ impl Operation for DeleteRecords {
             }
             DeleteStep::CountInventory => self.inventory_counted(result),
             DeleteStep::DeleteRecords => {
-                result.event()?;
+                result.done()?;
                 self.cleanup_records()
             }
             DeleteStep::WriteCleanup => {
@@ -495,8 +495,6 @@ impl Operation for ResetUpload {
 mod pure_tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::BackendUpload;
@@ -673,10 +671,7 @@ mod pure_tests {
         let mut delete = DeleteRecords::new(input(), vec![part()]);
         delete.step = DeleteStep::DeleteRecords;
 
-        let deleted = StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        };
-        let turn = delete.next(IoResult::Event(Box::new(Event::Storage(deleted))));
+        let turn = delete.next(IoResult::Done);
 
         let Ok(Next::Call(IoCall::Write(writes))) = turn else {
             panic!("expected cleanup records")
@@ -718,13 +713,7 @@ mod pure_tests {
                 assert_eq!(uploads, [-1]);
                 turn = delete.next(IoResult::Done);
             }
-            let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
-                panic!("expected the record delete")
-            };
-            assert!(matches!(
-                *effect,
-                Effect::Storage(StorageEffect::BatchDelete { .. })
-            ));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
         }
     }
 
@@ -736,13 +725,9 @@ mod pure_tests {
 
         let turn = delete.delete_records();
 
-        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
             panic!("expected upload records delete")
         };
-        let Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id }) = *effect else {
-            panic!("expected upload records delete")
-        };
-        assert_eq!(txn_id, None);
         assert_eq!(deletes.len(), 3);
         let upload_key = input().upload_key();
         for keyspace in [UPLOAD_KEYSPACE, aruna_core::keyspaces::ABE_PENDING_KEYSPACE] {

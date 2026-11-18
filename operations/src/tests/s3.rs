@@ -3,14 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::Effects;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
-use ulid::Ulid;
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
@@ -27,14 +23,4 @@ pub(crate) async fn seed_upload(storage: &StorageHandle, record: &MultipartUploa
         txn_id: None,
     };
     storage.send_storage_effect(write).await;
-}
-
-/// Answers the rows and the commit of a fenced write.
-pub(crate) fn fence_done(operation: &mut impl EffectOperation) -> Effects {
-    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_parts(77, 7),
-    }))
 }

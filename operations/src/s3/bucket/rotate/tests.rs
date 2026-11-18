@@ -378,7 +378,7 @@ fn concurrent_put_converted() {
             SystemTime::UNIX_EPOCH,
         );
         use aruna_core::calls::{IoCall, IoResult, Next};
-        use aruna_core::operation::{Operation, SubOperation};
+        use aruna_core::operation::Operation;
         rewrite.first().unwrap();
         let version = aruna_core::structs::storage::blob::BlobVersion::materialized(
             [1; 32],

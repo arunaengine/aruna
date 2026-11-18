@@ -912,7 +912,7 @@ async fn retire_source(
 mod tests {
     use super::*;
     use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::encryption::{BucketEncryption, SealPlan};
+    use aruna_core::structs::storage::encryption::SealPlan;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};

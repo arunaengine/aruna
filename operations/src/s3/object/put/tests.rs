@@ -1,46 +1,26 @@
-//! Tests PutObject gates, commit conflict retries, cleanup on failure and per backend dedup.
+//! Tests PutObject as calls and results: gates, the version transaction child, its conflict
+//! retries, the cleanup a failure leaves to `abort`, and per backend dedup.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
-};
-use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::format::EncodingClass;
-use aruna_core::structs::storage::format::StoredFormat;
-
-use crate::s3::usage::{QuotaGate, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::{BackendRegistry, NodeBackend};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::ChildOutcome;
+use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
-    DHT_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
-use aruna_core::operation::EffectOperation;
-use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
-};
-use aruna_core::structs::storage::routing::{
-    BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget,
-};
-use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::keyspaces::{DELETE_TRAIL_KEYSPACE, DHT_KEYSPACE};
+use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, HashIndex};
+use aruna_core::structs::storage::format::{Compression, StoredFormat};
+use aruna_core::structs::storage::routing::{BackendCatalog, NodeRoutingRule, RoutingTarget};
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
-use std::collections::HashMap;
 use std::fs::{exists, read_to_string};
 use std::path::Path;
 use tempfile::tempdir;
-use ulid::Ulid;
 
 fn count_files(path: &Path) -> usize {
     std::fs::read_dir(path)
@@ -50,11 +30,7 @@ fn count_files(path: &Path) -> usize {
         .sum()
 }
 
-async fn read_value(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Option<aruna_core::types::Value> {
+async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -66,11 +42,10 @@ async fn read_value(
     else {
         panic!("unexpected storage read result");
     };
-
     value
 }
 
-fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
+fn test_location(created_by: UserId) -> BackendLocation {
     BackendLocation {
         backend: BackendRef::node_default(),
         storage_class: None,
@@ -88,13 +63,16 @@ fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
     }
 }
 
-pub(super) fn put_config(
-    realm_id: RealmId,
-    group_id: Ulid,
-    node_id: aruna_core::NodeId,
-) -> PutObjectConfig {
+fn hashed(mut location: BackendLocation) -> BackendLocation {
+    location
+        .hashes
+        .insert(HASH_BLAKE3.to_string(), vec![7u8; 32]);
+    location
+}
+
+pub(super) fn put_config(realm_id: RealmId, group_id: Ulid, node_id: NodeId) -> PutObjectConfig {
     PutObjectConfig {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: UserId::local(Ulid::generate(), realm_id),
         group_id,
         realm_id,
         node_id,
@@ -114,868 +92,408 @@ pub(super) fn put_config(
     }
 }
 
-fn fence_clear() -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: crate::s3::purge_fence::fence_key("mybucket"),
-        value: None,
-    })
-}
-
-/// Answers an encryption settings read for a bucket without settings.
-fn no_settings() -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: b"mybucket".to_vec().into(),
-        value: None,
-    })
-}
-
-#[test]
-fn guard_allows_edit() {
-    // A routing or CORS edit is prospective policy, not a different bucket:
-    // it must not discard a write that already landed.
+fn config() -> PutObjectConfig {
     let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let config = put_config(realm_id, group_id, node_id);
-    let expected = BucketInfo {
+    put_config(
+        realm_id,
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    )
+}
+
+pub(super) fn values(values: Vec<Option<Value>>) -> IoResult {
+    IoResult::Values(values)
+}
+
+pub(super) fn event(event: Event) -> IoResult {
+    IoResult::Event(Box::new(event))
+}
+
+/// The version transaction's answer to its parent.
+pub(super) fn published(result: Result<PutObjectResult, PutObjectError>) -> IoResult {
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+pub(super) fn read_spaces(turn: &Turn) -> Vec<&str> {
+    match turn {
+        Ok(Next::Call(IoCall::Read(reads))) => reads.iter().map(|(space, _)| &space[..]).collect(),
+        other => panic!("expected a read, got {other:?}"),
+    }
+}
+
+pub(super) fn written(turn: &Turn) -> &[(String, Key, Value)] {
+    match turn {
+        Ok(Next::Call(IoCall::Write(rows))) => rows,
+        other => panic!("expected a write, got {other:?}"),
+    }
+}
+
+pub(super) fn asked(turn: &Turn) -> &Effect {
+    match turn {
+        Ok(Next::Call(IoCall::Effect(effect))) => effect,
+        other => panic!("expected an effect, got {other:?}"),
+    }
+}
+
+/// The cleanup rows among `calls`, in order.
+pub(super) fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
+    let rows = calls.iter().filter_map(|call| match call {
+        IoCall::Write(rows) => Some(rows),
+        _ => None,
+    });
+    rows.flatten()
+        .map(|(space, _, value)| {
+            assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
+            BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
+        })
+        .collect()
+}
+
+/// `calls` delete the written blob through a rollback child, and nothing else.
+fn assert_rolls_back(calls: &[IoCall], location: &BackendLocation) {
+    let rollback = IoCall::child(RollbackWrite::new(location.clone()));
+    assert_eq!(calls, [rollback]);
+}
+
+/// The version transaction of a put that wrote `location`.
+pub(super) fn publisher(
+    mut operation: PutObjectOperation,
+    location: BackendLocation,
+) -> PutObjectOperation {
+    operation.written_location = Some(location);
+    operation.publish_child()
+}
+
+/// A put waiting for its version transaction after writing `location`.
+fn waiting(location: BackendLocation) -> PutObjectOperation {
+    let mut operation = PutObjectOperation::new(config());
+    operation.written_location = Some(location);
+    operation.version_id = Some(Ulid::generate());
+    operation.state = PutObjectState::Publish;
+    operation
+}
+
+fn bucket(group_id: Ulid, created_by: UserId, compression: Compression) -> BucketInfo {
+    BucketInfo {
         group_id,
         created_at: std::time::SystemTime::UNIX_EPOCH,
-        created_by: config.user_id,
+        created_by,
         cors_configuration: None,
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
-        compression: Compression::Off,
+        compression,
         distribution: None,
-    };
+    }
+}
+
+/// Runs the version transaction up to its bucket read and answers it with `bucket`.
+fn bucket_answer(child: &mut PutObjectOperation, bucket: &BucketInfo) -> Turn {
+    assert_eq!(child.transaction(), TransactionMode::Write);
+    assert_eq!(read_spaces(&child.first()), [PURGE_FENCE_KEYSPACE]);
+    let turn = child.next(values(vec![None]));
+    assert_eq!(
+        read_spaces(&turn),
+        [S3_BUCKET_KEYSPACE, NODE_SUBJECT_KEYSPACE]
+    );
+    child.next(values(vec![Some(bucket.to_bytes().unwrap().into()), None]))
+}
+
+#[test]
+fn guard_allows_edit() {
+    // A routing or CORS edit is prospective policy, not a different bucket: it must not
+    // discard a write that already landed.
+    let config = config();
+    let expected = bucket(config.group_id, config.user_id, Compression::Off);
     let edited = BucketInfo {
         cors_configuration: Some(
             aruna_core::structs::storage::blob::BucketCorsConfiguration { rules: Vec::new() },
         ),
         ..expected.clone()
     };
-    let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
-    op.state = PutObjectState::StartTransaction;
-    op.written_location = Some(test_location(op.config.user_id));
-    op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }));
-    op.step(fence_clear());
+    let created_by = config.user_id;
+    let operation = PutObjectOperation::new(config).with_bucket_guard(expected);
+    let mut child = publisher(operation, test_location(created_by));
 
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                b"mybucket".to_vec().into(),
-                Some(edited.to_bytes().unwrap().into()),
-            ),
-            (b"subject".to_vec().into(), None),
-        ],
-    }));
-    let mut effects = effects;
-    effects.extend(op.step(no_settings()));
+    let turn = bucket_answer(&mut child, &edited);
+    assert_eq!(read_spaces(&turn), [BUCKET_ENCRYPTION_KEYSPACE]);
 
-    // Past the guard the minimal fixture fails at the hash step; a recreate
-    // would have ended here with a transaction conflict instead.
-    let outcome = op.finalize();
+    // Past the guard the minimal fixture fails at the hash step; a recreate would have
+    // ended with a transaction conflict instead.
+    let turn = child.next(values(vec![None]));
     assert!(
-        matches!(outcome, Err(PutObjectError::MissingHash(_))),
-        "expected the write to pass the guard, got {outcome:?} after {effects:?}"
+        matches!(turn, Err(PutObjectError::MissingHash(_))),
+        "expected the write to pass the guard, got {turn:?}"
     );
 }
 
 #[test]
 fn stale_encoding_rejected() {
-    // The setting changed while the bytes streamed: the raw copy must not become
-    // a version a finished migration would never revisit.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let config = put_config(realm_id, group_id, node_id);
-    let current = BucketInfo {
-        group_id,
-        created_at: std::time::SystemTime::UNIX_EPOCH,
-        created_by: config.user_id,
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Zstd { level: 3 },
-        distribution: None,
-    };
-    let mut op = PutObjectOperation::new(config);
-    op.state = PutObjectState::StartTransaction;
-    op.written_location = Some(test_location(op.config.user_id));
-    op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }));
-    op.step(fence_clear());
-
-    op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                b"mybucket".to_vec().into(),
-                Some(current.to_bytes().unwrap().into()),
-            ),
-            (b"subject".to_vec().into(), None),
-        ],
-    }));
-    op.step(Event::Blob(BlobEvent::DeleteFinished));
-
-    assert_eq!(
-        op.finalize(),
-        Err(PutObjectError::StorageError(
-            StorageError::TransactionConflict
-        ))
+    // The setting changed while the bytes streamed: the raw copy must not become a version a
+    // finished migration would never revisit.
+    let config = config();
+    let current = bucket(
+        config.group_id,
+        config.user_id,
+        Compression::Zstd { level: 3 },
     );
+    let created_by = config.user_id;
+    let mut child = publisher(PutObjectOperation::new(config), test_location(created_by));
+
+    let turn = bucket_answer(&mut child, &current);
+
+    assert_eq!(turn.err(), Some(StorageError::TransactionConflict.into()));
 }
 
 #[test]
 fn recreate_rejected() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let config = put_config(realm_id, group_id, node_id);
-    let expected = BucketInfo {
-        group_id,
-        created_at: std::time::SystemTime::UNIX_EPOCH,
-        created_by: config.user_id,
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    };
+    let config = config();
+    let expected = bucket(config.group_id, config.user_id, Compression::Off);
     let recreated = BucketInfo {
-        created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        created_at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         ..expected.clone()
     };
-    let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
-    op.state = PutObjectState::StartTransaction;
-    op.written_location = Some(test_location(op.config.user_id));
+    let created_by = config.user_id;
+    let operation = PutObjectOperation::new(config).with_bucket_guard(expected);
+    let mut child = publisher(operation, test_location(created_by));
 
-    let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == PURGE_FENCE_KEYSPACE
-    ));
-    let effects = op.step(fence_clear());
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
-            if reads.first().map(|(space, _)| space.as_str()) == Some(S3_BUCKET_KEYSPACE)
-    ));
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                b"mybucket".to_vec().into(),
-                Some(recreated.to_bytes().unwrap().into()),
-            ),
-            (b"subject".to_vec().into(), None),
-        ],
-    }));
+    let turn = bucket_answer(&mut child, &recreated);
 
-    // The terminal state is complete, so this is the only chance to release
-    // the transaction the guard read joined.
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [
-                Effect::Blob(BlobEffect::Delete { .. }),
-                Effect::Storage(StorageEffect::AbortTransaction { .. }),
-            ]
-        ),
-        "expected a rollback, got {effects:?}"
-    );
-    assert!(op.is_complete());
-    assert!(op.step(Event::Blob(BlobEvent::DeleteFinished)).is_empty());
-    assert_eq!(
-        op.finalize(),
-        Err(PutObjectError::StorageError(
-            StorageError::TransactionConflict
-        ))
-    );
-}
-
-#[test]
-fn error_closes_transaction() {
-    // Error is a complete state, so nothing else can release the transaction.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let txn_id = Ulid::generate();
-    op.state = PutObjectState::CheckHashLookup;
-    op.txn_id = Some(txn_id);
-
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"unexpected".to_vec().into(),
-    }));
-
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    );
-    assert!(op.txn_id.is_none());
-    // Replaying the terminal state must not abort the same transaction twice.
-    assert!(
-        op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }))
-            .is_empty()
-    );
+    assert_eq!(turn.err(), Some(StorageError::TransactionConflict.into()));
+    // The version transaction leaves the cleanup to its parent.
+    assert!(child.abort().is_empty());
 }
 
 #[test]
 fn rejects_write_error() {
-    // A rejected body stream (e.g. trailer checksum mismatch) must
-    // surface WriteFailed instead of InvalidOperationState.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    op.state = PutObjectState::WriteBlob;
+    // A rejected body stream (e.g. trailer checksum mismatch) surfaces WriteFailed.
+    let mut operation = PutObjectOperation::new(config());
+    operation.state = PutObjectState::WriteBlob;
 
-    let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::StreamFailed(
-        "checksum mismatch".to_string(),
-    ))));
+    let failed = BlobError::StreamFailed("checksum mismatch".to_string());
+    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed))));
 
-    assert!(effects.is_empty());
-    assert!(op.is_complete());
-    assert!(matches!(op.finalize(), Err(PutObjectError::WriteFailed(_))));
+    assert!(matches!(turn, Err(PutObjectError::WriteFailed(_))));
+    assert!(operation.abort().is_empty());
 }
 
 #[test]
 fn rejects_server_write() {
     // A full or flapping disk must never be reported as a client bad digest.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    op.state = PutObjectState::WriteBlob;
+    let mut operation = PutObjectOperation::new(config());
+    operation.state = PutObjectState::WriteBlob;
 
-    let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
-        "No space left on device".to_string(),
-    ))));
+    let failed = BlobError::WriteError("No space left on device".to_string());
+    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed))));
 
-    assert!(effects.is_empty());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(PutObjectError::BlobWriteFailed(_))
-    ));
+    assert!(matches!(turn, Err(PutObjectError::BlobWriteFailed(_))));
 }
 
 #[test]
 fn quota_error_cleans() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-    let txn_id = Ulid::generate();
-    let location = test_location(op.config.user_id);
+    // A quota or counter failure in the version transaction rolls the written blob back.
+    let config = config();
+    let (group_id, node_id) = (config.group_id, config.node_id);
+    let location = test_location(config.user_id);
+    let mut child = publisher(PutObjectOperation::new(config), location.clone());
+    child.quota_gate = Some(QuotaGate::new(1, 1, group_id, node_id));
+    let turn = child.handle_enforce_quota(IoResult::Done);
+    let error = turn.unwrap_err();
+    assert!(matches!(error, PutObjectError::QuotaGateError(_)));
 
-    op.state = PutObjectState::EnforceQuota;
-    op.txn_id = Some(txn_id);
-    op.written_location = Some(location.clone());
-    op.quota_gate = Some(QuotaGate::new(1, 1, group_id, node_id));
-
-    let effects = op.handle_enforce_quota(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects[0],
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id: observed }) if observed == txn_id
-    ));
-    assert_eq!(op.txn_id, None);
-
-    let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-
-    let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
-        panic!("expected blob cleanup")
-    };
-    assert_eq!(deleted, &location);
-
-    let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-
-    assert!(effects.is_empty());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(crate::s3::object::put::PutObjectError::QuotaGateError(_))
-    ));
-}
-
-#[test]
-fn usage_error_cleans() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-    let txn_id = Ulid::generate();
-    let location = test_location(op.config.user_id);
-
-    op.state = PutObjectState::UpdateUsage;
-    op.txn_id = Some(txn_id);
-    op.written_location = Some(location.clone());
-    op.usage_update = Some(UsageCounterUpdate::for_group(
+    child.usage_update = Some(UsageCounterUpdate::for_group(
         group_id,
         UsageDelta::default(),
     ));
+    child.usage_update.as_mut().unwrap().start_calls();
+    let turn = child.handle_usage_update(values(vec![None]));
+    assert!(matches!(turn, Err(PutObjectError::UsageUpdateError(_))));
 
-    let effects = op.handle_usage_update(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects[0],
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id: observed }) if observed == txn_id
-    ));
-    assert_eq!(op.txn_id, None);
-
-    let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-
-    let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
-        panic!("expected blob cleanup")
-    };
-    assert_eq!(deleted, &location);
-
-    let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-
-    assert!(effects.is_empty());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(crate::s3::object::put::PutObjectError::UsageUpdateError(_))
-    ));
+    let mut operation = waiting(location.clone());
+    let turn = operation.next(published(Err(error)));
+    assert!(matches!(turn, Err(PutObjectError::QuotaGateError(_))));
+    assert_rolls_back(&operation.abort(), &location);
 }
 
 #[test]
 fn retries_commit_conflict() {
-    // Concurrent writes contend on the usage counters; the streamed blob
-    // stays put and only the metadata transaction reopens.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let node_id = iroh::SecretKey::generate().public();
-    let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
-    let location = test_location(op.config.user_id);
-    let version_id = Ulid::generate();
+    // Concurrent writes contend on the usage counters; the written blob stays put and only
+    // the version transaction runs again, with the same version id.
+    let location = test_location(UserId::default());
+    let mut operation = waiting(location.clone());
+    let version_id = operation.version_id;
 
-    op.state = PutObjectState::CommitTransaction;
-    op.txn_id = Some(Ulid::generate());
-    op.version_id = Some(version_id);
-    op.written_location = Some(location.clone());
-    op.cleanup_location = Some(location.clone());
-    op.new_blob = true;
+    let conflict = StorageError::TransactionConflict;
+    let turn = operation.next(published(Err(conflict.into())));
 
-    let effects = op.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::TransactionConflict,
-    }));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, PutObjectState::Publish);
+    assert_eq!(operation.written_location, Some(location.clone()));
+    assert_eq!(operation.version_id, version_id);
+    let child = operation.publish_child();
+    assert_eq!(child.version_id, version_id);
+    assert_eq!(child.written_location, Some(location.clone()));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-    assert_eq!(op.state, PutObjectState::StartTransaction);
-    assert!(op.txn_id.is_none());
-    assert_eq!(op.written_location, Some(location.clone()));
-    assert_eq!(op.cleanup_location, None);
-    assert!(!op.new_blob);
-    // The retry must stay the same write, not mint a second version.
-    assert_eq!(op.version_id, Some(version_id));
-
-    let retry_txn = Ulid::generate();
-    op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: retry_txn,
-    }));
-    assert_eq!(op.state, PutObjectState::CheckPurgeFence);
-    assert_eq!(op.txn_id, Some(retry_txn));
-
-    op.state = PutObjectState::CommitTransaction;
-    let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: retry_txn,
-    }));
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReleaseReservation {
-            id: location.ulid
-        })]
-    );
+    let result = PutObjectResult {
+        location,
+        version_id: version_id.unwrap(),
+        replayed: false,
+    };
+    let turn = operation.next(published(Ok(result.clone())));
+    assert_eq!(turn, Ok(Next::Done(result)));
 }
 
 #[test]
 fn conflict_exhausts_retries() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let node_id = iroh::SecretKey::generate().public();
-    let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-    let txn_id = Ulid::generate();
-    let location = test_location(op.config.user_id);
-
-    op.state = PutObjectState::CommitTransaction;
-    op.txn_id = Some(txn_id);
-    op.written_location = Some(location.clone());
-
-    let conflict = || {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })
-    };
-    for _ in 0..super::CONFLICT_RETRIES {
-        assert!(matches!(
-            op.step(conflict()).as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
-        op.state = PutObjectState::CommitTransaction;
+    let location = test_location(UserId::default());
+    let mut operation = waiting(location.clone());
+    let conflict = || published(Err(StorageError::TransactionConflict.into()));
+    for _ in 0..CONFLICT_RETRIES {
+        let turn = operation.next(conflict());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     }
 
-    let effects = op.step(conflict());
+    let turn = operation.next(conflict());
 
-    let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
-        panic!("expected blob cleanup")
-    };
-    assert_eq!(deleted, &location);
-
-    let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-
-    assert!(effects.is_empty());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(crate::s3::object::put::PutObjectError::StorageError(
-            StorageError::TransactionConflict
-        ))
-    ));
+    assert_eq!(turn.err(), Some(StorageError::TransactionConflict.into()));
+    assert_rolls_back(&operation.abort(), &location);
 }
 
 #[test]
 fn fence_refuses_replay() {
-    // Two pulls of one device version race: the loser's commit conflicts, its retry reads
-    // the winner's receipt and drops its own bytes instead of minting a second version.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let node_id = iroh::SecretKey::generate().public();
-    let receipt: aruna_core::types::Key = b"receipt".to_vec().into();
+    // Two pulls of one device version race: the loser's commit conflicts, its rerun reads the
+    // winner's receipt and drops its own bytes instead of minting a second version.
+    let receipt: Key = b"receipt".to_vec().into();
     let space = "receipts".to_string();
-    let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id))
-        .with_fence(
-            vec![(space.clone(), receipt.clone(), None)],
-            vec![(space, receipt.clone())],
-        );
-    let mut location = test_location(op.config.user_id);
-    location.hashes.insert(
-        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-        vec![7u8; 32],
+    let operation = PutObjectOperation::new(config()).with_fence(
+        vec![(space.clone(), receipt.clone(), None)],
+        vec![(space, receipt)],
     );
-    let (txn_id, version_id) = (Ulid::generate(), Ulid::generate());
-    op.txn_id = Some(txn_id);
-    op.version_id = Some(version_id);
-    op.written_location = Some(location.clone());
+    let location = hashed(test_location(UserId::default()));
+    let mut parent = operation;
+    parent.written_location = Some(location.clone());
+    let mut child = parent.publish_child();
+    let version_id = child.version_id.unwrap();
 
     // Both transactions find the receipt free, so both record their version id.
-    assert!(matches!(
-        op.write_cleanup_row(txn_id).as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(observed), .. })]
-            if *observed == txn_id
-    ));
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(receipt.clone(), None)],
-    }));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the receipt write, got {effects:?}")
-    };
-    assert_eq!(writes[0].2.as_ref(), version_id.to_bytes());
-    // The cleanup row follows in the same transaction, then the commit conflicts.
-    assert!(matches!(
-        op.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }))
-        .as_slice(),
-        [Effect::Storage(StorageEffect::Write { .. })]
-    ));
-    op.state = PutObjectState::CommitTransaction;
-    assert!(matches!(
-        op.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }))
-        .as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction { .. })]
-    ));
+    let turn = child.write_cleanup_row();
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = child.next(values(vec![None]));
+    assert_eq!(written(&turn)[0].2.as_ref(), version_id.to_bytes());
+    // The reconcile row follows in the same transaction.
+    let turn = child.next(IoResult::Done);
+    assert_eq!(written(&turn)[0].0, BLOB_CLEANUP_KEYSPACE);
 
-    // The retry reads the guard again and finds the other pull's receipt.
-    let retry = Ulid::generate();
-    op.txn_id = Some(retry);
-    assert!(matches!(
-        op.write_cleanup_row(retry).as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ));
-    let winner: aruna_core::types::Value = Ulid::generate().to_bytes().to_vec().into();
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(receipt, Some(winner))],
-    }));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Blob(BlobEffect::Delete { location: deleted }) if *deleted == location
-    )));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id }) if *txn_id == retry
-    )));
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(crate::s3::object::put::PutObjectError::FenceTaken)
-    ));
+    // The rerun reads the guard again and finds the other pull's receipt.
+    let mut rerun = parent.publish_child();
+    rerun.write_cleanup_row().unwrap();
+    let winner: Value = Ulid::generate().to_bytes().to_vec().into();
+    let turn = rerun.next(values(vec![Some(winner)]));
+    assert_eq!(turn.err(), Some(PutObjectError::FenceTaken));
+
+    parent.state = PutObjectState::Publish;
+    parent
+        .next(published(Err(PutObjectError::FenceTaken)))
+        .unwrap_err();
+    assert_rolls_back(&parent.abort(), &location);
 }
 
 #[test]
 fn writes_before_commit() {
-    // The reconciliation row must commit atomically with metadata ownership.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let node_id = iroh::SecretKey::generate().public();
-    let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
-    let txn_id = Ulid::generate();
-    let mut location = test_location(op.config.user_id);
-    location.hashes.insert(
-        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-        vec![7u8; 32],
-    );
-    op.txn_id = Some(txn_id);
-    op.written_location = Some(location.clone());
+    // The reconciliation row commits atomically with metadata ownership.
+    let location = hashed(test_location(UserId::default()));
+    let mut child = publisher(PutObjectOperation::new(config()), location.clone());
 
-    let effects = op.write_cleanup_row(txn_id);
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            txn_id: observed,
-            value,
-            ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected a transactional reconciliation row, got {effects:?}")
+    let turn = child.write_cleanup_row();
+
+    let [(space, key, value)] = written(&turn) else {
+        panic!("expected a reconciliation row, got {turn:?}")
     };
-    assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+    assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
     assert_eq!(key.as_ref(), location.ulid.to_bytes());
-    assert_eq!(*observed, Some(txn_id));
     assert!(matches!(
-        super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
-        super::BlobCleanupWork::ReconcileWrite {
+        BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+        BlobCleanupWork::ReconcileWrite {
             location: observed,
-            owner: super::WriteOwner::Blob { blake3, .. },
+            owner: WriteOwner::Blob { blake3, .. },
         } if blake3 == [7u8; 32] && observed == location
-    ));
-
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"cleanup".to_vec().into(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { txn_id: observed })]
-            if *observed == txn_id
     ));
 }
 
 #[test]
 fn release_after_commit() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let location = test_location(op.config.user_id);
-    let id = location.ulid;
-    op.state = PutObjectState::CommitTransaction;
-    op.written_location = Some(location);
+    // The reservation is released, the bytes announced and the snapshot published after the
+    // version commits.
+    let location = hashed(test_location(UserId::default()));
+    let mut child = publisher(PutObjectOperation::new(config()), location.clone());
+    child.output = Some(location.clone());
 
-    let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::generate(),
-    }));
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReleaseReservation { id })]
-    );
-    assert_eq!(op.state, PutObjectState::ReleaseReservation);
-
-    let effects = op.step(Event::Blob(BlobEvent::ReservationReleased { id }));
-    assert_eq!(op.state, PutObjectState::Finish);
-    assert_eq!(effects.len(), 1);
-    assert!(
-        op.step(Event::Blob(BlobEvent::ReservationReleased { id }))
-            .is_empty()
-    );
-}
-
-#[test]
-fn release_failure_succeeds() {
-    // A refused release after a durable commit hands the reservation to the
-    // cleanup queue; the client must not be told its committed write failed.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let mut location = test_location(op.config.user_id);
-    location.hashes.insert(
-        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-        vec![7u8; 32],
-    );
-    let id = location.ulid;
-    op.version_id = Some(Ulid::generate());
-    op.state = PutObjectState::CommitTransaction;
-    op.written_location = Some(location.clone());
-    op.output = Some(Ok(location.clone()));
-
-    op.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::generate(),
-    }));
-    let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
-        "release refused".to_string(),
-    ))));
-
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected a reconciliation row, got {effects:?}")
+    let Ok(Next::Then { output, calls }) = child.finish_publish() else {
+        panic!("expected the result with its follow-up calls")
     };
-    assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
-    assert!(matches!(
-        super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
-        super::BlobCleanupWork::ReconcileWrite { location: observed, .. }
-            if observed.ulid == id
-    ));
 
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"k".to_vec().into(),
+    assert_eq!(output.location, location);
+    let release = IoCall::from(Effect::Blob(BlobEffect::ReleaseReservation {
+        id: location.ulid,
     }));
-    assert_eq!(effects.len(), 1);
-    assert_eq!(op.state, PutObjectState::Finish);
-    assert!(matches!(
-        op.finalize(),
-        Ok(result) if result.location == location
-    ));
-}
-
-#[test]
-fn release_on_failure() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let mut location = test_location(op.config.user_id);
-    location.hashes.insert(
-        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-        vec![7u8; 32],
-    );
-    let id = location.ulid;
-    op.cleanup
-        .set_error(PutObjectError::StorageError(StorageError::CommitFailed));
-    op.cleanup.set_release(id);
-    op.state = PutObjectState::QueueCleanupRow;
-    assert!(
-        op.cleanup
-            .queue(super::BlobCleanupWork::ReconcileWrite {
-                location,
-                owner: super::WriteOwner::Blob {
-                    blake3: [7u8; 32],
-                    realm_id,
-                    ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
-                    announce: true,
-                },
-            })
-            .is_some()
-    );
-
-    // The row is retried until storage accepts it; only then is the
-    // reservation released.
-    for _ in 0..2 {
-        assert!(matches!(
-            op.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            }))
-            .as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-    }
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"k".to_vec().into(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ReleaseReservation { id: observed })]
-            if *observed == id
-    ));
-    assert!(
-        op.step(Event::Blob(BlobEvent::ReservationReleased { id }))
-            .is_empty()
-    );
-    assert!(op.is_complete());
-}
-
-#[test]
-fn closed_keeps_hold() {
-    // A closed storage channel leaves the durable reservation for restart reconciliation.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let location = test_location(op.config.user_id);
-    let id = location.ulid;
-    op.cleanup
-        .set_error(PutObjectError::StorageError(StorageError::ChannelClosed));
-    op.cleanup.set_release(id);
-    op.state = PutObjectState::QueueCleanupRow;
-    assert!(
-        op.cleanup
-            .queue(super::BlobCleanupWork::ReconcileReservation { location })
-            .is_some()
-    );
-
-    let effects = op.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::ChannelClosed,
-    }));
-    assert!(effects.is_empty());
-    assert_eq!(op.cleanup.release_id(), Some(id));
-    assert!(op.cleanup.retry(&StorageError::Timeout).is_none());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(PutObjectError::StorageError(StorageError::ChannelClosed))
-    ));
-}
-
-#[test]
-fn exhausted_keeps_hold() {
-    // Exhausted cleanup retries must not release a reservation whose row was
-    // never accepted; the pending error still fails the request.
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(put_config(
-        realm_id,
-        Ulid::generate(),
-        iroh::SecretKey::generate().public(),
-    ));
-    let location = test_location(op.config.user_id);
-    let id = location.ulid;
-    op.cleanup
-        .set_error(PutObjectError::StorageError(StorageError::Timeout));
-    op.cleanup.set_release(id);
-    op.state = PutObjectState::QueueCleanupRow;
-    assert!(
-        op.cleanup
-            .queue(super::BlobCleanupWork::ReconcileReservation { location })
-            .is_some()
-    );
-
-    for _ in 0..3 {
-        assert!(matches!(
-            op.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            }))
-            .as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-    }
-    let effects = op.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-
-    assert!(effects.is_empty());
-    assert_eq!(op.cleanup.release_id(), Some(id));
-    assert!(op.cleanup.retry(&StorageError::Timeout).is_none());
-    assert!(op.is_complete());
-    assert!(matches!(
-        op.finalize(),
-        Err(PutObjectError::StorageError(StorageError::Timeout))
-    ));
+    assert_eq!(calls.first(), Some(&release));
+    assert!(calls.contains(&IoCall::from(schedule_snapshot_publish())));
+    assert!(calls.iter().any(|call| matches!(
+        call,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Net(_))
+    )));
 }
 
 #[test]
 fn unknown_keeps_blob() {
-    // Only a proven refusal rolls the blob back; any other commit failure
-    // may already own the version, so the copy goes to reconciliation.
+    // Only a proven refusal rolls the blob back; any other commit failure may already own
+    // the version, so the copy goes to reconciliation and its reservation is released.
     for error in [
         StorageError::CommitFailed,
         StorageError::PersistError("journal".to_string()),
         StorageError::Timeout,
     ] {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = iroh::SecretKey::generate().public();
-        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
-        op.state = PutObjectState::CommitTransaction;
-        op.txn_id = Some(Ulid::generate());
-        let mut location = test_location(op.config.user_id);
-        location.hashes.insert(
-            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-            vec![7u8; 32],
-        );
-        let release_id = location.ulid;
-        op.written_location = Some(location.clone());
+        let location = hashed(test_location(UserId::default()));
+        let mut operation = waiting(location.clone());
+        let realm_id = operation.config.realm_id;
 
-        let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: error.clone(),
-        }));
+        let turn = operation.next(published(Err(error.clone().into())));
 
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("{error} must queue reconciliation, got {effects:?}")
-        };
-        assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(turn.err(), Some(error.into()));
+        let calls = operation.abort();
         assert_eq!(
-            super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
-            super::BlobCleanupWork::ReconcileWrite {
-                location,
-                owner: super::WriteOwner::Blob {
+            cleanup_works(&calls),
+            [BlobCleanupWork::ReconcileWrite {
+                location: location.clone(),
+                owner: WriteOwner::Blob {
                     blake3: [7u8; 32],
                     realm_id,
-                    ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
+                    ttl_ms: RoCrateLimits::default().holder_ttl_ms,
                     announce: true,
                 },
-            }
+            }]
         );
-
-        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"k".to_vec().into(),
+        let release = IoCall::from(Effect::Blob(BlobEffect::ReleaseReservation {
+            id: location.ulid,
         }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReleaseReservation {
-                id: release_id
-            })]
-        );
-        let effects = op.step(Event::Blob(BlobEvent::ReservationReleased {
-            id: release_id,
-        }));
-        assert!(effects.is_empty());
-        assert!(op.is_complete());
-        assert!(matches!(
-            op.finalize(),
-            Err(PutObjectError::StorageError(observed)) if observed == error
-        ));
+        assert_eq!(calls.last(), Some(&release));
     }
+}
+
+#[test]
+fn cut_publish_reconciles() {
+    // A run that ends while its version transaction runs may have committed: the bytes go to
+    // reconciliation, without a release.
+    let location = hashed(test_location(UserId::default()));
+    let mut operation = waiting(location.clone());
+
+    let calls = operation.abort();
+
+    assert!(matches!(
+        cleanup_works(&calls).as_slice(),
+        [BlobCleanupWork::ReconcileWrite { location: kept, .. }] if *kept == location
+    ));
+    assert_eq!(calls.len(), 1);
 }
 
 #[tokio::test]
@@ -1730,328 +1248,6 @@ async fn delete_keeps_copy() {
     assert_eq!(count_files(Path::new(&cold_root)), 1);
 }
 
-#[test]
-fn generation_increments() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(PutObjectConfig {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
-        group_id: Ulid::generate(),
-        realm_id,
-        node_id: iroh::SecretKey::generate().public(),
-        request: PutObjectInput {
-            bucket: "mybucket".to_string(),
-            key: "some-file.txt".to_string(),
-            content_length: None,
-            body: None,
-        },
-        expected_checksums: vec![],
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: None,
-        routing: RoutingSnapshot::single(Ulid::generate()),
-    });
-    let version_id = Ulid::generate();
-    op.version_id = Some(version_id);
-    op.output = Some(Ok(BackendLocation {
-        backend: BackendRef::node_default(),
-        storage_class: None,
-        root: "/tmp".to_string(),
-        storage_bucket: "bucket".to_string(),
-        backend_path: "path".to_string(),
-        ulid: Ulid::generate(),
-        format: StoredFormat::default(),
-        created_by: op.config.user_id,
-        created_at: std::time::SystemTime::now(),
-        staging: false,
-        partial: false,
-        blob_size: 1,
-        hashes: HashMap::new(),
-    }));
-    op.txn_id = Some(Ulid::generate());
-    let existing = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
-
-    let effects = op.object_lookup_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: Some(existing.to_bytes().unwrap().into()),
-    }));
-    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-        panic!("expected liveness version read")
-    };
-    assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
-
-    let effects = op.liveness_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: None,
-    }));
-    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-        panic!("expected current pointer write")
-    };
-    assert_eq!(
-        CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
-        CurrentVersionPointer::new_with_generation(version_id, 5)
-    );
-}
-
-#[test]
-fn dedup_keeps_writer() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let (first, writer) = (
-        aruna_core::UserId::local(Ulid::generate(), realm_id),
-        aruna_core::UserId::local(Ulid::generate(), realm_id),
-    );
-    let mut op = PutObjectOperation::new(PutObjectConfig {
-        user_id: writer,
-        group_id: Ulid::generate(),
-        realm_id,
-        node_id: iroh::SecretKey::generate().public(),
-        request: PutObjectInput {
-            bucket: "mybucket".to_string(),
-            key: "some-file.txt".to_string(),
-            content_length: None,
-            body: None,
-        },
-        expected_checksums: vec![],
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: None,
-        routing: RoutingSnapshot::single(Ulid::generate()),
-    });
-    let with_hash = |created_by| {
-        let mut location = test_location(created_by);
-        location.hashes.insert(
-            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-            [3u8; 32].to_vec(),
-        );
-        location
-    };
-    // The deduplicated location keeps the earlier copy, written by someone else.
-    op.output = Some(Ok(with_hash(first)));
-    op.written_location = Some(with_hash(writer));
-    op.version_id = Some(Ulid::generate());
-    op.state = PutObjectState::WritePathIndex;
-    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-        key: vec![0].into(),
-    }));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the version record, got {effects:?}")
-    };
-    let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
-    assert_eq!(version.created_by, writer);
-    // The new version is journaled in the same batch: a kept row, a pending row and its
-    // source-id row.
-    let journal: Vec<_> = (writes.iter())
-        .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
-        .map(|(_, _, value)| aruna_core::plugin_runs::SourceEvent::from_bytes(value).unwrap())
-        .collect();
-    assert_eq!(journal.len(), 2);
-    assert_eq!(journal[0].revision, op.version_id.unwrap().to_string());
-    assert!(journal[0].resource.ends_with("/mybucket/some-file.txt"));
-}
-
-#[test]
-fn history_keeps_head() {
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let mut op = PutObjectOperation::new(PutObjectConfig {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
-        group_id: Ulid::generate(),
-        realm_id,
-        node_id: iroh::SecretKey::generate().public(),
-        request: PutObjectInput {
-            bucket: "mybucket".to_string(),
-            key: "some-file.txt".to_string(),
-            content_length: None,
-            body: None,
-        },
-        expected_checksums: vec![],
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: None,
-        routing: RoutingSnapshot::single(Ulid::generate()),
-    })
-    .keep_head();
-    op.version_id = Some(Ulid::generate());
-    let mut location = test_location(op.config.user_id);
-    location.blob_size = 7;
-    location.hashes.insert(
-        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-        [3u8; 32].to_vec(),
-    );
-    op.output = Some(Ok(location));
-    op.txn_id = Some(Ulid::generate());
-    let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
-    op.object_lookup_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: Some(head.to_bytes().unwrap().into()),
-    }));
-    let live = BlobVersion::materialized(
-        [9; 32],
-        BackendRef::node_default(),
-        EncodingClass::Raw,
-        std::time::SystemTime::UNIX_EPOCH,
-        op.config.user_id,
-        None,
-    );
-    // The head is not written; the version itself is read inside the transaction.
-    let effects = op.liveness_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: Some(live.to_bytes().unwrap().into()),
-    }));
-    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-        panic!("expected the version read, got {effects:?}")
-    };
-    assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
-    assert_eq!(op.state, PutObjectState::ReadHistory);
-    let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: None,
-    }));
-    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
-        panic!("expected the path index, got {effects:?}")
-    };
-    assert_eq!(key_space, PATHS_INDEX_KEYSPACE);
-
-    // No replication obligation, no new live object and the head keeps its charge.
-    op.state = PutObjectState::RegisterManagedCopy;
-    let effects = op.handle_copy_registered(Event::Storage(StorageEvent::WriteResult {
-        key: vec![0].into(),
-    }));
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-        panic!("expected the counter deltas, got {effects:?}")
-    };
-    let expected = UsageDelta {
-        logical_bytes: 7,
-        ..Default::default()
-    };
-    assert_eq!(deltas[0].1, expected);
-
-    // A version that appeared meanwhile is never overwritten.
-    op.state = PutObjectState::ReadHistory;
-    op.history_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value: Some(live.to_bytes().unwrap().into()),
-    }));
-    assert!(matches!(
-        op.output,
-        Some(Err(PutObjectError::VersionExists))
-    ));
-}
-
-#[test]
-fn writer_reads_trail() {
-    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let writer = || {
-        let mut op = PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
-            group_id,
-            realm_id,
-            node_id: iroh::SecretKey::generate().public(),
-            request: PutObjectInput {
-                bucket: "mybucket".to_string(),
-                key: "some-file.txt".to_string(),
-                content_length: None,
-                body: None,
-            },
-            expected_checksums: vec![],
-            checksum_type: None,
-            exists: false,
-            version_source: None,
-            preassigned_version_id: None,
-            quota_ceiling: None,
-            routing: RoutingSnapshot::single(Ulid::generate()),
-        });
-        op.version_id = Some(Ulid::generate());
-        op.txn_id = Some(Ulid::generate());
-        op.state = PutObjectState::ReadHistory;
-        // The version is not registered, so the trail is read before the head moves, in the
-        // incarnation the bucket's creation row names.
-        let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0].into(),
-            value: None,
-        }));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the creation read, got {effects:?}")
-        };
-        assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
-        let effects = op.trail_read(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0].into(),
-            value: Some(5u128.to_be_bytes().to_vec().into()),
-        }));
-        let [
-            Effect::Storage(StorageEffect::Iter {
-                key_space, start, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the trail read, got {effects:?}")
-        };
-        assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
-        // Only deletes since the version was created are read.
-        let id = op.version_id.unwrap();
-        let floor = Ulid::from_parts(id.timestamp_ms(), 0).to_bytes();
-        let Some(aruna_core::effects::IterStart::At(at)) = start else {
-            panic!("expected a bounded start, got {start:?}")
-        };
-        assert!(at.ends_with(&floor));
-        op
-    };
-    let page = |values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>| {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        })
-    };
-    // An import registered the version and a user deleted it: it is not published again.
-    let mut op = writer();
-    let record = BlobAuditRecord {
-        realm_id,
-        group_id,
-        node_id: iroh::SecretKey::generate().public(),
-        user_id: op.config.user_id,
-        kind: BlobAuditKind::DeleteVersion,
-        bucket: "mybucket".to_string(),
-        key: "some-file.txt".to_string(),
-        version_id: op.version_id,
-        occurred_at_ms: 1,
-    };
-    op.trail_read(page(vec![(
-        vec![0].into(),
-        record.to_bytes().unwrap().into(),
-    )]));
-    assert!(matches!(
-        op.output,
-        Some(Err(PutObjectError::HistoryDeleted))
-    ));
-    // A clean trail moves the head after both ranges; every purge is read, as a purge is
-    // keyed by its job.
-    let mut op = writer();
-    let effects = op.trail_read(page(Vec::new()));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { start: None, .. })]
-    ));
-    let effects = op.trail_read(page(Vec::new()));
-    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
-        panic!("expected the head write, got {effects:?}")
-    };
-    assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-    // The purges are read in the incarnation the creation row named.
-    let mut op = writer();
-    let effects = op.trail_read(page(Vec::new()));
-    let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
-        panic!("expected the purge read, got {effects:?}")
-    };
-    let purges = aruna_core::structs::storage::delete_audit::purge_prefix(group_id, "mybucket", 5);
-    assert_eq!(*prefix, Some(purges.into()));
-}
-
 #[tokio::test]
 pub async fn overwrite_retains_index() {
     let temp_handle = tempdir().unwrap();
@@ -2313,485 +1509,236 @@ async fn mismatch_cleans_blob() {
     assert_eq!(count_files(Path::new(&blob_root)), 0);
 }
 
-mod sealed {
-    use super::{fence_clear, put_config, test_location};
-    use crate::s3::object::put::{PutObjectError, PutObjectOperation, PutObjectState};
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::BlobError;
-    use aruna_core::errors::ConversionError;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::stream::BackendStream;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::abe::{
-        AbeError, AbeParameters, EnvelopeContext, ObjectEnvelope, create_parameters,
+/// A version transaction with `output` as the location it publishes.
+fn publishing(config: PutObjectConfig, output: BackendLocation) -> PutObjectOperation {
+    let mut child = publisher(PutObjectOperation::new(config), output.clone());
+    child.output = Some(output);
+    child
+}
+
+#[test]
+fn generation_increments() {
+    let config = put_config(
+        RealmId::from_bytes([1u8; 32]),
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    let output = hashed(test_location(config.user_id));
+    let mut child = publishing(config, output);
+    let version_id = child.version_id.unwrap();
+    let existing = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+
+    let turn = child.object_lookup_read(Some(existing.to_bytes().unwrap().into()));
+    assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+
+    let turn = child.liveness_read(None);
+    // The location row commits with the head.
+    let [(location_space, ..), (head_space, _, head)] = written(&turn) else {
+        panic!("expected the location and head rows, got {turn:?}")
     };
-    use aruna_core::structs::storage::encryption::{
-        BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, SealPlan,
-    };
-    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
-    use ulid::Ulid;
+    assert_eq!(location_space, BLOB_LOCATIONS_KEYSPACE);
+    assert_eq!(head_space, BLOB_HEAD_KEYSPACE);
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(head.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(version_id, 5)
+    );
+}
 
-    fn settings() -> BucketEncryption {
-        BucketEncryption {
-            mode: EncryptionMode::VaultLocked,
-            bucket_id: Some(Ulid::from_bytes([4; 16])),
-            key_generation: 1,
-            storage_generation: 2,
-            ..Default::default()
-        }
-    }
+#[test]
+fn dedup_keeps_writer() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let (first, writer) = (
+        UserId::local(Ulid::generate(), realm_id),
+        UserId::local(Ulid::generate(), realm_id),
+    );
+    let mut config = put_config(
+        realm_id,
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    config.user_id = writer;
+    // The deduplicated location keeps the earlier copy, written by someone else.
+    let mut child = publisher(
+        PutObjectOperation::new(config),
+        hashed(test_location(writer)),
+    );
+    child.output = Some(hashed(test_location(first)));
+    child.state = PutObjectState::WritePathIndex;
 
-    fn record() -> BucketKeyRecord {
-        let key = settings().active_key().unwrap();
-        BucketKeyRecord::new(key, Ulid::from_bytes([5; 16]), [6; 32], 1)
-    }
+    let turn = child.next(IoResult::Done);
 
-    fn row(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: b"mybucket".to_vec().into(),
-            value: value.map(Into::into),
-        })
-    }
+    let writes = written(&turn);
+    let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(version.created_by, writer);
+    // The new version is journaled in the same write: a kept row, a pending row and its
+    // source-id row.
+    let journal: Vec<_> = (writes.iter())
+        .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
+        .map(|(_, _, value)| SourceEvent::from_bytes(value).unwrap())
+        .collect();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0].revision, child.version_id.unwrap().to_string());
+    assert!(journal[0].resource.ends_with("/mybucket/some-file.txt"));
+}
 
-    fn operation() -> PutObjectOperation {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = iroh::SecretKey::generate().public();
-        let mut config = put_config(realm_id, Ulid::generate(), node_id);
-        config.request.body = Some(BackendStream::new(futures_util::stream::iter([Ok::<
-            _,
-            std::io::Error,
-        >(
-            bytes::Bytes::from_static(b"data"),
-        )])));
-        PutObjectOperation::new(config)
-    }
-
-    #[test]
-    fn captures_seal_plan() {
-        let mut op = operation();
-        op.start();
-        op.step(row(None));
-        let effects = op.step(fence_clear());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
-        let effects = op.step(row(Some(settings().to_bytes().unwrap())));
-        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
-        else {
-            panic!("expected the key record read, got {effects:?}")
-        };
-        assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
-        assert_eq!(key.as_ref(), record().key.key().as_slice());
-        let effects = op.step(row(Some(record().to_bytes().unwrap())));
-        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-            panic!("expected the ABE anchor read, got {effects:?}")
-        };
-        let (realm, node) = (op.config.realm_id, op.config.node_id);
-        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
-        let parameters = aruna_core::structs::storage::abe::create_parameters(
-            &secret,
-            realm,
-            node,
-            record().key,
-        )
+#[test]
+fn history_keeps_head() {
+    let config = put_config(
+        RealmId::from_bytes([1u8; 32]),
+        Ulid::generate(),
+        iroh::SecretKey::generate().public(),
+    );
+    let user_id = config.user_id;
+    let mut output = hashed(test_location(user_id));
+    output.blob_size = 7;
+    let mut parent = PutObjectOperation::new(config).keep_head();
+    parent.written_location = Some(output.clone());
+    let mut child = parent.publish_child();
+    child.output = Some(output);
+    let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+    child
+        .object_lookup_read(Some(head.to_bytes().unwrap().into()))
         .unwrap();
-        let values = vec![
-            (
-                reads[0].1.clone(),
-                Some(parameters.to_bytes().unwrap().into()),
-            ),
-            (reads[1].1.clone(), Some(1u64.to_be_bytes().to_vec().into())),
-        ];
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
-            panic!("expected the write, got {effects:?}")
-        };
-        let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
-            effect.as_ref()
-        else {
-            panic!("expected the envelope write")
-        };
-        assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
-        let seal = SealPlan::capture(&settings(), &record()).unwrap();
-        assert_eq!(resolved.encryption, seal);
-    }
+    let live = BlobVersion::materialized(
+        [9; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        user_id,
+        None,
+    );
+    // The head is not written; the version itself is read inside the transaction.
+    let turn = child.liveness_read(Some(live.to_bytes().unwrap().into()));
+    assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+    assert_eq!(child.state, PutObjectState::ReadHistory);
+    let turn = child.history_read(None);
+    let spaces: Vec<_> = written(&turn)
+        .iter()
+        .map(|(space, ..)| space.as_str())
+        .collect();
+    assert_eq!(spaces, [BLOB_LOCATIONS_KEYSPACE, PATHS_INDEX_KEYSPACE]);
 
-    #[test]
-    fn missing_key_refused() {
-        let mut op = operation();
-        op.start();
-        op.step(row(None));
-        op.step(fence_clear());
-        op.step(row(Some(settings().to_bytes().unwrap())));
-        let effects = op.step(row(None));
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Write { .. })))
-        );
-        assert!(op.is_complete());
-    }
+    // No replication obligation, no new live object and the head keeps its charge.
+    child.config.quota_ceiling = None;
+    child.state = PutObjectState::RegisterManagedCopy;
+    let turn = child.next(IoResult::Done);
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = turn else {
+        panic!("expected the counter deltas, got {turn:?}")
+    };
+    let expected = UsageDelta {
+        logical_bytes: 7,
+        ..Default::default()
+    };
+    assert_eq!(deltas[0].1, expected);
 
-    /// Runs the version transaction up to the seal fence with `settings` as the current row.
-    fn fenced(plan: Option<SealPlan>, current: &BucketEncryption) -> PutObjectOperation {
-        fenced_with(plan, current, |_| {})
-    }
+    // A version that appeared meanwhile is never overwritten.
+    let turn = child.history_read(Some(live.to_bytes().unwrap().into()));
+    assert_eq!(turn.err(), Some(PutObjectError::VersionExists));
+}
 
-    fn fenced_with(
-        plan: Option<SealPlan>,
-        current: &BucketEncryption,
-        prepare: impl FnOnce(&mut PutObjectOperation),
-    ) -> PutObjectOperation {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = iroh::SecretKey::generate().public();
-        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
-        prepare(&mut op);
-        let mut location = test_location(op.config.user_id);
-        if let Some(plan) = plan {
-            let layout = PithosLayout {
-                stored_size: 10,
-                metadata_digest: [1; 32],
-                storage_generation: plan.storage_generation,
-            };
-            location.format = StoredFormat::pithos(layout, plan.key);
-        }
-        op.seal_plan = plan;
-        op.state = PutObjectState::StartTransaction;
-        op.written_location = Some(location);
-        op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::generate(),
-        }));
-        op.step(fence_clear());
-        op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (b"mybucket".to_vec().into(), None),
-                (b"subject".to_vec().into(), None),
-            ],
-        }));
-        op.step(row(Some(current.to_bytes().unwrap())));
-        op
-    }
+#[test]
+fn registered_commits_nothing() {
+    // A listed write an import registered with the same bytes ends with no row written, and
+    // its bytes are still released and announced after the commit.
+    let config = config();
+    let output = hashed(test_location(config.user_id));
+    let mut child = publishing(config, output.clone());
+    let version = BlobVersion::materialized(
+        [7; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        UserId::default(),
+        None,
+    );
 
-    #[test]
-    fn stale_seal_refused() {
-        let plan = SealPlan::capture(&settings(), &record()).unwrap();
-        // The bucket changed its stored format while the bytes streamed.
-        let mut moved = settings();
-        moved.storage_generation += 1;
-        let outcome = fenced(plan, &moved).finalize();
-        assert!(matches!(
-            outcome,
-            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::StaleGeneration { .. }
-            )))
-        ));
-        // The current plan passes the fence and reaches the hash step.
-        let outcome = fenced(plan, &settings()).finalize();
-        assert!(
-            matches!(outcome, Err(PutObjectError::MissingHash(_))),
-            "{outcome:?}"
-        );
-    }
+    let turn = child.history_read(Some(version.to_bytes().unwrap().into()));
 
-    #[test]
-    fn plain_into_sealed() {
-        let outcome = fenced(None, &settings()).finalize();
-        assert!(matches!(
-            outcome,
-            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::StaleGeneration { .. }
-            )))
-        ));
-    }
+    let Ok(Next::Then {
+        output: result,
+        calls,
+    }) = turn
+    else {
+        panic!("expected the registered version, got {turn:?}")
+    };
+    assert_eq!(result.location, output);
+    assert!(child.registered);
+    assert!(calls.iter().all(|call| !matches!(call, IoCall::Write(_))));
+}
 
-    #[test]
-    fn records_copy_owner() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = iroh::SecretKey::generate().public();
-        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
-        let mut location = test_location(op.config.user_id);
-        let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
-        let layout = PithosLayout {
-            stored_size: 10,
-            metadata_digest: [1; 32],
-            storage_generation: 0,
-        };
-        location.format = StoredFormat::pithos(layout, key);
-        op.version_id = Some(Ulid::generate());
-        op.txn_id = Some(Ulid::generate());
-        op.output = Some(Ok(location));
-        op.state = PutObjectState::CreateVersionRecord;
-        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"version".to_vec().into(),
-        }));
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, txn_id, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the owner row, got {effects:?}")
-        };
-        assert_eq!(key_space, COPY_OWNER_KEYSPACE);
-        assert_eq!(*txn_id, op.txn_id);
-    }
-
-    fn parameters(op: &PutObjectOperation, secret: u8) -> AbeParameters {
-        let secret = aruna_core::compute::SecretBytes::new(vec![secret; 32]);
-        create_parameters(&secret, op.config.realm_id, op.config.node_id, record().key).unwrap()
-    }
-
-    fn envelope(parameters: AbeParameters) -> ObjectEnvelope {
-        ObjectEnvelope {
-            context: EnvelopeContext {
-                parameters,
-                epoch: 1,
-                object_key: "some-file.txt".to_string(),
-                write_id: Ulid::from_bytes([8; 16]),
-                public_key: [3; 32],
-            },
-            abe: vec![1; 16],
-            recovery_enc: [2; 32],
-            recovery_ciphertext: vec![4; 32],
-        }
-    }
-
-    /// Answers the publication fence with substituted parameters or another epoch.
-    fn abe_fence(substituted: bool, epoch: u64) -> PutObjectOperation {
-        let plan = SealPlan::capture(&settings(), &record()).unwrap();
-        let mut op = fenced_with(plan, &settings(), |op| {
-            op.envelope = Some(envelope(parameters(op, 9)));
-        });
-        assert_eq!(op.state, PutObjectState::FenceAbe);
-        let current = parameters(&op, if substituted { 10 } else { 9 });
-        op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"p".to_vec().into(),
-                    Some(current.to_bytes().unwrap().into()),
-                ),
-                (
-                    b"e".to_vec().into(),
-                    Some(epoch.to_be_bytes().to_vec().into()),
-                ),
-            ],
-        }));
-        op
-    }
-
-    #[test]
-    fn envelope_fence_refused() {
-        let refused = |op: PutObjectOperation| match op.finalize() {
-            Err(PutObjectError::BlobWriteFailed(BlobError::Abe(error))) => error,
-            other => panic!("expected an envelope refusal, got {other:?}"),
-        };
-        assert_eq!(refused(abe_fence(false, 2)), AbeError::Epoch);
-        assert_eq!(refused(abe_fence(true, 1)), AbeError::Parameters);
-        // The admitted parameters and epoch pass the fence and reach the hash step.
-        let outcome = abe_fence(false, 1).finalize();
-        assert!(
-            matches!(outcome, Err(PutObjectError::MissingHash(_))),
-            "{outcome:?}"
-        );
-    }
-
-    #[test]
-    fn envelope_write_rollback() {
-        let mut op = operation();
-        let txn_id = Ulid::generate();
-        op.txn_id = Some(txn_id);
-        op.state = PutObjectState::WriteEnvelope;
-        let effects = op.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::TransactionConflict,
-        }));
+#[test]
+fn writer_reads_trail() {
+    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let writer = || {
+        let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
+        let output = hashed(test_location(config.user_id));
+        let mut child = publishing(config, output);
+        // The version is not registered, so the trail is read before the head moves, in the
+        // incarnation the bucket's creation row names.
+        let turn = child.history_read(None);
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            read_spaces(&turn),
+            [aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE]
         );
-        assert!(op.finalize().is_err());
-    }
-
-    #[test]
-    fn plain_skips_envelope() {
-        let mut op = operation();
-        op.start();
-        op.step(row(None));
-        op.step(fence_clear());
-        let effects = op.step(row(None));
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
-            panic!("expected the plain write, got {effects:?}")
+        let turn = child.next(values(vec![Some(5u128.to_be_bytes().to_vec().into())]));
+        let Ok(Next::Call(IoCall::Page {
+            space,
+            prefix,
+            after,
+            ..
+        })) = turn
+        else {
+            panic!("expected the trail read, got {turn:?}")
         };
-        assert_eq!(resolved.encryption, None);
-    }
-
-    #[test]
-    fn disabled_skips_envelope() {
-        let mut op = operation().without_envelope();
-        op.start();
-        op.step(row(None));
-        op.step(fence_clear());
-        op.step(row(Some(settings().to_bytes().unwrap())));
-        let effects = op.step(row(Some(record().to_bytes().unwrap())));
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
-            panic!("expected the sealed write without envelope, got {effects:?}")
-        };
+        assert_eq!(space, DELETE_TRAIL_KEYSPACE);
+        // Only deletes since the version was created are read.
+        let id = child.version_id.unwrap();
+        let floor = Ulid::from_parts(id.timestamp_ms(), 0).0 - 1;
+        let after = after.expect("a bounded start");
         assert_eq!(
-            resolved.encryption,
-            SealPlan::capture(&settings(), &record()).unwrap()
+            after.as_ref(),
+            [prefix.as_ref(), &Ulid(floor).to_bytes()[..]].concat()
         );
-    }
-
-    #[test]
-    fn charges_envelope_bytes() {
-        let mut op = operation();
-        op.config.quota_ceiling = None;
-        let txn_id = Ulid::generate();
-        let mut location = test_location(op.config.user_id);
-        location.format = StoredFormat::pithos(
-            PithosLayout {
-                stored_size: 10,
-                metadata_digest: [1; 32],
-                storage_generation: 2,
-            },
-            record().key,
-        );
-        location.hashes.insert(
-            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-            vec![5; 32],
-        );
-        op.envelope = Some(envelope(parameters(&op, 9)));
-        op.version_id = Some(Ulid::generate());
-        op.txn_id = Some(txn_id);
-        op.output = Some(Ok(location));
-        let effects = op.store_envelope();
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the envelope rows, got {effects:?}")
-        };
-        let charge = writes[0].2.len() + writes[2].2.len();
-        assert_eq!(op.envelope_bytes, charge as u64);
-        op.state = PutObjectState::WriteReplicationObligation;
-        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"obligation".to_vec().into(),
-        }));
-        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-            panic!("expected the counter deltas, got {effects:?}")
-        };
-        assert!(
-            deltas
-                .iter()
-                .any(|(_, d)| d.logical_bytes == 1 + charge as i128)
-        );
-    }
-
-    /// Runs the quota gate for a write with a 2 byte ceiling and no prior usage.
-    fn quota_charge(payload: u64, envelope_bytes: u64) -> aruna_core::types::Effects {
-        let mut op = operation();
-        op.config.quota_ceiling = Some(2);
-        let txn_id = Ulid::generate();
-        let mut location = test_location(op.config.user_id);
-        location.blob_size = payload;
-        location.hashes.insert(
-            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-            vec![5; 32],
-        );
-        op.envelope_bytes = envelope_bytes;
-        op.txn_id = Some(txn_id);
-        op.output = Some(Ok(location));
-        op.state = PutObjectState::WriteReplicationObligation;
-        let mut effects = op.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"obligation".to_vec().into(),
-        }));
-        if op.state == PutObjectState::EnforceQuota {
-            let empty = || {
-                Event::Storage(StorageEvent::ReadResult {
-                    key: b"k".to_vec().into(),
-                    value: None,
-                })
-            };
-            // The rebuild marker, the realm config and the local counter are absent.
-            op.step(empty());
-            op.step(empty());
-            op.step(empty());
-            effects = op.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![],
-                next_start_after: None,
-            }));
-        }
-        effects
-    }
-
-    #[test]
-    fn quota_counts_envelope() {
-        let refused = |effects: aruna_core::types::Effects| {
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            )
-        };
-        // The payload alone fits, but the envelope pushes the charge over the ceiling.
-        assert!(refused(quota_charge(2, 1)));
-        assert!(refused(quota_charge(0, 3)));
-        assert!(!refused(quota_charge(0, 2)));
-        assert!(!refused(quota_charge(1, 1)));
-    }
-
-    /// While usage is rebuilt a write for a group with a quota is refused as retryable; a
-    /// group without a quota never reads the marker and books its usage.
-    #[test]
-    fn rebuild_refuses_quota() {
-        use aruna_core::structs::storage::usage::{USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY};
-        for ceiling in [Some(u64::MAX), None] {
-            let mut op = operation();
-            op.config.quota_ceiling = ceiling;
-            let mut location = test_location(op.config.user_id);
-            location.blob_size = 1;
-            location.hashes.insert(
-                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-                vec![5; 32],
-            );
-            op.txn_id = Some(Ulid::generate());
-            op.output = Some(Ok(location));
-            op.state = PutObjectState::WriteReplicationObligation;
-            let effects = op.step(Event::Storage(StorageEvent::WriteResult {
-                key: b"obligation".to_vec().into(),
-            }));
-            if ceiling.is_none() {
-                assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::AddUsage { .. })]
-                ));
-                continue;
-            }
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_REBUILD_KEY
-            ));
-            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-                key: USAGE_REBUILD_KEY.to_vec().into(),
-                value: Some(Vec::new().into()),
-            }));
-            // No earlier rebuild completed the counters, so nothing backs the quota.
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_COMPLETE_KEY
-            ));
-            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-                key: USAGE_COMPLETE_KEY.to_vec().into(),
-                value: None,
-            }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert_eq!(
-                op.cleanup.take_error(),
-                Some(PutObjectError::UsageRebuilding)
-            );
-        }
-    }
+        child
+    };
+    let page = |rows: Vec<(Key, Value)>| IoResult::Page { rows, next: None };
+    // An import registered the version and a user deleted it: it is not published again.
+    let mut child = writer();
+    let record = BlobAuditRecord {
+        realm_id,
+        group_id,
+        node_id: iroh::SecretKey::generate().public(),
+        user_id: child.config.user_id,
+        kind: BlobAuditKind::DeleteVersion,
+        bucket: "mybucket".to_string(),
+        key: "some-file.txt".to_string(),
+        version_id: child.version_id,
+        occurred_at_ms: 1,
+    };
+    let turn = child.next(page(vec![(
+        vec![0].into(),
+        record.to_bytes().unwrap().into(),
+    )]));
+    assert_eq!(turn.err(), Some(PutObjectError::HistoryDeleted));
+    // A clean trail moves the head after both ranges; every purge is read, as a purge is
+    // keyed by its job.
+    let mut child = writer();
+    let turn = child.next(page(Vec::new()));
+    let Ok(Next::Call(IoCall::Page {
+        prefix,
+        after: None,
+        ..
+    })) = turn
+    else {
+        panic!("expected the purge read, got {turn:?}")
+    };
+    // The purges are read in the incarnation the creation row named.
+    let purges = aruna_core::structs::storage::delete_audit::purge_prefix(group_id, "mybucket", 5);
+    assert_eq!(prefix, Key::from(purges));
+    let turn = child.next(page(Vec::new()));
+    assert_eq!(written(&turn)[1].0, BLOB_HEAD_KEYSPACE);
 }
 
 #[tokio::test]
@@ -2817,11 +1764,8 @@ async fn plain_owns_copy() {
                 layout: StoredLayout::Plain(ulid),
                 ..StoredFormat::default()
             },
-            hashes: HashMap::from([(
-                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-                vec![5; 32],
-            )]),
-            ..test_location(aruna_core::UserId::default())
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![5; 32])]),
+            ..test_location(UserId::default())
         }
     };
     let mut committed = Vec::new();
@@ -2838,23 +1782,33 @@ async fn plain_owns_copy() {
             mapped: false,
         };
         op.version_id = Some(Ulid::generate());
-        op.start_plain(target, ResolvedBackend::new(backend.clone(), None));
-        op.txn_id = None;
+        let _ = op.start_plain(target, ResolvedBackend::new(backend.clone(), None));
         op.written_location = Some(written.clone());
         // The lookup and the location row go through the storage, as in the commit.
-        let mut effects = op.start_hash_lookup();
-        while let Some(effect @ Effect::Storage(_)) = effects.pop() {
-            let event = storage.send_effect(effect).await;
-            if op.state != PutObjectState::CheckHashLookup {
-                break;
-            }
-            effects = op.step(event);
-        }
+        let Ok(Next::Call(IoCall::Read(reads))) = op.start_hash_lookup() else {
+            panic!("expected the location lookup")
+        };
+        let read = Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        });
+        let Event::Storage(StorageEvent::BatchReadResult { values }) =
+            storage.send_effect(read).await
+        else {
+            panic!("expected the lookup answer")
+        };
+        op.hash_checked(values.into_iter().next().and_then(|(_, value)| value))
+            .unwrap();
         assert!(op.new_blob, "{path} must not adopt another copy");
-        assert_eq!(
-            op.output.as_ref().and_then(|o| o.as_ref().ok()),
-            Some(&written)
-        );
+        assert_eq!(op.output.as_ref(), Some(&written));
+        let (space, key, value) = op.location_row().unwrap();
+        let write = Effect::Storage(StorageEffect::Write {
+            key_space: space,
+            key,
+            value,
+            txn_id: None,
+        });
+        storage.send_effect(write).await;
         committed.push(written);
     }
     // Each version reads its own copy back; the other bucket's copy stays where it was.
@@ -2881,60 +1835,863 @@ async fn plain_owns_copy() {
 
 /// Starts a put into a bucket bound as member `seed` of the two-shard test set and answers
 /// the bucket and record reads; the key "some-file.txt" lies in member 2's range.
-fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
+fn bound_put(seed: u8) -> (PutObjectOperation, Turn) {
     use crate::distribution::test_record::{binding, record};
     use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
     let (snapshot, bytes) = record(true);
-    let realm_id = RealmId::from_bytes([1u8; 32]);
-    let group_id = Ulid::generate();
-    let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
-    let bucket = BucketInfo {
-        group_id,
-        created_at: std::time::SystemTime::UNIX_EPOCH,
-        created_by: config.user_id,
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: Some(binding(&snapshot, seed, 5)),
-    };
+    let config = config();
+    let mut bucket = bucket(config.group_id, config.user_id, Compression::Off);
+    bucket.distribution = Some(binding(&snapshot, seed, 5));
     let mut op = PutObjectOperation::new(config);
-    op.start();
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"mybucket".to_vec().into(),
-        value: Some(bucket.to_bytes().unwrap().into()),
-    }));
-    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-        panic!("a bound bucket reads its record and fence first, got {effects:?}");
+    op.first().unwrap();
+    let turn = op.next(values(vec![Some(bucket.to_bytes().unwrap().into())]));
+    assert_eq!(read_spaces(&turn)[0], DISTRIBUTION_KEYSPACE);
+    let Event::Storage(StorageEvent::BatchReadResult { values: rows }) =
+        crate::distribution::test_record::authority_rows(Some(bytes), None)
+    else {
+        panic!("expected the record rows")
     };
-    assert_eq!(reads[0].0, DISTRIBUTION_KEYSPACE);
-    let answer = crate::distribution::test_record::authority_rows(Some(bytes), None);
-    let effects = op.step(answer);
-    (op, effects)
+    let turn = op.next(values(rows.into_iter().map(|(_, value)| value).collect()));
+    (op, turn)
 }
 
 #[test]
 fn coordinator_stamps_put() {
-    let (op, effects) = bound_put(2);
+    let (op, turn) = bound_put(2);
     assert_eq!(
         op.version_epoch,
         aruna_core::structs::storage::distribution::OriginalEpoch(1)
     );
-    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-        panic!("the coordinator continues with the purge fence, got {effects:?}");
-    };
-    assert_eq!(key_space, PURGE_FENCE_KEYSPACE);
+    // The coordinator continues with the purge fence.
+    assert_eq!(read_spaces(&turn), [PURGE_FENCE_KEYSPACE]);
 }
 
 #[test]
 fn member_put_refused() {
-    let (op, effects) = bound_put(1);
-    assert!(effects.is_empty());
+    let (_, turn) = bound_put(1);
     assert!(matches!(
-        op.finalize(),
+        turn,
         Err(PutObjectError::Distribution(
-            crate::distribution::guard::GuardError::NotCoordinator { .. }
+            GuardError::NotCoordinator { .. }
         ))
     ));
+}
+
+mod sealed {
+    use super::*;
+    use aruna_core::structs::storage::abe::{
+        AbeError, AbeParameters, EnvelopeContext, ObjectEnvelope, create_parameters,
+    };
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
+    use aruna_core::structs::storage::format::PithosLayout;
+
+    fn settings() -> BucketEncryption {
+        BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([4; 16])),
+            key_generation: 1,
+            storage_generation: 2,
+            ..Default::default()
+        }
+    }
+
+    fn record() -> BucketKeyRecord {
+        let key = settings().active_key().unwrap();
+        BucketKeyRecord::new(key, Ulid::from_bytes([5; 16]), [6; 32], 1)
+    }
+
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        values(vec![value.map(Into::into)])
+    }
+
+    fn operation() -> PutObjectOperation {
+        let mut config = config();
+        config.request.body = Some(BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from_static(b"data"),
+        )])));
+        PutObjectOperation::new(config)
+    }
+
+    /// Runs a put up to its encryption settings read: no bucket, no purge fence.
+    fn at_settings(op: &mut PutObjectOperation) {
+        op.first().unwrap();
+        op.next(row(None)).unwrap();
+        let turn = op.next(row(None));
+        assert_eq!(read_spaces(&turn), [BUCKET_ENCRYPTION_KEYSPACE]);
+    }
+
+    #[test]
+    fn captures_seal_plan() {
+        let mut op = operation();
+        at_settings(&mut op);
+        let turn = op.next(row(Some(settings().to_bytes().unwrap())));
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the key record read, got {turn:?}")
+        };
+        assert_eq!(reads[0].0, BUCKET_KEY_KEYSPACE);
+        assert_eq!(reads[0].1.as_ref(), record().key.key().as_slice());
+        let turn = op.next(row(Some(record().to_bytes().unwrap())));
+        assert_eq!(read_spaces(&turn).len(), 2);
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let (realm, node) = (op.config.realm_id, op.config.node_id);
+        let parameters = create_parameters(&secret, realm, node, record().key).unwrap();
+        let answers = vec![
+            Some(parameters.to_bytes().unwrap().into()),
+            Some(1u64.to_be_bytes().to_vec().into()),
+        ];
+        let turn = op.next(values(answers));
+        let Effect::Blob(BlobEffect::Abe(effect)) = asked(&turn) else {
+            panic!("expected the write, got {turn:?}")
+        };
+        let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
+            effect.as_ref()
+        else {
+            panic!("expected the envelope write")
+        };
+        assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
+        let seal = SealPlan::capture(&settings(), &record()).unwrap();
+        assert_eq!(resolved.encryption, seal);
+    }
+
+    #[test]
+    fn missing_key_refused() {
+        let mut op = operation();
+        at_settings(&mut op);
+        op.next(row(Some(settings().to_bytes().unwrap()))).unwrap();
+        let turn = op.next(row(None));
+        assert_eq!(turn.err(), Some(seal_error(BucketKeyError::Unsupported)));
+    }
+
+    /// Runs the version transaction up to the seal fence with `current` as the settings row.
+    fn fenced(plan: Option<SealPlan>, current: &BucketEncryption) -> (PutObjectOperation, Turn) {
+        fenced_with(plan, current, |_| {})
+    }
+
+    fn fenced_with(
+        plan: Option<SealPlan>,
+        current: &BucketEncryption,
+        prepare: impl FnOnce(&mut PutObjectOperation),
+    ) -> (PutObjectOperation, Turn) {
+        let mut op = PutObjectOperation::new(config());
+        prepare(&mut op);
+        let mut location = test_location(op.config.user_id);
+        if let Some(plan) = plan {
+            let layout = PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: plan.storage_generation,
+            };
+            location.format = StoredFormat::pithos(layout, plan.key);
+        }
+        op.seal_plan = plan;
+        let mut child = publisher(op, location);
+        child.first().unwrap();
+        child.next(row(None)).unwrap();
+        child.next(values(vec![None, None])).unwrap();
+        let turn = child.next(row(Some(current.to_bytes().unwrap())));
+        (child, turn)
+    }
+
+    #[test]
+    fn stale_seal_refused() {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        // The bucket changed its stored format while the bytes streamed.
+        let mut moved = settings();
+        moved.storage_generation += 1;
+        let (_, turn) = fenced(plan, &moved);
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+        // The current plan passes the fence and reaches the hash step.
+        let (_, turn) = fenced(plan, &settings());
+        assert!(
+            matches!(turn, Err(PutObjectError::MissingHash(_))),
+            "{turn:?}"
+        );
+    }
+
+    #[test]
+    fn plain_into_sealed() {
+        let (_, turn) = fenced(None, &settings());
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn records_copy_owner() {
+        let mut location = test_location(UserId::default());
+        let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
+        let layout = PithosLayout {
+            stored_size: 10,
+            metadata_digest: [1; 32],
+            storage_generation: 0,
+        };
+        location.format = StoredFormat::pithos(layout, key);
+        let mut child = publishing(config(), location);
+        child.state = PutObjectState::CreateVersionRecord;
+
+        let turn = child.next(IoResult::Done);
+
+        assert_eq!(written(&turn)[0].0, COPY_OWNER_KEYSPACE);
+    }
+
+    fn parameters(op: &PutObjectOperation, secret: u8) -> AbeParameters {
+        let secret = aruna_core::compute::SecretBytes::new(vec![secret; 32]);
+        create_parameters(&secret, op.config.realm_id, op.config.node_id, record().key).unwrap()
+    }
+
+    fn envelope(parameters: AbeParameters) -> ObjectEnvelope {
+        ObjectEnvelope {
+            context: EnvelopeContext {
+                parameters,
+                epoch: 1,
+                object_key: "some-file.txt".to_string(),
+                write_id: Ulid::from_bytes([8; 16]),
+                public_key: [3; 32],
+            },
+            abe: vec![1; 16],
+            recovery_enc: [2; 32],
+            recovery_ciphertext: vec![4; 32],
+        }
+    }
+
+    /// Answers the publication fence with substituted parameters or another epoch.
+    fn abe_fence(substituted: bool, epoch: u64) -> Turn {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        let (mut child, _) = fenced_with(plan, &settings(), |op| {
+            op.envelope = Some(envelope(parameters(op, 9)));
+        });
+        assert_eq!(child.state, PutObjectState::FenceAbe);
+        let current = parameters(&child, if substituted { 10 } else { 9 });
+        child.next(values(vec![
+            Some(current.to_bytes().unwrap().into()),
+            Some(epoch.to_be_bytes().to_vec().into()),
+        ]))
+    }
+
+    #[test]
+    fn envelope_fence_refused() {
+        let refused = |turn: Turn| match turn {
+            Err(PutObjectError::BlobWriteFailed(BlobError::Abe(error))) => error,
+            other => panic!("expected an envelope refusal, got {other:?}"),
+        };
+        assert_eq!(refused(abe_fence(false, 2)), AbeError::Epoch);
+        assert_eq!(refused(abe_fence(true, 1)), AbeError::Parameters);
+        // The admitted parameters and epoch pass the fence and reach the hash step.
+        let turn = abe_fence(false, 1);
+        assert!(
+            matches!(turn, Err(PutObjectError::MissingHash(_))),
+            "{turn:?}"
+        );
+    }
+
+    #[test]
+    fn plain_skips_envelope() {
+        let mut op = operation();
+        at_settings(&mut op);
+        let turn = op.next(row(None));
+        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+            panic!("expected the plain write, got {turn:?}")
+        };
+        assert_eq!(resolved.encryption, None);
+    }
+
+    #[test]
+    fn disabled_skips_envelope() {
+        let mut op = operation().without_envelope();
+        at_settings(&mut op);
+        op.next(row(Some(settings().to_bytes().unwrap()))).unwrap();
+        let turn = op.next(row(Some(record().to_bytes().unwrap())));
+        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+            panic!("expected the sealed write without envelope, got {turn:?}")
+        };
+        assert_eq!(
+            resolved.encryption,
+            SealPlan::capture(&settings(), &record()).unwrap()
+        );
+    }
+
+    fn sealed_output(blob_size: u64) -> BackendLocation {
+        let mut location = hashed(test_location(UserId::default()));
+        location.blob_size = blob_size;
+        location.format = StoredFormat::pithos(
+            PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: 2,
+            },
+            record().key,
+        );
+        location
+    }
+
+    #[test]
+    fn charges_envelope_bytes() {
+        let mut config = config();
+        config.quota_ceiling = None;
+        let mut child = publishing(config, sealed_output(1));
+        child.envelope = Some(envelope(parameters(&child, 9)));
+        let turn = child.store_envelope();
+        let writes = written(&turn);
+        let charge = writes[0].2.len() + writes[2].2.len();
+        assert_eq!(child.envelope_bytes, charge as u64);
+        child.state = PutObjectState::WriteReplicationObligation;
+        let turn = child.next(IoResult::Done);
+        let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = turn else {
+            panic!("expected the counter deltas, got {turn:?}")
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|(_, delta)| delta.logical_bytes == 1 + charge as i128)
+        );
+    }
+
+    /// Runs the quota gate for a write with a 2 byte ceiling and no prior usage.
+    fn quota_charge(payload: u64, envelope_bytes: u64) -> Turn {
+        let mut config = config();
+        config.quota_ceiling = Some(2);
+        let mut output = hashed(test_location(UserId::default()));
+        output.blob_size = payload;
+        let mut child = publishing(config, output);
+        child.envelope_bytes = envelope_bytes;
+        child.state = PutObjectState::WriteReplicationObligation;
+        let mut turn = child.next(IoResult::Done);
+        if child.state == PutObjectState::EnforceQuota {
+            // The rebuild marker, the realm config and the local counter are absent.
+            for _ in 0..3 {
+                child.next(row(None)).unwrap();
+            }
+            turn = child.next(IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            });
+        }
+        turn
+    }
+
+    #[test]
+    fn quota_counts_envelope() {
+        let refused = |turn: Turn| matches!(turn, Err(PutObjectError::QuotaExceeded { .. }));
+        // The payload alone fits, but the envelope pushes the charge over the ceiling.
+        assert!(refused(quota_charge(2, 1)));
+        assert!(refused(quota_charge(0, 3)));
+        assert!(!refused(quota_charge(0, 2)));
+        assert!(!refused(quota_charge(1, 1)));
+    }
+
+    /// While usage is rebuilt a write for a group with a quota is refused as retryable; a
+    /// group without a quota never reads the marker and books its usage.
+    #[test]
+    fn rebuild_refuses_quota() {
+        use aruna_core::structs::storage::usage::{USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY};
+        for ceiling in [Some(u64::MAX), None] {
+            let mut config = config();
+            config.quota_ceiling = ceiling;
+            let mut child = publishing(config, hashed(test_location(UserId::default())));
+            child.state = PutObjectState::WriteReplicationObligation;
+            let turn = child.next(IoResult::Done);
+            if ceiling.is_none() {
+                assert!(matches!(turn, Ok(Next::Call(IoCall::AddUsage { .. }))));
+                continue;
+            }
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(ref reads))) if reads[0].1.as_ref() == USAGE_REBUILD_KEY
+            ));
+            let turn = child.next(row(Some(Vec::new())));
+            // No earlier rebuild completed the counters, so nothing backs the quota.
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(ref reads))) if reads[0].1.as_ref() == USAGE_COMPLETE_KEY
+            ));
+            let turn = child.next(row(None));
+            assert_eq!(turn.err(), Some(PutObjectError::UsageRebuilding));
+        }
+    }
+}
+
+/// Routing resolves the backend before any byte moves; the version transaction fences it.
+mod routing {
+    use super::*;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::structs::storage::routing::{GroupRoutingInputs, StorageRoutingRule};
+    use std::collections::BTreeSet;
+
+    fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        PutObjectConfig {
+            user_id: UserId::local(Ulid::from_parts(1, 1), realm_id),
+            group_id: snapshot.group_id,
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "archive/one".to_string(),
+                content_length: Some(3),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"abc"[..],
+                ))),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::from_parts(2, 2),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    /// Answers the bucket, purge fence and encryption reads of an ungoverned plain bucket.
+    fn begin(operation: &mut PutObjectOperation) -> Turn {
+        operation.first().unwrap();
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None]))
+    }
+
+    fn resolved(turn: &Turn) -> &aruna_core::structs::storage::blob::ResolvedBackend {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::Write { resolved, .. }) => resolved,
+            other => panic!("expected one blob write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamps_resolved_backend() {
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: "archive/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("archive".to_string()),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        let resolved = resolved(&turn);
+        assert_eq!(resolved.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(resolved.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_stamps() {
+        // A class this node does not offer reroutes the write, never fails it.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class("glacier".to_string()),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        let resolved = resolved(&turn);
+        assert_eq!(resolved.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(resolved.storage_class, None);
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        // A named backend is binding: nothing may be written when it is gone.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::RoutingFailed(RoutingError::UnknownBackend(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // A disabled backend refuses writes: the version does not commit a location on it,
+        // and the written blob is rolled back.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        begin(&mut operation).unwrap();
+        let written = BackendLocation {
+            backend: BackendRef::Group(backend_id),
+            backend_path: "bucket/object".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            blob_size: 3,
+            ..test_location(UserId::default())
+        };
+        let finished = BlobEvent::WriteFinished {
+            location: written.clone(),
+        };
+        let turn = operation.next(event(Event::Blob(finished)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+
+        let mut child = operation.publish_child();
+        child.first().unwrap();
+        child.next(values(vec![None])).unwrap();
+        child.next(values(vec![None, None])).unwrap();
+        let turn = child.next(values(vec![None]));
+        assert_eq!(read_spaces(&turn), [STORAGE_BACKEND_KEYSPACE]);
+        let disabled = GroupStorage {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+        };
+        let turn = child.next(values(vec![Some(disabled.to_bytes().unwrap().into())]));
+        let error = turn.unwrap_err();
+        assert_eq!(error, BackendFenceError::Unavailable.into());
+
+        operation.next(published(Err(error))).unwrap_err();
+        assert_rolls_back(&operation.abort(), &written);
+    }
+}
+
+/// No byte-materialization call and no registration happens before the destination passed
+/// the shared placement gate, which runs as a child.
+mod decisions {
+    use super::*;
+    use crate::placement::policy::PolicyCacheStats;
+    use aruna_core::structs::placement::policy::{
+        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    const BODY: &[u8] = b"payload";
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// A rule that admits exactly one location.
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(9),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+            admitting: true,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        info.to_bytes().expect("bucket encodes").into()
+    }
+
+    fn operation(location: &str) -> PutObjectOperation {
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            group_id,
+            realm_id: realm(),
+            node_id: node(9),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "governed.txt".to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .with_gate(gate(location))
+    }
+
+    fn decided(decision: PlacementDecision, foreign_owner: Option<Ulid>) -> IoResult {
+        let outcome = PolicyGateOutcome {
+            decision,
+            foreign_owner,
+            stats: PolicyCacheStats::default(),
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(outcome)))
+    }
+
+    /// Answers the bucket read with `refs`; a governed write asks the gate next.
+    fn gated(operation: &mut PutObjectOperation, refs: Vec<PlacementPolicyRef>) {
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(refs, 1))]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::PolicyGate);
+    }
+
+    #[test]
+    fn denies_before_write() {
+        // The rule admits another location, so nothing may be written at all.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west");
+        gated(&mut operation, vec![rule.policy_ref()]);
+        let policy_ids = vec![rule.policy().policy_id];
+        let denied = PlacementDecision::Denied {
+            policy_ids: policy_ids.clone(),
+        };
+
+        let turn = operation.next(decided(denied, None));
+
+        assert_eq!(
+            turn.err(),
+            Some(PolicyGateError::Denied { policy_ids }.into())
+        );
+    }
+
+    #[test]
+    fn unresolved_blocks_write() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        gated(&mut operation, vec![rule.policy_ref()]);
+        let unavailable = PlacementDecision::Unavailable {
+            policy_ids: vec![rule.policy().policy_id],
+        };
+
+        let turn = operation.next(decided(unavailable, None));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks() {
+        // A node that advertises no subject may hold nothing governed.
+        let mut operation = operation("eu-west");
+        operation.gate_context = None;
+        operation.first().unwrap();
+        let refs = vec![PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([1u8; 16]),
+            digest: [4u8; 32],
+        }];
+
+        let turn = operation.next(values(vec![Some(bucket(refs, 1))]));
+
+        assert_eq!(turn.err(), Some(PolicyGateError::NoSubject.into()));
+    }
+
+    #[test]
+    fn planned_needs_hint() {
+        // A planned id in a distributed bucket must already carry the set hint.
+        use aruna_core::structs::storage::distribution::hint::with_hint;
+        let set_id = Ulid::from_bytes([5u8; 16]);
+        let planned = |id: Ulid| {
+            let mut operation = operation("eu-west");
+            operation.config.preassigned_version_id = Some(id);
+            operation.first().unwrap();
+            operation.next(values(vec![None])).unwrap();
+            let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
+            info.distribution = Some(DistributionBinding {
+                set_id,
+                member_id: Ulid::from_bytes([6u8; 16]),
+                incarnation: 1,
+                revision: Default::default(),
+            });
+            operation.next(values(vec![Some(info.to_bytes().unwrap().into())]))
+        };
+        let hint = SetHint::of_set(set_id);
+        let plain = Ulid::from_parts(1, 0);
+        assert_ne!(SetHint::of_version(plain), hint);
+        assert_eq!(
+            planned(plain).err(),
+            Some(PutObjectError::InvalidPreassignedVersion)
+        );
+        assert!(planned(with_hint(plain, hint)).is_ok());
+    }
+
+    #[test]
+    fn ungoverned_skips_gate() {
+        // An ungoverned write reaches the blob write with no policy round trip; an allowed
+        // governed write reaches it after the gate.
+        let mut plain = operation("eu-west");
+        plain.first().unwrap();
+        plain
+            .next(values(vec![Some(bucket(Vec::new(), 0))]))
+            .unwrap();
+        plain.next(values(vec![None])).unwrap();
+        let turn = plain.next(values(vec![None]));
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::Write { .. })
+        ));
+
+        let rule = policy("eu-west");
+        let mut governed = operation("eu-west");
+        gated(&mut governed, vec![rule.policy_ref()]);
+        let turn = governed.next(decided(PlacementDecision::Allowed, None));
+        assert_eq!(read_spaces(&turn), [PURGE_FENCE_KEYSPACE]);
+    }
+
+    #[test]
+    fn inherited_ref_gates() {
+        // Staging, imports and job outputs carry their source's refs into an otherwise
+        // ungoverned destination; a sender may never drop one.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(Vec::new(), 0))]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A copy inherits a rule another group owns; the subject satisfies it, so only the
+        // ownership refuses the write.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        gated(&mut operation, Vec::new());
+        let owner = Ulid::from_bytes([8u8; 16]);
+
+        let turn = operation.next(decided(PlacementDecision::Allowed, Some(owner)));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::ForeignPolicy { .. }
+            ))
+        ));
+    }
+
+    fn location() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            format: StoredFormat::default(),
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: BODY.len() as u64,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
+    }
+
+    fn subject_row(generation: u64) -> Value {
+        let mut record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            crate::tests::policy::subject(node(9), "eu-west"),
+        )
+        .expect("subject is valid");
+        record.subject.generation = generation;
+        record.to_bytes().expect("record encodes").into()
+    }
+
+    /// The version transaction of a write the gate admitted under `refs`, answered up to its
+    /// bucket and subject reread.
+    fn reread(refs: Vec<PlacementPolicyRef>, bucket_now: Value, subject: Option<Value>) -> Turn {
+        let mut operation = operation("eu-west");
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(refs.clone(), 1))]));
+        if !refs.is_empty() {
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+            operation
+                .next(decided(PlacementDecision::Allowed, None))
+                .unwrap();
+        }
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None])).unwrap();
+        let finished = BlobEvent::WriteFinished {
+            location: location(),
+        };
+        operation.next(event(Event::Blob(finished))).unwrap();
+        let mut child = operation.publish_child();
+        child.first().unwrap();
+        child.next(values(vec![None])).unwrap();
+        child.next(values(vec![Some(bucket_now), subject]))
+    }
+
+    #[test]
+    fn drift_aborts_commit() {
+        // A default changed while the bytes streamed was never evaluated, so the version must
+        // not commit the refs it would now inherit.
+        let changed = bucket(vec![policy("us-east").policy_ref()], 1);
+        let turn = reread(Vec::new(), changed, None);
+        assert_eq!(turn.err(), Some(PolicyGateError::Drift.into()));
+    }
+
+    #[test]
+    fn subject_advance_aborts() {
+        // The subject that admitted the write moved on while the bytes streamed.
+        let rule = policy("eu-west");
+        let same = bucket(vec![rule.policy_ref()], 1);
+        let turn = reread(vec![rule.policy_ref()], same, Some(subject_row(2)));
+        assert_eq!(turn.err(), Some(PolicyGateError::Drift.into()));
+    }
 }

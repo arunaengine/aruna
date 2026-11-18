@@ -170,7 +170,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, KEY_COPY_KEYSPACE};
     use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::structs::placement::record::PlacementRef;

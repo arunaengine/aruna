@@ -625,9 +625,7 @@ mod tests {
         // A queued member job or obligation of a key in the range keeps it owing.
         use crate::distribution::test_store::{open, range};
         use aruna_core::structs::identity::auth::AuthContext;
-        use aruna_core::types::{Effects, Key, Value};
-        use smallvec::smallvec;
-        use thiserror::Error;
+        use aruna_core::types::{Key, Value};
         let (_dir, storage_handle) = open();
         let context = DriverContext {
             storage_handle,
