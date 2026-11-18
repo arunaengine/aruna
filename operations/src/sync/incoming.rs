@@ -6,29 +6,36 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry_until};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
+use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::triggers::{PeerInput, peer_operation};
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::task::TaskKey;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::InboundEventHandler;
+use aruna_net::notification::{
+    close_stream, drain_request, read_frame, write_frame, write_message,
+};
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
@@ -36,6 +43,7 @@ use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
+const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAINTENANCE_JITTER_SECS: u64 = 15;
 
@@ -416,7 +424,9 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Realm usage refresh stopped after a document sync");
     }
-    crate::notifications::email::config_applied(context, &targets.targets).await;
+    if let Err(error) = drive(RefreshMailOperation::applied(&targets.targets), context).await {
+        warn!(%error, "Mail settings refresh stopped after a document sync");
+    }
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
     let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
@@ -574,14 +584,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await;
                 }
                 Alpn::Notification => {
-                    Box::pin(async {
-                        crate::notifications::incoming::handle_notification_stream(
-                            self.context.as_ref(),
-                            stream,
-                            node_id,
-                        )
-                        .await;
-                    })
+                    Box::pin(receive_notification(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    ))
                     .await
                 }
                 Alpn::Shard => {
@@ -684,6 +691,66 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
+}
+
+/// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
+/// table names for it and writes its answer frame.
+#[tracing::instrument(
+    name = "notifications.incoming.stream",
+    level = "debug",
+    skip(context, stream),
+    fields(peer = %peer)
+)]
+async fn receive_notification(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        warn!(peer = %peer, "Dropping inbound notification stream without net handle");
+        return;
+    };
+    let frame = match read_frame(&mut stream).await {
+        Ok(frame) => frame,
+        Err(error) => {
+            warn!(peer = %peer, error = %error, "Failed to read notification message");
+            return;
+        }
+    };
+    if let Err(error) = drain_request(&mut stream).await {
+        warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
+        close_stream(&mut stream).await;
+        return;
+    }
+    let input = PeerInput {
+        alpn: Alpn::Notification,
+        peer,
+        local_node: net_handle.node_id(),
+        local_realm: *net_handle.realm_id(),
+        now_ms: unix_timestamp_millis(),
+        frame: &frame,
+    };
+    let written = match peer_operation(input) {
+        // The same bound the config read had before, so a slow store cannot hold the stream.
+        Some(operation) => {
+            let build = || operation.clone();
+            let deadline = tokio::time::Instant::now() + NOTIFICATION_AUTH_TIMEOUT;
+            match drive_retry_until(build, context, peer.as_bytes(), deadline).await {
+                Ok(answer) => write_frame(&mut stream, &answer).await,
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        // Every request has an operation; an answer frame sent as a request is refused.
+        None => match postcard::from_bytes::<NotificationTransportMessage>(&frame) {
+            Ok(message) => {
+                debug!(peer = %peer, message = message.label(), "Received notification message");
+                let reason = "unexpected notification control message".to_string();
+                let response = NotificationTransportMessage::Reject(reason);
+                write_message(&mut stream, &response).await
+            }
+            Err(error) => Err(error.to_string()),
+        },
+    };
+    if let Err(error) = written {
+        warn!(peer = %peer, error = %error, "Failed to write notification response");
+    }
+    close_stream(&mut stream).await;
 }
 
 /// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
