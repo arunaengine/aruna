@@ -1384,6 +1384,11 @@ pub enum MetadataEffect {
         revision: Ulid,
         shapes: Vec<String>,
     },
+    /// The title of a document: the name of its graph's root entity, else its path.
+    DescribeTitle {
+        graph_iri: String,
+        document_path: String,
+    },
     /// The summary of a graph at a document cursor, from this node's summary cache when it
     /// holds that cursor.
     ExportSummaryAt {
@@ -1442,6 +1447,7 @@ impl MetadataEffect {
             MetadataEffect::CachedShapes { .. } => "cached_shapes",
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
             MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
+            MetadataEffect::DescribeTitle { .. } => "describe_title",
             MetadataEffect::CacheGeneration => "cache_generation",
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
@@ -1465,6 +1471,7 @@ impl MetadataEffect {
             | MetadataEffect::ExportRoCrate { graph_iri }
             | MetadataEffect::ExportRoCrateSummary { graph_iri }
             | MetadataEffect::ExportSummaryAt { graph_iri, .. }
+            | MetadataEffect::DescribeTitle { graph_iri, .. }
             | MetadataEffect::DeleteGraph { graph_iri }
             | MetadataEffect::ContainsGraph { graph_iri }
             | MetadataEffect::ContainsDot { graph_iri, .. }
@@ -1604,6 +1611,10 @@ pub enum MetadataEvent {
     /// The registry cache generation; a cache change answers with the generation after it.
     CacheGeneration {
         generation: u64,
+    },
+    /// The title of a document, or `None` when it has neither a name nor a path.
+    DocumentTitle {
+        title: Option<String>,
     },
     /// The cached registry rows of one group, or `None` without a fresh copy.
     CachedGroup {

@@ -74,6 +74,17 @@ impl GraphHandle {
                     error: MetadataError::InvalidEffect,
                 };
             }
+            MetadataEffect::DescribeTitle {
+                graph_iri,
+                document_path,
+            } => {
+                let properties = self.describe_root(graph_iri).await;
+                // Root subject "./" makes the fallback the document path, not the id tail.
+                let title =
+                    aruna_core::search_enrichment::hit_title(&properties, &document_path, "./");
+                let title = (!title.is_empty()).then_some(title);
+                return MetadataEvent::DocumentTitle { title };
+            }
             MetadataEffect::ExportSummaryAt { graph_iri, cursor } => {
                 if let Some(jsonld) = (self.inner.summaries).get(&graph_iri, cursor, Instant::now())
                 {
@@ -949,6 +960,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::UncacheRecord { .. }
         | MetadataEffect::CachedGroup { .. }
         | MetadataEffect::ExportSummaryAt { .. }
+        | MetadataEffect::DescribeTitle { .. }
         | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs

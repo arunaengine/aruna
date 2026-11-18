@@ -109,6 +109,7 @@ pub mod read_types;
 pub(crate) mod readable;
 pub mod search;
 pub mod search_types;
+pub(crate) mod title;
 
 use self::fanout_types::MetadataFanoutScope;
 use self::fanout_types::MetadataFanoutStats;

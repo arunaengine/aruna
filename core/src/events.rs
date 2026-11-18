@@ -906,6 +906,7 @@ impl MetadataEvent {
                 BatchMerged,
                 CacheGeneration,
                 CachedGroup,
+                DocumentTitle,
                 ProfileShapes,
                 ProfileChecked,
                 Error,

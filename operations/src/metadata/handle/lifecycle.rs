@@ -555,6 +555,7 @@ pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
             | MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportSummaryAt { .. }
+            | MetadataEffect::DescribeTitle { .. }
             | MetadataEffect::ExportRoCratePage { .. }
             | MetadataEffect::PlanBatch { .. }
             | MetadataEffect::MergeBatch { .. }
