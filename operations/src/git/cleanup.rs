@@ -154,7 +154,7 @@ async fn original(
         .map_or(UserId::nil(document.realm_id), |record| record.user_id);
     let auth = super::project::author(pusher);
     Ok(
-        match drive(lfs::readable(context.node_id(), &auth, &original), context).await {
+        match drive(lfs::readable(context.node_id(), &auth, &original), context).await? {
             true => Ok(()),
             false => Err("the original is unreadable, so this copy may be the last one"),
         },
