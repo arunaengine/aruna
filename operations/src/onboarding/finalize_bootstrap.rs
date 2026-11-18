@@ -1428,3 +1428,7 @@ mod tests {
         .await;
     }
 }
+
+#[cfg(test)]
+#[path = "finalize_tests.rs"]
+mod call_tests;
