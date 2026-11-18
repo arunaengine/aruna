@@ -16,7 +16,6 @@ use aruna_operations::node::recovery::RecoveryStatus;
 use aruna_operations::node::startup::RecoveryConfig;
 use aruna_operations::plugins::artifacts::spawn_repair;
 use aruna_operations::plugins::worker::spawn_worker;
-use aruna_operations::s3::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -24,6 +23,7 @@ use tracing::warn;
 
 use crate::application::{Service, ServiceExit};
 use crate::startup::realm::CoreAnnouncement;
+use crate::startup::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use crate::startup::test_hooks;
 
 pub(crate) struct Background {
