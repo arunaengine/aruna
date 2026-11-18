@@ -545,31 +545,27 @@ mod tests {
         };
         assert_eq!(asked(&turn), &Effect::Blob(lock));
         // A stale timer locks nothing and records nothing.
-        operation.step(Event::Blob(BlobEvent::KeyLocked {
+        let turn = operation.next(event(Event::Blob(BlobEvent::KeyLocked {
             locked: Vec::new(),
             sequence: Ulid::nil(),
             live: None,
-        }));
+        })));
         assert_eq!(
-            operation.finalize(),
-            Ok(LockResult {
+            turn,
+            Ok(Next::Done(LockResult {
                 locked: Vec::new(),
                 audited: true
-            })
+            }))
         );
     }
 
     #[test]
     fn stranger_refused() {
-        let (mut operation, effects) = read(Some(user(9)), None);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
-        assert_eq!(operation.finalize(), Err(LockError::NotHolder));
+        let (mut operation, turn) = read(Some(user(9)), None);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            Err(LockError::NotHolder)
+        );
     }
 }
