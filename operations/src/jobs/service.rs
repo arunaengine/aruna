@@ -44,6 +44,7 @@ use super::submit::{
     schedule_drain_effect,
 };
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, mint_unplaced};
+use super::submit_local::{MintJobOperation, QueueJobOperation, SubmitLocalOperation};
 use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
@@ -57,7 +58,7 @@ use crate::realm::load_config::load_realm_config;
 use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
-use super::lifecycle::cancel::{self, cancel_family};
+use super::lifecycle::cancel::{CancelFamilyOperation, PublishDeletionOperation};
 use super::lifecycle::family_reads::{
     FamilyResponderOperation, FamilyStatusOperation, SessionJobOperation,
 };
@@ -75,20 +76,9 @@ pub(crate) async fn mint_local_job(
     owner_node_id: NodeId,
     dedup_key: Option<&[u8]>,
 ) -> Result<JobId, SubmitJobError> {
-    let entropy = ulid::Ulid::generate().to_bytes();
-    let subject = dedup_key.unwrap_or(&entropy);
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return mint_unplaced(subject);
-    };
-    if net_handle.node_id() != owner_node_id || *net_handle.realm_id() != realm_id {
-        return Err(SubmitJobError::PlacementUnavailable(
-            "job owner does not match the serving node".to_string(),
-        ));
-    }
-    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
-    })?;
-    mint_configured_job(&config, owner_node_id, subject)
+    let serving = context.node_and_realm();
+    let mint = MintJobOperation::new(realm_id, owner_node_id, dedup_key, serving);
+    drive(mint, context).await
 }
 
 /// The accepting node is the immutable owner: creation, listing, dedup,
@@ -96,14 +86,11 @@ pub(crate) async fn mint_local_job(
 /// submit leaves no ghost rows and nothing is reserved on any other node.
 pub(crate) async fn submit_local_job(
     context: &DriverContext,
-    mut spec: SubmitJobSpec,
+    spec: SubmitJobSpec,
     job_id: JobId,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    if let Some(net_handle) = context.net_handle.as_ref() {
-        spec.owner_node_id = net_handle.node_id();
-    }
-    let build = || SubmitJobOperation::new(spec.clone(), job_id);
-    drive_retry(build, context, &job_id.to_bytes()).await
+    let queue = QueueJobOperation::new(spec, job_id, context.node_and_realm());
+    drive(queue, context).await
 }
 
 /// Submit a container execution job on behalf of `created_by`; the drain claims it
@@ -233,26 +220,14 @@ pub async fn submit_import_job(
     dedup: Option<String>,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let created_by = spec.auth_context.user_id;
-    let dedup_key = dedup.map(|key| user_dedup_key(created_by, &key));
-    let realm_id = spec.auth_context.realm_id;
-    let job_id = mint_local_job(context, realm_id, owner_node_id, dedup_key.as_deref()).await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::BackendImport(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            active_cap: None,
-        },
-        job_id,
-    )
-    .await
+    let submit = SubmitLocalOperation::backend_import(
+        spec,
+        owner_node_id,
+        (dedup, retention_ms),
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context).await
 }
 
 /// Queues one run of a harvest source for `created_by`. Provenance keeps a rerun idempotent.
@@ -596,7 +571,13 @@ async fn delete_recorded(
         .await
         .map_err(JobMutationError::Storage)?;
     let recorded = deletable && cleanup.is_none_or(|cleanup| cleanup.state.is_terminal());
-    if recorded && let Err(error) = cancel::publish_deletion(context, auth, job_id).await {
+    let deletion = PublishDeletionOperation::new(
+        auth,
+        job_id,
+        context.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    if recorded && let Err(error) = drive(deletion, context).await {
         return Ok(RunDelete::Unrecorded(error.to_string()));
     }
     delete_finished_run(context, auth.user_id, job_id, recorded).await
@@ -1400,7 +1381,14 @@ async fn family_cancel(
         path_restrictions: None,
         session: None,
     };
-    let published = cancel_family(context, &auth, job_id, auth_token).await?;
+    let cancel = CancelFamilyOperation::new(
+        &auth,
+        job_id,
+        auth_token,
+        context.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    let published = drive(cancel, context).await.transpose()?;
     Some(match published {
         Ok(()) => match drive(
             FamilyStatusOperation::new(&auth, job_id, aruna_core::time::unix_timestamp_millis()),
