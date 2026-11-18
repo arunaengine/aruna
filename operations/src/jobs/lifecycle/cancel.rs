@@ -645,3 +645,194 @@ impl Operation for CancelFamilyOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, REALM, node};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::JobRecord;
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn job() -> JobId {
+        JobId::from_bytes([3; 16])
+    }
+
+    fn serving() -> ServingNode {
+        Some((node(1), REALM))
+    }
+
+    fn flag() -> FlagLocalRunOperation {
+        FlagLocalRunOperation::new(job(), serving(), 5)
+    }
+
+    fn record(family: &Family) -> JobRecord {
+        let spec = family.spec();
+        JobRecord::new(
+            job(),
+            aruna_core::structs::execution::job::JobPayload::Execution(spec.payload),
+            spec.created_by,
+            node(1),
+            1,
+            1,
+            None,
+        )
+    }
+
+    // A row that is gone or settled needs no drain; a flagged one does.
+    #[test]
+    fn flag_outcomes() {
+        let family = Family::new([1; 32]);
+        let answer = |outcome| {
+            let mut operation = flag();
+            operation.first().expect("the request starts");
+            operation.next(child(outcome))
+        };
+        let missing = Err::<CancelRequestOutcome, _>(JobMutationError::NotFound);
+        assert_eq!(answer(missing), Ok(Next::Done(false)));
+        let done = CancelRequestOutcome::AlreadyTerminal(record(&family));
+        assert_eq!(
+            answer(Ok::<_, JobMutationError>(done)),
+            Ok(Next::Done(false))
+        );
+        let flagged = CancelRequestOutcome::Flagged(record(&family));
+        assert_eq!(
+            answer(Ok::<_, JobMutationError>(flagged)),
+            Ok(Next::Done(true))
+        );
+    }
+
+    // A terminal row is published, and a pending publication arms the settle timer.
+    #[test]
+    fn pending_publication_rearms() {
+        let family = Family::new([1; 32]);
+        let mut operation = flag();
+        operation.first().expect("the request starts");
+        let cancelled = CancelRequestOutcome::Cancelled(record(&family));
+        let next = operation.next(child(Ok::<_, JobMutationError>(cancelled)));
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        let pending = operation.next(child(Ok::<_, LifecycleError>(false)));
+        assert_eq!(
+            pending,
+            Ok(Next::Call(effect_call(schedule_terminal_settle(
+                SETTLE_RETRY_AFTER
+            ))))
+        );
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    // Only flagged rows wake the drain, after the last one was handled.
+    #[test]
+    fn drain_woken_once() {
+        let family = Family::new([1; 32]).family();
+        let mut runs = CancelLocalRunsOperation::new(family, serving(), 5);
+        runs.pending = Some(vec![job()]);
+        let next = runs.next(child(Ok::<_, IoError>(true)));
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        let done = runs.next(child(Ok::<_, IoError>(false)));
+        assert_eq!(
+            done,
+            Ok(Next::Then {
+                output: (),
+                calls: vec![effect_call(schedule_drain_effect())],
+            })
+        );
+    }
+
+    // Without a network there is no local executor to stop.
+    #[test]
+    fn offline_stops_nothing() {
+        let family = Family::new([1; 32]).family();
+        let mut runs = CancelLocalRunsOperation::new(family, None, 5);
+        assert_eq!(runs.first(), Ok(Next::Done(())));
+    }
+
+    fn publish(authority: CancelAuthority, local: NodeId) -> (Family, PublishCancelOperation) {
+        let family = Family::new([1; 32]);
+        let auth = AuthContext::anonymous(REALM);
+        let serving = Some((local, REALM));
+        let operation = PublishCancelOperation::new(family.spec(), &auth, authority, serving, 5);
+        (family, operation)
+    }
+
+    fn config(family: &Family) -> IoResult {
+        child(Ok::<_, GetConfigError>(family.config.clone()))
+    }
+
+    // A holder signs the record; a node outside the family cannot record a deletion.
+    #[test]
+    fn holder_signs_record() {
+        let (family, mut holder) = publish(CancelAuthority::Submitter, node(1));
+        holder.first().expect("the config is read");
+        let next = holder.next(config(&family));
+        assert!(
+            matches!(next, Ok(Next::Call(IoCall::Effect(_)))),
+            "{next:?}"
+        );
+        let (family, mut outsider) = publish(CancelAuthority::Deletion, node(9));
+        outsider.first().expect("the config is read");
+        assert!(matches!(
+            outsider.next(config(&family)),
+            Err(JobRouteError::Unavailable(_))
+        ));
+    }
+
+    // A forwarded cancel tries the next holder until one answers for the family.
+    #[test]
+    fn forward_tries_holders() {
+        let (family, mut outsider) = publish(CancelAuthority::Submitter, node(9));
+        outsider.first().expect("the config is read");
+        assert!(matches!(
+            outsider.next(config(&family)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let down = Err::<JobRouteOutcome, _>(JobRouteError::Unavailable("down".to_string()));
+        assert!(matches!(
+            outsider.next(child(down)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let refused = JobRouteOutcome::Remote(JobResponse::Forbidden);
+        assert_eq!(
+            outsider.next(child(Ok::<_, JobRouteError>(refused))),
+            Err(JobRouteError::Forbidden)
+        );
+    }
+
+    // No family means the caller's ordinary cancellation applies.
+    #[test]
+    fn no_family_answers_none() {
+        let auth = AuthContext::anonymous(REALM);
+        let mut cancel = CancelFamilyOperation::new(&auth, job(), None, serving(), 5);
+        cancel.first().expect("the alias is read");
+        let none = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
+        assert_eq!(cancel.next(none), Ok(Next::Done(None)));
+    }
+
+    // Only the submitter may delete the record of a run.
+    #[test]
+    fn deletion_needs_submitter() {
+        let family = Family::new([1; 32]);
+        let auth = AuthContext::anonymous(REALM);
+        let mut deletion = PublishDeletionOperation::new(&auth, job(), serving(), 5);
+        deletion.first().expect("the family is read");
+        let projected = crate::jobs::records::project::ProjectedFamily {
+            family: family.family(),
+            revision: 0,
+            projection: None,
+            truncated: false,
+            cached: false,
+        };
+        let read = Some((projected, family.spec()));
+        assert_eq!(
+            deletion.next(child(Ok::<_, JobRouteError>(read))),
+            Err(JobRouteError::NotFound)
+        );
+    }
+}
