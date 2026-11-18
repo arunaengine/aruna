@@ -7,6 +7,11 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::job_service::{
+    ArtifactLookup, JobReportLookup, OwnedArtifact, ReportQuery, RoutedCancelOutcome,
+    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
+    read_report_routed, resolve_job_owner,
+};
 use crate::jobs::family_report;
 use aruna_core::NodeId;
 use aruna_core::jobs::JobKind;
@@ -24,11 +29,6 @@ use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
-};
-use aruna_operations::jobs::service::{
-    ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
-    delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
-    resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
@@ -1282,9 +1282,11 @@ pub async fn get_job_report(
         &state.get_ctx(),
         &auth,
         job_id,
-        expected_digest,
-        last_key,
-        limit,
+        ReportQuery {
+            expected_digest,
+            last_key,
+            limit,
+        },
         forwarded_job_auth(bearer)?,
     )
     .await
