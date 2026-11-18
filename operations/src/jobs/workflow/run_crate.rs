@@ -53,7 +53,7 @@ use crate::metadata::create_document::{
 use crate::metadata::create_entry::mint_job_document;
 use crate::metadata::forward::write::route_metadata_create;
 use crate::metadata::record_reads::load_document_record;
-use crate::notifications::watch::emit::emit_metadata_created;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use crate::replication::protocol::LocationSummaryRequest;
@@ -351,16 +351,16 @@ async fn record_written(
     let realm_id = driver.serving_realm(parent.created_by.realm_id);
     let (group_id, document_id) = (record.group_id, record.document_id);
     let path = &record.document_path;
-    emit_metadata_created(
-        driver,
+    let emit = EmitEventOperation::metadata_created(
         realm_id,
         parent.created_by,
         group_id,
         document_id,
         path,
         event_id,
-    )
-    .await;
+    );
+    // Failures only warn inside the operation.
+    let _ = drive(emit, driver).await;
     let resource = document_id.to_string();
     let status = RunCrateStatus::Written {
         resource: resource.clone(),

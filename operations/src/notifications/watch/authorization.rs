@@ -1,46 +1,23 @@
-//! Runs the watch creation check for async callers; its tests cover every watch check.
+//! Tests every watch check against a local store: creation, listing, delivery and forwarding.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::notification_watch::WatchEventMask;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-
-use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::check::WatchCheckOperation;
-use crate::notifications::watch::paths::WatchAuthorization;
-
-async fn checked(
-    context: &DriverContext,
-    check: WatchCheckOperation,
-) -> Result<WatchAuthorization, String> {
-    drive(check, context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-pub async fn evaluate_watch_creation(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth_context: &AuthContext,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-) -> Result<WatchAuthorization, String> {
-    let check = WatchCheckOperation::creation(realm_id, auth_context, path_prefix, event_mask);
-    checked(context, check).await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::notifications::watch::check::WatchCheckOperation;
+    use crate::notifications::watch::paths::WatchAuthorization;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::WatchEventMask;
     use aruna_core::structs::execution::notification_watch::{
         WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
     };
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
@@ -59,6 +36,26 @@ mod tests {
     use crate::notifications::watch::paths::{
         WatchAuthorizationDenial, event_permission_path, watch_permission_path,
     };
+
+    async fn checked(
+        context: &DriverContext,
+        check: WatchCheckOperation,
+    ) -> Result<WatchAuthorization, String> {
+        drive(check, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_creation(
+        context: &DriverContext,
+        realm_id: RealmId,
+        auth_context: &AuthContext,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+    ) -> Result<WatchAuthorization, String> {
+        let check = WatchCheckOperation::creation(realm_id, auth_context, path_prefix, event_mask);
+        checked(context, check).await
+    }
 
     /// Canonical authorization result every watch surface shares: the owner must
     /// still hold READ on the watched prefix's permission path. No resource

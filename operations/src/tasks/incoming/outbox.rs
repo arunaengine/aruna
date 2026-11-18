@@ -1178,7 +1178,10 @@ impl OperationsTaskHandler {
                         warn!(%error, "Watch interest refresh stopped after an outbox drain");
                     }
                 }
-                crate::notifications::email::config_applied(self.context.as_ref(), &targets).await;
+                let refresh = RefreshMailOperation::applied(&targets);
+                if let Err(error) = drive(refresh, self.context.as_ref()).await {
+                    warn!(%error, "Mail settings refresh stopped after an outbox drain");
+                }
                 let project_started = Instant::now();
                 let projected = self
                     .project_create_events(retry_key, targets, metadata_create_events)

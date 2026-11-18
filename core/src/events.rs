@@ -512,6 +512,8 @@ pub enum NetEvent {
     DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
+    /// This node and the holders its watch interest matches; none without a net handle.
+    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -949,6 +951,7 @@ impl Event {
                     InboxWoken,
                     Heartbeat,
                     Recorded,
+                    WatchHolders,
                 }
             ),
             Event::Metadata(event) => event.label(),
@@ -1025,7 +1028,8 @@ impl Event {
                     Posted,
                     MailSent,
                     Backoff,
-                    Answered
+                    Answered,
+                    MailRefreshed
                 }
             ),
         }

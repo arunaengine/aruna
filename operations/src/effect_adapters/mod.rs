@@ -230,5 +230,6 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
+        OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
     }
 }

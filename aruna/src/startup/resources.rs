@@ -541,7 +541,11 @@ async fn fill(
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id).await;
+    let refresh =
+        aruna_operations::notifications::email::RefreshMailOperation::new(config.realm_id);
+    if let Err(error) = drive(refresh, &driver_ctx).await {
+        warn!(%error, "Mail settings refresh stopped during startup");
+    }
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::sweeps::spawn_recovery_sweep(

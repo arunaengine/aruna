@@ -20,6 +20,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::after_sync::apply_metadata;
 use crate::node::summary_refresh::RefreshUsageOperation;
+use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::shard::recovery::{
     PhaseOutcome, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass, RecoveryRotation,
@@ -839,7 +840,10 @@ pub(crate) async fn apply_restored_reconcile(
             warn!(%error, "Watch interest refresh stopped after the shard restore");
         }
     }
-    crate::notifications::email::config_applied(context, &result.targets).await;
+    let refresh = RefreshMailOperation::applied(&result.targets);
+    if let Err(error) = drive(refresh, context.as_ref()).await {
+        warn!(%error, "Mail settings refresh stopped after the shard restore");
+    }
     apply_metadata(context, Some(node_id), result, false).await;
     true
 }

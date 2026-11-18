@@ -76,8 +76,8 @@ async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Resul
     stream.0.finish().map_err(|error| error.to_string())
 }
 
-/// Carries out a change of this node's watch metrics or watch interest; without a net handle
-/// only the suppression is logged.
+/// Carries out a change of this node's watch metrics or watch interest, or reads the holders it
+/// matches; without a net handle only the suppression is logged.
 fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Event, NetEffect> {
     match effect {
         NetEffect::RecordSuppression(reason) => {
@@ -115,6 +115,18 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
             if let Some(net_handle) = net_handle {
                 net_handle.update_realm_interest(realm_id, nodes);
             }
+        }
+        NetEffect::WatchHolders {
+            realm_id,
+            path,
+            kind,
+        } => {
+            let holders = net_handle.map(|net_handle| {
+                let interest = net_handle.watch_interest_snapshot();
+                let holders = interest.matching_nodes(realm_id, &path, kind);
+                (net_handle.node_id(), holders)
+            });
+            return Ok(Event::Net(NetEvent::WatchHolders(holders)));
         }
         other => return Err(other),
     }

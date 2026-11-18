@@ -7,7 +7,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
-use crate::driver::{DriverContext, drive_retry};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::get_visible_document;
 use crate::metadata::api::export_types::GetVisibleRequest;
@@ -32,7 +32,7 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::update_metadata_document;
-use crate::notifications::watch::emit::emit_metadata_created;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
@@ -283,16 +283,15 @@ pub async fn create_metadata_authorized(
 
     // Post-commit, best-effort resource-watch emission. A failed emission only
     // warns and never affects the already-successful create.
-    emit_metadata_created(
-        context,
+    let emit = EmitEventOperation::metadata_created(
         realm_id,
         auth.user_id,
         record.group_id,
         record.document_id,
         &record.document_path,
         event_id,
-    )
-    .await;
+    );
+    let _ = drive(emit, context).await;
 
     Ok(record)
 }
@@ -408,16 +407,16 @@ pub async fn create_with_id(
     let record = created.record;
     let path = &record.document_path;
     let (user, group) = (auth.user_id, record.group_id);
-    emit_metadata_created(
-        context,
+    let emit = EmitEventOperation::metadata_created(
         realm_id,
         user,
         group,
         document_id,
         path,
         created.event_id,
-    )
-    .await;
+    );
+    // Failures only warn inside the operation.
+    let _ = drive(emit, context).await;
     Ok(record)
 }
 
