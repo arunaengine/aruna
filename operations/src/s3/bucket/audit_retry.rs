@@ -541,12 +541,14 @@ mod tests {
 
     #[test]
     fn stores_in_transaction() {
-        let key = retry_timer(&record());
+        // Each `record()` gets a new event id, so the timer and its rows share one record.
+        let record = record();
+        let key = retry_timer(&record);
         let mut operation = StoreAuditOperation::new(key.clone());
         let write = Effect::Storage(StorageEffect::Write {
             key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-            key: record().key().into(),
-            value: record().to_bytes().unwrap().into(),
+            key: record.key().into(),
+            value: record.to_bytes().unwrap().into(),
             txn_id: Some(txn()),
         });
         let delete = Effect::Storage(StorageEffect::Delete {

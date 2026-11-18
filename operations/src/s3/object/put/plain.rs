@@ -5,7 +5,6 @@
 use super::fenced::{Fenced, FencedWrite};
 use super::*;
 use aruna_core::calls::IoCall;
-use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
@@ -200,9 +199,6 @@ impl PutObjectOperation {
     pub(super) fn evidence_written(&mut self, result: IoResult) -> Turn {
         match result.child::<Fenced, StorageError>()? {
             Ok(Fenced::Written | Fenced::RuleGone) => self.start_publish(),
-            Ok(Fenced::Failed(error)) => {
-                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
-            }
             Err(error) => Err(error.into()),
         }
     }
@@ -215,9 +211,6 @@ impl PutObjectOperation {
             Ok(Fenced::RuleGone) => {
                 self.written_intent.clear();
                 Err(PutObjectError::ImportRemoved)
-            }
-            Ok(Fenced::Failed(error)) => {
-                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
             }
             Err(error) => Err(error.into()),
         }
@@ -449,29 +442,6 @@ pub(crate) fn same_name_path(
 
 /// Reads the rule's record of the path, where the rule records its files; another rule's or
 /// an unknown file there is never replaced.
-pub(crate) fn owner_read(target: &PlainTarget) -> Option<Effect> {
-    target.listed.then(|| {
-        Effect::Storage(StorageEffect::Read {
-            key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-            key: object_key(target.import_id, &target.path),
-            txn_id: None,
-        })
-    })
-}
-
-/// Whether the record read by `owner_read` names `key`. A record without a key proves no
-/// owner, since several keys can give the same path.
-pub(crate) fn owns_path(event: Event, key: &str) -> Result<bool, BlobError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => path_owned(value.as_deref(), key),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(BlobError::ReadError(error.to_string()))
-        }
-        _ => Err(BlobError::InvalidEffect),
-    }
-}
-
-/// The call form of [`owner_read`].
 pub(crate) fn owner_call(target: &PlainTarget) -> Option<IoCall> {
     let key = object_key(target.import_id, &target.path);
     target
@@ -479,7 +449,8 @@ pub(crate) fn owner_call(target: &PlainTarget) -> Option<IoCall> {
         .then(|| aruna_core::rows::read_row(IMPORTED_OBJECT_KEYSPACE, key))
 }
 
-/// Whether the record row `owner_call` read names `key`.
+/// Whether the record row `owner_call` read names `key`. A record without a key proves no
+/// owner, since several keys can give the same path.
 pub(crate) fn path_owned(value: Option<&[u8]>, key: &str) -> Result<bool, BlobError> {
     let Some(value) = value else {
         return Ok(false);
@@ -550,18 +521,6 @@ pub(crate) fn intent_rows(
         .iter()
         .map(|key| (space.clone(), key.clone(), value.clone()))
         .collect())
-}
-
-/// Deletes the intents of a write that moved no byte.
-pub(crate) fn intent_deletes(keys: &[Key]) -> Effect {
-    let space = IMPORT_INTENT_KEYSPACE.to_string();
-    Effect::Storage(StorageEffect::BatchDelete {
-        deletes: keys
-            .iter()
-            .map(|key| (space.clone(), key.clone()))
-            .collect(),
-        txn_id: None,
-    })
 }
 
 /// Pins a plain object to the backend version it was written as.

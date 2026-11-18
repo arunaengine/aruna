@@ -10,14 +10,16 @@ mod reissue;
 mod requests;
 mod snapshot;
 
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
+use crate::distribution::inventory::{StagedCall, outside_answer};
+use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 use aruna_core::NodeId;
-use aruna_core::calls::IoError;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
-use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, VaultQuery};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::*;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{all_values, done, event, page, values};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
@@ -26,10 +28,9 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 pub use member::MemberKeysOperation;
 pub use reissue::ReissueOperation;
-use smallvec::smallvec;
 use snapshot::Snapshot;
 use thiserror::Error;
 use ulid::Ulid;
@@ -101,10 +102,9 @@ impl From<IoError> for KeyError {
         }
     }
 }
+type KeyTurn = Result<Next<KeyResult>, KeyError>;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
-    Init,
-    Start,
     Bucket,
     Settings,
     Snapshot,
@@ -119,10 +119,6 @@ enum State {
     Holders,
     Cleanup,
     Write,
-    Commit,
-    Drain,
-    Done,
-    Reissue,
     Heads,
     Writes,
     Envelopes,
@@ -136,7 +132,6 @@ pub struct KeyOperation {
     node: NodeId,
     action: KeyAction,
     now: u64,
-    txn: Option<TxnId>,
     state: State,
     info: Option<BucketInfo>,
     snapshot: Option<Snapshot>,
@@ -157,7 +152,6 @@ pub struct KeyOperation {
     quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
-    output: Option<Result<KeyResult, KeyError>>,
 }
 impl KeyOperation {
     pub fn new(
@@ -175,8 +169,7 @@ impl KeyOperation {
             node,
             action,
             now,
-            txn: None,
-            state: State::Init,
+            state: State::Bucket,
             info: None,
             snapshot: None,
             recipient_keys: Vec::new(),
@@ -195,7 +188,6 @@ impl KeyOperation {
             quiet: false,
             managed: false,
             result: None,
-            output: None,
         }
     }
     /// Sends no holder notifications and walks no reissue pages, for reissue's own runs.
@@ -203,35 +195,21 @@ impl KeyOperation {
         self.quiet = true;
         self
     }
-    fn fail(&mut self, error: impl Into<KeyError>) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Err(error.into()));
-        self.abort()
+    fn fail(&mut self, error: impl Into<KeyError>) -> KeyTurn {
+        Err(error.into())
     }
-    fn read(&self, space: &str, key: Vec<u8>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: space.to_string(),
-            key: key.into(),
-            txn_id: self.txn
-        })]
-    }
-    fn fenced(&self, mut effects: Effects) -> Effects {
-        for effect in &mut effects {
-            if let Effect::Storage(
-                StorageEffect::Read { txn_id, .. } | StorageEffect::Iter { txn_id, .. },
-            ) = effect
-            {
-                *txn_id = self.txn;
-            }
-        }
-        effects
+    fn read(&self, space: &str, key: Vec<u8>) -> KeyTurn {
+        Ok(Next::Call(IoCall::Read(vec![(
+            space.to_string(),
+            key.into(),
+        )])))
     }
     fn newest(&self) -> Option<&UserKeyRecord> {
         self.recipient_keys
             .iter()
             .max_by_key(|k| (k.created_at_ms, k.record_id))
     }
-    fn settings_read(&mut self, value: Option<Value>) -> Effects {
+    fn settings_read(&mut self, value: Option<Value>) -> KeyTurn {
         let settings = BucketEncryption::from_row(value.as_deref()).ok();
         let Some(key) = settings.as_ref().and_then(|s| s.active_key()) else {
             return self.fail(KeyError::Missing);
@@ -258,34 +236,33 @@ impl KeyOperation {
             KeyAction::Open(_) | KeyAction::Grants(_) | KeyAction::Publish(_)
         );
         let due = reads_due.then(|| (ABE_DUE_KEYSPACE.to_string(), bucket_id.into()));
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
+        Ok(Next::Call(IoCall::Read(
+            vec![
                 (AUTH_KEYSPACE.to_string(), realm.clone().into()),
                 (
                     AUTH_KEYSPACE.to_string(),
-                    info.group_id.to_bytes().to_vec().into()
+                    info.group_id.to_bytes().to_vec().into(),
                 ),
                 (REALM_CONFIG_KEYSPACE.to_string(), realm.into()),
                 (ABE_PARAMETERS_KEYSPACE.to_string(), key.key().into()),
                 (
                     ABE_EPOCH_KEYSPACE.to_string(),
-                    key.bucket_id.to_bytes().to_vec().into()
+                    key.bucket_id.to_bytes().to_vec().into(),
                 ),
                 (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
                 (BUCKET_HOLDER_KEYSPACE.to_string(), holder.concat().into()),
                 (
                     USER_KEYSPACE.to_string(),
-                    self.recipient().to_bytes().into()
-                )
+                    self.recipient().to_bytes().into(),
+                ),
             ]
             .into_iter()
             .chain(due)
             .collect(),
-            txn_id: self.txn
-        })]
+        )))
     }
     /// Opens or issues the requests of a request, member or token action under the snapshot epoch.
-    fn prepare(&mut self) -> Effects {
+    fn prepare(&mut self) -> KeyTurn {
         if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. }) {
             match self.member_scopes() {
                 Ok(scopes) if scopes.is_empty() => {
@@ -307,7 +284,7 @@ impl KeyOperation {
         self.read_keys()
     }
     /// Reads the recipient's user keys from their vault.
-    fn read_keys(&mut self) -> Effects {
+    fn read_keys(&mut self) -> KeyTurn {
         let mut keys = ReadVaultOperation::new(ReadVaultConfig {
             node_id: self.node,
             realm_id: self.auth.realm_id,
@@ -316,22 +293,25 @@ impl KeyOperation {
             deadline: std::time::Duration::from_secs(10),
         });
         self.state = State::Keys;
-        let effects = self.fenced(keys.start());
+        let next = keys.first();
         self.keys = Some(keys);
-        effects
+        self.keys_next(next)
     }
-    fn keys_read(&mut self, event: Event) -> Effects {
+    fn keys_read(&mut self, result: IoResult) -> KeyTurn {
         let Some(keys) = self.keys.as_mut() else {
             return self.fail(KeyError::Storage);
         };
-        let effects = keys.step(event);
-        if !keys.is_complete() {
-            return self.fenced(effects);
-        }
-        let records = match self.keys.take().map(|k| k.finalize()) {
-            Some(Ok(VaultRecords::Keys(records))) => records,
+        let next = keys.next(result);
+        self.keys_next(next)
+    }
+    /// Makes the vault read's calls this run's own, so its local reads join the transaction.
+    fn keys_next(&mut self, next: Result<Next<VaultRecords>, ReadVaultError>) -> KeyTurn {
+        let records = match next {
+            Ok(Next::Call(call)) => return Ok(Next::Call(call)),
+            Ok(Next::Done(VaultRecords::Keys(records))) => records,
             _ => return self.fail(KeyError::Storage),
         };
+        self.keys = None;
         if records
             .iter()
             .any(|r| r.user_id != self.recipient() || r.validate().is_err())
@@ -341,7 +321,7 @@ impl KeyOperation {
         self.recipient_keys = records;
         self.records()
     }
-    fn records(&mut self) -> Effects {
+    fn records(&mut self) -> KeyTurn {
         let Some(snapshot) = &self.snapshot else {
             return self.fail(KeyError::Missing);
         };
@@ -362,15 +342,14 @@ impl KeyOperation {
             KeyAction::Epoch { .. } | KeyAction::Rekey => return self.fail(AbeError::Context),
         };
         self.state = State::Records;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: space.to_string(),
-            prefix: Some(prefix.into()),
-            start: cursor.map(|v| IterStart::After(v.into())),
+        Ok(Next::Call(IoCall::Page {
+            space: space.to_string(),
+            prefix: prefix.into(),
+            after: cursor.map(Key::from),
             limit: MAX_REQUESTS + 1,
-            txn_id: self.txn
-        })]
+        }))
     }
-    fn existing_read(&mut self, value: Option<Value>) -> Effects {
+    fn existing_read(&mut self, value: Option<Value>) -> KeyTurn {
         let KeyAction::Publish(submitted) = &self.action else {
             return self.fail(AbeError::Context);
         };
@@ -386,20 +365,16 @@ impl KeyOperation {
             None => self.fail(KeyError::Missing),
         }
     }
-    fn flush(&mut self) -> Effects {
+    fn flush(&mut self) -> KeyTurn {
         if !self.deletes.is_empty() {
             self.state = State::Cleanup;
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: std::mem::take(&mut self.deletes),
-                txn_id: self.txn
-            })];
+            let deletes = std::mem::take(&mut self.deletes);
+            return Ok(Next::Call(IoCall::Delete(deletes)));
         }
         if !self.writes.is_empty() {
             self.state = State::Write;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes: std::mem::take(&mut self.writes),
-                txn_id: self.txn
-            })];
+            let writes = std::mem::take(&mut self.writes);
+            return Ok(Next::Call(IoCall::Write(writes)));
         }
         // Older epochs left uncovered get the next bounded batch for the same scope.
         if self.more
@@ -425,33 +400,57 @@ impl KeyOperation {
         {
             return self.next_scope();
         }
-        let Some(txn_id) = self.txn else {
-            return self.fail(KeyError::Storage);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let output = self.result.take().ok_or(AbeError::Context)?;
+        let drain = crate::notifications::outbox_record::schedule_drain_effect();
+        let drain = self.notify.then(|| IoCall::Effect(Box::new(drain)));
+        let calls: Vec<IoCall> = drain.into_iter().chain(self.walk()).collect();
+        if calls.is_empty() {
+            return Ok(Next::Done(output));
+        }
+        Ok(Next::Then { output, calls })
+    }
+    /// Answers the issuance: a key unlocked after the locked status read cannot issue before the
+    /// due raise, so that run retries.
+    fn issue_read(&mut self, event: Event) -> KeyTurn {
+        match event {
+            Event::Blob(BlobEvent::Abe(_)) if self.snapshot.as_ref().is_some_and(|s| s.due) => {
+                self.fail(KeyError::Storage)
+            }
+            Event::Blob(BlobEvent::Abe(event)) => match *event {
+                AbeEvent::Grant(grant) => self.publish_grant(grant),
+                _ => self.fail(AbeError::Context),
+            },
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                match self.request.take() {
+                    Some(request) => {
+                        self.result = Some(KeyResult::Request(request.clone()));
+                        self.write_request(request)
+                    }
+                    None => self.fail(KeyError::Missing),
+                }
+            }
+            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => self.fail(error),
+            _ => self.fail(AbeError::Context),
+        }
     }
 }
-impl EffectOperation for KeyOperation {
+impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
-    fn start(&mut self) -> Effects {
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+    fn first(&mut self) -> KeyTurn {
         if self.auth.user_id.is_nil() {
             return self.fail(KeyError::Denied);
         }
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = State::Bucket;
+        self.read(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec())
     }
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                self.state = State::Bucket;
-                self.read(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec())
-            }
-            (State::Bucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+    fn next(&mut self, result: IoResult) -> KeyTurn {
+        match self.state {
+            State::Bucket => {
+                let [value] = values::<1>(result)?;
                 let Some(info) = value.as_ref().and_then(|v| BucketInfo::from_bytes(v).ok()) else {
                     return self.fail(KeyError::Missing);
                 };
@@ -459,13 +458,12 @@ impl EffectOperation for KeyOperation {
                 self.state = State::Settings;
                 self.read(BUCKET_ENCRYPTION_KEYSPACE, self.bucket.as_bytes().to_vec())
             }
-            (State::Settings, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+            State::Settings => {
+                let [value] = values::<1>(result)?;
                 self.settings_read(value)
             }
-            (State::Snapshot, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                if let Err(error) = self.snapshot_read(values) {
-                    return self.fail(error);
-                }
+            State::Snapshot => {
+                self.snapshot_read(all_values(result)?)?;
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
@@ -479,105 +477,38 @@ impl EffectOperation for KeyOperation {
                 }
                 self.prepare()
             }
-            (State::Unlock, Event::Blob(BlobEvent::KeyStatus { generations })) => {
+            State::Unlock => {
+                let Event::Blob(BlobEvent::KeyStatus { generations }) = event(result)? else {
+                    return self.fail(AbeError::Context);
+                };
                 let key = self.snapshot.as_ref().map(|s| s.parameters.key);
                 if generations.iter().any(|g| g.active && Some(g.key) == key) {
                     return self.raise_first();
                 }
                 self.prepare()
             }
-            (State::Keys, event) => self.keys_read(event),
-            (State::Credential, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+            State::Keys => self.keys_read(result),
+            State::Credential => {
+                let [value] = values::<1>(result)?;
                 self.credential_read(value)
             }
-            (State::Records, event) => self.records_read(event),
-            (State::Existing, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+            State::Records => self.records_read(result),
+            State::Existing => {
+                let [value] = values::<1>(result)?;
                 self.existing_read(value)
             }
-            (State::Reuse, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.reuse_read(values)
+            State::Reuse => self.reuse_read(page(result)?.0),
+            State::Count => self.count_read(page(result)?.0),
+            State::Holders => self.notify_holders(page(result)?.0),
+            State::Issue => self.issue_read(event(result)?),
+            State::Cleanup | State::Write => {
+                done(result)?;
+                self.flush()
             }
-            (State::Count, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.count_read(values)
-            }
-            (State::Holders, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.notify_holders(values)
-            }
-            // A key unlocked after the locked status read cannot issue before the due raise: retry.
-            (State::Issue, Event::Blob(BlobEvent::Abe(_)))
-                if self.snapshot.as_ref().is_some_and(|s| s.due) =>
-            {
-                self.fail(KeyError::Storage)
-            }
-            (State::Issue, Event::Blob(BlobEvent::Abe(event))) => match *event {
-                AbeEvent::Grant(grant) => self.publish_grant(grant),
-                _ => self.fail(AbeError::Context),
-            },
-            (
-                State::Issue,
-                Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))),
-            ) => match self.request.take() {
-                Some(request) => {
-                    self.result = Some(KeyResult::Request(request.clone()));
-                    self.write_request(request)
-                }
-                None => self.fail(KeyError::Missing),
-            },
-            (State::Issue, Event::Blob(BlobEvent::Error(BlobError::Abe(error)))) => {
-                self.fail(error)
-            }
-            (State::Cleanup, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
-            | (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.flush(),
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
-                if self.txn == Some(txn_id) =>
-            {
-                self.txn = None;
-                if self.notify {
-                    self.state = State::Drain;
-                    return smallvec![crate::notifications::outbox_record::schedule_drain_effect()];
-                }
-                self.walk()
-            }
-            // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
-            (State::Drain, Event::Task(_)) => self.walk(),
-            // One page per run bounds the request; saved progress resumes on the next issuance.
-            (State::Reissue, Event::SubOperation(SubOperationEvent::ReissuePaged { .. })) => {
-                self.state = State::Done;
-                self.output = self.result.take().map(Ok);
-                smallvec![]
-            }
-            (State::Heads, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.heads_read(values)
-            }
-            (State::Writes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.writes_read(values)
-            }
-            (State::Envelopes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.envelopes_read(values)
-            }
-            (
-                _,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => self.fail(KeyError::Conflict),
-            (_, Event::Storage(StorageEvent::Error { .. })) => self.fail(KeyError::Storage),
-            _ => self.fail(AbeError::Context),
+            State::Heads => self.heads_read(page(outside_answer(result)?)?.0),
+            State::Writes => self.writes_read(all_values(outside_answer(result)?)?),
+            State::Envelopes => self.envelopes_read(all_values(outside_answer(result)?)?),
         }
-    }
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-    fn finalize(self) -> Result<KeyResult, KeyError> {
-        self.output.unwrap_or(Err(AbeError::Context.into()))
-    }
-    fn abort(&mut self) -> Effects {
-        self.txn.take().map_or_else(Effects::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
-    }
-    fn is_conflict(error: &KeyError) -> bool {
-        matches!(error, KeyError::Conflict)
     }
 }
 
@@ -585,6 +516,7 @@ impl EffectOperation for KeyOperation {
 mod tests {
     use super::*;
     use crate::auth::permission_rules::{CollectedRole, PermissionRules};
+    use aruna_core::errors::StorageError;
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
@@ -602,35 +534,21 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
     }
 
     #[test]
     fn reports_conflicts() {
         // Only a transaction conflict is rerun by `drive_key`; other storage faults stay final.
-        let realm_id = RealmId([1; 32]);
-        let auth = AuthContext {
-            user_id: aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id),
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        };
-        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         for (error, expected) in [
-            (StorageError::TransactionConflict, KeyError::Conflict),
-            (StorageError::Timeout, KeyError::Storage),
+            (IoError::Conflict, KeyError::Conflict),
+            (IoError::Storage(StorageError::Timeout), KeyError::Storage),
         ] {
-            let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
-            let mut operation = KeyOperation::new("bucket".into(), auth.clone(), node, action, 1);
-            operation.start();
-            let txn_id = Ulid::from_bytes([3; 16]);
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            operation.step(Event::Storage(StorageEvent::Error { error }));
-            assert!(operation.is_complete());
-            assert_eq!(operation.finalize(), Err(expected));
+            let error = KeyError::from(error);
+            assert_eq!(error, expected);
+            let conflict = <KeyOperation as Operation>::is_conflict(&error);
+            assert_eq!(conflict, expected == KeyError::Conflict);
         }
     }
 
@@ -698,9 +616,7 @@ mod tests {
             direct: true,
             public: false,
         };
-        let txn_id = TxnId::generate();
         operation.info = Some(info);
-        operation.txn = Some(txn_id);
         operation.state = State::Issue;
         operation.request = Some(request.clone());
         // The status read saw a locked key and left the raise due; an unlock then let Issue succeed.
@@ -722,12 +638,10 @@ mod tests {
             ciphertext: Vec::new(),
         };
         let event = Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))));
-        let effects = operation.step(event);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
-        ));
-        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(event))),
+            Err(KeyError::Storage)
+        );
     }
 
     /// A token run at epoch 3 whose snapshot admits READ on `pattern`, and its foo/ request.
@@ -795,7 +709,6 @@ mod tests {
             compression: Default::default(),
             distribution: None,
         });
-        operation.txn = Some(TxnId::generate());
         operation.snapshot = Some(Snapshot {
             parameters,
             epoch: 3,
@@ -863,9 +776,12 @@ mod tests {
         ];
         operation.request = Some(request.clone());
         // Both foo/ grants join the new epoch; other scopes, restrictions and revisions stay apart.
-        let effects = operation.reuse_read(values.clone());
-        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
-            panic!("one issuance: {effects:?}");
+        let turn = operation.reuse_read(values.clone());
+        let Ok(Next::Call(IoCall::Effect(effect))) = &turn else {
+            panic!("one issuance: {turn:?}");
+        };
+        let Effect::Blob(BlobEffect::Abe(effect)) = effect.as_ref() else {
+            panic!("an issuance effect");
         };
         let AbeEffect::Issue(context) = effect.as_ref() else {
             panic!("an issue effect");
@@ -873,17 +789,17 @@ mod tests {
         assert_eq!(context.request.epochs, vec![1, 2, 3]);
 
         // Publication deletes exactly the merged parts and their token rows in its transaction.
+        let grant = IoResult::Event(Box::new(issued(&request, &[1, 2, 3])));
         assert!(matches!(
-            operation.step(issued(&request, &[1, 2, 3])).as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
+            operation.next(grant),
+            Ok(Next::Call(IoCall::Page { .. }))
         ));
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: values.clone(),
-            next_start_after: None,
-        }));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("one delete batch: {effects:?}");
+        let turn = operation.next(IoResult::Page {
+            rows: values.clone(),
+            next: None,
+        });
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("one delete batch: {turn:?}");
         };
         let grants: Vec<&Key> = deletes
             .iter()
@@ -900,13 +816,9 @@ mod tests {
         // READ moved off foo/ before publication: the merge is refused and no grant is deleted.
         let (mut operation, request) = merge_fixture("bar/**");
         operation.state = State::Issue;
-        let effects = operation.step(issued(&request, &[1, 2, 3]));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
+        let grant = IoResult::Event(Box::new(issued(&request, &[1, 2, 3])));
+        assert_eq!(operation.next(grant), Err(KeyError::Denied));
         assert!(operation.deletes.is_empty() && operation.writes.is_empty());
-        assert_eq!(operation.finalize(), Err(KeyError::Denied));
     }
 
     #[test]
@@ -932,34 +844,31 @@ mod tests {
         let parameters =
             aruna_core::structs::storage::abe::create_parameters(&secret, realm_id, node, key)
                 .unwrap();
-        let values =
-            |account: Option<&User>, config: &RealmConfigDocument| -> Vec<(Key, Option<Value>)> {
-                let rows: [Option<Vec<u8>>; 8] = [
-                    Some(
-                        RealmAuthorizationDocument::default_realm_doc(realm_id)
-                            .to_bytes(&actor)
-                            .unwrap(),
-                    ),
-                    Some(
-                        GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
-                            .to_bytes(&actor)
-                            .unwrap(),
-                    ),
-                    Some(config.to_bytes(&actor).unwrap()),
-                    Some(parameters.to_bytes().unwrap()),
-                    Some(1u64.to_be_bytes().to_vec()),
-                    Some(
-                        BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
-                            .to_bytes()
-                            .unwrap(),
-                    ),
-                    None,
-                    account.map(|account| account.to_bytes(&actor).unwrap()),
-                ];
-                rows.into_iter()
-                    .map(|v| (Key::from(Vec::new()), v.map(Value::from)))
-                    .collect()
-            };
+        let values = |account: Option<&User>, config: &RealmConfigDocument| -> Vec<Option<Value>> {
+            let rows: [Option<Vec<u8>>; 8] = [
+                Some(
+                    RealmAuthorizationDocument::default_realm_doc(realm_id)
+                        .to_bytes(&actor)
+                        .unwrap(),
+                ),
+                Some(
+                    GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
+                        .to_bytes(&actor)
+                        .unwrap(),
+                ),
+                Some(config.to_bytes(&actor).unwrap()),
+                Some(parameters.to_bytes().unwrap()),
+                Some(1u64.to_be_bytes().to_vec()),
+                Some(
+                    BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
+                        .to_bytes()
+                        .unwrap(),
+                ),
+                None,
+                account.map(|account| account.to_bytes(&actor).unwrap()),
+            ];
+            rows.into_iter().map(|v| v.map(Value::from)).collect()
+        };
         let snapshot = |action: KeyAction,
                         caller: aruna_core::UserId,
                         account: Option<&User>,

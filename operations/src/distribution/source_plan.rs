@@ -4,13 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::calls::ChildOutcome;
-use aruna_core::errors::SourceResolutionError;
 use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
@@ -596,14 +596,15 @@ mod tests {
     }
 
     fn spooled(size: u64) -> (BackendLocation, [u8; 32], u64) {
-        use aruna_core::structs::storage::blob::BackendRef;
+        use aruna_core::structs::storage::blob::{BackendRef, HIDDEN_BLOB_PREFIX};
         use aruna_core::structs::storage::format::StoredFormat;
+        let namespace = Ulid::from_bytes([5; 16]);
         let location = BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "aruna".to_string(),
-            backend_path: "hidden/one".to_string(),
+            backend_path: format!("{HIDDEN_BLOB_PREFIX}/{namespace}/one"),
             ulid: Ulid::from_bytes([8; 16]),
             format: StoredFormat::default(),
             created_by: keep().user_id,

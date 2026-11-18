@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::LocationSummaryError;
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::records::blob_location_read;
 use crate::realm::peer_trust::ensure_realm_peer;
@@ -14,7 +14,7 @@ use crate::replication::protocol::{
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
@@ -22,7 +22,7 @@ use aruna_core::keyspaces::{
 use aruna_core::managed_copy::{
     CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::EffectOperation;
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
@@ -48,7 +48,6 @@ enum SummaryState {
     ReadBucket,
     StartPolicy,
     ReadPolicy,
-    CheckPermission,
     ReadHead,
     ReadVersion,
     ReadLocation,
@@ -157,7 +156,6 @@ impl LocationSummaryOperation {
             SummaryState::ReadBucket => "read_bucket",
             SummaryState::StartPolicy => "start_policy",
             SummaryState::ReadPolicy => "read_policy",
-            SummaryState::CheckPermission => "check_permission",
             SummaryState::ReadHead => "read_head",
             SummaryState::ReadVersion => "read_version",
             SummaryState::ReadLocation => "read_location",
@@ -242,21 +240,36 @@ impl LocationSummaryOperation {
         let Some(bucket) = self.bucket.as_ref() else {
             return self.fail(LocationSummaryError::BucketNotFound);
         };
+        let mut reads = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                self.request.bucket.as_bytes().to_vec().into(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                self.request.realm_id.as_bytes().to_vec().into(),
+            ),
+            (AUTH_KEYSPACE.to_string(), bucket.group_id.to_bytes().into()),
+        ];
+        // The caller's roles are read in this transaction, after the three policy rows.
+        let roles = self.read_check().map(|check| check.reads());
+        let Some(Ok(roles)) = roles else {
+            return self.deny();
+        };
+        reads.extend(roles);
         self.state = SummaryState::ReadPolicy;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    S3_BUCKET_KEYSPACE.to_string(),
-                    self.request.bucket.as_bytes().to_vec().into(),
-                ),
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    self.request.realm_id.as_bytes().to_vec().into(),
-                ),
-                (AUTH_KEYSPACE.to_string(), bucket.group_id.to_bytes().into(),),
-            ],
+            reads,
             txn_id: self.txn_id,
         })]
+    }
+
+    fn read_check(&self) -> Option<CheckPermissionsConfig> {
+        Some(CheckPermissionsConfig {
+            auth_context: self.request.auth_context.clone(),
+            path: self.permission_path.clone()?,
+            required_permission: Permission::READ,
+        })
     }
 
     fn read_head(&mut self) -> Effects {
@@ -448,29 +461,12 @@ impl LocationSummaryOperation {
         self.policy_current = self.policy_allowed
             && matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
             && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
-        self.state = SummaryState::CheckPermission;
-        let Some(txn_id) = self.txn_id else {
-            return self.deny();
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(
-                CheckPermissionsConfig {
-                    auth_context: self.request.auth_context.clone(),
-                    path: path.to_string(),
-                    required_permission: Permission::READ,
-                },
-                txn_id,
-            ),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
-    }
-
-    fn handle_permission(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected(event);
-        };
+        let roles = values.iter().skip(3).map(|(_, value)| value.clone());
+        let allowed = self
+            .read_check()
+            .map(|check| check.allowed(roles.collect()));
         match allowed {
-            Ok(true) if self.policy_current => self.resolve_version(),
+            Some(Ok(true)) if self.policy_current => self.resolve_version(),
             _ => self.deny(),
         }
     }
@@ -722,7 +718,6 @@ impl EffectOperation for LocationSummaryOperation {
             SummaryState::ReadBucket => self.handle_bucket(event),
             SummaryState::StartPolicy => self.handle_start_policy(event),
             SummaryState::ReadPolicy => self.handle_policy(event),
-            SummaryState::CheckPermission => self.handle_permission(event),
             SummaryState::ReadHead => self.handle_head(event),
             SummaryState::ReadVersion => self.handle_version(event),
             SummaryState::ReadLocation => self.handle_location(event),
@@ -794,8 +789,11 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::EffectOperation;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    };
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
@@ -803,7 +801,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -849,9 +847,6 @@ mod pure_tests {
             txn_id: Ulid::from(11u128),
         }));
         operation.step(policy_batch());
-        operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         operation
     }
 
@@ -862,6 +857,32 @@ mod pure_tests {
             realm_id(),
             bucket_info().group_id,
         );
+        let realm_roles = RealmAuthorizationDocument::default_realm_doc(realm_id());
+        // The test caller is the nil user, which holds only public roles.
+        let group_id = bucket_info().group_id;
+        let mut group_roles = GroupAuthorizationDocument::default_group_doc(
+            UserId::nil(realm_id()),
+            realm_id(),
+            group_id,
+        );
+        let role_id = Ulid::from(20u128);
+        group_roles.roles.insert(
+            role_id,
+            Role {
+                role_id,
+                name: "public".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{}/g/{group_id}/**", realm_id()),
+                    Permission::READ,
+                )]),
+                assigned_users: HashSet::from([UserId::nil(realm_id())]),
+            },
+        );
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: node_id(5),
+            user_id: UserId::nil(realm_id()),
+            realm_id: realm_id(),
+        };
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -874,19 +895,28 @@ mod pure_tests {
                 ),
                 (
                     b"group".to_vec().into(),
-                    Some(
-                        group
-                            .to_bytes(&aruna_core::structs::identity::auth::Actor {
-                                node_id: node_id(5),
-                                user_id: UserId::nil(realm_id()),
-                                realm_id: realm_id(),
-                            })
-                            .unwrap()
-                            .into(),
-                    ),
+                    Some(group.to_bytes(&actor).unwrap().into()),
+                ),
+                (
+                    b"realm roles".to_vec().into(),
+                    Some(realm_roles.to_bytes(&actor).unwrap().into()),
+                ),
+                (
+                    b"group roles".to_vec().into(),
+                    Some(group_roles.to_bytes(&actor).unwrap().into()),
                 ),
             ],
         })
+    }
+
+    /// The policy rows of a caller whose group role row is gone, so the check refuses it.
+    fn refused_batch() -> Event {
+        let mut batch = policy_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        values[4].1 = None;
+        batch
     }
 
     fn verify(operation: &mut LocationSummaryOperation) {
@@ -1284,11 +1314,7 @@ mod pure_tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from(11u128),
         }));
-        operation.step(policy_batch());
-
-        operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
+        operation.step(refused_batch());
         operation.step(Event::Storage(StorageEvent::TransactionAborted {
             txn_id: Ulid::from(11u128),
         }));
@@ -1309,9 +1335,6 @@ mod pure_tests {
             txn_id: Ulid::from(11u128),
         }));
         operation.step(policy_batch());
-        operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         operation.step(Event::Storage(StorageEvent::TransactionAborted {
             txn_id: Ulid::from(11u128),
         }));
@@ -1346,9 +1369,6 @@ mod pure_tests {
         });
         values[1].1 = Some(postcard::to_allocvec(&realm).unwrap().into());
         operation.step(batch);
-        operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         operation.step(Event::Storage(StorageEvent::TransactionAborted {
             txn_id: Ulid::from(11u128),
         }));
@@ -1426,17 +1446,41 @@ mod pure_tests {
     fn answers_denial() {
         // A refused peer must say so, so the caller does not read it as offline.
         let stream_id = Ulid::from_bytes([5u8; 16]);
+        let peer = node_id(4);
+        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        realm.ensure_node(peer, RealmNodeKind::Server);
+        let realm = postcard::to_allocvec(&realm).unwrap();
         let mut operation = LocationSummaryOperation::new_incoming(
-            node_id(4),
+            peer,
             node_id(5),
             stream_id,
             request(Some(Ulid::from_bytes([3u8; 16]))),
-        );
-        operation.state = super::SummaryState::CheckPermission;
+        )
+        .with_policy(true);
+        operation.start();
+        operation.step(read_result(Some(realm.clone())));
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        let txn_id = Ulid::from(14u128);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        // The caller's roles are read with the policy rows, in the same transaction.
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: read_txn,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the policy read, got {effects:?}")
+        };
+        assert_eq!((reads.len(), *read_txn), (5, Some(txn_id)));
+        let mut batch = refused_batch();
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+            unreachable!();
+        };
+        values[1].1 = Some(realm.into());
+        operation.step(batch);
 
-        let effects = operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
 
         let [Effect::Blob(aruna_core::effects::BlobEffect::SendMessage { payload, .. })] =
             effects.as_slice()

@@ -57,12 +57,10 @@ fn create() -> UserCall {
 
 fn subscription() -> WatchSubscription {
     let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
-    WatchSubscription::new(
-        owner(),
-        format!("meta/{}/", Ulid::from_parts(5, 5)),
-        mask,
-        1,
-    )
+    let prefix = format!("meta/{}/", Ulid::from_parts(5, 5));
+    let mut watch = WatchSubscription::new(owner(), prefix, mask, 1);
+    watch.watch_id = Ulid::from_parts(6, 6);
+    watch
 }
 
 #[test]

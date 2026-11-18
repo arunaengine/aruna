@@ -4,37 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::dataset::current_row;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
-use aruna_core::types::{Effects, GroupId, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PutMetadataState {
-    Init,
-    StartTransaction,
-    ReadBucket,
-    Authorize,
-    ReadCreation,
-    Write,
-    Commit,
-    Cancel,
-    Finish,
-    Error,
-}
+use crate::auth::check_permissions::CheckPermissionsConfig;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PutMetadataError {
@@ -54,14 +39,12 @@ pub enum PutMetadataError {
     Distributed,
     #[error("the bucket metadata changed meanwhile")]
     Changed,
-    #[error("PutBucketMetadata did not finish")]
-    NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
-    InvalidStateEvent {
-        state: &'static str,
-        expected: &'static str,
-        received: &'static str,
-    },
+}
+
+impl From<IoError> for PutMetadataError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 /// Sets or clears (`None`) an ordinary bucket's metadata, bound to its current incarnation. The
@@ -76,9 +59,6 @@ pub struct PutMetadataOperation {
     metadata: Option<BucketMetadata>,
     /// Writes only while the stored metadata is still this; none counts as the default.
     expected: Option<BucketMetadata>,
-    state: PutMetadataState,
-    txn_id: Option<TxnId>,
-    outcome: Option<Result<(), PutMetadataError>>,
 }
 
 impl PutMetadataOperation {
@@ -95,9 +75,6 @@ impl PutMetadataOperation {
             group_id,
             metadata,
             expected: None,
-            state: PutMetadataState::Init,
-            txn_id: None,
-            outcome: None,
         }
     }
 
@@ -107,241 +84,91 @@ impl PutMetadataOperation {
         self
     }
 
-    fn key(&self) -> aruna_core::types::Key {
+    fn key(&self) -> Key {
         self.bucket.as_bytes().to_vec().into()
     }
 
-    fn fail(&mut self, error: PutMetadataError) -> Effects {
-        self.outcome = Some(Err(error));
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PutMetadataState::Cancel;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = PutMetadataState::Error;
-                smallvec![]
-            }
-        }
-    }
-
-    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
-        let state = match self.state {
-            PutMetadataState::StartTransaction => "StartTransaction",
-            PutMetadataState::ReadBucket => "ReadBucket",
-            PutMetadataState::Authorize => "Authorize",
-            PutMetadataState::ReadCreation => "ReadCreation",
-            PutMetadataState::Write => "Write",
-            PutMetadataState::Commit => "Commit",
-            _ => "Other",
-        };
-        self.fail(PutMetadataError::InvalidStateEvent {
-            state,
-            expected,
-            received: received.label(),
-        })
-    }
-
-    fn on_bucket(&mut self, txn_id: TxnId, value: Option<aruna_core::types::Value>) -> Effects {
-        let Some(value) = value else {
-            return self.fail(PutMetadataError::NoSuchBucket);
-        };
-        let info = match BucketInfo::from_bytes(value.as_ref()) {
-            Ok(info) => info,
-            Err(error) => return self.fail(error.into()),
-        };
-        if info.group_id != self.group_id {
-            return self.fail(PutMetadataError::GroupMismatch);
-        }
-        if info.distribution.is_some() {
-            return self.fail(PutMetadataError::Distributed);
-        }
-        // Roles are read in this transaction, so a revoked admin conflicts the commit.
-        self.state = PutMetadataState::Authorize;
-        let check = CheckPermissionsConfig {
+    fn check(&self) -> CheckPermissionsConfig {
+        CheckPermissionsConfig {
             auth_context: self.auth.clone(),
             path: group_admin_path(self.realm_id, self.group_id),
             required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(check, txn_id),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        }
     }
 
-    fn on_authorized(&mut self, txn_id: TxnId, allowed: bool) -> Effects {
-        if !allowed {
-            return self.fail(PutMetadataError::Forbidden);
-        }
-        self.state = PutMetadataState::ReadCreation;
-        let reads = vec![
+    /// The bucket, the creation and metadata rows, then the admin roles: all read in the
+    /// write's transaction, so a revoked admin conflicts the commit.
+    fn reads(&self) -> Result<Vec<(String, Key)>, PutMetadataError> {
+        let mut reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), self.key()),
             (BUCKET_CREATION_KEYSPACE.to_string(), self.key()),
             (BUCKET_METADATA_KEYSPACE.to_string(), self.key()),
         ];
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        let roles = self.check().reads();
+        reads.extend(roles.map_err(|_| PutMetadataError::Forbidden)?);
+        Ok(reads)
     }
 
-    fn on_creation(
-        &mut self,
-        txn_id: TxnId,
-        (value, row): (
-            Option<aruna_core::types::Value>,
-            Option<aruna_core::types::Value>,
-        ),
-    ) -> Effects {
+    fn write(&mut self, values: Vec<Option<Value>>) -> Result<IoCall, PutMetadataError> {
+        let mut values = values.into_iter();
+        let mut next = || values.next().flatten();
+        let (bucket, creation, row) = (next(), next(), next());
+        let bucket = bucket.ok_or(PutMetadataError::NoSuchBucket)?;
+        let info = BucketInfo::from_bytes(bucket.as_ref())?;
+        if info.group_id != self.group_id {
+            return Err(PutMetadataError::GroupMismatch);
+        }
+        if info.distribution.is_some() {
+            return Err(PutMetadataError::Distributed);
+        }
+        if !matches!(self.check().allowed(values.collect()), Ok(true)) {
+            return Err(PutMetadataError::Forbidden);
+        }
         if let Some(expected) = &self.expected {
-            let current = match current_row(value.as_ref(), row.as_ref()) {
-                Ok(current) => current.unwrap_or_default(),
-                Err(error) => return self.fail(error.into()),
-            };
+            let current = current_row(creation.as_ref(), row.as_ref())?.unwrap_or_default();
             // A retry of a write that already applied finds its own metadata and succeeds.
             let applied = current == self.metadata.clone().unwrap_or_default();
             if current != *expected && !applied {
-                return self.fail(PutMetadataError::Changed);
+                return Err(PutMetadataError::Changed);
             }
         }
-        self.state = PutMetadataState::Write;
         let key = self.key();
         let Some(metadata) = self.metadata.take() else {
-            return smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space: BUCKET_METADATA_KEYSPACE.to_string(),
+            return Ok(IoCall::Delete(vec![(
+                BUCKET_METADATA_KEYSPACE.to_string(),
                 key,
-                txn_id: Some(txn_id),
-            })];
+            )]));
         };
         let stored = StoredMetadata {
-            incarnation: incarnation(value.as_ref().map(|value| value.as_ref())),
+            incarnation: incarnation(creation.as_ref().map(|value| value.as_ref())),
             metadata,
         };
-        match stored.to_bytes() {
-            Ok(bytes) => smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: BUCKET_METADATA_KEYSPACE.to_string(),
-                key,
-                value: bytes.into(),
-                txn_id: Some(txn_id),
-            })],
-            Err(error) => self.fail(error.into()),
-        }
+        let row = (
+            BUCKET_METADATA_KEYSPACE.to_string(),
+            key,
+            stored.to_bytes()?.into(),
+        );
+        Ok(IoCall::Write(vec![row]))
     }
 }
 
-impl EffectOperation for PutMetadataOperation {
+impl Operation for PutMetadataOperation {
     type Output = ();
     type Error = PutMetadataError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PutMetadataState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<()>, PutMetadataError> {
+        Ok(Next::Call(IoCall::Read(self.reads()?)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (PutMetadataState::Cancel, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.state = PutMetadataState::Error;
-                smallvec![]
-            }
-            (PutMetadataState::Cancel, Event::Storage(StorageEvent::Error { .. })) => {
-                self.state = PutMetadataState::Error;
-                smallvec![]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (
-                PutMetadataState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = PutMetadataState::ReadBucket;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: self.key(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (
-                PutMetadataState::ReadBucket,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => match self.txn_id {
-                Some(txn_id) => self.on_bucket(txn_id, value),
-                None => self.fail(PutMetadataError::NotFinished),
-            },
-            (
-                PutMetadataState::Authorize,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match self.txn_id {
-                Some(txn_id) => self.on_authorized(txn_id, matches!(allowed, Ok(true))),
-                None => self.fail(PutMetadataError::NotFinished),
-            },
-            (
-                PutMetadataState::ReadCreation,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => match self.txn_id {
-                Some(txn_id) => {
-                    let mut values = values.into_iter().map(|(_, value)| value);
-                    let read = (values.next().flatten(), values.next().flatten());
-                    self.on_creation(txn_id, read)
-                }
-                None => self.fail(PutMetadataError::NotFinished),
-            },
-            (
-                PutMetadataState::Write,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => match self.txn_id.take() {
-                Some(txn_id) => {
-                    self.state = PutMetadataState::Commit;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                None => self.fail(PutMetadataError::NotFinished),
-            },
-            (
-                PutMetadataState::Commit,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.state = PutMetadataState::Finish;
-                self.outcome = Some(Ok(()));
-                smallvec![]
-            }
-            (PutMetadataState::StartTransaction, received) => {
-                self.unexpected("transaction start", received)
-            }
-            (PutMetadataState::ReadBucket, received) => self.unexpected("read result", received),
-            (PutMetadataState::ReadCreation, received) => {
-                self.unexpected("batch read result", received)
-            }
-            (PutMetadataState::Authorize, received) => {
-                self.unexpected("authorization result", received)
-            }
-            (PutMetadataState::Write, received) => self.unexpected("write result", received),
-            (PutMetadataState::Commit, received) => self.unexpected("commit", received),
-            (_, received) => self.unexpected("no event", received),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PutMetadataError> {
+        if let IoResult::Done = result {
+            return Ok(Next::Done(()));
         }
+        Ok(Next::Call(self.write(all_values(result)?)?))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PutMetadataState::Finish | PutMetadataState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(PutMetadataError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PutMetadataState::Error;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -351,6 +178,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::bucket::dataset::BucketMetadataOperation;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;

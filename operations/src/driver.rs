@@ -1726,6 +1726,27 @@ mod test {
         (directory, context)
     }
 
+    /// A net without relays or discovery: a relay connection's timers read the real clock, so
+    /// they spin forever once paused time passes their deadline.
+    fn local_net() -> aruna_net::NetConfig {
+        aruna_net::NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            discovery_method: aruna_net::DiscoveryMethod::None,
+            relay_method: aruna_net::RelayMethod::None,
+            ..aruna_net::NetConfig::default()
+        }
+    }
+
+    /// Holds paused time still until dropped, so only `advance` moves it: a running blocking task
+    /// stops auto-advance, which would pass deadlines while storage threads answer.
+    fn manual_clock() -> std::sync::mpsc::Sender<()> {
+        let (hold, release) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = release.recv();
+        });
+        hold
+    }
+
     /// Storage, a file system blob backend and a net handle in one temporary folder.
     async fn net_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
@@ -1733,10 +1754,9 @@ mod test {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -2031,10 +2051,9 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -2063,6 +2082,7 @@ mod test {
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
         tokio::time::pause();
+        let _clock = manual_clock();
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = DeadlineOperation {
             state: 0,
@@ -2455,6 +2475,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
+        let _clock = manual_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2499,6 +2520,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
+        let _clock = manual_clock();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -2797,10 +2819,9 @@ mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
-                .await
-                .unwrap();
+        let net_handle = aruna_net::NetHandle::new(local_net(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
             aruna_core::structs::storage::blob::BackendConfig {
                 backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
@@ -3451,6 +3472,7 @@ mod test {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
         started: Arc<tokio::sync::Notify>,
         gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        delay: Option<Duration>,
         finish: bool,
         done: bool,
     }
@@ -3463,6 +3485,7 @@ mod test {
                 log: log.clone(),
                 started: Arc::default(),
                 gate: None,
+                delay: None,
                 finish: true,
                 done: false,
             }
@@ -3486,6 +3509,9 @@ mod test {
         fn start(&mut self) -> aruna_core::types::Effects {
             self.log.lock().unwrap().push(self.name);
             self.started.notify_one();
+            if let Some(after) = self.delay {
+                return smallvec::smallvec![Effect::Delay(after)];
+            }
             let Some(gate) = self.gate.take() else {
                 self.done = self.finish;
                 return smallvec::smallvec![];
@@ -3532,9 +3558,9 @@ mod test {
     async fn scope_waits_holder() {
         let (_directory, context) = net_context().await;
         let log = Arc::default();
-        let (open, gate) = tokio::sync::oneshot::channel();
         let mut first = Holding::new("first", &log);
-        first.gate = Some(gate);
+        // Outlasts the hour below; no adapter limit ends a delay, unlike a spool's idle timeout.
+        first.delay = Some(Duration::from_secs(7200));
         let first_started = first.started.clone();
         let task_context = context.clone();
         let first_task = tokio::spawn(async move { drive(first, &task_context).await });
@@ -3552,12 +3578,12 @@ mod test {
         // before the clock jumps an hour.
         tokio::time::pause();
         tokio::time::sleep(Duration::from_secs(3600)).await;
-        tokio::time::resume();
         assert_eq!(*log.lock().unwrap(), ["first", "other"]);
 
-        open.send(()).unwrap();
+        // Paused time runs on to the end of the first run's delay.
         assert_eq!(first_task.await.unwrap(), Ok(()));
         assert_eq!(second_task.await.unwrap(), Ok(()));
+        tokio::time::resume();
         assert_eq!(*log.lock().unwrap(), ["first", "other", "second"]);
         assert!(reconcile_free(&context));
     }

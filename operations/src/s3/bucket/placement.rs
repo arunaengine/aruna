@@ -4,11 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -22,7 +23,9 @@ use ulid::Ulid;
 use crate::auth::check_permissions::permission_check;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PutPlacementInput {
@@ -100,7 +103,6 @@ pub enum PutPlacementError {
 pub struct PutPlacementOperation {
     input: PutPlacementInput,
     state: PutPlacementState,
-    resolver: Option<PolicySetResolver>,
     txn_id: Option<TxnId>,
     output: Option<Result<BucketPlacementDefault, PutPlacementError>>,
 }
@@ -110,7 +112,6 @@ impl PutPlacementOperation {
         Self {
             input,
             state: PutPlacementState::Init,
-            resolver: None,
             txn_id: None,
             output: None,
         }
@@ -138,28 +139,24 @@ impl PutPlacementOperation {
     /// Every ref is authenticated before it can become a default; an empty set
     /// clears the default and needs no resolution.
     fn resolve_refs(&mut self) -> Effects {
-        let mut resolver = PolicySetResolver::new(
+        let resolver = PolicySetResolver::new(
             self.input.auth_context.realm_id,
             self.input.local_node_id,
             self.input.now_ms,
             ResolveMode::Strict,
             &self.input.policies,
         );
-        let step = resolver.start();
-        self.resolver = Some(resolver);
         self.state = PutPlacementState::Resolve;
-        self.after_resolve(step)
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            resolver,
+            |result| { Event::Child(ChildOutcome::new(result)) }
+        ))]
     }
 
-    fn after_resolve(&mut self, step: ResolveStep) -> Effects {
-        match step {
-            ResolveStep::Pending(effects) => effects,
-            ResolveStep::Done => {
-                let foreign = self.resolver.as_ref().and_then(|resolver| {
-                    foreign_owner(resolver.resolutions(), self.input.group_id)
-                });
-                self.resolver = None;
-                if let Some(policy_id) = foreign {
+    fn after_resolve(&mut self, result: Result<Resolutions, PolicySetError>) -> Effects {
+        match result {
+            Ok(resolved) => {
+                if let Some(policy_id) = foreign_owner(&resolved, self.input.group_id) {
                     return self.fail(PutPlacementError::ForeignPolicy { policy_id });
                 }
                 self.state = PutPlacementState::StartTransaction;
@@ -167,13 +164,13 @@ impl PutPlacementOperation {
                     read: false
                 })]
             }
-            ResolveStep::Failed(policy_ref, source) => {
-                self.resolver = None;
+            Err(PolicySetError::Unresolved { policy_ref, source }) => {
                 self.fail(PutPlacementError::PolicyUnavailable {
                     policy_id: policy_ref.policy_id,
                     source,
                 })
             }
+            Err(PolicySetError::Io(_)) => self.invalid_event(),
         }
     }
 
@@ -278,11 +275,7 @@ impl EffectOperation for PutPlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        // The resolver owns its storage events: cache failures are best effort,
-        // and a failed policy read is reported as unavailable, not as a fault.
-        if let Event::Storage(StorageEvent::Error { error }) = &event
-            && !matches!(self.state, PutPlacementState::Resolve)
-        {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
             return self.fail(error.clone().into());
         }
         match self.state {
@@ -323,11 +316,13 @@ impl EffectOperation for PutPlacementOperation {
                 }
             }
             PutPlacementState::Resolve => {
-                let Some(resolver) = self.resolver.as_mut() else {
+                let Event::Child(outcome) = event else {
                     return self.invalid_event();
                 };
-                let step = resolver.step(event);
-                self.after_resolve(step)
+                match outcome.take::<Resolutions, PolicySetError>() {
+                    Some(result) => self.after_resolve(result),
+                    None => self.invalid_event(),
+                }
             }
             PutPlacementState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -380,10 +375,7 @@ impl EffectOperation for PutPlacementOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let mut effects = match self.resolver.as_mut() {
-            Some(resolver) => resolver.abort(),
-            None => smallvec![],
-        };
+        let mut effects: Effects = smallvec![];
         if let Some(txn_id) = self.txn_id.take() {
             effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
@@ -406,8 +398,6 @@ impl EffectOperation for PutPlacementOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{PutPlacementError, PutPlacementInput, PutPlacementOperation};
-    use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::tests::policy::signed_document;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -490,25 +480,11 @@ mod pure_tests {
         })
     }
 
-    /// A durable cache hit, so a unit test resolves a ref without a holder.
-    fn cached(policy: &VerifiedPolicy) -> Event {
-        let entry = PolicyCacheEntry::verified(&signed_document(realm_id(), policy, 9), 10);
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(entry.to_bytes().expect("entry encodes").into()),
-        })
-    }
-
     /// Drives authorization and ref resolution up to the open transaction.
     fn started(operation: &mut PutPlacementOperation, policies: &[VerifiedPolicy]) {
         operation.start();
         operation.step(authorized(true));
-        let mut refs: Vec<&VerifiedPolicy> = policies.iter().collect();
-        refs.sort_by_key(|policy| policy.policy_ref());
-        for policy in refs {
-            operation.step(cached(policy));
-            operation.step(crate::tests::policy::authority(realm_id()));
-        }
+        operation.step(crate::tests::policy::resolved_set(policies));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
@@ -635,11 +611,7 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(false));
         operation.step(authorized(true));
-        operation.step(cached(&policies[0]));
-        operation.step(crate::tests::policy::group_authority(
-            realm_id(),
-            group_id(),
-        ));
+        operation.step(crate::tests::policy::resolved_set(&policies));
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
@@ -659,8 +631,7 @@ mod pure_tests {
         let mut operation = operation(&policies, None);
         operation.start();
         operation.step(authorized(true));
-        operation.step(cached(&policies[0]));
-        let effects = operation.step(crate::tests::policy::group_authority(realm_id(), foreign));
+        let effects = operation.step(crate::tests::policy::resolved_set(&policies));
 
         assert!(effects.is_empty(), "a foreign rule opens no transaction");
         assert_eq!(
@@ -679,36 +650,14 @@ mod pure_tests {
         let mut operation = operation(&policies, None);
         operation.start();
         operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        let key: aruna_core::types::Key = Vec::new().into();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), None), (key.clone(), None), (key, None)],
-        }));
+        let unresolved = crate::tests::policy::unresolved_set(policies[0].policy_ref());
+        let effects = operation.step(unresolved);
 
         assert!(effects.is_empty(), "a failed resolve opens no transaction");
         assert!(matches!(
             operation.finalize(),
             Err(PutPlacementError::PolicyUnavailable { .. })
         ));
-    }
-
-    #[test]
-    fn cache_failure_continues() {
-        // A failed policy cache read is best effort: resolution goes on to the
-        // holders instead of failing the whole request.
-        let policies = vec![policy(1)];
-        let mut operation = operation(&policies, None);
-        operation.start();
-        operation.step(authorized(true));
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::KeyNotFound,
-        }));
-
-        assert!(!effects.is_empty(), "resolution continues past the cache");
-        assert!(!operation.is_complete());
     }
 
     #[test]
