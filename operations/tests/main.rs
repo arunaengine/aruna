@@ -26,6 +26,7 @@ mod linked_import;
 mod manifest_convergence;
 mod manifest_protocol;
 mod materialization_recovery;
+mod metadata_calls;
 mod metadata_crud;
 mod metadata_forwarding;
 mod metadata_replication;

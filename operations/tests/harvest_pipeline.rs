@@ -39,7 +39,7 @@ use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
 use aruna_operations::jobs::repository::{JobScope, NodeScope};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::forward::write::route_metadata_delete;
+use crate::metadata_calls::route_metadata_delete;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
