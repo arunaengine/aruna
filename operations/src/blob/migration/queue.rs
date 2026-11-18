@@ -359,173 +359,343 @@ impl AdvanceTransitionOperation {
         let settle = SettleTransitionOperation::new(&self.bucket, self.record.clone());
         self.call(AdvanceStep::Tail, IoCall::child(settle))
     }
-    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        BLOB_VERSIONS_KEYSPACE,
-        Some(prefix.into()),
-        record.cursor.clone().map(Into::into),
-        PAGE,
-        None,
-    )
-    .await?;
-    let quota = match versions.is_empty() {
-        true => None,
-        false => quota_origin(context).await?,
-    };
-    for (key, _) in &versions {
-        let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
-        let mut operation =
-            RewriteVersionOperation::new(version_key, record.clone(), SystemTime::now());
-        if let Some((quota, realm, node)) = &quota {
-            operation = operation.with_quota(quota.clone(), *realm, *node);
+
+    fn store(&mut self, step: AdvanceStep) -> Turn<Option<Duration>> {
+        let store = StoreTransitionOperation::new(&self.bucket, self.record.clone());
+        self.call(step, IoCall::child(store))
+    }
+
+    fn next_version(&mut self) -> Turn<Option<Duration>> {
+        let Some(key) = self.versions.pop_front() else {
+            return self.page_done();
+        };
+        let version = VersionKey::from_bytes(key.as_ref())?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let mut rewrite = RewriteVersionOperation::new(version, self.record.clone(), now);
+        if let Some((quota, realm, node)) = &self.quota {
+            rewrite = rewrite.with_quota(quota.clone(), *realm, *node);
         }
-        match crate::driver::drive(operation, context).await {
-            Ok(RewriteOutcome::Moved) => record.done += 1,
+        self.call(AdvanceStep::Rewrite(key), IoCall::child(rewrite))
+    }
+
+    fn rewritten(
+        &mut self,
+        key: Key,
+        outcome: Result<RewriteOutcome, RewriteError>,
+    ) -> Turn<Option<Duration>> {
+        match outcome {
+            Ok(RewriteOutcome::Moved) => self.record.done += 1,
             // Only a re-key returns `Unfinished`.
             Ok(RewriteOutcome::Skipped | RewriteOutcome::Unfinished) => {}
-            Ok(RewriteOutcome::AwaitingKey) => record.remaining += 1,
+            Ok(RewriteOutcome::AwaitingKey) => self.record.remaining += 1,
             Err(error) => {
-                record.failed += 1;
-                tracing::warn!(bucket, %error, "Failed to move a version to the new encryption");
+                self.record.failed += 1;
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    %error,
+                    "Failed to move a version to the new encryption"
+                );
             }
         }
-        record.cursor = Some(key.to_vec());
+        self.record.cursor = Some(key.to_vec());
+        self.next_version()
     }
-    if next.is_some() {
-        store(&context.storage_handle, bucket, &mut record).await?;
-        return Ok(Some(MIGRATION_CONTINUE));
+
+    fn page_done(&mut self) -> Turn<Option<Duration>> {
+        if self.more {
+            return self.store(AdvanceStep::StoredMore);
+        }
+        let record = &mut self.record;
+        record.cursor = None;
+        let wait = match (record.failed > 0, record.remaining > 0) {
+            (true, _) if record.retries < RETRIES => {
+                record.retries += 1;
+                Some(RECHECK.saturating_mul(1 << record.retries.min(6)))
+            }
+            (true, _) => {
+                record.state = TransitionState::Blocked;
+                record.blocked_reason = Some("versions failed to move in every retry".to_string());
+                Some(RECHECK.saturating_mul(60))
+            }
+            (false, true) => {
+                record.state = TransitionState::AwaitingKey;
+                Some(RECHECK)
+            }
+            (false, false) => {
+                record.state = TransitionState::Cleanup;
+                return self.settle();
+            }
+        };
+        let now = self.now_ms;
+        record.retry_at_ms = wait.map(|wait| now.saturating_add(wait.as_millis() as u64));
+        self.store(AdvanceStep::StoredWait(wait))
     }
-    record.cursor = None;
-    let wait = match (record.failed > 0, record.remaining > 0) {
-        (true, _) if record.retries < RETRIES => {
-            record.retries += 1;
-            Some(RECHECK.saturating_mul(1 << record.retries.min(6)))
+
+    fn stored(&mut self, result: IoResult, wait: Option<Duration>) -> Turn<Option<Duration>> {
+        let stored = result.child::<StoredTransition, MigrationError>()??;
+        self.record = stored.record;
+        if self.record.state == TransitionState::AwaitingKey
+            && let Some(key) = self.record.source
+        {
+            let unlocked = KeyUnlockedOperation::new(key);
+            return self.call(AdvanceStep::Unlocked(key, wait), IoCall::child(unlocked));
         }
-        (true, _) => {
-            record.state = TransitionState::Blocked;
-            record.blocked_reason = Some("versions failed to move in every retry".to_string());
-            Some(RECHECK.saturating_mul(60))
-        }
-        (false, true) => {
-            record.state = TransitionState::AwaitingKey;
-            Some(RECHECK)
-        }
-        (false, false) => {
-            record.state = TransitionState::Cleanup;
-            return settle(context, bucket, record).await;
-        }
-    };
-    record.retry_at_ms = wait.map(|wait| now.saturating_add(wait.as_millis() as u64));
-    store(&context.storage_handle, bucket, &mut record).await?;
-    if record.state == TransitionState::AwaitingKey
-        && let Some(key) = record.source
-        && crate::jobs::runtime::key_unlocked(context, key).await
-    {
-        resume_transitions(context, key).await?;
-        return Ok(Some(Duration::ZERO));
+        Ok(Next::Done(wait))
     }
-    Ok(wait)
+}
+
+impl Operation for AdvanceTransitionOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        let record = &mut self.record;
+        record.retry_at_ms = None;
+        if record.state == TransitionState::Finished {
+            let finish = FinishTransitionOperation::new(&self.bucket, self.record.clone());
+            return self.call(AdvanceStep::Tail, IoCall::child(finish));
+        }
+        if record.state == TransitionState::Cleanup {
+            return self.settle();
+        }
+        if record.cursor.is_none() {
+            // A new pass counts its own waits and failures.
+            record.remaining = 0;
+            record.failed = 0;
+            record.state = TransitionState::Running;
+        }
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: VersionKey::bucket_prefix(&self.bucket)?.into(),
+            after: record.cursor.clone().map(Into::into),
+            limit: PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match std::mem::replace(&mut self.step, AdvanceStep::Tail) {
+            AdvanceStep::Page => {
+                let (rows, next) = result.page()?;
+                self.more = next.is_some();
+                self.versions = rows.into_iter().map(|(key, _)| key).collect();
+                if self.versions.is_empty() {
+                    return self.page_done();
+                }
+                let quota = QuotaOriginOperation::new(self.serving);
+                self.call(AdvanceStep::Quota, IoCall::child(quota))
+            }
+            AdvanceStep::Quota => {
+                self.quota = result.child::<QuotaOrigin, MigrationError>()??;
+                self.next_version()
+            }
+            AdvanceStep::Rewrite(key) => self.rewritten(key, result.child()?),
+            AdvanceStep::Tail => {
+                let wait = result.child::<Option<Duration>, MigrationError>()??;
+                Ok(Next::Done(wait))
+            }
+            AdvanceStep::StoredMore => {
+                result.child::<StoredTransition, MigrationError>()??;
+                Ok(Next::Done(Some(MIGRATION_CONTINUE)))
+            }
+            AdvanceStep::StoredWait(wait) => self.stored(result, wait),
+            AdvanceStep::Unlocked(key, wait) => {
+                // A node that cannot tell holds no unlock.
+                if !result.child::<bool, IoError>()?.unwrap_or(false) {
+                    return Ok(Next::Done(wait));
+                }
+                let resume = ResumeTransitionsOperation::new(key);
+                self.call(AdvanceStep::Resumed, IoCall::child(resume))
+            }
+            AdvanceStep::Resumed => {
+                result.child::<(), MigrationError>()??;
+                Ok(Next::Done(Some(Duration::ZERO)))
+            }
+        }
+    }
 }
 
 /// The realm quota and origin that the envelope charges of rewritten versions must fit.
-pub(crate) async fn quota_origin(
-    context: &DriverContext,
-) -> Result<Option<(QuotaConfig, RealmId, NodeId)>, String> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Ok(None);
-    };
-    let realm = *net.realm_id();
-    // A realm without a config document has no quota.
-    match crate::driver::drive(GetConfigOperation::new(realm), context).await {
-        Ok(config) => Ok(Some((config.quota, realm, net.node_id()))),
-        Err(GetConfigError::DocumentNotFound) => Ok(None),
-        Err(error) => Err(error.to_string()),
+#[derive(Debug, PartialEq)]
+struct QuotaOriginOperation {
+    serving: Serving,
+}
+
+impl QuotaOriginOperation {
+    fn new(serving: Serving) -> Self {
+        Self { serving }
     }
+}
+
+impl Operation for QuotaOriginOperation {
+    type Output = QuotaOrigin;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<QuotaOrigin> {
+        match self.serving {
+            Some((_, realm)) => Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm)))),
+            None => Ok(Next::Done(None)),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<QuotaOrigin> {
+        let Some((node, realm)) = self.serving else {
+            return Ok(Next::Done(None));
+        };
+        // A realm without a config document has no quota.
+        match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => Ok(Next::Done(Some((config.quota, realm, node)))),
+            Err(GetConfigError::DocumentNotFound) => Ok(Next::Done(None)),
+            Err(error) => Err(MigrationError::failed(error)),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SettleStep {
+    Page,
+    Forget,
+    Reclaim,
+    StoredLeft,
+    StoredFinal,
+    Finish,
 }
 
 /// Counts old copies whose location rows still exist and forgets removed ones. With none
 /// left the transition finishes.
-async fn settle(
-    context: &DriverContext,
-    bucket: &str,
-    mut record: EncryptionTransition,
-) -> Result<Option<Duration>, String> {
-    let storage = &context.storage_handle;
-    let prefix: Key = cleanup_prefix(bucket).into();
-    let mut after = None;
-    let mut left = 0u64;
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            TRANSITION_CLEANUP_KEYSPACE,
-            Some(prefix.clone()),
-            after,
-            PAGE,
-            None,
-        )
-        .await?;
-        let keys = rows.into_iter().map(|(key, _)| key).collect();
-        left += forget_removed(storage, prefix.len(), keys).await?;
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => break,
-        }
-    }
-    record.cleanup_remaining = left;
-    let now = aruna_core::time::unix_timestamp_millis();
-    if left > 0 {
-        record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
-        store(storage, bucket, &mut record).await?;
-        return Ok(Some(RECHECK));
-    }
-    reclaim_uploads(storage, &record).await?;
-    record.remaining = 0;
-    record.blocked_reason = None;
-    record.state = TransitionState::Finished;
-    if store(storage, bucket, &mut record).await? {
-        if record.state != TransitionState::Finished {
-            return Ok(Some(RECHECK));
-        }
-        return finish(context, bucket, record).await;
-    }
-    Ok(None)
+#[derive(Debug, PartialEq)]
+struct SettleTransitionOperation {
+    bucket: String,
+    record: EncryptionTransition,
+    prefix_len: usize,
+    pages: PrefixPages,
+    left: u64,
+    now_ms: u64,
+    step: SettleStep,
 }
 
-async fn finish(
-    context: &DriverContext,
-    bucket: &str,
-    mut record: EncryptionTransition,
-) -> Result<Option<Duration>, String> {
-    let now = aruna_core::time::unix_timestamp_millis();
-    if let Some(source) = record.source
-        && record.target.plan.map(|plan| plan.key) != Some(source)
-    {
-        let wake = crate::replication::parking::WakeParkedOperation::new(source, now);
-        drive(wake, context)
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(tasks) = context.task_handle.as_ref() {
-            match tasks
-                .send_effect(crate::replication::queue::schedule_blob_drain())
-                .await
-            {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {}
-                Event::Task(TaskEvent::Error { message, .. }) => return Err(message),
-                other => {
-                    return Err(format!(
-                        "could not schedule the copy drain: {}",
-                        other.label()
-                    ));
+impl SettleTransitionOperation {
+    fn new(bucket: &str, record: EncryptionTransition) -> Self {
+        let prefix: Key = cleanup_prefix(bucket).into();
+        Self {
+            bucket: bucket.to_string(),
+            record,
+            prefix_len: prefix.len(),
+            pages: PrefixPages::new(TRANSITION_CLEANUP_KEYSPACE, prefix, PAGE),
+            left: 0,
+            now_ms: 0,
+            step: SettleStep::Page,
+        }
+    }
+
+    fn call(&mut self, step: SettleStep, call: IoCall) -> Turn<Option<Duration>> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn store(&mut self, step: SettleStep) -> Turn<Option<Duration>> {
+        let store = StoreTransitionOperation::new(&self.bucket, self.record.clone());
+        self.call(step, IoCall::child(store))
+    }
+
+    fn next_page(&mut self) -> Turn<Option<Duration>> {
+        if !self.pages.done() {
+            let page = self.pages.call();
+            return self.call(SettleStep::Page, page);
+        }
+        self.record.cleanup_remaining = self.left;
+        if self.left > 0 {
+            let wait = RECHECK.as_millis() as u64;
+            self.record.retry_at_ms = Some(self.now_ms.saturating_add(wait));
+            return self.store(SettleStep::StoredLeft);
+        }
+        let reclaim = ReclaimUploadsOperation::new(&self.record);
+        self.call(SettleStep::Reclaim, IoCall::child(reclaim))
+    }
+}
+
+impl Operation for SettleTransitionOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match self.step {
+            SettleStep::Page => {
+                let keys = self.pages.take(result)?;
+                let keys = keys.into_iter().map(|(key, _)| key).collect();
+                let forget = ForgetRemovedOperation::new(self.prefix_len, keys);
+                self.call(SettleStep::Forget, IoCall::child(forget))
+            }
+            SettleStep::Forget => {
+                self.left += result.child::<u64, MigrationError>()??;
+                self.next_page()
+            }
+            SettleStep::Reclaim => {
+                result.child::<u64, MigrationError>()??;
+                self.record.remaining = 0;
+                self.record.blocked_reason = None;
+                self.record.state = TransitionState::Finished;
+                self.store(SettleStep::StoredFinal)
+            }
+            SettleStep::StoredLeft => {
+                result.child::<StoredTransition, MigrationError>()??;
+                Ok(Next::Done(Some(RECHECK)))
+            }
+            SettleStep::StoredFinal => {
+                let stored = result.child::<StoredTransition, MigrationError>()??;
+                if !stored.stored {
+                    return Ok(Next::Done(None));
                 }
+                if stored.record.state != TransitionState::Finished {
+                    return Ok(Next::Done(Some(RECHECK)));
+                }
+                let finish = FinishTransitionOperation::new(&self.bucket, stored.record);
+                self.call(SettleStep::Finish, IoCall::child(finish))
+            }
+            SettleStep::Finish => {
+                let wait = result.child::<Option<Duration>, MigrationError>()??;
+                Ok(Next::Done(wait))
             }
         }
     }
-    forget_retired(context, &record).await;
-    record.finished_at_ms = Some(now);
-    if store(&context.storage_handle, bucket, &mut record).await? && record.finished_at_ms.is_none()
-    {
-        return Ok(Some(RECHECK));
+}
+
+#[derive(Debug, PartialEq)]
+enum FinishStep {
+    Wake,
+    Drain,
+    Forget,
+    Store,
+}
+
+/// Wakes the copies parked on a retired source, drops its unlock and ends the transition.
+#[derive(Debug, PartialEq)]
+struct FinishTransitionOperation {
+    bucket: String,
+    record: EncryptionTransition,
+    now_ms: u64,
+    step: FinishStep,
+}
+
+impl FinishTransitionOperation {
+    fn new(bucket: &str, record: EncryptionTransition) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            record,
+            now_ms: 0,
+            step: FinishStep::Wake,
+        }
     }
     Ok(None)
 }
