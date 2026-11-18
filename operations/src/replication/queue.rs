@@ -4,12 +4,13 @@
 
 use std::time::Duration;
 
-use aruna_core::calls::IoError;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, ReferenceAdvance,
@@ -17,15 +18,13 @@ use aruna_core::structs::storage::replication_queue::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::{NodeId, UserId};
-use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::plaintext::{consent_delete, consent_write, job_consent};
+use super::plaintext::{consent_delete, consent_row, job_consent};
 use super::version_replication::ReplicateScopeError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +58,8 @@ impl From<IoError> for BlobQueueError {
     }
 }
 
+type QueueTurn = Result<Next<QueueBlobResult>, BlobQueueError>;
+
 pub fn schedule_blob_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainReplicationQueue,
@@ -66,22 +67,30 @@ pub fn schedule_blob_drain() -> Effect {
     })
 }
 
+/// Whether the drain timer was set; the queued work is durable either way.
+fn drain_scheduled(result: IoResult) -> bool {
+    match result.event() {
+        Ok(Event::Task(TaskEvent::TimerScheduled { .. })) => true,
+        Ok(Event::Task(TaskEvent::Error { .. })) => false,
+        other => {
+            warn!(event = ?other, "Queued replication work persisted but drain scheduling returned an unexpected event");
+            false
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueBlobState {
-    Init,
     ClearConsent,
     ReadExisting,
     WriteJob,
     ScheduleDrain,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct QueueBlobOperation {
     job: BlobJobRecord,
     state: QueueBlobState,
-    output: Option<Result<QueueBlobResult, BlobQueueError>>,
     /// The plaintext request this queueing records: `Some(None)` withdraws an earlier one.
     consent: Option<Option<UserId>>,
 }
@@ -90,8 +99,7 @@ impl QueueBlobOperation {
     pub fn new(input: ReplicateScopeInput, source_delete_marker: Option<bool>) -> Self {
         Self {
             job: BlobJobRecord::new(input, source_delete_marker, unix_timestamp_millis()),
-            state: QueueBlobState::Init,
-            output: None,
+            state: QueueBlobState::ReadExisting,
             consent: None,
         }
     }
@@ -116,174 +124,91 @@ impl QueueBlobOperation {
                 relationship_id,
                 unix_timestamp_millis(),
             ),
-            state: QueueBlobState::Init,
-            output: None,
+            state: QueueBlobState::ReadExisting,
             consent: None,
         }
     }
 
-    fn fail(&mut self, error: BlobQueueError) -> Effects {
-        self.state = QueueBlobState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn call(&mut self, state: QueueBlobState, call: IoCall) -> QueueTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn read_existing(&mut self) -> Effects {
-        let key = match blob_job_key(&self.job) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueBlobState::ReadExisting;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })]
+    fn read_existing(&mut self) -> QueueTurn {
+        let key = blob_job_key(&self.job)?;
+        let read = read_row(REPLICATION_JOB_KEYSPACE, key);
+        self.call(QueueBlobState::ReadExisting, read)
     }
 
-    fn write_job(&mut self) -> Effects {
-        let (key_space, key, value) = match blob_job_entry(&self.job) {
-            Ok(entry) => entry,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueBlobState::WriteJob;
-        let Some(Effect::Storage(StorageEffect::Write {
-            key_space: consent_space,
-            key: consent_key,
-            value: consent_value,
-            ..
-        })) = self.consent_effect(&key)
-        else {
-            return smallvec![Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })];
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (key_space, key, value),
-                (consent_space, consent_key, consent_value)
-            ],
-            txn_id: None,
-        })]
+    fn write_job(&mut self) -> QueueTurn {
+        let entry = blob_job_entry(&self.job)?;
+        let consent = self.consent_entry(&entry.1);
+        let rows = std::iter::once(entry).chain(consent).collect();
+        self.call(QueueBlobState::WriteJob, IoCall::Write(rows))
     }
 
-    /// The write of a granted plaintext request for the job stored under `key`.
-    fn consent_effect(&self, key: &Key) -> Option<Effect> {
+    /// The row of a granted plaintext request for the job stored under `key`.
+    fn consent_entry(&self, key: &Key) -> Option<(KeySpace, Key, Value)> {
         let requester = self.consent.flatten()?;
-        consent_write(job_consent(key), requester).ok()
+        consent_row(job_consent(key), requester).ok()
     }
 
     /// Withdraws an earlier plaintext request before the job is written again.
-    fn clear_consent(&mut self) -> Effects {
-        let key = match blob_job_key(&self.job) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueBlobState::ClearConsent;
-        smallvec![consent_delete(job_consent(&key))]
+    fn clear_consent(&mut self) -> QueueTurn {
+        let key = blob_job_key(&self.job)?;
+        let delete = consent_delete(job_consent(&key));
+        self.call(QueueBlobState::ClearConsent, delete)
     }
 
     /// A preferred existing job stays, but a granted request is still recorded for it.
-    fn keep_existing(&mut self) -> Effects {
-        let key = match blob_job_key(&self.job) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        match self.consent_effect(&key) {
-            Some(effect) => {
-                self.state = QueueBlobState::WriteJob;
-                smallvec![effect]
-            }
+    fn keep_existing(&mut self) -> QueueTurn {
+        let key = blob_job_key(&self.job)?;
+        match self.consent_entry(&key) {
+            Some(row) => self.call(QueueBlobState::WriteJob, IoCall::Write(vec![row])),
             None => self.schedule_drain(),
         }
     }
 
-    fn schedule_drain(&mut self) -> Effects {
-        self.state = QueueBlobState::ScheduleDrain;
-        smallvec![schedule_blob_drain()]
+    fn existing_read(&mut self, value: Option<Value>) -> QueueTurn {
+        let existing = value.and_then(|value| BlobJobRecord::from_bytes(&value).ok());
+        match existing {
+            Some(existing) if blob_job_preferred(&existing, &self.job) => self.keep_existing(),
+            _ => self.write_job(),
+        }
     }
 
-    fn finish(&mut self, scheduled: bool) -> Effects {
-        self.state = QueueBlobState::Finish;
-        self.output = Some(Ok(QueueBlobResult {
-            queued: 1,
-            scheduled,
-        }));
-        smallvec![]
+    fn schedule_drain(&mut self) -> QueueTurn {
+        self.call(QueueBlobState::ScheduleDrain, schedule_blob_drain().into())
     }
 }
 
-impl EffectOperation for QueueBlobOperation {
+impl Operation for QueueBlobOperation {
     type Output = QueueBlobResult;
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> QueueTurn {
         match self.consent {
             Some(None) => self.clear_consent(),
             _ => self.read_existing(),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> QueueTurn {
         match self.state {
-            QueueBlobState::Init => self.start(),
-            QueueBlobState::ClearConsent => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.read_existing(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            QueueBlobState::ReadExisting => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match BlobJobRecord::from_bytes(&value) {
-                    Ok(existing) if blob_job_preferred(&existing, &self.job) => {
-                        self.keep_existing()
-                    }
-                    Ok(_) | Err(_) => self.write_job(),
-                },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            QueueBlobState::WriteJob => match event {
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
-                ) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            QueueBlobState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true),
-                Event::Task(TaskEvent::Error { .. }) => self.finish(false),
-                other => {
-                    warn!(event = ?other, "Blob replication job persisted but drain scheduling returned an unexpected event");
-                    self.finish(false)
-                }
-            },
-            QueueBlobState::Finish => smallvec![],
-            QueueBlobState::Error => smallvec![],
+            QueueBlobState::ClearConsent => {
+                result.done()?;
+                self.read_existing()
+            }
+            QueueBlobState::ReadExisting => self.existing_read(result.value()?),
+            QueueBlobState::WriteJob => {
+                result.done()?;
+                self.schedule_drain()
+            }
+            QueueBlobState::ScheduleDrain => Ok(Next::Done(QueueBlobResult {
+                queued: 1,
+                scheduled: drain_scheduled(result),
+            })),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, QueueBlobState::Finish | QueueBlobState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(result)) => Ok(result),
-            Some(Err(error)) => Err(error),
-            None => Err(BlobQueueError::UnexpectedEvent(
-                "queue operation finished without output".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -297,17 +222,49 @@ pub struct LiveVersionInput {
     pub delete_marker: bool,
 }
 
+/// Stores a live obligation in one transaction, unless a readable one is already there.
+#[derive(Debug, PartialEq)]
+struct ObligationWrite {
+    key: Key,
+    value: Value,
+    writing: bool,
+}
+
+impl Operation for ObligationWrite {
+    type Output = ();
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Result<Next<()>, BlobQueueError> {
+        let read = read_row(REPLICATION_OBLIGATION_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, BlobQueueError> {
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let stored = result.value()?;
+        if stored.is_some_and(|value| LiveObligationRecord::from_bytes(&value).is_ok()) {
+            return Ok(Next::Done(()));
+        }
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![(
+            REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            self.key.clone(),
+            self.value.clone(),
+        )])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LiveVersionState {
-    Init,
-    StartObligation,
-    ReadObligation,
     WriteObligation,
-    CommitObligation,
-    AbortObligation,
     ScheduleDrain,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, PartialEq)]
@@ -315,11 +272,6 @@ pub struct LiveVersionOperation {
     input: LiveVersionInput,
     reference_advance: Option<ReferenceAdvance>,
     state: LiveVersionState,
-    seed_key: Option<Key>,
-    seed_value: Option<ByteView>,
-    txn_id: Option<Ulid>,
-    abort_error: Option<BlobQueueError>,
-    output: Option<Result<QueueBlobResult, BlobQueueError>>,
 }
 
 impl LiveVersionOperation {
@@ -327,24 +279,13 @@ impl LiveVersionOperation {
         Self {
             input,
             reference_advance: None,
-            state: LiveVersionState::Init,
-            seed_key: None,
-            seed_value: None,
-            txn_id: None,
-            abort_error: None,
-            output: None,
+            state: LiveVersionState::WriteObligation,
         }
     }
 
     pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
         self.reference_advance = Some(advance);
         self
-    }
-
-    fn fail(&mut self, error: BlobQueueError) -> Effects {
-        self.state = LiveVersionState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
     }
 
     fn seed_record(&self) -> LiveObligationRecord {
@@ -363,184 +304,49 @@ impl LiveVersionOperation {
         record
     }
 
-    fn start_obligation(&mut self) -> Effects {
-        let record = self.seed_record();
-        let (_, key, value) = match live_obligation_entry(&record) {
-            Ok(entry) => entry,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.seed_key = Some(key);
-        self.seed_value = Some(value);
-        self.state = LiveVersionState::StartObligation;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn abort_obligation(&mut self, error: Option<BlobQueueError>) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobQueueError::UnexpectedEvent(
-                "obligation transaction is not active".to_string(),
-            ));
-        };
-        self.abort_error = error;
-        self.state = LiveVersionState::AbortObligation;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn write_obligation(&mut self) -> Effects {
-        let (Some(key), Some(value), Some(txn_id)) =
-            (self.seed_key.clone(), self.seed_value.clone(), self.txn_id)
-        else {
-            return self.fail(BlobQueueError::UnexpectedEvent(
-                "obligation write is not prepared".to_string(),
-            ));
-        };
-        self.state = LiveVersionState::WriteObligation;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn read_obligation(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobQueueError::UnexpectedEvent(
-                "obligation transaction is not active".to_string(),
-            ));
-        };
-        let Some(key) = self.seed_key.clone() else {
-            return self.fail(BlobQueueError::UnexpectedEvent(
-                "obligation key is not prepared".to_string(),
-            ));
-        };
-        self.state = LiveVersionState::ReadObligation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn commit_obligation(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobQueueError::UnexpectedEvent(
-                "obligation transaction is not active".to_string(),
-            ));
-        };
-        self.state = LiveVersionState::CommitObligation;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn schedule_drain(&mut self) -> Effects {
+    /// A lost conflict means another writer stored the obligation, so the drain still runs.
+    fn obligation_written(&mut self, written: Result<(), BlobQueueError>) -> QueueTurn {
+        match written {
+            Err(error) if !Self::is_conflict(&error) => return Err(error),
+            _ => {}
+        }
         self.state = LiveVersionState::ScheduleDrain;
-        smallvec![schedule_blob_drain()]
-    }
-
-    fn finish(&mut self, queued: usize, scheduled: bool) -> Effects {
-        self.state = LiveVersionState::Finish;
-        self.output = Some(Ok(QueueBlobResult { queued, scheduled }));
-        smallvec![]
+        Ok(Next::Call(schedule_blob_drain().into()))
     }
 }
 
-impl EffectOperation for LiveVersionOperation {
+impl Operation for LiveVersionOperation {
     type Output = QueueBlobResult;
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
-        self.start_obligation()
+    fn first(&mut self) -> QueueTurn {
+        let (_, key, value) = live_obligation_entry(&self.seed_record())?;
+        let write = ObligationWrite {
+            key,
+            value,
+            writing: false,
+        };
+        Ok(Next::Call(IoCall::child(write)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> QueueTurn {
         match self.state {
-            LiveVersionState::Init => self.start_obligation(),
-            LiveVersionState::StartObligation => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.txn_id = Some(txn_id);
-                    self.read_obligation()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            LiveVersionState::ReadObligation => match event {
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    self.write_obligation()
-                }
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match LiveObligationRecord::from_bytes(&value) {
-                    Ok(_) => self.abort_obligation(None),
-                    Err(_) => self.write_obligation(),
-                },
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.abort_obligation(Some(error.into()))
-                }
-                other => self.abort_obligation(Some(BlobQueueError::UnexpectedEvent(
-                    other.label().to_string(),
-                ))),
-            },
-            LiveVersionState::WriteObligation => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_obligation(),
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.abort_obligation(Some(error.into()))
-                }
-                other => self.abort_obligation(Some(BlobQueueError::UnexpectedEvent(
-                    other.label().to_string(),
-                ))),
-            },
-            LiveVersionState::CommitObligation => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            LiveVersionState::AbortObligation => match event {
-                Event::Storage(StorageEvent::TransactionAborted { .. }) => {
-                    match self.abort_error.take() {
-                        Some(error) => self.fail(error),
-                        None => self.schedule_drain(),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
-            },
-            LiveVersionState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(0, true),
-                Event::Task(TaskEvent::Error { .. }) => self.finish(0, false),
-                other => {
-                    warn!(event = ?other, "Durable replication obligation persisted but drain scheduling returned an unexpected event");
-                    self.finish(0, false)
-                }
-            },
-            LiveVersionState::Finish => smallvec![],
-            LiveVersionState::Error => smallvec![],
+            LiveVersionState::WriteObligation => {
+                self.obligation_written(result.child::<(), BlobQueueError>()?)
+            }
+            LiveVersionState::ScheduleDrain => Ok(Next::Done(QueueBlobResult {
+                queued: 0,
+                scheduled: drain_scheduled(result),
+            })),
         }
     }
 
-    fn is_complete(&self) -> bool {
+    fn is_conflict(error: &BlobQueueError) -> bool {
         matches!(
-            self.state,
-            LiveVersionState::Finish | LiveVersionState::Error
+            error,
+            BlobQueueError::Io(IoError::Conflict)
+                | BlobQueueError::Storage(StorageError::TransactionConflict)
         )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(result)) => Ok(result),
-            Some(Err(error)) => Err(error),
-            None => Err(BlobQueueError::UnexpectedEvent(
-                "live replication queue operation finished without output".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
