@@ -19,7 +19,8 @@ use thiserror::Error;
 
 use super::forward::{config_of, realm_config};
 use super::here::NodeRealm;
-use crate::auth::bearer_token::{ArunaBearerError, GrantValidOperation};
+use crate::auth::bearer_token::GrantValidOperation;
+use crate::auth::error::ArunaBearerError;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::driver::DriverContext;
 use crate::realm::peer_trust::is_sync_eligible;

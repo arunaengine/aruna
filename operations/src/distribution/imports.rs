@@ -34,7 +34,8 @@ use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::service::{SubmitHandedError, SubmitHandedOperation, SubmitJobResult};
+use crate::jobs::service::{SubmitHandedError, SubmitHandedOperation};
+use crate::jobs::submit::SubmitJobResult;
 use crate::jobs::staging::{CheckpointError, ReadCheckpointOperation, handed_checkpoint};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
