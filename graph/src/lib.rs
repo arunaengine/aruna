@@ -171,20 +171,26 @@ impl GraphHandle {
 
     /// Whether `graph_iri` holds a graph.
     pub async fn contains_graph(&self, graph_iri: String) -> Result<bool, MetadataError> {
-        self.blocking(move |node| node.contains_graph(&GraphId::new(&graph_iri)))
-            .await
+        self.blocking(move |node| {
+            node.contains_graph(&GraphId::new(&graph_iri))
+                .map_err(Box::new)
+        })
+        .await
     }
 
     /// Removes the local copy of one graph.
     pub async fn delete_graph(&self, graph_iri: String) -> Result<(), MetadataError> {
-        self.blocking(move |node| node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri)))
-            .await
+        self.blocking(move |node| {
+            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+                .map_err(Box::new)
+        })
+        .await
     }
 
     /// The IRIs of every graph in the store.
     pub async fn graphs(&self) -> Result<Vec<String>, MetadataError> {
         let inner = self.inner.clone();
-        let graphs = tokio::task::spawn_blocking(move || inner.node.graphs())
+        let graphs = tokio::task::spawn_blocking(move || inner.node.graphs().map_err(Box::new))
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -205,7 +211,7 @@ impl GraphHandle {
                     let policy = node.graph_policy(&graph)?;
                     Ok((graph.as_str().to_string(), policy_from_craqle(policy)))
                 })
-                .collect::<Result<BTreeMap<_, _>, CraqleError>>()
+                .collect::<Result<BTreeMap<_, _>, Box<CraqleError>>>()
         })
         .await
     }
@@ -213,10 +219,11 @@ impl GraphHandle {
     /// Applies document sync updates that arrived from peers; returns the changed graphs.
     pub async fn reconcile(&self) -> Result<Vec<String>, MetadataError> {
         let inner = self.inner.clone();
-        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
-            .await
-            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let applied =
+            tokio::task::spawn_blocking(move || inner.node.reconcile_irokle().map_err(Box::new))
+                .await
+                .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
         Ok(applied
             .iter()
             .map(|graph| graph.as_str().to_string())
@@ -225,8 +232,11 @@ impl GraphHandle {
 
     /// The document sync topic of one graph, bound or derived.
     pub async fn graph_topic(&self, graph_iri: String) -> Result<irokle::TopicId, MetadataError> {
-        self.blocking(move |node| node.bind_or_derive_irokle_topic(&GraphId::new(&graph_iri)))
-            .await
+        self.blocking(move |node| {
+            node.bind_or_derive_irokle_topic(&GraphId::new(&graph_iri))
+                .map_err(Box::new)
+        })
+        .await
     }
 
     /// Binds one graph to its document sync topic, when the sync store knows one.
@@ -234,8 +244,11 @@ impl GraphHandle {
         &self,
         graph_iri: String,
     ) -> Result<Option<irokle::TopicId>, MetadataError> {
-        self.blocking(move |node| node.bind_irokle_topic(&GraphId::new(&graph_iri)))
-            .await
+        self.blocking(move |node| {
+            node.bind_irokle_topic(&GraphId::new(&graph_iri))
+                .map_err(Box::new)
+        })
+        .await
     }
 
     /// Creates the document sync topic of one graph with `members`.
@@ -245,8 +258,11 @@ impl GraphHandle {
         members: BTreeSet<NodeId>,
     ) -> Result<irokle::TopicId, MetadataError> {
         let members = members.into_iter().map(irokle_peer_id).collect();
-        self.blocking(move |node| node.mint_irokle_topic(&GraphId::new(&graph_iri), members))
-            .await
+        self.blocking(move |node| {
+            node.mint_irokle_topic(&GraphId::new(&graph_iri), members)
+                .map_err(Box::new)
+        })
+        .await
     }
 
     /// Adds `peers` to the document sync topic of one graph.
@@ -267,7 +283,8 @@ impl GraphHandle {
 
     /// Makes every pending search index update visible.
     pub async fn flush_search_updates(&self) -> Result<(), MetadataError> {
-        self.blocking(|node| node.flush_search_updates()).await
+        self.blocking(|node| node.flush_search_updates().map_err(Box::new))
+            .await
     }
 
     /// Writes the store and the document sync journal to disk.
@@ -333,13 +350,13 @@ impl GraphHandle {
     async fn blocking<T, F>(&self, work: F) -> Result<T, MetadataError>
     where
         T: Send + 'static,
-        F: FnOnce(&CraqleNode) -> Result<T, CraqleError> + Send + 'static,
+        F: FnOnce(&CraqleNode) -> Result<T, Box<CraqleError>> + Send + 'static,
     {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || work(&inner.node))
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(error_from_craqle)
+            .map_err(|error| error_from_craqle(*error))
     }
 }
 
