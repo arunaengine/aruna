@@ -70,7 +70,9 @@ use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
 use crate::jobs::lifecycle::publish::settle_terminals;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
+use crate::jobs::lifecycle::witness::{
+    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
+};
 use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::state::release_job;

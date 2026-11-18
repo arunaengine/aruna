@@ -642,7 +642,13 @@ impl OperationsTaskHandler {
     /// Runs every witness round whose persisted deadline has elapsed.
     pub(super) async fn drain_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
-        if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
+        let context = self.context.as_ref();
+        let drain = WitnessDrainOperation::new(witness_node(context), now_ms);
+        let remaining = drive(drain, context).await.unwrap_or_else(|error| {
+            warn!(error = %error, "Witness deadline scan failed");
+            true
+        });
+        if remaining {
             self.reschedule_timer(TaskKey::DrainWitnessQueue, WITNESS_RETRY_AFTER)
                 .await;
         }

@@ -3,174 +3,345 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{JobRecordFrame, LaunchFrame};
-use aruna_core::events::{Event, LaunchDecline};
-use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
-    DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
-};
-use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, WitnessBudgetRecord,
-};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::policy::PlacementDecision;
-use aruna_core::types::{Key, TxnId};
-use aruna_net::NetHandle;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
-use ulid::Ulid;
+use aruna_compute::ExecutorRegistry;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::page;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
+use aruna_core::structs::execution::job::{JobFamilyId, SubmissionId};
+use aruna_core::types::{Key, Value};
+use tracing::warn;
 
 use super::LifecycleError;
-use super::offer::{OfferLaunchOperation, OfferOutcome};
-use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::witness_arm::{
-    ArmFamilyOperation, ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange,
-    WitnessDeadline, WitnessExplain, deadline_index_key, deadline_key,
+    ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange, WitnessDeadline,
+    deadline_index_key, deadline_key,
 };
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::admit::Admission;
-use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::pages::{SpecInputsOperation, StoreEntriesOperation};
-use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::verify::FamilyView;
-use crate::realm::load_config::load_realm_config;
-use crate::storage_read::iter_prefix_page;
-use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
+pub(crate) use super::witness_round::suppressed;
+pub use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
+use crate::driver::DriverContext;
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::store_call::RowRead;
 
 /// Families one drain pass considers.
 const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
-/// Wall-clock budget of one launch offer.
-const OFFER_DEADLINE: Duration = Duration::from_secs(30);
-/// Declined targets one explain row retains.
-const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
-/// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
-pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
-    let Some((local, realm_id)) = context.node_and_realm() else {
-        debug!(?family, "No net handle; witness fallback not armed");
-        return;
-    };
-    let operation = ArmFamilyOperation::new(family, local, realm_id, now_ms);
-    if let Err(error) = drive(operation, context).await {
-        warn!(?family, error = %error, "Witness deadline was not armed");
-    }
+/// This node as witness rounds see it; `None` without a network.
+pub fn witness_node(context: &DriverContext) -> Option<WitnessNode> {
+    let (local, realm_id) = context.node_and_realm()?;
+    let registry: Option<&ExecutorRegistry> = context.compute_handle.as_deref();
+    Some(WitnessNode {
+        local,
+        realm_id,
+        fresh: context.fresh_heartbeats(),
+        limits: registry.map(ExecutorRegistry::limits).unwrap_or_default(),
+    })
 }
 
-/// One bounded pass over the persisted deadlines. Returns true while rows
-/// remain, so the caller re-arms instead of spinning.
-pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bool {
-    let (rows, mut remaining) = match iter_prefix_page(
-        &context.storage_handle,
-        WITNESS_DEADLINE_KEYSPACE,
-        None,
-        None,
-        WITNESS_DRAIN_BATCH,
-        None,
-    )
-    .await
-    {
-        Ok((rows, next)) => (rows, next.is_some()),
-        Err(error) => {
-            warn!(error = %error, "Witness deadline scan failed");
-            return true;
+fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
+    if key.len() != DEADLINE_KEY_BYTES {
+        return None;
+    }
+    let submission: [u8; 32] = key.get(8..40)?.try_into().ok()?;
+    let request_digest: [u8; 32] = key.get(40..72)?.try_into().ok()?;
+    Some(JobFamilyId {
+        submission_id: SubmissionId(submission),
+        request_digest,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainStep {
+    Scan,
+    Index {
+        family: JobFamilyId,
+        key: Key,
+    },
+    Round {
+        family: JobFamilyId,
+        key: Key,
+        deadline: WitnessDeadline,
+    },
+    /// A change whose failure leaves work behind when `required`.
+    Change {
+        required: bool,
+    },
+}
+
+/// One bounded pass over the persisted deadlines. Answers true while rows remain, so the
+/// caller re-arms instead of spinning.
+#[derive(Debug, PartialEq)]
+pub struct WitnessDrainOperation {
+    node: Option<WitnessNode>,
+    now_ms: u64,
+    /// Deadline rows still to handle, the next one last.
+    rows: Vec<(Key, Value)>,
+    remaining: bool,
+    step: DrainStep,
+}
+
+type DrainNext = Result<Next<bool>, IoError>;
+
+impl WitnessDrainOperation {
+    pub fn new(node: Option<WitnessNode>, now_ms: u64) -> Self {
+        Self {
+            node,
+            now_ms,
+            rows: Vec::new(),
+            remaining: false,
+            step: DrainStep::Scan,
         }
-    };
-    for (key, _) in rows {
-        let Some(family) = deadline_family(&key) else {
-            continue;
-        };
-        let deadline = match read_deadline_index(context, &family).await {
-            Ok(Some(deadline)) => deadline,
-            Ok(None) => {
-                if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
-                    remaining = true;
-                }
+    }
+
+    fn next_row(&mut self) -> DrainNext {
+        while let Some((key, _)) = self.rows.pop() {
+            let Some(family) = deadline_family(&key) else {
                 continue;
-            }
-            Err(_) => {
-                remaining = true;
-                continue;
-            }
+            };
+            let read = RowRead::new(
+                DEADLINE_INDEX_KEYSPACE,
+                deadline_index_key(&family),
+                |row: Option<Value>| {
+                    Ok(row.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok()))
+                },
+            );
+            self.step = DrainStep::Index { family, key };
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        Ok(Next::Done(self.remaining))
+    }
+
+    fn change(&mut self, family: JobFamilyId, change: DeadlineChange, required: bool) -> DrainNext {
+        self.step = DrainStep::Change { required };
+        let operation = ChangeDeadlineOperation::new(family, change);
+        Ok(Next::Call(IoCall::child(operation)))
+    }
+
+    fn indexed(
+        &mut self,
+        family: JobFamilyId,
+        key: Key,
+        deadline: Option<WitnessDeadline>,
+    ) -> DrainNext {
+        let Some(deadline) = deadline else {
+            return self.change(family, DeadlineChange::Stale { key }, true);
         };
         if deadline_key(&family, deadline.due_at_ms) != key {
-            if !change_deadline(context, &family, DeadlineChange::Stale { key }).await {
-                remaining = true;
-            }
-            continue;
+            return self.change(family, DeadlineChange::Stale { key }, true);
         }
-        if deadline.due_at_ms > now_ms {
-            remaining = true;
-            continue;
+        if deadline.due_at_ms > self.now_ms {
+            self.remaining = true;
+            return self.next_row();
         }
-        match run_round(context, family, now_ms).await {
+        self.step = DrainStep::Round {
+            family,
+            key,
+            deadline,
+        };
+        let round = WitnessRoundOperation::new(family, self.node.clone(), self.now_ms);
+        Ok(Next::Call(IoCall::child(round)))
+    }
+
+    fn rounded(
+        &mut self,
+        (family, key, deadline): (JobFamilyId, Key, WitnessDeadline),
+        outcome: RoundOutcome,
+    ) -> DrainNext {
+        match outcome {
             RoundOutcome::Done => {
                 let clear = DeadlineChange::Clear {
                     key,
                     expected: deadline,
                 };
-                if !change_deadline(context, &family, clear).await {
-                    remaining = true;
-                }
+                self.change(family, clear, true)
             }
             RoundOutcome::Retry { after_ms } => {
+                self.remaining = true;
                 let next = WitnessDeadline {
-                    due_at_ms: now_ms + after_ms,
+                    due_at_ms: self.now_ms + after_ms,
                     rank: deadline.rank,
                 };
                 let replace = DeadlineChange::Replace {
                     expected: Some(deadline),
                     next,
                 };
-                change_deadline(context, &family, replace).await;
-                remaining = true;
+                self.change(family, replace, false)
             }
         }
     }
-    remaining
 }
 
-/// Builds and runs one planning round for the stored spec; see [`BuildPlanOperation`]. The
-/// paged inputs of the spec are read in first.
-async fn build_plan(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    spec: &LogicalJobSpec,
-    excluded: &[ExecutionTargetId],
-    now_ms: u64,
-) -> Result<ExecutionPlan, PlanBuildError> {
-    let local = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let fill = SpecInputsOperation::new(spec, context.node_and_realm());
-    let spec = drive(fill, context)
-        .await
-        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
-    let round = PlanRound {
-        config: config.clone(),
-        spec,
-        excluded: excluded.to_vec(),
-        now_ms,
-        local,
-        fresh: context.fresh_heartbeats(),
-    };
-    drive(BuildPlanOperation::new(round), context).await
+impl Operation for WitnessDrainOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> DrainNext {
+        Ok(Next::Call(IoCall::Page {
+            space: WITNESS_DEADLINE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: WITNESS_DRAIN_BATCH,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> DrainNext {
+        match std::mem::replace(&mut self.step, DrainStep::Scan) {
+            DrainStep::Scan => {
+                let (mut rows, next) = page(result)?;
+                rows.reverse();
+                self.rows = rows;
+                self.remaining = next.is_some();
+                self.next_row()
+            }
+            DrainStep::Index { family, key } => {
+                match result.child::<Option<WitnessDeadline>, JobMutationError>()? {
+                    Ok(deadline) => self.indexed(family, key, deadline),
+                    Err(_) => {
+                        self.remaining = true;
+                        self.next_row()
+                    }
+                }
+            }
+            DrainStep::Round {
+                family,
+                key,
+                deadline,
+            } => match result.child::<RoundOutcome, IoError>()? {
+                Ok(outcome) => self.rounded((family, key, deadline), outcome),
+                Err(error) => {
+                    warn!(error = %error, "Witness round did not finish");
+                    self.remaining = true;
+                    self.next_row()
+                }
+            },
+            DrainStep::Change { required } => {
+                let applied = result.child::<bool, LifecycleError>()?.unwrap_or(false);
+                self.remaining |= required && !applied;
+                self.next_row()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::records::{Family, context, node};
+    use crate::driver::drive;
+    use crate::storage_read::iter_prefix_page;
+    use crate::tests::records::{Family, context};
+    use aruna_core::calls::ChildOutcome;
+
+    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    async fn change_deadline(
+        context: &DriverContext,
+        family: &JobFamilyId,
+        change: DeadlineChange,
+    ) -> bool {
+        let operation = ChangeDeadlineOperation::new(*family, change);
+        drive(operation, context).await.unwrap_or(false)
+    }
+
+    async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bool {
+        drive(WitnessDrainOperation::new(None, now_ms), context)
+            .await
+            .unwrap_or(true)
+    }
+
+    async fn read_deadline_index(
+        context: &DriverContext,
+        family: &JobFamilyId,
+    ) -> Result<Option<WitnessDeadline>, JobMutationError> {
+        let read = RowRead::new(
+            DEADLINE_INDEX_KEYSPACE,
+            deadline_index_key(family),
+            |row: Option<Value>| {
+                Ok(row.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok()))
+            },
+        );
+        drive(read, context).await
+    }
+
+    fn family() -> JobFamilyId {
+        JobFamilyId {
+            submission_id: SubmissionId([1u8; 32]),
+            request_digest: [2u8; 32],
+        }
+    }
+
+    fn deadline(due_at_ms: u64) -> WitnessDeadline {
+        WitnessDeadline { due_at_ms, rank: 1 }
+    }
+
+    fn scanned(due_at_ms: u64) -> WitnessDrainOperation {
+        let mut drain = WitnessDrainOperation::new(None, 10);
+        assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let rows = vec![(deadline_key(&family(), due_at_ms), Value::from(Vec::new()))];
+        let scan = IoResult::Page { rows, next: None };
+        assert!(matches!(drain.next(scan), Ok(Next::Call(IoCall::Child(_)))));
+        drain
+    }
+
+    fn indexed(row: Option<WitnessDeadline>) -> IoResult {
+        child(Ok::<_, JobMutationError>(row))
+    }
+
+    // A row the index no longer names is dropped, and a failed drop stays owed.
+    #[test]
+    fn stale_row_dropped() {
+        let mut drain = scanned(5);
+        assert!(matches!(
+            drain.next(indexed(None)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(drain.step, DrainStep::Change { required: true });
+        let failed = child(Ok::<_, LifecycleError>(false));
+        assert!(matches!(drain.next(failed), Ok(Next::Done(true))));
+    }
+
+    // A deadline still ahead stays for a later pass.
+    #[test]
+    fn future_deadline_kept() {
+        let mut drain = scanned(50);
+        let done = drain.next(indexed(Some(deadline(50))));
+        assert!(matches!(done, Ok(Next::Done(true))));
+    }
+
+    // A finished round clears its deadline and leaves nothing behind.
+    #[test]
+    fn finished_round_clears() {
+        let mut drain = scanned(5);
+        assert!(matches!(
+            drain.next(indexed(Some(deadline(5)))),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let finished = child(Ok::<_, IoError>(RoundOutcome::Done));
+        assert!(matches!(
+            drain.next(finished),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let cleared = child(Ok::<_, LifecycleError>(true));
+        assert!(matches!(drain.next(cleared), Ok(Next::Done(false))));
+    }
+
+    // A round to repeat moves the deadline, and rows remain even if the move fails.
+    #[test]
+    fn retried_round_remains() {
+        let mut drain = scanned(5);
+        drain.next(indexed(Some(deadline(5)))).unwrap();
+        let again = child(Ok::<_, IoError>(RoundOutcome::Retry { after_ms: 7 }));
+        drain.next(again).unwrap();
+        assert_eq!(drain.step, DrainStep::Change { required: false });
+        let failed = child(Err::<bool, _>(LifecycleError::NotFinished));
+        assert!(matches!(drain.next(failed), Ok(Next::Done(true))));
+    }
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -179,7 +350,7 @@ mod tests {
         let (_dir, ctx) = context(&fixture.config, fixture.holder.public()).await;
         for index in 0..=WITNESS_DRAIN_BATCH {
             let family = JobFamilyId {
-                submission_id: aruna_core::structs::execution::job::SubmissionId([index as u8; 32]),
+                submission_id: SubmissionId([index as u8; 32]),
                 request_digest: [index as u8; 32],
             };
             let next = WitnessDeadline {
@@ -250,677 +421,4 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, deadline_key(&family, second.due_at_ms));
     }
-
-    /// One family with a launch by `holder` that no receipt answers.
-    fn foreign(fixture: &Family) -> (LaunchIntent, Vec<JobRecordEnvelope>) {
-        let spec = fixture.spec();
-        let launch = fixture.launch(&spec, fixture.holder.public(), 0);
-        let records = vec![fixture.sign(
-            &fixture.holder,
-            JobFamilyRecord::Launch(Box::new(launch.clone())),
-        )];
-        (launch, records)
-    }
-
-    #[test]
-    fn defers_to_launch() {
-        // Another witness's unreceipted launch holds the family until its
-        // window ends; this node's own launch never defers the round.
-        let fixture = Family::new([3u8; 32]);
-        let (launch, records) = foreign(&fixture);
-        let now = launch.created_at_ms + 10;
-
-        assert_eq!(
-            foreign_launch_wait(&records, node(2), now, 1_000),
-            Some(990)
-        );
-        assert_eq!(
-            foreign_launch_wait(&records, fixture.holder.public(), now, 1_000),
-            None
-        );
-    }
-
-    #[test]
-    fn plans_after_window() {
-        // Past the window, and once a receipt exists, the round plans again.
-        let fixture = Family::new([4u8; 32]);
-        let (launch, mut records) = foreign(&fixture);
-
-        assert_eq!(
-            foreign_launch_wait(&records, node(2), launch.created_at_ms + 1_000, 1_000),
-            None
-        );
-        records.push(fixture.sign(
-            &fixture.target,
-            JobFamilyRecord::Receipt(Box::new(fixture.receipt(&launch, 1))),
-        ));
-        assert_eq!(
-            foreign_launch_wait(&records, node(2), launch.created_at_ms + 10, 1_000),
-            None
-        );
-    }
-
-    #[test]
-    fn lost_target_expires() {
-        // A target keeps its launch for the whole configured catch-up window.
-        let base = 5_000;
-        let window = 300_000;
-        assert!(!lost_target_expired(10, 9 + window, window));
-        assert!(lost_target_expired(10, 10 + window, window));
-        assert_eq!(lost_retry_ms(10, 10, base, window), base);
-        assert_eq!(lost_retry_ms(10, 9 + window, base, window), 1);
-    }
-}
-
-/// What one round leaves behind: nothing more to do for this family here, or a
-/// re-armed deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoundOutcome {
-    Done,
-    Retry { after_ms: u64 },
-}
-
-/// One witness round: suppression, budget, plan, launch, offer. Every step
-/// reads only replicated records plus this node's own view.
-async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) -> RoundOutcome {
-    let Some(net) = context.net_handle.as_ref() else {
-        return RoundOutcome::Done;
-    };
-    let realm_id = *net.realm_id();
-    let local = net.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        return RoundOutcome::Retry { after_ms: 1_000 };
-    };
-    let base = config.compute.witness_delay_ms;
-    let window = config.compute.catch_up_ms;
-    let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
-        return RoundOutcome::Retry { after_ms: base };
-    };
-    if !view.holds(local) {
-        return RoundOutcome::Done;
-    }
-    // An incomplete family read is undecided evidence: a suppression, cancel or
-    // earlier launch may be in the unloaded part, so no budget and no offer.
-    let records = match drive(LoadFamilyOperation::family(family), context).await {
-        Ok(records) => records,
-        Err(error) => {
-            warn!(error = %error, "Job family read is incomplete; witness round deferred");
-            return RoundOutcome::Retry { after_ms: base };
-        }
-    };
-    let running = running_nodes(family, &records);
-    let silent = silent_nodes(net, &running, window);
-    if suppressed(family, &records, &silent) {
-        // An unfinished execution suppresses only while its node reports, so look again later.
-        return match suppressed(family, &records, &running) {
-            true => RoundOutcome::Done,
-            false => RoundOutcome::Retry { after_ms: window },
-        };
-    }
-    let Some(spec) = stored_spec(family, &records) else {
-        return RoundOutcome::Retry { after_ms: base };
-    };
-    let budget = match stored_budget(context, &config, &spec, local, &records, now_ms).await {
-        Some(budget) => budget,
-        None => return RoundOutcome::Retry { after_ms: base },
-    };
-    let mine: Vec<&JobRecordEnvelope> = records
-        .iter()
-        .filter(|envelope| match &envelope.record {
-            JobFamilyRecord::Launch(launch) => launch.scheduler_node_id == local,
-            _ => false,
-        })
-        .collect();
-    let sequence = mine.len() as u32;
-    let mut explain =
-        read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &explain_key(&family, local))
-            .await
-            .unwrap_or(WitnessExplain {
-                sequence,
-                plan: empty_plan(),
-                declined: Vec::new(),
-                overlapping: false,
-                stored_at_ms: now_ms,
-            });
-    if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
-        JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
-        _ => 0,
-    }) && let JobFamilyRecord::Launch(launch) = &envelope.record
-        && !explain.declined.contains(&launch.target)
-    {
-        if lost_target_expired(launch.created_at_ms, now_ms, window) {
-            record_decline(context, &family, local, launch.target.clone()).await;
-            return RoundOutcome::Retry { after_ms: 0 };
-        }
-        let retry_after_ms = lost_retry_ms(launch.created_at_ms, now_ms, base, window);
-        if launch.created_at_ms.saturating_add(base) > now_ms {
-            return RoundOutcome::Retry {
-                after_ms: retry_after_ms,
-            };
-        }
-        let Ok(frame) = JobRecordFrame::new((*envelope).clone()) else {
-            return RoundOutcome::Done;
-        };
-        return offer(
-            context,
-            Offer {
-                realm_id,
-                local,
-                family,
-                frame,
-                target: launch.target.clone(),
-                now_ms,
-                retry_after_ms,
-            },
-        )
-        .await;
-    }
-    // Another witness already launched and its window has not run out, so this
-    // round leaves the family to it instead of adding a second execution.
-    if let Some(after_ms) = foreign_launch_wait(&records, local, now_ms, window) {
-        debug!(after_ms, "Another witness holds a launch for this family");
-        return RoundOutcome::Retry { after_ms };
-    }
-    if sequence >= budget.max_launches {
-        debug!(sequence, "Witness budget is exhausted for this request");
-        return RoundOutcome::Done;
-    }
-    let plan = match build_plan(context, &config, &spec, &explain.declined, now_ms).await {
-        Ok(plan) => plan,
-        Err(error) => {
-            warn!(error = %error, "Execution planning failed");
-            return RoundOutcome::Retry { after_ms: base };
-        }
-    };
-    info!(
-        sequence,
-        selected = plan.selected.is_some(),
-        alternatives = plan.alternatives.len(),
-        rejected = plan.rejected.len(),
-        omitted = plan.omitted,
-        retryable = plan.retryable,
-        "Witness planning round decided"
-    );
-    explain.sequence = sequence;
-    explain.overlapping = !mine.is_empty();
-    explain.plan = plan;
-    explain.stored_at_ms = now_ms;
-    // The explain record is durable before any launch exists, so every launch
-    // has an auditable reason even if this node dies right after sending it.
-    if write_row(
-        context,
-        PLAN_EXPLAIN_KEYSPACE,
-        &explain_key(&family, local),
-        &explain,
-    )
-    .await
-    .is_err()
-    {
-        return RoundOutcome::Retry { after_ms: base };
-    }
-    let Some(selection) = explain.plan.selected.clone() else {
-        let after_ms = match explain.plan.retryable {
-            true => base,
-            false => base.saturating_mul(4),
-        };
-        return RoundOutcome::Retry { after_ms };
-    };
-    let mut launch = LaunchIntent {
-        launch_id: Ulid::generate(),
-        submission_id: family.submission_id,
-        request_digest: family.request_digest,
-        job_id: spec.job_id,
-        scheduler_node_id: local,
-        scheduler_seq: sequence,
-        witness_placement: view.placement,
-        holder_generation: holder_generation(&config, &view),
-        target: selection.target.clone(),
-        inputs: selection.inputs,
-        input_pages: None,
-        output_policies: selection.output_policies,
-        plan_digest: selection.plan_digest,
-        spec_digest: spec.spec_digest,
-        created_at_ms: now_ms,
-    };
-    // Planned inputs too large for the launch record go to pages this node serves.
-    match drive(StoreEntriesOperation::launch(&launch), context).await {
-        Ok(Some(manifest)) => {
-            launch.inputs.clear();
-            launch.input_pages = Some(manifest);
-        }
-        Ok(None) => {}
-        Err(_) => return RoundOutcome::Retry { after_ms: base },
-    }
-    let Some(frame) = sign_record(context, realm_id, JobFamilyRecord::Launch(Box::new(launch)))
-    else {
-        return RoundOutcome::Retry { after_ms: base };
-    };
-    if !append_local(context, realm_id, local, frame.clone(), now_ms).await {
-        return RoundOutcome::Retry { after_ms: base };
-    }
-    let offered = Offer {
-        realm_id,
-        local,
-        family,
-        frame,
-        target: selection.target,
-        now_ms,
-        retry_after_ms: lost_retry_ms(now_ms, now_ms, base, window),
-    };
-    offer(context, offered).await
-}
-
-/// One launch offer round: the durable launch, its target, and the delays this
-/// witness answers with.
-struct Offer {
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-    local: NodeId,
-    family: JobFamilyId,
-    frame: JobRecordFrame,
-    target: ExecutionTargetId,
-    now_ms: u64,
-    retry_after_ms: u64,
-}
-
-/// Sends the durable launch to its target and settles what the answer means.
-async fn offer(context: &DriverContext, offered: Offer) -> RoundOutcome {
-    let Offer {
-        realm_id,
-        local,
-        family,
-        frame,
-        target,
-        now_ms,
-        retry_after_ms,
-    } = offered;
-    let Ok(launch) = LaunchFrame::new(frame.into_inner()) else {
-        return RoundOutcome::Done;
-    };
-    let target_node = target.node_id;
-    let answered = match context.net_handle.as_ref() {
-        // No transport dials the node it starts from, so a launch planned onto this
-        // node is admitted in process; the decision is the one an inbound offer gets.
-        Some(net) if net.node_id() == target_node => Ok(admit_here(context, launch).await),
-        _ => {
-            drive(
-                OfferLaunchOperation::new(target_node, launch, OFFER_DEADLINE),
-                context,
-            )
-            .await
-        }
-    };
-    match answered {
-        Ok(OfferOutcome::Accepted(receipt)) => {
-            match append_local(context, realm_id, local, receipt, now_ms).await {
-                true => RoundOutcome::Done,
-                false => RoundOutcome::Retry {
-                    after_ms: retry_after_ms,
-                },
-            }
-        }
-        Ok(OfferOutcome::Declined(reason)) => {
-            if reason == LaunchDecline::Cancelled {
-                return RoundOutcome::Done;
-            }
-            if permanent_decline(&reason) {
-                record_decline(context, &family, local, target).await;
-                RoundOutcome::Retry { after_ms: 0 }
-            } else {
-                RoundOutcome::Retry {
-                    after_ms: retry_after_ms,
-                }
-            }
-        }
-        Ok(OfferOutcome::Unavailable) | Err(_) => RoundOutcome::Retry {
-            after_ms: retry_after_ms,
-        },
-    }
-}
-
-/// Admits a launch planned onto this node, with the answer a remote target would give.
-async fn admit_here(context: &DriverContext, launch: LaunchFrame) -> OfferOutcome {
-    let context = std::sync::Arc::new(context.clone());
-    let Some(node) = super::target::launch_node(&context, &launch) else {
-        return OfferOutcome::Unavailable;
-    };
-    let admit = super::launch_admit::AdmitLaunchOperation::new(launch, node);
-    match drive(admit, context.as_ref()).await.ok() {
-        Some(Ok(receipt)) => match JobRecordFrame::new(receipt.into_inner()) {
-            Ok(frame) => OfferOutcome::Accepted(frame),
-            Err(_) => OfferOutcome::Unavailable,
-        },
-        Some(Err(reason)) => OfferOutcome::Declined(reason),
-        None => OfferOutcome::Unavailable,
-    }
-}
-
-fn permanent_decline(reason: &LaunchDecline) -> bool {
-    match reason {
-        LaunchDecline::Unauthorized | LaunchDecline::LaunchConflict => true,
-        LaunchDecline::Policy(policy) => !matches!(
-            policy.decision(),
-            PlacementDecision::Required { .. } | PlacementDecision::Unavailable { .. }
-        ),
-        LaunchDecline::NotHolder
-        | LaunchDecline::Capacity
-        | LaunchDecline::Draining
-        | LaunchDecline::Cancelled
-        | LaunchDecline::AlreadyRunning => false,
-    }
-}
-
-async fn record_decline(
-    context: &DriverContext,
-    family: &JobFamilyId,
-    local: NodeId,
-    target: ExecutionTargetId,
-) {
-    let key = explain_key(family, local);
-    let Some(mut explain) = read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &key).await
-    else {
-        return;
-    };
-    if !explain.declined.contains(&target) && explain.declined.len() < MAX_DECLINED_TARGETS {
-        explain.declined.push(target);
-    }
-    let _ = write_row(context, PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
-}
-
-/// Whether a launch is suppressed by a success, cancellation, permanent failure,
-/// or an execution that may still finish. An unfinished execution on a `silent`
-/// node no longer suppresses: that node stopped reporting.
-pub(crate) fn suppressed(
-    family: JobFamilyId,
-    records: &[JobRecordEnvelope],
-    silent: &BTreeSet<NodeId>,
-) -> bool {
-    let Ok(Some(projection)) = reduce_family(family, records) else {
-        return false;
-    };
-    if projection.cancel_requested || projection.canonical_execution_id.is_some() {
-        return true;
-    }
-    projection.executions.iter().any(|execution| {
-        execution.state != PhysicalExecutionState::Error
-            && (execution.state.is_terminal() || !silent.contains(&execution.executor_node_id))
-    })
-}
-
-/// Executor nodes of the family's unfinished executions.
-fn running_nodes(family: JobFamilyId, records: &[JobRecordEnvelope]) -> BTreeSet<NodeId> {
-    let Ok(Some(projection)) = reduce_family(family, records) else {
-        return BTreeSet::new();
-    };
-    projection
-        .executions
-        .iter()
-        .filter(|execution| !execution.state.is_terminal())
-        .map(|execution| execution.executor_node_id)
-        .collect()
-}
-
-/// The `running` nodes that sent no heartbeat within the catch-up window. Without any heartbeat
-/// the silence counts from this node's start, so a restart alone never makes a node silent early.
-fn silent_nodes(net: &NetHandle, running: &BTreeSet<NodeId>, window_ms: u64) -> BTreeSet<NodeId> {
-    running
-        .iter()
-        .copied()
-        .filter(|node| net.heartbeat_silence(*node).as_millis() > u128::from(window_ms))
-        .collect()
-}
-
-/// The stored spec of the family's canonical alias.
-fn stored_spec(family: JobFamilyId, records: &[JobRecordEnvelope]) -> Option<LogicalJobSpec> {
-    let projection = reduce_family(family, records).ok()??;
-    records.iter().find_map(|envelope| match &envelope.record {
-        JobFamilyRecord::Spec(spec) if spec.job_id == projection.canonical_job_id => {
-            Some(spec.as_ref().clone())
-        }
-        _ => None,
-    })
-}
-
-/// This node's immutable launch bound, stored once before its first launch.
-async fn stored_budget(
-    context: &DriverContext,
-    config: &RealmConfigDocument,
-    spec: &LogicalJobSpec,
-    local: NodeId,
-    records: &[JobRecordEnvelope],
-    now_ms: u64,
-) -> Option<WitnessBudgetRecord> {
-    if let Some(budget) = records.iter().find_map(|envelope| match &envelope.record {
-        JobFamilyRecord::Budget(budget) if budget.scheduler_node_id == local => Some(*budget),
-        _ => None,
-    }) {
-        return Some(budget);
-    }
-    let budget = WitnessBudgetRecord {
-        submission_id: spec.submission_id,
-        request_digest: spec.request_digest,
-        scheduler_node_id: local,
-        source_spec_digest: spec.spec_digest,
-        max_launches: spec.retry.launches_per_witness,
-    };
-    let frame = sign_record(context, config.realm_id, JobFamilyRecord::Budget(budget))?;
-    match append_local(context, config.realm_id, local, frame, now_ms).await {
-        true => Some(budget),
-        false => None,
-    }
-}
-
-/// The candidate map epoch this witness observed, recorded as audit evidence
-/// only: it never proves that the scheduler held the family.
-fn holder_generation(config: &RealmConfigDocument, view: &FamilyView) -> u64 {
-    config
-        .activation(&view.placement.strategy_id, view.placement.shard)
-        .map(|activation| activation.candidate_map_epoch)
-        .unwrap_or_default()
-}
-
-fn sign_record(
-    context: &DriverContext,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-    record: JobFamilyRecord,
-) -> Option<JobRecordFrame> {
-    let net = context.net_handle.as_ref()?;
-    let envelope = JobRecordEnvelope::signed_with(realm_id, record, net.node_id(), |message| {
-        net.sign(message)
-    })
-    .ok()?;
-    JobRecordFrame::new(envelope).ok()
-}
-
-async fn append_local(
-    context: &DriverContext,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-    local: NodeId,
-    record: JobRecordFrame,
-    now_ms: u64,
-) -> bool {
-    let operation = AppendRecordOperation::new(AppendRecordConfig {
-        realm_id,
-        local_node_id: local,
-        record,
-        local: None,
-        origin: RecordOrigin::Local,
-        now_ms,
-    });
-    match drive(operation, context).await {
-        Ok(outcome) => matches!(
-            outcome.admission,
-            Admission::Authentic | Admission::Duplicate
-        ),
-        Err(error) => {
-            warn!(error = %error, "Witness record append failed");
-            false
-        }
-    }
-}
-
-fn empty_plan() -> ExecutionPlan {
-    ExecutionPlan {
-        selected: None,
-        retryable: true,
-        alternatives: Vec::new(),
-        rejected: Vec::new(),
-        omitted: 0,
-    }
-}
-
-fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
-    if key.len() != DEADLINE_KEY_BYTES {
-        return None;
-    }
-    let submission: [u8; 32] = key.get(8..40)?.try_into().ok()?;
-    let request_digest: [u8; 32] = key.get(40..72)?.try_into().ok()?;
-    Some(JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId(submission),
-        request_digest,
-    })
-}
-
-fn explain_key(family: &JobFamilyId, node: NodeId) -> Key {
-    let mut bytes = family.to_bytes().to_vec();
-    bytes.extend_from_slice(node.as_bytes());
-    Key::from(bytes.as_slice())
-}
-
-/// Applies one deadline change; a failed or skipped change reads as unchanged.
-async fn change_deadline(
-    context: &DriverContext,
-    family: &JobFamilyId,
-    change: DeadlineChange,
-) -> bool {
-    let operation = ChangeDeadlineOperation::new(*family, change);
-    drive(operation, context).await.unwrap_or(false)
-}
-
-fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
-    now_ms.saturating_sub(created_at_ms) >= window_ms
-}
-
-fn lost_retry_ms(created_at_ms: u64, now_ms: u64, base_delay_ms: u64, window_ms: u64) -> u64 {
-    let elapsed = now_ms.saturating_sub(created_at_ms);
-    let remaining = window_ms.saturating_sub(elapsed);
-    base_delay_ms.min(remaining)
-}
-
-/// How long this round must still leave a launch by another witness alone. It
-/// is a soft lease: the launch keeps the family until the window ends without a
-/// receipt, and then any witness may plan again.
-fn foreign_launch_wait(
-    records: &[JobRecordEnvelope],
-    local: NodeId,
-    now_ms: u64,
-    window_ms: u64,
-) -> Option<u64> {
-    let receipted: std::collections::BTreeSet<Ulid> = records
-        .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Receipt(receipt) => Some(receipt.launch_id),
-            _ => None,
-        })
-        .collect();
-    records
-        .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Launch(launch)
-                if launch.scheduler_node_id != local && !receipted.contains(&launch.launch_id) =>
-            {
-                Some(launch.created_at_ms)
-            }
-            _ => None,
-        })
-        .max()
-        .map(|created_at_ms| window_ms.saturating_sub(now_ms.saturating_sub(created_at_ms)))
-        .filter(|remaining| *remaining > 0)
-}
-
-async fn read_deadline_index(
-    context: &DriverContext,
-    family: &JobFamilyId,
-) -> Result<Option<WitnessDeadline>, LifecycleError> {
-    read_row_txn(
-        context,
-        DEADLINE_INDEX_KEYSPACE,
-        &deadline_index_key(family),
-        None,
-    )
-    .await
-}
-
-async fn read_row_txn<T: for<'a> Deserialize<'a>>(
-    context: &DriverContext,
-    key_space: &str,
-    key: &Key,
-    txn_id: Option<TxnId>,
-) -> Result<Option<T>, LifecycleError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.clone(),
-            txn_id,
-        })
-        .await;
-    match event {
-        Event::Storage(aruna_core::events::StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.and_then(|bytes| from_bytes::<T>(&bytes).ok()))
-        }
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "read".to_string(),
-            expected: "read result",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn read_row<T: for<'a> Deserialize<'a>>(
-    context: &DriverContext,
-    key_space: &str,
-    key: &Key,
-) -> Option<T> {
-    read_row_txn(context, key_space, key, None)
-        .await
-        .ok()
-        .flatten()
-}
-
-async fn write_row_txn<T: Serialize>(
-    context: &DriverContext,
-    key_space: &str,
-    key: &Key,
-    row: &T,
-    txn_id: Option<TxnId>,
-) -> Result<(), LifecycleError> {
-    let bytes = to_bytes(row)?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(aruna_core::effects::StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.clone(),
-            value: bytes.as_slice().into(),
-            txn_id,
-        })
-        .await;
-    match event {
-        Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(aruna_core::events::StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LifecycleError::UnexpectedEvent {
-            state: "write".to_string(),
-            expected: "write result",
-            got: other.label(),
-        }),
-    }
-}
-
-async fn write_row<T: Serialize>(
-    context: &DriverContext,
-    key_space: &str,
-    key: &Key,
-    row: &T,
-) -> Result<(), LifecycleError> {
-    write_row_txn(context, key_space, key, row, None).await
 }
