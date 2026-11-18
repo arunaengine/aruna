@@ -939,81 +939,268 @@ impl<O: PageObject> MergedPageOperation<O> {
             asked: None,
             object: PhantomData,
         };
-        // A partial listing keeps what it collected and goes on past a range no holder served.
-        let remote = match remote {
-            Some(Err(PageError::Unanswered { .. } | PageError::Relay(_))) if request.partial => {
-                let range_id = range.range_id.to_string();
-                page.stale_ranges.retain(|stale| *stale != range_id);
-                page.unavailable_ranges.push(range_id);
-                skipped = true;
-                continue;
-            }
-            Some(part) => Some(part?),
-            None => None,
-        };
-        let (part, lister, copy) = match remote {
-            Some(((part, lister), copy)) => (part, lister, copy),
-            None => {
-                let token = (start.as_ref())
-                    .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))
-                    .transpose()?;
-                let hidden = (resumed.as_ref())
-                    .map(|(_, _, cursor)| open_cursor(cursor).ok_or(PageError::Cursor))
-                    .transpose()?;
-                let bounds = Some((range.lower.clone(), range.upper.clone()));
-                let position = (token, None, hidden);
-                let part = local_part(scope, (info, caller), &sub, position, bounds).await?;
-                // Listing here instead of the coordinator lists this member's copy.
-                let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
-                (part, scope.node_id, copy)
-            }
-        };
-        skipped = false;
+        self.step = step;
+        Ok(Next::Call(IoCall::child(part)))
+    }
+
+    fn list_here(&mut self) -> PageTurn<O> {
+        let current = self.current()?;
+        let bucket = &self.request.bucket;
+        let token = (current.start.as_ref())
+            .map(|(key, group)| resume_token(bucket, key, group.as_deref()))
+            .transpose()?;
+        let hidden = (current.resumed.as_ref())
+            .map(|(_, _, cursor)| open_cursor(cursor).ok_or(PageError::Cursor))
+            .transpose()?;
+        let range = &current.range;
+        let bounds = Some((range.lower.clone(), range.upper.clone()));
+        let input = list_input(&current.sub, self.info.group_id, token, None);
+        let who = (self.info.group_id, self.caller.clone());
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        self.step = MergeStep::Local;
+        Ok(Next::Call(IoCall::child(part)))
+    }
+
+    /// A partial listing keeps what it collected and goes on past a range no holder served.
+    fn range_failed(&mut self, error: PageError) -> PageTurn<O> {
+        if !self.request.partial
+            || !matches!(error, PageError::Unanswered { .. } | PageError::Relay(_))
+        {
+            return Err(error);
+        }
+        let range_id = self.current()?.range.range_id.to_string();
+        self.page.stale_ranges.retain(|stale| *stale != range_id);
+        self.page.unavailable_ranges.push(range_id);
+        self.skipped = true;
+        self.next_range()
+    }
+
+    fn coordinator_failed(&mut self, error: PageError, cursor: Option<String>) -> PageTurn<O> {
+        if !error.holder_fault() {
+            return self.range_failed(error);
+        }
+        let range = self.current()?.range.clone();
+        self.page.stale_ranges.push(range.range_id.to_string());
+        let snapshot = self.view()?.snapshot();
+        let here = (snapshot.record_holders(&range).iter())
+            .any(|member| member.member_id == self.binding.member_id);
+        if here {
+            return self.list_here();
+        }
+        let copies = self.others(snapshot.copy_holders(&range));
+        self.list_remote(copies, true, cursor, MergeStep::Copy(true))
+    }
+
+    fn apply(&mut self, part: ObjectPage<O>, lister: NodeId, copy: bool) -> PageTurn<O> {
+        self.skipped = false;
+        let current = self.current.take().ok_or(IoError::Unfinished)?;
         // A range that stopped among hidden entries goes on from its member's cursor.
         if let Some(cursor) = part.next_cursor.clone().filter(|cursor| is_sealed(cursor)) {
             let next = Resume::Hidden {
-                lower: range.lower.clone(),
+                lower: current.range.lower,
                 node: lister,
                 copy,
                 cursor,
-                group: last_group.clone(),
+                group: self.last_group.clone(),
             };
-            page.next_cursor = Some(encode_resume(&next)?);
-            return Ok(page);
+            self.page.next_cursor = Some(encode_resume(&next)?);
+            return self.finish();
         }
         let keys = (part.objects.iter().map(PageObject::key))
             .chain(part.prefixes.iter().map(String::as_str));
-        bytes += keys.map(str::len).sum::<usize>();
+        self.bytes += keys.map(str::len).sum::<usize>();
         for group in part.prefixes {
-            if last_group.as_deref() == Some(group.as_str()) {
+            if self.last_group.as_deref() == Some(group.as_str()) {
                 continue;
             }
-            if last_key.as_deref().is_none_or(|key| group.as_str() > key) {
-                last_key = Some(group.clone());
+            if self
+                .last_key
+                .as_deref()
+                .is_none_or(|key| group.as_str() > key)
+            {
+                self.last_key = Some(group.clone());
             }
-            last_group = Some(group.clone());
-            page.prefixes.push(group);
+            self.last_group = Some(group.clone());
+            self.page.prefixes.push(group);
         }
         if let Some(object) = part.objects.last()
-            && last_key.as_deref().is_none_or(|key| object.key() > key)
+            && self
+                .last_key
+                .as_deref()
+                .is_none_or(|key| object.key() > key)
         {
-            last_key = Some(object.key().to_string());
+            self.last_key = Some(object.key().to_string());
         }
-        page.objects.extend(part.objects);
+        self.page.objects.extend(part.objects);
         // The range's own position, which also moves on when nothing in it was shown.
         if part.next_cursor.is_some() {
-            page.next_cursor = part.next_cursor;
-            break;
+            self.page.next_cursor = part.next_cursor;
+            return self.finish();
+        }
+        self.next_range()
+    }
+}
+
+impl<O: PageObject> Operation for MergedPageOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    /// A listing whose downloads this node authorizes has this node check every remote entry.
+    fn first(&mut self) -> PageTurn<O> {
+        let checked = matches!(self.access, MemberAccess::Delegated(_));
+        let Some((auth, _)) = self.caller.as_ref().filter(|_| checked) else {
+            return self.read_view();
+        };
+        let ids = (self.node.realm_id, self.info.group_id, self.node.node_id);
+        let access = BucketAccessOperation::new(auth, ids, &self.request.bucket);
+        self.step = MergeStep::Access;
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        match std::mem::replace(&mut self.step, MergeStep::Local) {
+            MergeStep::Access => {
+                let access = result.child::<BucketAccess, AuthorizeError>()?;
+                let access = access.map_err(PageError::internal)?;
+                self.checks = Some((Arc::new(access), self.info.group_id));
+                self.read_view()
+            }
+            MergeStep::View => {
+                self.view = Some(result.child::<DistributionView, GuardError>()??);
+                self.step = MergeStep::Fence;
+                Ok(Next::Call(IoCall::child(local_fence(self.binding.set_id))))
+            }
+            MergeStep::Fence => {
+                self.fence = Some(result.child::<LocalFence, GuardError>()??);
+                self.plan()
+            }
+            MergeStep::Local => {
+                let part = result.child::<ObjectPage<O>, PageError>()??;
+                // Listing here instead of the coordinator lists this member's copy.
+                let current = self.current()?;
+                let copy = (current.resumed.as_ref()).map_or(!current.local, |(_, copy, _)| *copy);
+                self.apply(part, self.node.node_id, copy)
+            }
+            MergeStep::Primary(cursor) => match result.child::<RemotePart<O>, PageError>()? {
+                Ok((part, lister)) => self.apply(part, lister, false),
+                Err(error) => self.coordinator_failed(error, cursor),
+            },
+            MergeStep::Copy(copy) => match result.child::<RemotePart<O>, PageError>()? {
+                Ok((part, lister)) => self.apply(part, lister, copy),
+                Err(error) => self.range_failed(error),
+            },
         }
     }
-    Ok(page)
+}
+
+/// What an [`ObjectPageOperation`] lists.
+#[derive(Debug, PartialEq)]
+enum PageKind {
+    /// Local for an ordinary bucket, merged across the key ranges of a distributed one.
+    Whole,
+    /// One range another member relays here.
+    Range {
+        start_after: Option<String>,
+        bounds: (String, Option<String>),
+    },
+}
+
+/// One page of a bucket's objects on this node. With a caller, only what that caller may read
+/// shows.
+#[derive(Debug, PartialEq)]
+pub struct ObjectPageOperation<O> {
+    node: PageNode,
+    access: MemberAccess,
+    info: BucketInfo,
+    caller: Option<OwnedCaller>,
+    request: ListRequest,
+    kind: PageKind,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> ObjectPageOperation<O> {
+    pub fn new(
+        node: PageNode,
+        access: MemberAccess,
+        info: &BucketInfo,
+        caller: Option<Caller<'_>>,
+        request: ListRequest,
+    ) -> Self {
+        Self {
+            node,
+            access,
+            info: info.clone(),
+            caller: caller.map(|(auth, expiry)| (auth.clone(), expiry)),
+            request,
+            kind: PageKind::Whole,
+            object: PhantomData,
+        }
+    }
+
+    /// One page of the range `bounds` names, for a listing another member relays here.
+    pub fn for_range(
+        mut self,
+        start_after: Option<String>,
+        bounds: (String, Option<String>),
+    ) -> Self {
+        self.kind = PageKind::Range {
+            start_after,
+            bounds,
+        };
+        self
+    }
+
+    fn local(
+        &mut self,
+        start_after: Option<String>,
+        bounds: Option<(String, Option<String>)>,
+    ) -> Result<IoCall, PageError> {
+        let (token, hidden) = local_token(&self.request)?;
+        let group_id = self.info.group_id;
+        let input = list_input(&self.request, group_id, token, start_after);
+        let who = (group_id, self.caller.take());
+        let part = LocalPartOperation::<O>::new(self.node, who, input, (hidden, bounds));
+        Ok(IoCall::child(part))
+    }
+}
+
+impl<O: PageObject> Operation for ObjectPageOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> PageTurn<O> {
+        let kind = std::mem::replace(&mut self.kind, PageKind::Whole);
+        let call = match (kind, self.info.distribution.clone()) {
+            (
+                PageKind::Range {
+                    start_after,
+                    bounds,
+                },
+                _,
+            ) => self.local(start_after, Some(bounds))?,
+            (PageKind::Whole, None) => self.local(None, None)?,
+            (PageKind::Whole, Some(binding)) => {
+                let merged = MergedPageOperation::<O>::new(
+                    self.node,
+                    self.access.clone(),
+                    (self.info.clone(), binding),
+                    self.caller.take(),
+                    self.request.clone(),
+                );
+                IoCall::child(merged)
+            }
+        };
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        Ok(Next::Done(result.child::<ObjectPage<O>, PageError>()??))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Error = PageError<()>;
 
     #[test]
     fn resume_round_trips() {
@@ -1021,14 +1208,14 @@ mod tests {
             key: "a/b".to_string(),
             group: Some("a/".to_string()),
         };
-        let encoded = encode_resume::<()>(&after).unwrap();
-        assert_eq!(decode_resume::<()>(&encoded).unwrap(), after);
+        let encoded = encode_resume(&after).unwrap();
+        assert_eq!(decode_resume(&encoded).unwrap(), after);
         let from = Resume::From("m".to_string());
-        let encoded = encode_resume::<()>(&from).unwrap();
-        assert_eq!(decode_resume::<()>(&encoded).unwrap(), from);
+        let encoded = encode_resume(&from).unwrap();
+        assert_eq!(decode_resume(&encoded).unwrap(), from);
         assert!(matches!(
-            decode_resume::<()>("not a cursor"),
-            Err(Error::Cursor)
+            decode_resume("not a cursor"),
+            Err(PageError::Cursor)
         ));
     }
 
@@ -1040,7 +1227,7 @@ mod tests {
             prefix: None,
             delimiter: Some("/".to_string()),
             cursor: Some(
-                encode_resume::<()>(&Resume::After {
+                encode_resume(&Resume::After {
                     key: "d/".to_string(),
                     group: Some("d/".to_string()),
                 })
@@ -1049,18 +1236,111 @@ mod tests {
             limit: 5,
             partial: false,
         };
-        let token = local_token::<()>(&request).unwrap().0.unwrap();
+        let token = local_token(&request).unwrap().0.unwrap();
         assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
         let from = ListRequest {
-            cursor: Some(encode_resume::<()>(&Resume::From("m".to_string())).unwrap()),
+            cursor: Some(encode_resume(&Resume::From("m".to_string())).unwrap()),
             ..request
         };
-        assert!(local_token::<()>(&from).is_err());
+        assert!(local_token(&from).is_err());
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Key(String);
+
+    impl From<&ListedObject> for Key {
+        fn from(object: &ListedObject) -> Self {
+            Self(object.head.key.clone())
+        }
+    }
+
+    impl From<RangeEntry> for Key {
+        fn from(entry: RangeEntry) -> Self {
+            Self(entry.key)
+        }
+    }
+
+    impl PageObject for Key {
+        fn key(&self) -> &str {
+            &self.0
+        }
+    }
+
+    fn step_info() -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    fn step_node() -> PageNode {
+        PageNode {
+            realm_id: RealmId::from_bytes([1; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            ids: None,
+        }
+    }
+
+    fn step_request(cursor: Option<&str>) -> ListRequest {
+        ListRequest {
+            bucket: "b".to_string(),
+            prefix: None,
+            delimiter: None,
+            cursor: cursor.map(str::to_string),
+            limit: 5,
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn foreign_cursor_refused() {
+        let access = MemberAccess::Bearer(None);
+        let request = step_request(Some("not a cursor"));
+        let mut page =
+            ObjectPageOperation::<Key>::new(step_node(), access, &step_info(), None, request);
+        assert_eq!(page.first(), Err(PageError::Cursor));
+    }
+
+    #[test]
+    fn plain_listing_children() {
+        let access = MemberAccess::Bearer(None);
+        let request = step_request(None);
+        let mut page =
+            ObjectPageOperation::<Key>::new(step_node(), access, &step_info(), None, request);
+        assert!(matches!(page.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let done: PageResult<Key> = Ok(ObjectPage::default());
+        let outcome = aruna_core::calls::ChildOutcome::new(done);
+        assert_eq!(
+            page.next(IoResult::Child(outcome)),
+            Ok(Next::Done(ObjectPage::default()))
+        );
+    }
+
+    #[test]
+    fn holder_faults_told() {
+        let refusal = |status| {
+            PageError::Relay(RangeRefusal {
+                node_id: step_node().node_id,
+                status,
+                code: None,
+                message: String::new(),
+            })
+        };
+        assert!(refusal(503).holder_fault());
+        assert!(!refusal(403).holder_fault());
+        assert!(!PageError::Cursor.holder_fault());
     }
 
     #[test]
     fn resumes_past_group() {
-        let token = resume_token::<()>("bucket", "d/x", Some("d/")).unwrap();
+        let token = resume_token("bucket", "d/x", Some("d/")).unwrap();
         assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
         let head = BlobHeadKey::from_bytes(&token.last_key).unwrap();
         assert_eq!(head.key, "d/");
