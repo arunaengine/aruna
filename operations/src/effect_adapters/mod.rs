@@ -108,6 +108,10 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::DatasetSummary(request)) => {
             metadata::dispatch_summary(*request, context).await
         }
+        // A routed harvest write drives metadata operations through the handles the runner holds.
+        Effect::Net(NetEffect::HarvestWrite(write)) => {
+            metadata::dispatch_harvest_write(*write, context).await
+        }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
             Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
