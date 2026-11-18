@@ -46,7 +46,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, CreateDocumentResult,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::route_update::{RouteUpdateInput, RouteUpdateOperation};
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::origin::EmitEventOperation;
@@ -421,17 +421,15 @@ impl Operation for UpdateDatasetOperation {
                 // The holder refuses the update inside its transaction when an edit landed
                 // after the base.
                 Ok(Next::Call(IoCall::child(RouteUpdateOperation::new(
-                    RouteUpdateInput {
-                        actor: actor_of(&self.run),
-                        record,
-                        document_id: spec.document_id,
+                    (actor_of(&self.run), self.run.local_node),
+                    (record, spec.document_id),
+                    DocumentUpdate {
                         public: None,
                         mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
                         expected_revision: self.base,
-                        auth_token: Some(AuthToken::internal(spec.auth_context.clone())),
                         commit_message: None,
                     },
-                    self.run.local_node,
+                    Some(AuthToken::internal(spec.auth_context.clone())),
                 ))))
             }
             UpdateStep::Update => {
