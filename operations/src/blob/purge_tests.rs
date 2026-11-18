@@ -245,7 +245,7 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::query::insert_job(&context, &record)
+    crate::jobs::store::test_calls::insert_job(&context, &record)
         .await
         .unwrap();
     crate::driver::drive(
