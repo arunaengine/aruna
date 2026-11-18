@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::jobs::repository::link_reads::LinkChecksOperation;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
@@ -266,11 +267,7 @@ pub async fn process_materialization_batch(
     if timings.processed > 0
         && let Some(task_handle) = &context.task_handle
     {
-        crate::jobs::repository::link_queue::restore_link_timer(
-            context,
-            task_handle,
-        )
-        .await;
+        crate::jobs::repository::link_queue::restore_link_timer(context, task_handle).await;
     }
     if job_count > 0 {
         info!(
@@ -421,7 +418,7 @@ async fn process_job_groups(
     }
     let finish_started = Instant::now();
     let syncs = dedupe_graph_syncs(&finished);
-    if let Err(error) = finish_completed_jobs(&context.storage_handle, finished).await
+    if let Err(error) = finish_completed_jobs(context, finished).await
         && first_error.is_none()
     {
         first_error = Some(error);
@@ -492,7 +489,7 @@ struct FinishPlan {
 // Chunked so a failure costs one chunk instead of the whole batch, and the craqle work
 // behind the committed chunks survives.
 async fn finish_completed_jobs(
-    storage: &StorageHandle,
+    context: &DriverContext,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationError> {
     let mut chunk = Vec::with_capacity(MATERIALIZATION_FINISH_CHUNK);
@@ -500,21 +497,22 @@ async fn finish_completed_jobs(
         chunk.push(job);
         if chunk.len() >= MATERIALIZATION_FINISH_CHUNK {
             let taken = std::mem::take(&mut chunk);
-            finish_chunk(storage, taken).await?;
+            finish_chunk(context, taken).await?;
             chunk.reserve(MATERIALIZATION_FINISH_CHUNK);
         }
     }
     if !chunk.is_empty() {
-        finish_chunk(storage, chunk).await?;
+        finish_chunk(context, chunk).await?;
     }
     Ok(())
 }
 
 async fn finish_chunk(
-    storage: &StorageHandle,
+    context: &DriverContext,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationError> {
-    let plan = plan_finish_chunk(storage, finished).await?;
+    let storage = &context.storage_handle;
+    let plan = plan_finish_chunk(context, finished).await?;
     if plan.writes.is_empty() && plan.deletes.is_empty() {
         return Ok(());
     }
@@ -544,9 +542,10 @@ async fn finish_chunk(
 
 // Guard reads precede the transaction so concurrent changes enter its read set.
 async fn plan_finish_chunk(
-    storage: &StorageHandle,
+    context: &DriverContext,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<FinishPlan, MetadataMaterializationError> {
+    let storage = &context.storage_handle;
     let snapshot =
         read_status_map(storage, finished.iter().map(finished_document_id).collect()).await?;
     let parked = read_dead_letters(storage, &finished).await?;
@@ -696,9 +695,8 @@ async fn plan_finish_chunk(
     }
 
     // Linked repositories learn of the change in the same commit as the new status.
-    match crate::jobs::repository::link_queue::queue_rows(storage, superseding.keys().copied())
-        .await
-    {
+    let checks = LinkChecksOperation::new(superseding.keys().copied(), unix_timestamp_millis());
+    match drive(checks, context).await {
         Ok(rows) => plan.writes.extend(rows),
         Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
     }

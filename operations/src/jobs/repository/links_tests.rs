@@ -31,7 +31,7 @@ fn job(nonce: u64) -> JobId {
     .unwrap()
 }
 
-fn link() -> RepositoryLink {
+pub(super) fn link() -> RepositoryLink {
     RepositoryLink {
         link_id: Ulid::from_bytes([1; 16]),
         document_id: Ulid::from_bytes([2; 16]),
