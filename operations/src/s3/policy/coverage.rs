@@ -3,14 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -19,14 +18,13 @@ use aruna_core::structs::storage::blob::{
     ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::permission_check;
-use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
 const COVERAGE_PAGE_LIMIT: usize = 256;
@@ -134,15 +132,18 @@ pub enum CoverageError {
     Unauthorized,
     #[error(transparent)]
     Distribution(#[from] GuardError),
-    #[error("unexpected event during the coverage scan")]
-    InvalidEvent,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl From<IoError> for CoverageError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type CoverageTurn = Result<Next<CoverageReport>, CoverageError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanState {
-    Init,
-    Authorize,
-    StartTransaction,
     ReadBucket,
     /// Reads the set record and this node's fence, so only the keys it writes are counted.
     ReadRecord,
@@ -150,9 +151,6 @@ enum ScanState {
     ReadVersions,
     ReadHeads,
     ReadCopies,
-    CommitTransaction,
-    Finish,
-    Error,
 }
 
 /// One observed entry, carried between the page reads that classify it.
@@ -163,11 +161,73 @@ struct Observed {
     version: Option<BlobVersion>,
 }
 
+/// Reports one page after checking that the caller may administer the realm's placement.
 #[derive(Debug, PartialEq)]
 pub struct PolicyCoverageOperation {
     input: CoverageInput,
+    scanning: bool,
+}
+
+impl PolicyCoverageOperation {
+    pub fn new(input: CoverageInput) -> Self {
+        Self {
+            input,
+            scanning: false,
+        }
+    }
+
+    fn authorized(&mut self, allowed: Result<bool, AuthorizationError>) -> CoverageTurn {
+        match allowed {
+            Ok(true) => {
+                self.scanning = true;
+                let scan = CoverageScan::new(self.input.clone());
+                Ok(Next::Call(IoCall::child(scan)))
+            }
+            Ok(false) => Err(CoverageError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Coverage authorization check failed");
+                Err(CoverageError::Unauthorized)
+            }
+        }
+    }
+}
+
+impl Operation for PolicyCoverageOperation {
+    type Output = CoverageReport;
+    type Error = CoverageError;
+
+    fn first(&mut self) -> CoverageTurn {
+        let auth_context = self.input.auth_context.clone();
+        let path = policy_admin_path(auth_context.realm_id);
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context,
+            path,
+            required_permission: Permission::READ,
+        });
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CoverageTurn {
+        if self.scanning {
+            let report = result.child::<CoverageReport, CoverageError>()??;
+            return Ok(Next::Done(report));
+        }
+        self.authorized(result.child::<bool, AuthorizationError>()?)
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            CoverageError::Unauthorized | CoverageError::NoSuchBucket
+        )
+    }
+}
+
+/// Reads one page of heads or versions and what classifies them from one snapshot.
+#[derive(Debug, PartialEq)]
+struct CoverageScan {
+    input: CoverageInput,
     state: ScanState,
-    txn_id: Option<TxnId>,
     generation: u64,
     target_refs: Vec<PlacementPolicyRef>,
     entries: Vec<Observed>,
@@ -180,15 +240,13 @@ pub struct PolicyCoverageOperation {
     binding: Option<DistributionBinding>,
     authority: (Option<Value>, Option<Value>),
     elsewhere: usize,
-    output: Option<Result<CoverageReport, CoverageError>>,
 }
 
-impl PolicyCoverageOperation {
-    pub fn new(input: CoverageInput) -> Self {
+impl CoverageScan {
+    fn new(input: CoverageInput) -> Self {
         Self {
             input,
-            state: ScanState::Init,
-            txn_id: None,
+            state: ScanState::ReadBucket,
             generation: 0,
             target_refs: Vec::new(),
             entries: Vec::new(),
@@ -200,8 +258,12 @@ impl PolicyCoverageOperation {
             binding: None,
             authority: (None, None),
             elsewhere: 0,
-            output: None,
         }
+    }
+
+    fn call(&mut self, state: ScanState, call: IoCall) -> CoverageTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
     /// Whether this report counts `key`: in a distributed bucket only while this node writes its
@@ -221,82 +283,66 @@ impl PolicyCoverageOperation {
         }
     }
 
-    fn page_limit(&self) -> usize {
-        self.input.limit.clamp(1, COVERAGE_PAGE_LIMIT)
+    fn bucket_read(&mut self, value: Option<Value>) -> CoverageTurn {
+        let value = value.ok_or(CoverageError::NoSuchBucket)?;
+        let bucket = BucketInfo::from_bytes(value.as_ref())?;
+        self.generation = bucket.placement_policy_generation;
+        self.target_refs = bucket.placement_policies;
+        self.binding = bucket.distribution;
+        match self.binding.as_ref() {
+            // Read in the same snapshot as the heads, so both describe one moment.
+            Some(binding) => {
+                let reads = authority_reads(binding.set_id);
+                self.call(ScanState::ReadRecord, IoCall::Read(reads))
+            }
+            None => self.scan_page(),
+        }
     }
 
-    fn fail(&mut self, error: CoverageError) -> Effects {
-        self.state = ScanState::Error;
-        self.output = Some(Err(error));
-        self.abort()
+    fn scan_page(&mut self) -> CoverageTurn {
+        let bucket = &self.input.bucket;
+        let (space, prefix) = match self.input.scope {
+            CoverageScope::CurrentHeads => {
+                (BLOB_HEAD_KEYSPACE, BlobHeadKey::bucket_prefix(bucket)?)
+            }
+            CoverageScope::Historical => {
+                (BLOB_VERSIONS_KEYSPACE, VersionKey::bucket_prefix(bucket)?)
+            }
+        };
+        let page = IoCall::Page {
+            space: space.to_string(),
+            prefix: prefix.into(),
+            after: self.input.start_after.clone(),
+            limit: self.input.limit.clamp(1, COVERAGE_PAGE_LIMIT),
+        };
+        self.call(ScanState::ScanPage, page)
     }
 
-    fn scan_page(&mut self) -> Effects {
-        let (key_space, prefix) = match self.input.scope {
-            CoverageScope::CurrentHeads => (
-                BLOB_HEAD_KEYSPACE.to_string(),
-                BlobHeadKey::bucket_prefix(&self.input.bucket),
-            ),
-            CoverageScope::Historical => (
-                BLOB_VERSIONS_KEYSPACE.to_string(),
-                VersionKey::bucket_prefix(&self.input.bucket),
-            ),
-        };
-        let prefix = match prefix {
-            Ok(prefix) => prefix,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = ScanState::ScanPage;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space,
-            prefix: Some(prefix.into()),
-            start: self.input.start_after.clone().map(IterStart::After),
-            limit: self.page_limit(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(CoverageError::InvalidEvent);
-        };
-        self.cursor = next_start_after;
-        if values.is_empty() {
-            return self.commit();
+    fn page_read(&mut self, (rows, next): (Vec<(Key, Value)>, Option<Key>)) -> CoverageTurn {
+        self.cursor = next;
+        if rows.is_empty() {
+            return Ok(Next::Done(self.report()));
         }
         match self.input.scope {
-            CoverageScope::CurrentHeads => self.decode_heads(values),
-            CoverageScope::Historical => self.decode_versions(values),
+            CoverageScope::CurrentHeads => self.decode_heads(rows),
+            CoverageScope::Historical => self.decode_versions(rows),
         }
     }
 
     /// Heads page: the version records they point at are read next.
-    fn decode_heads(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let mut reads = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                Ok(head) => head,
-                Err(error) => return self.fail(error.into()),
-            };
-            match self.counts(&head.key) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => return self.fail(error),
+    fn decode_heads(&mut self, rows: Vec<(Key, Value)>) -> CoverageTurn {
+        let mut reads = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            if !self.counts(&head.key)? {
+                continue;
             }
-            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(error) => return self.fail(error.into()),
-            };
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
             let version_key = VersionKey::new(&self.input.bucket, &head.key, pointer.version_id);
-            let encoded = match version_key.to_bytes() {
-                Ok(encoded) => encoded,
-                Err(error) => return self.fail(error.into()),
-            };
-            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), encoded.into()));
+            reads.push((
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes()?.into(),
+            ));
             self.entries.push(Observed {
                 key: head.key,
                 version_id: pointer.version_id,
@@ -304,36 +350,21 @@ impl PolicyCoverageOperation {
             });
         }
         if reads.is_empty() {
-            return self.commit();
+            return Ok(Next::Done(self.report()));
         }
-        self.state = ScanState::ReadVersions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(ScanState::ReadVersions, IoCall::Read(reads))
     }
 
     /// Versions page: the object heads decide which of them are historical.
-    fn decode_versions(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let mut reads = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            let version_key = match VersionKey::from_bytes(key.as_ref()) {
-                Ok(version_key) => version_key,
-                Err(error) => return self.fail(error.into()),
-            };
-            match self.counts(&version_key.key) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => return self.fail(error),
+    fn decode_versions(&mut self, rows: Vec<(Key, Value)>) -> CoverageTurn {
+        let mut reads = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            let version_key = VersionKey::from_bytes(key.as_ref())?;
+            if !self.counts(&version_key.key)? {
+                continue;
             }
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(error) => return self.fail(error.into()),
-            };
-            let head = match BlobHeadKey::new(&self.input.bucket, &version_key.key).to_bytes() {
-                Ok(head) => head,
-                Err(error) => return self.fail(error.into()),
-            };
+            let version = BlobVersion::from_bytes(value.as_ref())?;
+            let head = BlobHeadKey::new(&self.input.bucket, &version_key.key).to_bytes()?;
             reads.push((BLOB_HEAD_KEYSPACE.to_string(), head.into()));
             self.entries.push(Observed {
                 key: version_key.key,
@@ -342,55 +373,38 @@ impl PolicyCoverageOperation {
             });
         }
         if reads.is_empty() {
-            return self.commit();
+            return Ok(Next::Done(self.report()));
         }
-        self.state = ScanState::ReadHeads;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(ScanState::ReadHeads, IoCall::Read(reads))
     }
 
-    fn handle_versions(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(CoverageError::InvalidEvent);
-        };
-        if values.len() != self.entries.len() {
-            return self.fail(CoverageError::InvalidEvent);
+    fn check_answers(&self, read: &[Option<Value>]) -> Result<(), CoverageError> {
+        if read.len() == self.entries.len() {
+            return Ok(());
         }
-        for (entry, (_, value)) in self.entries.iter_mut().zip(values) {
-            entry.version = match value
-                .map(|value| BlobVersion::from_bytes(value.as_ref()))
-                .transpose()
-            {
-                Ok(version) => version,
-                Err(error) => {
-                    self.state = ScanState::Error;
-                    self.output = Some(Err(error.into()));
-                    return self.abort();
-                }
-            };
+        let got = "a different row count";
+        let expected = "one row per entry";
+        Err(IoError::Unexpected { expected, got }.into())
+    }
+
+    fn versions_read(&mut self, read: Vec<Option<Value>>) -> CoverageTurn {
+        self.check_answers(&read)?;
+        for (entry, value) in self.entries.iter_mut().zip(read) {
+            entry.version = (value.as_deref())
+                .map(BlobVersion::from_bytes)
+                .transpose()?;
         }
         self.read_copies()
     }
 
     /// Historical scope: an entry that still is the head is not historical.
-    fn handle_heads(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(CoverageError::InvalidEvent);
-        };
-        if values.len() != self.entries.len() {
-            return self.fail(CoverageError::InvalidEvent);
-        }
+    fn heads_read(&mut self, read: Vec<Option<Value>>) -> CoverageTurn {
+        self.check_answers(&read)?;
         let entries = std::mem::take(&mut self.entries);
-        for (entry, (_, value)) in entries.into_iter().zip(values) {
-            let pointer = match value
-                .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-                .transpose()
-            {
-                Ok(pointer) => pointer,
-                Err(error) => return self.fail(error.into()),
-            };
+        for (entry, value) in entries.into_iter().zip(read) {
+            let pointer = (value.as_deref())
+                .map(CurrentVersionPointer::from_bytes)
+                .transpose()?;
             if pointer.is_some_and(|pointer| pointer.version_id == entry.version_id) {
                 continue;
             }
@@ -411,10 +425,10 @@ impl PolicyCoverageOperation {
                 });
             }
         }
-        self.commit()
+        Ok(Next::Done(self.report()))
     }
 
-    fn read_copies(&mut self) -> Effects {
+    fn read_copies(&mut self) -> CoverageTurn {
         let mut reads = Vec::new();
         for entry in &self.entries {
             let Some(version) = entry.version.as_ref() else {
@@ -427,45 +441,32 @@ impl PolicyCoverageOperation {
                 VersionKey::new(&self.input.bucket, &entry.key, entry.version_id),
                 backend.clone(),
             );
-            let encoded = match key.to_bytes() {
-                Ok(encoded) => encoded,
-                Err(error) => return self.fail(error.into()),
-            };
-            reads.push((MANAGED_COPY_KEYSPACE.to_string(), encoded.into()));
+            reads.push((MANAGED_COPY_KEYSPACE.to_string(), key.to_bytes()?.into()));
         }
         if reads.is_empty() {
             return self.classify(Vec::new());
         }
-        self.state = ScanState::ReadCopies;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(ScanState::ReadCopies, IoCall::Read(reads))
     }
 
-    fn handle_copies(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(CoverageError::InvalidEvent);
-        };
-        let mut states = Vec::with_capacity(values.len());
-        for (_, value) in values {
-            let state = match value
-                .map(|value| ManagedCopyRecord::from_bytes(value.as_ref()))
-                .transpose()
-            {
-                Ok(Some(record)) if record.state.is_serveable() => CopyState::Registered,
-                Ok(Some(_)) => CopyState::Quarantined,
-                Ok(None) => CopyState::Absent,
-                Err(error) => return self.fail(error.into()),
-            };
-            states.push(state);
+    fn copies_read(&mut self, read: Vec<Option<Value>>) -> CoverageTurn {
+        let mut states = Vec::with_capacity(read.len());
+        for value in read {
+            let record = (value.as_deref())
+                .map(ManagedCopyRecord::from_bytes)
+                .transpose()?;
+            states.push(match record {
+                Some(record) if record.state.is_serveable() => CopyState::Registered,
+                Some(_) => CopyState::Quarantined,
+                None => CopyState::Absent,
+            });
         }
         self.classify(states)
     }
 
     /// Attachment and local copy state are recorded independently, so zero
     /// attachment gaps never implies that every registered copy is compliant.
-    fn classify(&mut self, copy_states: Vec<CopyState>) -> Effects {
+    fn classify(&mut self, copy_states: Vec<CopyState>) -> CoverageTurn {
         let entries = std::mem::take(&mut self.entries);
         let mut copies = copy_states.into_iter();
         for entry in entries {
@@ -505,7 +506,7 @@ impl PolicyCoverageOperation {
                 });
             }
         }
-        self.commit()
+        Ok(Next::Done(self.report()))
     }
 
     fn attachment_gap(&self, refs: &[PlacementPolicyRef]) -> Option<AttachmentGap> {
@@ -538,8 +539,8 @@ impl PolicyCoverageOperation {
         limits
     }
 
-    fn commit(&mut self) -> Effects {
-        self.output = Some(Ok(CoverageReport {
+    fn report(&mut self) -> CoverageReport {
+        CoverageReport {
             bucket: self.input.bucket.clone(),
             scope: self.input.scope,
             generation: self.generation,
@@ -552,57 +553,26 @@ impl PolicyCoverageOperation {
             complete: self.cursor.is_none(),
             limits: self.limits(),
             elsewhere: self.elsewhere,
-        }));
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = ScanState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            None => {
-                self.state = ScanState::Finish;
-                smallvec![]
-            }
         }
     }
 }
 
-impl EffectOperation for PolicyCoverageOperation {
+impl Operation for CoverageScan {
     type Output = CoverageReport;
     type Error = CoverageError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ScanState::Authorize;
-        smallvec![permission_check(
-            self.input.auth_context.clone(),
-            policy_admin_path(self.input.auth_context.realm_id),
-            Permission::READ,
-        )]
+    fn first(&mut self) -> CoverageTurn {
+        let key = self.input.bucket.as_bytes().to_vec();
+        self.call(ScanState::ReadBucket, read_row(S3_BUCKET_KEYSPACE, key))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
+    fn next(&mut self, result: IoResult) -> CoverageTurn {
         match self.state {
-            ScanState::Init => self.start(),
-            ScanState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(CoverageError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => {
-                        self.state = ScanState::StartTransaction;
-                        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                            read: true
-                        })]
-                    }
-                    Ok(false) => self.fail(CoverageError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Coverage authorization check failed");
-                        self.fail(CoverageError::Unauthorized)
-                    }
-                }
+            ScanState::ReadBucket => self.bucket_read(result.value()?),
+            ScanState::ReadRecord => {
+                let [record, fence] = values::<2>(result)?;
+                self.authority = (record, fence);
+                self.scan_page()
             }
             ScanState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
