@@ -370,6 +370,117 @@ impl StoreJobOperation {
             now_ms: 0,
             attempts: 0,
         }
-        Err(error) => Err(error.to_string()),
+    }
+
+    fn attempt(&mut self) -> Turn<()> {
+        self.attempts += 1;
+        let store = StoreProgressOperation::new(
+            &self.bucket,
+            self.job_id,
+            self.step.clone(),
+            self.ended,
+            self.now_ms,
+        );
+        Ok(Next::Call(IoCall::child(store)))
+    }
+}
+
+impl Operation for StoreJobOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        self.attempt()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match result.child::<(), StoreProgressError>()? {
+            Ok(()) => Ok(Next::Done(())),
+            Err(StoreProgressError::Conflict)
+                if self.attempts <= StoreProgressOperation::conflict_retries() =>
+            {
+                self.attempt()
+            }
+            Err(StoreProgressError::Conflict) => {
+                warn!(bucket = %self.bucket, "The progress of a bucket job could not be stored");
+                Ok(Next::Done(()))
+            }
+            Err(error) => Err(MigrationError::failed(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
+
+    fn auth() -> AuthContext {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn stored(outcome: Result<(), StoreProgressError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    fn store_step() -> StoreJobOperation {
+        StoreJobOperation {
+            bucket: "bucket".to_string(),
+            job_id: Ulid::from_bytes([3; 16]),
+            step: JobStep::default(),
+            ended: None,
+            now_ms: 0,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn no_jobs_ends() {
+        let mut process = ProcessLinkedOperation::new(NodeRouting::default());
+        assert!(matches!(
+            process.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        assert_eq!(process.next(empty_page()), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn denial_is_verdict() {
+        let mut admin = StillAdminOperation::new(&auth(), Ulid::from_bytes([4; 16]));
+        assert!(matches!(admin.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let denied: Result<(), AuthorizeError> = Err(AuthorizeError::PermissionDenied);
+        let answer = IoResult::Child(ChildOutcome::new(denied));
+        assert_eq!(admin.next(answer), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn conflict_retries_then_warns() {
+        let mut store = store_step();
+        store.first().unwrap();
+        for _ in 0..StoreProgressOperation::conflict_retries() {
+            let turn = store.next(stored(Err(StoreProgressError::Conflict)));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        }
+        let last = store.next(stored(Err(StoreProgressError::Conflict)));
+        assert_eq!(last, Ok(Next::Done(())));
     }
 }
