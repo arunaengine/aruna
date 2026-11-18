@@ -893,170 +893,311 @@ impl MigratePageOperation {
                 record.retries += 1;
                 record.cursor = None;
                 record.retry_at_ms = Some(self.now_ms.saturating_add(wait.as_millis() as u64));
+                Some(wait)
+            }
+            // A move that ends hands every attempt it still owns to the cleanup queue first;
+            // a long hand-over goes on in the next runs.
+            (false, _) if record.moving => {
+                let call = self.hand_over();
+                return self.call(PageStep::FinalHandOver, call);
+            }
+            (false, _) => {
+                record.finished_at_ms = Some(self.now_ms);
+                None
+            }
+        };
+        self.store_ahead(after)
+    }
+
+    fn store_ahead(&mut self, after: Option<Duration>) -> PageTurn {
+        let ahead = self.pending_after.take();
+        self.store(ahead, after)
+    }
+}
+
+impl Operation for MigratePageOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PageTurn {
+        // A hand-over under way finishes before anything else of the move.
+        if self.record.moving {
+            let read = read_row(MOVE_HANDOVER_KEYSPACE, bucket_key(&self.bucket));
+            return Ok(Next::Call(read));
+        }
+        self.after_handover()
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        match std::mem::replace(&mut self.step, PageStep::Tail) {
+            PageStep::Handover => {
+                let handover = decode_handover(result.value()?)?;
+                let started = self.record.started_at_ms;
+                if handover.is_some_and(|handover| handover.started_ms == started) {
+                    let call = self.hand_over();
+                    return self.call(PageStep::HandedOver, call);
+                }
+                self.after_handover()
+            }
+            PageStep::HandedOver => match result.child::<bool, MigrationError>()?? {
+                true => self.end_now(),
+                false => Ok(Next::Done(Some(MIGRATION_CONTINUE))),
+            },
+            PageStep::Routing => {
+                self.snapshot = routing_result(result)?;
+                if self.snapshot.is_none() {
+                    return self.end_now();
+                }
+                let read = read_row(RENAME_MOVE_KEYSPACE, bucket_key(&self.bucket));
+                self.call(PageStep::Request, read)
+            }
+            PageStep::Request => self.request_read(result.value()?),
+            PageStep::Access => {
+                let access = result.child::<Option<BucketAccess>, MigrationError>()??;
+                let Some(access) = access else {
+                    return self.read_versions();
+                };
+                self.access = Some(Arc::new(access));
+                let Some(routing) = self.snapshot.as_ref() else {
+                    return self.read_versions();
+                };
+                let earlier = EarlierPatternsOperation::new(routing);
+                self.call(PageStep::Earlier, IoCall::child(earlier))
+            }
+            PageStep::Earlier => {
+                self.earlier = result.child::<Earlier, MigrationError>()??;
+                self.read_versions()
+            }
+            PageStep::Versions => {
+                let (rows, next) = result.page()?;
+                self.versions_read(rows, next)
+            }
+            PageStep::Ahead => self.ahead_read(result.value()?),
+            PageStep::Window => match result {
+                IoResult::Group(event) => self.window_event(event),
+                other => Err(MigrationError::Failed(other.label().to_string())),
+            },
+            PageStep::StopRequest => {
+                let record = (self.record.moving, self.record.started_at_ms);
+                let request = decode_request(result.value()?, record)?;
+                if request.is_some_and(|request| request.aborted_at_ms.is_some()) {
+                    return self.end_aborted();
+                }
+                self.store_ahead(None)
+            }
+            PageStep::FinalHandOver => match result.child::<bool, MigrationError>()?? {
+                true => {
+                    self.record.finished_at_ms = Some(self.now_ms);
+                    self.store_ahead(None)
+                }
+                false => self.store_ahead(Some(MIGRATION_CONTINUE)),
+            },
+            PageStep::Tail => {
+                let after = result.child::<Option<Duration>, MigrationError>()??;
+                Ok(Next::Done(after))
+            }
+            PageStep::Store(after) => {
+                result.child::<(), MigrationError>()??;
+                Ok(Next::Done(after))
+            }
+        }
     }
 }
 
 /// Ends an aborted rename's move once its intents are handed to the cleanup queue, which
 /// settles them apart from this move; its request stays to show the abort.
-pub(super) async fn end_aborted(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    mut record: CompressionMigration,
-) -> Result<Option<Duration>, String> {
-    if !hand_over_moves(context, bucket, record.started_at_ms).await? {
-        return Ok(Some(MIGRATION_CONTINUE));
+#[derive(Debug, PartialEq)]
+pub(super) struct EndAbortedOperation {
+    routing: NodeRouting,
+    bucket: String,
+    record: CompressionMigration,
+    now_ms: u64,
+    storing: bool,
+}
+
+impl EndAbortedOperation {
+    pub(super) fn new(routing: NodeRouting, bucket: &str, record: CompressionMigration) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            record,
+            now_ms: 0,
+            storing: false,
+        }
     }
-    record.retry_at_ms = None;
-    record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-    store_progress(context, bucket, &record, None).await?;
-    Ok(None)
+}
+
+impl Operation for EndAbortedOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PageTurn {
+        let started = self.record.started_at_ms;
+        let hand_over = HandOverOperation::new(self.routing.clone(), &self.bucket, started);
+        Ok(Next::Call(IoCall::child(hand_over)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        if self.storing {
+            result.child::<(), MigrationError>()??;
+            return Ok(Next::Done(None));
+        }
+        if !result.child::<bool, MigrationError>()?? {
+            return Ok(Next::Done(Some(MIGRATION_CONTINUE)));
+        }
+        self.record.retry_at_ms = None;
+        self.record.finished_at_ms = Some(self.now_ms);
+        self.storing = true;
+        let store = StoreMigrationOperation::new(&self.bucket, self.record.clone(), None);
+        Ok(Next::Call(IoCall::child(store)))
+    }
 }
 
 /// Where a move's hand-over of its intents stands: the move, the rule and the last intent.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Handover {
     pub(super) started_ms: u64,
     pub(super) import_id: Option<Ulid>,
     pub(super) after: Option<Vec<u8>>,
 }
 
-/// Intent pages one hand-over run writes at most before it stores its place.
-const HANDOVER_PAGES: usize = 16;
-
-/// Whether the move started at `started_ms` has a hand-over under way.
-async fn handing_over(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    started_ms: u64,
-) -> Result<bool, String> {
-    Ok(read_handover(context, bucket)
-        .await?
-        .is_some_and(|handover| handover.started_ms == started_ms))
+pub(super) fn decode_handover(value: Option<Value>) -> Result<Option<Handover>, MigrationError> {
+    value
+        .map(|value| postcard::from_bytes(&value))
+        .transpose()
+        .map_err(MigrationError::failed)
 }
 
-pub(super) async fn read_handover(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-) -> Result<Option<Handover>, String> {
-    let read = StorageEffect::Read {
-        key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the hand-over: {}", other.label())),
-    }
-}
-
-pub(super) async fn store_handover(
-    context: &crate::driver::DriverContext,
+/// The row that stores `handover`, or the delete that ends it.
+pub(super) fn handover_call(
     bucket: &str,
     handover: Option<&Handover>,
-) -> Result<(), String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let effect = match handover {
-        Some(handover) => StorageEffect::Write {
-            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
+) -> Result<IoCall, MigrationError> {
+    let key = bucket_key(bucket);
+    let Some(handover) = handover else {
+        return Ok(IoCall::Delete(vec![(
+            MOVE_HANDOVER_KEYSPACE.to_string(),
             key,
-            value: postcard::to_allocvec(handover)
-                .map_err(|error| error.to_string())?
-                .into(),
-            txn_id: None,
-        },
-        None => StorageEffect::Delete {
-            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
+        )]));
     };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
-        }
-        other => Err(format!("could not store the hand-over: {}", other.label())),
-    }
+    let value = postcard::to_allocvec(handover).map_err(MigrationError::failed)?;
+    let row = (MOVE_HANDOVER_KEYSPACE.to_string(), key, value.into());
+    Ok(IoCall::Write(vec![row]))
+}
+
+#[derive(Debug, PartialEq)]
+enum HandStep {
+    Routing,
+    Place,
+    Page,
+    Written,
+    Stored(bool),
 }
 
 /// Writes one `SettleMove` work per intent this move still owns, with the intent itself, a
-/// bounded number of pages per run from a stored place; `true` once all are handed over.
-async fn hand_over_moves(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
+/// bounded number of pages per run from a stored place. Outputs `true` once all are handed over.
+#[derive(Debug, PartialEq)]
+pub(super) struct HandOverOperation {
+    routing: NodeRouting,
+    bucket: String,
     started_ms: u64,
-) -> Result<bool, String> {
-    let Some(routing) = move_routing(context, bucket).await? else {
-        store_handover(context, bucket, None).await?;
-        return Ok(true);
-    };
-    let mut rules: Vec<Ulid> = (routing.imports.iter())
-        .filter(|rule| rule.bucket == bucket)
-        .map(|rule| rule.import_id)
-        .collect();
-    rules.sort();
-    let stored = read_handover(context, bucket).await?;
-    let mut place = match stored.filter(|handover| handover.started_ms == started_ms) {
-        Some(handover) => handover,
-        None => Handover {
+    step: HandStep,
+    rules: Vec<Ulid>,
+    place: Option<Handover>,
+    pages: usize,
+    more: Option<Key>,
+}
+
+impl HandOverOperation {
+    pub(super) fn new(routing: NodeRouting, bucket: &str, started_ms: u64) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
             started_ms,
-            import_id: rules.first().copied(),
-            after: None,
-        },
-    };
-    for _ in 0..HANDOVER_PAGES {
-        let Some(import_id) = place.import_id else {
-            store_handover(context, bucket, None).await?;
-            return Ok(true);
+            step: HandStep::Routing,
+            rules: Vec::new(),
+            place: None,
+            pages: 0,
+            more: None,
+        }
+    }
+
+    fn store(&mut self, place: Option<&Handover>, finished: bool) -> Turn<bool> {
+        let call = handover_call(&self.bucket, place)?;
+        self.step = HandStep::Stored(finished);
+        Ok(Next::Call(call))
+    }
+
+    fn next_page(&mut self) -> Turn<bool> {
+        if self.pages == HANDOVER_PAGES {
+            let place = self.place.take();
+            return self.store(place.as_ref(), false);
+        }
+        let Some(place) = self.place.as_mut() else {
+            return self.store(None, true);
         };
-        let (rows, next) = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
-            IMPORT_INTENT_KEYSPACE,
-            Some(aruna_core::structs::storage::backend_import::object_prefix(
-                import_id,
-            )),
-            place.after.take().map(Into::into),
-            RULE_PAGE,
-            None,
-        )
-        .await?;
+        let Some(import_id) = place.import_id else {
+            return self.store(None, true);
+        };
+        self.pages += 1;
+        let after = place.after.take().map(Into::into);
+        self.step = HandStep::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: IMPORT_INTENT_KEYSPACE.to_string(),
+            prefix: object_prefix(import_id),
+            after,
+            limit: RULE_PAGE,
+        }))
+    }
+
+    fn page_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<bool> {
         let mut writes = Vec::new();
         for (key, value) in rows {
-            let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+            let intent = WriteIntent::from_bytes(&value)?;
             // Only this move's own intents; an upload's or another move's stay.
-            if intent.mover != Some(started_ms) {
+            if intent.mover != Some(self.started_ms) {
                 continue;
             }
-            let version = VersionKey::new(bucket, &intent.key, intent.version_id);
+            let version = VersionKey::new(&self.bucket, &intent.key, intent.version_id);
             let work = BlobCleanupWork::SettleMove {
                 version,
                 intents: vec![(key.to_vec(), intent)],
             };
-            let value = work.to_bytes().map_err(|error| error.to_string())?;
-            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+            let value = work.to_bytes()?.into();
+            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value));
         }
-        if !writes.is_empty() {
-            let write = StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            };
-            match context.storage_handle.send_storage_effect(write).await {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-                other => return Err(format!("could not hand over the moves: {}", other.label())),
-            }
+        self.more = next;
+        if writes.is_empty() {
+            return self.advance_place();
         }
-        match next {
-            Some(next) => place.after = Some(next.to_vec()),
-            None => {
-                // Rules are sorted; a removed rule still has its place among them.
-                place.import_id = rules.iter().find(|rule| **rule > import_id).copied();
-            }
-        }
+        self.step = HandStep::Written;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
-    store_handover(context, bucket, Some(&place)).await?;
-    Ok(false)
+
+    fn advance_place(&mut self) -> Turn<bool> {
+        let next = self.more.take();
+        if let Some(place) = self.place.as_mut() {
+            match next {
+                Some(next) => place.after = Some(next.to_vec()),
+                None => {
+                    // Rules are sorted; a removed rule still has its place among them.
+                    let current = place.import_id;
+                    place.import_id = (self.rules.iter())
+                        .find(|rule| Some(**rule) > current)
+                        .copied();
+                }
+            }
+        }
+        self.next_page()
+    }
 }
 
 /// Runs `version` once more as a rename, which adopts a copy that reached its new name, then
