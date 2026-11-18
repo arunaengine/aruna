@@ -1382,6 +1382,12 @@ pub enum MetadataEffect {
         revision: Ulid,
         shapes: Vec<String>,
     },
+    /// The summary of a graph at a document cursor, from this node's summary cache when it
+    /// holds that cursor.
+    ExportSummaryAt {
+        graph_iri: String,
+        cursor: Ulid,
+    },
     // This node's registry cache.
     /// The generation of the registry cache, read before a write whose row it caches later.
     CacheGeneration,
@@ -1428,6 +1434,7 @@ impl MetadataEffect {
             MetadataEffect::CheckProfile { .. } => "check_profile",
             MetadataEffect::CachedShapes { .. } => "cached_shapes",
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
+            MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
             MetadataEffect::CacheGeneration => "cache_generation",
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
@@ -1449,6 +1456,7 @@ impl MetadataEffect {
             | MetadataEffect::GetGraphPolicy { graph_iri }
             | MetadataEffect::ExportRoCrate { graph_iri }
             | MetadataEffect::ExportRoCrateSummary { graph_iri }
+            | MetadataEffect::ExportSummaryAt { graph_iri, .. }
             | MetadataEffect::DeleteGraph { graph_iri }
             | MetadataEffect::ContainsGraph { graph_iri }
             | MetadataEffect::ContainsDot { graph_iri, .. }

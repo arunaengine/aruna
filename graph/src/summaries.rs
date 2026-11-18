@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
@@ -11,24 +11,12 @@ use ulid::Ulid;
 
 // Two maximum-size list pages worth of documents, capped by bytes so a few unusually large
 // summaries cannot grow the cache without bound.
-const SUMMARY_CACHE_ENTRIES: usize = 2_048;
-const SUMMARY_CACHE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const SUMMARY_CACHE_ENTRIES: usize = 2_048;
+pub(crate) const SUMMARY_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Backstop staleness bound, matching the visibility and query cache TTLs, so
 /// any coherence hole between the registry cursor and the local graph content
 /// expires instead of surviving until the next event or eviction.
-const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(30);
-
-static SUMMARY_CACHE: OnceLock<MetadataSummaryCache> = OnceLock::new();
-
-pub(crate) fn summary_cache() -> &'static MetadataSummaryCache {
-    SUMMARY_CACHE.get_or_init(|| {
-        MetadataSummaryCache::new(
-            SUMMARY_CACHE_ENTRIES,
-            SUMMARY_CACHE_BYTES,
-            SUMMARY_CACHE_TTL,
-        )
-    })
-}
+pub(crate) const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// RO-Crate summary cache keyed by `(graph_iri, cursor)`, where the cursor is
 /// the document's `last_event_id`. A replicated cursor can lead the local graph

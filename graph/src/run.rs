@@ -73,6 +73,23 @@ impl GraphHandle {
                     error: MetadataError::InvalidEffect,
                 };
             }
+            MetadataEffect::ExportSummaryAt { graph_iri, cursor } => {
+                if let Some(jsonld) = (self.inner.summaries).get(&graph_iri, cursor, Instant::now())
+                {
+                    return MetadataEvent::RoCrateSummaryResult {
+                        graph_iri,
+                        jsonld: jsonld.to_string(),
+                    };
+                }
+                let event = Box::pin(self.run(MetadataEffect::ExportRoCrateSummary {
+                    graph_iri: graph_iri.clone(),
+                }))
+                .await;
+                if let MetadataEvent::RoCrateSummaryResult { jsonld, .. } = &event {
+                    (self.inner.summaries).insert(&graph_iri, cursor, jsonld, Instant::now());
+                }
+                return event;
+            }
             effect => effect,
         };
         let graph_iri = effect.graph_iri();
@@ -927,7 +944,8 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CacheShapes { .. }
         | MetadataEffect::CacheGeneration
         | MetadataEffect::CacheRecords { .. }
-        | MetadataEffect::UncacheRecord { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::UncacheRecord { .. }
+        | MetadataEffect::ExportSummaryAt { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

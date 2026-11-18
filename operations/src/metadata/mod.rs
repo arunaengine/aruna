@@ -47,7 +47,6 @@ pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
-mod summary_cache;
 pub mod timestamp_index;
 pub(crate) mod timestamp_sweep;
 pub mod update_document;

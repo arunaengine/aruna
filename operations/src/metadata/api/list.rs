@@ -16,6 +16,7 @@ use super::{
     parse_registry_iter, pending_projection_target, stream,
 };
 use crate::driver::{DriverContext, drive};
+use crate::metadata::api::export::SummaryOperation;
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
 
@@ -150,7 +151,14 @@ pub async fn list_visible_documents(
             .map(|record| async move {
                 // A pending graph cannot export content from before its accepted event.
                 ensure_record_materialized(context, record).await?;
-                export_summary_jsonld(context, &record.graph_iri, record.last_event_id).await
+                drive(
+                    crate::metadata::api::export::SummaryOperation::new(
+                        &record.graph_iri,
+                        record.last_event_id,
+                    ),
+                    context,
+                )
+                .await
             })
             .collect::<Vec<_>>();
         let summaries = stream::iter(exports)

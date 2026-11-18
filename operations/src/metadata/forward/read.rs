@@ -7,8 +7,8 @@ use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export::export_metadata_rocrate;
-use crate::metadata::api::export::get_visible_document;
+use crate::metadata::api::export::ExportOperation;
+use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::api::export_types::GetVisibleRequest;
@@ -21,8 +21,8 @@ use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::revision_read::RawDisplayOperation;
 use crate::metadata::revision_read::MetadataRawView;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
@@ -207,7 +207,11 @@ pub async fn get_metadata_routed(
     auth_token: Option<AuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     if context.net_handle.is_none() {
-        return get_visible_document(context.as_ref(), realm_id, request).await;
+        return drive(
+            VisibleRecordOperation::new(realm_id, request),
+            context.as_ref(),
+        )
+        .await;
     }
     let config = load_realm_config(context, realm_id)
         .await
@@ -311,9 +315,12 @@ async fn read_routed(
         let auth_token = auth_token.clone();
         Box::pin(async move {
             if Some(holder) == local_node {
-                let record = get_visible_document(context.as_ref(), realm_id, request)
-                    .await
-                    .map_err(read_error)?;
+                let record = drive(
+                    VisibleRecordOperation::new(realm_id, request),
+                    context.as_ref(),
+                )
+                .await
+                .map_err(read_error)?;
                 if routed_record_matches(&config, realm_id, record.document_id, &placement, &record)
                 {
                     Ok(record)
@@ -410,9 +417,24 @@ pub async fn route_profile_status(
         )
         .await?;
         return if revalidate {
-            drive(RevalidateOperation::new(context.as_ref().net_handle.as_ref().map(|net| net.node_id()), registry.clone()), context.as_ref()).await
+            drive(
+                RevalidateOperation::new(
+                    context
+                        .as_ref()
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                    registry.clone(),
+                ),
+                context.as_ref(),
+            )
+            .await
         } else {
-            drive(ValidationStatusOperation::new(registry.clone()), context.as_ref()).await
+            drive(
+                ValidationStatusOperation::new(registry.clone()),
+                context.as_ref(),
+            )
+            .await
         }
         .map_err(|_| MetadataApiError::ServiceUnavailable);
     }
@@ -451,9 +473,24 @@ pub async fn route_profile_status(
                 .await
                 .map_err(read_error)?;
                 if revalidate {
-                    drive(RevalidateOperation::new(context.as_ref().net_handle.as_ref().map(|net| net.node_id()), record.clone()), context.as_ref()).await
+                    drive(
+                        RevalidateOperation::new(
+                            context
+                                .as_ref()
+                                .net_handle
+                                .as_ref()
+                                .map(|net| net.node_id()),
+                            record.clone(),
+                        ),
+                        context.as_ref(),
+                    )
+                    .await
                 } else {
-                    drive(ValidationStatusOperation::new(record.clone()), context.as_ref()).await
+                    drive(
+                        ValidationStatusOperation::new(record.clone()),
+                        context.as_ref(),
+                    )
+                    .await
                 }
                 .map_err(|_| MetadataReadError::Unavailable)
             } else {
@@ -690,7 +727,7 @@ pub async fn export_rocrate_here(
     request: ExportMetadataRequest,
     metadata_bytes: u64,
 ) -> Result<ExportMetadataResult, MetadataApiError> {
-    let export = export_metadata_rocrate(context, realm_id, request).await?;
+    let export = drive(ExportOperation::new(realm_id, request), context).await?;
     ensure_export_limit(&export, metadata_bytes)?;
     Ok(export)
 }
@@ -704,7 +741,7 @@ async fn export_within(
     metadata_bytes: u64,
 ) -> Result<ExportMetadataResult, MetadataApiError> {
     loop {
-        let export = export_metadata_rocrate(context, realm_id, request.clone()).await?;
+        let export = drive(ExportOperation::new(realm_id, request.clone()), context).await?;
         let over = ensure_export_limit(&export, metadata_bytes);
         let page = matches!(export, ExportMetadataResult::Page { .. });
         match (
@@ -1009,13 +1046,15 @@ pub(crate) async fn apply_document_query(
     let auth = metadata
         .authorize_read_peer(peer, auth_token, false)
         .await?;
-    let record = get_visible_document(
+    let record = drive(
+        VisibleRecordOperation::new(
+            realm_id,
+            GetVisibleRequest {
+                document_id,
+                auth: auth.clone(),
+            },
+        ),
         context.as_ref(),
-        realm_id,
-        GetVisibleRequest {
-            document_id,
-            auth: auth.clone(),
-        },
     )
     .await
     .map_err(read_error)?;

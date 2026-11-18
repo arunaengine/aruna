@@ -12,7 +12,7 @@ use super::distributed_types::{
     MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,
 };
 use super::export::raw_identity_matches;
-use super::export::{export_metadata_rocrate, get_visible_document};
+use super::export::{ExportOperation, VisibleRecordOperation};
 use super::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };

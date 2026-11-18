@@ -26,6 +26,7 @@ mod profiles;
 mod read;
 mod run;
 mod shacl;
+mod summaries;
 
 pub use crate::read::{Properties, ReadScope};
 pub use crate::shacl::ProfileShaclEngine;
@@ -106,6 +107,8 @@ struct GraphInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    /// RO-Crate summaries by graph and document cursor.
+    summaries: crate::summaries::MetadataSummaryCache,
     /// Shape sources of the Profile revisions this node fetched.
     profiles: crate::profiles::ProfileCache,
     /// Striped holds that serialize this node's writes to one document.
@@ -169,6 +172,11 @@ impl GraphHandle {
                 deferred_persist_running: AtomicBool::new(false),
                 profile_shacl,
                 profiles: crate::profiles::ProfileCache::new(),
+                summaries: crate::summaries::MetadataSummaryCache::new(
+                    crate::summaries::SUMMARY_CACHE_ENTRIES,
+                    crate::summaries::SUMMARY_CACHE_BYTES,
+                    crate::summaries::SUMMARY_CACHE_TTL,
+                ),
                 document_holds: std::array::from_fn(|_| Arc::default()),
             }),
         })
@@ -246,10 +254,15 @@ impl GraphHandle {
                 .await
                 .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        Ok(applied
+        // Peer sync invalidates summaries because their cursor may precede newly applied content.
+        let applied: Vec<String> = applied
             .iter()
             .map(|graph| graph.as_str().to_string())
-            .collect())
+            .collect();
+        for graph in &applied {
+            self.inner.summaries.remove(graph);
+        }
+        Ok(applied)
     }
 
     /// The document sync topic of one graph, bound or derived.

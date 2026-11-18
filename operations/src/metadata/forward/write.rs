@@ -11,7 +11,7 @@ use crate::device::edit::apply_local_edit;
 use crate::driver::drive;
 use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export::get_visible_document;
+use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
@@ -739,13 +739,15 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    get_visible_document(
+                    drive(
+                        VisibleRecordOperation::new(
+                            realm_id,
+                            GetVisibleRequest {
+                                document_id: *document_id,
+                                auth,
+                            },
+                        ),
                         context.as_ref(),
-                        realm_id,
-                        GetVisibleRequest {
-                            document_id: *document_id,
-                            auth,
-                        },
                     )
                     .await
                     .map(Box::new)

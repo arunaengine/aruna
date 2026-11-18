@@ -4,6 +4,8 @@
 
 use super::list::summary_request;
 use super::*;
+use crate::driver::drive;
+use crate::metadata::api::export::ExportOperation;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {
@@ -49,18 +51,19 @@ async fn raw_export_fenced() {
     let record = public_record(Ulid::generate(), Ulid::generate());
     seed_raw_document(&test, &record).await;
 
-    let exported = export_metadata_rocrate(
+    let exported = drive(
+        ExportOperation::new(TEST_REALM_ID, raw_request(record.document_id)),
         &test.context,
-        TEST_REALM_ID,
-        raw_request(record.document_id),
     )
     .await
     .expect("raw export succeeds");
     assert!(matches!(exported, ExportMetadataResult::Raw { .. }));
-    let foreign = export_metadata_rocrate(
+    let foreign = drive(
+        ExportOperation::new(
+            RealmId::from_bytes([9u8; 32]),
+            raw_request(record.document_id),
+        ),
         &test.context,
-        RealmId::from_bytes([9u8; 32]),
-        raw_request(record.document_id),
     )
     .await;
     assert!(matches!(foreign, Err(MetadataApiError::NotFound)));
@@ -78,10 +81,9 @@ async fn raw_export_fenced() {
     )
     .await;
 
-    let fenced = export_metadata_rocrate(
+    let fenced = drive(
+        ExportOperation::new(TEST_REALM_ID, raw_request(record.document_id)),
         &test.context,
-        TEST_REALM_ID,
-        raw_request(record.document_id),
     )
     .await;
 

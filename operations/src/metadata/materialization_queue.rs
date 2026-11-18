@@ -48,7 +48,7 @@ use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
 use super::data_links::DataLinkError;
 use super::iri_index::MetadataIriError;
-use super::profile::validation::{assess_render, violation_count};
+use super::profile::validation::{ProfileAssessOperation, render_verdict, violation_count};
 use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
@@ -2211,13 +2211,13 @@ async fn merge_batch_event(
             ));
         }
     };
-    let mut status = assess_render(
-        context,
+    let assess = ProfileAssessOperation::render(
+        context.net_handle.as_ref().map(|net| net.node_id()),
         event.record.document_id,
         event.record.group_id,
-        &render,
-    )
-    .await;
+        render.clone(),
+    );
+    let mut status = render_verdict(drive(assess, context).await, event.record.document_id);
     let findings = violation_count(&status);
     let raw_plan = crate::metadata::raw_revision::prepare_merged_event(
         context,

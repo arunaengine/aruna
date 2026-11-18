@@ -4,6 +4,8 @@
 
 use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
+use crate::driver::drive;
+use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::live_records::LiveRecordsOperation;
 use aruna_core::StructuredId;
 use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
@@ -501,13 +503,15 @@ async fn hidden_ids_match() {
     let missing = public_record(group_id, Ulid::generate());
 
     for document_id in [public.document_id, private.document_id, missing.document_id] {
-        let result = get_visible_document(
+        let result = drive(
+            VisibleRecordOperation::new(
+                TEST_REALM_ID,
+                GetVisibleRequest {
+                    document_id,
+                    auth: Some(auth_for(stranger)),
+                },
+            ),
             &test.context,
-            TEST_REALM_ID,
-            GetVisibleRequest {
-                document_id,
-                auth: Some(auth_for(stranger)),
-            },
         )
         .await;
         assert!(matches!(result, Err(MetadataApiError::NotFound)));
