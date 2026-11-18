@@ -376,19 +376,53 @@ impl SweepUploadsOperation {
         if record.status == MultipartUploadStatus::Aborting {
             abort = abort.resuming_abort();
         }
-        match drive(operation, context).await {
-            Ok(_) => {
-                outcome.aborted = outcome.aborted.saturating_add(1);
-                warn!(%upload_id, status = ?record.status, "Reclaimed a stale multipart upload");
+        self.aborting = Some((upload_id, record.status));
+        Ok(Next::Call(IoCall::child(abort)))
+    }
+
+    fn page_read(&mut self, rows: Vec<(Key, Value)>) -> Turn<UploadSweepOutcome> {
+        for (_, value) in rows {
+            match MultipartUpload::from_bytes(&value) {
+                Ok(record) if stale_upload(&record, self.now_ms) => self.stale.push_back(record),
+                Ok(_) => {}
+                Err(error) => warn!(error = %error, "Skipping an undecodable multipart upload"),
+            }
+            if self.stale.len() >= UPLOAD_SWEEP_BATCH {
+                return self.next_abort();
+            }
+        }
+        if self.pages.done() {
+            return self.next_abort();
+        }
+        Ok(Next::Call(self.pages.call()))
+    }
+}
+
+impl Operation for SweepUploadsOperation {
+    type Output = UploadSweepOutcome;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<UploadSweepOutcome> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<UploadSweepOutcome> {
+        let Some((upload_id, status)) = self.aborting.take() else {
+            let rows = self.pages.take(result)?;
+            return self.page_read(rows);
+        };
+        match result.child::<(), AbortUploadError>()? {
+            Ok(()) => {
+                self.outcome.aborted = self.outcome.aborted.saturating_add(1);
+                warn!(%upload_id, ?status, "Reclaimed a stale multipart upload");
             }
             Err(error) => {
-                outcome.failed = outcome.failed.saturating_add(1);
+                self.outcome.failed = self.outcome.failed.saturating_add(1);
                 warn!(%upload_id, error = %error, "Failed to reclaim a stale multipart upload");
             }
         }
+        self.next_abort()
     }
-
-    Ok(outcome)
 }
 
 /// The backend a row needs credentials for, if it needs any.
@@ -396,165 +430,283 @@ fn work_backend(work: &BlobCleanupWork) -> Option<&BackendRef> {
     work.location().map(|location| &location.backend)
 }
 
-/// Only a tenant backend whose record is provably absent counts as removed; an
-/// unreadable record leaves the row queued.
-async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bool {
-    let BackendRef::Group(backend_id) = backend else {
-        return false;
-    };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-            key: backend_key(*backend_id),
-            txn_id: None,
-        })
-        .await;
-    matches!(parse_read(event, GroupStorage::from_bytes), Ok(None))
+/// Drops a page of `key_space` rows under `prefix`. Outputs `true` once none is left.
+#[derive(Debug, PartialEq)]
+struct DropRowsOperation {
+    key_space: String,
+    prefix: Vec<u8>,
+    deleting: bool,
 }
 
-async fn delete_cleanup_rows(
-    context: &DriverContext,
-    deletes: Vec<(String, Key)>,
-) -> Result<(), String> {
-    if deletes.is_empty() {
-        return Ok(());
+impl Operation for DropRowsOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        Ok(Next::Call(IoCall::Page {
+            space: self.key_space.clone(),
+            prefix: self.prefix.clone().into(),
+            after: None,
+            limit: CLEANUP_PAGE_SIZE,
+        }))
     }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected cleanup delete event: {}",
-            other.label()
-        )),
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(false));
+        }
+        let (rows, _) = result.page()?;
+        if rows.is_empty() {
+            return Ok(Next::Done(true));
+        }
+        self.deleting = true;
+        let deletes = (rows.into_iter())
+            .map(|(key, _)| (self.key_space.clone(), key))
+            .collect();
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 }
 
-// Best-effort execution: a failed entry stays queued and retries next drain.
-async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> RowOutcome {
-    match work {
-        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await.into(),
-        BlobCleanupWork::ReconcileWrite {
-            location,
-            owner: WriteOwner::Upload { upload_id },
-        } => reconcile_target(context, upload_id, None, location).await,
-        BlobCleanupWork::ReconcileWrite {
-            location,
-            owner:
-                WriteOwner::CompletedUpload {
-                    upload_id,
-                    blake3,
-                    realm_id,
-                    ttl_ms,
-                    announce,
-                },
-        } => {
-            let holder = (blake3, realm_id, ttl_ms, announce);
-            reconcile_target(context, upload_id, Some(holder), location).await
+/// How the result of a finished step decides the row.
+#[derive(Debug, PartialEq)]
+enum WorkStep {
+    Start,
+    /// A child that answers with the row's outcome.
+    Outcome,
+    /// A child that answers whether the row is done.
+    Finished,
+    /// A child that answers done or not yet, and the message of its failure.
+    Pass(&'static str),
+    Trail,
+    Owner(WriteOwner, Box<BackendLocation>),
+    Reservation(WriteOwner),
+    Delete,
+    Reconcile,
+    Dht,
+    Planned(Box<ReleaseFile>),
+    Settle,
+}
+
+/// Runs one queued cleanup row. Execution is best effort: a failed row stays queued and retries
+/// in a later drain.
+#[derive(Debug, PartialEq)]
+struct CleanupWorkOperation {
+    work: Option<BlobCleanupWork>,
+    node: CleanupNode,
+    now_ms: u64,
+    step: WorkStep,
+}
+
+type WorkTurn = Turn<RowOutcome>;
+
+impl CleanupWorkOperation {
+    fn new(work: BlobCleanupWork, node: CleanupNode) -> Self {
+        Self {
+            work: Some(work),
+            node,
+            now_ms: 0,
+            step: WorkStep::Start,
         }
-        // The committed metadata decides. An unreadable owner is not a proof of
-        // either outcome, so the row waits for a drain that can read it.
-        BlobCleanupWork::ReconcileWrite { location, owner } => {
-            let done = match owns_write(context, &owner, &location).await {
-                None => false,
-                Some(true) => {
-                    if let Some(blob_handle) = context.blob_handle.as_ref() {
-                        blob_handle.clear_reservation(location.ulid);
-                    }
-                    match owner {
-                        WriteOwner::Blob {
-                            blake3,
-                            realm_id,
-                            ttl_ms,
-                            announce: true,
-                        } => register_dht(context, blake3, realm_id, ttl_ms).await,
-                        // A copy of a distributed bucket is found through its content index.
-                        WriteOwner::Blob {
-                            announce: false, ..
-                        } => true,
-                        WriteOwner::UploadPart { .. }
-                        | WriteOwner::Upload { .. }
-                        | WriteOwner::CompletedUpload { .. }
-                        | WriteOwner::Pending => true,
-                    }
-                }
-                Some(false) => delete_blob(context, location).await,
-            };
-            done.into()
+    }
+
+    fn call(&mut self, step: WorkStep, call: IoCall) -> WorkTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn release(&mut self, file: ReleaseFile) -> WorkTurn {
+        let release = ReleaseRenamedOperation::new(file);
+        self.call(WorkStep::Finished, IoCall::child(release))
+    }
+
+    fn delete_blob(&mut self, location: BackendLocation) -> WorkTurn {
+        // An imported object is never Aruna's to delete; a part still ends its provider part
+        // claim.
+        if location.is_external() && !location.partial {
+            return Ok(Next::Done(RowOutcome::Done));
         }
-        BlobCleanupWork::ReconcileReservation { location } => {
-            reconcile_reservation(context, location).await.into()
-        }
-        BlobCleanupWork::RegisterDht {
-            blake3,
-            realm_id,
-            ttl_ms,
-        } => register_dht(context, blake3, realm_id, ttl_ms).await.into(),
-        BlobCleanupWork::ReleaseRenamed {
-            location,
-            import_id,
-            version_id,
-            version,
-        } => release_renamed(context, location, import_id, version_id, version)
-            .await
-            .into(),
-        BlobCleanupWork::ReleasePlanned {
-            job_id,
-            location,
-            import_id,
-            version_id,
-            version,
-        } => match purge_ended(context, job_id).await {
-            Some(true) => release_renamed(context, location, import_id, version_id, version)
-                .await
-                .into(),
-            Some(false) => RowOutcome::Kept,
-            None => RowOutcome::Failed,
-        },
-        BlobCleanupWork::SettleUpload {
-            attempt,
-            location,
-            upload_id,
-            since_ms,
-        } => {
-            let now = aruna_core::time::unix_timestamp_millis();
-            // A copy may still be running; only an upload past the grace is its leftover.
-            if now < since_ms.saturating_add(SETTLE_GRACE_MS) {
-                return RowOutcome::Kept;
+        let delete = Effect::Blob(BlobEffect::Delete { location });
+        self.call(WorkStep::Delete, delete.into())
+    }
+
+    fn register_dht(&mut self, blake3: [u8; 32], realm_id: RealmId, ttl_ms: u64) -> WorkTurn {
+        let limits = RoCrateLimits {
+            holder_ttl_ms: ttl_ms,
+            ..RoCrateLimits::default()
+        };
+        let Ok(effect) = dht_registration_effect(&blake3, realm_id, &limits) else {
+            return Ok(Next::Done(RowOutcome::Failed));
+        };
+        self.call(WorkStep::Dht, effect.into())
+    }
+
+    fn start(&mut self, work: BlobCleanupWork) -> WorkTurn {
+        match work {
+            BlobCleanupWork::DeleteBlob { location } => self.delete_blob(location),
+            BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Upload { upload_id },
+            } => {
+                let target = ReconcileTargetOperation::new(upload_id, None, location);
+                self.call(WorkStep::Outcome, IoCall::child(target))
             }
-            let Some(blob_handle) = context.blob_handle.as_ref() else {
-                return RowOutcome::Failed;
-            };
-            // Exactly the decoded upload; a newer try of the attempt keeps its own.
-            let upload = Some((Box::new(location), upload_id));
-            let effect = BlobEffect::SettleCopy { attempt, upload };
-            // The settlement removes the record itself, and only while it is unchanged.
-            match blob_handle.send_blob_effect(effect).await {
-                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
-                event => {
-                    warn!(?event, "A copy upload could not be settled");
-                    RowOutcome::Failed
+            BlobCleanupWork::ReconcileWrite {
+                location,
+                owner:
+                    WriteOwner::CompletedUpload {
+                        upload_id,
+                        blake3,
+                        realm_id,
+                        ttl_ms,
+                        announce,
+                    },
+            } => {
+                let holder = Some((blake3, realm_id, ttl_ms, announce));
+                let target = ReconcileTargetOperation::new(upload_id, holder, location);
+                self.call(WorkStep::Outcome, IoCall::child(target))
+            }
+            // The committed metadata decides. An unreadable owner is not a proof of either
+            // outcome, so the row waits for a drain that can read it.
+            BlobCleanupWork::ReconcileWrite { location, owner } => {
+                let owns = OwnsWriteOperation::new(&owner, &location);
+                let step = WorkStep::Owner(owner, Box::new(location));
+                self.call(step, IoCall::child(owns))
+            }
+            BlobCleanupWork::ReconcileReservation { location } => {
+                let reconcile = Effect::Blob(BlobEffect::ReconcileReservation { location });
+                self.call(WorkStep::Reconcile, reconcile.into())
+            }
+            BlobCleanupWork::RegisterDht {
+                blake3,
+                realm_id,
+                ttl_ms,
+            } => self.register_dht(blake3, realm_id, ttl_ms),
+            BlobCleanupWork::ReleaseRenamed {
+                location,
+                import_id,
+                version_id,
+                version,
+            } => self.release(ReleaseFile {
+                location,
+                import_id,
+                version_id,
+                version,
+                has_blob: self.node.has_blob,
+            }),
+            BlobCleanupWork::ReleasePlanned {
+                job_id,
+                location,
+                import_id,
+                version_id,
+                version,
+            } => {
+                let file = ReleaseFile {
+                    location,
+                    import_id,
+                    version_id,
+                    version,
+                    has_blob: self.node.has_blob,
+                };
+                // A purge job id that cannot exist has no purge left to wait for.
+                let Ok(job_id) = JobId::try_from_bytes(job_id.to_bytes()) else {
+                    return self.release(file);
+                };
+                let read = read_job_record(job_id);
+                self.call(WorkStep::Planned(Box::new(file)), IoCall::child(read))
+            }
+            BlobCleanupWork::SettleUpload {
+                attempt,
+                location,
+                upload_id,
+                since_ms,
+            } => {
+                // A copy may still be running; only an upload past the grace is its leftover.
+                if self.now_ms < since_ms.saturating_add(SETTLE_GRACE_MS) {
+                    return Ok(Next::Done(RowOutcome::Kept));
                 }
+                // Exactly the decoded upload; a newer try of the attempt keeps its own.
+                let upload = Some((Box::new(location), upload_id));
+                let settle = Effect::Blob(BlobEffect::SettleCopy { attempt, upload });
+                self.call(WorkStep::Settle, settle.into())
+            }
+            BlobCleanupWork::SettleMove { version, intents } => {
+                let routing = self.node.routing.clone();
+                let settle = SettleMoveOperation::new(routing, &version, intents);
+                let step = WorkStep::Pass("A rename's move could not be settled");
+                self.call(step, IoCall::child(settle))
+            }
+            BlobCleanupWork::DropRows { key_space, prefix } => {
+                let drop = DropRowsOperation {
+                    key_space,
+                    prefix,
+                    deleting: false,
+                };
+                let step = WorkStep::Pass("Rows of a removed rule could not be dropped");
+                self.call(step, IoCall::child(drop))
+            }
+            BlobCleanupWork::DropClaims { import_id } => {
+                let drop = DropClaimsOperation::new(import_id);
+                let step = WorkStep::Pass("Claims of a removed rule could not be dropped");
+                self.call(step, IoCall::child(drop))
+            }
+            BlobCleanupWork::DropTrail {
+                group_id,
+                bucket,
+                incarnation,
+            } => {
+                let drop = DropTrailOperation::new(group_id, bucket.as_deref(), incarnation);
+                self.call(WorkStep::Trail, IoCall::child(drop))
             }
         }
-        BlobCleanupWork::SettleMove { version, intents } => {
-            let routing = crate::driver::node_routing(context);
-            let settle =
-                crate::blob::migration::drain::SettleMoveOperation::new(routing, &version, intents);
-            match crate::driver::drive(settle, context).await {
-                Ok(true) => RowOutcome::Done,
-                Ok(false) => RowOutcome::Kept,
-                Err(error) => {
-                    warn!(%error, "A rename's move could not be settled");
-                    RowOutcome::Failed
-                }
+    }
+
+    fn owner_known(
+        &mut self,
+        owner: WriteOwner,
+        location: BackendLocation,
+        owned: Option<bool>,
+    ) -> WorkTurn {
+        match owned {
+            None => Ok(Next::Done(RowOutcome::Failed)),
+            Some(true) => {
+                let clear = Effect::Blob(BlobEffect::ReleaseReservation { id: location.ulid });
+                self.call(WorkStep::Reservation(owner), clear.into())
+            }
+            Some(false) => self.delete_blob(location),
+        }
+    }
+
+    fn reservation_cleared(&mut self, owner: WriteOwner) -> WorkTurn {
+        match owner {
+            WriteOwner::Blob {
+                blake3,
+                realm_id,
+                ttl_ms,
+                announce: true,
+            } => self.register_dht(blake3, realm_id, ttl_ms),
+            // A copy of a distributed bucket is found through its content index.
+            WriteOwner::Blob {
+                announce: false, ..
+            }
+            | WriteOwner::UploadPart { .. }
+            | WriteOwner::Upload { .. }
+            | WriteOwner::CompletedUpload { .. }
+            | WriteOwner::Pending => Ok(Next::Done(RowOutcome::Done)),
+        }
+    }
+
+    fn planned(
+        &mut self,
+        file: ReleaseFile,
+        record: Result<Option<JobRecord>, JobMutationError>,
+    ) -> WorkTurn {
+        match record {
+            Ok(record) if record.is_none_or(|record| record.is_settled()) => self.release(file),
+            Ok(_) => Ok(Next::Done(RowOutcome::Kept)),
+            Err(error) => {
+                warn!(%error, "A purge job could not be read");
+                Ok(Next::Done(RowOutcome::Failed))
             }
         }
         BlobCleanupWork::DropRows { key_space, prefix } => {
