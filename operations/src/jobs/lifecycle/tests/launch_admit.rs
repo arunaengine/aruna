@@ -34,7 +34,7 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-fn calls_child(next: Result<Next<LaunchAnswer>, LaunchUndecided>) {
+fn calls_child<T: std::fmt::Debug>(next: Result<Next<T>, LaunchUndecided>) {
     assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))), "{next:?}");
 }
 
@@ -203,10 +203,7 @@ fn other_target_refused() {
     calls_child(operation.first());
     assert_eq!(
         operation.next(config_answer(&family)),
-        Ok(Next::Done(LaunchAnswer {
-            decision: Err(LaunchDecline::Unauthorized),
-            cancel: None,
-        }))
+        Ok(Next::Done(Err(LaunchDecline::Unauthorized)))
     );
 }
 
