@@ -154,3 +154,33 @@ pub async fn schedule_projection_drain(
     let wake = crate::metadata::projection::ProjectionWakeOperation::new(after);
     crate::driver::drive(wake, context).await
 }
+
+/// Runs one pass of the graph prune drain.
+pub async fn process_prune_batch(
+    context: &DriverContext,
+) -> Result<
+    crate::metadata::prune_queue::GraphDrainResult,
+    crate::metadata::prune_queue::MetadataGraphError,
+> {
+    let batch = crate::metadata::prune_queue::PruneBatchOperation::new();
+    crate::driver::drive(batch, context).await
+}
+
+/// Queues and runs the prunes for deleted graphs.
+pub async fn process_graph_tombstones(
+    context: &DriverContext,
+    tombstones: impl IntoIterator<Item = aruna_core::metadata::GraphLifecycleRecord>,
+) -> crate::metadata::prune_queue::TombstoneProcessingResult {
+    let tombstones = crate::metadata::prune_queue::TombstonesOperation::new(tombstones);
+    crate::driver::drive(tombstones, context)
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether any graph prune job is queued.
+pub async fn prune_jobs_exist(
+    context: &DriverContext,
+) -> Result<bool, crate::metadata::prune_queue::MetadataGraphError> {
+    let due = crate::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
+    Ok(!due.jobs.is_empty())
+}

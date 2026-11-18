@@ -24,7 +24,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
-use super::link_reads::LinkChecksOperation;
+use super::link_reads::{LinkTimerOperation, QueueDeletedOperation};
 use super::link_store::{change_link, ensure_lineage, read_link};
 use super::links::{
     ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation,
@@ -35,8 +35,8 @@ use crate::jobs::service::submit_export_job;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::revision_read::RawViewOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
+use crate::metadata::revision_read::RawViewOperation;
 use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 use aruna_core::placement::holds_placement;
@@ -392,55 +392,13 @@ async fn write_row(context: &DriverContext, row: (String, Key, Value)) -> Result
 /// Queues checks for the links of the deleted document behind `graph_iri`; each check
 /// then removes its link and token.
 pub async fn queue_deleted(context: &DriverContext, graph_iri: &str) -> Result<(), LinkError> {
-    let document_id = graph_iri
-        .rsplit('/')
-        .next()
-        .and_then(|id| Ulid::from_string(id).ok())
-        .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
-    let Some(document_id) = document_id else {
-        return Ok(());
-    };
-    let checks = LinkChecksOperation::new([document_id], unix_timestamp_millis());
-    let rows = drive(checks, context).await?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    for row in rows {
-        write_row(context, row).await?;
-    }
-    if let Some(task_handle) = &context.task_handle {
-        restore_link_timer(context, task_handle).await;
-    }
-    Ok(())
+    drive(QueueDeletedOperation::new(graph_iri), context).await
 }
 
 /// Arms the drain for the earliest queued check; the queue itself is the durable state.
-pub async fn restore_link_timer(context: &DriverContext, task_handle: &TaskHandle) {
-    let now = unix_timestamp_millis();
-    let mut next = None;
-    let mut start = None;
-    loop {
-        let Ok((values, next_start)) = scan_queue(context, start).await else {
-            warn!("Failed to scan the repository link queue");
-            return;
-        };
-        for (_, value) in values {
-            let due = postcard::from_bytes::<LinkQueueEntry>(&value).map_or(now, |e| e.due_at_ms);
-            next = min_due_at(next, due);
-        }
-        match next_start {
-            Some(key) => start = Some(key),
-            None => break,
-        }
-    }
-    let Some(due) = next else {
-        return;
-    };
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(schedule_drain(due_after(now, due)))
-        .await
-    {
-        warn!(%message, "Failed to arm the repository link queue");
+pub async fn restore_link_timer(context: &DriverContext, _task_handle: &TaskHandle) {
+    if let Err(error) = drive(LinkTimerOperation::new(), context).await {
+        warn!(%error, "Failed to scan the repository link queue");
     }
 }
 

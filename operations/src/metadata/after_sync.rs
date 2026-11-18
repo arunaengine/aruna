@@ -15,7 +15,7 @@ use crate::metadata::projection::{
     MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionWakeOperation, max_clock_skew,
 };
-use crate::metadata::prune_queue::process_graph_tombstones;
+use crate::metadata::prune_queue::TombstonesOperation;
 
 /// Time spent on each part of [`apply_metadata`].
 pub(crate) struct MetadataTimings {
@@ -52,7 +52,10 @@ pub(crate) async fn apply_metadata(
     }
     let project = project_started.elapsed();
     let prune_started = Instant::now();
-    process_graph_tombstones(context, metadata_graph_tombstones).await;
+    let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
+    if let Err(error) = drive(tombstones, context).await {
+        warn!(error = ?error, "Failed to prune deleted metadata graphs");
+    }
     MetadataTimings {
         project,
         prune: prune_started.elapsed(),

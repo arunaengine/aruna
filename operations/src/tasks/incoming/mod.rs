@@ -103,8 +103,34 @@ async fn replay_event_log(
     }
 }
 use crate::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation, PruneTimerOperation,
+    TombstonesOperation, jobs_queued,
 };
+
+/// Arms the graph prune drain for its next due job at start.
+async fn restore_graph_prune(
+    context: &crate::driver::DriverContext,
+    task_handle: &aruna_tasks::TaskHandle,
+) {
+    match crate::driver::drive(PruneTimerOperation::new(), context).await {
+        Ok(None) => {}
+        Ok(Some(after)) => {
+            let wake =
+                aruna_core::effects::Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
+                    key: TaskKey::DrainPruneQueue,
+                    after,
+                });
+            if let aruna_core::events::Event::Task(aruna_core::task::TaskEvent::Error {
+                message,
+                ..
+            }) = task_handle.send_effect(wake).await
+            {
+                warn!(message = %message, "Failed to restore metadata graph prune timer");
+            }
+        }
+        Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
+    }
+}
 use crate::node::info::facts::NodeFacts;
 use crate::node::info::flows::ObservePlacementOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};

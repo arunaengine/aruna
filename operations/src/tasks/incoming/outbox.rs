@@ -1166,7 +1166,10 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones).await;
+                let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
+                if let Err(error) = drive(tombstones, self.context.as_ref()).await {
+                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
+                }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {

@@ -321,6 +321,145 @@ impl Operation for LinkChecksOperation {
     }
 }
 
+/// Arms the link drain for the earliest queued check; the queue itself is the durable state.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LinkTimerOperation {
+    pages: PrefixPages,
+    next_due: Option<u64>,
+    now_ms: u64,
+    waking: bool,
+}
+
+impl LinkTimerOperation {
+    pub(crate) fn new() -> Self {
+        Self {
+            pages: PrefixPages::new(LINK_QUEUE_KEYSPACE, Key::from(Vec::new()), LINK_PAGE),
+            next_due: None,
+            now_ms: 0,
+            waking: false,
+        }
+    }
+}
+
+impl Operation for LinkTimerOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        if self.next_due.is_none() && !self.waking {
+            self.now_ms = now_ms;
+        }
+    }
+
+    fn first(&mut self) -> Result<Next<()>, LinkError> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, LinkError> {
+        if self.waking {
+            if let IoResult::Event(event) = result
+                && let aruna_core::events::Event::Task(aruna_core::task::TaskEvent::Error {
+                    message,
+                    ..
+                }) = *event
+            {
+                tracing::warn!(%message, "Failed to arm the repository link queue");
+            }
+            return Ok(Next::Done(()));
+        }
+        for (_, value) in self.pages.take(result)? {
+            let due = postcard::from_bytes::<LinkQueueEntry>(&value)
+                .map_or(self.now_ms, |entry| entry.due_at_ms);
+            self.next_due = crate::tasks::queue_backoff::min_due_at(self.next_due, due);
+        }
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        let Some(due) = self.next_due else {
+            return Ok(Next::Done(()));
+        };
+        self.waking = true;
+        let after = crate::tasks::queue_backoff::due_after(self.now_ms, due);
+        Ok(Next::Call(IoCall::Effect(Box::new(
+            super::links::schedule_drain(after),
+        ))))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeletedStage {
+    Checks,
+    Write,
+    Timer,
+}
+
+/// Queues checks for the links of the deleted document behind `graph_iri`; each check then
+/// removes its link and token.
+#[derive(Debug, PartialEq)]
+pub(crate) struct QueueDeletedOperation {
+    document_id: Option<Ulid>,
+    stage: DeletedStage,
+    now_ms: u64,
+}
+
+impl QueueDeletedOperation {
+    pub(crate) fn new(graph_iri: &str) -> Self {
+        let document_id = graph_iri
+            .rsplit('/')
+            .next()
+            .and_then(|id| Ulid::from_string(id).ok())
+            .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
+        Self {
+            document_id,
+            stage: DeletedStage::Checks,
+            now_ms: 0,
+        }
+    }
+}
+
+impl Operation for QueueDeletedOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn first(&mut self) -> Result<Next<()>, LinkError> {
+        let Some(document_id) = self.document_id else {
+            return Ok(Next::Done(()));
+        };
+        Ok(Next::Call(IoCall::child(LinkChecksOperation::new(
+            [document_id],
+            self.now_ms,
+        ))))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        if self.stage == DeletedStage::Checks {
+            self.now_ms = now_ms;
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, LinkError> {
+        match self.stage {
+            DeletedStage::Checks => {
+                let rows = result.child::<Rows, LinkError>()??;
+                if rows.is_empty() {
+                    return Ok(Next::Done(()));
+                }
+                self.stage = DeletedStage::Write;
+                Ok(Next::Call(IoCall::Write(rows)))
+            }
+            DeletedStage::Write => {
+                aruna_core::rows::done(result)?;
+                self.stage = DeletedStage::Timer;
+                Ok(Next::Call(IoCall::child(LinkTimerOperation::new())))
+            }
+            DeletedStage::Timer => {
+                result.child::<(), LinkError>()??;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod call_tests {
     use super::*;

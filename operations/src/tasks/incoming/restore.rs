@@ -55,7 +55,7 @@ async fn durable_rearm_loop(
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
@@ -312,7 +312,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -492,7 +492,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
+        match drive(PruneBatchOperation::new(), &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -504,7 +504,10 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match prune_jobs_exist(&bulk).await {
+            Ok(_) => match drive(jobs_queued(), &bulk)
+                .await
+                .map(|due| !due.jobs.is_empty())
+            {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
