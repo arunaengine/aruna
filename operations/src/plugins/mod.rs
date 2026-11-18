@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod marks;
 
 pub mod matcher;
+pub mod objects;
 pub mod outbound;
 pub mod outgoing;
 pub mod plugin_work;

@@ -387,7 +387,7 @@ pub async fn enforce_policies(
 
 /// Extracts the group id from a canonical `/{realm}/g/{group}/...` path, mirroring
 /// the permission-rule parser. Non-group paths carry no group scope.
-fn group_from_path(path: &str) -> Option<GroupId> {
+pub(crate) fn group_from_path(path: &str) -> Option<GroupId> {
     let mut segments = path.split('/');
     segments.next();
     segments.next();

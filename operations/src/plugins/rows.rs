@@ -3,8 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
+use aruna_core::operation::{Operation, Runnable, TransactionMode, boxed_suboperation};
 use aruna_core::rows;
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -27,6 +28,24 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
 
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
     Ok(rows::decode(bytes)?)
+}
+
+/// Runs `operation` as a child whose outcome `map` reduces to what the parent decides with.
+pub(crate) fn mapped_child<O, K, T, E>(
+    operation: O,
+    map: impl FnOnce(Result<O::Output, O::Error>) -> Result<T, E> + Send + 'static,
+) -> IoCall
+where
+    O: Runnable<K> + 'static,
+    K: 'static,
+    O::Output: Send + 'static,
+    O::Error: Send + 'static,
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoCall::Child(boxed_suboperation(operation, move |result| {
+        Event::Child(ChildOutcome::new(map(result)))
+    }))
 }
 
 /// A read of these rows, in this order.
