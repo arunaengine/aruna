@@ -11,11 +11,17 @@ use crate::calls::{CallRun, IoCall, IoError, IoResult, Next};
 use crate::{effects::Effect, events::Event, types::Effects};
 
 /// A backend scope at most one operation holds at a time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HoldScope {
     /// The document reconcile of `net`, which also excludes its shard membership changes and
     /// topic evictions.
     DocumentReconcile,
+    /// The plugin run admissions of this node, so no install passes its queue bound.
+    PluginAdmissions,
+    /// The plugin artifact copies of this node, so progress rows never lose a chunk.
+    PluginCopies,
+    /// The changes of one plugin install on this node, so they never overlap here.
+    PluginInstall(ulid::Ulid),
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the
