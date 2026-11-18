@@ -438,15 +438,16 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
     assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
     let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
-    let found = Box::pin(aruna_operations::metadata::identifier_lookup::lookup_local(
-        &fixture.context,
-        fixture.actor.realm_id,
-        Some(&auth),
-        SecondaryIdKind::Doi,
-        "10.1234/1",
-        None,
-    ))
-    .await?;
+    use aruna_operations::metadata::identifier_lookup::{
+        IdentifierLookupOperation, IdentifierQuery,
+    };
+    let query = IdentifierQuery {
+        kind: SecondaryIdKind::Doi,
+        value: "10.1234/1".to_string(),
+        endpoint: None,
+    };
+    let lookup = IdentifierLookupOperation::new(fixture.actor.realm_id, Some(auth), query);
+    let found = Box::pin(aruna_operations::driver::drive(lookup, &fixture.context)).await?;
     assert_eq!(
         found
             .iter()

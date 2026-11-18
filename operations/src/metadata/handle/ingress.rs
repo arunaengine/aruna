@@ -1149,16 +1149,21 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::identifier_lookup::lookup_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            kind,
-                            &value,
-                            endpoint.as_deref(),
-                        )
-                        .await
-                        .map_err(|_| MetadataReadError::Unavailable),
+                        Some(net_handle) => {
+                            use crate::metadata::identifier_lookup::{
+                                IdentifierLookupOperation, IdentifierQuery,
+                            };
+                            let query = IdentifierQuery {
+                                kind,
+                                value,
+                                endpoint,
+                            };
+                            let lookup =
+                                IdentifierLookupOperation::new(*net_handle.realm_id(), auth, query);
+                            drive(lookup, context.as_ref())
+                                .await
+                                .map_err(|_| MetadataReadError::Unavailable)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),
