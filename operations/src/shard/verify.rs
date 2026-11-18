@@ -70,10 +70,7 @@ fn verification_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
 
 /// The shards this node holds with their co-holders in rank order, so the first
 /// reachable co-holder is the highest-ranked one.
-fn held_shards(
-    config: &RealmConfigDocument,
-    node_id: NodeId,
-) -> Vec<(PlacementRef, Vec<NodeId>)> {
+fn held_shards(config: &RealmConfigDocument, node_id: NodeId) -> Vec<(PlacementRef, Vec<NodeId>)> {
     (config.strategies.iter())
         .flat_map(|strategy| {
             (0..strategy.shard_count).filter_map(move |shard| {
@@ -144,10 +141,12 @@ impl Operation for VerifyHeldOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ShardVerificationSummary>, IoError> {
         if !self.verifying {
-            return Ok(match result.child::<RealmConfigDocument, GetConfigError>()? {
-                Ok(config) => self.verify_all(&config),
-                Err(_) => Next::Done(ShardVerificationSummary::default()),
-            });
+            return Ok(
+                match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => self.verify_all(&config),
+                    Err(_) => Next::Done(ShardVerificationSummary::default()),
+                },
+            );
         }
         let IoResult::Group(GroupEvent::Finished { results }) = result else {
             return Err(IoError::Unexpected {
@@ -275,12 +274,8 @@ impl Operation for VerifyShardOperation {
                     return Ok(Next::Call(shard_call(ShardNetEffect::Existing(topics))));
                 }
                 self.stage = VerifyStage::Converge;
-                let converge = ConvergeOperation::new(
-                    self.realm_id,
-                    self.placement,
-                    &self.co_holders,
-                    None,
-                );
+                let converge =
+                    ConvergeOperation::new(self.realm_id, self.placement, &self.co_holders, None);
                 Ok(Next::Call(IoCall::child(converge)))
             }
             VerifyStage::SoleExists => match shard_answer(result)? {
@@ -374,9 +369,8 @@ type ConvergeOutput = Option<(NodeId, [u8; 32])>;
 type ConvergeTurn = Result<Next<ConvergeOutput>, IoError>;
 
 /// Reconciles the local shard copy against the first reachable co-holder, returning it with
-/// the digest both sides agree on, which a completion proof commits to. With `required`, the
-/// local cursor must also dominate that frontier, so a target cannot prove while missing an
-/// unreachable holder's writes. `None` when no co-holder converged.
+/// the digest a completion proof commits to, or `None`. With `required`, the local cursor must
+/// also dominate that frontier, so a target cannot prove while missing a holder's writes.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ConvergeOperation {
     realm_id: RealmId,
@@ -488,9 +482,7 @@ impl Operation for ConvergeOperation {
                 );
                 let converged = (self.remote.as_ref())
                     .is_some_and(|remote| manifests_converged(&local, remote));
-                if exists
-                    && converged
-                    && dominates_required(&local.cursor, self.required.as_ref())
+                if exists && converged && dominates_required(&local.cursor, self.required.as_ref())
                 {
                     return Ok(Next::Done(Some((holder, local.digest))));
                 }

@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::warn;
 
-use crate::forward::transport::reject;
-use crate::realm::peer_trust::is_sync_eligible;
 use crate::document_repository::GetConfigOperation;
+use crate::forward::transport::reject;
 use crate::realm::load_config::config_unavailable;
+use crate::realm::peer_trust::is_sync_eligible;
 
 pub(crate) async fn apply_bucket_create(
     context: &Arc<DriverContext>,
@@ -101,7 +101,10 @@ async fn create_once(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, net_handle.node_id()) {
         return Err(SyncRefusal::Unavailable);
@@ -195,7 +198,10 @@ async fn bucket_writable(
         .ok_or(SyncRefusal::Unavailable)?;
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     if !is_sync_eligible(&config, node_id) {
         return Err(SyncRefusal::Unavailable);

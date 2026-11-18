@@ -37,6 +37,7 @@ use ulid::Ulid;
 use super::read::load_access;
 use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
 use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
@@ -55,7 +56,6 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, Pu
 use crate::s3::object::read::get_object_routed;
 use aruna_core::metadata::AuthToken;
 use aruna_core::time::unix_timestamp_millis;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
@@ -411,7 +411,12 @@ async fn allowed(
     path: &str,
 ) -> Result<bool, PublishError> {
     let extras = PolicyRequestExtras::rest();
-    match drive(AuthorizeOperation::new(realm_id, auth, path, &Permission::WRITE, extras), context).await {
+    match drive(
+        AuthorizeOperation::new(realm_id, auth, path, &Permission::WRITE, extras),
+        context,
+    )
+    .await
+    {
         Ok(()) => Ok(true),
         Err(AuthorizeError::Storage(error)) => Err(PublishError::Unavailable(error.to_string())),
         Err(_) => Ok(false),

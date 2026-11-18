@@ -6,6 +6,7 @@ use super::shared::{Claim, claim_file, read_shared, taken_paths};
 use super::{ImportRuleError, read_earlier, validate_folder};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
+use crate::auth::request_authorization::BucketAccessOperation;
 use crate::blob::migration::misplaced::{RenamePlan, rename_page};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
@@ -32,7 +33,6 @@ use aruna_core::structs::storage::discovery::{
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use ulid::Ulid;
-use crate::auth::request_authorization::BucketAccessOperation;
 
 /// Files one preview page lists.
 pub const PREVIEW_PAGE: usize = 200;
@@ -254,15 +254,16 @@ pub async fn bucket_access(
         return Err(ImportRuleError::Forbidden);
     }
     let scope = (auth.realm_id, rule.group_id, node_id);
-    let access = drive(BucketAccessOperation::new(auth, scope, &rule.bucket), context)
-        .await
-        .map_err(|error| match error {
-            AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => {
-                ImportRuleError::Forbidden
-            }
-            AuthorizeError::Storage(error) => ImportRuleError::Storage(error),
-            AuthorizeError::CheckFailed(message) => ImportRuleError::Read(message),
-        })?;
+    let access = drive(
+        BucketAccessOperation::new(auth, scope, &rule.bucket),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => ImportRuleError::Forbidden,
+        AuthorizeError::Storage(error) => ImportRuleError::Storage(error),
+        AuthorizeError::CheckFailed(message) => ImportRuleError::Read(message),
+    })?;
     match access.allows(None, &Permission::WRITE) {
         true => Ok(access),
         false => Err(ImportRuleError::Forbidden),

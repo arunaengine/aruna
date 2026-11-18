@@ -28,11 +28,11 @@ use aruna_operations::sync::replicate_documents::{
 use aruna_operations::users::read_document::ReadUserOperation;
 use ulid::Ulid;
 
+use aruna_operations::auth::bearer_token::TokenRevokedOperation;
 use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
     read_realm_config, replicate_config, spawn_node, wait_for_convergence, write,
 };
-use aruna_operations::auth::bearer_token::TokenRevokedOperation;
 
 const MANAGEMENT_NODES: usize = 2;
 const REPLICATION_FACTOR: u32 = 1;
@@ -71,7 +71,11 @@ async fn device_fetches_revocation() -> TestResult<()> {
     // revocation: exactly what a device that was closed comes back to.
     let device = join_device(&realm).await?;
     assert!(
-        !drive(TokenRevokedOperation::new(realm_id, &token_hash), &device.context).await?,
+        !drive(
+            TokenRevokedOperation::new(realm_id, &token_hash),
+            &device.context
+        )
+        .await?,
         "the device must not know the revocation before it fetches anything"
     );
 
@@ -80,7 +84,11 @@ async fn device_fetches_revocation() -> TestResult<()> {
         "a realm node must serve the device the realm documents"
     );
     assert!(
-        drive(TokenRevokedOperation::new(realm_id, &token_hash), &device.context).await?,
+        drive(
+            TokenRevokedOperation::new(realm_id, &token_hash),
+            &device.context
+        )
+        .await?,
         "the device must deny a token the realm revoked while it was away"
     );
     Ok(())

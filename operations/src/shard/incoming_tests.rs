@@ -49,7 +49,10 @@ fn foreign_realm_rejected() {
 
 fn asked(peer: NodeId) -> ServeManifestOperation {
     let mut operation = ServeManifestOperation::new((node(1), realm()), peer, request(realm()));
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     operation
 }
 

@@ -18,6 +18,7 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
@@ -29,7 +30,6 @@ use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
 use aruna_blob::native::body_stream;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
-use crate::auth::request_authorization::AuthorizeOperation;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LinkError {
@@ -123,7 +123,10 @@ pub async fn authorize_target(
         &arn.key,
     );
     let extras = PolicyRequestExtras::operation(operation);
-    match Box::pin(drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras), context))
+    match Box::pin(drive(
+        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
+        context,
+    ))
     .await
     {
         Ok(()) => Ok(()),

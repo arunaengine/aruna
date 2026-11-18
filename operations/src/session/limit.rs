@@ -37,14 +37,14 @@ fn retire_failed(error: impl std::fmt::Display) -> CreateSessionError {
 /// oldest active sessions, which signs them out, and creation runs again. A service account
 /// keeps the plain limit, so renewing never ends the sessions its automation uses.
 #[derive(Debug, PartialEq)]
-pub struct CreateMakingRoomOperation {
+pub struct MakeRoomOperation {
     node_id: NodeId,
     config: CreateSessionConfig,
     now: u64,
     step: Step,
 }
 
-impl CreateMakingRoomOperation {
+impl MakeRoomOperation {
     pub fn new(node_id: NodeId, config: CreateSessionConfig) -> Self {
         Self {
             node_id,
@@ -80,7 +80,7 @@ impl CreateMakingRoomOperation {
     }
 }
 
-impl Operation for CreateMakingRoomOperation {
+impl Operation for MakeRoomOperation {
     type Output = CreatedSession;
     type Error = CreateSessionError;
 

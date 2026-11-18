@@ -44,9 +44,12 @@ fn plan() -> RemapPlan {
 
 async fn load(context: &DriverContext) -> BucketAccess {
     let auth = access(context).await;
-    BucketAccess::load(context, &auth, (realm(), group(), node(4)), BUCKET)
-        .await
-        .unwrap()
+    let load = crate::auth::request_authorization::BucketAccessOperation::new(
+        &auth,
+        (realm(), group(), node(4)),
+        BUCKET,
+    );
+    crate::driver::drive(load, context).await.unwrap()
 }
 
 fn scope(access: &BucketAccess) -> RemapScope<'_> {

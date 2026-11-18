@@ -394,11 +394,13 @@ mod tests {
         DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
     };
     use aruna_core::{NodeId, alpn::Alpn};
+    use aruna_net::streams::BiStream;
     use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use async_trait::async_trait;
     use std::{sync::Arc, time::Duration};
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
     use ulid::Ulid;
 
@@ -668,11 +670,13 @@ mod tests {
             .expect("receive shard stream promptly")
             .expect("capture remains open");
 
-        let error =
-            tokio::time::timeout(Duration::from_millis(250), crate::effect_adapters::shard::read_request(&mut inbound))
-                .await
-                .expect("oversized header must be rejected without reading its body")
-                .expect_err("oversized request must be rejected");
+        let error = tokio::time::timeout(
+            Duration::from_millis(250),
+            crate::effect_adapters::shard::read_request(&mut inbound),
+        )
+        .await
+        .expect("oversized header must be rejected without reading its body")
+        .expect_err("oversized request must be rejected");
         assert_eq!(error, "shard frame exceeds maximum size");
 
         client.shutdown().await;

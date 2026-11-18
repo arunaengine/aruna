@@ -7,10 +7,10 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use tracing::{info, warn};
 
+use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::{
     DisabledScanOperation, HoldingScanOperation, RemoveBackendOperation,
 };
-use crate::driver::{DriverContext, drive};
 
 /// Deletes the record and credentials of every disabled tenant backend that no
 /// longer holds anything. Runs after the reclaim sweep, which is what empties

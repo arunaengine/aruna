@@ -22,6 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
@@ -34,7 +35,6 @@ use crate::s3::object::pages::{
 };
 use crate::s3::object::read::get_object_routed;
 use aruna_core::archive_path::safe_zip_path;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
 pub const REPORT_PATH: &str = "_report.json";
@@ -611,7 +611,12 @@ async fn authorization<R>(
 ) -> Result<(), EntryStatus> {
     let extras = PolicyRequestExtras::rest();
     let read = &Permission::READ;
-    match drive(AuthorizeOperation::new(scope.realm_id, auth, path, read, extras), scope.context).await {
+    match drive(
+        AuthorizeOperation::new(scope.realm_id, auth, path, read, extras),
+        scope.context,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
             Err(EntryStatus::Denied)

@@ -36,7 +36,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurg
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::purge::{scope_totals, storage_files};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
@@ -66,7 +66,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
-use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 const BUCKET: &str = "bucket";
 
@@ -635,9 +634,12 @@ async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
 /// The duplicates preview of the whole bucket.
 async fn duplicates(context: &TestContext) -> aruna_operations::blob::unify::UnifyPage {
     let scope = (context.auth.realm_id, context.group_id, context.node_id);
-    let access = drive(BucketAccessOperation::new(&context.auth, scope, BUCKET), &context.driver)
-        .await
-        .unwrap();
+    let access = drive(
+        BucketAccessOperation::new(&context.auth, scope, BUCKET),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
         .await
         .unwrap()

@@ -6,9 +6,9 @@ use super::*;
 use aruna_core::effects::StorageEffect;
 use ulid::Ulid;
 
+use crate::auth::bearer_token::UserCutoffOperation;
 use crate::session::create::pure_tests::session_config;
 use crate::session::index::MAX_USER_SESSIONS;
-use crate::auth::bearer_token::UserCutoffOperation;
 
 /// A realm whose user `session_config` creates sessions for, on real storage.
 async fn session_realm() -> (
@@ -114,7 +114,10 @@ async fn revokes_past_capacity() {
         let revoked = drive(revoke, &context).await.unwrap();
         assert!(revoked.is_some_and(|revoked| revoked.revoked));
     }
-    let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
+    let cutoff = drive(
+        UserCutoffOperation::new(config.realm_id, &config.user_id),
+        &context,
+    )
     .await
     .unwrap();
     // The last revoked session and every older one are cut off.
@@ -124,7 +127,9 @@ async fn revokes_past_capacity() {
         expiry: now + 3_600,
         ..config
     };
-    crate::driver::drive(CreateMakingRoomOperation::new(node_id, next), &context).await.unwrap();
+    crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+        .await
+        .unwrap();
 }
 
 // A service account, or one whose document is not here yet, at the limit is refused as
@@ -158,12 +163,15 @@ async fn service_keeps_limit() {
             expiry: now + 3_600,
             ..config.clone()
         };
-        let refused = crate::driver::drive(CreateMakingRoomOperation::new(node_id, next), &context).await;
+        let refused = crate::driver::drive(MakeRoomOperation::new(node_id, next), &context).await;
         assert_eq!(
             refused,
             Err(CreateSessionError::LimitReached { oldest: base })
         );
-        let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
+        let cutoff = drive(
+            UserCutoffOperation::new(config.realm_id, &config.user_id),
+            &context,
+        )
         .await
         .unwrap();
         assert_eq!(cutoff, None);
@@ -194,7 +202,9 @@ async fn issues_at_cutoff() {
         expiry: now + 3_600,
         ..config
     };
-    let created = crate::driver::drive(CreateMakingRoomOperation::new(node_id, next), &context).await.unwrap();
+    let created = crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+        .await
+        .unwrap();
     assert_eq!(created.session.created_at, now + 1);
     assert_eq!(created.session.expires_at, now + 3_600);
 }
@@ -231,23 +241,35 @@ async fn full_user_login() {
         Err(CreateSessionError::LimitReached { oldest: base })
     );
 
-    crate::driver::drive(CreateMakingRoomOperation::new(node_id, next), &context).await.unwrap();
+    crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+        .await
+        .unwrap();
 
-    let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
+    let cutoff = drive(
+        UserCutoffOperation::new(config.realm_id, &config.user_id),
+        &context,
+    )
     .await
     .unwrap();
     assert_eq!(cutoff, Some(base + 1));
     assert!(first.unwrap().created_at < base + 1);
 }
 
-fn stepped() -> CreateMakingRoomOperation {
+fn stepped() -> MakeRoomOperation {
     let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-    let mut operation = CreateMakingRoomOperation::new(node_id, session_config());
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let mut operation = MakeRoomOperation::new(node_id, session_config());
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     operation
 }
 
-fn answer<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn answer<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
 }
 
@@ -278,7 +300,7 @@ fn retired(config: &CreateSessionConfig) -> IoResult {
 }
 
 /// Runs up to the check of the cutoff that follows signing out the oldest session.
-fn past_retire(oldest: u64) -> CreateMakingRoomOperation {
+fn past_retire(oldest: u64) -> MakeRoomOperation {
     let mut operation = stepped();
     let config = operation.config.clone();
     operation.next(cutoff(None)).unwrap();

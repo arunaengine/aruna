@@ -21,6 +21,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::BucketAccess;
+use crate::auth::request_authorization::BucketAccessOperation;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::bound_view;
 use crate::distribution::routing::local_fence;
@@ -33,7 +34,6 @@ use crate::s3::object::visible::{
     HiddenCursor, Listed, Lister, NextPage, VisibleError, after_entry, is_sealed, open_cursor,
     visible_from, visible_page,
 };
-use crate::auth::request_authorization::BucketAccessOperation;
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
 const MAX_PAGE_RANGES: usize = 64;
@@ -311,9 +311,12 @@ async fn shown_part<R: RangeRelay>(
 ) -> PageResult<R::Object, R::Error> {
     let (realm_id, node_id, context) = (scope.realm_id, scope.node_id, scope.context);
     let ids = (realm_id, info.group_id, node_id);
-    let access = drive(BucketAccessOperation::new(auth, ids, &input.bucket), context)
-        .await
-        .map_err(PageError::internal)?;
+    let access = drive(
+        BucketAccessOperation::new(auth, ids, &input.bucket),
+        context,
+    )
+    .await
+    .map_err(PageError::internal)?;
     // The bearer's expiry bounds a delegated HEAD of a target on another node.
     let caller = LinkCaller {
         auth: auth.clone(),
@@ -566,7 +569,11 @@ async fn merged_page<R: RangeRelay>(
     let access = match caller.filter(|_| relay.checks_here()) {
         Some((auth, _)) => {
             let ids = (scope.realm_id, info.group_id, scope.node_id);
-            let access = drive(BucketAccessOperation::new(auth, ids, &request.bucket), context).await;
+            let access = drive(
+                BucketAccessOperation::new(auth, ids, &request.bucket),
+                context,
+            )
+            .await;
             Some(access.map_err(PageError::internal)?)
         }
         None => None,

@@ -13,12 +13,12 @@ use super::search::{
     BucketPage, BucketSearchHit, SearchBucketsError, SearchBucketsInput, SearchBucketsOperation,
     candidate_path,
 };
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::search_scan::{open_position, seal_position};
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::enforcement::PolicyBulkOperation;
 
 /// Runs one node's bucket search, dropping hits denied by realm/group policies.
 /// Policy state is read once per candidate group; unreadable groups stay invisible,
@@ -129,7 +129,10 @@ async fn anonymous_reads(
     let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
     let anonymous = AuthContext::anonymous(input.realm_id);
     let extras = PolicyRequestExtras::operation("s3.ListBuckets");
-    drive(AuthorizeOperation::new(input.realm_id, &anonymous, &path, &Permission::READ, extras), context)
+    drive(
+        AuthorizeOperation::new(input.realm_id, &anonymous, &path, &Permission::READ, extras),
+        context,
+    )
     .await
     .is_ok()
 }

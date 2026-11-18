@@ -43,7 +43,11 @@ fn append_config() -> AppendVaultConfig {
     }
 }
 
-fn answer<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn answer<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(ChildOutcome::new(result))
 }
 
@@ -122,7 +126,10 @@ fn odd_answer_undeliverable() {
 
 fn caller() -> VaultCallerOperation {
     let mut operation = VaultCallerOperation::new(node(2), realm(), bearer());
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     operation
 }
 
@@ -206,8 +213,9 @@ fn apply_maps_refusal() {
 }
 
 #[test]
-fn apply_rejects_other_message() {
-    let mut operation = ApplyVaultOperation::new(None, node(2), MetadataTransportMessage::WriteNotFound);
+fn apply_rejects_other() {
+    let mut operation =
+        ApplyVaultOperation::new(None, node(2), MetadataTransportMessage::WriteNotFound);
     assert!(matches!(
         operation.first(),
         Ok(Next::Done(MetadataTransportMessage::Reject(_)))

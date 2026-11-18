@@ -235,9 +235,12 @@ mod tests {
             .await
             .expect("ensure topic");
 
-        let manifest = drive(AssembleManifestOperation::new(realm_id, placement), &context)
-            .await
-            .expect("assemble manifest");
+        let manifest = drive(
+            AssembleManifestOperation::new(realm_id, placement),
+            &context,
+        )
+        .await
+        .expect("assemble manifest");
 
         assert_eq!(manifest.placement, placement);
         assert_eq!(manifest.holder, net.node_id());

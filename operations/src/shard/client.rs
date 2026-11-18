@@ -50,9 +50,7 @@ impl Operation for FetchManifestOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ShardManifest>, ManifestError> {
         match shard_answer(result)? {
-            ShardNetEvent::Manifest(manifest) => {
-                Ok(Next::Done(*manifest.map_err(ManifestError)?))
-            }
+            ShardNetEvent::Manifest(manifest) => Ok(Next::Done(*manifest.map_err(ManifestError)?)),
             ShardNetEvent::NoNetwork => {
                 Err(ManifestError("shard fetch needs a net handle".to_string()))
             }
