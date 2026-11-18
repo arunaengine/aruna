@@ -98,21 +98,12 @@ fn tagged() -> HashMap<String, String> {
 fn run(page: FilePage, read: Result<CrateBytes, CrateReadError>) -> Result<ReleaseView, ViewError> {
     let mut operation = ReleaseViewOperation::new(config(page));
     let first = operation.first();
-    let Ok(Next::Call(IoCall::Effect(effect))) = &first else {
-        panic!("the crate is read first: {first:?}");
-    };
-    let Effect::Net(NetEffect::Release(effect)) = effect.as_ref() else {
-        panic!("the crate is read first: {first:?}");
-    };
-    let ReleaseEffect::ReadCrate(asked) = effect.as_ref() else {
-        panic!("a crate read is asked");
-    };
-    assert_eq!(
-        (asked.key.as_str(), asked.version_id),
-        ("releases/6.0.crate.json", version(9))
+    assert!(
+        matches!(first, Ok(Next::Call(IoCall::Child(_)))),
+        "{first:?}"
     );
-    let event = Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)));
-    match operation.next(IoResult::Event(Box::new(event)))? {
+    let outcome = aruna_core::calls::ChildOutcome::new(read.map(|found| (found, 0u64)));
+    match operation.next(IoResult::Child(outcome))? {
         Next::Done(view) => Ok(view),
         other => panic!("the view finishes: {other:?}"),
     }
@@ -200,7 +191,7 @@ fn refuses_non_releases() {
     assert_eq!(failed, Err(ViewError::Unavailable("down".into())));
     // An event the operation does not wait for ends it with an error.
     let mut operation = ReleaseViewOperation::new(config(all()));
-    let holder = Event::Net(NetEvent::Release(ReleaseEvent::Holder(Err("x".into()))));
+    let holder = aruna_core::events::Event::Delayed;
     assert!(matches!(
         operation.next(IoResult::Event(Box::new(holder))),
         Err(ViewError::Io(IoError::Unexpected { .. }))

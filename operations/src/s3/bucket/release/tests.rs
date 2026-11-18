@@ -18,6 +18,7 @@ use aruna_core::structs::storage::release::RangeMembers;
 use serde_json::json;
 
 use super::access::LoadAccessOperation;
+use super::holder::AskHolderError;
 use super::*;
 use crate::distribution::test_record::{binding, record, secret};
 use crate::driver::{DriverContext, drive};
@@ -176,10 +177,6 @@ fn rows(pointers: &[(Ulid, &str)]) -> IoResult {
     }
 }
 
-fn net(event: NetEvent) -> IoResult {
-    IoResult::Event(Box::new(Event::Net(event)))
-}
-
 fn crate_read(label: &str, pinned: &[String]) -> IoResult {
     let files: Vec<_> = (pinned.iter())
         .map(|id| json!({"@id": id, "@type": "File"}))
@@ -188,25 +185,16 @@ fn crate_read(label: &str, pinned: &[String]) -> IoResult {
     graph.extend(files);
     let bytes = serde_json::to_vec(&json!({ "@graph": graph })).unwrap();
     let metadata = HashMap::from([(RELEASE_TAG.to_string(), label.to_string())]);
-    net(NetEvent::Release(ReleaseEvent::CrateRead(Ok(CrateBytes {
-        metadata,
-        bytes,
-    }))))
+    crate_answer(Ok(CrateBytes { metadata, bytes }))
 }
 
-/// The release effect a step asks for, if it asks for one.
-fn release_effect(turn: &Step) -> Option<&ReleaseEffect> {
-    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
-        return None;
-    };
-    match effect.as_ref() {
-        Effect::Net(NetEffect::Release(effect)) => Some(effect),
-        _ => None,
-    }
+fn crate_answer(read: Result<CrateBytes, CrateReadError>) -> IoResult {
+    let read = read.map(|found| (found, 0u64));
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(read))
 }
 
 fn reads_crate(turn: &Step) -> bool {
-    matches!(release_effect(turn), Some(ReleaseEffect::ReadCrate(_)))
+    matches!(turn, Ok(Next::Call(IoCall::Child(_))))
 }
 
 fn output(turn: Step) -> MembersOutput {
@@ -279,9 +267,7 @@ async fn access_and_tags() {
     assert!(listed.releases.is_empty());
 
     // A gone version and a version without the release tag are no release.
-    let gone = net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
-        CrateReadError::Missing,
-    ))));
+    let gone = crate_answer(Err(CrateReadError::Missing));
     for (answer, complete) in [(gone, true), (crate_read("5.0", &[]), true)] {
         let mut op = operation(&fixture, (&fixture.owner, info.clone()), vec![], None).await;
         let _ = op.first();
@@ -293,9 +279,7 @@ async fn access_and_tags() {
         assert_eq!(output.complete, complete);
     }
     // A crate that cannot be read leaves the answer incomplete.
-    let failed = net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
-        CrateReadError::Failed("backend down".into()),
-    ))));
+    let failed = crate_answer(Err(CrateReadError::Failed("backend down".into())));
     let mut op = operation(
         &fixture,
         (&fixture.owner, info.clone()),
@@ -320,14 +304,14 @@ async fn asks_range_coordinators() {
         .find(|range| range.coordinator != binding(&snapshot, 1, 5).member_id)
         .unwrap();
     let remote_answer = |refused: Vec<Ulid>| {
-        net(NetEvent::Release(ReleaseEvent::Holder(Ok(
-            HolderAnswer::Members(RangeMembers {
+        let answer: Result<HolderAnswer, AskHolderError> =
+            Ok(HolderAnswer::Members(RangeMembers {
                 answers: vec![ReleaseMembers::complete()],
                 releases: Vec::new(),
                 complete: true,
                 refused,
-            }),
-        ))))
+            }));
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(answer))
     };
     // With a bearer the coordinator of the other range is asked, and its answer counts.
     let queries = vec![query("db/a", 1)];
@@ -341,12 +325,15 @@ async fn asks_range_coordinators() {
     assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
     let _ = op.next(set(&bytes));
     let asked = op.next(rows(&[]));
-    let Some(ReleaseEffect::Holder(request)) = release_effect(&asked) else {
-        panic!("the coordinator is asked: {asked:?}");
-    };
-    assert_eq!(request.bearer, "token");
     assert!(
-        matches!(&request.ask, HolderAsk::Members { range_ids, .. } if range_ids == &vec![other.range_id])
+        matches!(asked, Ok(Next::Call(IoCall::Child(_)))),
+        "{asked:?}"
+    );
+    assert_eq!(op.config.bearer.as_deref(), Some("token"));
+    assert!(
+        op.asked
+            .last()
+            .is_some_and(|(_, ranges)| ranges == &vec![other.range_id])
     );
     assert!(output(op.next(remote_answer(Vec::new()))).complete);
 

@@ -29,7 +29,7 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
-use aruna_operations::s3::bucket::release::publish::ReadCrateOperation;
+use aruna_operations::s3::bucket::release::holder::ReadCrateOperation;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -547,10 +547,8 @@ async fn release_crate(
         realm_id,
         node_id,
     };
-    let found = drive(ReadCrateOperation::new(read), context.as_ref()).await;
-    let found = found.unwrap_or_else(|error| Err(CrateReadError::Failed(error.to_string())));
-    match found {
-        Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
+    match drive(ReadCrateOperation::new(read), context.as_ref()).await {
+        Ok((found, _)) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
                 .map_err(|error| ServerError::InternalError(error.into()))
         }

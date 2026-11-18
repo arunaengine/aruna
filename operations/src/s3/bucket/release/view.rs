@@ -5,22 +5,19 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::ReleasePointer;
-use aruna_core::structs::storage::release::{
-    CrateBytes, CrateRead, CrateReadError, ReleaseEffect, ReleaseEvent,
-};
+use aruna_core::structs::storage::release::{CrateBytes, CrateRead, CrateReadError};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
 use super::access::LoadAccessOperation;
+use super::holder::ReadCrateOperation;
 use super::{Access, BucketScope, ReleaseError};
 
 /// The most entries one page lists.
@@ -139,22 +136,12 @@ impl Operation for ReleaseViewOperation {
             realm_id: config.realm_id,
             node_id: config.node_id,
         };
-        let effect = ReleaseEffect::ReadCrate(Box::new(read));
-        let effect = Effect::Net(NetEffect::Release(Box::new(effect)));
-        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+        Ok(Next::Call(IoCall::child(ReadCrateOperation::new(read))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReleaseView>, ViewError> {
-        match result.event()? {
-            Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read))) => {
-                Ok(Next::Done(self.on_crate(read)?))
-            }
-            other => Err(IoError::Unexpected {
-                expected: "ReleaseEvent::CrateRead",
-                got: other.label(),
-            }
-            .into()),
-        }
+        let read = result.child::<(CrateBytes, u64), CrateReadError>()?;
+        Ok(Next::Done(self.on_crate(read.map(|(found, _)| found))?))
     }
 }
 

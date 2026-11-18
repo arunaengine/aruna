@@ -4,14 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
-use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE};
-use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
 use aruna_core::stream::BackendStream;
@@ -29,7 +25,7 @@ use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
 use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::release::{
     CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk, RangeFiles,
-    RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
+    RangeMembers, ReleaseFile,
 };
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::{Key, Value as Row};
@@ -40,6 +36,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::access::LoadAccessOperation;
+use super::holder::{AskHolderError, AskHolderOperation, ReadCrateOperation};
 use super::{
     Access, BucketScope, MembersConfig, MembersOutput, OwnedScope, ReleaseError,
     ReleaseMembersOperation,
@@ -52,9 +49,7 @@ use crate::distribution::routing::local_fence;
 use crate::distribution::status::{StatusError, read_view};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
-};
+use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -209,8 +204,6 @@ const CHANGED: &str = "a pinned file changed while the release was written; publ
 const FILE_PAGE: usize = 256;
 /// Rows read per storage page while looking for a bucket's releases.
 const ROW_PAGE: usize = 256;
-/// How long one question to a range's coordinator may take in all.
-const HOLDER_DEADLINE: Duration = Duration::from_secs(60);
 
 /// One page of release files and the key the next page starts after.
 pub type FilesPage = (Vec<ReleaseFile>, Option<String>);
@@ -450,40 +443,6 @@ fn range_refused(range: &KeyRange) -> PublishError {
     ))
 }
 
-/// A release question to another member under the caller's token.
-fn holder_call(
-    node_id: NodeId,
-    auth_token: AuthToken,
-    bucket: String,
-    ask: HolderAsk,
-) -> Result<IoCall, PublishError> {
-    let frame = encode_message(&MetadataTransportMessage::ReleaseHolder {
-        auth_token: Some(auth_token),
-        bucket,
-        ask,
-    })
-    .map_err(PublishError::Unavailable)?;
-    let request = MetadataRequestEffect {
-        peer: node_id,
-        frame,
-        timeout: HOLDER_DEADLINE,
-    };
-    Ok(Effect::Net(NetEffect::MetadataRequest(Box::new(request))).into())
-}
-
-/// A member's answer; a transport failure reads like an unavailable member.
-fn holder_reply(result: IoResult) -> Result<Result<HolderAnswer, MetadataReadError>, IoError> {
-    let Event::Net(NetEvent::MetadataAnswer(answer)) = result.event()? else {
-        return Ok(Err(MetadataReadError::Unavailable));
-    };
-    let MetadataAnswer { result, .. } = *answer;
-    let reply = result.ok().and_then(|bytes| decode_message(&bytes).ok());
-    Ok(match reply {
-        Some(MetadataTransportMessage::ReleaseHolderResults { result }) => result,
-        _ => Err(MetadataReadError::Unavailable),
-    })
-}
-
 impl CoordinatedFilesOperation {
     fn new(scope: OwnedScope, access: Access, input: PublishInput) -> Self {
         Self {
@@ -517,16 +476,15 @@ impl CoordinatedFilesOperation {
         let Some(bearer) = self.input.bearer.clone() else {
             return Err(range_refused(&range));
         };
-        let token = AuthToken::bearer(bearer).map_err(unavailable)?;
         let ask = HolderAsk::Files {
             range_id: range.range_id,
             prefix: self.input.spec.prefix.clone(),
             skip: self.input.key.clone(),
             after,
         };
-        let call = holder_call(node_id, token, self.scope.bucket.clone(), ask)?;
+        let holder = AskHolderOperation::new(node_id, &bearer, &self.scope.bucket, ask);
         self.step = CoordinatedStep::Remote(range, node_id);
-        Ok(Next::Call(call))
+        Ok(Next::Call(IoCall::child(holder)))
     }
 
     fn next_range(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
@@ -591,18 +549,22 @@ impl Operation for CoordinatedFilesOperation {
                 self.files.extend(files);
                 self.next_range()
             }
-            CoordinatedStep::Remote(range, node_id) => match holder_reply(result)? {
-                Ok(HolderAnswer::Files(listed)) if !listed.refused => {
-                    self.files.extend(listed.files);
-                    match listed.next {
-                        Some(next) => self.ask(range, node_id, Some(next)),
-                        None => self.next_range(),
+            CoordinatedStep::Remote(range, node_id) => {
+                match result.child::<HolderAnswer, AskHolderError>()? {
+                    Ok(HolderAnswer::Files(listed)) if !listed.refused => {
+                        self.files.extend(listed.files);
+                        match listed.next {
+                            Some(next) => self.ask(range, node_id, Some(next)),
+                            None => self.next_range(),
+                        }
                     }
+                    // The coordinator refused a file; the generic refusal names none.
+                    Err(AskHolderError::Refused(MetadataReadError::Forbidden)) => {
+                        Err(PublishError::Forbidden(UNREADABLE))
+                    }
+                    _ => Err(range_refused(&range)),
                 }
-                // The coordinator refused a file; the generic refusal names none.
-                Err(MetadataReadError::Forbidden) => Err(PublishError::Forbidden(UNREADABLE)),
-                _ => Err(range_refused(&range)),
-            },
+            }
         }
     }
 }
@@ -1010,41 +972,6 @@ impl Operation for PublishReleaseOperation {
     }
 }
 
-/// Reads one release crate version on this node with the caller's identity.
-#[derive(Debug, PartialEq)]
-pub struct ReadCrateOperation {
-    read: Option<CrateRead>,
-}
-
-impl ReadCrateOperation {
-    pub fn new(read: CrateRead) -> Self {
-        Self { read: Some(read) }
-    }
-}
-
-impl Operation for ReadCrateOperation {
-    type Output = Result<CrateBytes, CrateReadError>;
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
-        let read = self.read.take().ok_or(IoError::Unfinished)?;
-        let effect = ReleaseEffect::ReadCrate(Box::new(read));
-        Ok(Next::Call(
-            Effect::Net(NetEffect::Release(Box::new(effect))).into(),
-        ))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
-        match result.event()? {
-            Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read))) => Ok(Next::Done(read)),
-            other => Err(IoError::Unexpected {
-                expected: "ReleaseEvent::CrateRead",
-                got: other.label(),
-            }),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 enum HolderStep {
     Bucket,
@@ -1169,12 +1096,9 @@ impl HolderAnswerOperation {
                     realm_id: self.realm_id,
                     node_id: self.node_id,
                 };
-                let read = Box::new(read);
-                let effect = ReleaseEffect::ReadChunk { read, offset };
+                let chunk = ReadCrateOperation::new(read).chunk_at(offset);
                 self.step = HolderStep::Chunk;
-                Ok(Next::Call(
-                    Effect::Net(NetEffect::Release(Box::new(effect))).into(),
-                ))
+                Ok(Next::Call(IoCall::child(chunk)))
             }
         }
     }
@@ -1260,11 +1184,7 @@ impl Operation for HolderAnswerOperation {
                 })))
             }
             HolderStep::Chunk => {
-                let Event::Net(NetEvent::Release(ReleaseEvent::CrateChunk(read))) =
-                    result.event()?
-                else {
-                    return Err(unavailable("no release crate answer"));
-                };
+                let read = result.child::<(CrateBytes, u64), CrateReadError>()?;
                 match read {
                     Ok((found, size)) if found.metadata.contains_key(RELEASE_TAG) => {
                         let bytes = found.bytes;
@@ -1418,21 +1338,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_transport_unavailable() {
-        let peer = iroh::SecretKey::from_bytes(&[3; 32]).public();
-        let answer = MetadataAnswer {
-            peer,
-            elapsed: Duration::ZERO,
-            result: Ok(vec![0xff]),
-        };
-        let event = Event::Net(NetEvent::MetadataAnswer(Box::new(answer)));
-        assert_eq!(
-            holder_reply(IoResult::Event(Box::new(event))),
-            Ok(Err(MetadataReadError::Unavailable))
-        );
-    }
-
-    #[test]
     fn missing_chunk_answers() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
@@ -1444,10 +1349,9 @@ mod tests {
         };
         let mut holder = HolderAnswerOperation::new((realm_id, node), &auth, ("db", ask));
         holder.step = HolderStep::Chunk;
-        let read = ReleaseEvent::CrateChunk(Err(CrateReadError::Missing));
-        let event = Event::Net(NetEvent::Release(read));
+        let read: Result<(CrateBytes, u64), CrateReadError> = Err(CrateReadError::Missing);
         assert_eq!(
-            holder.next(IoResult::Event(Box::new(event))),
+            holder.next(IoResult::Child(ChildOutcome::new(read))),
             Ok(Next::Done(HolderAnswer::Crate(None)))
         );
     }
