@@ -6,28 +6,30 @@ use crate::s3::object::search::{
     ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
     SearchNodePage, SearchObjectsError, SearchObjectsInput,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::table::{metadata_matches, query_terms};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_core::types::{GroupId, Key, TxnId};
+use aruna_core::types::{Key, Value};
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 #[path = "index_search.rs"]
@@ -42,7 +44,9 @@ const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;
 /// Versions one read returns while learning whether a changed key existed at the snapshot.
 const VERSION_BATCH: usize = 64;
 
-#[derive(Debug)]
+type SearchTurn<T> = Result<Next<T>, SearchObjectsError>;
+
+#[derive(Debug, PartialEq)]
 struct LiveHead {
     head: BlobHeadKey,
     cursor_key: Vec<u8>,
@@ -51,101 +55,32 @@ struct LiveHead {
     changed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Candidate {
     hit: SearchNodeHit,
     changed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct HeadCandidate {
     head: BlobHeadKey,
     version_id: ulid::Ulid,
     cursor_key: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct CandidateBatch {
     candidates: Vec<Candidate>,
     next_start: Option<IterStart>,
+    distributed: HashMap<String, bool>,
 }
 
-/// Searches one node's current object heads. Every candidate is authorized on
-/// its full object path; hidden matches are consumed internally and never
-/// affect a returned total or continuation signal.
-pub async fn search_local_objects(
-    context: &DriverContext,
-    input: SearchObjectsInput,
-) -> Result<SearchNodePage, SearchObjectsError> {
-    if let Some(bucket) = input.bucket.as_deref() {
-        let binding = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-            Ok(info) => info.distribution,
-            Err(GetBucketError::NotFound) => None,
-            Err(error) => return Err(SearchObjectsError::Storage(error.to_string())),
-        };
-        if let Some(binding) = binding {
-            let indexes = context.storage_handle.range_indexes();
-            let search = index_search::RangeSearch {
-                binding,
-                indexes,
-                budget: index_search::EXAMINE_BUDGET,
-            };
-            return index_search::search_ranges(context, &input, search).await;
-        }
-    }
-    let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
-    let mut start = (input.start_after.clone()).map(|key| IterStart::After(key.into()));
-    let mut visible = Vec::with_capacity(limit + 1);
-    let mut changed = Vec::new();
-    let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
-    let mut distributed = HashMap::new();
-
-    loop {
-        let batch = scan_candidate_batch(
-            context,
-            &input,
-            start.clone(),
-            HEAD_SCAN_BATCH,
-            &mut distributed,
-        )
-        .await?;
-
-        for candidate in batch.candidates {
-            if !authorize(context, &input, &mut evaluators, &candidate.hit).await? {
-                continue;
-            }
-            if candidate.changed {
-                changed.push(candidate.hit.cursor_key);
-                if changed.len() >= CHANGED_PAGE_CAP {
-                    let next_start_after = changed.last().cloned();
-                    return Ok(node_page(visible, changed, next_start_after, &distributed));
-                }
-                continue;
-            }
-            visible.push(candidate.hit);
-            if visible.len() > limit {
-                let next_start_after = visible
-                    .get(limit - 1)
-                    .map(|candidate| candidate.cursor_key.clone());
-                visible.truncate(limit);
-                changed_until(&mut changed, next_start_after.as_deref());
-                return Ok(node_page(visible, changed, next_start_after, &distributed));
-            }
-        }
-
-        match batch.next_start {
-            Some(next) => start = Some(next),
-            None => return Ok(node_page(visible, changed, None, &distributed)),
-        }
-    }
-}
-
-/// A page of a scan; the distributed buckets it skipped count as unsearched, since only their
+/// One page of a scan; the distributed buckets it skipped count as unsearched, since only their
 /// range indexes cover them.
 fn node_page(
     hits: Vec<SearchNodeHit>,
     changed: Vec<Vec<u8>>,
-    next_start_after: Option<Vec<u8>>,
+    (next_start_after, now_ms): (Option<Vec<u8>>, u64),
     distributed: &HashMap<String, bool>,
 ) -> SearchNodePage {
     let mut skipped_buckets: Vec<String> = (distributed.iter())
@@ -156,7 +91,7 @@ fn node_page(
     SearchNodePage {
         hits,
         next_start_after,
-        observed_at: SystemTime::now(),
+        observed_at: UNIX_EPOCH + Duration::from_millis(now_ms),
         incomplete_ranges: skipped_buckets.len(),
         remote_ranges: 0,
         index_progress: Vec::new(),
@@ -174,212 +109,150 @@ pub(crate) fn changed_until(changed: &mut Vec<Vec<u8>>, next: Option<&[u8]>) {
     }
 }
 
-/// Whether the caller may read the hit: group READ on its full object path, token path
-/// restrictions and the request policies of its group.
-async fn authorize(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
-    candidate: &SearchNodeHit,
-) -> Result<bool, SearchObjectsError> {
-    let path = object_permission_path(
-        input.realm_id,
-        candidate.hit.group_id,
-        input.node_id,
-        &candidate.hit.bucket,
-        &candidate.hit.key,
-    );
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
+/// Where a permission check of one hit stands.
+enum Checked {
+    Call(IoCall),
+    Decided(bool),
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum CheckWait {
+    #[default]
+    Permission,
+    Policy(String),
+}
+
+/// Whether the caller may read a hit: group READ on its full object path, token path
+/// restrictions and the request policies of its group, each loaded once.
+#[derive(Debug, Default, PartialEq)]
+struct HitCheck {
+    evaluators: PolicyEvaluators,
+    path: String,
+    wait: CheckWait,
+}
+
+impl HitCheck {
+    fn begin(&mut self, input: &SearchObjectsInput, hit: &SearchNodeHit) -> IoCall {
+        self.path = object_permission_path(
+            input.realm_id,
+            hit.hit.group_id,
+            input.node_id,
+            &hit.hit.bucket,
+            &hit.hit.key,
+        );
+        self.wait = CheckWait::Permission;
+        IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: input.auth.clone(),
-            path: path.clone(),
+            path: self.path.clone(),
             required_permission: Permission::READ,
-        }),
-        context,
-    )
-    .await
-    .unwrap_or(false);
-    if !allowed {
-        return Ok(false);
+        }))
     }
-    let policy_scope = (input.realm_id, candidate.hit.group_id);
-    if !evaluators.contains_key(&policy_scope) {
-        evaluators.extend(drive(PolicyBulkOperation::new(vec![policy_scope]), context).await?);
-    }
-    let request = policy_request_with(
-        &path,
-        &Permission::READ,
-        Some(&input.auth),
-        PolicyRequestExtras::rest(),
-    );
-    match evaluators
-        .get(&policy_scope)
-        .ok_or(SearchObjectsError::Unavailable)?
-        .evaluate(&request)
-    {
-        Ok(()) => Ok(true),
-        Err(PolicyEnforcementError::Denied { .. }) => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
 
-async fn scan_candidate_batch(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    start: Option<IterStart>,
-    scan_limit: usize,
-    distributed: &mut HashMap<String, bool>,
-) -> Result<CandidateBatch, SearchObjectsError> {
-    let txn_id = start_read(context).await?;
-    let result = scan_candidates(context, input, start, scan_limit, txn_id, distributed).await;
-    finish_read(context, txn_id, result).await
-}
-
-async fn start_read(context: &DriverContext) -> Result<TxnId, SearchObjectsError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        event => Err(storage_event_error(event)),
-    }
-}
-
-/// Commits the read transaction after `result`, or aborts it after an error.
-async fn finish_read<T>(
-    context: &DriverContext,
-    txn_id: TxnId,
-    result: Result<T, SearchObjectsError>,
-) -> Result<T, SearchObjectsError> {
-    let completion = if result.is_ok() {
-        StorageEffect::CommitTransaction { txn_id }
-    } else {
-        StorageEffect::AbortTransaction { txn_id }
-    };
-    let completion = context.storage_handle.send_storage_effect(completion).await;
-
-    match result {
-        Err(error) => Err(error),
-        Ok(batch) => match completion {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(batch),
-            event => Err(storage_event_error(event)),
-        },
-    }
-}
-
-async fn scan_candidates(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    start: Option<IterStart>,
-    scan_limit: usize,
-    txn_id: TxnId,
-    distributed: &mut HashMap<String, bool>,
-) -> Result<CandidateBatch, SearchObjectsError> {
-    let (heads, next_start) =
-        scan_heads(context, input, start, scan_limit, txn_id, distributed).await?;
-    let mut live = load_live(context, input, heads, txn_id).await?;
-    retain_matches(input, &mut live);
-    let candidates = build_hits(context, input, live, txn_id).await?;
-
-    Ok(CandidateBatch {
-        candidates,
-        next_start,
-    })
-}
-
-async fn scan_heads(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    start: Option<IterStart>,
-    scan_limit: usize,
-    txn_id: TxnId,
-    distributed: &mut HashMap<String, bool>,
-) -> Result<(Vec<HeadCandidate>, Option<IterStart>), SearchObjectsError> {
-    let prefix = match (input.bucket.as_deref(), input.key_match) {
-        (Some(bucket), ObjectKeyMatch::Prefix) => {
-            Some(BlobHeadKey::object_prefix(bucket, &input.query)?)
+    fn answer(
+        &mut self,
+        input: &SearchObjectsInput,
+        hit: &SearchNodeHit,
+        result: IoResult,
+    ) -> Result<Checked, SearchObjectsError> {
+        let scope = (input.realm_id, hit.hit.group_id);
+        match std::mem::take(&mut self.wait) {
+            CheckWait::Permission => {
+                if !(result.child::<bool, AuthorizationError>()?).unwrap_or(false) {
+                    return Ok(Checked::Decided(false));
+                }
+                if !self.evaluators.contains_key(&scope) {
+                    self.wait = CheckWait::Policy(self.path.clone());
+                    let bulk = PolicyBulkOperation::new(vec![scope]);
+                    return Ok(Checked::Call(IoCall::child(bulk)));
+                }
+            }
+            CheckWait::Policy(_) => {
+                let loaded = result.child::<PolicyEvaluators, PolicyEnforcementError>()??;
+                self.evaluators.extend(loaded);
+            }
         }
-        (Some(bucket), ObjectKeyMatch::Substring | ObjectKeyMatch::Metadata) => {
-            Some(BlobHeadKey::bucket_prefix(bucket)?)
-        }
-        (None, _) => None,
-    };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: aruna_core::keyspaces::BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: prefix.map(Into::into),
-            start,
-            limit: scan_limit,
-            txn_id: Some(txn_id),
-        })
-        .await;
-    let Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after,
-    }) = event
-    else {
-        return Err(storage_event_error(event));
-    };
-    let mut next_start = next_start_after.map(IterStart::After);
-    if input.bucket.is_none() {
-        learn_buckets(context, &values, txn_id, distributed).await?;
-    }
-    let mut heads = Vec::new();
-    for (key, value) in values {
-        let head = BlobHeadKey::from_bytes(key.as_ref())?;
-        if distributed.get(&head.bucket) == Some(&true) {
-            // "{bucket}0" is the first head key after every key of the bucket.
-            let after_bucket = format!("{}0", head.bucket).into_bytes();
-            next_start = Some(IterStart::At(after_bucket.into()));
-            break;
-        }
-        if !input.key_match.matches(&head.key, &input.query) {
-            continue;
-        }
-        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-        heads.push(HeadCandidate {
-            head,
-            version_id: pointer.version_id,
-            cursor_key: key.to_vec(),
-        });
-    }
-    Ok((heads, next_start))
-}
-
-/// Records which buckets of a realm-wide batch are distributed. Their keys are searched only
-/// through their range indexes, so a realm-wide scan skips them.
-async fn learn_buckets(
-    context: &DriverContext,
-    values: &[(Key, aruna_core::types::Value)],
-    txn_id: TxnId,
-    distributed: &mut HashMap<String, bool>,
-) -> Result<(), SearchObjectsError> {
-    let mut names = Vec::new();
-    for (key, _) in values {
-        let head = BlobHeadKey::from_bytes(key.as_ref())?;
-        if !distributed.contains_key(&head.bucket) && !names.contains(&head.bucket) {
-            names.push(head.bucket);
+        let request = policy_request_with(
+            &self.path,
+            &Permission::READ,
+            Some(&input.auth),
+            PolicyRequestExtras::rest(),
+        );
+        let evaluator = (self.evaluators.get(&scope)).ok_or(SearchObjectsError::Unavailable)?;
+        match evaluator.evaluate(&request) {
+            Ok(()) => Ok(Checked::Decided(true)),
+            Err(PolicyEnforcementError::Denied { .. }) => Ok(Checked::Decided(false)),
+            Err(error) => Err(error.into()),
         }
     }
-    let reads = (names.iter())
-        .map(|name| {
-            (
-                S3_BUCKET_KEYSPACE.to_string(),
-                Key::from(name.as_bytes().to_vec()),
-            )
-        })
-        .collect();
-    let buckets = batch_read(context, reads, txn_id).await?;
-    for (name, (_, bucket)) in names.into_iter().zip(buckets) {
-        let bucket = bucket
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()?;
-        let bound = bucket.is_some_and(|bucket| bucket.distribution.is_some());
-        distributed.insert(name, bound);
+}
+
+/// How walking the candidates of a page goes on.
+enum WalkTurn {
+    Call(IoCall),
+    /// Every candidate was looked at and the page has room.
+    Drained,
+    /// The page is full and continues after this position.
+    Full(Option<Vec<u8>>),
+}
+
+/// Authorizes candidates one after another and collects the page they make.
+#[derive(Debug, Default, PartialEq)]
+struct HitWalk {
+    check: HitCheck,
+    pending: VecDeque<Candidate>,
+    current: Option<Candidate>,
+    visible: Vec<SearchNodeHit>,
+    changed: Vec<Vec<u8>>,
+}
+
+impl HitWalk {
+    fn add(&mut self, candidates: Vec<Candidate>) {
+        self.pending.extend(candidates);
     }
-    Ok(())
+
+    fn advance(&mut self, input: &SearchObjectsInput) -> WalkTurn {
+        let Some(candidate) = self.pending.pop_front() else {
+            return WalkTurn::Drained;
+        };
+        let call = self.check.begin(input, &candidate.hit);
+        self.current = Some(candidate);
+        WalkTurn::Call(call)
+    }
+
+    fn answer(
+        &mut self,
+        input: &SearchObjectsInput,
+        result: IoResult,
+    ) -> Result<WalkTurn, SearchObjectsError> {
+        let candidate = self.current.take().ok_or(IoError::Unfinished)?;
+        match self.check.answer(input, &candidate.hit, result)? {
+            Checked::Call(call) => {
+                self.current = Some(candidate);
+                Ok(WalkTurn::Call(call))
+            }
+            Checked::Decided(false) => Ok(self.advance(input)),
+            Checked::Decided(true) => Ok(self.accept(input, candidate)),
+        }
+    }
+
+    fn accept(&mut self, input: &SearchObjectsInput, candidate: Candidate) -> WalkTurn {
+        if candidate.changed {
+            self.changed.push(candidate.hit.cursor_key);
+            if self.changed.len() >= CHANGED_PAGE_CAP {
+                return WalkTurn::Full(self.changed.last().cloned());
+            }
+            return self.advance(input);
+        }
+        self.visible.push(candidate.hit);
+        let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
+        if self.visible.len() <= limit {
+            return self.advance(input);
+        }
+        let next = (self.visible.get(limit - 1)).map(|hit| hit.cursor_key.clone());
+        self.visible.truncate(limit);
+        changed_until(&mut self.changed, next.as_deref());
+        WalkTurn::Full(next)
+    }
 }
 
 /// Keeps the heads whose loaded version matches a metadata query; key queries keep every head.
