@@ -43,7 +43,6 @@ use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::keyspaces::{
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
 };
-use aruna_core::node_facts::NodeFacts;
 use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::SetDrainOperation;
 use aruna_core::placement::{build_view, held_buckets};
