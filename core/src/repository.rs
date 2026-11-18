@@ -14,13 +14,14 @@ mod credential;
 pub use credential::RepositoryCredential;
 pub mod fields;
 pub mod invenio;
+pub mod remote;
 mod kind;
 pub use kind::{KindDescriptor, RequirementProfile, builtin_profile, descriptor, kinds};
 mod link;
 pub mod rules;
 pub use link::*;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryQuery {
     pub group_id: Ulid,
     pub connector_id: Ulid,

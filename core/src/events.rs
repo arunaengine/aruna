@@ -359,6 +359,8 @@ pub enum BlobEvent {
     BucketDeleted {
         deleted: bool,
     },
+    /// The answer to a repository, provider or stored artifact call.
+    Remote(Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -514,6 +516,8 @@ pub enum NetEvent {
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
     DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
+    /// The end of a routed harvest metadata write.
+    HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -884,6 +888,7 @@ impl Event {
                     BucketReady,
                     BucketExists,
                     BucketDeleted,
+                    Remote,
                 }
             ),
             Event::StagingSource(event) => variant_label!(
@@ -947,6 +952,7 @@ impl Event {
                     ArtifactStored,
                     MetadataAnswer,
                     DatasetSummary,
+                    HarvestWrite,
                     WritePeerAuth,
                     GrantSign,
                     Notification,

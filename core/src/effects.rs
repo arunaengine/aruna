@@ -464,6 +464,9 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// One repository, provider or stored artifact call of a job or link; answers
+    /// `BlobEvent::Remote`.
+    Remote(Box<crate::repository::remote::RemoteRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +800,9 @@ pub enum NetEffect {
     WritePeerAuth(Box<WritePeerRequest>),
     /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
     DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
+    /// Routes one harvest metadata write to the document's holders; answers
+    /// `NetEvent::HarvestWrite`.
+    HarvestWrite(Box<crate::repository::remote::HarvestWrite>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
