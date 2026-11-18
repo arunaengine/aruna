@@ -444,16 +444,14 @@ mod tests {
     use tempfile::tempdir;
 
     use std::collections::BTreeSet;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     use aruna_core::calls::Next;
     use aruna_core::operation::Operation;
     use aruna_core::structs::execution::job::{CapturedInput, ExecutionSpec};
-    use aruna_core::structs::identity::auth::Permission;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
-    use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+    use aruna_core::structs::storage::blob::bucket_permission_path;
     use aruna_core::structs::storage::distribution::source_root::RootEntry;
-    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::origin::SourcePin;
 
     use super::super::credential::{
@@ -465,7 +463,6 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::s3::access::get::GetAccessOperation;
-    use crate::s3::bucket::create::CreateBucketOperation;
 
     fn run_of(
         context: &DriverContext,

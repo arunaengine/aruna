@@ -3,11 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::format::Compression;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::job_calls::insert_job;
+use crate::job_calls::record_attempt_intent;
+use crate::job_calls::reserve_output_commits;
 use aruna_blob::blob::BlobHandler;
-use aruna_compute::ExecutorBackend;
+use aruna_compute::{ExecutorBackend, ExecutorRegistry};
 use aruna_core::UserId;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
@@ -23,8 +26,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     AttemptControl, AttemptIntent, CapturedInput, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, OutputDestination,
-    OutputSelection, WorkspaceMode,
+    InputSource, JobClaim, JobError, JobId, JobPayload, JobRecord, JobState, OutputDestination,
+    OutputObject, OutputSelection, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -39,12 +42,11 @@ use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::driver::{DriverContext, drive};
-use crate::job_calls::reserve_output_commits;
-use crate::job_calls::insert_job;
-use crate::job_calls::record_attempt_intent;
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::jobs::workflow::workspace::{capture_outputs, load_direct_inputs};
+use aruna_operations::jobs::workflow::credential::RunIdentity;
+use aruna_operations::jobs::workflow::inputs::LoadInputsOperation;
+use aruna_operations::jobs::workflow::outputs::{CaptureOutputsOperation, CaptureScope};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
@@ -54,6 +56,7 @@ use aruna_operations::s3::object::put::{
 use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
+use aruna_operations::tasks::job_runner::under_lease;
 use aruna_storage::storage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use futures_util::StreamExt;
@@ -427,6 +430,52 @@ fn job_record(harness: &Harness, spec: &ExecutionSpec) -> JobRecord {
         1,
         None,
     )
+}
+
+/// Opens the inputs of a run that are not in `mounted`, as its preparation does.
+async fn load_direct_inputs(
+    driver: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    mounted: &BTreeSet<String>,
+) -> Result<Vec<TaskInput>, JobError> {
+    let realm_id = driver.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    let job = Arc::new(record.clone());
+    drive(LoadInputsOperation::new(run, spec, job, mounted), driver).await
+}
+
+/// Captures the outputs of a run from `backend`, under its lease and until `cancel`.
+async fn capture_outputs(
+    driver: &DriverContext,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    (node_id, cancel): (NodeId, &CancellationToken),
+) -> Result<Vec<OutputObject>, JobError> {
+    let mut driver = driver.clone();
+    let registry = ExecutorRegistry::new().with_backend(backend.clone());
+    driver.compute_handle = Some(Arc::new(registry));
+    let realm_id = driver.serving_realm(record.created_by.realm_id);
+    let capture = CaptureOutputsOperation::new(CaptureScope {
+        kind: backend.kind(),
+        fence: fence.clone(),
+        spec: Arc::new(spec.clone()),
+        record: Arc::new(record.clone()),
+        run: RunIdentity::new(spec, record, realm_id, node_id),
+        routing: node_routing(&driver),
+        until_stop: true,
+    });
+    let token = record
+        .claim
+        .as_ref()
+        .expect("the run is claimed")
+        .claim_token;
+    under_lease(&driver, (record.job_id, token), cancel.clone(), capture)
+        .await
+        .expect("the run keeps its lease")
 }
 
 async fn read_input(input: TaskInput) -> Vec<u8> {

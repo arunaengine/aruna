@@ -7,7 +7,6 @@ use super::credential::{MintCredentialOperation, RunIdentity, WorkspaceAccessOpe
 use super::finalize::exit_message;
 use super::inventory::CollectOutputsOperation;
 use super::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec};
-use super::reconcile::ResumeAttemptOperation;
 use super::settle::{ParkAttemptOperation, SettleScope};
 use super::supervise::WalltimeAnchorOperation;
 use super::*;
@@ -229,6 +228,21 @@ async fn prepare_workspace(
     let realm_id = context.serving_realm(record.created_by.realm_id);
     let run = RunIdentity::new(spec, record, realm_id, node_id);
     drive(WorkspaceAccessOperation::existing(run, bucket), context).await
+}
+
+async fn prepare_attempt(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    bucket: &str,
+) -> Result<PreparedTask, JobError> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    let job = (Arc::new(spec.clone()), Arc::new(record.clone()));
+    let key = run_wiring(context).encryption_key;
+    let prepare = PrepareAttemptOperation::new(run, job, bucket, key, false);
+    drive(prepare, context).await
 }
 
 async fn pre_submit_failure(
@@ -1693,11 +1707,9 @@ async fn recovery_reuses_credential() {
     })
     .await
     .unwrap();
-    let first = Box::pin(super::prepare::prepare_attempt(
-        &ctx, &spec, &record, local, "ws-test",
-    ))
-    .await
-    .unwrap();
+    let first = Box::pin(prepare_attempt(&ctx, &spec, &record, local, "ws-test"))
+        .await
+        .unwrap();
     assert_eq!(first.mounts.len(), 1);
     let fence = fence(&attempt);
     let dyn_backend: Arc<dyn ExecutorBackend> = backend.clone();
@@ -1747,7 +1759,7 @@ async fn workspace_run_credential() {
     })
     .await
     .unwrap();
-    let prepare = || super::prepare::prepare_attempt(&ctx, &spec, &record, local, "ws-test");
+    let prepare = || prepare_attempt(&ctx, &spec, &record, local, "ws-test");
     let plain = Box::pin(prepare()).await.unwrap();
     assert!(plain.workspace.is_none());
     assert!(plain.secrets.is_empty());
