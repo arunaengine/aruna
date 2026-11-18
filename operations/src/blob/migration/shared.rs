@@ -37,20 +37,20 @@ impl MigrationError {
 }
 
 /// Reads the encryption settings of `bucket`; [`is_encrypted`] takes the answer.
-pub(super) fn encryption_read(bucket: &str) -> IoCall {
+pub(crate) fn encryption_read(bucket: &str) -> IoCall {
     read_row(BUCKET_ENCRYPTION_KEYSPACE, bucket.as_bytes().to_vec())
 }
 
-pub(super) fn is_encrypted(value: Option<Value>) -> Result<bool, MigrationError> {
+pub(crate) fn is_encrypted(value: Option<Value>) -> Result<bool, MigrationError> {
     Ok(BucketEncryption::from_row(value.as_deref())?.is_encrypted())
 }
 
 /// Resolves the routing a move of `bucket` uses; [`routing_result`] takes the answer.
-pub(super) fn routing_call(routing: NodeRouting, bucket: &str) -> IoCall {
+pub(crate) fn routing_call(routing: NodeRouting, bucket: &str) -> IoCall {
     IoCall::child(BucketRoutingOperation::new(routing, bucket))
 }
 
-pub(super) fn routing_result(result: IoResult) -> Result<Option<RoutingSnapshot>, MigrationError> {
+pub(crate) fn routing_result(result: IoResult) -> Result<Option<RoutingSnapshot>, MigrationError> {
     (result.child::<Option<RoutingSnapshot>, ImportRowsError>()?).map_err(MigrationError::failed)
 }
 
