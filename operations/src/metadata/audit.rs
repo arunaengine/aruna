@@ -604,12 +604,11 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::metadata::audit_entry::{audit_member, authorize_admin, list_audit};
     use crate::metadata::protocol::MetadataReadError;
-    use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
+    use crate::metadata::repository::{audit_entry, metadata_audit_key};
     use aruna_core::UserId;
     use aruna_core::audit::AUDIT_KEY_BYTES;
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::AuthToken;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
@@ -1522,10 +1521,8 @@ mod tests {
             (first_doc, Ulid::from_bytes([7u8; 16])),
             (second_doc, Ulid::from_bytes([8u8; 16])),
         ] {
-            let effect =
-                write_audit_effect(&record(group_id, document_id, realm_id), audit_id, None)
-                    .unwrap();
-            context.storage_handle.send_effect(effect).await;
+            let row = audit_entry(&record(group_id, document_id, realm_id), audit_id).unwrap();
+            crate::testing::write_entries(&context.storage_handle, vec![row]).await;
         }
 
         let first = crate::driver::drive(

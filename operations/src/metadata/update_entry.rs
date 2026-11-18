@@ -5,6 +5,7 @@
 
 use std::future::Future;
 
+use aruna_core::calls::IoError;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -65,7 +66,7 @@ async fn ready_base(
         match storage.send_storage_effect(effect).await {
             Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
             Event::Storage(StorageEvent::Error { error }) => Err(UpdateDocumentError::from(error)),
-            _ => Err(UpdateDocumentError::MissingTransaction),
+            _ => Err(unanswered("a storage page")),
         }
     };
     let newest = read(StorageEffect::Last {
@@ -90,7 +91,7 @@ async fn ready_base(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(UpdateDocumentError::MissingTransaction),
+        _ => return Err(unanswered("a storage read")),
     };
     let status =
         status.and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
@@ -140,7 +141,7 @@ async fn unprojected(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            _ => return Err(UpdateDocumentError::MissingTransaction),
+            _ => return Err(unanswered("a storage page")),
         };
         for (key, _) in values {
             let read = StorageEffect::Read {
@@ -151,7 +152,7 @@ async fn unprojected(
             let logged = match storage.send_storage_effect(read).await {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
                 Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-                _ => return Err(UpdateDocumentError::MissingTransaction),
+                _ => return Err(unanswered("a storage read")),
             };
             let event =
                 logged.and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
@@ -216,5 +217,13 @@ pub fn update_metadata_document(
             metadata_handle.upsert_cached_at(updated.clone(), cache_generation);
         }
         Ok(updated)
+    })
+}
+
+/// The error for a storage answer of the wrong kind.
+fn unanswered(expected: &'static str) -> UpdateDocumentError {
+    UpdateDocumentError::Io(IoError::Unexpected {
+        expected,
+        got: "another event",
     })
 }
