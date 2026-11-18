@@ -302,8 +302,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::executor::{JobContext, ProgressReporter};
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::record_attempt_intent;
+    use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;

@@ -602,9 +602,12 @@ impl Operation for ResumeAttemptOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverContext;
     use crate::jobs::JOB_MAX_ATTEMPTS;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::record_attempt_intent;
+    use crate::jobs::runtime::JobsRuntime;
+    use crate::jobs::store::test_calls::{insert_job, read_job_record, record_attempt_intent};
+    use crate::tasks::job_reconcile::ExternalReconciler;
+    use crate::tasks::job_runner::ComputeReconciler;
     use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::UserId;
