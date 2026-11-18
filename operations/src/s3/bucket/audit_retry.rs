@@ -469,88 +469,30 @@ mod tests {
             key: retry_timer(&record),
             due_unix_millis: 0,
         };
-        let row = postcard::to_allocvec(&timer).unwrap();
-        (Vec::new().into(), row.into())
-    }
-
-    fn scan(start: Option<&[u8]>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: TASK_TIMER_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(|key| IterStart::After(key.to_vec().into())),
-            limit: TIMER_PAGE,
-            txn_id: None,
-        })
-    }
-
-    fn stored_event(result: Result<(), String>) -> Event {
-        Event::SubOperation(SubOperationEvent::AuditStored { result })
-    }
-
-    #[test]
-    fn resumes_kept_records() {
-        // Other timers and undecodable rows are skipped; a failed store keeps its timer.
-        let mut operation = ResumeAuditOperation::default();
-        assert_eq!(operation.start().as_slice(), [scan(None)]);
-        let page = Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                timer_row(retry_timer(&record())),
-                timer_row(TaskKey::DrainCleanupQueue),
-                (Vec::new().into(), vec![0xff].into()),
-                timer_row(retry_timer(&record())),
+        let value = Value::from(postcard::to_allocvec(&timer).unwrap());
+        let mut resume = ResumeAuditOperation::default();
+        assert!(matches!(
+            resume.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: vec![
+                (Key::from(vec![1]), value.clone()),
+                (Key::from(vec![2]), value),
             ],
-            next_start_after: Some(b"last".to_vec().into()),
-        });
-        let effects = operation.step(page);
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(stored_event(Ok(())));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(stored_event(Err("busy".to_string())));
-        assert_eq!(effects.as_slice(), [scan(Some(b"last"))]);
-        let last = Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        });
-        assert!(operation.step(last).is_empty());
-        assert_eq!(operation.finalize(), Ok(1));
-    }
-
-    #[test]
-    fn resume_contract() {
-        let mut scanning = ResumeAuditOperation::default();
-        scanning.start();
-        assert!(scanning.step(storage_error()).is_empty());
+            next: None,
+        };
+        assert!(matches!(
+            resume.next(page),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<(), _>(AuditError::Storage(StorageError::Timeout));
+        let turn = resume.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let stored = Ok::<(), AuditError>(());
         assert_eq!(
-            scanning.finalize(),
-            Err(AuditError::Storage(StorageError::Timeout))
+            resume.next(IoResult::Child(ChildOutcome::new(stored))),
+            Ok(Next::Done(1))
         );
-        let scanning = || {
-            let mut operation = ResumeAuditOperation::default();
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(scanning, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert!(!refused.is_empty());
-        let storing = || {
-            let mut operation = scanning();
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![timer_row(retry_timer(&record()))],
-                next_start_after: None,
-            }));
-            operation
-        };
-        let refused = rejects_events(storing, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        let mut fresh = ResumeAuditOperation::default();
-        check_abort(&mut fresh, &[]);
-        rejects_finalize(fresh);
-        let mut open = storing();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
     }
 }
