@@ -870,7 +870,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -1173,13 +1173,10 @@ mod tests {
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
         let net = NetHandle::new(
             NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
                 secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
                 realm_id,
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
                 sync_storage_path: Some(dir.path().join("document-sync")),
-                ..NetConfig::default()
+                ..crate::testing::local_net()
             },
             storage.clone(),
         )
@@ -1635,7 +1632,7 @@ mod tests {
         let dir = tempdir().expect("tempdir must open");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
-        let net = NetHandle::new(NetConfig::default(), storage.clone())
+        let net = NetHandle::new(crate::testing::local_net(), storage.clone())
             .await
             .expect("net must open");
         let context = Arc::new(DriverContext {

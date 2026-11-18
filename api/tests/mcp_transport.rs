@@ -26,7 +26,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -86,7 +86,7 @@ async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: 
 async fn setup_fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(root.path().to_str().unwrap()).unwrap();
-    let net = NetHandle::new(NetConfig::default(), storage.clone())
+    let net = NetHandle::new(aruna_operations::testing::local_net(), storage.clone())
         .await
         .unwrap();
     let node_id = net.node_id();
