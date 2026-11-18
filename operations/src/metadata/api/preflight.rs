@@ -416,16 +416,15 @@ pub(crate) async fn references_preflight_local(
         let mut after = None;
         let mut found = 0usize;
         loop {
-            let page = crate::metadata::iri_index::read_backlinks(
-                &context.storage_handle,
-                iri,
-                None,
-                after,
-                request.limit.saturating_add(1),
-                &mut budget,
-            )
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            let read = crate::metadata::iri_index::BacklinksOperation::new(
+                (iri, None),
+                (after, request.limit.saturating_add(1)),
+                budget,
+            );
+            let (page, left) = drive(read, context)
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            budget = left;
             for (document_id, postings) in page.documents {
                 let record = match records.get(&document_id) {
                     Some(record) => record.clone(),

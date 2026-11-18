@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -17,6 +18,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{iri_object_prefix, iri_reference_entry, iri_reference_prefix};
 use aruna_core::structs::storage::data::link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -26,6 +28,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::call_results::page_rows;
 use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 
@@ -52,8 +55,6 @@ pub(crate) enum MetadataIriError {
     DataLink(#[from] DataLinkError),
     #[error("unexpected metadata IRI reference index event: {0}")]
     UnexpectedEvent(String),
-    #[error("metadata IRI backlink lookup exceeded its budget")]
-    BudgetExhausted,
 }
 
 impl From<MetadataIriError> for MetadataError {
@@ -122,126 +123,185 @@ pub(crate) async fn plan_iri_rows(
 
 /// One page of the postings that name an object: every row of at most `limit` documents
 /// after the requested one, by document id. `next` is the last document when more may follow.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct BacklinkPage {
     pub documents: BTreeMap<Ulid, Vec<IriIndexRecord>>,
     pub next: Option<Ulid>,
 }
 
-/// Reads one page of the postings that name `object_iri`. Without a predicate, each
-/// predicate group under the object is found by one seek and read from `after` on.
-pub(crate) async fn read_backlinks(
-    storage: &StorageHandle,
-    object_iri: &str,
-    predicate_iri: Option<&str>,
-    after: Option<Ulid>,
-    limit: usize,
-    budget: &mut LinkBudget,
-) -> Result<BacklinkPage, MetadataIriError> {
-    let limit = limit.max(1);
-    let mut documents = BTreeMap::<Ulid, Vec<IriIndexRecord>>::new();
-    let mut truncated = false;
-    let group = GroupRead {
-        object_iri,
-        predicate_iri,
-        after,
-        limit,
-    };
-    match predicate_iri {
-        Some(predicate) => {
-            let prefix = iri_reference_prefix(predicate, object_iri);
-            truncated = group.read(storage, prefix, budget, &mut documents).await?;
-        }
-        None => {
-            let object = iri_object_prefix(object_iri);
-            let mut start = IterStart::At(object.clone());
-            loop {
-                if !budget.take_seek() {
-                    return Err(MetadataIriError::BudgetExhausted);
-                }
-                let (values, _) = iter_page(
-                    storage,
-                    IRI_INDEX_KEYSPACE,
-                    Some(object.clone()),
-                    Some(start),
-                    1,
-                )
-                .await?;
-                let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
-                    break;
-                };
-                let next = prefix_upper_bound(prefix);
-                let prefix = ByteView::from(prefix.to_vec());
-                truncated |= group.read(storage, prefix, budget, &mut documents).await?;
-                let Some(next) = next else {
-                    break;
-                };
-                start = IterStart::At(ByteView::from(next));
-            }
+/// Why a backlink page could not be read.
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum BacklinkError {
+    #[error("metadata IRI backlink lookup exceeded its budget")]
+    BudgetExhausted,
+    /// A stored row does not decode: callers charge it to the document.
+    #[error("metadata IRI backlink row is malformed: {0}")]
+    Malformed(String),
+    #[error("metadata IRI backlink read failed: {0}")]
+    Unavailable(String),
+}
+
+impl From<aruna_core::calls::IoError> for BacklinkError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Codec(error) => Self::Malformed(error),
+            other => Self::Unavailable(other.to_string()),
         }
     }
-    let more = truncated || documents.len() > limit;
-    let documents: BTreeMap<_, _> = documents.into_iter().take(limit).collect();
-    let next = if more {
-        documents.keys().next_back().copied()
-    } else {
-        None
-    };
-    Ok(BacklinkPage { documents, next })
 }
 
-/// One object and predicate group of a backlink page.
-struct GroupRead<'a> {
-    object_iri: &'a str,
-    predicate_iri: Option<&'a str>,
+#[derive(Debug, PartialEq)]
+enum BacklinkStage {
+    /// The seek for the next predicate group under the object.
+    Group,
+    /// The rows of the group with this prefix.
+    Rows(Vec<u8>),
+}
+
+/// Reads one page of the postings that name `object_iri`, within `budget`, which comes back
+/// with what is left. Without a predicate, each predicate group under the object is found by
+/// one seek and read from `after` on. Hash collisions are dropped by comparing stored IRIs.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BacklinksOperation {
+    object_iri: String,
+    predicate_iri: Option<String>,
     after: Option<Ulid>,
     limit: usize,
+    budget: LinkBudget,
+    start: Option<Vec<u8>>,
+    documents: BTreeMap<Ulid, Vec<IriIndexRecord>>,
+    truncated: bool,
+    stage: BacklinkStage,
 }
 
-impl GroupRead<'_> {
-    /// Reads up to `limit + 1` rows of the group after the page start; `true` when more
-    /// rows may follow. Hash collisions are dropped by comparing the stored IRIs.
-    async fn read(
-        &self,
-        storage: &StorageHandle,
-        prefix: ByteView,
-        budget: &mut LinkBudget,
-        documents: &mut BTreeMap<Ulid, Vec<IriIndexRecord>>,
-    ) -> Result<bool, MetadataIriError> {
-        if !budget.take_seek() {
-            return Err(MetadataIriError::BudgetExhausted);
+type BacklinkTurn = Result<Next<(BacklinkPage, LinkBudget)>, BacklinkError>;
+
+fn index_iter(prefix: Vec<u8>, start: IterStart, limit: usize) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
+        key_space: IRI_INDEX_KEYSPACE.to_string(),
+        prefix: Some(ByteView::from(prefix)),
+        start: Some(start),
+        limit,
+        txn_id: None,
+    })))
+}
+
+impl BacklinksOperation {
+    pub(crate) fn new(
+        (object_iri, predicate_iri): (&str, Option<&str>),
+        (after, limit): (Option<Ulid>, usize),
+        budget: LinkBudget,
+    ) -> Self {
+        Self {
+            object_iri: object_iri.to_string(),
+            predicate_iri: predicate_iri.map(str::to_string),
+            after,
+            limit: limit.max(1),
+            budget,
+            start: Some(iri_object_prefix(object_iri).to_vec()),
+            documents: BTreeMap::new(),
+            truncated: false,
+            stage: BacklinkStage::Group,
         }
-        let start = self
-            .after
-            .map(|document_id| IterStart::After(ByteView::from(group_key(&prefix, document_id))));
-        let (values, next) = iter_page(
-            storage,
-            IRI_INDEX_KEYSPACE,
-            Some(prefix),
-            start,
-            self.limit.saturating_add(1),
-        )
-        .await?;
-        budget.rows = budget
-            .rows
-            .checked_sub(values.len())
-            .ok_or(MetadataIriError::BudgetExhausted)?;
+    }
+
+    /// Reads up to `limit + 1` rows of one predicate group after the page start.
+    fn read_group(&mut self, prefix: Vec<u8>) -> BacklinkTurn {
+        if !self.budget.take_seek() {
+            return Err(BacklinkError::BudgetExhausted);
+        }
+        let start = match self.after {
+            Some(document_id) => IterStart::After(ByteView::from(group_key(&prefix, document_id))),
+            None => IterStart::At(ByteView::from(prefix.clone())),
+        };
+        let call = index_iter(prefix.clone(), start, self.limit.saturating_add(1));
+        self.stage = BacklinkStage::Rows(prefix);
+        Ok(Next::Call(call))
+    }
+
+    /// Seeks the next predicate group under the object, or ends the page.
+    fn seek_group(&mut self) -> BacklinkTurn {
+        let Some(start) = self.start.take() else {
+            return Ok(Next::Done(self.page()));
+        };
+        if !self.budget.take_seek() {
+            return Err(BacklinkError::BudgetExhausted);
+        }
+        let object = iri_object_prefix(&self.object_iri).to_vec();
+        self.stage = BacklinkStage::Group;
+        Ok(Next::Call(index_iter(
+            object,
+            IterStart::At(ByteView::from(start)),
+            1,
+        )))
+    }
+
+    fn rows(&mut self, result: IoResult) -> BacklinkTurn {
+        let (values, next) = page_rows(result)?;
+        self.budget.rows =
+            (self.budget.rows.checked_sub(values.len())).ok_or(BacklinkError::BudgetExhausted)?;
         for (_, value) in values {
-            let record =
-                postcard::from_bytes::<IriIndexRecord>(&value).map_err(ConversionError::from)?;
+            let record = postcard::from_bytes::<IriIndexRecord>(&value)
+                .map_err(|error| BacklinkError::Malformed(error.to_string()))?;
             if record.object_iri != self.object_iri
-                || self
-                    .predicate_iri
+                || (self.predicate_iri.as_deref())
                     .is_some_and(|predicate| record.predicate_iri != predicate)
             {
                 continue;
             }
-            documents
+            self.documents
                 .entry(record.document_id)
                 .or_default()
                 .push(record);
         }
-        Ok(next.is_some())
+        self.truncated |= next.is_some();
+        if self.predicate_iri.is_some() {
+            return Ok(Next::Done(self.page()));
+        }
+        self.seek_group()
+    }
+
+    fn group_found(&mut self, result: IoResult) -> BacklinkTurn {
+        let (values, _) = page_rows(result)?;
+        let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
+            return Ok(Next::Done(self.page()));
+        };
+        let prefix = prefix.to_vec();
+        self.start = prefix_upper_bound(&prefix);
+        self.read_group(prefix)
+    }
+
+    fn page(&mut self) -> (BacklinkPage, LinkBudget) {
+        let documents = std::mem::take(&mut self.documents);
+        let more = self.truncated || documents.len() > self.limit;
+        let documents: BTreeMap<_, _> = documents.into_iter().take(self.limit).collect();
+        let next = more
+            .then(|| documents.keys().next_back().copied())
+            .flatten();
+        (BacklinkPage { documents, next }, self.budget)
+    }
+}
+
+impl Operation for BacklinksOperation {
+    type Output = (BacklinkPage, LinkBudget);
+    type Error = BacklinkError;
+
+    fn first(&mut self) -> BacklinkTurn {
+        match self.predicate_iri.as_deref() {
+            Some(predicate) => {
+                let prefix = iri_reference_prefix(predicate, &self.object_iri).to_vec();
+                self.start = None;
+                self.read_group(prefix)
+            }
+            None => self.seek_group(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> BacklinkTurn {
+        match std::mem::replace(&mut self.stage, BacklinkStage::Group) {
+            BacklinkStage::Group => self.group_found(result),
+            BacklinkStage::Rows(_) => self.rows(result),
+        }
     }
 }
 
@@ -260,7 +320,6 @@ pub(crate) async fn lookup_iri_references(
     object_iri: &str,
     limit: usize,
 ) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
-    let storage = &context.storage_handle;
     let mut budget = LinkBudget {
         seeks: limit.max(INDEX_PAGE_SIZE),
         rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
@@ -269,20 +328,19 @@ pub(crate) async fn lookup_iri_references(
     let mut matches = BTreeMap::new();
     let mut after = None;
     while found.len() < limit {
-        let page = read_backlinks(
-            storage,
-            object_iri,
-            Some(predicate_iri),
-            after,
-            INDEX_PAGE_SIZE,
-            &mut budget,
-        )
-        .await;
-        let page = match page {
-            Ok(page) => page,
+        let read = BacklinksOperation::new(
+            (object_iri, Some(predicate_iri)),
+            (after, INDEX_PAGE_SIZE),
+            budget,
+        );
+        let page = match drive(read, context).await {
+            Ok((page, left)) => {
+                budget = left;
+                page
+            }
             // The budget bounds the lookup; the documents found so far are the answer.
-            Err(MetadataIriError::BudgetExhausted) => break,
-            Err(error) => return Err(error.into()),
+            Err(BacklinkError::BudgetExhausted) => break,
+            Err(error) => return Err(MetadataError::Backend(error.to_string())),
         };
         let mut records = Vec::with_capacity(page.documents.len());
         for document_id in page.documents.keys() {
@@ -568,6 +626,22 @@ mod tests {
     use aruna_storage::FjallStorage;
 
     const OBJECT: &str = "https://example.test/object";
+
+    /// One backlink page read from `storage`, spending `budget` as the lookup does.
+    async fn read_backlinks(
+        storage: &StorageHandle,
+        object_iri: &str,
+        predicate_iri: Option<&str>,
+        after: Option<Ulid>,
+        limit: usize,
+        budget: &mut LinkBudget,
+    ) -> Result<BacklinkPage, BacklinkError> {
+        let read = BacklinksOperation::new((object_iri, predicate_iri), (after, limit), *budget);
+        let context = DriverContext::storage_only(storage.clone());
+        let (page, left) = drive(read, &context).await?;
+        *budget = left;
+        Ok(page)
+    }
 
     fn record(document_id: Ulid, cursor: Ulid, predicate: &str, object: &str) -> IriIndexRecord {
         IriIndexRecord {
@@ -896,7 +970,7 @@ mod tests {
         let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut budget)
             .await
             .expect_err("two seeks are needed");
-        assert!(matches!(error, MetadataIriError::BudgetExhausted));
+        assert!(matches!(error, BacklinkError::BudgetExhausted));
     }
 
     #[tokio::test]
@@ -919,7 +993,7 @@ mod tests {
         let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut open_budget())
             .await
             .expect_err("malformed row fails to decode");
-        assert!(matches!(error, MetadataIriError::Conversion(_)));
+        assert!(matches!(error, BacklinkError::Malformed(_)));
     }
 
     #[tokio::test]
@@ -1002,5 +1076,58 @@ mod tests {
             .unwrap();
         assert!(replace_rows(&storage, &record_at, rows).await.unwrap());
         assert!(row_exists(&storage, IRI_INDEX_KEYSPACE, key).await);
+    }
+
+    fn rows(records: &[IriIndexRecord]) -> IoResult {
+        let values = (records.iter())
+            .map(|record| {
+                let (_, key, value) = iri_reference_entry(record).unwrap();
+                (key, value)
+            })
+            .collect();
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })))
+    }
+
+    #[test]
+    fn predicate_page_reads_once() {
+        let budget = LinkBudget { seeks: 2, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, Some("p")), (None, 10), budget);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let document = Ulid::from_parts(1, 1);
+        let found = record(document, Ulid::from_parts(2, 2), "p", OBJECT);
+        let other = record(
+            Ulid::from_parts(3, 3),
+            Ulid::from_parts(2, 2),
+            "p",
+            "elsewhere",
+        );
+        let Ok(Next::Done((page, left))) = read.next(rows(&[found.clone(), other])) else {
+            panic!("expected the page");
+        };
+        // A hash collision on another object is dropped.
+        assert_eq!(page.documents, BTreeMap::from([(document, vec![found])]));
+        assert_eq!(page.next, None);
+        assert_eq!(left, LinkBudget { seeks: 1, rows: 6 });
+    }
+
+    #[test]
+    fn spent_budget_refuses() {
+        let budget = LinkBudget { seeks: 0, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, None), (None, 10), budget);
+        assert_eq!(read.first(), Err(BacklinkError::BudgetExhausted));
+    }
+
+    #[test]
+    fn empty_object_ends() {
+        let budget = LinkBudget { seeks: 4, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, None), (None, 10), budget);
+        read.first().unwrap();
+        let Ok(Next::Done((page, _))) = read.next(rows(&[])) else {
+            panic!("expected an empty page");
+        };
+        assert_eq!(page, BacklinkPage::default());
     }
 }

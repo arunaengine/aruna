@@ -96,17 +96,14 @@ pub async fn references_metadata(
         });
     }
 
-    let mut budget = REFERENCE_BUDGET;
-    let page = crate::metadata::iri_index::read_backlinks(
-        &context.storage_handle,
-        &request.iri,
-        request.predicate.as_deref(),
-        request.after,
-        limit,
-        &mut budget,
-    )
-    .await
-    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let read = crate::metadata::iri_index::BacklinksOperation::new(
+        (&request.iri, request.predicate.as_deref()),
+        (request.after, limit),
+        REFERENCE_BUDGET,
+    );
+    let (page, _) = drive(read, context)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
 
     let mut references = Vec::new();
     for (document_id, postings) in page.documents {
