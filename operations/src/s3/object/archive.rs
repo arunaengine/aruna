@@ -349,13 +349,13 @@ fn job_call(effect: JobEffect) -> IoCall {
 }
 
 fn job_event(result: IoResult) -> Result<JobEvent, IoError> {
-    match result.event()? {
-        Event::Job(event) => Ok(event),
-        other => Err(IoError::Unexpected {
-            expected: "Event::Job",
-            got: other.label(),
-        }),
-    }
+    let event = result.event()?;
+    let got = event.label();
+    let Event::Job(event) = event else {
+        let expected = "Event::Job";
+        return Err(IoError::Unexpected { expected, got });
+    };
+    Ok(event)
 }
 
 fn unexpected_job() -> IoError {
