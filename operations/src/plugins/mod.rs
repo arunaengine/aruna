@@ -10,6 +10,7 @@ pub mod check;
 pub mod cleanup;
 pub mod clock;
 pub mod copies;
+pub mod copy_rows;
 pub mod creates;
 pub mod dataset;
 pub mod decide;

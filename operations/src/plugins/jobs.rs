@@ -54,9 +54,7 @@ pub(crate) async fn job_status(
 ) -> Result<JobStatus, HostError> {
     let row = job_row(ctx, install, id).await?;
     let record = match (&row.summary, row.job) {
-        (None, Some(job)) => read_job_record(ctx, job, None)
-            .await
-            .map_err(unavailable)?,
+        (None, Some(job)) => read_job_record(ctx, job, None).await.map_err(unavailable)?,
         _ => None,
     };
     let state = work_state(&row, record.as_ref());
@@ -246,9 +244,7 @@ pub(crate) async fn retire_work(
             dropped.extend([index_key(install_id, row.work_id), key]);
             continue;
         };
-        let record = read_job_record(ctx, job, None)
-            .await
-            .map_err(StoreError)?;
+        let record = read_job_record(ctx, job, None).await.map_err(StoreError)?;
         let Some(record) = record else {
             dropped.extend([index_key(install_id, row.work_id), key]);
             continue;
