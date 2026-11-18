@@ -1545,9 +1545,9 @@ mod pure_tests {
 
     use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::{EffectOperation, Operation};
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -1556,11 +1556,11 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_core::types::Effects;
     use ulid::Ulid;
 
     use super::{
         BaoReadError, BaoReadOperation, BaoReadOutput, IncomingBaoOperation, IncomingBaoResult,
+        ServeTurn,
     };
     use crate::replication::protocol::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage,
@@ -1732,8 +1732,8 @@ mod pure_tests {
         // A realm node holds no observations, so it answers as it always did.
         let mut operation = device_serve(Some([5u8; 32]));
         operation.local_owner = None;
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
     }
 
     #[test]
@@ -1743,24 +1743,24 @@ mod pure_tests {
         operation.peer_is_infra = false;
         operation.request.auth_context.user_id = UserId::local(Ulid::from(77u128), test_realm());
         assert!(!operation.serves_own_data());
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     #[test]
     fn device_needs_hash() {
         // Without a named identity this node would have to invent one.
         let mut operation = device_serve(None);
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::HashMismatch);
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::HashMismatch);
     }
 
     #[test]
     fn device_needs_fingerprint() {
         // Without the observed fingerprint the adapter cannot re-check anything.
         let mut operation = device_serve(Some([5u8; 32]));
-        let effects = operation.serve_observation(observation(5, None));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+        let turn = operation.serve_observation(observation(5, None));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::NotFound);
     }
 
     #[test]
@@ -1771,8 +1771,8 @@ mod pure_tests {
             policy_id: Ulid::from(3u128),
             digest: [2u8; 32],
         }];
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     #[test]
@@ -1780,15 +1780,15 @@ mod pure_tests {
         // A metadata probe would echo an identity this node has not verified.
         let mut operation = device_serve(Some([5u8; 32]));
         operation.request.metadata_only = true;
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     #[test]
     fn device_serves_file() {
         let mut operation = device_serve(Some([5u8; 32]));
-        let effects = operation.serve_observation(observation(5, Some("5-1")));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let turn = operation.serve_observation(observation(5, Some("5-1")));
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(operation.source_fingerprint.as_deref(), Some("5-1"));
     }
 
@@ -1808,11 +1808,8 @@ mod pure_tests {
             None,
         );
         let value: byteview::ByteView = materialized.to_bytes().unwrap().into();
-        let effects = operation.handle_exact_version(Event::Storage(StorageEvent::ReadResult {
-            key: byteview::ByteView::from(vec![0u8]),
-            value: Some(value),
-        }));
-        assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+        let turn = operation.handle_exact_version(Some(value));
+        assert_eq!(refusal_from(&turn), BaoReadRefusal::ReadDenied);
     }
 
     #[test]
@@ -1820,16 +1817,28 @@ mod pure_tests {
         // An event the resolve state cannot explain must fail, not be ignored.
         let mut operation = device_serve(Some([5u8; 32]));
         operation.state = super::IncomingBaoState::ResolveSource;
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(BaoReadError::Unexpected { .. })
-        ));
+        let event = Event::Storage(StorageEvent::SyncAllFinished);
+        let turn = operation.next(IoResult::Event(Box::new(event)));
+        assert!(matches!(turn, Err(BaoReadError::Unexpected { .. })));
     }
 
-    fn refusal_from(effects: &Effects) -> BaoReadRefusal {
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+    fn row(value: Option<byteview::ByteView>) -> IoResult {
+        IoResult::Values(vec![value])
+    }
+
+    fn rows(values: Vec<Option<byteview::ByteView>>) -> IoResult {
+        IoResult::Values(values)
+    }
+
+    fn asked(turn: &ServeTurn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
+    fn refusal_from(turn: &ServeTurn) -> BaoReadRefusal {
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(turn) else {
             panic!("expected refusal frame")
         };
         let VersionReplicationMessage::BaoReadRefused(reason) =
@@ -1838,6 +1847,52 @@ mod pure_tests {
             panic!("expected typed refusal")
         };
         reason
+    }
+
+    /// The refusal frame and the close of a failed serve, or only the close.
+    fn abort_shape(calls: &[IoCall]) -> (Option<BaoReadRefusal>, bool) {
+        fn effect(call: &IoCall) -> &BlobEffect {
+            match call {
+                IoCall::Effect(effect) => match effect.as_ref() {
+                    Effect::Blob(effect) => effect,
+                    other => panic!("expected a stream call, got {other:?}"),
+                },
+                other => panic!("expected a stream call, got {other:?}"),
+            }
+        }
+        let closes = calls
+            .last()
+            .is_some_and(|call| matches!(effect(call), BlobEffect::CloseConnection { .. }));
+        let refusal = (calls.len() == 2).then(|| match effect(&calls[0]) {
+            BlobEffect::SendMessage { payload, .. } => {
+                match VersionReplicationMessage::from_bytes(payload).unwrap() {
+                    VersionReplicationMessage::BaoReadRefused(reason) => reason,
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+            other => panic!("expected the refusal frame, got {other:?}"),
+        });
+        (refusal, closes)
+    }
+
+    #[test]
+    fn abort_tells_reader() {
+        // A storage failure before any answer still reaches the reader as a refusal.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.first().unwrap();
+        let expected = (Some(BaoReadRefusal::BackendFailure), true);
+        assert_eq!(abort_shape(&operation.abort()), expected);
+
+        // Once the reader was answered, a failure only closes the stream.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.send_refusal(BaoReadRefusal::NotFound).unwrap();
+        assert_eq!(abort_shape(&operation.abort()), (None, true));
+
+        // The operation's own failure closes the stream without inventing an answer.
+        let mut operation = device_serve(Some([5u8; 32]));
+        operation.first().unwrap();
+        operation.fail(BaoReadError::NotFinished).unwrap_err();
+        assert_eq!(abort_shape(&operation.abort()), (None, true));
     }
 
     #[test]
@@ -2003,8 +2058,8 @@ mod pure_tests {
         // No destination subject means nothing governed may be served, even
         // though every ref was echoed back.
         let (location, _) = location_value([4u8; 32]);
-        let effects = operation.challenge_destination(location);
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        let turn = operation.challenge_destination(location);
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2048,8 +2103,8 @@ mod pure_tests {
         operation.peer_placement = Some(entry.clone());
 
         let (location, _) = location_value([4u8; 32]);
-        let effects = operation.challenge_destination(location.clone());
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        let turn = operation.challenge_destination(location.clone());
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2059,8 +2114,8 @@ mod pure_tests {
 
         // The honest claim resolves the rule instead of being refused outright.
         operation.request.destination = Some(storage_subject(&entry, 4));
-        let effects = operation.challenge_destination(location);
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let turn = operation.challenge_destination(location);
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Child(_)))));
     }
 
     #[test]
@@ -2095,33 +2150,22 @@ mod pure_tests {
         let decide = |group_roles: Option<Vec<u8>>| {
             let request = read_request(local, [4u8; 32]);
             let mut operation =
-                IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), request);
-            let txn_id = Ulid::from(10u128);
-            operation.txn_id = Some(txn_id);
+                IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), request)
+                    .with_snapshot();
             let next = super::PolicyNext::Exact;
-            let effects = operation.start_policy(group_id, path.clone(), next);
-            let [
-                Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: read,
-                }),
-            ] = effects.as_slice()
-            else {
-                panic!("expected the policy read, got {effects:?}")
+            let turn = operation.start_policy(group_id, path.clone(), next);
+            let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+                panic!("expected the policy read, got {turn:?}")
             };
-            assert_eq!((reads.len(), *read), (4, Some(txn_id)));
-            let rows = [
+            assert_eq!(reads.len(), 4);
+            let values = [
                 Some(postcard::to_allocvec(&config).unwrap()),
                 Some(group.to_bytes(&actor).unwrap()),
                 Some(realm_roles.to_bytes(&actor).unwrap()),
                 group_roles,
             ];
-            let values = reads
-                .iter()
-                .zip(rows)
-                .map(|((_, key), row)| (key.clone(), row.map(Into::into)))
-                .collect();
-            operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            let values = values.into_iter().map(|row| row.map(Into::into)).collect();
+            operation.next(IoResult::Values(values)).unwrap();
             operation.policy_allowed
         };
         assert!(decide(Some(roles.to_bytes(&actor).unwrap())));
