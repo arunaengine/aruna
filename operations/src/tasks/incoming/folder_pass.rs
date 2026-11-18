@@ -23,7 +23,11 @@ pub async fn reconcile_folder(
     folder: &SyncedFolder,
 ) -> Result<ReconcilePlan, ReconcileFolderError> {
     let _pass = folder_gate(folder.folder_id).lock().await;
-    drive(folder_pass(context, folder.clone()), context).await
+    drive(
+        folder_pass(context.node_and_realm(), folder.clone()),
+        context,
+    )
+    .await
 }
 
 /// Reconciles every active folder once, and finishes interrupted binds and unbinds.
@@ -41,7 +45,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
             // An unbind finishes here, also after a cancelled call or a restart.
             FolderState::Deleting => {
                 let _pass = folder_gate(folder_id).lock().await;
-                let unbind = finish_unbind(context, folder_id, node_id);
+                let unbind = finish_unbind(context.node_and_realm(), folder_id, node_id);
                 if let Err(error) = drive(unbind, context).await {
                     warn!(folder = %folder_id, reason = %error, "Could not finish the unbind");
                 }
@@ -73,7 +77,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
 
 /// Arms the device timers a starting node needs; a realm node with no folders schedules nothing.
 pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
-    let timers = drive(sync_timers(context), context)
+    let timers = drive(sync_timers(context.node_and_realm()), context)
         .await
         .unwrap_or_default();
     if timers.folders

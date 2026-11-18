@@ -267,7 +267,18 @@ async fn fetch_device_documents(
     let budget = timeout.min(DEVICE_FETCH_BUDGET);
     let mut attempt = 0;
     loop {
-        if drive(fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget), driver_ctx).await.unwrap_or(false) {
+        if drive(
+            fetch_from_peers(
+                driver_ctx.node_and_realm(),
+                owner,
+                vec![bootstrap_peer],
+                budget,
+            ),
+            driver_ctx,
+        )
+        .await
+        .unwrap_or(false)
+        {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -315,7 +326,18 @@ pub async fn wait_for_placement(
             // re-reads the documents the same way it first fetched them.
             Some(owner) => {
                 let budget = timeout.min(DEVICE_FETCH_BUDGET);
-                if !drive(fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget), driver_ctx).await.unwrap_or(false) {
+                if !drive(
+                    fetch_from_peers(
+                        driver_ctx.node_and_realm(),
+                        owner,
+                        vec![bootstrap_peer],
+                        budget,
+                    ),
+                    driver_ctx,
+                )
+                .await
+                .unwrap_or(false)
+                {
                     warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
                 }
                 None

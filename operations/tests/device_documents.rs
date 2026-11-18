@@ -81,7 +81,12 @@ async fn device_fetches_revocation() -> TestResult<()> {
     );
 
     assert!(
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false),
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false),
         "a realm node must serve the device the realm documents"
     );
     assert!(
@@ -128,7 +133,12 @@ async fn device_fetches_owner() -> TestResult<()> {
     );
 
     assert!(
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false),
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false),
         "a realm node must serve the device the realm documents"
     );
     let fetched = drive(
@@ -151,7 +161,12 @@ async fn device_fetches_groups() -> TestResult<()> {
     assert!(read_group_auth(&device, group_id).await?.is_none());
 
     assert!(
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false),
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false),
         "a realm node must serve the device the realm documents"
     );
 
@@ -186,7 +201,12 @@ async fn device_fetches_groups() -> TestResult<()> {
     let stale = cache_stale_group(&realm, &device).await?;
 
     assert!(
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false),
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false),
         "a realm node must serve the device the realm documents"
     );
 
@@ -251,7 +271,12 @@ async fn device_fetches_nodes() -> TestResult<()> {
 
     let device = join_device(&realm).await?;
     assert!(
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false),
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false),
         "the device beat must fetch the realm documents"
     );
     let documents = drive(
@@ -310,24 +335,62 @@ async fn device_learns_removal() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
     let realm_id = realm.realm_id;
     let device = join_device(&realm).await?;
-    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
+    assert!(
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false)
+    );
 
     set_listed(&realm, &device, false).await?;
-    assert!(!drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     assert!(
-        !drive(realm_removed(realm_id), &device.context).await.unwrap_or(false),
+        !drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false)
+    );
+    assert!(
+        !drive(realm_removed(realm_id), &device.context)
+            .await
+            .unwrap_or(false),
         "one refusal round may be a restarting realm"
     );
-    assert!(!drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
-    assert!(drive(realm_removed(realm_id), &device.context).await.unwrap_or(false));
+    assert!(
+        !drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false)
+    );
+    assert!(
+        drive(realm_removed(realm_id), &device.context)
+            .await
+            .unwrap_or(false)
+    );
     assert!(
         read_realm_config(&device, realm_id).await.is_ok(),
         "nothing on the device is wiped"
     );
 
     set_listed(&realm, &device, true).await?;
-    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
-    assert!(!drive(realm_removed(realm_id), &device.context).await.unwrap_or(false));
+    assert!(
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false)
+    );
+    assert!(
+        !drive(realm_removed(realm_id), &device.context)
+            .await
+            .unwrap_or(false)
+    );
     Ok(())
 }
 
@@ -339,9 +402,20 @@ async fn offline_learns_removal() -> TestResult<()> {
     let device = join_device(&realm).await?;
     set_listed(&realm, &device, false).await?;
     for _ in 0..2 {
-        assert!(!drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
+        assert!(
+            !drive(
+                fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+                &device.context
+            )
+            .await
+            .unwrap_or(false)
+        );
     }
-    assert!(drive(realm_removed(realm.realm_id), &device.context).await.unwrap_or(false));
+    assert!(
+        drive(realm_removed(realm.realm_id), &device.context)
+            .await
+            .unwrap_or(false)
+    );
     Ok(())
 }
 

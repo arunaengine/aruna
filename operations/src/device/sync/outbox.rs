@@ -36,7 +36,6 @@ use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
 use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::document_repository::{config_of, realm_config};
-use crate::driver::DriverContext;
 use aruna_core::structs::identity::realm::NodeRealm;
 
 use super::folders::FolderError;
@@ -95,9 +94,9 @@ pub struct DrainOutboxOperation {
 }
 
 /// One pass over the upload outbox; see [`DrainOutboxOperation`].
-pub fn drain_sync_outbox(context: &DriverContext) -> DrainOutboxOperation {
+pub fn drain_sync_outbox(ids: Option<(NodeId, RealmId)>) -> DrainOutboxOperation {
     DrainOutboxOperation {
-        ids: context.node_and_realm(),
+        ids,
         draining: false,
     }
 }
@@ -768,7 +767,7 @@ mod tests {
         let (_tempdir, context) = context().await;
         let context = Arc::new(context);
         assert_eq!(
-            drive(drain_sync_outbox(&context), &context).await,
+            drive(drain_sync_outbox(context.node_and_realm()), &context).await,
             Ok(DrainOutcome::Deferred)
         );
     }

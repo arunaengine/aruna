@@ -89,6 +89,11 @@ impl DriverContext {
             .map_or(fallback, |net| *net.realm_id())
     }
 
+    /// This node; `None` on a node without a net transport.
+    pub fn node_id(&self) -> Option<aruna_core::NodeId> {
+        self.net_handle.as_ref().map(|net| net.node_id())
+    }
+
     /// This node and the realm it serves; `None` on a node without a net transport.
     pub fn node_and_realm(
         &self,
