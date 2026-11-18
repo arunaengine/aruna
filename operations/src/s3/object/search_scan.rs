@@ -578,44 +578,249 @@ impl ScanBatchOperation {
             if !self.distributed.contains_key(&head.bucket) && !names.contains(&head.bucket) {
                 names.push(head.bucket);
             }
-            BlobVersionState::Reference {
-                cached_metadata, ..
-            } => (
-                None,
-                None,
-                Some(cached_metadata.content_length),
-                cached_metadata
-                    .last_modified
-                    .or(Some(candidate.version.created_at)),
-            ),
-            // No content identity is claimed before the hash is verified.
-            BlobVersionState::PendingContent { .. } => {
-                (None, None, None, Some(candidate.version.created_at))
-            }
-            BlobVersionState::Deleted => continue,
-        };
-        let hit = SearchNodeHit {
-            cursor_key: candidate.cursor_key,
-            hit: ObjectInventoryHit {
-                node_id: input.node_id,
-                group_id: bucket.group_id,
-                bucket: candidate.head.bucket,
-                key: candidate.head.key,
-                content_w3id,
-                checksum,
-                size,
-                updated_at,
-                metadata: match input.key_match {
-                    ObjectKeyMatch::Metadata => kept_metadata(&candidate.version.metadata),
-                    ObjectKeyMatch::Substring | ObjectKeyMatch::Prefix => BTreeMap::new(),
-                },
-            },
-        };
-        let changed = candidate.changed;
-        candidates.push(Candidate { hit, changed });
+        }
+        if names.is_empty() {
+            return self.take_heads(values);
+        }
+        let reads = (names.iter())
+            .map(|name| {
+                let key = Key::from(name.as_bytes().to_vec());
+                (S3_BUCKET_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.step = ScanStep::Buckets(names, values);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    Ok(candidates)
+    fn take_heads(&mut self, values: Vec<(Key, Value)>) -> BatchTurn {
+        let input = &self.input;
+        let mut heads = Vec::new();
+        for (key, value) in values {
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            if self.distributed.get(&head.bucket) == Some(&true) {
+                // "{bucket}0" is the first head key after every key of the bucket.
+                let after_bucket = format!("{}0", head.bucket).into_bytes();
+                self.next_start = Some(IterStart::At(after_bucket.into()));
+                break;
+            }
+            if !input.key_match.matches(&head.key, &input.query) {
+                continue;
+            }
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+            heads.push(HeadCandidate {
+                head,
+                version_id: pointer.version_id,
+                cursor_key: key.to_vec(),
+            });
+        }
+        self.step = ScanStep::Hits;
+        let turn = self.hits.start(heads)?;
+        self.built(turn)
+    }
+
+    fn built(&mut self, turn: BuildTurn) -> BatchTurn {
+        match turn {
+            BuildTurn::Call(call) => Ok(Next::Call(call)),
+            BuildTurn::Done(candidates) => Ok(Next::Done(CandidateBatch {
+                candidates,
+                next_start: self.next_start.take(),
+                distributed: std::mem::take(&mut self.distributed),
+            })),
+        }
+    }
+}
+
+impl Operation for ScanBatchOperation {
+    type Output = CandidateBatch;
+    type Error = SearchObjectsError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
+    fn first(&mut self) -> BatchTurn {
+        let input = &self.input;
+        let prefix = match (input.bucket.as_deref(), input.key_match) {
+            (Some(bucket), ObjectKeyMatch::Prefix) => {
+                Some(BlobHeadKey::object_prefix(bucket, &input.query)?)
+            }
+            (Some(bucket), ObjectKeyMatch::Substring | ObjectKeyMatch::Metadata) => {
+                Some(BlobHeadKey::bucket_prefix(bucket)?)
+            }
+            (None, _) => None,
+        };
+        let scan = StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: prefix.map(Into::into),
+            start: self.start.take(),
+            limit: HEAD_SCAN_BATCH,
+            txn_id: None,
+        };
+        Ok(Next::Call(Effect::Storage(scan).into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> BatchTurn {
+        match std::mem::replace(&mut self.step, ScanStep::Hits) {
+            ScanStep::Heads => {
+                let event = result.event()?;
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
+                    return Err(storage_event_error(event));
+                };
+                self.next_start = next_start_after.map(IterStart::After);
+                match self.input.bucket {
+                    None => self.learn_buckets(values),
+                    Some(_) => self.take_heads(values),
+                }
+            }
+            ScanStep::Buckets(names, values) => {
+                for (name, bucket) in names.into_iter().zip(result.values()?) {
+                    let bucket = bucket
+                        .map(|value| BucketInfo::from_bytes(value.as_ref()))
+                        .transpose()?;
+                    let bound = bucket.is_some_and(|bucket| bucket.distribution.is_some());
+                    self.distributed.insert(name, bound);
+                }
+                self.take_heads(values)
+            }
+            ScanStep::Hits => {
+                let turn = self.hits.answer(result)?;
+                self.built(turn)
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SearchStep {
+    Bucket,
+    Ranges,
+    Batch,
+    Walk,
+}
+
+/// Searches this node's object heads, or a distributed bucket through its range indexes when
+/// `indexed` says it keeps them. Every candidate is authorized on its full path; hidden matches
+/// never affect a returned total or continuation signal.
+#[derive(Debug, PartialEq)]
+pub struct SearchObjectsOperation {
+    input: SearchObjectsInput,
+    indexed: bool,
+    start: Option<IterStart>,
+    next_start: Option<IterStart>,
+    distributed: HashMap<String, bool>,
+    walk: HitWalk,
+    now_ms: u64,
+    step: SearchStep,
+}
+
+type PageTurn = SearchTurn<SearchNodePage>;
+
+impl SearchObjectsOperation {
+    pub fn new(input: SearchObjectsInput, indexed: bool) -> Self {
+        Self {
+            start: (input.start_after.clone()).map(|key| IterStart::After(key.into())),
+            input,
+            indexed,
+            next_start: None,
+            distributed: HashMap::new(),
+            walk: HitWalk::default(),
+            now_ms: 0,
+            step: SearchStep::Batch,
+        }
+    }
+
+    fn read_batch(&mut self) -> PageTurn {
+        let batch = ScanBatchOperation::new(
+            self.input.clone(),
+            self.start.take(),
+            std::mem::take(&mut self.distributed),
+        );
+        self.step = SearchStep::Batch;
+        Ok(Next::Call(IoCall::child(batch)))
+    }
+
+    fn walked(&mut self, turn: WalkTurn) -> PageTurn {
+        match turn {
+            WalkTurn::Call(call) => {
+                self.step = SearchStep::Walk;
+                Ok(Next::Call(call))
+            }
+            WalkTurn::Drained => match self.next_start.take() {
+                Some(next) => {
+                    self.start = Some(next);
+                    self.read_batch()
+                }
+                None => self.finish(None),
+            },
+            WalkTurn::Full(next) => self.finish(next),
+        }
+    }
+
+    fn finish(&mut self, next: Option<Vec<u8>>) -> PageTurn {
+        let hits = std::mem::take(&mut self.walk.visible);
+        let changed = std::mem::take(&mut self.walk.changed);
+        let page = node_page(hits, changed, (next, self.now_ms), &self.distributed);
+        Ok(Next::Done(page))
+    }
+}
+
+impl Operation for SearchObjectsOperation {
+    type Output = SearchNodePage;
+    type Error = SearchObjectsError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PageTurn {
+        let Some(bucket) = self.input.bucket.clone() else {
+            return self.read_batch();
+        };
+        self.step = SearchStep::Bucket;
+        Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        match self.step {
+            SearchStep::Bucket => {
+                let binding = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => info.distribution,
+                    Err(GetBucketError::NotFound) => None,
+                    Err(error) => return Err(SearchObjectsError::Storage(error.to_string())),
+                };
+                let Some(binding) = binding else {
+                    return self.read_batch();
+                };
+                let search = index_search::RangeSearchOperation::new(
+                    self.input.clone(),
+                    binding,
+                    index_search::EXAMINE_BUDGET,
+                    self.indexed,
+                );
+                self.step = SearchStep::Ranges;
+                Ok(Next::Call(IoCall::child(search)))
+            }
+            SearchStep::Ranges => Ok(Next::Done(
+                result.child::<SearchNodePage, SearchObjectsError>()??,
+            )),
+            SearchStep::Batch => {
+                let batch = result.child::<CandidateBatch, SearchObjectsError>()??;
+                self.distributed = batch.distributed;
+                self.next_start = batch.next_start;
+                self.walk.add(batch.candidates);
+                let turn = self.walk.advance(&self.input);
+                self.walked(turn)
+            }
+            SearchStep::Walk => {
+                let turn = self.walk.answer(&self.input, result)?;
+                self.walked(turn)
+            }
+        }
+    }
 }
 
 /// A version's own metadata, without the `aruna-` entries that only steer search.
@@ -624,27 +829,6 @@ fn kept_metadata(metadata: &HashMap<String, String>) -> BTreeMap<String, String>
         .filter(|(key, _)| !key.starts_with("aruna-"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
-}
-
-async fn batch_read(
-    context: &DriverContext,
-    reads: Vec<(String, Key)>,
-    txn_id: TxnId,
-) -> Result<Vec<(Key, Option<aruna_core::types::Value>)>, SearchObjectsError> {
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => Ok(values),
-        event => Err(storage_event_error(event)),
-    }
 }
 
 fn storage_event_error(event: Event) -> SearchObjectsError {
@@ -661,11 +845,14 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::NodeId;
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::types::GroupId;
 
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, UNIX_EPOCH};
@@ -683,6 +870,14 @@ mod tests {
     use byteview::ByteView;
     use tempfile::TempDir;
     use ulid::Ulid;
+
+    pub(super) async fn search_local_objects(
+        context: &DriverContext,
+        input: SearchObjectsInput,
+    ) -> Result<SearchNodePage, SearchObjectsError> {
+        let indexed = context.storage_handle.range_indexes().is_some();
+        drive(SearchObjectsOperation::new(input, indexed), context).await
+    }
 
     pub(super) struct Fixture {
         _directory: TempDir,
@@ -1160,5 +1355,68 @@ mod tests {
         let page = search_local_objects(&fixture.context, input).await.unwrap();
         assert!(page.hits.is_empty());
         assert_eq!(page.changed, Some(Vec::new()));
+    }
+
+    fn step_input(bucket: Option<&str>) -> SearchObjectsInput {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        SearchObjectsInput {
+            auth: AuthContext::anonymous(realm_id),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            query: "needle".to_string(),
+            key_match: ObjectKeyMatch::Substring,
+            bucket: bucket.map(str::to_string),
+            limit: 10,
+            start_after: None,
+            as_of: UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn empty_scan_finishes() {
+        let mut scan = ScanBatchOperation::new(step_input(None), None, HashMap::new());
+        assert_eq!(scan.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(scan.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let event = Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        });
+        let Ok(Next::Done(batch)) = scan.next(IoResult::Event(Box::new(event))) else {
+            panic!("an empty scan ends the batch");
+        };
+        assert!(batch.candidates.is_empty());
+        assert_eq!(batch.next_start, None);
+    }
+
+    #[test]
+    fn empty_batch_ends() {
+        let mut search = SearchObjectsOperation::new(step_input(None), false);
+        search.stamp(5);
+        search.first().unwrap();
+        let batch = CandidateBatch {
+            candidates: Vec::new(),
+            next_start: None,
+            distributed: HashMap::from([("bound".to_string(), true)]),
+        };
+        let done: Result<CandidateBatch, SearchObjectsError> = Ok(batch);
+        let outcome = aruna_core::calls::ChildOutcome::new(done);
+        let Ok(Next::Done(page)) = search.next(IoResult::Child(outcome)) else {
+            panic!("an empty batch ends the page");
+        };
+        assert_eq!(page.skipped_buckets, ["bound"]);
+        assert_eq!(page.observed_at, UNIX_EPOCH + Duration::from_millis(5));
+    }
+
+    #[test]
+    fn missing_bucket_scans() {
+        let mut search = SearchObjectsOperation::new(step_input(Some("gone")), false);
+        search.first().unwrap();
+        let missing: Result<BucketInfo, GetBucketError> = Err(GetBucketError::NotFound);
+        let outcome = aruna_core::calls::ChildOutcome::new(missing);
+        assert!(matches!(
+            search.next(IoResult::Child(outcome)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(search.step, SearchStep::Batch);
     }
 }
