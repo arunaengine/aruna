@@ -25,11 +25,11 @@ use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::here::Heard;
 use crate::distribution::feed_walks::{FeedError, IndexProgress, RangeProgressOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::bootstrap::{BootstrapError, ReadCursorOperation};
 use crate::replication::members::{CopyLag, CopyLagOperation, LagMap, RecordError};
+use aruna_core::heartbeat::Heard;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -299,6 +299,11 @@ pub fn heartbeat_reach(
         },
         None => Reach::Unreachable { since_ms: None },
     }
+}
+
+/// Whether this node hears from `node_id`.
+pub fn node_reach(heard: &Heard, node_id: NodeId) -> Reach {
+    heartbeat_reach(heard.local, heard.nodes.clone())(node_id)
 }
 
 impl Reach {

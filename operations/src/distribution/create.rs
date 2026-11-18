@@ -29,14 +29,13 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::forward::{AdmitMemberOperation, PublishRefusal};
-use super::here::{Here, here};
 use super::status_view::{ReadViewOperation, StatusError};
 use super::submit::{PublishLocalOperation, SendAdminOperation, SubmitOperation};
 use crate::document_repository::{config_of, realm_config};
-use crate::driver::DriverContext;
 use crate::forward::transport::{peer_answer, peer_call};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::heartbeat::Here;
 use aruna_core::metadata::AuthToken;
 
 /// How often and how far apart admission rereads a record that lags the accepted revision.
@@ -161,13 +160,13 @@ pub struct CreateSetOperation {
 
 /// The creation of a set on this node; see [`CreateSetOperation`].
 pub fn create_set(
-    context: &DriverContext,
+    here: Here,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
     input: CreateInput,
 ) -> CreateSetOperation {
     CreateSetOperation {
-        here: here(context),
+        here,
         auth: auth.clone(),
         bearer,
         input: Some(input),
@@ -294,14 +293,14 @@ type Admitting = Result<Next<CreationReport>, CreateError>;
 
 /// The admission of a set's pending members; see [`AdmitPendingOperation`].
 pub fn admit_pending(
-    context: &DriverContext,
+    here: Here,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
     accepted: (Ulid, Option<DistributionRevision>),
     sizes: &[RangeSize],
 ) -> AdmitPendingOperation {
     let caller = (auth.clone(), bearer);
-    AdmitPendingOperation::new(here(context), caller, accepted, sizes.to_vec())
+    AdmitPendingOperation::new(here, caller, accepted, sizes.to_vec())
 }
 
 impl AdmitPendingOperation {

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::{
@@ -20,7 +21,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::submit::{StateOperation, Stated};
-use crate::driver::DriverContext;
 use crate::s3::usage::{LoadCountersError, LoadCountersOperation};
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 
@@ -92,20 +92,21 @@ pub(super) struct BalanceInputs {
 }
 
 /// The fill of every node this node hears from, and its own capacity.
-pub(super) fn balance_inputs(context: &DriverContext) -> BalanceInputs {
-    let fill = context
-        .fresh_heartbeats()
-        .into_iter()
+pub(super) fn balance_inputs(
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    capacity: Option<u64>,
+) -> BalanceInputs {
+    let fill = (fresh.iter())
         .filter_map(|(node_id, held)| {
             let utilization = held.heartbeat.utilization;
             let used = utilization.storage_bytes_used;
-            Some((node_id, permille(used, utilization.storage_capacity_bytes)?))
+            Some((
+                *node_id,
+                permille(used, utilization.storage_capacity_bytes)?,
+            ))
         })
         .collect();
-    BalanceInputs {
-        fill,
-        capacity: crate::driver::node_routing(context).catalog.capacity(),
-    }
+    BalanceInputs { fill, capacity }
 }
 
 /// Proposes one balancing transfer of a set to its publisher, when this node is over-full.

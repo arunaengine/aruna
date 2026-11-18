@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::descriptor::build_source_binding;
-use crate::driver::{DriverContext, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::object::put::{
@@ -86,10 +85,10 @@ impl From<IoError> for MaterializeSnapshotError {
 
 /// Reads a staged source and stores it as an object; a retry finds the object it already made.
 pub fn stage_snapshot_blob(
-    context: &DriverContext,
+    routing: &NodeRouting,
     input: MaterializeSnapshotInput,
 ) -> StageSnapshotOperation {
-    StageSnapshotOperation::routed(input, &node_routing(context))
+    StageSnapshotOperation::routed(input, routing)
 }
 
 /// What the pending call of staging a snapshot answers.
@@ -288,7 +287,7 @@ impl From<SnapshotReuseError> for MaterializeSnapshotError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{drive, node_routing};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use axum::Router;
     use axum::routing::get;
@@ -461,15 +460,21 @@ mod tests {
             expected_checksums: Vec::new(),
         };
 
-        let first = drive(stage_snapshot_blob(context, input.clone()), context)
-            .await
-            .unwrap();
-        let second = drive(stage_snapshot_blob(context, input.clone()), context)
-            .await
-            .unwrap();
+        let first = drive(
+            stage_snapshot_blob(&node_routing(context), input.clone()),
+            context,
+        )
+        .await
+        .unwrap();
+        let second = drive(
+            stage_snapshot_blob(&node_routing(context), input.clone()),
+            context,
+        )
+        .await
+        .unwrap();
         let mut manual = input;
         manual.retry_key = None;
-        let third = drive(stage_snapshot_blob(context, manual), context)
+        let third = drive(stage_snapshot_blob(&node_routing(context), manual), context)
             .await
             .unwrap();
         server.abort();
