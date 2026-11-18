@@ -2,36 +2,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::handle::Handle;
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_DUE_KEYSPACE, REFRESH_JOB_KEYSPACE};
-use aruna_core::structs::execution::source_access::ObservationMatch;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
+use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
+use thiserror::Error;
 use tracing::{info, warn};
-use ulid::Ulid;
 
 use super::metadata::{
     ReferenceRefresh, ReferenceRefreshError, ReferenceRefreshRecord, due_key, job_entries,
     split_due,
 };
-use crate::driver::{DriverContext, drive};
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
-use crate::s3::object::refresh_observe::ObserveSourceOperation;
+use crate::s3::object::refresh_observe::{ObserveError, ObserveSourceOperation};
 use crate::s3::usage::schedule_snapshot_publish;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::tasks::task_persistence::persist_task_effect;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 
@@ -46,17 +45,411 @@ pub struct ReferenceDrainResult {
     pub next_due_after: Option<Duration>,
 }
 
-struct ReferenceRefreshScan {
-    jobs: Vec<(Vec<u8>, ReferenceRefreshRecord)>,
+#[derive(Debug, Error, PartialEq)]
+pub enum RefreshRunError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Mint(#[from] MintError),
+    #[error(transparent)]
+    Observe(#[from] ObserveError),
+    #[error("the refresh carries no observation")]
+    NoObservation,
+}
+
+impl From<IoError> for RefreshRunError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ApplyState {
+    ReadVersion,
+    Mint(Box<MintSuccessorOperation>),
+    WriteVersion,
+}
+
+/// Applies one observation in one transaction: a confirmed change becomes a successor, and a
+/// confirmed match moves the version's refresh time. Outputs whether a successor was written.
+#[derive(Debug, PartialEq)]
+struct RefreshApply {
+    refresh: ReferenceRefresh,
+    state: ApplyState,
+    version_key: Vec<u8>,
+    refreshed: Option<Vec<u8>>,
+    minted: bool,
+}
+
+type ApplyTurn = Result<Next<bool>, RefreshRunError>;
+
+impl RefreshApply {
+    fn new(refresh: ReferenceRefresh) -> Self {
+        Self {
+            refresh,
+            state: ApplyState::ReadVersion,
+            version_key: Vec::new(),
+            refreshed: None,
+            minted: false,
+        }
+    }
+
+    fn version_read(&mut self, value: Option<Value>) -> ApplyTurn {
+        let Some(value) = value else {
+            return Ok(Next::Done(false));
+        };
+        let version = BlobVersion::from_bytes(value.as_ref())?;
+        let BlobVersionState::Reference {
+            cached_metadata,
+            last_refresh,
+            ..
+        } = &version.state
+        else {
+            return Ok(Next::Done(false));
+        };
+        // Only a confirmed observation counts as a refresh; fields under the version id never
+        // change, so a confirmed change becomes a successor and an unknown one is dropped.
+        let observation = (self.refresh.metadata.clone()).ok_or(RefreshRunError::NoObservation)?;
+        let comparison = cached_metadata.compare(&observation);
+        // A version whose recorded digests bind its bytes gets no successor without them.
+        let bound = !cached_metadata.enforced_checksums().is_empty();
+        let newer = self.refresh.refreshed_at > *last_refresh;
+        let mint = newer && comparison == ObservationMatch::Changed && !bound;
+        if newer && comparison == ObservationMatch::Same {
+            self.refreshed = Some(self.with_refresh_time(&version)?);
+        }
+        if !mint {
+            return self.write_version();
+        }
+        let refresh = self.refresh.clone();
+        let mut mint = Box::new(MintSuccessorOperation::new(refresh, observation, version));
+        let turn = mint.first();
+        self.state = ApplyState::Mint(mint);
+        self.mint_turn(turn)
+    }
+
+    /// The stored version with only its refresh time moved.
+    fn with_refresh_time(&self, version: &BlobVersion) -> Result<Vec<u8>, ConversionError> {
+        let mut version = version.clone();
+        if let BlobVersionState::Reference { last_refresh, .. } = &mut version.state {
+            *last_refresh = self.refresh.refreshed_at;
+        }
+        version.to_bytes()
+    }
+
+    fn mint_turn(&mut self, turn: Result<Next<bool>, MintError>) -> ApplyTurn {
+        match turn? {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Done(written) => {
+                self.minted = written;
+                self.write_version()
+            }
+            Next::Wait | Next::Then { .. } => Err(IoError::Unfinished.into()),
+        }
+    }
+
+    fn write_version(&mut self) -> ApplyTurn {
+        let Some(value) = self.refreshed.take() else {
+            return Ok(Next::Done(self.minted));
+        };
+        self.state = ApplyState::WriteVersion;
+        Ok(Next::Call(IoCall::Write(vec![(
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            self.version_key.clone().into(),
+            value.into(),
+        )])))
+    }
+}
+
+impl Operation for RefreshApply {
+    type Output = bool;
+    type Error = RefreshRunError;
+
+    fn first(&mut self) -> ApplyTurn {
+        let refresh = &self.refresh;
+        let key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
+        self.version_key = key.to_bytes()?;
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, self.version_key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> ApplyTurn {
+        match &mut self.state {
+            ApplyState::ReadVersion => self.version_read(result.value()?),
+            ApplyState::Mint(mint) => {
+                let turn = mint.next(result);
+                self.mint_turn(turn)
+            }
+            ApplyState::WriteVersion => {
+                result.done()?;
+                Ok(Next::Done(self.minted))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RefreshStep {
+    Observe,
+    Apply,
+}
+
+/// Refreshes one reference version. Without an observation it observes the source first; a
+/// failed observation fails the refresh, which the queue retries later.
+#[derive(Debug, PartialEq)]
+pub struct RefreshReferenceOperation {
+    refresh: ReferenceRefresh,
+    step: RefreshStep,
+}
+
+type RefreshTurn = Result<Next<()>, RefreshRunError>;
+
+impl RefreshReferenceOperation {
+    pub fn new(refresh: ReferenceRefresh) -> Self {
+        Self {
+            refresh,
+            step: RefreshStep::Apply,
+        }
+    }
+
+    fn apply(&mut self) -> RefreshTurn {
+        self.step = RefreshStep::Apply;
+        Ok(Next::Call(IoCall::child(RefreshApply::new(
+            self.refresh.clone(),
+        ))))
+    }
+
+    fn observed(&mut self, observed: Result<SourceMetadata, ObserveError>) -> RefreshTurn {
+        match observed {
+            Ok(metadata) => {
+                self.refresh.metadata = Some(metadata);
+                self.refresh.refreshed_at = SystemTime::now().max(self.refresh.refreshed_at);
+                self.apply()
+            }
+            // Work for a version that is gone or no longer resolvable is finished, not retried.
+            Err(error) if error.is_obsolete() => Ok(Next::Done(())),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn applied(&self, applied: Result<bool, RefreshRunError>) -> RefreshTurn {
+        match applied {
+            // The dirty markers and the obligation committed above are the durable work.
+            Ok(true) => Ok(Next::Then {
+                output: (),
+                calls: vec![
+                    schedule_snapshot_publish().into(),
+                    schedule_blob_drain().into(),
+                ],
+            }),
+            Ok(false) => Ok(Next::Done(())),
+            // The key's range moved to another coordinator, which refreshes it there.
+            Err(RefreshRunError::Mint(MintError::Distribution(error))) if error.moved_away() => {
+                Ok(Next::Done(()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Operation for RefreshReferenceOperation {
+    type Output = ();
+    type Error = RefreshRunError;
+
+    fn first(&mut self) -> RefreshTurn {
+        if self.refresh.metadata.is_some() {
+            return self.apply();
+        }
+        let refresh = &self.refresh;
+        let key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
+        self.step = RefreshStep::Observe;
+        Ok(Next::Call(IoCall::child(ObserveSourceOperation::new(key))))
+    }
+
+    fn next(&mut self, result: IoResult) -> RefreshTurn {
+        match self.step {
+            RefreshStep::Observe => self.observed(result.child::<SourceMetadata, ObserveError>()?),
+            RefreshStep::Apply => self.applied(result.child::<bool, RefreshRunError>()?),
+        }
+    }
+}
+
+fn due_page(limit: usize) -> IoCall {
+    IoCall::Page {
+        space: REFRESH_DUE_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after: None,
+        limit,
+    }
+}
+
+/// Sets the drain timer for the earliest queued refresh, if any.
+#[derive(Debug, Default, PartialEq)]
+pub struct RestoreRefreshTimer {
+    setting: bool,
+}
+
+impl RestoreRefreshTimer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for RestoreRefreshTimer {
+    type Output = ();
+    type Error = ReferenceRefreshError;
+
+    fn first(&mut self) -> Result<Next<()>, ReferenceRefreshError> {
+        Ok(Next::Call(due_page(1)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ReferenceRefreshError> {
+        if self.setting {
+            if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
+                warn!(message = %message, "Failed to restore reference metadata refresh timer");
+            }
+            return Ok(Next::Done(()));
+        }
+        let (rows, _) = result.page()?;
+        let due = rows.first().and_then(|(row, _)| split_due(row));
+        let Some((due_at_ms, _)) = due else {
+            return Ok(Next::Done(()));
+        };
+        self.setting = true;
+        let reset = Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainRefreshQueue,
+            after: due_after(unix_timestamp_millis(), due_at_ms),
+        });
+        Ok(Next::Call(reset.into()))
+    }
+}
+
+/// Removes a finished job, or replaces it with `next`, unless a newer request replaced it.
+#[derive(Debug, PartialEq)]
+pub(super) struct SettleJob {
+    key: Vec<u8>,
+    job: ReferenceRefreshRecord,
+    next: Option<ReferenceRefreshRecord>,
+    state: SettleState,
+}
+
+#[derive(Debug, PartialEq)]
+enum SettleState {
+    ReadJob,
+    DeleteRows,
+    WriteNext,
+}
+
+type SettleTurn = Result<Next<()>, ReferenceRefreshError>;
+
+impl SettleJob {
+    pub(super) fn new(
+        key: Vec<u8>,
+        job: ReferenceRefreshRecord,
+        next: Option<ReferenceRefreshRecord>,
+    ) -> Self {
+        Self {
+            key,
+            job,
+            next,
+            state: SettleState::ReadJob,
+        }
+    }
+
+    fn job_read(&mut self, value: Option<Value>) -> SettleTurn {
+        let stored = value.map(|value| postcard::from_bytes::<ReferenceRefreshRecord>(&value));
+        if !matches!(stored, Some(Ok(stored)) if stored == self.job) {
+            return Ok(Next::Done(()));
+        }
+        let due = due_key(self.job.due_at_ms, &self.key);
+        let mut deletes = vec![(REFRESH_DUE_KEYSPACE.to_string(), due)];
+        if self.next.is_none() {
+            let key = ByteView::from(self.key.clone());
+            deletes.push((REFRESH_JOB_KEYSPACE.to_string(), key));
+        }
+        self.state = SettleState::DeleteRows;
+        Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+
+    fn rows_deleted(&mut self) -> SettleTurn {
+        let Some(next) = self.next.as_ref() else {
+            return Ok(Next::Done(()));
+        };
+        let writes = job_entries(next)?;
+        self.state = SettleState::WriteNext;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for SettleJob {
+    type Output = ();
+    type Error = ReferenceRefreshError;
+
+    fn first(&mut self) -> SettleTurn {
+        let read = read_row(REFRESH_JOB_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> SettleTurn {
+        match self.state {
+            SettleState::ReadJob => self.job_read(result.value()?),
+            SettleState::DeleteRows => {
+                result.done()?;
+                self.rows_deleted()
+            }
+            SettleState::WriteNext => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainState {
+    ReadDue,
+    ReadJob(Key),
+    DeleteStale,
+    RunJob,
+    Settle { failed: bool },
+}
+
+/// Runs one batch of due refreshes: walks a page of the due index in due order with a point read
+/// per row, refreshes each job and settles it, rescheduling the ones that failed.
+#[derive(Debug, PartialEq)]
+pub struct DrainRefreshOperation {
+    state: DrainState,
+    started: Instant,
+    now_ms: u64,
+    rows: VecDeque<Key>,
+    more_rows: bool,
+    jobs: VecDeque<(Vec<u8>, ReferenceRefreshRecord)>,
+    current: Option<(Vec<u8>, ReferenceRefreshRecord)>,
+    job_count: usize,
+    oldest_lag_ms: u64,
+    scan_ms: u64,
+    succeeded: usize,
+    failed: usize,
     has_more_due: bool,
     next_due_ms: Option<u64>,
 }
 
-pub async fn refresh_reference_metadata(
-    context: Arc<DriverContext>,
-    refresh: ReferenceRefresh,
-) -> Result<(), String> {
-    refresh_with_context(context.as_ref(), refresh).await
+type DrainTurn = Result<Next<ReferenceDrainResult>, ReferenceRefreshError>;
+
+impl Default for DrainRefreshOperation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub(super) async fn refresh_with_context(

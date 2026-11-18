@@ -275,7 +275,7 @@ mod tests {
 
     use crate::driver::DriverContext;
     use crate::s3::object::metadata_drain::{
-        jobs_exist, process_batch, refresh_with_context, settle_job,
+        DrainRefreshOperation, RefreshReferenceOperation, RefreshRunError, SettleJob,
     };
     use aruna_core::UserId;
     use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
@@ -286,6 +286,33 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
+
+    async fn process_batch(
+        context: &DriverContext,
+    ) -> Result<super::super::metadata_drain::ReferenceDrainResult, ReferenceRefreshError> {
+        crate::driver::drive(DrainRefreshOperation::new(), context).await
+    }
+
+    async fn refresh_with_context(
+        context: &DriverContext,
+        refresh: ReferenceRefresh,
+    ) -> Result<(), RefreshRunError> {
+        crate::driver::drive(RefreshReferenceOperation::new(refresh), context).await
+    }
+
+    async fn jobs_exist(storage: &StorageHandle) -> bool {
+        let scan = StorageEffect::Iter {
+            key_space: REFRESH_DUE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1,
+            txn_id: None,
+        };
+        match storage.send_storage_effect(scan).await {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+            other => panic!("unexpected due index event: {other:?}"),
+        }
+    }
 
     struct TestState {
         _storage_dir: tempfile::TempDir,
@@ -896,11 +923,12 @@ mod tests {
         };
         let key = job_key(&older_job.refresh).unwrap();
 
-        settle_job(storage, &key, &older_job, None).await.unwrap();
+        let settle = SettleJob::new(key.to_vec(), older_job.clone(), None);
+        crate::driver::drive(settle, &test.context).await.unwrap();
 
         assert_eq!(read_jobs(storage).await, queued);
         assert_eq!(queued[0].refresh.refreshed_at, newer);
-        assert!(jobs_exist(storage).await.unwrap());
+        assert!(jobs_exist(storage).await);
     }
 
     #[tokio::test]
@@ -962,7 +990,7 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_none());
-        assert!(!jobs_exist(&test.context.storage_handle).await.unwrap());
+        assert!(!jobs_exist(&test.context.storage_handle).await);
     }
 
     #[tokio::test]
