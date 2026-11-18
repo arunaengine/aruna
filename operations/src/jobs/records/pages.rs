@@ -569,8 +569,12 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::testing::test_context;
+    use crate::tests::records::node;
     use crate::tests::s3::test_storage;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::PeerRequestError;
 
     fn submission() -> SubmissionId {
         SubmissionId([3; 32])
@@ -589,6 +593,127 @@ mod tests {
                 known_link: false,
             })
             .collect()
+    }
+
+    async fn store(context: &DriverContext, pages: &[InputPage]) {
+        let writes = page_rows(&submission(), pages).unwrap();
+        let txn_id = None;
+        let effect = StorageEffect::BatchWrite { writes, txn_id };
+        context.storage_handle.send_storage_effect(effect).await;
+    }
+
+    fn answer(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
+        let answer = MetadataAnswer {
+            peer,
+            elapsed: Duration::ZERO,
+            result,
+        };
+        IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+            answer,
+        )))))
+    }
+
+    fn page_answer(page: Option<InputPage>) -> Vec<u8> {
+        let page = page.map(Box::new);
+        encode_message(&MetadataTransportMessage::InputPageResult { page }).unwrap()
+    }
+
+    fn asked_peer(next: ChainNext) -> NodeId {
+        let Ok(Next::Call(IoCall::Effect(effect))) = next else {
+            panic!("expected a page request: {next:?}");
+        };
+        let Effect::Net(NetEffect::MetadataRequest(request)) = *effect else {
+            panic!("expected a metadata request");
+        };
+        request.peer
+    }
+
+    // A missing page is asked of each peer in turn; a wrong page or failure moves on, and the
+    // page that matches is kept here before the chain continues.
+    #[test]
+    fn fetch_tries_peers() {
+        let (manifest, pages) = paginate(&pins(), PageEntries::Launch).unwrap();
+        let peers = vec![node(1), node(2), node(3)];
+        let mut load = LoadChainOperation::new(submission(), manifest, peers);
+        assert!(matches!(load.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let asked = load.next(IoResult::Values(vec![None]));
+        assert_eq!(asked_peer(asked), node(1));
+        let failed = answer(node(1), Err(PeerRequestError::TimedOut));
+        assert_eq!(asked_peer(load.next(failed)), node(2));
+        let wrong = answer(node(2), Ok(page_answer(Some(pages[1].clone()))));
+        assert_eq!(asked_peer(load.next(wrong)), node(3));
+        let right = answer(node(3), Ok(page_answer(Some(pages[0].clone()))));
+        assert!(matches!(load.next(right), Ok(Next::Call(IoCall::Write(_)))));
+        assert!(matches!(
+            load.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        assert_eq!(load.pages, pages[..1]);
+    }
+
+    // When no peer has the page, the chain names the page it could not get.
+    #[test]
+    fn exhausted_peers_unavailable() {
+        let (manifest, _) = paginate(&pins(), PageEntries::Launch).unwrap();
+        let mut load = LoadChainOperation::new(submission(), manifest, vec![node(1)]);
+        load.first().expect("the page is read here first");
+        load.next(IoResult::Values(vec![None])).expect("one peer");
+        let empty = answer(node(1), Ok(page_answer(None)));
+        assert_eq!(
+            load.next(empty),
+            Err(PageReadError::Unavailable { index: 0 })
+        );
+    }
+
+    // A stored page under the wrong digest is refused rather than used.
+    #[test]
+    fn stored_page_checked() {
+        let (manifest, pages) = paginate(&pins(), PageEntries::Launch).unwrap();
+        let mut load = LoadChainOperation::new(submission(), manifest, Vec::new());
+        load.first().expect("the page is read here first");
+        let row = postcard::to_allocvec(&pages[1]).unwrap();
+        let read = load.next(IoResult::Values(vec![Some(Value::from(row))]));
+        assert!(matches!(
+            read,
+            Err(PageReadError::Page(PageError::Digest { .. }))
+        ));
+    }
+
+    // Without a network only the named peers can be asked; with one, the config comes first.
+    #[test]
+    fn family_chain_config() {
+        let (manifest, _) = paginate(&pins(), PageEntries::Launch).unwrap();
+        let mut alone = FamilyChainOperation::new(submission(), manifest, vec![node(1)], None);
+        assert!(matches!(alone.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(alone.loading);
+        let node_id = Some((node(2), crate::tests::records::REALM));
+        let mut served = FamilyChainOperation::new(submission(), manifest, Vec::new(), node_id);
+        assert!(matches!(served.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(!served.loading);
+    }
+
+    // Only a realm infrastructure node is served a page.
+    #[test]
+    fn device_gets_nothing() {
+        let realm = crate::tests::records::REALM;
+        let mut serve = ServePageOperation::new(realm, node(1), submission(), [1; 32]);
+        serve.first().expect("the config is read");
+        let config = RealmConfigDocument::new(realm, Vec::new(), 1);
+        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(
+            Ok::<_, GetConfigError>(config),
+        ));
+        assert_eq!(serve.next(answer), Ok(Next::Done(None)));
+    }
+
+    // A launch that fits its record stores nothing.
+    #[test]
+    fn small_entries_inline() {
+        let mut store = StoreEntriesOperation {
+            submission: submission(),
+            paged: Ok(None),
+            manifest: None,
+        };
+        assert_eq!(store.first(), Ok(Next::Done(None)));
     }
 
     #[tokio::test]
@@ -635,25 +760,21 @@ mod tests {
             });
         }
         let (full_inputs, full_captured) = (inputs.clone(), captured.clone());
-        let manifest = page_request(&context, &spec.submission_id, &mut inputs, &mut captured)
-            .await
-            .unwrap()
-            .expect("paged");
-        assert!(inputs.is_empty() && captured.is_empty() && manifest.pages > 1);
+        let store = StoreEntriesOperation::request(spec.submission_id, &inputs, &captured);
+        let manifest = drive(store, &context).await.unwrap().expect("paged");
+        assert!(manifest.pages > 1);
         spec.input_pages = Some(manifest);
-        let filled = with_inputs(&context, &spec).await.unwrap();
+        let filled = drive(SpecInputsOperation::new(&spec, None), &context)
+            .await
+            .unwrap();
         assert_eq!(filled.payload.inputs, full_inputs);
         assert_eq!(filled.captured_inputs, full_captured);
-        let (mut small, mut small_captured) =
-            (full_inputs[..2].to_vec(), full_captured[..2].to_vec());
-        let inline = page_request(
-            &context,
-            &spec.submission_id,
-            &mut small,
-            &mut small_captured,
+        let small = StoreEntriesOperation::request(
+            spec.submission_id,
+            &full_inputs[..2],
+            &full_captured[..2],
         );
-        assert_eq!(inline.await.unwrap(), None);
-        assert_eq!(small.len(), 2);
+        assert_eq!(drive(small, &context).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -662,20 +783,14 @@ mod tests {
         let (_directory, storage) = test_storage();
         let context = test_context(storage);
         let (manifest, pages) = paginate(&pins(), PageEntries::Launch).unwrap();
-        store_pages(&context, &submission(), &pages[1..])
-            .await
-            .unwrap();
-        let missing = load_chain(&context, &submission(), &manifest, &[]).await;
+        let load = |submission| LoadChainOperation::new(submission, manifest, Vec::new());
+        store(&context, &pages[1..]).await;
+        let missing = drive(load(submission()), &context).await;
         assert_eq!(missing, Err(PageReadError::Unavailable { index: 0 }));
-        store_pages(&context, &submission(), &pages[..1])
-            .await
-            .unwrap();
-        let loaded = load_chain(&context, &submission(), &manifest, &[])
-            .await
-            .unwrap();
+        store(&context, &pages[..1]).await;
+        let loaded = drive(load(submission()), &context).await.unwrap();
         assert_eq!(loaded, pages);
-        let other = SubmissionId([5; 32]);
-        let foreign = load_chain(&context, &other, &manifest, &[]).await;
+        let foreign = drive(load(SubmissionId([5; 32])), &context).await;
         assert_eq!(foreign, Err(PageReadError::Unavailable { index: 0 }));
     }
 }
