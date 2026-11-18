@@ -329,7 +329,10 @@ mod tests {
     #[test]
     fn search_checks_answer() {
         let mut operation = search(5, RepositoryConnectorKind::Invenio);
-        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let url = "https://zenodo.org/api/records?q=title%3Aa&page=1&size=5&allversions=false";
         assert_eq!(
             operation.next(child::<_, TransferError>(Ok(session()))),
@@ -377,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn doi_tries_each_field() {
+    fn doi_tries_field() {
         let mut operation = resolve(RecordReference::Doi("10.1234/ab".into()));
         operation.first().unwrap();
         let version = operation.next(child::<_, TransferError>(Ok(session())));

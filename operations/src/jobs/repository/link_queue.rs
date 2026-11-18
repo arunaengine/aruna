@@ -12,8 +12,8 @@ use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::repository::{
-    LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
-    RemoteState, RepositoryLink,
+    LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
+    RepositoryLink,
 };
 use aruna_core::rows::{PrefixPages, all_values, done, event};
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
@@ -36,7 +36,7 @@ use super::links::{
 };
 use super::pull::CheckDueOperation;
 use super::push::{creator_auth, parse_checkpoint, read_checkpoint};
-use super::submit::{LinkJob, SubmitLinkJobOperation};
+use super::submit::{LinkJob, LinkJobOperation};
 use super::{NodeScope, TransferError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::store::job_rows::ReadJobOperation;
@@ -450,7 +450,10 @@ impl Operation for CheckLinkOperation {
                 let record = result
                     .child::<Option<JobRecord>, aruna_core::calls::IoError>()?
                     .map_err(|error| LinkError::Unexpected(error.to_string()))?;
-                if record.as_ref().is_some_and(|record| !record.state.is_terminal()) {
+                if record
+                    .as_ref()
+                    .is_some_and(|record| !record.state.is_terminal())
+                {
                     return self.retry_after(ACTIVE_RETRY_MS);
                 }
                 let stale = SettleStaleOperation::new(
@@ -708,7 +711,7 @@ impl StartPushOperation {
             limits: self.link.limits.clone(),
         };
         self.step = PushStep::Submit;
-        child(IoCall::child(SubmitLinkJobOperation::new(
+        child(IoCall::child(LinkJobOperation::new(
             self.scope.clone(),
             self.link.owner_node,
             LinkJob::Export(spec),
@@ -943,7 +946,9 @@ impl Operation for PushRevisionOperation {
             }
             RevisionStep::Registry => {
                 let record = registry_row(result)?;
-                Ok(Next::Done(record.map(|record| (record.last_event_id, None))))
+                Ok(Next::Done(
+                    record.map(|record| (record.last_event_id, None)),
+                ))
             }
         }
     }
@@ -1079,7 +1084,9 @@ impl Operation for LinkTimerOperation {
                     return Ok(Next::Done(()));
                 };
                 self.step = TimerStep::Arm;
-                Ok(Next::Call(schedule_drain(due_after(self.now_ms, due)).into()))
+                Ok(Next::Call(
+                    schedule_drain(due_after(self.now_ms, due)).into(),
+                ))
             }
             TimerStep::Arm => {
                 if let Event::Task(TaskEvent::Error { message, .. }) = event(result)? {
@@ -1092,5 +1099,5 @@ impl Operation for LinkTimerOperation {
 }
 
 #[cfg(test)]
-#[path = "link_queue_tests.rs"]
+#[path = "queue_tests.rs"]
 mod tests;

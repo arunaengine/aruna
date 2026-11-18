@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryCredential;
 use aruna_core::repository::remote::{InvenioAccess, JobStop};
 use aruna_core::rows::event;
-use aruna_core::operation::Operation;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -103,7 +103,11 @@ impl ConnectOperation {
         }
     }
 
-    fn opened(&self, view: &ConnectorView, token: Option<String>) -> Result<Session, TransferError> {
+    fn opened(
+        &self,
+        view: &ConnectorView,
+        token: Option<String>,
+    ) -> Result<Session, TransferError> {
         if !self.request.scope.has_blob {
             return Err(TransferError::Retryable("blob handle unavailable".into()));
         }

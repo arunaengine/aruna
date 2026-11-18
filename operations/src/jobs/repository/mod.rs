@@ -118,7 +118,9 @@ pub(crate) fn remote_call(call: RemoteCall, stop: Option<JobStop>) -> IoCall {
 }
 
 /// The answer to a [`remote_call`].
-pub(crate) fn remote_answer(result: IoResult) -> Result<Result<RemoteAnswer, RemoteFailure>, IoError> {
+pub(crate) fn remote_answer(
+    result: IoResult,
+) -> Result<Result<RemoteAnswer, RemoteFailure>, IoError> {
     match result.event()? {
         Event::Blob(BlobEvent::Remote(answer)) => Ok(answer),
         Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(Err(

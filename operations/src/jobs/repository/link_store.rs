@@ -21,7 +21,7 @@ use ulid::Ulid;
 use super::NodeScope;
 use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use super::push::creator_auth;
-use super::submit::{LinkJob, SubmitLinkJobOperation};
+use super::submit::{LinkJob, LinkJobOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
@@ -309,7 +309,7 @@ impl ApplyChangeOperation {
         };
         let key = format!("identifiers/{}/{}", self.link.link_id, record.id);
         self.step = ChangeStep::Register;
-        Ok(Next::Call(IoCall::child(SubmitLinkJobOperation::new(
+        Ok(Next::Call(IoCall::child(LinkJobOperation::new(
             self.scope.clone(),
             self.link.owner_node,
             LinkJob::Identifiers(spec),
@@ -396,5 +396,5 @@ impl Operation for ApplyChangeOperation {
 }
 
 #[cfg(test)]
-#[path = "link_store_tests.rs"]
+#[path = "store_tests.rs"]
 mod tests;

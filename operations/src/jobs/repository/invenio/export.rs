@@ -10,7 +10,9 @@ use aruna_core::repository::invenio::{
     export_fields, missing_fields, record_id, record_identifiers, validate_id,
 };
 use aruna_core::repository::remote::{FileDigests, InvenioError, RemoteAnswer, RemoteCall};
-use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryDestination, RepositoryRecord};
+use aruna_core::repository::{
+    ExportIdentity, LinkFailure, RepositoryDestination, RepositoryRecord,
+};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
@@ -274,7 +276,10 @@ impl RepositoryExportOperation {
 
     fn save_then(&mut self, after: After) -> Turn<ExportResult> {
         self.step = ExportStep::Save(after);
-        Ok(Next::Call(save_checkpoint(&self.run.job, &self.checkpoint)?))
+        Ok(Next::Call(save_checkpoint(
+            &self.run.job,
+            &self.checkpoint,
+        )?))
     }
 
     fn resume(&mut self, after: After) -> Turn<ExportResult> {
@@ -621,7 +626,10 @@ impl CreateDraftOperation {
             DraftStep::Created(session, parent) => {
                 let record = json_body(result)?;
                 self.check_created(&record, parent)?;
-                Ok(Next::Done((self.fenced, Ok(record_from(&session, &record)?))))
+                Ok(Next::Done((
+                    self.fenced,
+                    Ok(record_from(&session, &record)?),
+                )))
             }
         }
     }
@@ -863,7 +871,9 @@ impl Operation for PrepareDraftOperation {
     type Error = TransferError;
 
     fn first(&mut self) -> Turn<Self::Output> {
-        Ok(Next::Call(self.run.connect("personal login missing", true)?))
+        Ok(Next::Call(
+            self.run.connect("personal login missing", true)?,
+        ))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
@@ -987,7 +997,9 @@ impl DepositOperation {
             || draft["is_published"] != self.published
             || draft["parent"]["id"] != self.record.parent_id
         {
-            return Err(invalid("export record identity or publication state changed"));
+            return Err(invalid(
+                "export record identity or publication state changed",
+            ));
         }
         self.draft = draft;
         self.checked = true;
@@ -1095,7 +1107,9 @@ impl DepositOperation {
                 let session = session_of(result)?;
                 let draft_url = session.url(&["records", &self.record.id, "draft"])?;
                 if draft_url.as_str() != self.record.url {
-                    return Err(invalid("repository connector endpoint changed during export"));
+                    return Err(invalid(
+                        "repository connector endpoint changed during export",
+                    ));
                 }
                 let call = session.get(draft_url);
                 self.step = DepositStep::Draft(session);
@@ -1262,7 +1276,13 @@ impl UploadEntryOperation {
     }
 
     fn file_url(&self, tail: &[&str]) -> Result<url::Url, TransferError> {
-        let mut segments = vec!["records", &self.record_id, "draft", "files", &self.entry.path];
+        let mut segments = vec![
+            "records",
+            &self.record_id,
+            "draft",
+            "files",
+            &self.entry.path,
+        ];
         segments.extend_from_slice(tail);
         self.session.url(&segments)
     }
@@ -1293,7 +1313,11 @@ impl UploadEntryOperation {
 
     fn after_hash(&mut self) -> Turn<FileDigests> {
         let digests = self.digests()?.clone();
-        if let Some(file) = self.existing.as_ref().filter(|file| file["checksum"].is_string()) {
+        if let Some(file) = self
+            .existing
+            .as_ref()
+            .filter(|file| file["checksum"].is_string())
+        {
             verify_file(file, &digests, false)?;
             if file["status"] == "completed" {
                 return Ok(Next::Done(digests));
@@ -1358,8 +1382,7 @@ impl Operation for UploadEntryOperation {
                 }
                 let replaced = self.replace
                     && self.existing.as_ref().is_some_and(|file| {
-                        file["checksum"].is_string()
-                            && verify_file(file, &digests, false).is_err()
+                        file["checksum"].is_string() && verify_file(file, &digests, false).is_err()
                     });
                 self.expected = Some(digests);
                 if replaced {
@@ -1449,7 +1472,9 @@ impl FinishDepositOperation {
     fn files_call(&self, published: bool) -> Result<IoCall, TransferError> {
         let url = match published {
             true => self.session.url(&["records", self.id(), "files"])?,
-            false => self.session.url(&["records", self.id(), "draft", "files"])?,
+            false => self
+                .session
+                .url(&["records", self.id(), "draft", "files"])?,
         };
         Ok(self.session.get(url))
     }
@@ -1501,10 +1526,11 @@ impl Operation for FinishDepositOperation {
                 if current["parent"]["id"] != self.record.parent_id {
                     return Err(invalid("repository parent changed"));
                 }
-                if !self.run.destination.public_files
-                    && current["access"]["files"] != "restricted"
+                if !self.run.destination.public_files && current["access"]["files"] != "restricted"
                 {
-                    return Err(invalid("repository file access is more public than requested"));
+                    return Err(invalid(
+                        "repository file access is more public than requested",
+                    ));
                 }
                 self.step = FinishStep::Files(current);
                 Ok(Next::Call(self.files_call(self.published)?))
@@ -1550,7 +1576,9 @@ impl Operation for FinishDepositOperation {
                     .ok_or_else(|| invalid("community has no id"))?;
                 let request =
                     json!({"receiver": {"community": id}, "type": "community-submission"});
-                let url = self.session.url(&["records", self.id(), "draft", "review"])?;
+                let url = self
+                    .session
+                    .url(&["records", self.id(), "draft", "review"])?;
                 self.step = FinishStep::ReviewRequest;
                 Ok(Next::Call(self.session.put(url, request)))
             }

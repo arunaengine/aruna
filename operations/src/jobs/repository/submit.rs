@@ -89,7 +89,7 @@ enum SubmitStep {
 
 /// Mints the job id from the realm config and submits the job, rerun after a lost conflict.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SubmitLinkJobOperation {
+pub(crate) struct LinkJobOperation {
     scope: NodeScope,
     owner: NodeId,
     job: Option<LinkJob>,
@@ -98,7 +98,7 @@ pub(crate) struct SubmitLinkJobOperation {
     step: SubmitStep,
 }
 
-impl SubmitLinkJobOperation {
+impl LinkJobOperation {
     pub(crate) fn new(scope: NodeScope, owner: NodeId, job: LinkJob, key: String) -> Self {
         Self {
             scope,
@@ -129,7 +129,7 @@ fn spent() -> SubmitJobError {
     SubmitJobError::UnexpectedEvent("the link job was already submitted".to_string())
 }
 
-impl Operation for SubmitLinkJobOperation {
+impl Operation for LinkJobOperation {
     type Output = SubmitJobResult;
     type Error = SubmitJobError;
 
@@ -160,9 +160,7 @@ impl Operation for SubmitLinkJobOperation {
                     .child::<RealmConfigDocument, GetConfigError>()?
                     .map_err(|error| {
                         warn!(%error, "Realm config unavailable for a repository link job");
-                        SubmitJobError::PlacementUnavailable(
-                            "realm config unavailable".to_string(),
-                        )
+                        SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
                     })?;
                 let job = self.job.as_ref().ok_or_else(spent)?;
                 let subject = job.dedup_key(&self.key);
@@ -193,15 +191,15 @@ mod tests {
         })
     }
 
-    fn operation(scope: NodeScope, owner: NodeId) -> SubmitLinkJobOperation {
+    fn operation(scope: NodeScope, owner: NodeId) -> LinkJobOperation {
         let job = job(&scope);
-        let mut operation = SubmitLinkJobOperation::new(scope, owner, job, "key".into());
+        let mut operation = LinkJobOperation::new(scope, owner, job, "key".into());
         operation.stamp(NOW_MS);
         operation
     }
 
     #[test]
-    fn placed_job_reads_config() {
+    fn placed_job_config() {
         let mut submit = operation(scope(), link().owner_node);
         assert_eq!(
             submit.first(),
@@ -218,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_owner_is_refused() {
+    fn foreign_owner_refused() {
         let mut submit = operation(scope(), other_node());
         assert!(matches!(
             submit.first(),
@@ -241,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_keep_their_key() {
+    fn identifiers_keep_key() {
         assert_eq!(job(&local_scope()).dedup_key("key"), b"key");
     }
 }

@@ -23,7 +23,7 @@ use super::link_store::{
 };
 use super::links::{LinkChange, LinkError};
 use super::push::creator_auth;
-use super::submit::{LinkJob, SubmitLinkJobOperation};
+use super::submit::{LinkJob, LinkJobOperation};
 use super::{NodeScope, TransferError};
 use crate::jobs::store::job_rows::ReadJobOperation;
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
@@ -63,7 +63,9 @@ impl CheckDueOperation {
     }
 
     fn retry(&self) -> Turn<Option<u64>> {
-        Ok(Next::Done(Some(self.now_ms.saturating_add(ACTIVE_RETRY_MS))))
+        Ok(Next::Done(Some(
+            self.now_ms.saturating_add(ACTIVE_RETRY_MS),
+        )))
     }
 }
 
@@ -108,7 +110,10 @@ impl Operation for CheckDueOperation {
                 let record = result
                     .child::<Option<JobRecord>, aruna_core::calls::IoError>()?
                     .map_err(|error| LinkError::Unexpected(error.to_string()))?;
-                if record.as_ref().is_some_and(|record| !record.state.is_terminal()) {
+                if record
+                    .as_ref()
+                    .is_some_and(|record| !record.state.is_terminal())
+                {
                     return self.retry();
                 }
                 let change = LinkChange::Finish {
@@ -318,7 +323,7 @@ impl Operation for StartPullOperation {
                     self.link.link_id, self.record_id, self.link.sequence
                 );
                 self.step = PullStep::Submit;
-                Ok(Next::Call(IoCall::child(SubmitLinkJobOperation::new(
+                Ok(Next::Call(IoCall::child(LinkJobOperation::new(
                     self.scope.clone(),
                     self.link.owner_node,
                     LinkJob::Import(spec),

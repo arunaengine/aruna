@@ -142,7 +142,10 @@ mod tests {
     #[test]
     fn rbac_runs_first() {
         let mut operation = check();
-        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let denied = child::<bool, AuthorizationError>(Ok(false));
         assert_eq!(
             operation.next(denied),
@@ -169,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_group_is_denied() {
+    fn missing_group_denied() {
         let mut operation = check();
         operation.first().unwrap();
         let missing = child::<bool, AuthorizationError>(Err(AuthorizationError::GroupNotFound));

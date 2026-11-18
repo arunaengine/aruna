@@ -72,7 +72,10 @@ impl CrateCheck {
     }
 
     /// The check result from the Profile's verdict and the kind's mapping rules.
-    pub fn finish(self, status: ProfileValidationStatus) -> Result<RequirementCheck, TransferError> {
+    pub fn finish(
+        self,
+        status: ProfileValidationStatus,
+    ) -> Result<RequirementCheck, TransferError> {
         let rules = descriptor(self.kind)
             .ok_or_else(|| not_supported("publishing"))?
             .rules()?;
@@ -221,7 +224,8 @@ impl CheckContentOperation {
                     prefix: prefix.as_deref(),
                 })
                 .collect::<Vec<_>>();
-            self.findings.extend(content_findings(&check.target, &facts));
+            self.findings
+                .extend(content_findings(&check.target, &facts));
             self.targets.pop_front();
         }
         Ok(Next::Done(std::mem::take(&mut self.findings)))
@@ -239,7 +243,9 @@ impl Operation for CheckContentOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, TransferError> {
         let answer = remote_answer(result)?.map_err(TransferError::from)?;
         let RemoteAnswer::Bytes(mut prefix) = answer else {
-            return Err(TransferError::Retryable("unexpected crate file answer".into()));
+            return Err(TransferError::Retryable(
+                "unexpected crate file answer".into(),
+            ));
         };
         prefix.truncate(FORMAT_PREFIX as usize);
         let check = self

@@ -367,7 +367,10 @@ impl HarvestJobOperation {
             // Complete: advance the window so the next harvest is incremental.
             return self.save_cursor(self.overall_max, None, AfterSave::Finish);
         };
-        if !self.seen_tokens.insert(*blake3::hash(token.as_bytes()).as_bytes()) {
+        if !self
+            .seen_tokens
+            .insert(*blake3::hash(token.as_bytes()).as_bytes())
+        {
             let failure = retryable("OAI provider returned a resumption token twice");
             return self.save_cursor(self.original_last, None, AfterSave::Fail(failure));
         }
@@ -639,11 +642,7 @@ impl ApplyRecordOperation {
         )))))
     }
 
-    fn update_call(
-        &self,
-        document_id: Ulid,
-        record: Option<MetadataRegistryRecord>,
-    ) -> IoCall {
+    fn update_call(&self, document_id: Ulid, record: Option<MetadataRegistryRecord>) -> IoCall {
         self.routed(HarvestWrite::Update {
             actor: self.actor.clone(),
             owner: self.owner(),

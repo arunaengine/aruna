@@ -202,7 +202,9 @@ impl Operation for LinkSessionOperation {
     type Error = TransferError;
 
     fn first(&mut self) -> Turn<Session> {
-        Ok(Next::Call(IoCall::Read(vec![secret_row(self.link.link_id)])))
+        Ok(Next::Call(IoCall::Read(vec![secret_row(
+            self.link.link_id,
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Session> {
@@ -212,7 +214,9 @@ impl Operation for LinkSessionOperation {
         let link = &self.link;
         let credential = parse_secret(value(result)?)
             .map_err(|error| TransferError::Retryable(error.to_string()))?
-            .filter(|secret| secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint)
+            .filter(|secret| {
+                secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint
+            })
             .ok_or_else(|| TransferError::Permanent("the link token was removed".into()))?;
         self.connecting = true;
         Ok(Next::Call(IoCall::child(ConnectOperation::new(
@@ -354,7 +358,11 @@ enum StateStep {
     Connect,
     Draft(Session),
     Versions(Session, Option<Value>),
-    Files(Option<RepositoryRecord>, Option<RepositoryRecord>, LinkReview),
+    Files(
+        Option<RepositoryRecord>,
+        Option<RepositoryRecord>,
+        LinkReview,
+    ),
 }
 
 /// The repository's current draft and latest published version, for accepting remote edits.

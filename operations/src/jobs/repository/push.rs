@@ -17,7 +17,9 @@ use ulid::Ulid;
 
 use super::invenio::remote::CheckLineageOperation;
 use super::link_queue::{PushRevisionOperation, Revision};
-use super::link_store::{ApplyChangeOperation, ReadLinkOperation, link_row, parse_link, parse_secret, secret_row};
+use super::link_store::{
+    ApplyChangeOperation, ReadLinkOperation, link_row, parse_link, parse_secret, secret_row,
+};
 use super::links::{LinkChange, LinkError};
 use super::{JobScope, NodeScope, TransferError};
 use crate::jobs::executor::JobRunOutcome;
@@ -66,9 +68,9 @@ pub(crate) fn checkpoint_saved(result: IoResult) -> Result<(), TransferError> {
     result
         .child::<(), JobMutationError>()?
         .map_err(|error| match error {
-            JobMutationError::Conflict => TransferError::Retryable(
-                "checkpoint write exhausted conflict retries".to_string(),
-            ),
+            JobMutationError::Conflict => {
+                TransferError::Retryable("checkpoint write exhausted conflict retries".to_string())
+            }
             error => TransferError::Retryable(error.to_string()),
         })
 }
@@ -166,7 +168,9 @@ impl Operation for PrepareLinkOperation {
                             "the link has not started this push".into(),
                         ));
                     }
-                    Some(_) => return Err(permanent("a newer push of this link replaced this job")),
+                    Some(_) => {
+                        return Err(permanent("a newer push of this link replaced this job"));
+                    }
                 }
                 let credential = parse_secret(secret)
                     .map_err(stored)?
@@ -175,8 +179,7 @@ impl Operation for PrepareLinkOperation {
                     })
                     .ok_or_else(|| permanent("the link token was removed"))?;
                 self.destination.credential = Some(credential);
-                if self.checkpoint.repository.is_some()
-                    || self.checkpoint.repository_base.is_some()
+                if self.checkpoint.repository.is_some() || self.checkpoint.repository_base.is_some()
                 {
                     return self.finish();
                 }

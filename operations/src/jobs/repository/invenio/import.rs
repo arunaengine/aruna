@@ -46,11 +46,7 @@ pub(crate) struct AcquireRequest {
     pub(crate) current: Option<(String, Ulid)>,
 }
 
-pub(crate) type Acquired = (
-    ArtifactRef,
-    Vec<SecondaryIdentifier>,
-    Option<PullProgress>,
-);
+pub(crate) type Acquired = (ArtifactRef, Vec<SecondaryIdentifier>, Option<PullProgress>);
 
 type VersionRecords = Vec<(Value, Value)>;
 
@@ -248,7 +244,12 @@ struct HistoryOperation {
 }
 
 impl HistoryOperation {
-    fn new(session: Session, requested: String, limits: RoCrateLimits, options: ImportOptions) -> Self {
+    fn new(
+        session: Session,
+        requested: String,
+        limits: RoCrateLimits,
+        options: ImportOptions,
+    ) -> Self {
         Self {
             session,
             requested,
