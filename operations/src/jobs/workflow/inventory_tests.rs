@@ -164,7 +164,7 @@ fn refuses_unreserved_key() {
 
 // A later page of the same prefix is asked for before the next prefix.
 #[test]
-fn follows_pages_and_prefixes() {
+fn follows_all_pages() {
     let token = ListContinuationToken {
         last_key: b"reports/a".to_vec(),
         last_common_prefix: None,

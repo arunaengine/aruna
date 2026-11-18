@@ -329,10 +329,9 @@ pub struct ViewListing {
     pub next: Option<ViewFrom>,
 }
 
-/// Lists `entries` (in key order) below a prefix from a position. The caller checks each
-/// [`candidate`](Self::candidate) and gives the verdict to [`answer`](Self::answer), so nothing
-/// before the position or past the page is checked. A common prefix shows once one of its
-/// entries does and counts once toward `max_keys`.
+/// Lists `entries` (in key order) below a prefix from a position; the caller checks each
+/// candidate, and nothing before the position or past the page is checked. A common prefix
+/// shows once one of its entries does and counts once toward `max_keys`.
 #[derive(Debug)]
 pub struct ViewLister<'a> {
     entries: &'a [ViewEntry],
@@ -896,7 +895,7 @@ mod tests {
 
     // An input at the manifest key turns the cache off and is read as that input.
     #[test]
-    fn manifest_key_disables_cache() {
+    fn manifest_key_disables() {
         let local = entry("a").captured.source_node_id;
         let taken = vec![entry("a"), entry(CACHE_MANIFEST_KEY)];
         let mut keys = CachedKeysOperation::new(taken.clone(), local);
@@ -906,7 +905,7 @@ mod tests {
 
     // Nothing that could be cached asks for no row at all.
     #[test]
-    fn no_candidates_read_nothing() {
+    fn empty_candidates_skip() {
         let other = iroh::SecretKey::from_bytes(&[9; 32]).public();
         let mut keys = CachedKeysOperation::new(vec![entry("a")], other);
         assert_eq!(keys.first(), Ok(Next::Done(BTreeSet::new())));
@@ -914,7 +913,7 @@ mod tests {
 
     // A row that does not decode leaves the cache undecided.
     #[test]
-    fn bad_row_is_unavailable() {
+    fn bad_row_unavailable() {
         let local = entry("a").captured.source_node_id;
         let mut keys = CachedKeysOperation::new(vec![entry("a")], local);
         keys.first().unwrap();
@@ -944,7 +943,7 @@ mod tests {
 
     // Every cached entry is checked, in order, before the list is built.
     #[test]
-    fn manifest_checks_each_entry() {
+    fn manifest_checks_entries() {
         let entries = vec![entry("a"), entry("skipped"), entry("c")];
         let mut manifest = manifest_operation(entries.clone());
         assert!(matches!(manifest.first(), Ok(Next::Call(IoCall::Child(_)))));
@@ -962,7 +961,7 @@ mod tests {
 
     // A run that caches nothing has no list and checks nothing.
     #[test]
-    fn manifest_empty_is_none() {
+    fn empty_manifest_none() {
         let mut manifest = manifest_operation(vec![entry("a")]);
         manifest.first().unwrap();
         assert_eq!(manifest.next(cached_answer(&[])), Ok(Next::Done(None)));

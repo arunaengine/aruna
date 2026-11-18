@@ -92,7 +92,7 @@ fn settle(outcome: JobRunOutcome, checkpointed: bool) -> SettleRunOperation {
 
 // Only an active unlock of exactly this key counts.
 #[test]
-fn key_needs_active_unlock() {
+fn active_unlock_needed() {
     let answer = |generations| {
         let mut unlocked = KeyUnlockedOperation::new(key());
         assert!(matches!(
@@ -128,7 +128,7 @@ fn terminal_retries_storage() {
 
 // A lost claim is no storage failure and ends the write at once.
 #[test]
-fn terminal_token_loss_ends() {
+fn token_loss_ends() {
     let mut write = TerminalWriteOperation::new(job(), token(), TerminalWrite::Cancel, NOW_MS);
     write.first().unwrap();
     assert_eq!(
@@ -139,7 +139,7 @@ fn terminal_token_loss_ends() {
 
 // A success writes its terminal state and owes no cleanup handler.
 #[test]
-fn success_needs_no_cleanup() {
+fn success_skips_cleanup() {
     let outcome = JobRunOutcome::Succeeded(JobResultPayload::Cleanup);
     let mut run = settle(outcome, false);
     assert!(is_child(&run.first()));
@@ -190,7 +190,7 @@ fn other_outcomes_settle() {
 
 // A job waiting for keys passes on whether its wait ended in a cancel.
 #[test]
-fn awaiting_key_reports_cleanup() {
+fn key_wait_reports() {
     let mut run = settle(JobRunOutcome::AwaitingKey(vec![wait()]), false);
     assert!(is_child(&run.first()));
     let reply = child(Ok::<_, JobMutationError>(true));
@@ -210,7 +210,7 @@ fn parked() -> IoResult {
 
 // A key unlocked while the job parked wakes it here; no unlock call would.
 #[test]
-fn unlocked_key_wakes_job() {
+fn unlocked_key_wakes() {
     let mut keys = await_keys();
     assert!(is_child(&keys.next(parked())));
     let unlocked = child(Ok::<_, IoError>(true));
@@ -221,7 +221,7 @@ fn unlocked_key_wakes_job() {
 
 // A key still locked, or one whose state cannot be read, leaves the job parked.
 #[test]
-fn locked_key_stays_parked() {
+fn locked_key_parks() {
     for reply in [
         child(Ok::<_, IoError>(false)),
         child(Err::<bool, _>(IoError::Unfinished)),
@@ -257,7 +257,7 @@ fn park_failures() {
 
 // A page names its jobs, skips rows that are no schedule keys and keeps the cursor.
 #[test]
-fn lease_page_reads_jobs() {
+fn lease_page_jobs() {
     let mut page = LeasePageOperation::new(None);
     assert_eq!(
         page.first(),
@@ -306,7 +306,7 @@ fn recovery_skips_unclaimed() {
 
 // An in-process job is released without spending an attempt.
 #[test]
-fn recovery_releases_in_process() {
+fn recovery_releases_local() {
     let claimed = record(JobExecutionClass::InProcess, true);
     let (mut run, next) = recover(Some(claimed.clone()));
     assert!(is_child(&next));

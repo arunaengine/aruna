@@ -128,7 +128,7 @@ fn completion_reads_progress() {
 
 // A write that lost its race announces nothing.
 #[test]
-fn lost_write_stays_silent() {
+fn lost_write_silent() {
     let ending = RunEnding::Cancel { result: result() };
     let mut end = EndRunOperation::new(job(), token(), ending, SCOPE);
     end.first().unwrap();
@@ -180,7 +180,7 @@ fn exhausted_cancel_settles() {
 
 // A failed park write is only logged.
 #[test]
-fn park_write_failure_ends() {
+fn park_failure_ends() {
     let mut operation = park();
     let failed = child(Err::<ParkOutcome, _>(JobMutationError::NotFound));
     assert_eq!(operation.next(failed), Ok(Next::Done(())));
@@ -192,7 +192,7 @@ fn failure(error: JobError) -> SubmitFailureOperation {
 
 // A permanent failure ends the job through its terminal write.
 #[test]
-fn permanent_failure_ends_job() {
+fn permanent_failure_ends() {
     let mut operation = failure(JobError::permanent("bad image"));
     assert!(is_child(&operation.first()));
     assert_eq!(operation.step, FailureStep::End);

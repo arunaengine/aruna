@@ -107,7 +107,7 @@ fn unreadable_reservations_stop() {
 
 // The request may shorten the realm's idle wait and never lengthen it.
 #[test]
-fn request_only_shortens_idle() {
+fn request_shortens_idle() {
     assert_eq!(at_realm(Some(10)).next(realm(50)), Ok(planned(10, 0)));
     assert_eq!(at_realm(Some(90)).next(realm(50)), Ok(planned(50, 0)));
     assert_eq!(at_realm(None).next(realm(50)), Ok(planned(50, 0)));
@@ -182,7 +182,7 @@ fn keys(report: &SessionReportOperation) -> Vec<String> {
 
 // Without a ledger the report still says why the session ended.
 #[test]
-fn empty_report_writes_end() {
+fn empty_report_ends() {
     let mut report = report(SessionLedger::default());
     assert!(is_child(&report.first()));
     assert!(report.rows.is_empty());
@@ -191,7 +191,7 @@ fn empty_report_writes_end() {
 
 // Inputs, then touched objects, then the end, one write each.
 #[test]
-fn report_rows_in_order() {
+fn report_rows_ordered() {
     let touched = TouchedObject {
         bucket: "work".to_string(),
         key: "a".to_string(),
@@ -235,7 +235,7 @@ fn finished_copy_counts() {
 
 // A copy whose id does not parse is skipped without a read.
 #[test]
-fn bad_copy_id_skipped() {
+fn bad_copy_skipped() {
     let mut report = report(SessionLedger {
         inputs: Vec::new(),
         pending: vec![pending("not-a-job")],

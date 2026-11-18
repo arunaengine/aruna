@@ -250,7 +250,7 @@ fn refuses_foreign_credential() {
 
 // An expired credential is renewed before an attempt exists and is final after.
 #[test]
-fn expired_depends_on_intent() {
+fn expiry_follows_intent() {
     let spec = spec();
     let mut record = record(&spec);
     let access = stored(&spec, &record, now());

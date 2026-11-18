@@ -132,7 +132,7 @@ fn cleans_then_revokes() {
 
 // Without an attempt only the credential is revoked; a key already gone is fine.
 #[test]
-fn no_attempt_only_revokes() {
+fn attemptless_only_revokes() {
     let mut cleanup = operation(None);
     assert!(is_child(&cleanup.first()));
     assert_eq!(cleanup.next(missing_key()), Ok(Next::Done(())));
@@ -152,7 +152,7 @@ fn missing_object_tombstones() {
 
 // A failed backend step still revokes, and the job fails with that step's error.
 #[test]
-fn backend_failure_still_revokes() {
+fn backend_failure_revokes() {
     let mut cleanup = fenced();
     cleanup.next(answer(ComputeAnswer::Done(Ok(())))).unwrap();
     let down = BackendError::Unavailable("down".to_string());
