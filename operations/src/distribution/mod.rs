@@ -18,6 +18,7 @@ pub mod guard;
 pub mod handoff;
 pub mod here;
 pub mod held;
+pub(crate) mod import_start;
 pub(crate) mod imports;
 #[cfg(test)]
 mod index_feed_tests;

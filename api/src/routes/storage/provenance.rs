@@ -6,7 +6,7 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
-use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::driver::drive_until;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;

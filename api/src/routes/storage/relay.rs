@@ -17,7 +17,6 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::{route_read, route_write};
 use aruna_operations::distribution::status::node_reach;
-use aruna_operations::driver::drive;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;

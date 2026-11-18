@@ -965,7 +965,17 @@ impl OperationsTaskHandler {
                 let context = &self.context;
                 let mut after = match crate::driver::drive(maintain_ranges(context), context).await
                 {
-                    Ok(pass) => pass.finish(),
+                    Ok(pass) => {
+                        let (after, imports) = pass.finish();
+                        for start in imports {
+                            let started =
+                                crate::distribution::import_start::start_kept(context, start);
+                            if let Err(error) = started.await {
+                                warn!(%error, "Handed over imports could not start");
+                            }
+                        }
+                        after
+                    }
                     Err(error) => {
                         warn!(%error, "Range maintenance could not finish a pass");
                         maintain_retry()

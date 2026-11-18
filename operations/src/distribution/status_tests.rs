@@ -339,7 +339,10 @@ fn lag_failure_ends() {
 // cursor of the fill's own walk counts.
 #[test]
 fn adds_copies_fills() {
-    let source = copied_view(1);
+    let mut source = copied_view(1);
+    for member in &mut source.head.snapshot.config.members {
+        member.incarnation = Some(5);
+    }
     let mut status = plain_status(&source);
     let range_id = status.ranges[0].range_id;
     let member_id = Ulid::from_bytes([2; 16]);

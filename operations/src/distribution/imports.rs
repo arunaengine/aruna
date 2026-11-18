@@ -33,9 +33,6 @@ use crate::connectors::get_connector::{
 use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
-use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::service::{SubmitHandedError, SubmitHandedOperation};
-use crate::jobs::submit::SubmitJobResult;
 use crate::jobs::staging::{CheckpointError, ReadCheckpointOperation, handed_checkpoint};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -84,10 +81,10 @@ struct FencedJob {
 /// What a new coordinator keeps of a range's imports: jobs still to fetch from the former
 /// coordinator, and jobs ready to run here with their connector and position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Kept {
+pub(super) struct Kept {
     from: NodeId,
     pending: Vec<JobId>,
-    ready: Vec<(StagingJobSpec, Option<StagingJobCheckpoint>)>,
+    pub(super) ready: Vec<(StagingJobSpec, Option<StagingJobCheckpoint>)>,
 }
 
 fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
@@ -663,19 +660,25 @@ impl Operation for FetchImportsOperation {
     }
 }
 
-/// What the pending call of starting handed imports answers.
+/// Kept imports of a range this node now coordinates, ready to run as its own jobs.
+#[derive(Debug, PartialEq)]
+pub(crate) struct KeptStart {
+    pub(super) key: Vec<u8>,
+    pub(super) kept: Kept,
+    pub(super) bucket: BucketInfo,
+}
+
+/// What the pending call of looking at handed imports answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinueStep {
     Page,
     Record,
     Bucket,
-    Submit,
-    Write,
     Delete,
 }
 
-/// Starts the kept imports of every range this node now coordinates, as its own jobs; a
-/// transfer that ended without this node drops them. A started job leaves the row at once.
+/// Finds the kept imports of every range this node now coordinates; a transfer that ended
+/// without this node drops them, one still on its way leaves them waiting.
 #[derive(Debug, PartialEq)]
 pub(super) struct ContinueImportsOperation {
     local: NodeId,
@@ -684,10 +687,10 @@ pub(super) struct ContinueImportsOperation {
     /// The handover row being worked on, with its range.
     current: Option<(Vec<u8>, Value, Ulid)>,
     kept: Option<Kept>,
-    bucket: Option<BucketInfo>,
+    starts: Vec<KeptStart>,
 }
 
-type Continuing = Result<Next<()>, ImportError>;
+type Continuing = Result<Next<Vec<KeptStart>>, ImportError>;
 
 impl ContinueImportsOperation {
     pub(super) fn new(local: NodeId) -> Self {
@@ -697,7 +700,7 @@ impl ContinueImportsOperation {
             rows: VecDeque::new(),
             current: None,
             kept: None,
-            bucket: None,
+            starts: Vec::new(),
         }
     }
 
@@ -710,7 +713,7 @@ impl ContinueImportsOperation {
             self.step = ContinueStep::Record;
             return Ok(Next::Call(record_read(set_id)));
         }
-        Ok(Next::Done(()))
+        Ok(Next::Done(std::mem::take(&mut self.starts)))
     }
 
     fn drop_row(&mut self) -> Continuing {
@@ -741,26 +744,10 @@ impl ContinueImportsOperation {
             _ => self.drop_row(),
         }
     }
-
-    /// Runs the next fetched job here as its own job from its handed position.
-    fn submit_next(&mut self) -> Continuing {
-        let kept = self.kept.as_ref().ok_or(IoError::Unfinished)?;
-        let Some((spec, resume)) = kept.ready.first().cloned() else {
-            return self.drop_row();
-        };
-        let bucket = self.bucket.as_ref().ok_or(IoError::Unfinished)?;
-        let spec = StagingJobSpec {
-            bucket_identity: bucket.identity(),
-            ..spec
-        };
-        let submit = SubmitHandedOperation::new(spec, resume, self.local, JOB_RETENTION_MS);
-        self.step = ContinueStep::Submit;
-        Ok(Next::Call(IoCall::child(submit)))
-    }
 }
 
 impl Operation for ContinueImportsOperation {
-    type Output = ();
+    type Output = Vec<KeptStart>;
     type Error = ImportError;
 
     fn first(&mut self) -> Continuing {
@@ -789,22 +776,11 @@ impl Operation for ContinueImportsOperation {
             }
             ContinueStep::Bucket => {
                 let info = result.child::<BucketInfo, GetBucketError>()?;
-                self.bucket = Some(info.map_err(failed)?);
-                self.submit_next()
-            }
-            ContinueStep::Submit => {
-                let submitted = result.child::<SubmitJobResult, SubmitHandedError>()?;
-                submitted.map_err(failed)?;
-                let (key, ..) = self.current.as_ref().ok_or(IoError::Unfinished)?;
-                let key = key.clone();
-                let kept = self.kept.as_mut().ok_or(IoError::Unfinished)?;
-                kept.ready.remove(0);
-                self.step = ContinueStep::Write;
-                Ok(Next::Call(encoded_row(key, &*kept)?))
-            }
-            ContinueStep::Write => {
-                result.done()?;
-                self.submit_next()
+                let bucket = info.map_err(failed)?;
+                let (key, ..) = self.current.take().ok_or(IoError::Unfinished)?;
+                let kept = self.kept.take().ok_or(IoError::Unfinished)?;
+                self.starts.push(KeptStart { key, kept, bucket });
+                self.next_row()
             }
             ContinueStep::Delete => {
                 result.done()?;

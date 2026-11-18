@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs};
 use super::here::NodeRealm;
-use super::imports::{ContinueImportsOperation, ImportError};
+use super::imports::{ContinueImportsOperation, ImportError, KeptStart};
 use super::inventory::{StagedCall, outside_answer};
 use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
 pub use super::rebuild::BeginRebuildsError;
@@ -74,15 +74,17 @@ pub(crate) struct MaintainCursors {
 pub(crate) struct MaintainPass {
     after: Duration,
     cursors: MaintainCursors,
+    imports: Vec<KeptStart>,
 }
 
 impl MaintainPass {
-    /// Keeps the cursors for the next pass and returns when it should run.
-    pub(crate) fn finish(self) -> Duration {
+    /// Keeps the cursors for the next pass; returns when it should run and the handed imports
+    /// to start now.
+    pub(crate) fn finish(self) -> (Duration, Vec<KeptStart>) {
         if let Ok(mut kept) = CURSORS.lock() {
             *kept = Some(self.cursors);
         }
-        self.after
+        (self.after, self.imports)
     }
 }
 
@@ -140,6 +142,7 @@ pub(crate) struct MaintainRangesOperation {
     lifecycle_poll: Option<Duration>,
     after: Duration,
     refresh_began: Option<Vec<u8>>,
+    imports: Vec<KeptStart>,
 }
 
 type Maintaining = Result<Next<MaintainPass>, IoError>;
@@ -161,6 +164,7 @@ impl MaintainRangesOperation {
             lifecycle_poll: None,
             after: MAINTAIN_AFTER,
             refresh_began: None,
+            imports: Vec::new(),
         }
     }
 
@@ -283,6 +287,7 @@ impl MaintainRangesOperation {
         Ok(Next::Done(MaintainPass {
             after: poll.map_or(self.after, |poll| poll.min(self.after)),
             cursors: std::mem::take(&mut self.cursors),
+            imports: std::mem::take(&mut self.imports),
         }))
     }
 }
@@ -332,8 +337,9 @@ impl Operation for MaintainRangesOperation {
                 self.next_balance()
             }
             MaintainStep::Imports => {
-                if let Err(error) = result.child::<(), ImportError>()? {
-                    warn!(%error, "Handed over imports could not start");
+                match result.child::<Vec<KeptStart>, ImportError>()? {
+                    Ok(starts) => self.imports = starts,
+                    Err(error) => warn!(%error, "Handed over imports could not start"),
                 }
                 self.refresh()
             }

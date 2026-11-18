@@ -948,7 +948,7 @@ async fn redeem(
     let refused = || drs_error(StatusCode::FORBIDDEN, "download ticket refused");
     let signed = SignedTicket::decode(encoded).map_err(|_| refused())?;
     let now = unix_timestamp_millis() / 1000;
-    match drive(redeem_ticket(&state.get_ctx(), &signed, object_id, now), &state.get_ctx()).await {
+    match redeem_ticket(&state.get_ctx(), &signed, object_id, now).await {
         Ok(auth) => Ok(auth),
         Err(RedeemError::Unavailable) => Err(DrsError::unavailable().into_response()),
         Err(_) => Err(refused()),

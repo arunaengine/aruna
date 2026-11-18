@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod checkpoint_read;
 mod lanes;
 mod limiter;
 mod manifest;
@@ -43,6 +44,8 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::reference::{MaterializeReferenceInput, MaterializeReferenceOperation};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 use aruna_core::structs::checksum::ExpectedChecksum;
+
+pub use checkpoint_read::{CheckpointError, ReadCheckpointOperation};
 
 /// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
 /// started yet, as a job handed over goes on from there.

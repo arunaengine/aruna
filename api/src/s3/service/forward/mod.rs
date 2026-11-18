@@ -31,7 +31,6 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::{route_read, route_upload, route_write};
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::distribution::status::node_reach;
-use aruna_operations::driver::drive;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
