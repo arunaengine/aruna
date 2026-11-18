@@ -699,389 +699,96 @@ impl UnifyJobOperation {
         }
     }
 
-    async fn run(&self, fence: Option<(&LinkedJob, &LinkedJob)>) -> Result<Unified, String> {
-        let found = self.found;
-        let error = |error: aruna_core::errors::ConversionError| error.to_string();
-        let mut writes = Vec::new();
-        let name: Key = self.bucket.as_bytes().to_vec().into();
-        if let Some((expected, next)) = fence {
-            let read = vec![(LINKED_JOB_KEYSPACE.to_string(), name.clone())];
-            let stored = self.batch(read).await?.pop().flatten();
-            if stored.as_deref() != Some(expected.to_bytes().map_err(error)?.as_slice()) {
-                return Ok(Unified::Stopped);
+    fn finish(&mut self) -> Turn<JobStep> {
+        Ok(Next::Done(std::mem::take(&mut self.progress)))
+    }
+
+    fn next_key(&mut self) -> Turn<JobStep> {
+        loop {
+            if self.unified == JOB_KEYS || self.walk.scanned > JOB_SCAN {
+                return self.finish();
             }
-            let next = next.to_bytes().map_err(error)?;
-            writes.push((LINKED_JOB_KEYSPACE.to_string(), name, next.into()));
-        }
-        let keep_key = found.keep.location_key().map_err(error)?;
-        let mut reads = vec![(
-            BLOB_LOCATIONS_KEYSPACE.to_string(),
-            Key::from(keep_key.to_bytes()),
-        )];
-        for (id, _) in &found.versions {
-            let version = VersionKey::new(self.bucket, &found.key, *id);
-            let version = version.to_bytes().map_err(error)?;
-            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), version.into()));
-        }
-        for copy in &found.copies {
-            reads.push((BACKEND_VERSION_KEYSPACE.to_string(), version_key(copy.ulid)));
-            for rule in self.rules {
-                let row = object_key(rule.import_id, &copy.backend_path);
-                reads.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row));
-            }
-        }
-        let mut values = self.batch(reads).await?.into_iter();
-        let kept = values.next().flatten();
-        // Compared decoded: the encoding of a location's hash map is not stable.
-        let kept = kept.as_deref().map(BackendLocation::from_bytes).transpose();
-        let mut deletes = Vec::new();
-        let twin = found
-            .twins
-            .iter()
-            .find(|(ulid, ..)| *ulid == found.keep.ulid);
-        match (kept.map_err(error)?, twin) {
-            (Some(kept), None) if kept == found.keep => {}
-            // A kept second copy becomes the versions' own file with a location row.
-            (None, Some((_, index, version))) => {
-                if !self.adoptable(index, *version).await? {
-                    return Ok(Unified::Changed);
+            match self.walk.advance()? {
+                WalkStep::Read(call) => {
+                    self.stage = JobStage::Page;
+                    return Ok(Next::Call(call));
                 }
-                let value = found.keep.to_bytes().map_err(error)?;
-                let location = Key::from(keep_key.to_bytes());
-                writes.push((BLOB_LOCATIONS_KEYSPACE.to_string(), location, value.into()));
-                deletes.push((RENAMED_ROW_KEYSPACE.to_string(), index.clone()));
-                self.charge(&found.keep).await?;
-            }
-            _ => return Ok(Unified::Changed),
-        }
-        // A kept file a release is deleting, at its backend version or without one, takes no
-        // new reader.
-        let read = vec![(
-            BACKEND_VERSION_KEYSPACE.to_string(),
-            version_key(found.keep.ulid),
-        )];
-        let provider = self.batch(read).await?.pop().flatten();
-        let provider = provider.map(|provider| String::from_utf8_lossy(&provider).into_owned());
-        let unversioned = provider.is_none();
-        let claim = claim_key(&found.keep, &provider.unwrap_or_default()).map_err(error)?;
-        let read = vec![(DELETE_CLAIM_KEYSPACE.to_string(), claim)];
-        if self.batch(read).await?.pop().flatten().is_some() {
-            return Ok(Unified::Changed);
-        }
-        // Without a backend version the kept file must still hold the bytes it was found with.
-        if unversioned && !self.kept_unchanged().await? {
-            return Ok(Unified::Changed);
-        }
-        // Which copy each version reads now; any change refuses the whole key.
-        let mut readers: HashMap<Ulid, Vec<(Ulid, BlobVersion)>> = HashMap::new();
-        for (id, stored) in &found.versions {
-            if values.next().flatten().as_deref() != Some(stored.as_slice()) {
-                return Ok(Unified::Changed);
-            }
-            let version = BlobVersion::from_bytes(stored).map_err(error)?;
-            // A raw copy is the copy whose location row the version reads.
-            let file = match &version.state {
-                BlobVersionState::Materialized {
-                    encoding: EncodingClass::Plain { location },
-                    ..
-                } => Some(*location),
-                BlobVersionState::Materialized {
-                    encoding: EncodingClass::Raw,
-                    ..
-                } => (found.copies.iter())
-                    .find(|copy| copy.location_key().ok() == version.location_key())
-                    .map(|copy| copy.ulid),
-                _ => None,
-            };
-            if let Some(file) = file {
-                readers.entry(file).or_default().push((*id, version));
-            }
-        }
-        let encoding = found.keep.format.encoding();
-        let mut changed = 0;
-        for copy in &found.copies {
-            let provider = values.next().flatten();
-            let mine = readers.remove(&copy.ulid).unwrap_or_default();
-            let twin = found.twins.iter().find(|(ulid, ..)| *ulid == copy.ulid);
-            let mut owner = None;
-            let mut foreign = false;
-            for rule in self.rules {
-                let row = values.next().flatten();
-                let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-                let Some(row) = row.map_err(error)? else {
-                    continue;
-                };
-                // A row of another key or version makes the file that version's own.
-                let named = match twin {
-                    Some((.., version)) => *version == row.version_id,
-                    None => mine.iter().any(|(id, _)| *id == row.version_id),
-                };
-                let ours = row.key.as_deref().is_none_or(|key| key == found.key) && named;
-                match ours {
-                    true => owner = owner.or(Some((rule.import_id, row.version_id))),
-                    false => foreign = true,
+                WalkStep::End => {
+                    self.progress.finished = true;
+                    return self.finish();
+                }
+                WalkStep::Key(key, versions) => {
+                    if !key.starts_with(&self.prefix) {
+                        self.progress.cursor = Some(key);
+                        continue;
+                    }
+                    let started = self.started_at_ms;
+                    let fresh = (versions.iter()).all(|(id, _)| id.timestamp_ms() <= started);
+                    let allowed = self.access.allows(Some(&key), &Permission::WRITE) && fresh;
+                    let scope = (self.bucket.as_str(), key.as_str());
+                    let found = DuplicatesOperation::new(self.snapshot.clone(), scope, versions);
+                    self.stage = JobStage::Key(key, allowed);
+                    return Ok(Next::Call(IoCall::child(found)));
                 }
             }
-            if foreign || (mine.is_empty() && twin.is_none()) {
+        }
+    }
+
+    fn next_duplicate(&mut self, key: String, allowed: bool) -> Turn<JobStep> {
+        while let Some(found) = self.found.pop_front() {
+            let group_id = (self.snapshot.as_ref())
+                .filter(|_| allowed)
+                .map(|routing| routing.group_id);
+            let Some(group_id) = group_id else {
+                self.progress.skipped += 1;
                 continue;
-            }
-            // A second copy goes with its row while its index row still names it; that row
-            // goes now.
-            if let Some((_, index, _)) = twin {
-                let read = vec![(RENAMED_ROW_KEYSPACE.to_string(), index.clone())];
-                let stored = self.batch(read).await?.pop().flatten();
-                let stored = stored.filter(|value| !value.is_empty());
-                let stored = stored
-                    .as_deref()
-                    .map(BackendLocation::from_bytes)
-                    .transpose();
-                if stored.map_err(error)?.as_ref() != Some(copy) {
-                    continue;
-                }
-                deletes.push((RENAMED_ROW_KEYSPACE.to_string(), index.clone()));
-            }
-            for (id, mut version) in mine {
-                if let BlobVersionState::Materialized { encoding: old, .. } = &mut version.state {
-                    *old = encoding;
-                }
-                let key = VersionKey::new(self.bucket, &found.key, id);
-                writes.extend(self.copies(&key, copy).await?);
-                let value = version.to_bytes().map_err(error)?;
-                let key = key.to_bytes().map_err(error)?;
-                writes.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.into(), value.into()));
-            }
-            // A file named by its version's id was written by Aruna, so it goes without a
-            // backend version too.
-            let named = owner.is_some_and(|(import, version)| {
-                let rules = self.rules.iter().filter(|rule| rule.import_id == import);
-                id_named(
-                    &rules.cloned().collect::<Vec<_>>(),
-                    &copy.backend_path,
-                    version,
-                )
-            });
-            writes.push(release(copy, provider, owner, named)?);
-            changed += 1;
-        }
-        if changed == 0 {
-            return Ok(Unified::Kept);
-        }
-        if !deletes.is_empty() {
-            let delete = StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(self.txn_id),
             };
-            match self
-                .context
-                .storage_handle
-                .send_storage_effect(delete)
-                .await
-            {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-                other => return Err(format!("could not drop the copy index: {}", other.label())),
-            }
+            // The key's progress is stored with it; the cursor names the key before it.
+            let mut next = self.current.clone();
+            next.cursor = self.progress.cursor.clone();
+            next.done += 1;
+            next.skipped += self.progress.skipped;
+            next.failed += self.progress.failed;
+            let fence = Some((self.current.clone(), next.clone()));
+            let unify = UnifyOperation::new((&self.bucket, group_id), found, fence);
+            self.stage = JobStage::Unify(key, allowed, Box::new(next));
+            return Ok(Next::Call(IoCall::child(unify)));
         }
-        let write = StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(self.txn_id),
-        };
-        match self.context.storage_handle.send_storage_effect(write).await {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Unified::Done),
-            other => Err(format!(
-                "could not write the unification: {}",
-                other.label()
-            )),
-        }
+        self.progress.cursor = Some(key);
+        self.next_key()
     }
 
-    /// Whether the kept second copy's index row still names it and its row still names
-    /// `version` under this key, as this transaction reads them.
-    async fn adoptable(&self, index: &Key, version: Ulid) -> Result<bool, String> {
-        let error = |error: aruna_core::errors::ConversionError| error.to_string();
-        let found = self.found;
-        let mut reads = vec![(RENAMED_ROW_KEYSPACE.to_string(), index.clone())];
-        for rule in self.rules {
-            let row = object_key(rule.import_id, &found.keep.backend_path);
-            reads.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row));
-        }
-        let mut values = self.batch(reads).await?.into_iter();
-        let stored = values.next().flatten().filter(|value| !value.is_empty());
-        let stored = stored
-            .as_deref()
-            .map(BackendLocation::from_bytes)
-            .transpose();
-        if stored.map_err(error)?.as_ref() != Some(&found.keep) {
-            return Ok(false);
-        }
-        for row in values.flatten() {
-            let row = ImportedObject::from_bytes(&row).map_err(error)?;
-            if row.key.as_deref() == Some(found.key.as_str()) && row.version_id == version {
-                return Ok(true);
+    fn unified(
+        &mut self,
+        (key, allowed, next): (String, bool, LinkedJob),
+        outcome: Unified,
+    ) -> Turn<JobStep> {
+        match outcome {
+            Unified::Done => {
+                (self.progress.skipped, self.progress.failed) = (0, 0);
+                self.current = next;
+            }
+            Unified::Kept => self.progress.skipped += 1,
+            Unified::Changed => self.progress.failed += 1,
+            Unified::Stopped => {
+                return Ok(Next::Done(JobStep {
+                    cursor: self.current.cursor.clone(),
+                    ..JobStep::default()
+                }));
             }
         }
-        Ok(false)
-    }
-
-    /// Whether the kept file still has the size and the full ETag its row recorded, as a
-    /// listing of its path shows them now.
-    async fn kept_unchanged(&self) -> Result<bool, String> {
-        let keep = &self.found.keep;
-        let Some(blob) = self.context.blob_handle.as_ref() else {
-            return Ok(false);
-        };
-        let reads = (self.rules.iter())
-            .map(|rule| {
-                let row = object_key(rule.import_id, &keep.backend_path);
-                (IMPORTED_OBJECT_KEYSPACE.to_string(), row)
-            })
-            .collect();
-        let mut recorded = None;
-        for row in self.batch(reads).await?.into_iter().flatten() {
-            let row = ImportedObject::from_bytes(&row).map_err(|error| error.to_string())?;
-            if row.key.as_deref() == Some(self.found.key.as_str()) {
-                recorded = row.etag;
-            }
-        }
-        let Some(recorded) = recorded else {
-            return Ok(false);
-        };
-        let list = aruna_core::effects::BlobEffect::ListExternal {
-            backend: keep.backend.clone(),
-            prefix: keep.backend_path.clone(),
-            start_after: None,
-            limit: 1,
-        };
-        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
-        match blob.send_blob_effect(list).await {
-            Event::Blob(aruna_core::events::BlobEvent::ExternalListed { objects, .. }) => {
-                Ok(objects.first().is_some_and(|object| {
-                    object.key == keep.backend_path
-                        && object.size == keep.blob_size
-                        && object.etag.as_deref().map(unquoted) == Some(unquoted(&recorded))
-                }))
-            }
-            other => Err(format!("could not list the kept file: {}", other.label())),
-        }
-    }
-
-    /// Charges the kept file's new location row, as reclaim debits the released one.
-    async fn charge(&self, location: &BackendLocation) -> Result<(), String> {
-        use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
-        let bytes = i128::from(location.stored_size());
-        let Some(stored) = StoredDelta::of_copy(location, 1, bytes) else {
-            return Ok(());
-        };
-        let mut update = UsageCounterUpdate::for_stored(stored);
-        let mut effects = update.start(self.txn_id);
-        loop {
-            let mut answer = None;
-            for effect in effects {
-                let Effect::Storage(effect) = effect else {
-                    return Err(format!("not a storage effect: {effect:?}"));
-                };
-                answer = Some(
-                    self.context
-                        .storage_handle
-                        .send_storage_effect(effect)
-                        .await,
-                );
-            }
-            let Some(answer) = answer else {
-                return Ok(());
-            };
-            match update.step(answer, self.txn_id) {
-                Ok(Some(next)) => effects = next,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    }
-
-    /// The copy registrations of `version` that name `copy`, moved to the kept file.
-    async fn copies(
-        &self,
-        version: &VersionKey,
-        copy: &BackendLocation,
-    ) -> Result<Vec<(String, Key, Value)>, String> {
-        let prefix = ManagedCopyKey::version_prefix(version).map_err(|error| error.to_string())?;
-        let mut rows = Vec::new();
-        let mut after = None;
-        loop {
-            let page = iter_prefix_page(
-                &self.context.storage_handle,
-                MANAGED_COPY_KEYSPACE,
-                Some(prefix.clone().into()),
-                after.take(),
-                RULE_PAGE,
-                Some(self.txn_id),
-            );
-            let (page, next) = page.await?;
-            rows.extend(page);
-            match next {
-                Some(next) => after = Some(next),
-                None => break,
-            }
-        }
-        let mut writes = Vec::new();
-        for (key, value) in rows {
-            let record =
-                ManagedCopyRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-            if record.location.same_object(copy) {
-                let record = ManagedCopyRecord {
-                    location: self.found.keep.clone(),
-                    ..record
-                };
-                let value = record.to_bytes().map_err(|error| error.to_string())?;
-                writes.push((MANAGED_COPY_KEYSPACE.to_string(), key, value.into()));
-            }
-        }
-        Ok(writes)
+        self.unified += 1;
+        self.next_duplicate(key, allowed)
     }
 }
 
-/// The release of `copy` at its backend version, or of a file its version's id names, or else
-/// the drop of its location row, which leaves the file in place.
-fn release(
-    copy: &BackendLocation,
-    provider: Option<Value>,
-    owner: Option<(Ulid, Ulid)>,
-    named: bool,
-) -> Result<(String, Key, Value), String> {
-    let error = |error: aruna_core::errors::ConversionError| error.to_string();
-    let provider = provider.or_else(|| named.then(|| Value::from(Vec::new())));
-    let Some(provider) = provider else {
-        let location = copy.location_key().map_err(error)?;
-        let candidate =
-            ReclaimCandidateKey::new(location.backend, location.encoding, location.blake3_hash);
-        let value = ReclaimCandidate {
-            enqueued_at: SystemTime::now(),
-        };
-        let value = value.to_bytes().map_err(error)?;
-        let key = candidate.to_bytes().into();
-        return Ok((BLOB_RECLAIM_KEYSPACE.to_string(), key, value.into()));
-    };
-    let (import_id, version_id) = owner.unwrap_or((Ulid::nil(), Ulid::nil()));
-    let work = BlobCleanupWork::ReleaseRenamed {
-        location: copy.clone(),
-        import_id,
-        version_id,
-        version: String::from_utf8(provider.to_vec()).map_err(|error| error.to_string())?,
-    };
-    let value = work.to_bytes().map_err(error)?;
-    let key = Ulid::generate().to_bytes().to_vec().into();
-    Ok((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()))
-}
+impl Operation for UnifyJobOperation {
+    type Output = JobStep;
+    type Error = MigrationError;
 
-/// The group's rules that read or write on `backend`, whose rows may record a copy.
-pub(crate) async fn rules_on(
-    context: &DriverContext,
-    group_id: GroupId,
-    backend: &BackendRef,
-) -> Result<Vec<BackendImport>, String> {
-    let operation = BackendRulesOperation::new(group_id, backend.clone());
-    let rules = crate::driver::drive(operation, context).await;
-    rules.map_err(|error| error.to_string())
-}
+    fn first(&mut self) -> Turn<JobStep> {
+        Ok(Next::Call(routing_call(self.routing.clone(), &self.bucket)))
+    }
 
 async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<Vec<u8>>, String> {
     let read = StorageEffect::Read {
