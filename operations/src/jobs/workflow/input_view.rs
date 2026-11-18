@@ -687,7 +687,7 @@ impl Operation for ViewEntryOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::drive;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::encryption::EncryptionMode;
     use ulid::Ulid;
