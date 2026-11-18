@@ -258,7 +258,10 @@ pub(crate) async fn start(
                 spawn_cutoff_sweep(driver_ctx.clone(), &shutdown, realm_id, node_id)
             }
             StartupPhase::DrainGitMerges => {
-                aruna_operations::git::pending::spawn_drain(driver_ctx.clone(), &shutdown)
+                aruna_operations::tasks::incoming::git_drain::spawn_drain(
+                    driver_ctx.clone(),
+                    &shutdown,
+                )
             }
             StartupPhase::RecoverChild => {
                 let recovery_config = RecoveryConfig {

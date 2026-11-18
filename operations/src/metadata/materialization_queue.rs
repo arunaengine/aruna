@@ -1532,9 +1532,14 @@ async fn process_materialization_job(
                 ));
             }
             // Boxed so callers' futures stay shallow enough to prove `Send`.
-            let capture: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
-                crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()),
-            );
+            let node = crate::git::GitNode {
+                ids: context.node_and_realm(),
+                routing: crate::driver::node_routing(context),
+            };
+            let capture =
+                crate::git::snapshot::capture(&node, &event.record, raw_revision.as_ref());
+            let capture: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                Box::pin(crate::driver::drive(capture, context));
             if let Err(error) = capture.await {
                 return Ok(ProcessedMaterializationJob::deferred(
                     defer_materialization_job(
