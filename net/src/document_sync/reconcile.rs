@@ -210,6 +210,12 @@ impl DocumentSyncService {
         }
     }
 
+    /// Counts one durably stored Git record for the readers of its document.
+    pub fn note_git_record(&self, document_id: ulid::Ulid) -> DocumentNetEvent {
+        aruna_core::git::record_written(document_id);
+        DocumentNetEvent::GitRecordNoted
+    }
+
     /// The next batch above the stored cursor; the cursor repairs itself here: a lost or failed
     /// eviction callback cannot make a rebuilt chain's early ops look applied.
     fn reconcile_batch(

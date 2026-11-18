@@ -781,6 +781,8 @@ pub enum DocumentEffect {
     },
     /// Rebuilds the peer set after a realm config change; the runner carries it out.
     ReloadRealmPeers,
+    /// Counts one durably stored Git record of the document for its readers.
+    NoteGitRecord { document_id: Ulid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +809,7 @@ pub enum DocumentNetEvent {
     ReconcileBatch(Option<Box<ReconcileBatch>>),
     OverflowPage(Box<OverflowPage>),
     RealmPeersReloaded,
+    GitRecordNoted,
     Error {
         target: Option<DocumentTarget>,
         error: String,

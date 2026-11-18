@@ -364,7 +364,7 @@ impl DocumentSyncService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn publish_event_op(
+    pub(in crate::document_sync) fn publish_event_op(
         &self,
         oplog: &Oplog<::irokle::FjallStorage>,
         topic_id: ::irokle::TopicId,
@@ -424,40 +424,6 @@ impl DocumentSyncService {
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))
-    }
-
-    /// Signs one op carrying `payload` under the document-sync event type
-    /// without encoding an event, so tests can deliver a payload no peer can
-    /// decode. Returns the op's transport identity.
-    #[cfg(test)]
-    pub(crate) fn publish_raw_event(
-        &self,
-        topic_id: ::irokle::TopicId,
-        payload: Vec<u8>,
-    ) -> Result<SyncQuarantineIdentity> {
-        let oplog = Oplog::with_storage(self.node.storage().clone());
-        let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
-        let envelope = EventEnvelope {
-            type_id: DocumentEvent::TYPE_ID.to_string(),
-            payload: payload.into(),
-        };
-        let op = self.publish_event_op(
-            &oplog,
-            topic_id,
-            actor_id,
-            envelope,
-            &BTreeSet::new(),
-            true,
-            true,
-            &mut 0,
-            &mut 0,
-        )?;
-        self.flush_database()?;
-        Ok(SyncQuarantineIdentity {
-            topic: topic_id,
-            actor: op.signed.body.actor_id,
-            actor_seq: op.signed.body.actor_seq,
-        })
     }
 
     /// Marks locally published ops as applied by advancing the per-topic

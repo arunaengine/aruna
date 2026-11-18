@@ -43,21 +43,6 @@ impl DocumentSyncService {
             .collect()
     }
 
-    /// Admits one peer and adds it to the fan-out set, as a realm config would.
-    #[cfg(test)]
-    pub(in crate::document_sync) fn add_peer_candidate(&self, node_id: NodeId) -> Result<()> {
-        let peer_id = node_to_peer(&node_id);
-        if peer_id == self.node.peer_id() {
-            return Ok(());
-        }
-        self.node
-            .add_peer_to_whitelist(peer_id)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        self.flush_database()?;
-        self.default_peers.write().insert(peer_id);
-        Ok(())
-    }
-
     pub fn refresh_peer_candidates(&self, nodes: impl IntoIterator<Item = NodeId>) -> Result<()> {
         let mut peers = BTreeSet::new();
         for node_id in nodes {
