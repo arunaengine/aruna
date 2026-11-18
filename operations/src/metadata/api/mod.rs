@@ -97,6 +97,7 @@ mod join;
 pub mod links;
 pub mod list;
 pub mod list_types;
+pub(crate) mod node_fanout;
 pub mod path;
 pub mod path_types;
 mod prefix_scan;

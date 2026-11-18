@@ -41,7 +41,7 @@ pub struct MetadataFanoutStats {
     pub omitted: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RealmNodeDiscovery {
     pub(crate) nodes: Vec<NodeId>,
     pub(crate) failed: bool,
