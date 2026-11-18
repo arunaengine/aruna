@@ -2608,24 +2608,23 @@ mod tests {
             location
         }
 
-        fn empty_blob() -> Event {
+        fn empty_blob() -> IoResult {
             let blob = BackendStream::new(futures_util::stream::empty::<
                 Result<bytes::Bytes, std::io::Error>,
             >());
-            Event::Blob(BlobEvent::ReadFinished {
+            blob_event(BlobEvent::ReadFinished {
                 blob,
                 stream_size: 40,
             })
         }
 
-        /// The publication's reads: bucket, encryption, group default and the linked rule.
         /// Answers the publication's rule reads: bucket, encryption, group default, then the
         /// group's import rules; returns what follows them.
         fn rules_read(
             operation: &mut MigrateVersionOperation,
             default: Option<RoutingTarget>,
             rule: impl IntoIterator<Item = BackendImport>,
-        ) -> Effects {
+        ) -> Turn {
             let group = GroupStorageRouting {
                 group_id: GROUP,
                 default_target: default,
@@ -2633,26 +2632,22 @@ mod tests {
                 updated_by: Default::default(),
             };
             let values = vec![
-                (Vec::new().into(), Some(bucket(Compression::Off).into())),
-                (Vec::new().into(), None),
-                (Vec::new().into(), Some(group.to_bytes().unwrap().into())),
+                Some(bucket(Compression::Off).into()),
+                None,
+                Some(group.to_bytes().unwrap().into()),
             ];
-            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the import rule scan, got {effects:?}")
+            let turn = operation.next(IoResult::Values(values));
+            let Ok(Next::Call(IoCall::Page { space, .. })) = &turn else {
+                panic!("expected the import rule scan, got {turn:?}")
             };
-            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-            let values = (rule.into_iter())
+            assert_eq!(space, BACKEND_IMPORT_KEYSPACE);
+            let rows = (rule.into_iter())
                 .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
                 .collect();
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after: None,
-            }))
+            operation.next(IoResult::Page { rows, next: None })
         }
 
-        fn storage_record(disabled: bool) -> Event {
+        fn storage_record(disabled: bool) -> IoResult {
             let record = aruna_core::structs::storage::group_backend::GroupStorage {
                 backend_id: STORAGE,
                 group_id: GROUP,
@@ -2671,22 +2666,21 @@ mod tests {
         /// Answers the rule reads and the target storage fence, up to the version read.
         fn published(operation: &mut MigrateVersionOperation, rule: Option<BackendImport>) {
             let default = Some(RoutingTarget::Backend(storage()));
-            let effects = rules_read(operation, default, rule);
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the storage fence, got {effects:?}")
+            let turn = rules_read(operation, default, rule);
+            let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+                panic!("expected the storage fence, got {turn:?}")
             };
-            assert_eq!(key_space, aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE);
-            operation.step(storage_record(false));
+            assert_eq!(reads[0].0, aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE);
+            operation.next(storage_record(false)).unwrap();
         }
 
         /// Answers the file's write with the location the adapter reports.
-        fn plain_written(plain: &PlainPath) -> Event {
+        fn plain_written(plain: &PlainPath) -> IoResult {
             let mut written = on_storage(location(false));
             (written.storage_bucket, written.backend_path) = (String::new(), plain.path.clone());
             written.ulid = plain.ulid;
             written.format.layout = StoredLayout::Plain(plain.ulid);
-            Event::Blob(BlobEvent::PlainWritten {
+            blob_event(BlobEvent::PlainWritten {
                 location: written,
                 version: None,
                 etag: None,
@@ -2694,61 +2688,20 @@ mod tests {
         }
 
         /// Answers the stored and synced intent before a linked write, and returns the write.
-        fn past_intent(operation: &mut MigrateVersionOperation, effects: Effects) -> Effects {
-            let [Effect::Storage(StorageEffect::StartTransaction { .. })] = effects.as_slice()
-            else {
-                return effects;
+        fn past_intent(operation: &mut MigrateVersionOperation, turn: Turn) -> Turn {
+            let Ok(Next::Call(IoCall::Child(_))) = &turn else {
+                return turn;
             };
-            // The rule is read in the transaction that stores the intent.
-            let txn_id = TxnId::from(9);
-            let effects =
-                operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(_), .. })]
-                    if key_space == BACKEND_IMPORT_KEYSPACE
-            ));
-            let effects = operation.step(read_result(Some(vec![1])));
-            let [
-                Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: Some(_),
-                }),
-            ] = effects.as_slice()
-            else {
-                panic!("expected the intent rows, got {effects:?}")
-            };
-            assert_eq!(writes[0].0.as_str(), IMPORT_INTENT_KEYSPACE);
+            assert_eq!(operation.state, MigrateState::WriteIntent);
             // The source bytes are known, so the intent proves the copy before it is written.
-            let intent = WriteIntent::from_bytes(&writes[0].2).unwrap();
+            let target = operation.plain.clone().unwrap();
+            let intent = operation.write_intent(&target, Default::default());
             let source = operation.old.as_ref().and_then(|old| old.get_blake3());
             assert_eq!(intent.written.as_ref().map(|hash| &hash[..]), source);
-            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id,
-            }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::SyncAll)]
-            ));
-            operation.step(Event::Storage(StorageEvent::SyncAllFinished))
-        }
-
-        /// Answers a write and the hash record a linked write adds to its intent.
-        fn after_write(operation: &mut MigrateVersionOperation, written: Event) -> Effects {
-            let effects = operation.step(written);
-            match effects.as_slice() {
-                [Effect::Storage(StorageEffect::BatchWrite { writes, .. })]
-                    if writes[0].0 == IMPORT_INTENT_KEYSPACE =>
-                {
-                    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                        entries: Vec::new(),
-                    }))
-                }
-                _ => effects,
-            }
+            let stored = Ok::<_, StorageError>(Fenced::Written);
+            let turn = operation.next(IoResult::Child(ChildOutcome::new(stored)));
+            assert_eq!(turn, Ok(Next::Call(IoCall::Sync)));
+            operation.next(IoResult::Done)
         }
 
         /// Drives a move of `version` from Aruna storage up to its publication reads; a linked
@@ -2757,79 +2710,68 @@ mod tests {
             operation: &mut MigrateVersionOperation,
             version: &BlobVersion,
             taken: bool,
-        ) -> Effects {
-            operation.start();
-            operation.step(read_result(Some(version.to_bytes().unwrap())));
-            let effects = operation.step(read_result(Some(location(false).to_bytes().unwrap())));
-            let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
-                panic!("expected the target row read, got {effects:?}")
+        ) -> Turn {
+            operation.first().unwrap();
+            operation
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            let turn = operation.next(read_result(Some(location(false).to_bytes().unwrap())));
+            let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+                panic!("expected the target row read, got {turn:?}")
             };
-            assert_eq!(BlobLocationKey::from_bytes(key).unwrap().backend, storage());
-            let mut effects = operation.step(read_result(None));
-            if let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() {
-                assert_eq!(key_space, IMPORTED_OBJECT_KEYSPACE);
-                effects = operation.step(read_result(None));
+            let key = BlobLocationKey::from_bytes(&reads[0].1).unwrap();
+            assert_eq!(key.backend, storage());
+            let mut turn = operation.next(read_result(None));
+            if let Ok(Next::Call(IoCall::Read(reads))) = &turn {
+                assert_eq!(reads[0].0, IMPORTED_OBJECT_KEYSPACE);
+                turn = operation.next(read_result(None));
             }
-            if let [Effect::Blob(BlobEffect::StatPlain { .. })] = effects.as_slice() {
-                effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            if let Effect::Blob(BlobEffect::StatPlain { .. }) = asked(&turn) {
+                turn = operation.next(blob_event(BlobEvent::PlainStat {
                     exists: taken,
                     version: None,
                 }));
             }
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::Read { .. })]
+                asked(&turn),
+                Effect::Blob(BlobEffect::Read { .. })
             ));
-            let effects = operation.step(empty_blob());
-            let effects = past_intent(operation, effects);
-            let new = match effects.as_slice() {
-                [Effect::Blob(BlobEffect::Write { resolved, .. })] => {
+            let turn = operation.next(empty_blob());
+            let turn = past_intent(operation, turn);
+            let new = match asked(&turn) {
+                Effect::Blob(BlobEffect::Write { resolved, .. }) => {
                     assert_eq!(resolved.backend, storage());
-                    Event::Blob(BlobEvent::WriteFinished {
+                    blob_event(BlobEvent::WriteFinished {
                         location: on_storage(location(false)),
                     })
                 }
-                [Effect::Blob(BlobEffect::WritePlain { plain, .. })] => plain_written(plain),
+                Effect::Blob(BlobEffect::WritePlain { plain, .. }) => plain_written(plain),
                 other => panic!("expected a write, got {other:?}"),
             };
-            after_write(operation, new);
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: TxnId::default(),
-            }))
+            operation.next(new).unwrap();
+            enter_publish(operation)
         }
 
         /// Answers the publication's read of the target row, with the rows the rules keep of the
         /// path absent.
         fn answer_target(
             operation: &mut MigrateVersionOperation,
-            effects: Effects,
+            turn: Turn,
             value: Option<Vec<u8>>,
-        ) -> Effects {
-            match effects.as_slice() {
-                [Effect::Storage(StorageEffect::Read { .. })] => operation.step(read_result(value)),
-                [Effect::Storage(StorageEffect::BatchRead { reads, .. })] => {
-                    let rest = reads[1..].iter().map(|(_, key)| (key.clone(), None));
-                    let first = (Key::from(Vec::new()), value.map(Into::into));
-                    let values = std::iter::once(first).chain(rest).collect();
-                    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
-                }
-                other => panic!("expected the target read, got {other:?}"),
-            }
+        ) -> Turn {
+            let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+                panic!("expected the target read, got {turn:?}")
+            };
+            let mut values = vec![None; reads.len()];
+            values[0] = value.map(Into::into);
+            operation.next(IoResult::Values(values))
         }
 
-        fn batch(effects: &Effects) -> &Vec<(String, Key, Value)> {
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the row writes, got {effects:?}")
+        fn batch(turn: &Turn) -> &Vec<(String, Key, Value)> {
+            let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+                panic!("expected the row writes, got {turn:?}")
             };
             writes
-        }
-
-        fn aborted(effects: &Effects) -> bool {
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            )
         }
 
         #[test]
@@ -2837,9 +2779,9 @@ mod tests {
             // The version names the copy on the group's storage; the old copy is reclaimed.
             let mut operation = operation("k", Vec::new());
             let version = raw_version();
-            copied(&mut operation, &version, false);
+            copied(&mut operation, &version, false).unwrap();
             published(&mut operation, None);
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, None);
 
             let writes = batch(&effects);
@@ -2863,71 +2805,63 @@ mod tests {
             if let BlobVersionState::Materialized { backend, .. } = &mut version.state {
                 *backend = storage();
             }
-            operation.start();
+            operation.first().unwrap();
 
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
 
-            assert!(effects.is_empty());
-            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+            assert_eq!(effects, Ok(Next::Done(MigrateOutcome::Skipped)));
         }
 
         #[test]
         fn discards_changed_rule() {
             // The default rule went back to Aruna storage during the copy.
             let mut operation = operation("k", Vec::new());
-            copied(&mut operation, &raw_version(), false);
+            copied(&mut operation, &raw_version(), false).unwrap();
 
-            let effects = rules_read(&mut operation, None, None);
+            let turn = rules_read(&mut operation, None, None);
 
-            assert!(aborted(&effects));
-            operation.step(Event::Storage(StorageEvent::TransactionAborted {
-                txn_id: TxnId::default(),
-            }));
-            let effects = operation.step(Event::Blob(BlobEvent::ReservationReleased {
-                id: Ulid::nil(),
-            }));
             // The unpublished copy goes to the cleanup queue.
-            assert_eq!(effects.len(), 1);
-            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+            leaves_copy(&skipped_calls(turn), true);
         }
 
         #[test]
         fn disabled_target_discards() {
             // A storage disabled during the copy never takes the version, so nothing is reclaimed.
             let mut operation = operation("k", Vec::new());
-            copied(&mut operation, &raw_version(), false);
+            copied(&mut operation, &raw_version(), false).unwrap();
             rules_read(
                 &mut operation,
                 Some(RoutingTarget::Backend(storage())),
                 None,
-            );
+            )
+            .unwrap();
 
-            let effects = operation.step(storage_record(true));
+            let turn = operation.next(storage_record(true));
 
-            assert!(aborted(&effects));
+            leaves_copy(&skipped_calls(turn), true);
         }
 
         #[test]
         fn skips_missing_target() {
             // A row on the target whose bytes are gone is never adopted.
             let mut operation = operation("k", Vec::new());
-            operation.start();
-            operation.step(read_result(Some(raw_version().to_bytes().unwrap())));
-            operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+            operation.first().unwrap();
+            operation
+                .next(read_result(Some(raw_version().to_bytes().unwrap())))
+                .unwrap();
+            operation
+                .next(read_result(Some(location(false).to_bytes().unwrap())))
+                .unwrap();
             let target = on_storage(location(false));
 
-            let effects = operation.step(read_result(Some(target.to_bytes().unwrap())));
-            let [Effect::Blob(BlobEffect::StatCopy { location })] = effects.as_slice() else {
+            let effects = operation.next(read_result(Some(target.to_bytes().unwrap())));
+            let Effect::Blob(BlobEffect::StatCopy { location }) = asked(&effects) else {
                 panic!("expected the target probe, got {effects:?}")
             };
             assert!(location.same_object(&target));
-            let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: false }));
+            let turn = operation.next(blob_event(BlobEvent::CopyStat { exists: false }));
 
-            assert!(effects.is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(MigrateVersionError::TargetMissing)
-            );
+            assert_eq!(turn, Err(MigrateVersionError::TargetMissing));
         }
 
         #[test]
@@ -2935,27 +2869,30 @@ mod tests {
             // The adopted row must still be the probed copy when the version moves to it.
             let mut operation = operation("k", Vec::new());
             let version = raw_version();
-            operation.start();
-            operation.step(read_result(Some(version.to_bytes().unwrap())));
-            operation.step(read_result(Some(location(false).to_bytes().unwrap())));
-            operation.step(read_result(Some(
-                on_storage(location(false)).to_bytes().unwrap(),
-            )));
-            let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: true }));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::StartTransaction { .. })]
-            ));
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: TxnId::default(),
-            }));
+            operation.first().unwrap();
+            operation
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            operation
+                .next(read_result(Some(location(false).to_bytes().unwrap())))
+                .unwrap();
+            operation
+                .next(read_result(Some(
+                    on_storage(location(false)).to_bytes().unwrap(),
+                )))
+                .unwrap();
+            let turn = operation.next(blob_event(BlobEvent::CopyStat { exists: true }));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+            enter_publish(&mut operation).unwrap();
             published(&mut operation, None);
-            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
 
             let replaced = on_storage(location(false));
-            let effects = operation.step(read_result(Some(replaced.to_bytes().unwrap())));
+            let turn = operation.next(read_result(Some(replaced.to_bytes().unwrap())));
 
-            assert!(aborted(&effects));
+            assert_eq!(turn, Err(MigrateVersionError::TargetMissing));
         }
 
         #[test]
@@ -2964,8 +2901,7 @@ mod tests {
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
             let effects = copied(&mut operation, &version, false);
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
+            let Ok(Next::Call(IoCall::Read(reads))) = &effects else {
                 panic!("expected the publication reads, got {effects:?}")
             };
             assert_eq!(reads.len(), 3);
@@ -2977,7 +2913,7 @@ mod tests {
             // Only a free path is taken, so an outside file is never replaced.
             assert!(plain.if_not_exists);
             published(&mut operation, Some(rule()));
-            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.next(read_result(Some(version.to_bytes().unwrap())));
             let effects = answer_target(&mut operation, effects, None);
 
             let writes = batch(&effects);
@@ -2997,7 +2933,7 @@ mod tests {
             // The move stores its identity at both paths it may reach and retires it on publish.
             let mut moved = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
-            copied(&mut moved, &version, false);
+            copied(&mut moved, &version, false).unwrap();
             let plain = moved.plain_path.clone().unwrap();
             let id = Ulid::from_bytes([2; 16]);
             let tagged = tagged_path(&plain.path, plain.ulid);
@@ -3005,48 +2941,40 @@ mod tests {
             assert_eq!(moved.written_intent, expected.to_vec());
             assert_eq!(moved.intent_keys(plain.ulid), expected.to_vec());
             published(&mut moved, Some(rule()));
-            let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
-            answer_target(&mut moved, effects, None);
-            let effects = moved.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] =
-                effects.as_slice()
-            else {
-                panic!("expected the intent retirement, got {effects:?}")
+            let effects = moved.next(read_result(Some(version.to_bytes().unwrap())));
+            answer_target(&mut moved, effects, None).unwrap();
+            let turn = moved.next(IoResult::Done);
+            let Ok(Next::Call(IoCall::Delete(deletes))) = &turn else {
+                panic!("expected the intent retirement, got {turn:?}")
             };
-            assert!(txn_id.is_some());
             let retired: Vec<Key> = deletes.iter().map(|(_, key)| key.clone()).collect();
             assert_eq!(retired, expected.to_vec());
 
             // A refused write moved no byte, so its intents go before the move fails.
             let mut refused = operation("in/x/one.csv", vec![rule()]);
-            refused.start();
-            refused.step(read_result(Some(version.to_bytes().unwrap())));
-            refused.step(read_result(Some(location(false).to_bytes().unwrap())));
-            refused.step(read_result(None));
-            refused.step(read_result(None));
-            refused.step(Event::Blob(BlobEvent::PlainStat {
-                exists: false,
-                version: None,
-            }));
-            let effects = refused.step(empty_blob());
-            past_intent(&mut refused, effects);
-            let effects = refused.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchDelete {
-                    txn_id: None,
-                    ..
-                })]
-            ));
-            refused.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
-            refused.step(Event::Storage(StorageEvent::SyncAllFinished));
+            refused.first().unwrap();
+            refused
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            refused
+                .next(read_result(Some(location(false).to_bytes().unwrap())))
+                .unwrap();
+            refused.next(read_result(None)).unwrap();
+            refused.next(read_result(None)).unwrap();
+            refused
+                .next(blob_event(BlobEvent::PlainStat {
+                    exists: false,
+                    version: None,
+                }))
+                .unwrap();
+            let effects = refused.next(empty_blob());
+            past_intent(&mut refused, effects).unwrap();
+            let turn = refused.next(blob_event(BlobEvent::Error(BlobError::PathTaken)));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+            assert_eq!(refused.next(IoResult::Done), Ok(Next::Call(IoCall::Sync)));
+            let turn = refused.next(IoResult::Done);
             assert!(refused.written_intent.is_empty());
-            let error = refused.finalize().unwrap_err();
-            assert_eq!(error, MigrateVersionError::Blob(BlobError::PathTaken));
+            assert_eq!(turn, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
         }
 
         #[test]
@@ -3054,26 +2982,26 @@ mod tests {
             // The rule went before the intents were stored, so none are and the move stops.
             let mut moved = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
-            moved.start();
-            moved.step(read_result(Some(version.to_bytes().unwrap())));
-            moved.step(read_result(Some(location(false).to_bytes().unwrap())));
-            moved.step(read_result(None));
-            moved.step(read_result(None));
-            moved.step(Event::Blob(BlobEvent::PlainStat {
-                exists: false,
-                version: None,
-            }));
-            moved.step(empty_blob());
-            let txn_id = TxnId::from(9);
-            moved.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            let effects = moved.step(read_result(None));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            moved.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+            moved.first().unwrap();
+            moved
+                .next(read_result(Some(version.to_bytes().unwrap())))
+                .unwrap();
+            moved
+                .next(read_result(Some(location(false).to_bytes().unwrap())))
+                .unwrap();
+            moved.next(read_result(None)).unwrap();
+            moved.next(read_result(None)).unwrap();
+            moved
+                .next(blob_event(BlobEvent::PlainStat {
+                    exists: false,
+                    version: None,
+                }))
+                .unwrap();
+            moved.next(empty_blob()).unwrap();
+            let gone = Ok::<_, StorageError>(Fenced::RuleGone);
+            let turn = moved.next(IoResult::Child(ChildOutcome::new(gone)));
             assert!(moved.written_intent.is_empty());
-            assert_eq!(moved.output, Some(Ok(MigrateOutcome::Skipped)));
+            assert_eq!(turn, Ok(Next::Done(MigrateOutcome::Skipped)));
         }
 
         #[test]
