@@ -1571,124 +1571,241 @@ enum AbandonStep {
 }
 
 /// Queues the release of the file at `path`, once per intent and version, if it has a backend
-/// version and its size and ETag prove the bytes `intent` recorded; others stay. `false` when
-/// the storage cannot be asked yet.
-async fn abandon(
-    context: &crate::driver::DriverContext,
-    (intent_row, intent, import_id): (&[u8], &WriteIntent, Ulid),
+/// version and its size and ETag prove the bytes the intent recorded; others stay. Outputs
+/// `false` when the storage cannot be asked yet.
+#[derive(Debug, PartialEq)]
+struct AbandonOperation {
+    intent_row: Vec<u8>,
+    intent: WriteIntent,
+    import_id: Ulid,
     path: String,
-) -> Result<bool, String> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Ok(false);
-    };
-    let resolved = ResolvedBackend::new(intent.backend.clone(), None);
-    let stat = BlobEffect::StatExternal {
-        resolved,
-        path: path.clone(),
-        created_by: intent.created_by,
-    };
-    // Nothing there releases nothing but this write's own reservation, which a stat does not
-    // show as a file; without a backend version nothing names the bytes.
-    let (mut location, version, etag) = match blob_handle.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
-            let drop = BlobEffect::DropReservation {
-                backend: intent.backend.clone(),
-                path,
-                version_id: intent.version_id,
-            };
-            let dropped = blob_handle.send_blob_effect(drop).await;
-            return Ok(matches!(dropped, Event::Blob(BlobEvent::DeleteFinished)));
+    step: AbandonStep,
+}
+
+impl AbandonOperation {
+    fn new(intent_row: Vec<u8>, intent: WriteIntent, import_id: Ulid, path: String) -> Self {
+        Self {
+            intent_row,
+            intent,
+            import_id,
+            path,
+            step: AbandonStep::Stat,
         }
-        Event::Blob(BlobEvent::ExternalStat {
-            location: Some(location),
-            version: Some(version),
-            etag,
-        }) => (location, version, etag),
-        Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(true),
-        _ => return Ok(false),
-    };
-    let Some(source) = stored_copy(context, intent.written).await? else {
-        return Ok(true);
-    };
-    if !same_bytes(&source, location.blob_size, etag.as_deref()) {
-        return Ok(true);
     }
-    location.hashes = source.hashes;
-    location.format.layout = StoredLayout::Plain(location.ulid);
-    let key = release_key(intent_row, &version);
-    let work = BlobCleanupWork::ReleaseRenamed {
-        location,
-        import_id,
-        version_id: intent.version_id,
-        version,
-    };
-    let value = work.to_bytes().map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-        key: key.into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
-        other => Err(format!(
-            "could not queue the abandoned copy: {}",
-            other.label()
-        )),
+
+    /// Nothing there releases nothing but this write's own reservation, which a stat does not
+    /// show as a file; without a backend version nothing names the bytes.
+    fn stat_read(&mut self, event: Event) -> Turn<bool> {
+        let (location, version, etag) = match event {
+            Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
+                let drop = Effect::Blob(BlobEffect::DropReservation {
+                    backend: self.intent.backend.clone(),
+                    path: self.path.clone(),
+                    version_id: self.intent.version_id,
+                });
+                self.step = AbandonStep::Dropped;
+                return Ok(Next::Call(drop.into()));
+            }
+            Event::Blob(BlobEvent::ExternalStat {
+                location: Some(location),
+                version: Some(version),
+                etag,
+            }) => (location, version, etag),
+            Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(Next::Done(true)),
+            _ => return Ok(Next::Done(false)),
+        };
+        // A stored copy of the bytes that records their MD5 proves what the file holds.
+        let Some(hash) = self.intent.written else {
+            return Ok(Next::Done(true));
+        };
+        let pages = PrefixPages::new(BLOB_LOCATIONS_KEYSPACE, hash.to_vec(), RULE_PAGE);
+        let page = pages.call();
+        self.step = AbandonStep::Copies(Box::new(location), version, etag, pages);
+        Ok(Next::Call(page))
+    }
+
+    fn queue_release(
+        &mut self,
+        mut location: BackendLocation,
+        version: String,
+        etag: Option<String>,
+        source: BackendLocation,
+    ) -> Turn<bool> {
+        if !same_bytes(&source, location.blob_size, etag.as_deref()) {
+            return Ok(Next::Done(true));
+        }
+        location.hashes = source.hashes;
+        location.format.layout = StoredLayout::Plain(location.ulid);
+        let key = release_key(&self.intent_row, &version);
+        let work = BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id: self.import_id,
+            version_id: self.intent.version_id,
+            version,
+        };
+        self.step = AbandonStep::Queued;
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            key.into(),
+            work.to_bytes()?.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-/// A stored copy of the bytes with the BLAKE3 `hash` that records their MD5.
-async fn stored_copy(
-    context: &crate::driver::DriverContext,
-    hash: Option<[u8; 32]>,
-) -> Result<Option<BackendLocation>, String> {
-    let Some(hash) = hash else {
-        return Ok(None);
-    };
-    let mut after = None;
-    loop {
-        let (rows, next) = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
-            BLOB_LOCATIONS_KEYSPACE,
-            Some(hash.to_vec().into()),
-            after,
-            RULE_PAGE,
-            None,
-        )
-        .await?;
-        for (_, value) in rows {
-            let location =
-                BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-            if location.hashes.contains_key(HASH_MD5) {
-                return Ok(Some(location));
+impl Operation for AbandonOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        let stat = Effect::Blob(BlobEffect::StatExternal {
+            resolved: ResolvedBackend::new(self.intent.backend.clone(), None),
+            path: self.path.clone(),
+            created_by: self.intent.created_by,
+        });
+        Ok(Next::Call(stat.into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, AbandonStep::Queued) {
+            AbandonStep::Stat => self.stat_read(result.event()?),
+            AbandonStep::Dropped => Ok(Next::Done(matches!(
+                result.event()?,
+                Event::Blob(BlobEvent::DeleteFinished)
+            ))),
+            AbandonStep::Copies(location, version, etag, mut pages) => {
+                for (_, value) in pages.take(result)? {
+                    let source = BackendLocation::from_bytes(&value)?;
+                    if source.hashes.contains_key(HASH_MD5) {
+                        return self.queue_release(*location, version, etag, source);
+                    }
+                }
+                if pages.done() {
+                    return Ok(Next::Done(true));
+                }
+                let page = pages.call();
+                self.step = AbandonStep::Copies(location, version, etag, pages);
+                Ok(Next::Call(page))
+            }
+            AbandonStep::Queued => {
+                result.done()?;
+                Ok(Next::Done(true))
             }
         }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(None),
-        }
     }
 }
 
-async fn drop_intents(
-    context: &crate::driver::DriverContext,
-    intents: &[Vec<u8>],
-) -> Result<bool, String> {
-    let deletes = intents
-        .iter()
-        .map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key.clone().into()))
-        .collect();
-    let delete = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(true),
-        other => Err(format!(
-            "could not drop the move's intents: {}",
-            other.label()
-        )),
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn record() -> CompressionMigration {
+        CompressionMigration::new(Compression::Off, 5)
+    }
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    #[test]
+    fn replaced_record_kept() {
+        let mut store = StoreMigrationOperation::new("b", record(), None);
+        store.first().unwrap();
+        let mut newer = record();
+        newer.started_at_ms = 6;
+        let value = Value::from(newer.to_bytes().unwrap());
+        assert_eq!(
+            store.next(IoResult::Values(vec![Some(value)])),
+            Ok(Next::Done(()))
+        );
+    }
+
+    #[test]
+    fn finished_record_leaves_queue() {
+        let mut finished = record();
+        finished.finished_at_ms = Some(9);
+        let stored = Value::from(record().to_bytes().unwrap());
+        let mut store = StoreMigrationOperation::new("b", finished, None);
+        store.first().unwrap();
+        let turn = store.next(IoResult::Values(vec![Some(stored)]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let turn = store.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = store.next(IoResult::Values(vec![None]));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("a finished migration leaves the queue");
+        };
+        assert_eq!(deletes.len(), 2);
+    }
+
+    #[test]
+    fn empty_bucket_finishes_pass() {
+        let mut page =
+            MigratePageOperation::new(NodeRouting::default(), "b", record(), MIGRATION_TIME);
+        page.stamp(7);
+        assert!(matches!(page.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let turn = page.next(empty_page());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = page.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(page.record.finished_at_ms, Some(7));
+        assert_eq!(
+            page.next(child::<(), MigrationError>(Ok(()))),
+            Ok(Next::Done(None))
+        );
+    }
+
+    #[test]
+    fn gone_bucket_hands_over() {
+        let mut hand = HandOverOperation::new(NodeRouting::default(), "b", 5);
+        assert!(matches!(hand.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let routed: Result<Option<RoutingSnapshot>, crate::blob::import_rows::ImportRowsError> =
+            Ok(None);
+        let turn = hand.next(child(routed));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(hand.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn empty_queue_ends_run() {
+        let routing = NodeRouting::default();
+        let after = Some(Key::from(b"a".to_vec()));
+        let mut run = ProcessMigrationsOperation::new(routing, None, after);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let expected = MigrationRun {
+            next: Some(MIGRATION_CONTINUE),
+            cursor: None,
+        };
+        assert_eq!(run.next(empty_page()), Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn locked_storage_waits() {
+        let intent = WriteIntent {
+            key: "k".to_string(),
+            version_id: Ulid::from_bytes([1; 16]),
+            backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
+            created_by: Default::default(),
+            written: None,
+            mover: None,
+        };
+        let import = Ulid::from_bytes([2; 16]);
+        let mut abandon = AbandonOperation::new(vec![1], intent, import, "p".to_string());
+        assert!(matches!(abandon.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let answer = IoResult::Event(Box::new(missing));
+        assert_eq!(abandon.next(answer), Ok(Next::Done(false)));
     }
 }
 
