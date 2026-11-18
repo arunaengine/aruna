@@ -6,15 +6,15 @@ use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, config_node_path, overlay_placement, parse_config_node,
 };
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -26,10 +26,8 @@ use aruna_core::structs::placement::record::{
     PlacementBinding, PlacementScope, band_start, coordinator_spans, owned_pools,
 };
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -50,13 +48,16 @@ pub struct EnsureConfigParams {
     pub reject_kind_mismatch: bool,
 }
 
+/// Ensures the target node's entry, handle range and job-control binding in the realm config in
+/// one write transaction; an unchanged config commits nothing. Callers rerun it after a lost
+/// commit.
 #[derive(Debug, PartialEq)]
 pub struct EnsureConfigOperation {
     config: EnsureConfigParams,
     membership: MembershipFence,
-    txn_id: Option<TxnId>,
-    state: EnsureConfigState,
-    output: Option<Result<RealmConfigDocument, EnsureConfigError>>,
+    stage: Stage,
+    document: Option<RealmConfigDocument>,
+    deletes: Vec<(KeySpace, Key)>,
 }
 
 struct EnsureResources {
@@ -67,30 +68,15 @@ struct EnsureResources {
     transfer_pool: Option<BandPool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum EnsureConfigState {
-    Init,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitNoop {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    Finish,
-    Error,
+/// What the ensure transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
 }
+
+type EnsureTurn = Result<Next<RealmConfigDocument>, EnsureConfigError>;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnsureConfigError {
@@ -114,8 +100,8 @@ pub enum EnsureConfigError {
     DefaultStrategyMissing,
     #[error("granted band start is not a valid placement handle")]
     InvalidBandStart,
-    #[error("missing active transaction")]
-    MissingTransaction,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -124,14 +110,29 @@ pub enum EnsureConfigError {
     },
 }
 
+impl From<IoError> for EnsureConfigError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "EnsureConfig".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
 impl EnsureConfigOperation {
     pub fn new(config: EnsureConfigParams) -> Self {
         Self {
             config,
             membership: MembershipFence::default(),
-            txn_id: None,
-            state: EnsureConfigState::Init,
-            output: None,
+            stage: Stage::Read,
+            document: None,
+            deletes: Vec::new(),
         }
     }
 
@@ -145,30 +146,6 @@ impl EnsureConfigOperation {
         AdminDocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
-    }
-
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = EnsureConfigState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
-                    MembershipFence::key(self.config.actor.realm_id)
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
     }
 
     fn plan_resources(
@@ -351,10 +328,7 @@ impl EnsureConfigOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, EnsureConfigError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(EnsureConfigError::MissingTransaction);
-        };
+    ) -> EnsureTurn {
         let fresh = document_value.is_none();
         let mut document = match document_value.as_deref() {
             Some(value) => RealmConfigDocument::from_bytes(value)?,
@@ -422,8 +396,7 @@ impl EnsureConfigOperation {
             && resources.seed_pool.is_none()
             && resources.transfer_pool.is_none()
         {
-            self.output = Some(Ok(document.clone()));
-            return Ok(self.emit_commit_noop(document));
+            return Ok(Next::Done(document));
         }
 
         let admin_events = self.apply_config_events(
@@ -461,199 +434,65 @@ impl EnsureConfigOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = EnsureConfigState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document);
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit_noop(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(EnsureConfigError::MissingTransaction);
-        };
-        self.state = EnsureConfigState::CommitNoop { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(EnsureConfigError::MissingTransaction);
-        };
-        self.state = EnsureConfigState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: EnsureConfigError) -> Effects {
-        let cleanup = self.abort();
-        self.state = EnsureConfigState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(EnsureConfigError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> EnsureTurn {
+        let output = self.document.take().ok_or(EnsureConfigError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for EnsureConfigOperation {
+impl Operation for EnsureConfigOperation {
     type Output = RealmConfigDocument;
     type Error = EnsureConfigError;
 
-    fn start(&mut self) -> Effects {
-        self.state = EnsureConfigState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            EnsureConfigState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            EnsureConfigState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [
-                        (_, document_value),
-                        (_, reducer_state_value),
-                        (_, membership),
-                    ] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    let membership = match MembershipFence::from_value(membership.as_deref()) {
-                        Ok(fence) => fence,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    self.membership = membership;
-                    match self
-                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            EnsureConfigState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => {
-                let document = document.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(EnsureConfigError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = EnsureConfigState::DeleteAdminConflicts { document };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
-            }
-            EnsureConfigState::DeleteAdminConflicts { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
-            }
-            EnsureConfigState::CommitNoop { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = EnsureConfigState::Finish;
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", other.label()),
-            },
-            EnsureConfigState::CommitTransaction { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                        self.txn_id = None;
-                        self.state = EnsureConfigState::ScheduleSyncDrain { document };
-                        smallvec![schedule_drain_effect()]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => {
-                        self.txn_id = None;
-                        self.fail(error.into())
-                    }
-                    other => self.unexpected_event("transaction commit result", other.label()),
-                }
-            }
-            EnsureConfigState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = EnsureConfigState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = EnsureConfigState::Finish;
-                    smallvec![]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            EnsureConfigState::Finish | EnsureConfigState::Error | EnsureConfigState::Init => {
-                smallvec![]
-            }
-        }
+    fn first(&mut self) -> EnsureTurn {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                MembershipFence::key(self.config.actor.realm_id),
+            ),
+        ])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            EnsureConfigState::Finish | EnsureConfigState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or_else(|| {
-            Ok(RealmConfigDocument::default_for_realm(
-                self.config.actor.realm_id,
-                Vec::new(),
-            ))
-        })
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> EnsureTurn {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer, membership] = values::<3>(result)?;
+                self.membership = MembershipFence::from_value(membership.as_deref())?;
+                self.emit_document_write(document, reducer)
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
 }
@@ -774,14 +613,13 @@ mod pure_tests {
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
     };
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE,
         SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminConflict, AdminConflictValue, AdminDocumentState, CONFIG_STRATEGY_PATH,
     };
@@ -793,14 +631,13 @@ mod pure_tests {
         HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
         StrategyBinding, band_start, coordinator_spans,
     };
-    use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+    use aruna_core::types::{Key, KeySpace, Value};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
     use super::{
-        EnsureConfigError, EnsureConfigOperation, EnsureConfigParams, EnsureConfigState,
-        config_node_path, overlay_reducer_state,
+        EnsureConfigError, EnsureConfigOperation, EnsureConfigParams, config_node_path,
+        overlay_reducer_state,
     };
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -842,13 +679,10 @@ mod pure_tests {
         }
     }
 
-    fn batch_write(effects: Effects, txn_id: TxnId) -> Vec<(KeySpace, Key, Value)> {
-        match effects.into_iter().next().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
-                assert_eq!(id, Some(txn_id));
-                writes
-            }
-            other => panic!("unexpected write effect: {other:?}"),
+    fn batch_write(turn: Next<RealmConfigDocument>) -> Vec<(KeySpace, Key, Value)> {
+        match turn {
+            Next::Call(IoCall::Write(writes)) => writes,
+            _ => panic!("expected one write"),
         }
     }
 
@@ -875,8 +709,6 @@ mod pure_tests {
             .insert(path.clone(), conflict(&path));
 
         let mut operation = EnsureConfigOperation::new(config(actor.clone(), 7));
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
                 .emit_document_write(
@@ -884,7 +716,6 @@ mod pure_tests {
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 )
                 .unwrap(),
-            txn_id,
         );
 
         let stored =
@@ -913,18 +744,12 @@ mod pure_tests {
                     && matches!(event.op, AdminDocumentOperation::ConfigNodeEnsured { .. })
         ));
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
-        }));
         assert_eq!(
-            effects.first(),
-            Some(&Effect::Storage(StorageEffect::BatchDelete {
-                deletes: vec![(
-                    DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                    reducer_conflict_key(&target, &path),
-                )],
-                txn_id: Some(txn_id),
-            }))
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(vec![(
+                DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                reducer_conflict_key(&target, &path),
+            )])))
         );
     }
 
@@ -934,10 +759,8 @@ mod pure_tests {
         // path does: whatever only the document carries a rebuild loses.
         let realm_id = RealmId::from_bytes([9; 32]);
         let mut operation = EnsureConfigOperation::new(config(actor(1, realm_id), 3));
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
 
-        let writes = batch_write(operation.emit_document_write(None, None).unwrap(), txn_id);
+        let writes = batch_write(operation.emit_document_write(None, None).unwrap());
 
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
@@ -994,13 +817,10 @@ mod pure_tests {
             target_node_kind: kind,
             ..config(actor.clone(), 3)
         });
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
                 .emit_document_write(Some(document.to_bytes(actor).unwrap().into()), None)
                 .unwrap(),
-            txn_id,
         );
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
@@ -1074,20 +894,13 @@ mod pure_tests {
             target_node_kind: RealmNodeKind::Server,
             ..config(actor_a.clone(), 3)
         });
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
-        let effects = operation
+        let turn = operation
             .emit_document_write(
                 Some(merged.to_bytes(&actor_a).unwrap().into()),
                 Some(state_a.into()),
             )
             .unwrap();
-        assert_eq!(
-            effects.first(),
-            Some(&Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id
-            }))
-        );
+        assert!(matches!(turn, Next::Done(_)));
     }
 
     #[test]
@@ -1138,7 +951,6 @@ mod pure_tests {
             create_if_missing: false,
             ..config(actor_a.clone(), 3)
         });
-        operation.txn_id = Some(TxnId::generate());
         let error = operation
             .emit_document_write(Some(document.to_bytes(&actor_a).unwrap().into()), None)
             .unwrap_err();
@@ -1157,13 +969,10 @@ mod pure_tests {
         let mut document = pooled_document(realm_id, &[(1, actor.clone(), 0, HANDLE_BANDS)]);
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         let mut operation = EnsureConfigOperation::new(config(actor.clone(), 3));
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
                 .emit_document_write(Some(document.to_bytes(&actor).unwrap().into()), None)
                 .unwrap(),
-            txn_id,
         );
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
@@ -1225,52 +1034,31 @@ mod pure_tests {
         );
 
         let mut operation = EnsureConfigOperation::new(config(actor.clone(), 3));
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
-        let effects = operation
+        let turn = operation
             .emit_document_write(
                 Some(document.to_bytes(&actor).unwrap().into()),
                 Some(postcard::to_allocvec(&previous_state).unwrap().into()),
             )
             .unwrap();
 
-        assert_eq!(
-            effects.first(),
-            Some(&Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id
-            }))
-        );
-        assert!(!effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Storage(StorageEffect::BatchWrite { writes, .. })
-                if writes
-                    .iter()
-                    .any(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
-        )));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap(), document);
+        // Nothing changed: the config answers without a write or an outbox row.
+        assert_eq!(turn, Next::Done(document));
     }
 
     #[test]
     fn scheduled_outbox_finishes() {
+        // A changed config comes out with the drain wake after the commit.
         let realm_id = RealmId::from_bytes([11; 32]);
-        let actor = actor(11, realm_id);
-        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        let mut operation = EnsureConfigOperation::new(config(actor, 3));
-        operation.state = EnsureConfigState::ScheduleSyncDrain { document };
-
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.state, EnsureConfigState::Finish);
+        let mut operation = EnsureConfigOperation::new(config(actor(11, realm_id), 3));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let written = operation.next(IoResult::Values(vec![None, None, None]));
+        assert!(matches!(written, Ok(Next::Call(IoCall::Write(_)))));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("expected the config with the drain wake");
+        };
+        assert_eq!(output.description, "Ensured Realm");
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     #[test]
@@ -1442,7 +1230,6 @@ mod pure_tests {
             reject_kind_mismatch: true,
             ..config(actor.clone(), 3)
         });
-        operation.txn_id = Some(TxnId::generate());
 
         let error = operation
             .emit_document_write(Some(document.to_bytes(&actor).unwrap().into()), None)
