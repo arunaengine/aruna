@@ -404,3 +404,7 @@ pub(super) fn build_task_spec(
             .collect(),
     }
 }
+
+#[cfg(test)]
+#[path = "prepare_tests.rs"]
+mod tests;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::compute::effect::ComputeAnswer;
+use aruna_core::compute::effect::{BackendFacts, ComputeAnswer};
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
 };
@@ -14,7 +14,7 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEvent, JobStops};
 use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionSpec, JobId, JobPayload, JobRecord,
+    AttemptControl, AttemptIntent, ExecutionSpec, JobClaim, JobId, JobPayload, JobRecord,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -24,6 +24,7 @@ use super::attempt::{AttemptScope, RunWiring};
 
 pub(super) const EPOCH: u64 = 3;
 pub(super) const BUCKET: &str = "work";
+pub(super) const PINNED: &str = "alpine@sha256:1";
 
 pub(super) fn job() -> JobId {
     JobId::from_bytes([1; 16])
@@ -66,6 +67,37 @@ pub(super) fn record() -> JobRecord {
     let user = UserId::local(Ulid::from_bytes([5; 16]), realm());
     let payload = JobPayload::Execution(spec());
     JobRecord::new(job(), payload, user, node(), 1, 1, None)
+}
+
+pub(super) fn claimed() -> JobRecord {
+    let mut job = record();
+    job.claim = Some(JobClaim {
+        holder_node_id: node(),
+        claim_token: token(),
+        lease_expires_ms: 1,
+    });
+    job
+}
+
+pub(super) fn intent() -> AttemptIntent {
+    AttemptIntent {
+        attempt_no: 1,
+        external_name: "attempt".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: PINNED.to_string(),
+        attempt_epoch: EPOCH,
+    }
+}
+
+pub(super) fn facts() -> BackendFacts {
+    BackendFacts {
+        kind: ExecutorKind::Docker,
+        s3_mount: false,
+        session: false,
+        local_site: false,
+        worker_location: None,
+        run_as: NOBODY,
+    }
 }
 
 pub(super) fn fence() -> FenceContext {
