@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::forward::route_create::RouteCreateOperation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_forward_document,
 };
-use crate::metadata::forward::write::{apply_batch_routed, route_metadata_create};
+use crate::metadata::forward::write::apply_batch_routed;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
@@ -276,7 +277,16 @@ async fn forward_entry(
             jsonld: entry.jsonld.clone(),
         },
     });
-    match route_metadata_create(operation, context.clone(), Some(token)).await {
+    match drive(
+        RouteCreateOperation::new(
+            operation,
+            context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(token),
+        ),
+        &context,
+    )
+    .await
+    {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published a queued draft");
             track_created(

@@ -5,6 +5,7 @@
 pub(crate) mod holder_reads;
 pub(crate) mod profile_export;
 pub mod read;
+pub mod route_create;
 pub mod write;
 
 #[cfg(test)]

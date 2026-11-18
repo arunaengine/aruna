@@ -11,6 +11,7 @@ use std::pin::Pin;
 use tokio::time::{Instant, timeout};
 
 use crate::driver::DriverContext;
+use crate::metadata::handle::MetadataRequestDelivery;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
 // so its type must not contain the runner's own future.
@@ -44,7 +45,14 @@ pub(super) async fn dispatch_request(
         .await
         {
             Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(error)) => Err(PeerRequestError::Failed(error.to_string())),
+            Ok(Err(error)) => match error.delivery() {
+                MetadataRequestDelivery::DefinitelyNotSent => {
+                    Err(PeerRequestError::NotSent(error.to_string()))
+                }
+                MetadataRequestDelivery::PossiblySent => {
+                    Err(PeerRequestError::Failed(error.to_string()))
+                }
+            },
             Err(_) => Err(PeerRequestError::TimedOut),
         },
     };

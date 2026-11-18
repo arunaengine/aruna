@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
-use aruna_core::profile_shapes::{ProfileShaclError, ProfileShaclReport, ProfileShapes};
+use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleIrokleOptions, CraqleNode, CraqleOptions,
-    CrateViolation, GraphId, SearchStorage,
+    GraphId, SearchStorage,
 };
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 

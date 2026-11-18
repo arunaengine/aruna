@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
@@ -47,8 +48,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::forward::read::export_rocrate_routed;
 use aruna_operations::metadata::forward::write::{
-    PinnedCreate, create_with_id, route_metadata_create, route_metadata_delete,
-    route_metadata_update,
+    PinnedCreate, create_with_id, route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
@@ -892,10 +892,13 @@ async fn bystander_writes_forward() -> TestResult<()> {
         || registry_row_present(bystander, document_id),
     )
     .await?;
-    let record = drive(DocumentRecordOperation::new(document_id), bystander.context.as_ref())
-        .await
-        .map_err(|error| format!("registry read failed: {error:?}"))?
-        .ok_or("the non-holder must carry the registry row")?;
+    let record = drive(
+        DocumentRecordOperation::new(document_id),
+        bystander.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("registry read failed: {error:?}"))?
+    .ok_or("the non-holder must carry the registry row")?;
     assert_eq!(record.placement, placement);
     let config = drive(
         GetConfigOperation::new(realm.realm_id),
@@ -939,10 +942,13 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
-    let stale_record = drive(DocumentRecordOperation::new(document_id), stale.context.as_ref())
-        .await
-        .map_err(|error| format!("registry read failed: {error:?}"))?
-        .ok_or("the holder must carry the registry row")?;
+    let stale_record = drive(
+        DocumentRecordOperation::new(document_id),
+        stale.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("registry read failed: {error:?}"))?
+    .ok_or("the holder must carry the registry row")?;
     let deleted = stale
         .context
         .storage_handle
@@ -1143,17 +1149,20 @@ async fn user_create_forwards() -> TestResult<()> {
         None
     );
 
-    let created = route_metadata_create(
-        CreateDocumentOperation::new(document_config(
-            &realm,
-            user,
-            group_id,
-            document_id,
-            path,
-            topology_payload(),
-        )),
-        user.context.clone(),
-        Some(realm.bearer_token()),
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new(document_config(
+                &realm,
+                user,
+                group_id,
+                document_id,
+                path,
+                topology_payload(),
+            )),
+            user.context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(realm.bearer_token()),
+        ),
+        &user.context,
     )
     .await?
     .record;
@@ -1294,9 +1303,12 @@ async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> 
 }
 
 async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
-    drive(DocumentRecordOperation::new(document_id), node.context.as_ref())
-        .await
-        .is_ok_and(|record| record.is_some())
+    drive(
+        DocumentRecordOperation::new(document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .is_ok_and(|record| record.is_some())
 }
 
 /// A server mints into a bucket it holds; a create pinned to one holder by a non-holder answers

@@ -10,6 +10,7 @@ pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 
+use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use upload::UploadClaimError;
 use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
@@ -70,7 +71,7 @@ use crate::jobs::store::query::list_job_entries;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
+use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::policy::{GateContextError, GateOperation};
@@ -1135,17 +1136,20 @@ async fn create_document(
         user_id: spec.auth_context.user_id,
         realm_id: spec.auth_context.realm_id,
     };
-    match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id: spec.metadata.group_id,
-            document_id: spec.document_id,
-            document_path: spec.metadata.path.clone(),
-            public: spec.metadata.public,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        ctx.driver.clone(),
-        Some(AuthToken::internal(spec.auth_context.clone())),
+    match drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id: spec.metadata.group_id,
+                document_id: spec.document_id,
+                document_path: spec.metadata.path.clone(),
+                public: spec.metadata.public,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            ctx.driver.net_handle.as_ref().map(|net| net.node_id()),
+            Some(AuthToken::internal(spec.auth_context.clone())),
+        ),
+        &ctx.driver,
     )
     .await
     {
@@ -1222,10 +1226,9 @@ async fn update_document(
             user_id: spec.auth_context.user_id,
             realm_id: spec.auth_context.realm_id,
         };
-        let record =
-            drive(DocumentRecordOperation::new(spec.document_id), &ctx.driver)
-                .await
-                .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
+        let record = drive(DocumentRecordOperation::new(spec.document_id), &ctx.driver)
+            .await
+            .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.
         match Box::pin(route_metadata_update(
             &ctx.driver,

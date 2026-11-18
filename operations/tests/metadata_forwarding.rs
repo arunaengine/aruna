@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keys::generate_signing_key;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -52,7 +53,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_update};
+use aruna_operations::metadata::forward::write::route_metadata_update;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::realm::set_policies::{
@@ -1007,9 +1008,12 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
-    drive(DocumentRecordOperation::new(document_id), node.context.as_ref())
-        .await
-        .map_err(|error| format!("metadata registry read failed: {error:?}").into())
+    drive(
+        DocumentRecordOperation::new(document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("metadata registry read failed: {error:?}").into())
 }
 
 async fn read_group_auth(
@@ -1071,26 +1075,29 @@ async fn drive_create_at(
     document_id: Ulid,
     document_path: &str,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
-    let created = route_metadata_create(
-        CreateDocumentOperation::new(CreateDocumentConfig {
-            actor: Actor {
-                node_id: node.net.node_id(),
-                user_id: realm.user_id,
-                realm_id: realm.realm_id,
-            },
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: true,
-            payload: CreateDocumentPayload::Scaffold {
-                name: "Forwarded".to_string(),
-                description: "Placed by a holder".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            },
-        }),
-        node.context.clone(),
-        Some(realm.bearer_token()),
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new(CreateDocumentConfig {
+                actor: Actor {
+                    node_id: node.net.node_id(),
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                },
+                group_id,
+                document_id,
+                document_path: document_path.to_string(),
+                public: true,
+                payload: CreateDocumentPayload::Scaffold {
+                    name: "Forwarded".to_string(),
+                    description: "Placed by a holder".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                },
+            }),
+            node.context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(realm.bearer_token()),
+        ),
+        &node.context,
     )
     .await?;
     Ok(created.record)

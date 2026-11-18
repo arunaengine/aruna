@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
@@ -82,62 +83,6 @@ use crate::forward::transport::retry_disposition;
 use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use aruna_core::StructuredId;
-
-/// Creates locally when the origin holds the bucket, otherwise at a holder.
-/// Definitely unsent requests may try another holder; ambiguous delivery is
-/// terminal so the create is not replayed.
-pub async fn route_metadata_create(
-    operation: CreateDocumentOperation,
-    context: Arc<DriverContext>,
-    auth_token: Option<AuthToken>,
-) -> Result<CreateDocumentResult, MetadataWriteError> {
-    let config = operation.config().clone();
-    let commit_message = operation.message().map(str::to_owned);
-    match drive(
-        CreateEntryOperation::new(
-            operation,
-            context.net_handle.as_ref().map(|net| net.node_id()),
-        ),
-        &context,
-    )
-    .await
-    {
-        Err(CreateDocumentError::HoldsNoBucket) => {}
-        Ok(created) => return Ok(created),
-        Err(error) => return Err(error.into()),
-    }
-
-    // Mint the forwarded id at the origin with the blind-hash bucket of the
-    // subject, so every candidate holder stamps the same bucket.
-    let realm_config = load_realm_config(&context, config.actor.realm_id)
-        .await
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let document_id = if config.document_id.is_nil() {
-        mint_forward_document(
-            &realm_config,
-            &config.actor,
-            config.group_id,
-            &config.document_path,
-        )?
-    } else {
-        MetaResourceId::from_bytes(config.document_id.to_bytes()).map_err(|error| {
-            CreateDocumentError::PlacementBindingUnavailable(format!(
-                "forwarded document id is not a structured id: {error}"
-            ))
-        })?
-    };
-    let target = (document_id.as_ulid(), None);
-    forward_create(
-        &context,
-        &realm_config,
-        &config,
-        target,
-        (auth_token, commit_message),
-    )
-    .await
-}
 
 /// Sends the create of `document_id` to the holders of its bucket, or to the `pinned` one only,
 /// and checks the record the answering holder returns.
@@ -272,18 +217,21 @@ pub async fn create_metadata_authorized(
         )
         .await?;
     }
-    let created = route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id,
-            document_id,
-            document_path: path,
-            public,
-            payload,
-        })
-        .with_message(commit_message),
-        context.clone(),
-        auth_token,
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path: path,
+                public,
+                payload,
+            })
+            .with_message(commit_message),
+            context.net_handle.as_ref().map(|net| net.node_id()),
+            auth_token,
+        ),
+        &context,
     )
     .await?;
     let event_id = created.event_id;

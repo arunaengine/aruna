@@ -51,7 +51,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::create_entry::DocumentMintOperation;
-use crate::metadata::forward::write::route_metadata_create;
+use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::mutate_placement::node_kind;
@@ -300,22 +300,25 @@ pub(crate) async fn record_crate(
         launch.as_ref(),
     );
 
-    let status = match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id: spec.group_id,
-            document_id,
-            document_path,
-            public: false,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        driver.clone(),
-        Some(AuthToken::internal(AuthContext {
-            user_id: parent.created_by,
-            realm_id: driver.serving_realm(parent.created_by.realm_id),
-            path_restrictions: None,
-            session: None,
-        })),
+    let status = match drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id: spec.group_id,
+                document_id,
+                document_path,
+                public: false,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            driver.net_handle.as_ref().map(|net| net.node_id()),
+            Some(AuthToken::internal(AuthContext {
+                user_id: parent.created_by,
+                realm_id: driver.serving_realm(parent.created_by.realm_id),
+                path_restrictions: None,
+                session: None,
+            })),
+        ),
+        &driver,
     )
     .await
     {

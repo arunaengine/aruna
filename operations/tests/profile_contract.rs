@@ -29,7 +29,7 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::forward::read::{admits_profile_peer, export_profile_local};
-use aruna_operations::metadata::forward::write::route_metadata_create;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use aruna_operations::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
     ValidationStatusOperation, profile_public_iri, profile_verdict,
@@ -1641,17 +1641,20 @@ async fn create_crate(
     jsonld: String,
 ) -> Result<aruna_operations::metadata::create_document::CreateDocumentResult, CreateDocumentError>
 {
-    match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            document_path: path.to_string(),
-            public: true,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        test.context.clone(),
-        None,
+    match drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                document_path: path.to_string(),
+                public: true,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            test.context.net_handle.as_ref().map(|net| net.node_id()),
+            None,
+        ),
+        &test.context,
     )
     .await
     {
