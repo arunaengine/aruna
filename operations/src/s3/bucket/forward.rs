@@ -6,17 +6,17 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::authorize::{peer_answer, peer_check};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{pull_refusal, refusal_kind};
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::events::WritePeerRefusal;
+use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRefusal;
@@ -250,15 +250,17 @@ impl Operation for BucketForwardOperation {
                     return self.refuse(SyncRefusal::Unavailable);
                 }
                 self.step = ForwardStep::Peer;
-                Ok(Next::Call(peer_check(self.peer, self.token.take())))
+                let token = self.token.take().ok_or(IoError::Unfinished)?;
+                let check = WritePeerOperation::new(self.peer, token);
+                Ok(Next::Call(IoCall::child(check)))
             }
-            ForwardStep::Peer => match peer_answer(result)? {
+            ForwardStep::Peer => match result.child::<AuthContext, PeerAuthRefusal>()? {
                 Ok(auth) => {
                     let realm_id = auth.realm_id;
                     self.read_config(realm_id, ForwardStep::PeerConfig(Box::new(auth)))
                 }
-                Err(WritePeerRefusal::Unauthorized) => self.refuse(SyncRefusal::Unauthorized),
-                Err(WritePeerRefusal::Unavailable(_)) => self.refuse(SyncRefusal::Unavailable),
+                Err(PeerAuthRefusal::Unauthorized) => self.refuse(SyncRefusal::Unauthorized),
+                Err(PeerAuthRefusal::Unavailable(_)) => self.refuse(SyncRefusal::Unavailable),
             },
             ForwardStep::PeerConfig(auth) => {
                 let config = match result.child::<RealmConfigDocument, GetConfigError>()? {

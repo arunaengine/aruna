@@ -1127,6 +1127,7 @@ impl Event {
                     Backoff,
                     Answered,
                     MailRefreshed,
+                    RangeListed,
                     ConnectionAnswered
                 }
             ),

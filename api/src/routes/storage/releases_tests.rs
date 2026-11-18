@@ -218,7 +218,7 @@ async fn pins_one_version() {
     store(&node, "db/a.fasta", ">a22").await;
     let place = (node.state.get_realm_id(), node.state.get_node_id());
     let context = node.state.get_ctx();
-    let view = run_operation(
+    let view = drive(
         ReadOriginOperation::new(place.0, BUCKET, "db/a.fasta", None),
         context.as_ref(),
     )

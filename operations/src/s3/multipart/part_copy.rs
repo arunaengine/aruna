@@ -445,7 +445,7 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::checksum::Hasher;
+    use aruna_core::structs::checksum::{HASH_MD5, Hasher};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
     use aruna_core::structs::storage::format::Compression;
