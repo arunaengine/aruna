@@ -22,7 +22,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
-use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
+use aruna_operations::device::compute::{LocalExecutionConfig, LocalRunOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
@@ -702,16 +702,18 @@ pub async fn create_task(
     let workspace_mode = target_modes(target).1;
 
     if target == ExecutionTarget::Local {
-        return match submit_local_execution(
-            &state.get_ctx(),
-            LocalExecutionConfig {
-                spec,
-                owner: caller.auth.user_id,
-                node_id: state.get_node_id(),
-                idempotency_key,
-                workspace_mode,
-                retention_ms: state.rocrate_limits().artifact_retention_ms,
-            },
+        let config = LocalExecutionConfig {
+            spec,
+            owner: caller.auth.user_id,
+            node_id: state.get_node_id(),
+            idempotency_key,
+            workspace_mode,
+            retention_ms: state.rocrate_limits().artifact_retention_ms,
+        };
+        let context = state.get_ctx();
+        return match drive(
+            LocalRunOperation::on_node(config, &context),
+            context.as_ref(),
         )
         .await
         {

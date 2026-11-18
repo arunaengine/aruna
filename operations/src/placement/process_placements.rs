@@ -163,7 +163,7 @@ async fn ensure_held_topics(
             let event = net_handle
                 .sync_document_topics(missing.clone(), co_members.clone())
                 .await;
-            crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
+            crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
                 if net_handle.sync_topic_exists(topic).unwrap_or(false) {
                     known.push(topic);
@@ -251,7 +251,7 @@ pub(crate) async fn resolve_creatable_topics(
         let event = net_handle
             .sync_document_topics(to_adopt.clone(), co_members.to_vec())
             .await;
-        crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
         // Only keep topics whose genesis actually landed; an adopt that failed
         // must not fall through to a fresh create - retry it on the next pass.
         for topic in to_adopt {

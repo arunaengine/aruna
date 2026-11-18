@@ -11,14 +11,14 @@ use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 
-use crate::node::recovery::RecoveryError;
+use crate::shard::recovery::RecoveryError;
 use aruna_core::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentTarget::sync_topic_id`]).
 pub const RESTORE_TOPIC_COUNT: usize = 5;
 
-pub(super) fn shared_targets(
+pub(crate) fn shared_targets(
     realm_id: RealmId,
     node_id: NodeId,
 ) -> [DocumentTarget; RESTORE_TOPIC_COUNT] {
@@ -38,14 +38,14 @@ pub(super) fn shared_targets(
 /// Whether a shared target belongs to the realm rather than to one node.
 /// Node-owned targets are planned by that node alone; realm-wide ones need a
 /// single designated minter.
-pub(super) fn realm_wide_target(target: &DocumentTarget) -> bool {
+pub(crate) fn realm_wide_target(target: &DocumentTarget) -> bool {
     matches!(
         target,
         DocumentTarget::RealmConfig { .. } | DocumentTarget::RealmAuthorization { .. }
     )
 }
 
-pub(super) fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+pub(crate) fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     let node_id = node_id.to_string();
     config
         .nodes
@@ -53,7 +53,7 @@ pub(super) fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) 
         .any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
 }
 
-pub(super) fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
+pub(crate) fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
     config
         .nodes
         .iter()
@@ -66,9 +66,9 @@ pub(super) fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) 
 /// Work units one bounded restore pass may process. A work-unit limit, never a
 /// wall-clock deadline, so the bound holds however many shards share a
 /// co-holder set.
-pub(super) const RESTORE_UNIT_BUDGET: usize = 8;
+pub(crate) const RESTORE_UNIT_BUDGET: usize = 8;
 /// Topics per work unit; one unit still fills a document sync topic batch.
-pub(super) const RESTORE_CHUNK_TOPICS: usize = 64;
+pub(crate) const RESTORE_CHUNK_TOPICS: usize = 64;
 
 /// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
 /// invariant is `shard_topics == held_shards`, i.e. one topic per held shard,
@@ -96,8 +96,8 @@ impl RestoreShardSummary {
 /// Where a bounded restore resumes, bound to the exact current work plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardRestoreCursor {
-    pub(super) next_unit: usize,
-    pub(super) plan_hash: Option<[u8; 32]>,
+    pub(crate) next_unit: usize,
+    pub(crate) plan_hash: Option<[u8; 32]>,
 }
 
 /// What one bounded [`restore_shard_pass`] did.
@@ -119,21 +119,21 @@ pub struct ShardRestorePass {
     pub enumerated: bool,
 }
 
-pub(super) type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
+pub(crate) type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
 
 /// Restore work grouped by co-holder and retained peer sets, so matching shards
 /// ride one ensure and one sync instead of one round trip each.
-pub(super) struct ShardPlan {
-    pub(super) summary: RestoreShardSummary,
-    pub(super) shared_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    pub(super) shared_join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    pub(super) rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
-    pub(super) join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
+pub(crate) struct ShardPlan {
+    pub(crate) summary: RestoreShardSummary,
+    pub(crate) shared_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    pub(crate) shared_join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    pub(crate) rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
+    pub(crate) join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
 }
 
 /// Derives the restore plan from the realm config alone. I/O-free, so the local
 /// serving gate and the bounded remote pass read the same view.
-pub(super) fn plan_shard_groups(
+pub(crate) fn plan_shard_groups(
     config: &RealmConfigDocument,
     node_id: NodeId,
     realm_id: RealmId,
@@ -223,13 +223,13 @@ pub(super) fn plan_shard_groups(
 
 /// The half-open unit range one bounded pass processes, and whether it wraps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RestoreRange {
-    pub(super) start: usize,
-    pub(super) end: usize,
-    pub(super) wrapped: bool,
+pub(crate) struct RestoreRange {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) wrapped: bool,
 }
 
-pub(super) fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange {
+pub(crate) fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange {
     let start = cursor.next_unit.min(units_total);
     let end = (start + RESTORE_UNIT_BUDGET).min(units_total);
     RestoreRange {
@@ -242,16 +242,16 @@ pub(super) fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> R
 /// One bounded unit of restore work: one co-holder group's ensure and sync over
 /// a chunk of topics.
 #[derive(Clone, Debug)]
-pub(super) struct RestoreUnit {
-    pub(super) kind: RestoreKind,
-    pub(super) peers: Vec<NodeId>,
-    pub(super) publishers: Vec<NodeId>,
-    pub(super) retained: BTreeSet<NodeId>,
-    pub(super) topics: Vec<::irokle::TopicId>,
+pub(crate) struct RestoreUnit {
+    pub(crate) kind: RestoreKind,
+    pub(crate) peers: Vec<NodeId>,
+    pub(crate) publishers: Vec<NodeId>,
+    pub(crate) retained: BTreeSet<NodeId>,
+    pub(crate) topics: Vec<::irokle::TopicId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RestoreKind {
+pub(crate) enum RestoreKind {
     /// Shared topics this node may mint: its own node-owned ones, and the
     /// realm-wide ones when it is the designated minter.
     Shared,
@@ -263,7 +263,7 @@ pub(super) enum RestoreKind {
     Join,
 }
 
-pub(super) fn bind_restore_plan(cursor: &mut ShardRestoreCursor, units: &[RestoreUnit]) -> bool {
+pub(crate) fn bind_restore_plan(cursor: &mut ShardRestoreCursor, units: &[RestoreUnit]) -> bool {
     let plan_hash = restore_plan_hash(units);
     let changed = cursor.plan_hash != Some(plan_hash);
     if changed {
@@ -273,7 +273,7 @@ pub(super) fn bind_restore_plan(cursor: &mut ShardRestoreCursor, units: &[Restor
     changed
 }
 
-pub(super) fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
+pub(crate) fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for unit in units {
         let kind = match unit.kind {
@@ -305,7 +305,7 @@ pub(super) fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
 
 impl ShardPlan {
     /// Flattens the plan into a deterministic list of bounded work units.
-    pub(super) fn into_units(self) -> Vec<RestoreUnit> {
+    pub(crate) fn into_units(self) -> Vec<RestoreUnit> {
         let mut units = Vec::new();
         // A unit without peers still has local work: its topics are ensured and
         // minted here, and only the peer exchange is skipped.
@@ -356,13 +356,13 @@ impl ShardPlan {
 }
 
 #[derive(Default)]
-pub(super) struct RestoreUnitOutcome {
-    pub(super) unresolved_topics: BTreeSet<::irokle::TopicId>,
-    pub(super) error: Option<RecoveryError>,
+pub(crate) struct RestoreUnitOutcome {
+    pub(crate) unresolved_topics: BTreeSet<::irokle::TopicId>,
+    pub(crate) error: Option<RecoveryError>,
 }
 
 impl RestoreUnitOutcome {
-    pub(super) fn fail_topics(&mut self, topics: impl IntoIterator<Item = ::irokle::TopicId>) {
+    pub(crate) fn fail_topics(&mut self, topics: impl IntoIterator<Item = ::irokle::TopicId>) {
         let before = self.unresolved_topics.len();
         self.unresolved_topics.extend(topics);
         if self.unresolved_topics.len() > before {

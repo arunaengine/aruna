@@ -12,12 +12,17 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::UserId;
+use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
-use aruna_operations::device::compute::{ComputeStatus, compute_status};
+use aruna_operations::device::compute::{
+    BackendState, ComputeStatus, LocalExecutionError, LocalRunsOperation, status_of,
+};
 use aruna_operations::device::publish_run::{
     PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
 };
+use aruna_operations::driver::{DriverContext, drive};
 
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -130,6 +135,29 @@ async fn get_device_compute(
         .await
         .map_err(map_local_error)?;
     Ok(Json(status.into()))
+}
+
+/// The local compute plane and the owner's runs on it; only the backend answers its health.
+async fn compute_status(
+    context: &DriverContext,
+    owner: UserId,
+) -> Result<ComputeStatus, LocalExecutionError> {
+    let backend =
+        (context.compute_handle.as_ref()).and_then(|registry| registry.select(None).cloned());
+    let runs = drive(LocalRunsOperation::new(owner), context).await?;
+    let plane = match &backend {
+        Some(backend) => BackendState {
+            kind: Some(backend.kind().as_wire()),
+            limits: backend.capabilities().limits,
+            failure: backend.health().await.err().map(|error| error.to_string()),
+        },
+        None => BackendState {
+            kind: None,
+            limits: ResourceEnvelope::default(),
+            failure: Some("no compute backend is configured on this device".to_string()),
+        },
+    };
+    Ok(status_of(plane, runs))
 }
 
 /// Where a finished local run is published.

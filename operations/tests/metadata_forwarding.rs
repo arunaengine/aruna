@@ -1170,7 +1170,7 @@ async fn install_realm_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::shard::restore::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 realm_id,

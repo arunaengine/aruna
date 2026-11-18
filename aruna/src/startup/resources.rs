@@ -18,10 +18,10 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
-use aruna_operations::node::recovery::RecoveryStatus;
-use aruna_operations::node::usage_publish::publish_refresh_snapshots;
+use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::plugins::plugin_work::PluginWorkHandler;
+use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
@@ -682,7 +682,8 @@ fn spawn_usage_rebuild(
             }
         }
         info!("Usage counters rebuilt");
-        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
+        let publish = PublishUsageOperation::new(&context, (node_id, realm_id), true, true);
+        if let Err(error) = drive(publish, context.as_ref()).await {
             warn!(error = %error, "Usage snapshots were not published after the rebuild");
         }
     });
