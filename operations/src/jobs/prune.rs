@@ -5,12 +5,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id, parse_schedule_key,
+    JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
+    parse_schedule_key,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -26,6 +29,7 @@ use super::store::query::{
     batch_delete, first_schedule_entry, job_entry_deletes, staging_row_deletes,
 };
 use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
+use super::store::{JobMutationError, row_calls};
 use crate::driver::DriverContext;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::prune_delete_entries;
@@ -227,6 +231,48 @@ pub async fn restore_prune_timer(context: &DriverContext, task_handle: &TaskHand
     }
 }
 
+/// Moves the prune timer up to the earliest `prune/` entry. An unreadable index leaves the timer
+/// as it is, and the timer call itself is best effort.
+#[derive(Debug, PartialEq)]
+pub struct PruneTimerOperation {
+    now_ms: u64,
+}
+
+impl PruneTimerOperation {
+    pub fn new(now_ms: u64) -> Self {
+        Self { now_ms }
+    }
+}
+
+impl Operation for PruneTimerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let first = row_calls::first_schedule_entry(PRUNE_INDEX_PREFIX);
+        Ok(Next::Call(IoCall::child(first)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let expiry_ms = match result.child::<Option<(u64, JobId)>, JobMutationError>()? {
+            Ok(Some((expiry_ms, _))) => expiry_ms,
+            Ok(None) => return Ok(Next::Done(())),
+            Err(error) => {
+                warn!(error = %error, "Failed to scan job prune index");
+                return Ok(Next::Done(()));
+            }
+        };
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PruneJobs,
+            after: Duration::from_millis(expiry_ms.saturating_sub(self.now_ms)),
+        });
+        Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::Effect(Box::new(timer))],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +282,7 @@ mod tests {
     use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, transition_to_running};
     use crate::testing::test_context;
     use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
@@ -333,6 +380,42 @@ mod tests {
             .unwrap()
             .0
             .len()
+    }
+
+    // The timer moves to the earliest entry, counted from now.
+    #[test]
+    fn timer_follows_entry() {
+        let mut timer = PruneTimerOperation::new(10);
+        assert!(matches!(timer.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let entry = Some((25, JobId::from_bytes([1u8; 16])));
+        let found = IoResult::Child(ChildOutcome::new(Ok::<_, JobMutationError>(entry)));
+        let Next::Then { calls, .. } = timer.next(found).unwrap() else {
+            panic!("expected the timer call");
+        };
+        let [IoCall::Effect(effect)] = calls.as_slice() else {
+            panic!("expected one effect");
+        };
+        assert_eq!(
+            **effect,
+            Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::PruneJobs,
+                after: Duration::from_millis(15),
+            })
+        );
+    }
+
+    // Without an entry, or with an unreadable index, the timer stays as it is.
+    #[test]
+    fn timer_needs_entry() {
+        let outcomes = [
+            Ok::<Option<(u64, JobId)>, _>(None),
+            Err(JobMutationError::Storage("down".to_string())),
+        ];
+        for outcome in outcomes {
+            let found = IoResult::Child(ChildOutcome::new(outcome));
+            let next = PruneTimerOperation::new(10).next(found).unwrap();
+            assert!(matches!(next, Next::Done(())));
+        }
     }
 
     #[tokio::test]
