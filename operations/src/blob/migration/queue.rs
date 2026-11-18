@@ -260,7 +260,12 @@ async fn advance(
     store(&context.storage_handle, bucket, &mut record).await?;
     if record.state == TransitionState::AwaitingKey
         && let Some(key) = record.source
-        && crate::jobs::runtime::key_unlocked(context, key).await
+        && crate::driver::drive(
+            crate::jobs::runtime_steps::KeyUnlockedOperation::new(key),
+            context,
+        )
+        .await
+        .unwrap_or(false)
     {
         resume_transitions(context, key).await?;
         return Ok(Some(Duration::ZERO));

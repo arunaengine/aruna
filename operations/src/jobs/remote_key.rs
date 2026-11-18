@@ -28,7 +28,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::key_wake::{alias_page, alias_wait, find_alias, read_row, version_wait};
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
-use crate::jobs::runtime::key_unlocked;
+use crate::jobs::runtime_steps::KeyUnlockedOperation;
 use crate::jobs::store::key_wait::{read_key_waits, satisfy_key_wait};
 use crate::jobs::store::remote_wait::{
     OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
@@ -67,7 +67,8 @@ pub(crate) async fn register_waits(
     }
     let mut locked = Vec::new();
     for wait in waits {
-        if !key_unlocked(context, wait.key).await {
+        let unlocked = drive(KeyUnlockedOperation::new(wait.key), context).await;
+        if !unlocked.unwrap_or(false) {
             locked.push(wait);
         }
     }

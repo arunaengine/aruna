@@ -12,7 +12,7 @@ use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::promote_unlocked;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::runtime::key_unlocked;
+use crate::jobs::runtime_steps::KeyUnlockedOperation;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::key_wait::{park_job, satisfy_key_wait, wake_key_waits};
 use crate::jobs::store::park_wake::AwaitOutcome;
@@ -209,7 +209,10 @@ pub(crate) async fn version_wait(
     let Some(key) = key else {
         return Ok(None);
     };
-    if key_unlocked(context, key).await {
+    if drive(KeyUnlockedOperation::new(key), context)
+        .await
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
     Ok(Some(KeyWait {
@@ -285,7 +288,9 @@ pub(crate) async fn park_locked(
     }
     // A key unlocked while the job parked wakes it here; no unlock call would.
     for key in keys {
-        if key_unlocked(context, key).await
+        if drive(KeyUnlockedOperation::new(key), context)
+            .await
+            .unwrap_or(false)
             && let Err(error) =
                 satisfy_key_wait(context, job_id, key, unix_timestamp_millis()).await
         {

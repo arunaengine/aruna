@@ -160,6 +160,7 @@ impl RangeTurns {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
