@@ -181,6 +181,65 @@ impl Operation for RollbackWrite {
     }
 }
 
+/// Releases the reservation of committed bytes; a refused release writes `reconcile` itself, so
+/// the cleanup worker settles the reservation later and nothing it frees is leaked.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReleaseWrite {
+    id: Ulid,
+    reconcile: Option<BlobCleanupWork>,
+    queued: bool,
+}
+
+impl ReleaseWrite {
+    pub(crate) fn new(id: Ulid, reconcile: Option<BlobCleanupWork>) -> Self {
+        Self {
+            id,
+            reconcile,
+            queued: false,
+        }
+    }
+}
+
+impl Operation for ReleaseWrite {
+    type Output = ();
+    type Error = StorageError;
+
+    fn first(&mut self) -> Result<Next<()>, StorageError> {
+        let release = BlobEffect::ReleaseReservation { id: self.id };
+        Ok(Next::Call(Effect::Blob(release).into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, StorageError> {
+        if self.queued {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if let Event::Blob(BlobEvent::ReservationReleased { id }) = result.event()?
+            && id == self.id
+        {
+            return Ok(Next::Done(()));
+        }
+        let Some(work) = self.reconcile.take() else {
+            return Ok(Next::Done(()));
+        };
+        tracing::warn!(
+            event = "put_object.release_deferred",
+            release_id = %self.id,
+            "Queuing the blob reservation for reconciliation"
+        );
+        let key = match &work {
+            BlobCleanupWork::ReconcileWrite { location, .. } => location.ulid,
+            _ => Ulid::generate(),
+        };
+        let value = work.to_bytes();
+        let value = value.map_err(|error| IoError::Codec(error.to_string()))?;
+        let key = key.to_bytes().to_vec().into();
+        let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
+        self.queued = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +296,45 @@ mod tests {
             }
         );
         assert_eq!(rollback.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn release_queues_reconcile() {
+        let work = BlobCleanupWork::ReconcileWrite {
+            location: location(),
+            owner: aruna_core::structs::storage::blob::WriteOwner::Pending,
+        };
+        let id = location().ulid;
+        // A released reservation needs nothing more.
+        let mut release = ReleaseWrite::new(id, Some(work.clone()));
+        let effect = Effect::Blob(BlobEffect::ReleaseReservation { id });
+        assert_eq!(release.first(), Ok(Next::Call(effect.into())));
+        let released = BlobEvent::ReservationReleased { id };
+        assert_eq!(release.next(answer(released)), Ok(Next::Done(())));
+
+        // A refused release writes the reconcile row under the location's id.
+        let mut release = ReleaseWrite::new(id, Some(work.clone()));
+        release.first().unwrap();
+        let refused = BlobEvent::Error(aruna_core::errors::BlobError::DeleteError(
+            "unreachable".to_string(),
+        ));
+        let Ok(Next::Call(IoCall::Write(rows))) = release.next(answer(refused)) else {
+            panic!("expected the reconcile row")
+        };
+        let [(space, key, value)] = rows.as_slice() else {
+            panic!("expected one row, got {rows:?}")
+        };
+        assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(key.as_ref(), id.to_bytes());
+        assert_eq!(BlobCleanupWork::from_bytes(value.as_ref()).unwrap(), work);
+        assert_eq!(release.next(IoResult::Done), Ok(Next::Done(())));
+
+        // Without a reconcile row to keep, a refused release ends the child.
+        let mut release = ReleaseWrite::new(id, None);
+        release.first().unwrap();
+        let other = BlobEvent::ReservationReleased {
+            id: Ulid::from_parts(9, 9),
+        };
+        assert_eq!(release.next(answer(other)), Ok(Next::Done(())));
     }
 }

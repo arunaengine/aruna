@@ -562,8 +562,10 @@ impl PutObjectOperation {
         let version_id = self.version_id.ok_or(PutObjectError::PutObjectFailed)?;
         let mut calls = Vec::new();
         if let Some(written) = self.written_location.as_ref() {
-            let release = BlobEffect::ReleaseReservation { id: written.ulid };
-            calls.push(Effect::Blob(release).into());
+            // A refused release leaves the reconcile row of the stored bytes behind.
+            let stored = Some(&location).filter(|stored| stored.ulid == written.ulid);
+            let reconcile = stored.and_then(|stored| self.reconcile_work(stored.clone()).ok());
+            calls.push(IoCall::child(ReleaseWrite::new(written.ulid, reconcile)));
         }
         // Distributed buckets are found through their content indexes, not the DHT.
         if self.binding.is_none()

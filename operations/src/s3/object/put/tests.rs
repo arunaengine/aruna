@@ -433,9 +433,18 @@ fn release_after_commit() {
     };
 
     assert_eq!(output.location, location);
-    let release = IoCall::from(Effect::Blob(BlobEffect::ReleaseReservation {
-        id: location.ulid,
-    }));
+    // The release runs as a child that keeps the reconcile row when the release is refused.
+    let realm_id = child.config.realm_id;
+    let reconcile = BlobCleanupWork::ReconcileWrite {
+        location: location.clone(),
+        owner: WriteOwner::Blob {
+            blake3: [7u8; 32],
+            realm_id,
+            ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+            announce: true,
+        },
+    };
+    let release = IoCall::child(ReleaseWrite::new(location.ulid, Some(reconcile)));
     assert_eq!(calls.first(), Some(&release));
     assert!(calls.contains(&IoCall::from(schedule_snapshot_publish())));
     assert!(calls.iter().any(|call| matches!(
