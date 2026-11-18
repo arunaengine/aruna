@@ -2,21 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::document_apply::reads::DependencyPlan;
+use ::irokle::Event as _;
+use aruna_core::document::{BatchEvent, OverflowPage, ReconcileBatch};
 
-use super::plan_run::run_plan;
 use super::*;
-
-pub(crate) mod admin;
-mod batch;
-pub(crate) mod cursor;
-mod document;
-mod overflow;
-mod validate;
-
-pub(in crate::document_sync) use self::admin::*;
-pub(in crate::document_sync) use self::cursor::*;
-pub(in crate::document_sync) use self::validate::*;
 
 impl DocumentSyncService {
     /// Reconciles shard topic membership to the current holder set: the publisher
@@ -190,30 +179,115 @@ impl DocumentSyncService {
 }
 
 impl DocumentSyncService {
-    pub async fn reconcile_sync_topics(
+    /// Answers a reconcile operation with the topic's next batch.
+    pub fn reconcile_batch_event(
         &self,
-        topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentReconcileResult> {
-        self.reconcile_document_topics(topic_ids).await
+        topic_id: ::irokle::TopicId,
+        stored_cursor: Option<Value>,
+    ) -> DocumentNetEvent {
+        match self.reconcile_batch(topic_id, stored_cursor) {
+            Ok(batch) => DocumentNetEvent::ReconcileBatch(batch.map(Box::new)),
+            Err(error) => DocumentNetEvent::Error {
+                target: None,
+                error: error.to_string(),
+            },
+        }
     }
 
-    pub(in crate::document_sync) async fn reconcile_documents(
+    /// Answers an overflow replay with its next page.
+    pub fn overflow_page_event(
         &self,
-    ) -> Result<DocumentReconcileResult> {
-        let topics = self.document_topic_ids()?;
-        self.reconcile_document_topics(topics).await
+        topic_id: ::irokle::TopicId,
+        start: Value,
+        applied: Option<Value>,
+    ) -> DocumentNetEvent {
+        match self.overflow_page(topic_id, start, applied) {
+            Ok(page) => DocumentNetEvent::OverflowPage(Box::new(page)),
+            Err(error) => DocumentNetEvent::Error {
+                target: None,
+                error: error.to_string(),
+            },
+        }
     }
 
-    pub(in crate::document_sync) fn document_topic_ids(&self) -> Result<Vec<::irokle::TopicId>> {
-        let topics = self
+    /// The next batch above the stored cursor; the cursor repairs itself here: a lost or failed
+    /// eviction callback cannot make a rebuilt chain's early ops look applied.
+    fn reconcile_batch(
+        &self,
+        topic_id: ::irokle::TopicId,
+        stored_cursor: Option<Value>,
+    ) -> Result<Option<ReconcileBatch>> {
+        let Some(topic) = self
             .node
-            .list_topics()
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        Ok(topics
-            .into_iter()
-            .filter(|topic| topic.event_type_id == DocumentEvent::TYPE_ID)
-            .map(|topic| topic.topic_id)
-            .collect())
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if topic.event_type_id != DocumentEvent::TYPE_ID {
+            return Ok(None);
+        }
+        let storage = self.node.storage();
+        let genesis = topic.genesis;
+        let cursor = applied_cursor_clock(storage, topic_id, genesis, stored_cursor)?;
+        let batch = self.document_event_batch(topic_id, &cursor, FRAME_LEN_LIMIT)?;
+        if batch.cursor == cursor {
+            return Ok(None);
+        }
+        let start_value = applied_cursor_value(storage, topic_id, genesis, &cursor)?;
+        let cursor_value = applied_cursor_value(storage, topic_id, genesis, &batch.cursor)?;
+        let policies = self.shard_publishers.read();
+        let policy = policies.get(&topic_id);
+        let events = (batch.events.into_iter())
+            .map(|(event, actor, actor_seq)| BatchEvent {
+                publisher_allowed: policy.is_none_or(|policy| policy.allows(&actor, actor_seq)),
+                event,
+                actor,
+                actor_seq,
+            })
+            .collect();
+        drop(policies);
+        Ok(Some(ReconcileBatch {
+            start_value,
+            cursor_key: topic_cursor_key(topic_id),
+            cursor_value,
+            rejections: batch.rejections,
+            events,
+        }))
+    }
+
+    /// The events after the encoded position `start`, until the topic's applied cursor.
+    fn overflow_page(
+        &self,
+        topic_id: ::irokle::TopicId,
+        start: Value,
+        applied: Option<Value>,
+    ) -> Result<OverflowPage> {
+        let storage = self.node.storage();
+        let Some(topic) = storage
+            .topic_state(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        else {
+            return Ok(OverflowPage::TopicGone);
+        };
+        let genesis = topic.genesis;
+        let clock = applied_cursor_clock(storage, topic_id, genesis, Some(start))?;
+        let main = applied_cursor_clock(storage, topic_id, genesis, applied)?;
+        if clock.dominates(&main) {
+            return Ok(OverflowPage::Finished);
+        }
+        let batch = self.document_event_batch(topic_id, &clock, FRAME_LEN_LIMIT)?;
+        if batch.cursor == clock {
+            return Ok(OverflowPage::Finished);
+        }
+        Ok(OverflowPage::Page {
+            at: applied_cursor_value(storage, topic_id, genesis, &clock)?,
+            next: applied_cursor_value(storage, topic_id, genesis, &batch.cursor)?,
+            events: (batch.events.into_iter())
+                .map(|(event, actor, _)| (event, actor))
+                .collect(),
+        })
     }
 }
 
@@ -400,24 +474,4 @@ impl DocumentSyncService {
             rejections,
         })
     }
-}
-
-impl DocumentSyncService {
-    #[cfg(test)]
-    pub(in crate::document_sync) fn document_events_after(
-        &self,
-        topic_id: ::irokle::TopicId,
-        cursor: &::irokle::ActorClock,
-    ) -> Result<Vec<(DocumentEvent, ::irokle::ActorId, u64)>> {
-        Ok(self
-            .document_event_batch(topic_id, cursor, FRAME_LEN_LIMIT)?
-            .events)
-    }
-}
-
-pub(in crate::document_sync) async fn dependency_available(
-    storage: &StorageHandle,
-    dependency: DocumentSyncDependency,
-) -> Result<bool> {
-    run_plan(storage, DependencyPlan(dependency)).await
 }

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
+use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -341,20 +341,6 @@ impl NetHandle {
             .await
     }
 
-    /// Shard-topic anti-entropy for the startup restore and placement
-    /// reconciler: ensures the topics locally, syncs them with `peers`, and
-    /// reconciles the applied events.
-    pub async fn sync_document_topics(
-        &self,
-        topics: Vec<::irokle::TopicId>,
-        peers: Vec<NodeId>,
-    ) -> aruna_core::document::DocumentNetEvent {
-        self.inner
-            .document_sync
-            .sync_documents_event(topics, peers)
-            .await
-    }
-
     pub async fn handle_sync_stream(
         &self,
         stream: streams::BiStream,
@@ -364,25 +350,6 @@ impl NetHandle {
             .document_sync
             .handle_inbound_stream(stream, peer)
             .await
-    }
-
-    pub async fn reconcile_sync_topics(
-        &self,
-        topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentReconcileResult> {
-        let applied = self
-            .inner
-            .document_sync
-            .reconcile_sync_topics(topic_ids)
-            .await?;
-        if applied
-            .targets
-            .iter()
-            .any(|target| matches!(target, DocumentTarget::RealmConfig { .. }))
-        {
-            self.reload_realm_peers().await?;
-        }
-        Ok(applied)
     }
 
     /// Connection-attempt counters behind the structured connection
