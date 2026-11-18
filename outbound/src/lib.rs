@@ -5,6 +5,7 @@
 mod backoff;
 mod connection;
 mod mail;
+mod range_listing;
 mod transfers;
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub use connection::ConnectionSender;
 use connection::ScreenedSender;
 pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
 use mail::{MailProfiles, smtp_builder};
+pub use range_listing::ListingSigner;
 pub use transfers::{
     OpenedDownload, TransferBody, TransferError, TransferMeter, UploadAnswer, UploadBody,
 };
@@ -32,6 +34,8 @@ pub struct OutboundHandle {
 
 struct Inner {
     http: reqwest::Client,
+    /// Reaches other members at the addresses the realm records publish.
+    members: reqwest::Client,
     policy: EgressPolicy,
     mail: MailProfiles,
     backoffs: Backoffs,
@@ -71,6 +75,10 @@ impl OutboundHandle {
         Self {
             inner: Arc::new(Inner {
                 http,
+                members: reqwest::Client::builder()
+                    .connect_timeout(range_listing::CONNECT_TIMEOUT)
+                    .build()
+                    .unwrap_or_default(),
                 policy,
                 mail: MailProfiles::new(builder),
                 backoffs: Backoffs::default(),
@@ -97,6 +105,9 @@ impl OutboundHandle {
                 self.inner.mail.refresh(current);
                 OutboundEvent::MailRefreshed
             }
+            OutboundEffect::ListRange(listing) => OutboundEvent::RangeListed(Box::new(
+                self.list_range(*listing, &range_listing::NoSigner).await,
+            )),
             OutboundEffect::Connection(call) => OutboundEvent::ConnectionAnswered {
                 result: self.inner.connections.send(*call).await,
             },
