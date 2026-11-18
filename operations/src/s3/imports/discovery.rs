@@ -9,8 +9,10 @@ use super::shared::{
 use super::{ImportRuleError, ReadEarlierOperation, validate_folder};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
-use crate::blob::migration::misplaced::{RenamePlan, rename_page};
-use crate::driver::{DriverContext, drive};
+use crate::blob::migration::misplaced::{
+    AccessRule, AnyKey, RenamePage, RenamePageOperation, RenamePlan, RenameQuery,
+};
+use crate::blob::migration::shared::MigrationError;
 use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::fence::group_fence_key;
 use crate::jobs::blob_request::BlobRequest;
@@ -36,8 +38,10 @@ use aruna_core::structs::storage::discovery::{
     DiscoveryRule, DiscoveryRules, IdentityError, check_naming, check_patterns, file_identity,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashSet;
+use std::sync::Arc;
 use ulid::Ulid;
 
 /// Files one preview page lists.
@@ -273,17 +277,57 @@ impl Operation for RenameGuardsOperation {
 
 /// The plan of a rename of a rule's files after `bucket_access`, over all its keys; files
 /// whose key the caller lacks `permission` on count as withheld.
-pub async fn authorized_renames(
-    context: &DriverContext,
-    (auth, node_id): (&AuthContext, NodeId),
-    rule: &BackendImport,
+#[derive(Debug, PartialEq)]
+pub struct AuthorizedRenamesOperation {
+    access: Option<RuleAccessOperation>,
+    planning: bool,
+    routing: NodeRouting,
+    rule: BackendImport,
     permission: Permission,
-) -> Result<RenamePlan, ImportRuleError> {
-    let access = drive(RuleAccessOperation::new(auth, node_id, rule), context).await?;
-    let allow = |key: &str| access.allows(Some(key), &permission);
-    let all = |_: &str| true;
-    let planned = rename_page(context, rule, (&all, &allow), (None, None, 0)).await;
-    Ok(planned.map_err(ImportRuleError::Read)?.plan)
+}
+
+impl AuthorizedRenamesOperation {
+    pub fn new(
+        routing: NodeRouting,
+        (auth, node_id): (&AuthContext, NodeId),
+        rule: &BackendImport,
+        permission: Permission,
+    ) -> Self {
+        Self {
+            access: Some(RuleAccessOperation::new(auth, node_id, rule)),
+            planning: false,
+            routing,
+            rule: rule.clone(),
+            permission,
+        }
+    }
+}
+
+impl Operation for AuthorizedRenamesOperation {
+    type Output = RenamePlan;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> Result<Next<RenamePlan>, ImportRuleError> {
+        match self.access.take() {
+            Some(access) => Ok(Next::Call(IoCall::child(access))),
+            None => Err(ImportRuleError::Read("rename plan restarted".to_string())),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RenamePlan>, ImportRuleError> {
+        if !self.planning {
+            let access = result.child::<BucketAccess, ImportRuleError>()??;
+            let writable = AccessRule::new(Arc::new(access), self.permission.clone());
+            let query = RenameQuery::default();
+            let rules = (AnyKey, writable);
+            let page = RenamePageOperation::new(self.routing.clone(), &self.rule, rules, query);
+            self.planning = true;
+            return Ok(Next::Call(IoCall::child(page)));
+        }
+        let page = result.child::<RenamePage, MigrationError>()?;
+        let page = page.map_err(|error| ImportRuleError::Read(error.to_string()))?;
+        Ok(Next::Done(page.plan))
+    }
 }
 
 type AccessPreviewTurn = Result<Next<DiscoveryPreview>, ImportRuleError>;
@@ -673,6 +717,7 @@ fn named(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
 
     fn import_rule() -> BackendImport {
         BackendImport {
