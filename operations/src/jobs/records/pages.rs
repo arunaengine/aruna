@@ -189,6 +189,380 @@ impl LoadChainOperation {
     }
 }
 
+/// The page a peer answered, when it is the page asked for.
+fn answered_page(answer: MetadataAnswer, digest: &[u8; 32]) -> Result<Option<InputPage>, String> {
+    let bytes = answer.result.map_err(|error| format!("{error:?}"))?;
+    match decode_message(&bytes).map_err(|error| error.to_string())? {
+        MetadataTransportMessage::InputPageResult { page } => Ok(page
+            .map(|page| *page)
+            .filter(|page| page.digest().ok().as_ref() == Some(digest))),
+        other => Err(format!(
+            "the node answered {}",
+            crate::metadata::transport_message_kind(&other)
+        )),
+    }
+}
+
+impl Operation for LoadChainOperation {
+    type Output = Vec<InputPage>;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> ChainNext {
+        self.read_next()
+    }
+
+    fn next(&mut self, result: IoResult) -> ChainNext {
+        match self.step.take() {
+            Some(ChainStep::Local(digest)) => match value(result)? {
+                Some(row) => {
+                    self.pages.push(stored_page(&row, &digest)?);
+                    self.read_next()
+                }
+                None => self.fetch(digest, 0),
+            },
+            Some(ChainStep::Fetch(digest, peer)) => self.fetched(digest, peer, result),
+            Some(ChainStep::Keep(page)) => {
+                done(result)?;
+                self.pages.push(*page);
+                self.read_next()
+            }
+            None => Err(IoError::Unfinished.into()),
+        }
+    }
+}
+
+/// The chain of `manifest`, read from `peers` and then from the other holders of the family,
+/// which keep its pages with its records.
+#[derive(Debug, PartialEq)]
+struct FamilyChainOperation {
+    submission: SubmissionId,
+    manifest: PageManifest,
+    peers: Vec<NodeId>,
+    node: ServingNode,
+    loading: bool,
+}
+
+impl FamilyChainOperation {
+    fn new(
+        submission: SubmissionId,
+        manifest: PageManifest,
+        peers: Vec<NodeId>,
+        node: ServingNode,
+    ) -> Self {
+        Self {
+            submission,
+            manifest,
+            peers,
+            node,
+            loading: false,
+        }
+    }
+
+    fn load(&mut self) -> ChainNext {
+        self.loading = true;
+        let peers = std::mem::take(&mut self.peers);
+        let load = LoadChainOperation::new(self.submission, self.manifest, peers);
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    fn add_holders(&mut self, config: &RealmConfigDocument) {
+        let local = self.node.map(|(local, _)| local);
+        let holders = (config.family_placement(self.submission))
+            .map(|placement| resolve_shard_holders(config, &placement))
+            .unwrap_or_default();
+        let others = holders.into_iter().filter(|holder| Some(*holder) != local);
+        self.peers.extend(others);
+    }
+}
+
+impl Operation for FamilyChainOperation {
+    type Output = Vec<InputPage>;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> ChainNext {
+        match self.node {
+            Some((_, realm_id)) => Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id)))),
+            None => self.load(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> ChainNext {
+        if self.loading {
+            return Ok(Next::Done(
+                result.child::<Vec<InputPage>, PageReadError>()??,
+            ));
+        }
+        // Without the realm config only the named peers can be asked.
+        match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => self.add_holders(&config),
+            Err(error) => warn!(error = %error, "Realm config unavailable for input pages"),
+        }
+        self.load()
+    }
+}
+
+/// The spec with its paged inputs filled in, read here, from the nodes that admitted it or
+/// from the family holders.
+#[derive(Debug, PartialEq)]
+pub struct SpecInputsOperation {
+    spec: LogicalJobSpec,
+    node: ServingNode,
+}
+
+impl SpecInputsOperation {
+    pub fn new(spec: &LogicalJobSpec, node: ServingNode) -> Self {
+        Self {
+            spec: spec.clone(),
+            node,
+        }
+    }
+}
+
+impl Operation for SpecInputsOperation {
+    type Output = LogicalJobSpec;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> Result<Next<LogicalJobSpec>, PageReadError> {
+        let spec = &self.spec;
+        let Some(manifest) = spec.input_pages else {
+            return Ok(Next::Done(spec.clone()));
+        };
+        let peers = vec![
+            spec.admission.admitting_node_id,
+            spec.ingress_node_id,
+            spec.origin_node_id,
+        ];
+        let chain = FamilyChainOperation::new(spec.submission_id, manifest, peers, self.node);
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LogicalJobSpec>, PageReadError> {
+        let pages = result.child::<Vec<InputPage>, PageReadError>()??;
+        let (inputs, captured): (Vec<_>, Vec<_>) = spec_entries(pages)?.into_iter().unzip();
+        let mut filled = self.spec.clone();
+        filled.payload.inputs = inputs;
+        filled.captured_inputs = captured;
+        Ok(Next::Done(filled))
+    }
+}
+
+/// The launch's planned inputs, inline or read from its scheduler or the family holders.
+#[derive(Debug, PartialEq)]
+pub struct PlannedInputsOperation {
+    launch: LaunchIntent,
+    node: ServingNode,
+}
+
+impl PlannedInputsOperation {
+    pub fn new(launch: &LaunchIntent, node: ServingNode) -> Self {
+        Self {
+            launch: launch.clone(),
+            node,
+        }
+    }
+}
+
+impl Operation for PlannedInputsOperation {
+    type Output = Vec<PlannedInput>;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> Result<Next<Vec<PlannedInput>>, PageReadError> {
+        let launch = &self.launch;
+        let Some(manifest) = launch.input_pages else {
+            return Ok(Next::Done(launch.inputs.clone()));
+        };
+        let peers = vec![launch.scheduler_node_id];
+        let chain = FamilyChainOperation::new(launch.submission_id, manifest, peers, self.node);
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<PlannedInput>>, PageReadError> {
+        let pages = result.child::<Vec<InputPage>, PageReadError>()??;
+        Ok(Next::Done(launch_entries(pages)?))
+    }
+}
+
+/// Keeps the pages a record binds, fetched from the peer that sent it, the nodes it names or
+/// the family holders. A holder acknowledges such a record only once this succeeds.
+#[derive(Debug, PartialEq)]
+pub struct KeepPagesOperation {
+    chain: Option<(SubmissionId, PageManifest, Vec<NodeId>)>,
+    node: ServingNode,
+}
+
+impl KeepPagesOperation {
+    pub fn new(record: &JobFamilyRecord, peer: NodeId, node: ServingNode) -> Self {
+        let bound = match record {
+            JobFamilyRecord::Spec(spec) => spec.input_pages.map(|manifest| {
+                let peers = vec![
+                    peer,
+                    spec.admission.admitting_node_id,
+                    spec.ingress_node_id,
+                    spec.origin_node_id,
+                ];
+                (spec.submission_id, manifest, peers)
+            }),
+            JobFamilyRecord::Launch(launch) => launch.input_pages.map(|manifest| {
+                let peers = vec![peer, launch.scheduler_node_id];
+                (launch.submission_id, manifest, peers)
+            }),
+            _ => None,
+        };
+        Self { chain: bound, node }
+    }
+}
+
+impl Operation for KeepPagesOperation {
+    type Output = ();
+    type Error = PageReadError;
+
+    fn first(&mut self) -> Result<Next<()>, PageReadError> {
+        let Some((submission, manifest, peers)) = self.chain.take() else {
+            return Ok(Next::Done(()));
+        };
+        let chain = FamilyChainOperation::new(submission, manifest, peers, self.node);
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PageReadError> {
+        result.child::<Vec<InputPage>, PageReadError>()??;
+        Ok(Next::Done(()))
+    }
+}
+
+/// Keeps entries too large for their record in pages here and answers the manifest, or `None`
+/// when they fit inline.
+#[derive(Debug, PartialEq)]
+pub struct StoreEntriesOperation {
+    submission: SubmissionId,
+    paged: Result<Option<(PageManifest, Vec<InputPage>)>, PageError>,
+    manifest: Option<PageManifest>,
+}
+
+impl StoreEntriesOperation {
+    /// The inputs of a request with their captures; every input must have one.
+    pub fn request(
+        submission: SubmissionId,
+        inputs: &[InputSelection],
+        captured: &[CapturedInput],
+    ) -> Self {
+        let pairs: Option<Vec<_>> = inputs
+            .iter()
+            .map(|input| {
+                let capture = captured
+                    .iter()
+                    .find(|capture| capture.destination_key == input.dest_key)?;
+                Some((input.clone(), capture.clone()))
+            })
+            .collect();
+        let paged = pairs
+            .ok_or(PageError::Chain)
+            .and_then(|pairs| paged(&pairs, PageEntries::Spec));
+        Self::with(submission, paged)
+    }
+
+    /// The planned inputs of a launch.
+    pub fn launch(launch: &LaunchIntent) -> Self {
+        let paged = paged(&launch.inputs, PageEntries::Launch);
+        Self::with(launch.submission_id, paged)
+    }
+
+    fn with(
+        submission: SubmissionId,
+        paged: Result<Option<(PageManifest, Vec<InputPage>)>, PageError>,
+    ) -> Self {
+        Self {
+            submission,
+            paged,
+            manifest: None,
+        }
+    }
+}
+
+fn paged<T: serde::Serialize + Clone>(
+    entries: &[T],
+    wrap: fn(Vec<T>) -> PageEntries,
+) -> Result<Option<(PageManifest, Vec<InputPage>)>, PageError> {
+    if !needs_pages(&entries).map_err(PageError::from)? {
+        return Ok(None);
+    }
+    paginate(entries, wrap).map(Some).map_err(PageError::from)
+}
+
+impl Operation for StoreEntriesOperation {
+    type Output = Option<PageManifest>;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> Result<Next<Option<PageManifest>>, PageReadError> {
+        let Some((manifest, pages)) = std::mem::replace(&mut self.paged, Ok(None))? else {
+            return Ok(Next::Done(None));
+        };
+        self.manifest = Some(manifest);
+        let rows = page_rows(&self.submission, &pages)?;
+        Ok(Next::Call(IoCall::Write(rows)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<PageManifest>>, PageReadError> {
+        done(result)?;
+        Ok(Next::Done(self.manifest.take()))
+    }
+}
+
+/// One page for a realm infrastructure node; a device never reads another's inputs.
+#[derive(Debug, PartialEq)]
+pub struct ServePageOperation {
+    realm_id: RealmId,
+    peer: NodeId,
+    submission: SubmissionId,
+    digest: [u8; 32],
+    admitted: bool,
+}
+
+type ServedPage = Option<Box<InputPage>>;
+
+impl ServePageOperation {
+    pub fn new(
+        realm_id: RealmId,
+        peer: NodeId,
+        submission: SubmissionId,
+        digest: [u8; 32],
+    ) -> Self {
+        Self {
+            realm_id,
+            peer,
+            submission,
+            digest,
+            admitted: false,
+        }
+    }
+}
+
+impl Operation for ServePageOperation {
+    type Output = ServedPage;
+    type Error = PageReadError;
+
+    fn first(&mut self) -> Result<Next<ServedPage>, PageReadError> {
+        let read = GetConfigOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ServedPage>, PageReadError> {
+        if self.admitted {
+            let page = value(result)?
+                .map(|row| stored_page(&row, &self.digest))
+                .transpose()?;
+            return Ok(Next::Done(page.map(Box::new)));
+        }
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        if !config.is_ok_and(|config| is_sync_eligible(&config, self.peer)) {
+            return Ok(Next::Done(None));
+        }
+        self.admitted = true;
+        let key = page_key(&self.submission, &self.digest);
+        Ok(Next::Call(read_row(INPUT_PAGE_KEYSPACE, key)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aruna_core::structs::execution::job::InputContent;
