@@ -6,14 +6,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::plugin_installs::{
-    BoundScope, InstallGuard, InstallState, PluginInstall, Prerequisite, SecretBinding,
+    BoundScope, InstallGuard, InstallState, PluginInstall, SecretBinding,
 };
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::types::GroupId;
@@ -28,8 +26,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::{
-    Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
-    read_row, read_user, teardown,
+    AccountChange, CheckReady, Identity, MakeReady, ReadGroupAuth, RealmAdmin, RepairAccount,
+    StepError, Teardown,
 };
 use super::bound::{BindError, BindPlace, bind_slots, vault_kind};
 use super::grants::covers;
@@ -48,7 +46,7 @@ use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
-use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
+use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
 
 #[derive(Debug, Error)]
@@ -193,11 +191,12 @@ pub async fn install_plugin(
         Some(existing) if existing.state != InstallState::Preparing => {
             let paths = role_paths(&parse_grants(&existing.grants));
             let identity = Identity::of(existing);
-            check_ready(ctx, &prepared.scope, identity, &paths)
+            let check = CheckReady::new(prepared.scope, identity, paths);
+            drive(check, ctx)
                 .await
                 .map_err(|error| InstallError::Step {
                     step: "check",
-                    error,
+                    error: error.0,
                 })?;
             return Ok(existing.clone());
         }
@@ -266,9 +265,10 @@ pub(crate) async fn settle(
     )?)?;
     let scope = scope_of(actor.realm_id, &record);
     let grants = parse_grants(&record.grants);
-    let prerequisites = match make_ready(ctx, actor, auth, &scope, &record).await {
+    let change = AccountChange::of((actor, auth), &record, unix_timestamp_secs());
+    let prerequisites = match drive(MakeReady::new(change, &record), ctx).await {
         Ok(prerequisites) => prerequisites,
-        Err((step, error)) => {
+        Err(StepError { step, error }) => {
             abandon(ctx, actor, auth, &record, step).await;
             return Err(InstallError::Step { step, error });
         }
@@ -321,16 +321,8 @@ async fn abandon(
         warn!(%id, step, "A plugin install changed meanwhile; leaving it as it is");
         return;
     }
-    let scope = scope_of(actor.realm_id, record);
-    let undo = teardown(
-        ctx,
-        actor,
-        auth,
-        &scope,
-        Identity::of(record),
-        guard_of(record),
-    );
-    if let Err(error) = undo.await {
+    let change = AccountChange::of((actor, auth), record, unix_timestamp_secs());
+    if let Err(error) = drive(Teardown::new(change), ctx).await {
         warn!(%id, %error, "Could not undo a failed plugin install step");
     }
     // Only an install that never became active loses its rules here.
@@ -341,29 +333,6 @@ async fn abandon(
     if let Err(error) = write_record(ctx, actor, auth, Some(record.revision), failed, None).await {
         warn!(%id, %error, "Could not record the failed plugin install step");
     }
-}
-
-/// Steps 2 to 5 for `record`: the account, its role, then a check of both against current
-/// state, each write refused once the record moved on. Secret use rules join as step 4 later.
-async fn make_ready(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    scope: &InstallScope,
-    record: &PluginInstall,
-) -> Result<Vec<Prerequisite>, (&'static str, String)> {
-    let (identity, guard) = (Identity::of(record), guard_of(record));
-    let name = account_name(ctx, &record.plugin, scope.group_id).await;
-    ensure_account(ctx, actor, auth, scope, identity, name, guard)
-        .await
-        .map_err(|error| ("account", error))?;
-    let paths = role_paths(&parse_grants(&record.grants));
-    ensure_role(ctx, actor, auth, scope, identity, &paths, guard)
-        .await
-        .map_err(|error| ("role", error))?;
-    check_ready(ctx, scope, identity, &paths)
-        .await
-        .map_err(|error| ("check", error))
 }
 
 /// Repairs the account and role of every settled install from its current record on a
@@ -411,26 +380,14 @@ pub(crate) async fn repair_settled(
     repaired
 }
 
-/// Makes one settled install's account and role match its record again; `true` if it changed.
+/// Makes one settled install's account and role match its record again, as the admin who granted
+/// it; `true` if it changed.
 pub(crate) async fn repair_install(
     ctx: &DriverContext,
     node_id: aruna_core::NodeId,
     realm_id: RealmId,
     install: &PluginInstall,
 ) -> Result<bool, InstallError> {
-    let (scope, identity) = (scope_of(realm_id, install), Identity::of(install));
-    let paths = role_paths(&parse_grants(&install.grants));
-    if check_ready(ctx, &scope, identity, &paths).await.is_ok() {
-        return Ok(false);
-    }
-    let step = |step| move |error| InstallError::Step { step, error };
-    // An administrator's deactivation stands; repair restores only what the install stopped.
-    let user = read_user(ctx, identity.account)
-        .await
-        .map_err(step("account"))?;
-    if user.is_some_and(|user| user.is_deactivated() && !user.stopped_by_install()) {
-        return Ok(false);
-    }
     let actor = Actor {
         node_id,
         user_id: install.granted_by,
@@ -442,16 +399,14 @@ pub(crate) async fn repair_install(
         path_restrictions: None,
         session: None,
     };
-    let guard = guard_of(install);
-    let name = account_name(ctx, &install.plugin, scope.group_id).await;
-    ensure_account(ctx, &actor, &auth, &scope, identity, name, guard)
-        .await
-        .map_err(step("account"))?;
-    ensure_role(ctx, &actor, &auth, &scope, identity, &paths, guard)
-        .await
-        .map_err(step("role"))?;
-    info!(install = %install.install_id, "Repaired a plugin install's account and role");
-    Ok(true)
+    let change = AccountChange::of((&actor, &auth), install, unix_timestamp_secs());
+    let repaired = drive(RepairAccount::new(change, install), ctx).await;
+    let repaired =
+        repaired.map_err(|StepError { step, error }| InstallError::Step { step, error })?;
+    if repaired {
+        info!(install = %install.install_id, "Repaired a plugin install's account and role");
+    }
+    Ok(repaired)
 }
 
 pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
@@ -506,9 +461,8 @@ pub(crate) async fn check_holder(
         .await
         .map_err(|error| InstallError::Unavailable(error.to_string()))?;
     let config = read_config(ctx, scope.realm_id).await?;
-    let group = read_auth(ctx, scope.group_id)
-        .await
-        .map_err(InstallError::Unavailable)?;
+    let group = drive(ReadGroupAuth(scope.group_id), ctx).await;
+    let group = group.map_err(|error| InstallError::Unavailable(error.0))?;
     let group_policies = group.iter().flat_map(|auth_doc| auth_doc.policies.iter());
     let path_policies =
         (config.request_policies.iter().chain(group_policies)).any(|policy| policy.reads_path());
@@ -818,7 +772,8 @@ pub(crate) async fn sweep_orphans(
     if due.is_empty() {
         return Ok(0);
     }
-    let Some(admin) = realm_admin(ctx, config).await? else {
+    let admin = drive(RealmAdmin(config.realm_id), ctx).await;
+    let Some(admin) = admin.map_err(|error| error.0)? else {
         warn!("No realm administrator to deactivate unnamed plugin accounts with");
         return Ok(0);
     };
@@ -855,22 +810,6 @@ pub(crate) async fn sweep_orphans(
         }
     }
     Ok(swept)
-}
-
-/// The realm administrator with the smallest id, so every node acts as the same one.
-async fn realm_admin(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-) -> Result<Option<UserId>, String> {
-    let key = config.realm_id.as_bytes().to_vec();
-    let realm = read_row(ctx, AUTH_KEYSPACE, key).await?;
-    let realm = (realm.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes)))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let admins = (realm.iter().flat_map(|realm| realm.roles.values()))
-        .filter(|role| role.name == REALM_ADMIN_ROLE)
-        .flat_map(|role| role.assigned_users.iter().copied());
-    Ok(admins.min())
 }
 
 #[cfg(test)]

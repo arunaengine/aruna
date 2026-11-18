@@ -537,7 +537,7 @@ async fn invalid_patches() {
 
 #[tokio::test]
 async fn secret_values_granted() {
-    use crate::plugins::account::{Identity, ensure_role, guard_of};
+    use crate::plugins::account::{AccountChange, EnsureRole};
     use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
     use crate::plugins::grants::role_paths;
     use crate::plugins::rules::ensure_rules;
@@ -568,21 +568,12 @@ async fn secret_values_granted() {
     .await;
     let config = read_config(&fixture.ctx, fixture.actor.realm_id).await;
     let granted = config.unwrap().installs.remove(0);
-    let (scope, paths) = (
-        install_scope(&granted),
-        role_paths(&parse_grants(&granted.grants)),
-    );
-    let (identity, auth) = ((Identity::of(&granted), guard_of(&granted)), fixture.auth());
-    let role = ensure_role(
-        &fixture.ctx,
-        &fixture.actor,
-        &auth,
-        &scope,
-        identity.0,
-        &paths,
-        identity.1,
-    );
-    role.await.unwrap();
+    let paths = role_paths(&parse_grants(&granted.grants));
+    let auth = fixture.auth();
+    let change = AccountChange::of((&fixture.actor, &auth), &granted, 1);
+    drive(EnsureRole::new(change, paths), &fixture.ctx)
+        .await
+        .unwrap();
     // The secret's rules let this install inject it, not read its value.
     assert_eq!(kind(&granted).await, Err(ErrorKind::Denied));
     let config = read_config(&fixture.ctx, fixture.actor.realm_id)

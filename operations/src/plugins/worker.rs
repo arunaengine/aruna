@@ -31,11 +31,11 @@ use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::account::prerequisites_held;
+use super::account::PrerequisitesHeld;
 use super::artifacts::fetch_artifact;
 use super::artifacts::local_config;
-use super::broker::{RunBroker, absent};
-use super::check::{RunScope, check_call};
+use super::broker::RunBroker;
+use super::check::{CallError, CheckCall, RunScope};
 use super::cleanup::sweep_events;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start, probe_clock};
 use super::decide::{
@@ -58,6 +58,7 @@ use super::lifecycle::{match_targets, targets};
 use super::marks::{MARK_ROW, Mark, MarkEnded};
 use super::matcher::event_trigger;
 use super::matcher::match_page;
+use super::objects::absent;
 use super::outbound::Outbound;
 use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
@@ -381,10 +382,12 @@ impl Worker {
         };
         let needs = event_trigger(event.kind).needs();
         let target = needs.map(|permission| (permission, event.path.as_str()));
-        match check_call(&self.ctx, &scope, target).await {
+        match drive(CheckCall::new(&scope, target), &self.ctx).await {
             Ok(_) => Ok(()),
-            Err(error) if error.kind == ErrorKind::Unavailable => Err(Ended::Retry(error.message)),
-            Err(error) => Err(Ended::Cancelled(error.message)),
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
+                Err(Ended::Retry(error.message))
+            }
+            Err(CallError(error)) => Err(Ended::Cancelled(error.message)),
         }
     }
 
@@ -640,7 +643,8 @@ pub(crate) async fn judge(
     let Some(install) = install.filter(|install| install.revision >= row.revision) else {
         return Ok(Verdict::Unready);
     };
-    if !prerequisites_held(ctx, install).await.map_err(StoreError)? {
+    let held = drive(PrerequisitesHeld::new(install), ctx).await;
+    if !held.map_err(|error| StoreError(error.0))? {
         return Ok(Verdict::Unready);
     }
     Ok(
@@ -670,7 +674,7 @@ async fn trigger_check(
     };
     let needs = event_trigger(row.event.kind).needs();
     let target = needs.map(|permission| (permission, row.event.path.as_str()));
-    check_call(ctx, &scope, target).await?;
+    drive(CheckCall::new(&scope, target), ctx).await?;
     Ok(scope.run)
 }
 

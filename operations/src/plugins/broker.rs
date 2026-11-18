@@ -3,11 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
@@ -36,7 +34,7 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::{RunScope, authorize_call, check_call, matching};
+use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use super::creates::{
     Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
 };
@@ -49,7 +47,8 @@ use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, written};
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
-use super::marks::{MARKED, is_marked};
+use super::marks::is_marked;
+use super::objects::{LocalObject, Unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::outgoing::{
     declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
@@ -78,9 +77,8 @@ use crate::metadata::forward::write::{
     CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 use aruna_core::entity_patch::craqle_patch_request;
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
@@ -139,7 +137,8 @@ impl RunBroker {
         &self,
         target: Option<(Permission, &str)>,
     ) -> Result<PluginInstall, HostError> {
-        let install = check_call(&self.ctx, &self.scope, target).await?;
+        let check = CheckCall::new(&self.scope, target);
+        let install = drive(check, &self.ctx).await?;
         match take_call(install.install_id, std::time::Instant::now()) {
             true => Ok(install),
             false => Err(HostError::new(
@@ -559,7 +558,7 @@ impl RunBroker {
         path: &str,
     ) -> Result<(String, String), HostError> {
         let place = (self.scope.realm_id, self.scope.local);
-        local_object(&self.ctx, place, install, path).await
+        Ok(drive(LocalObject::new(place, install, path), &self.ctx).await?)
     }
 }
 
@@ -575,9 +574,10 @@ impl RunBroker {
         let Ok(patterns) = matching(install, permission, target) else {
             return Ok(false);
         };
-        match authorize_call(&self.ctx, install, permission, target, &patterns).await {
+        let check = Authorize::call(install, permission, target, &patterns);
+        match drive(check, &self.ctx).await {
             Ok(()) => Ok(true),
-            Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => Err(error),
             Err(_) => Ok(false),
         }
     }
@@ -661,39 +661,6 @@ fn byte_size(bytes: usize) -> String {
     match bytes % (1 << 20) {
         0 => format!("{} MiB", bytes >> 20),
         _ => format!("{bytes} bytes"),
-    }
-}
-
-/// The bucket and key on `local` of an object path below the install's group data; a bucket of
-/// another node or another group is refused.
-pub(crate) async fn local_object(
-    ctx: &DriverContext,
-    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
-    install: &PluginInstall,
-    path: &str,
-) -> Result<(String, String), HostError> {
-    let invalid = || HostError::new(ErrorKind::Invalid, format!("{path} is not an object path"));
-    let root = format!("/{realm_id}/g/{}/data/", install.group_id);
-    let rest = path.strip_prefix(&root).ok_or_else(invalid)?;
-    let mut parts = rest.splitn(3, '/');
-    let (node, bucket) = (
-        parts.next().unwrap_or_default(),
-        parts.next().ok_or_else(invalid)?,
-    );
-    let key = parts.next().unwrap_or_default().to_string();
-    let node = NodeId::from_str(node).map_err(|_| invalid())?;
-    if node != local {
-        return Err(unavailable(
-            "objects of another node are not reachable from plugins yet",
-        ));
-    }
-    let info = drive(GetBucketOperation::new(bucket.to_string()), ctx).await;
-    match info {
-        Ok(info) if info.group_id == install.group_id => Ok((bucket.to_string(), key)),
-        _ => Err(HostError::new(
-            ErrorKind::NotFound,
-            format!("no bucket at {path}"),
-        )),
     }
 }
 
@@ -1006,7 +973,7 @@ impl Broker for RunBroker {
         let (bucket, key) = self.object_at(&install, &path).await?;
         let version = (version.as_deref()).map(version_id).transpose()?;
         let missing = || HostError::new(ErrorKind::NotFound, format!("no object at {path}"));
-        let version = unmarked(&self.ctx, (&bucket, &key), version).await?;
+        let version = drive(Unmarked::new((&bucket, &key), version), &self.ctx).await?;
         let input = GetObjectInput {
             bucket,
             key,
@@ -1292,41 +1259,6 @@ impl Broker for RunBroker {
         let reason = "the call did not finish in time";
         self.mark_unknown(intent, reason).await;
     }
-}
-
-/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
-/// when it is marked; `None` when there is no such object, so nothing is read either.
-pub(crate) async fn unmarked(
-    ctx: &DriverContext,
-    (bucket, key): (&str, &str),
-    version: Option<Ulid>,
-) -> Result<Option<Ulid>, HostError> {
-    let head = HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: version,
-    };
-    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
-        Ok(head) => head.resolved_version_id.or(version),
-        Err(error) if absent(&error) => return Ok(None),
-        Err(error) => return Err(unavailable(error.to_string())),
-    };
-    let Some(resolved) = resolved else {
-        return Ok(None);
-    };
-    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
-    match drive(marked, ctx).await {
-        Ok(false) => Ok(Some(resolved)),
-        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
-        Err(error) => Err(unavailable(error.0)),
-    }
-}
-
-pub(crate) fn absent(error: &HeadObjectError) -> bool {
-    matches!(
-        error,
-        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
-    )
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.

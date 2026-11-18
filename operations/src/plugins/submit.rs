@@ -14,10 +14,9 @@ use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
-use super::broker::local_object;
-use super::broker::unmarked;
-use super::check::{RunScope, authorize_access, authorize_call, check_call, copy_grants, matching};
+use super::check::{Authorize, CheckCall, CopyGrants, RunScope, matching};
 use super::grants::InstallScope;
+use super::objects::{LocalObject, Unmarked};
 use super::rows::encode;
 use super::unavailable;
 use super::work::{
@@ -47,16 +46,17 @@ pub(crate) async fn start_copy(
     scope: &RunScope,
     request: CopyRequest,
 ) -> Result<Ulid, HostError> {
-    let install = check_call(ctx, scope, None).await?;
-    copy_grants(ctx, &install, (&request.source, &request.target)).await?;
+    let install = drive(CheckCall::new(scope, None), ctx).await?;
+    let grants = CopyGrants::new(&install, (&request.source, &request.target));
+    drive(grants, ctx).await?;
     if install.paused {
         return Err(HostError::new(ErrorKind::Denied, "the install is paused"));
     }
     let place = (scope.realm_id, scope.local);
-    let (bucket, key) = local_object(ctx, place, &install, &request.source).await?;
+    let (bucket, key) = drive(LocalObject::new(place, &install, &request.source), ctx).await?;
     // Every attempt checks the version it reads again; a source that is missing now fails there.
-    unmarked(ctx, (&bucket, &key), request.source_version).await?;
-    local_object(ctx, place, &install, &request.target).await?;
+    drive(Unmarked::new((&bucket, &key), request.source_version), ctx).await?;
+    drive(LocalObject::new(place, &install, &request.target), ctx).await?;
     let identity = Identity::Call {
         run_id: scope.run.run_id,
         ordinal: request.ordinal,
@@ -122,16 +122,17 @@ pub(crate) async fn start_download(
     scope: &RunScope,
     request: DownloadRequest,
 ) -> Result<Ulid, HostError> {
-    let install = check_call(ctx, scope, None).await?;
+    let install = drive(CheckCall::new(scope, None), ctx).await?;
     connection_granted(ctx, (scope, &install), &request.context.connection).await?;
     let download = Permission::TransfersDownload;
     let patterns = matching(&install, download, &request.target)?;
-    authorize_call(ctx, &install, download, &request.target, &patterns).await?;
+    let check = Authorize::call(&install, download, &request.target, &patterns);
+    drive(check, ctx).await?;
     if install.paused {
         return Err(HostError::new(ErrorKind::Denied, "the install is paused"));
     }
     let place = (scope.realm_id, scope.local);
-    let (bucket, key) = local_object(ctx, place, &install, &request.target).await?;
+    let (bucket, key) = drive(LocalObject::new(place, &install, &request.target), ctx).await?;
     let identity = Identity::Call {
         run_id: scope.run.run_id,
         ordinal: request.ordinal,
@@ -195,22 +196,21 @@ pub(crate) async fn start_upload(
     scope: &RunScope,
     request: UploadRequest,
 ) -> Result<Ulid, HostError> {
-    let install = check_call(ctx, scope, None).await?;
+    let install = drive(CheckCall::new(scope, None), ctx).await?;
     connection_granted(ctx, (scope, &install), &request.context.connection).await?;
     let upload = Permission::TransfersUpload;
     let patterns = matching(&install, upload, &request.source)?;
     let read = (upload, Access::READ);
-    authorize_access(ctx, &install, read, &request.source, &patterns).await?;
+    let check = Authorize::access(&install, read, &request.source, &patterns);
+    drive(check, ctx).await?;
     if install.paused {
         return Err(HostError::new(ErrorKind::Denied, "the install is paused"));
     }
     let place = (scope.realm_id, scope.local);
-    let (bucket, key) = local_object(ctx, place, &install, &request.source).await?;
+    let (bucket, key) = drive(LocalObject::new(place, &install, &request.source), ctx).await?;
     // Every attempt checks the version it sends again; one marked meanwhile fails there.
-    if unmarked(ctx, (&bucket, &key), request.version)
-        .await?
-        .is_none()
-    {
+    let readable = Unmarked::new((&bucket, &key), request.version);
+    if drive(readable, ctx).await?.is_none() {
         let message = format!("no object at {}", request.source);
         return Err(HostError::new(ErrorKind::NotFound, message));
     }
@@ -270,7 +270,8 @@ async fn connection_granted(
     let connection = connection.connection(name);
     let send = Permission::ConnectionsSend;
     let patterns = matching(install, send, &connection)?;
-    authorize_call(ctx, install, send, &connection, &patterns).await
+    let check = Authorize::call(install, send, &connection, &patterns);
+    Ok(drive(check, ctx).await?)
 }
 
 /// Submits the job of a reserved work and records it. The dedup key is the work id, so a

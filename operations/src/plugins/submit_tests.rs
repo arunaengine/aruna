@@ -532,8 +532,8 @@ fn send(fixture: &Fixture, install: &PluginInstall, version: Option<Ulid>) -> Up
 #[tokio::test]
 async fn upload_started() {
     // An upload needs a readable, unmarked source; the same call finds the same work.
-    use crate::plugins::broker::unmarked;
     use crate::plugins::marks::{Mark, mark_row};
+    use crate::plugins::objects::Unmarked;
     use crate::plugins::rows::write_rows;
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
@@ -546,7 +546,7 @@ async fn upload_started() {
         start_upload(&blob, &scope, send(&fixture, &install, None)).await,
         Ok(work_id)
     );
-    let version = unmarked(&blob, ("in", "a.txt"), None)
+    let version = drive(Unmarked::new(("in", "a.txt"), None), &blob)
         .await
         .unwrap()
         .unwrap();
