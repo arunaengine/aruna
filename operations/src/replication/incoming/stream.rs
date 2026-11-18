@@ -981,12 +981,24 @@ impl Operation for ReadPolicyOperation {
                 }
                 Ok(Next::Done((paths, Vec::new(), false)))
             }
-            Ok((paths, allowed, had_denial))
-        }
-        // The serve finds the version in its member bucket and checks the caller in its
-        // snapshot transaction, as for every target.
-        crate::replication::protocol::BaoReadTarget::Version { .. } => {
-            Ok((paths, Vec::new(), false))
+            ReadPolicyStep::Paths => {
+                let found = result.child::<Vec<HashIndex>, ResolvePathsError>()?;
+                self.resolved(found.map_err(policy_failed)?)
+            }
+            ReadPolicyStep::Evaluators(candidates) => {
+                let loaded = result.child::<PolicyEvaluators, PolicyEnforcementError>()?;
+                let evaluators = loaded.map_err(policy_failed)?;
+                let auth = &self.request.auth_context;
+                let groups = candidates.iter().map(|candidate| candidate.group_id);
+                let rules = GroupRulesOperation::new(Some(auth), groups);
+                self.step = ReadPolicyStep::Rules(candidates, evaluators);
+                Ok(Next::Call(IoCall::child(rules)))
+            }
+            ReadPolicyStep::Rules(candidates, evaluators) => {
+                let rules = result.child::<GroupPermissionRules, AuthorizationError>()?;
+                let permissions = rules.unwrap_or_default();
+                self.evaluate(candidates, &evaluators, &permissions)
+            }
         }
     }
 }
