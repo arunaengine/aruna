@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::cell::RefCell;
-
 use aruna_core::compute::Secret;
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
 
@@ -13,19 +11,6 @@ use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, hold_keys, secret};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use aruna_core::plugins::Refusal;
-
-impl HeldSecrets {
-    /// One checked use of a slot, as a run makes it.
-    async fn obtain<F: Future<Output = Result<Released, ReleaseError>>>(
-        &mut self,
-        mut request: ReleaseRequest,
-        ask: impl FnOnce(ReleaseRequest) -> F,
-    ) -> Result<(Released, SecretFields), ReleaseError> {
-        self.prepare(&mut request);
-        let slot = request.slot.clone();
-        self.absorb(&slot, ask(request).await?)
-    }
-}
 
 fn request(slot: &str) -> ReleaseRequest {
     ReleaseRequest {
@@ -53,44 +38,6 @@ fn answer(value_id: u128, token: Option<&str>) -> Released {
 }
 
 #[tokio::test]
-async fn reuse_while_unchanged() {
-    let mut held = HeldSecrets::default();
-    let asked = RefCell::new(Vec::new());
-    let ask = |reply: Result<Released, ReleaseError>| {
-        let asked = &asked;
-        move |request: ReleaseRequest| {
-            asked.borrow_mut().push(request.held);
-            std::future::ready(reply)
-        }
-    };
-    let (_, first) = held
-        .obtain(request("a"), ask(Ok(answer(1, Some("one")))))
-        .await
-        .unwrap();
-    assert_eq!(first.get("token"), Some("one"));
-    // The check passed again for the same value: the held fields are used.
-    let (_, again) = held
-        .obtain(request("a"), ask(Ok(answer(1, None))))
-        .await
-        .unwrap();
-    assert_eq!(again.get("token"), Some("one"));
-    // A rotated value arrives with its fields and replaces the held ones.
-    let (_, rotated) = held
-        .obtain(request("a"), ask(Ok(answer(2, Some("two")))))
-        .await
-        .unwrap();
-    assert_eq!(rotated.get("token"), Some("two"));
-    let unknown = held.obtain(request("a"), ask(Ok(answer(3, None)))).await;
-    assert!(matches!(unknown, Err(ReleaseError::Unavailable(_))));
-    let refused = Err(ReleaseError::Refused(Refusal::Rule));
-    let denied = held.obtain(request("a"), ask(refused.clone())).await;
-    assert_eq!(denied.map(|_| ()), refused.map(|_: Released| ()));
-    let ids =
-        [None, Some(1), Some(1), Some(2), Some(2)].map(|id| id.map(|id| Ulid::from_parts(1, id)));
-    assert_eq!(asked.into_inner(), ids);
-}
-
-#[tokio::test]
 async fn management_receiver() {
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
@@ -113,9 +60,8 @@ async fn management_receiver() {
     let alone = ask_release(&fixture.ctx, &config, local, asked).await;
     assert!(matches!(alone, Err(ReleaseError::Unavailable(_))));
     hold_keys(&fixture.ctx);
-    let mut held = HeldSecrets::default();
-    let ask = |asked| ask_release(&fixture.ctx, &config, local, asked);
-    let (_, fields) = held.obtain(first, ask).await.unwrap();
+    let released = ask_release(&fixture.ctx, &config, local, first).await;
+    let (_, fields) = fresh_fields(released.unwrap()).unwrap();
     assert_eq!(fields.get("token"), Some(TOKEN));
 }
 
@@ -136,6 +82,70 @@ mod operations {
 
     fn unavailable() -> ReleaseError {
         ReleaseError::Unavailable("no".into())
+    }
+
+    fn plugin_answer(event: PluginEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Plugin(event)))
+    }
+
+    fn obtain(run_id: Ulid) -> ObtainSecret {
+        let place = (Arc::new(fixtures::realm_nodes()), node(3));
+        let mut obtain = ObtainSecret::new(place, run_id, request("a"));
+        let slot = "a".to_string();
+        let held = Effect::Plugin(PluginEffect::HeldValue { run_id, slot });
+        assert_eq!(obtain.first(), Ok(Next::Call(IoCall::Effect(Box::new(held)))));
+        obtain
+    }
+
+    #[test]
+    fn obtain_keeps_fields() {
+        let run_id = Ulid::from_parts(9, 1);
+        let mut obtain = obtain(run_id);
+        let value_id = Ulid::from_parts(1, 1);
+        let held = plugin_answer(PluginEvent::Held(Some(value_id)));
+        assert!(is_child(&obtain.next(held)), "the release names the held value");
+        // The check passed again for the held value, so its fields come from the run.
+        let released = child_result(Ok::<_, ReleaseFailure>(answer(1, None)));
+        let Ok(Next::Call(IoCall::Effect(hold))) = obtain.next(released) else {
+            panic!("the release is kept for the run");
+        };
+        let slot = "a".to_string();
+        let fields = None;
+        let expected = PluginEffect::HoldValue {
+            run_id,
+            slot,
+            value_id,
+            fields,
+        };
+        assert_eq!(*hold, Effect::Plugin(expected));
+        let kept = plugin_answer(PluginEvent::Fields(answer(1, Some("one")).fields));
+        let Ok(Next::Done((_, fields))) = obtain.next(kept) else {
+            panic!("the held fields answer the use");
+        };
+        assert_eq!(fields.get("token"), Some("one"));
+    }
+
+    #[test]
+    fn obtain_refuses_lost() {
+        let mut lost = obtain(Ulid::from_parts(9, 2));
+        lost.next(plugin_answer(PluginEvent::Held(None))).unwrap();
+        let released = child_result(Ok::<_, ReleaseFailure>(answer(3, None)));
+        lost.next(released).unwrap();
+        let none = lost.next(plugin_answer(PluginEvent::Fields(None)));
+        assert_eq!(none.unwrap_err().0.kind, ErrorKind::Unavailable);
+        let mut refused = obtain(Ulid::from_parts(9, 3));
+        refused.next(plugin_answer(PluginEvent::Held(None))).unwrap();
+        let rule: ReleaseFailure = ReleaseError::Refused(Refusal::Rule).into();
+        let denied = refused.next(child_result(Err::<Released, _>(rule)));
+        assert_eq!(denied.unwrap_err().0.kind, ErrorKind::Denied);
+    }
+
+    #[test]
+    fn fresh_needs_fields() {
+        let (_, fields) = fresh_fields(answer(1, Some("one"))).unwrap();
+        assert_eq!(fields.get("token"), Some("one"));
+        let lost = fresh_fields(answer(1, None));
+        assert!(matches!(lost, Err(ReleaseError::Unavailable(_))));
     }
 
     fn ask(local: u8) -> AskRelease {
