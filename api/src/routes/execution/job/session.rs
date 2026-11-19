@@ -1061,7 +1061,7 @@ async fn stage_one(
     if let Some(operation) = write_gate(gate, &head.source_policies, None).map_err(gate_refusal)? {
         let outcome = drive(operation, &context)
             .await
-            .map_err(|error| ServerError::InternalError(error.into()))?;
+            .map_err(|error| gate_refusal(PolicyGateError::Read(error)))?;
         gate_decision(outcome).map_err(gate_refusal)?;
     }
     let version_id = head.resolved_version_id.or(version_id);
