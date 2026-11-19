@@ -27,8 +27,22 @@ use aruna_operations::jobs::backend_import::{BackendImportOperation, ImportJob};
 use aruna_operations::jobs::context::JobContext;
 use aruna_operations::jobs::copy::CopyJobOperation;
 use aruna_operations::jobs::executor::RangeTurns;
+use aruna_operations::jobs::repository::JobScope;
 use aruna_operations::jobs::staging::{StagingJobOperation, StagingRun};
 use aruna_operations::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
+
+/// This job as the repository and harvest operations see it.
+pub fn job_scope(ctx: &JobContext) -> JobScope {
+    let stop = aruna_blob::remote::job_stop(ctx.cancel.clone(), ctx.shutdown.clone());
+    let progress = ctx.progress.clone();
+    JobScope::new(
+        ctx.job_id,
+        ctx.owner_node_id,
+        ctx.claim_token,
+        stop,
+        progress,
+    )
+}
 
 /// The running job's signals and shared state, as its operations reach them through effects.
 struct ContextHost {

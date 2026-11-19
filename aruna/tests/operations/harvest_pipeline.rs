@@ -491,8 +491,11 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
 }
 
 async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
-    let operation =
-        HarvestJobOperation::new(ctx.driver.node_scope(), ctx.job_scope(), spec.clone());
+    let operation = HarvestJobOperation::new(
+        ctx.driver.node_scope(),
+        aruna::tasks::job_host::job_scope(ctx),
+        spec.clone(),
+    );
     harvest_outcome(drive(operation, &ctx.driver).await)
 }
 

@@ -75,7 +75,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             Box::pin(aruna_operations::driver::drive(
                 aruna_operations::jobs::harvest::HarvestJobOperation::new(
                     ctx.driver.node_scope(),
-                    ctx.job_scope(),
+                    crate::tasks::job_host::job_scope(ctx),
                     spec.clone(),
                 ),
                 &ctx.driver,

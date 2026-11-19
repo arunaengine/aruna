@@ -42,6 +42,25 @@ pub struct JobScope {
     pub(crate) progress: ProgressReporter,
 }
 
+impl JobScope {
+    /// The run of `job_id` under `claim_token`, ended early by `stop`.
+    pub fn new(
+        job_id: JobId,
+        owner_node: NodeId,
+        claim_token: Ulid,
+        stop: JobStop,
+        progress: ProgressReporter,
+    ) -> Self {
+        Self {
+            job_id,
+            owner_node,
+            claim_token,
+            stop,
+            progress,
+        }
+    }
+}
+
 impl std::fmt::Debug for JobScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobScope")
