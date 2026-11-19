@@ -346,7 +346,7 @@ impl Broker for RunBroker {
     ) -> Result<Vec<u8>, HostError> {
         let path = self.expand(text)?;
         let read = ReadObject::new(&self.scope, &path, version, cx.max_bytes);
-        Ok(drive(read, &self.ctx).await?)
+        Ok(drive(read, &self.ctx).await?.0)
     }
 
     async fn connection_send(

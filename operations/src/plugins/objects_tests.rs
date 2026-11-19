@@ -94,3 +94,26 @@ fn missing_object_empty() {
     )));
     assert_eq!(kind_of(failed.next(down)), ErrorKind::Unavailable);
 }
+
+#[test]
+fn read_shows_size() {
+    // A run record of a read shows how many bytes came back, never the bytes.
+    let install = install();
+    let scope = RunScope {
+        realm_id: realm(),
+        local: install.receiver,
+        run: aruna_test_support::plugins::queued(install.install_id, 1),
+    };
+    let mut read = ReadObject::new(&scope, &data_path("in/a.txt"), None, 64);
+    read.phase = ReadPhase::Collect;
+    let collected = BlobEvent::StreamCollected {
+        bytes: Ok(b"object body".to_vec()),
+    };
+    let answer = read.next(IoResult::Event(Box::new(Event::Blob(collected))));
+    let Ok(Next::Done(bytes)) = answer else {
+        panic!("the collected bytes answer the read");
+    };
+    assert_eq!(bytes.0, b"object body");
+    let outcome = ChildOutcome::new(Ok::<_, CallError>(bytes));
+    assert_eq!(format!("{outcome:?}"), "Ok(11 bytes)");
+}
