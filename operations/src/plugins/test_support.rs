@@ -385,7 +385,11 @@ impl Fixture {
         let auth = self.auth();
         let request = self.request(Some(install_id));
         let prepared = prepare_install(&self.ctx, &auth, self.actor.realm_id, &request).await;
-        let record = new_record(&self.actor, &prepared.unwrap(), self.actor.node_id);
+        let record = new_record(
+            &self.actor,
+            &prepared.unwrap(),
+            (self.actor.node_id, (Ulid::generate(), Ulid::generate())),
+        );
         write_record(&self.ctx, &self.actor, &auth, None, record, None)
             .await
             .unwrap()
@@ -784,7 +788,12 @@ pub async fn recorded(
     install: &PluginInstall,
     (source, target): (&str, &str),
 ) -> PluginWorkSpec {
-    let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
+    let mut row = WorkRow::reserved(
+        install,
+        WorkKind::Copy,
+        (Ulid::generate(), Ulid::generate()),
+        1,
+    );
     row.version_id = Some(Ulid::generate());
     let identity = Identity::Call {
         run_id: row.run_id,

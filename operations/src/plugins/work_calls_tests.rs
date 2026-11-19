@@ -31,7 +31,7 @@ fn config_of(install: &PluginInstall) -> RealmConfigDocument {
 }
 
 fn row_of(install: &PluginInstall) -> WorkRow {
-    WorkRow::reserved(install, WorkKind::Copy, Ulid::nil(), 1)
+    WorkRow::reserved(install, WorkKind::Copy, (Ulid::nil(), Ulid::generate()), 1)
 }
 
 fn is_child<T>(next: Next<T>) -> bool {

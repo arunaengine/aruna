@@ -164,11 +164,16 @@ pub struct WorkRow {
 }
 
 impl WorkRow {
-    /// A new row of `install` in state `Reserved`.
-    pub fn reserved(install: &PluginInstall, kind: WorkKind, run_id: Ulid, now_ms: u64) -> Self {
+    /// A new row `work_id` of `install` in state `Reserved`.
+    pub fn reserved(
+        install: &PluginInstall,
+        kind: WorkKind,
+        (run_id, work_id): (Ulid, Ulid),
+        now_ms: u64,
+    ) -> Self {
         Self {
             account: install.account,
-            work_id: Ulid::generate(),
+            work_id,
             kind,
             source: None,
             target: None,

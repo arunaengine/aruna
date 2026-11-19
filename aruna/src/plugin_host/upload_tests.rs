@@ -96,7 +96,12 @@ async fn recorded(
 ) -> (WorkRow, PluginWorkSpec) {
     let data = format!("/{}/g/{}/data", fixture.actor.realm_id, install.group_id);
     let source = format!("{data}/{}/in/a.txt", fixture.actor.node_id);
-    let mut row = WorkRow::reserved(install, WorkKind::Upload, Ulid::generate(), 1);
+    let mut row = WorkRow::reserved(
+        install,
+        WorkKind::Upload,
+        (Ulid::generate(), Ulid::generate()),
+        1,
+    );
     row.source = Some(source.clone());
     row.context = Some(RequestContext {
         connection: "catalog".into(),
