@@ -1050,7 +1050,8 @@ async fn drive_effects(
     let mut queue: VecDeque<Effect> = executable.start().into_iter().collect();
     let mut state = RunState::new(context);
 
-    while !executable.is_complete() {
+    // A run that fails in its first step is complete at once; its cleanup effects still run.
+    while !executable.is_complete() || !queue.is_empty() {
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
             if let Some(TransactionEffect::Abort(txn_id)) = transaction
@@ -2338,7 +2339,8 @@ mod test {
         ready.notified().await;
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        assert!(task.await.unwrap().is_ok());
+        // The parent's own deadline ends it while the child still cleans up.
+        assert_eq!(task.await.unwrap(), Err(IoError::Aborted));
         // Real time again: auto-advance would fire the request timeouts of the
         // storage roundtrips below before the worker thread can answer.
         tokio::time::resume();
