@@ -31,7 +31,6 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_net::NetHandle;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_local_document,
@@ -1006,12 +1005,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
@@ -1022,7 +1016,6 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
@@ -1051,12 +1044,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
@@ -1067,7 +1055,6 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

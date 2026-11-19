@@ -957,7 +957,6 @@ mod tests {
             storage_handle: FjallStorage::open(path.to_str().unwrap()).unwrap(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

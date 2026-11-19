@@ -975,7 +975,6 @@ mod tests {
     use aruna_storage::{FjallStorage, StorageHandle};
 
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::MetadataHandle;
 
     type Rows = Vec<(String, Key, Value)>;
 
@@ -1636,17 +1635,11 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .unwrap();
-        let metadata_handle = MetadataHandle::new(
-            temp.join("meta"),
-            metadata_storage,
-            None,
-            Default::default(),
-        );
+        crate::metadata::install_indexes(&metadata_storage, temp.join("meta"));
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
             graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,

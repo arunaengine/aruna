@@ -57,7 +57,6 @@ use aruna_core::task::{PersistedTaskTimer, TaskKey};
 use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -258,7 +257,7 @@ async fn public_routes_work() {
     assert_eq!(raw.context_digest.len(), 64);
     assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
     assert!(raw.projected_event_id.is_none());
-    let projected_jsonld = aruna_operations::metadata::export_rocrate_jsonld(
+    let projected_jsonld = aruna_operations::testing::export_rocrate_jsonld(
         test.state.get_ctx().as_ref(),
         created.summary.graph_iri.clone(),
     )
@@ -3233,15 +3232,9 @@ pub(crate) async fn setup_state() -> TestState {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
-    context.metadata_handle = Some(metadata_handle);
     context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
@@ -3326,16 +3319,10 @@ pub(crate) async fn setup_network_state() -> TestState {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.net_handle = Some(net.clone());
-    context.metadata_handle = Some(metadata_handle);
     context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
@@ -3416,7 +3403,6 @@ async fn setup_closed_storage() -> Arc<ServerState> {
                 storage_handle,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
                 graph_handle: None,
                 task_handle: None,
                 compute_handle: None,

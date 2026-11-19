@@ -176,7 +176,6 @@ async fn fixture() -> Fixture {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,

@@ -429,7 +429,6 @@ mod tests {
             storage_handle: storage,
             net_handle: Some(net.clone()),
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

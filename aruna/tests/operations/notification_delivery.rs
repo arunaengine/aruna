@@ -25,7 +25,6 @@ use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
 };
@@ -340,7 +339,6 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
         storage_handle: reader_ctx.storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,
@@ -478,14 +476,14 @@ async fn build_realm_nodes(
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    build_node(realm_id, None, None, None).await
+    build_node(realm_id, None, None, false).await
 }
 
 async fn spawn_with_secret(
     realm_id: RealmId,
     secret: [u8; 32],
 ) -> Result<TestNode, Box<dyn std::error::Error>> {
-    build_node(realm_id, Some(secret), None, None).await
+    build_node(realm_id, Some(secret), None, false).await
 }
 
 async fn respawn_with_storage(
@@ -493,15 +491,15 @@ async fn respawn_with_storage(
     secret: [u8; 32],
     storage: StorageHandle,
 ) -> Result<TestNode, Box<dyn std::error::Error>> {
-    build_node(realm_id, Some(secret), Some(storage), None).await
+    build_node(realm_id, Some(secret), Some(storage), false).await
 }
 
-/// `metadata` adds a metadata handle, which serves and sends notification setting requests.
+/// `metadata` adds a metadata store, which serves and sends notification setting requests.
 async fn build_node(
     realm_id: RealmId,
     secret: Option<[u8; 32]>,
     reused_storage: Option<StorageHandle>,
-    metadata: Option<MetadataHandleOptions>,
+    metadata: bool,
 ) -> Result<TestNode, Box<dyn std::error::Error>> {
     let (temp_dir, storage) = match reused_storage {
         Some(storage) => (None, storage),
@@ -524,8 +522,8 @@ async fn build_node(
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let (metadata_dir, metadata_handle, graph_handle) = match metadata {
-        Some(options) => {
+    let (metadata_dir, graph_handle) = match metadata {
+        true => {
             let dir = tempfile::tempdir()?;
             let graph = aruna_graph::GraphHandle::open(
                 dir.path().join("metadata"),
@@ -535,17 +533,16 @@ async fn build_node(
                 aruna_graph::GraphOptions::default(),
             )?;
             let path = dir.path().join("metadata");
-            let handle = MetadataHandle::new(path, storage.clone(), Some(net.clone()), options);
-            (Some(dir), Some(handle), Some(graph))
+            aruna_operations::metadata::install_indexes(&storage, path);
+            (Some(dir), Some(graph))
         }
-        None => (None, None, None),
+        false => (None, None),
     };
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle,
         graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
@@ -659,8 +656,7 @@ impl SettingRealm {
 
     async fn start(&self, index: usize) -> TestResult<TestNode> {
         let secret = [self.seed.wrapping_mul(4).wrapping_add(index as u8 + 1); 32];
-        let options = MetadataHandleOptions::default();
-        let node = build_node(self.realm_id, Some(secret), None, Some(options)).await?;
+        let node = build_node(self.realm_id, Some(secret), None, true).await?;
         if index < 3 {
             let keys = RealmKeys::derive(&self.realm_key);
             node.context.storage_handle.open_realm(keys);

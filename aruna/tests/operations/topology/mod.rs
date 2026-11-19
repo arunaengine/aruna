@@ -54,7 +54,6 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -1032,18 +1031,12 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         Some(net.document_sync_database()),
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        storage.clone(),
-        Some(net.clone()),
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob_handle),
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
@@ -1580,18 +1573,12 @@ pub async fn spawn_node_with(
         Some(net.document_sync_database()),
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        dir.join("metadata"),
-        storage.clone(),
-        Some(net.clone()),
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, dir.join("metadata"));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
@@ -1961,29 +1948,23 @@ pub async fn spawn_replica_with(
     };
     let net = NetHandle::new(net_config, storage.clone()).await?;
     let task_handle = TaskHandle::new();
-    let (metadata_handle, graph_handle) = match metadata {
-        true => (
-            Some(MetadataHandle::new(
-                temp_dir.path().join("metadata"),
-                storage.clone(),
-                Some(net.clone()),
-                Default::default(),
-            )),
+    let graph_handle = match metadata {
+        true => {
+            aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
             Some(aruna_graph::GraphHandle::open(
                 temp_dir.path().join("metadata"),
                 net.node_id(),
                 Some(net.document_sync_node()),
                 Some(net.document_sync_database()),
                 Default::default(),
-            )?),
-        ),
-        false => (None, None),
+            )?)
+        }
+        false => None,
     };
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle,
         graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,

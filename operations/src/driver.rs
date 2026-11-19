@@ -35,7 +35,6 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
-use crate::metadata::MetadataHandle;
 use crate::recorder;
 
 /// Node-local routing inputs for a caller assembling an operation config.
@@ -87,7 +86,6 @@ pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
-    pub metadata_handle: Option<MetadataHandle>,
     pub graph_handle: Option<GraphHandle>,
     pub task_handle: Option<TaskHandle>,
     /// Enabled executor backends; `None` on nodes with no compute plane.
@@ -103,7 +101,6 @@ impl DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -264,7 +261,6 @@ impl std::fmt::Debug for DriverContext {
         f.debug_struct("DriverContext")
             .field("net_handle", &self.net_handle)
             .field("blob_handle", &self.blob_handle.is_some())
-            .field("metadata_handle", &self.metadata_handle.is_some())
             .field("graph_handle", &self.graph_handle.is_some())
             .field("task_handle", &self.task_handle.is_some())
             .field("compute_handle", &self.compute_handle.is_some())
@@ -1849,7 +1845,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -1896,7 +1891,6 @@ mod test {
                 storage_handle,
                 net_handle: Some(net_handle),
                 blob_handle: Some(blob_handle),
-                metadata_handle: None,
                 graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
@@ -2053,7 +2047,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2088,7 +2081,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2192,7 +2184,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2748,7 +2739,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2791,7 +2781,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2865,7 +2854,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -2962,7 +2950,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -3039,7 +3026,6 @@ mod test {
                         storage_handle,
                         net_handle: None,
                         blob_handle: None,
-                        metadata_handle: None,
                         graph_handle: None,
                         task_handle: None,
                         compute_handle: None,
@@ -3070,7 +3056,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -3154,7 +3139,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -3944,7 +3928,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             task_handle: None,
             compute_handle: None,
             graph_handle: None,

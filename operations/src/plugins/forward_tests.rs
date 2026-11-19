@@ -305,7 +305,7 @@ async fn update_waits() {
         event,
         queued_ms: 1,
     };
-    let metadata = fixture.ctx.metadata_handle.is_some();
+    let metadata = fixture.ctx.graph_handle.is_some();
     let waits = async || drive(Unreadable::new(&row, metadata), &fixture.ctx).await;
     let newer = (document, Ulid::from_parts(20, 1));
     materialization(&fixture, newer, State::Materialized).await;

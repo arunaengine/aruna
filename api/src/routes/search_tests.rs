@@ -29,7 +29,6 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::extract::Path;
@@ -198,17 +197,11 @@ async fn setup() -> Fixture {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

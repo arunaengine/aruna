@@ -25,7 +25,6 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
@@ -1418,7 +1417,7 @@ async fn graph_exists(
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match aruna_operations::metadata::send_metadata_effect(
+    match aruna_operations::testing::send_metadata_effect(
         &test.context,
         MetadataEffect::ContainsGraph { graph_iri },
     )
@@ -1707,12 +1706,7 @@ async fn build_context(
         None,
         aruna_graph::GraphOptions::default().with_validation_disabled(validator_disabled),
     )?;
-    let metadata = MetadataHandle::new(
-        metadata_dir.path(),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
@@ -1738,7 +1732,6 @@ async fn build_context(
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

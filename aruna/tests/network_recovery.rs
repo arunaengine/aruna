@@ -13,7 +13,6 @@ use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -148,17 +147,14 @@ async fn rejoin_peer(
             return Err(error.into());
         }
     };
-    let metadata = MetadataHandle::new(
+    aruna_operations::metadata::install_indexes(
+        &context_storage,
         directory.path().join("metadata"),
-        context_storage.clone(),
-        Some(peer.clone()),
-        Default::default(),
     );
     let context = Arc::new(DriverContext {
         storage_handle: context_storage,
         net_handle: Some(peer.clone()),
         blob_handle: None,
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

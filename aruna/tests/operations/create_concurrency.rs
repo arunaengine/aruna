@@ -11,7 +11,6 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -52,17 +51,11 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: None,
         compute_handle: None,

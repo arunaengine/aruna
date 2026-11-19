@@ -999,7 +999,6 @@ fn drain_context(node: &TestNode) -> Arc<DriverContext> {
         storage_handle: node.context.storage_handle.clone(),
         net_handle: node.context.net_handle.clone(),
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

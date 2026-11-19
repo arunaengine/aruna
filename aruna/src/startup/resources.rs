@@ -18,7 +18,6 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
@@ -399,7 +398,6 @@ async fn fill(
             storage_handle: acquired.storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -443,7 +441,6 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
-    let metadata_options = MetadataHandleOptions::default();
     let graph_handle = GraphHandle::open(
         &config.metadata_storage_path,
         config.node_id,
@@ -454,11 +451,9 @@ async fn fill(
             .with_sync_all(config.fjall_persist_policy == FjallPersistPolicy::SyncAll),
     )?;
     acquired.graph_handle = Some(graph_handle.clone());
-    let metadata_handle = MetadataHandle::new(
+    aruna_operations::metadata::install_indexes(
+        &acquired.storage_handle,
         &config.metadata_storage_path,
-        acquired.storage_handle.clone(),
-        Some(net_handle.clone()),
-        metadata_options,
     );
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
@@ -492,7 +487,6 @@ async fn fill(
         storage_handle: acquired.storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),

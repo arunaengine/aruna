@@ -600,7 +600,7 @@ fn install_inbound_handler(
         warn!("Cannot initialize inbound handling without net handle");
         return None;
     };
-    let has_metadata = context.metadata_handle.is_some();
+    let has_metadata = context.graph_handle.is_some();
     let inbound_handler = Arc::new(OperationsInboundHandler::new(
         context.clone(),
         rocrate_limits,
@@ -1062,7 +1062,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::replication::protocol::{
         LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
     };
@@ -1131,7 +1130,6 @@ mod tests {
             storage_handle,
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -1220,7 +1218,6 @@ mod tests {
                 storage_handle: storage_b,
                 net_handle: Some(net_b.clone()),
                 blob_handle: Some(blob_handle),
-                metadata_handle: None,
                 graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
@@ -1278,17 +1275,11 @@ mod tests {
                 aruna_graph::GraphOptions::default(),
             )
             .unwrap();
-            let metadata_handle = MetadataHandle::new(
-                dir.path().join("metadata"),
-                storage.clone(),
-                Some(net.clone()),
-                Default::default(),
-            );
+            aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
                 blob_handle: None,
-                metadata_handle: Some(metadata_handle),
                 graph_handle: Some(graph_handle),
                 task_handle: None,
                 compute_handle: None,
@@ -1407,7 +1398,6 @@ mod tests {
                     storage_handle: storage_b,
                     net_handle: Some(net_b.clone()),
                     blob_handle: Some(blob_handle),
-                    metadata_handle: None,
                     graph_handle: None,
                     task_handle: None,
                     compute_handle: None,

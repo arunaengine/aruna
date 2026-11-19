@@ -30,10 +30,10 @@ use tempfile::TempDir;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
 use crate::jobs::lifecycle::submit_external::IngressNode;
+use crate::jobs::node_inputs::launch_node;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::records::verify::FamilyView;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::jobs::node_inputs::launch_node;
 use aruna_core::effects::LaunchFrame;
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
@@ -410,7 +410,6 @@ pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDi
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

@@ -15,7 +15,6 @@ use ulid::Ulid;
 
 use aruna::inbound::initialize_incoming_fixture;
 use aruna_operations::groups::deletion::tests::{Fixture, read};
-use aruna_operations::metadata::MetadataHandle;
 
 async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
     let net = NetHandle::new(
@@ -40,14 +39,11 @@ async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata = MetadataHandle::new(
+    aruna_operations::metadata::install_indexes(
+        &fixture.context.storage_handle,
         fixture.dir.path().join("metadata"),
-        fixture.context.storage_handle.clone(),
-        Some(net.clone()),
-        Default::default(),
     );
     fixture.context.net_handle = Some(net.clone());
-    fixture.context.metadata_handle = Some(metadata);
     fixture.context.graph_handle = Some(graph);
     net.reload_realm_peers().await.unwrap();
     net

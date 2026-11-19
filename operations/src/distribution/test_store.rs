@@ -240,7 +240,6 @@ pub(crate) fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
         storage_handle: handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

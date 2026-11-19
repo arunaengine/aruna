@@ -415,19 +415,13 @@ async fn usage_counts_documents() {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = aruna_operations::metadata::MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: None,
         compute_handle: None,
@@ -586,7 +580,6 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

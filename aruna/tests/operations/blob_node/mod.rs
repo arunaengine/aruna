@@ -92,7 +92,6 @@ pub async fn setup_on(
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

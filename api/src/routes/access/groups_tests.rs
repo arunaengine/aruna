@@ -182,7 +182,6 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,

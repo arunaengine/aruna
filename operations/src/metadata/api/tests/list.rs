@@ -176,7 +176,6 @@ async fn group_scan_capped() {
         storage_handle: test.context.storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

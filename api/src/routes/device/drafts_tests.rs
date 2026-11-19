@@ -16,7 +16,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -39,19 +38,13 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata = MetadataHandle::new(
-        dir.path().join("metadata"),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
     let state = Arc::new(
         ServerState::new(
             Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: Some(metadata),
                 graph_handle: Some(graph),
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,

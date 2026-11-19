@@ -13,7 +13,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::types::GroupId;
 use aruna_core::{StructuredId, UserId};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -51,18 +50,12 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
     let task_handle = with_drains.then(TaskHandle::new);
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: task_handle.clone(),
         compute_handle: None,

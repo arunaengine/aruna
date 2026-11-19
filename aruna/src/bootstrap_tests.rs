@@ -142,7 +142,6 @@ fn context_net(
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

@@ -44,7 +44,6 @@ async fn wake_until_acknowledged() {
         storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

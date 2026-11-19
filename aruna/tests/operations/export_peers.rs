@@ -124,15 +124,9 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
     .await
     .unwrap();
     let path = tempdir.path().join("metadata");
-    let metadata_handle = metadata.then(|| {
-        let net = Some(net.clone());
-        aruna_operations::metadata::MetadataHandle::new(
-            &path,
-            storage.clone(),
-            net,
-            Default::default(),
-        )
-    });
+    if metadata {
+        aruna_operations::metadata::install_indexes(&storage, &path);
+    }
     let graph_handle = metadata.then(|| {
         aruna_graph::GraphHandle::open(&path, net.node_id(), None, None, Default::default())
             .unwrap()
@@ -141,7 +135,6 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
-        metadata_handle,
         graph_handle,
         task_handle: None,
         compute_handle: None,
