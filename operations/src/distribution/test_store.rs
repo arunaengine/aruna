@@ -3,27 +3,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[cfg(test)]
 use aruna_core::calls::{IoCall, IoError, IoResult};
+#[cfg(test)]
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+#[cfg(test)]
 use aruna_core::events::{Event, StorageEvent};
+#[cfg(test)]
 use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
-use aruna_core::structs::storage::distribution::accounting::{
-    RangeAccount, RangeCounters, account_key,
-};
+use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+#[cfg(test)]
+use aruna_core::structs::storage::distribution::accounting::{RangeAccount, account_key};
 use aruna_core::structs::storage::distribution::inventory::{HeadEntry, VersionEntry};
 use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
+#[cfg(test)]
 use aruna_core::types::TxnId;
+#[cfg(test)]
 use aruna_storage::storage::{FjallStorage, StorageHandle};
+#[cfg(test)]
 use byteview::ByteView;
+#[cfg(test)]
 use tempfile::TempDir;
 use ulid::Ulid;
-
-use super::inventory::{
-    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, StagedCall,
-    open_ranges,
-};
+use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};
+#[cfg(test)]
+use super::inventory::{InventoryError, StagedCall, open_ranges};
+#[cfg(test)]
 use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
 
+#[cfg(test)]
 pub fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
     let handle = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage");
@@ -42,6 +50,7 @@ pub fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
     }
 }
 
+#[cfg(test)]
 pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
     let Effect::Storage(effect) = effect else {
         panic!("only storage effects are expected: {effect:?}");
@@ -49,10 +58,12 @@ pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
     handle.send_storage_effect(effect).await
 }
 
+#[cfg(test)]
 pub async fn begin(handle: &StorageHandle) -> TxnId {
     handle.begin_write().await
 }
 
+#[cfg(test)]
 /// True when the commit succeeded, false on a conflict.
 pub async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     match handle
@@ -65,6 +76,7 @@ pub async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     }
 }
 
+#[cfg(test)]
 pub async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) {
     let writes = open_ranges(set_id, ranges).expect("ranges encode");
     let event = handle
@@ -79,6 +91,7 @@ pub async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) 
     ));
 }
 
+#[cfg(test)]
 /// Runs one call of an embedded update in `txn_id`; an outside read runs without it.
 async fn run_staged(
     handle: &StorageHandle,
@@ -164,6 +177,7 @@ async fn run_staged(
     })
 }
 
+#[cfg(test)]
 /// Runs `update` to the end inside the open transaction `txn_id`.
 pub async fn stage(
     handle: &StorageHandle,
@@ -178,6 +192,7 @@ pub async fn stage(
     Ok(())
 }
 
+#[cfg(test)]
 /// Runs a counter update to the end inside the open transaction `txn_id`.
 pub async fn stage_usage(
     handle: &StorageHandle,
@@ -192,6 +207,7 @@ pub async fn stage_usage(
     Ok(())
 }
 
+#[cfg(test)]
 /// Stages and commits `update` in its own transaction.
 pub async fn apply(
     handle: &StorageHandle,
@@ -203,6 +219,7 @@ pub async fn apply(
     Ok(commit(handle, txn_id).await)
 }
 
+#[cfg(test)]
 pub async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
     let event = handle
         .send_storage_effect(StorageEffect::Read {
@@ -217,6 +234,7 @@ pub async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Optio
     }
 }
 
+#[cfg(test)]
 pub async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
     get(handle, RANGE_COUNTER_KEYSPACE, key)
         .await
@@ -225,10 +243,12 @@ pub async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
         })
 }
 
+#[cfg(test)]
 pub async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
     get(handle, INVENTORY_KEYSPACE, position).await.is_some()
 }
 
+#[cfg(test)]
 pub fn context(handle: &StorageHandle) -> aruna_drivers::driver::DriverContext {
     aruna_drivers::driver::DriverContext {
         storage_handle: handle.clone(),
@@ -241,6 +261,7 @@ pub fn context(handle: &StorageHandle) -> aruna_drivers::driver::DriverContext {
     }
 }
 
+#[cfg(test)]
 pub async fn account(handle: &StorageHandle, set_id: Ulid, range_id: Ulid) -> Option<RangeAccount> {
     get(
         handle,
@@ -306,6 +327,7 @@ pub fn exact(objects: i128, bytes: i128) -> RangeCounters {
     }
 }
 
+#[cfg(test)]
 /// Writes `count` sample entries of range `range_seed` with priorities from 1 upwards.
 pub async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
     use aruna_core::keyspaces::KEY_SAMPLE_KEYSPACE;
@@ -352,12 +374,22 @@ impl Feeder {
         }
     }
 
+    #[cfg(test)]
     /// One bounded pass over each walk; true when it changed an index or a row.
     pub async fn pass(&mut self, context: &aruna_drivers::driver::DriverContext) -> bool {
-        use crate::distribution::feed_walks::FeedPassOperation;
+        let pass = self.next_pass();
+        self.passed(aruna_drivers::driver::drive(pass, context).await)
+    }
+
+    /// The next bounded pass, which takes the kept cursors.
+    pub fn next_pass(&mut self) -> crate::distribution::feed_walks::FeedPassOperation {
         let cursors = std::mem::take(&mut self.cursors);
-        let pass = FeedPassOperation::new(self.limits, cursors);
-        match aruna_drivers::driver::drive(pass, context).await {
+        crate::distribution::feed_walks::FeedPassOperation::new(self.limits, cursors)
+    }
+
+    /// Keeps the cursors of a finished pass; true when it changed an index or a row.
+    pub fn passed<E>(&mut self, pass: Result<crate::distribution::feed_walks::FeedPass, E>) -> bool {
+        match pass {
             Ok(pass) => {
                 self.cursors = pass.cursors;
                 pass.busy
