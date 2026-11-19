@@ -52,7 +52,7 @@
   "structural": {
     "async_parallel": 0,
     "core_clocks": 19,
-    "duplicate_groups": 2,
+    "duplicate_groups": 1,
     "group_cycle_modules": 17,
     "group_mutual_pairs": 17,
     "mixed_files": 0,
