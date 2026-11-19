@@ -1454,12 +1454,13 @@ mod tests {
     #[tokio::test]
     async fn guards_folder_pull() {
         use crate::device::sync::folders::finish_unbind;
-        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };
         use crate::tests::device::store_folder;
-        use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+        use aruna_core::structs::{
+            FolderMode, FolderState, RemoteBinding, SyncedFolder, folder_bucket,
+        };
 
         let fixture = crate::tests::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);

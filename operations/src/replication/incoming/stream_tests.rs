@@ -413,8 +413,8 @@ async fn checks_advance_policy() {
 
 #[tokio::test]
 async fn denies_offered_bucket() {
-    use crate::device::sync::repository::folder_bucket;
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+    use aruna_core::structs::folder_bucket;
     use aruna_drivers::driver::drive;
 
     let fixture = crate::tests::staging::setup_driver_context().await;

@@ -254,7 +254,6 @@ pub(super) fn store_progress(progress: &SyncedFolder) -> UpdateFolderOperation {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::repository::folder_bucket;
     use super::super::{folder_pass, folder_scope};
     use super::bind::ReserveBindingOperation;
     use super::unbind::{ClearRowsOperation, DeleteLocalOperation};
@@ -265,7 +264,7 @@ mod tests {
     use crate::tests::device::{context, delete_rows, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-    use aruna_core::structs::{EntrySide, EntryState, SyncBase, SyncedBytes};
+    use aruna_core::structs::{EntrySide, EntryState, SyncBase, SyncedBytes, folder_bucket};
     use aruna_drivers::driver::{DriverContext, drive};
 
     fn realm() -> RealmId {
