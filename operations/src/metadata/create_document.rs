@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
-use std::sync::{Mutex, OnceLock};
 
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -34,7 +33,7 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
-use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
+use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle, StructuredId};
 use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -814,8 +813,10 @@ pub fn mint_local_document(
     actor: &Actor,
     group_id: GroupId,
     document_path: &str,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<MetaResourceId, CreateDocumentError> {
-    mint_document_for(config, actor, group_id, document_path, false)
+    mint_document_for(config, actor, group_id, document_path, false, ids, now_ms)
 }
 
 /// Mints a forwarded blind-bucket id from an already-loaded config.
@@ -824,8 +825,10 @@ pub fn mint_forward_document(
     actor: &Actor,
     group_id: GroupId,
     document_path: &str,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<MetaResourceId, CreateDocumentError> {
-    mint_document_for(config, actor, group_id, document_path, true)
+    mint_document_for(config, actor, group_id, document_path, true, ids, now_ms)
 }
 
 pub(crate) fn mint_document_for(
@@ -834,11 +837,13 @@ pub(crate) fn mint_document_for(
     group_id: GroupId,
     document_path: &str,
     forward_blind: bool,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<MetaResourceId, CreateDocumentError> {
     let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
     let (handle, placement) =
         resolve_create_placement(config, actor, group_id, &normalized, forward_blind)?;
-    mint_document_id(handle, &placement)
+    mint_document_id(handle, &placement, ids, now_ms)
 }
 
 /// Resolves the `(handle, placement)` a create's id must embed. The handle comes
@@ -920,20 +925,26 @@ fn bucket_from_placement(placement: &PlacementRef) -> Result<BucketId, CreateDoc
         .map_err(|error| CreateDocumentError::PlacementBindingUnavailable(error.to_string()))
 }
 
+/// The largest time and the largest nonce of a structured id, both 48 bits wide.
+const FIELD_MAX: u64 = (1 << 48) - 1;
+
+/// A document id at `now_ms` with its time and nonce from the run's `ids`. The ids of one run
+/// strictly increase; ids of separate runs differ by their random nonce.
 fn mint_document_id(
     handle: PlacementHandle,
     placement: &PlacementRef,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<MetaResourceId, CreateDocumentError> {
     let bucket = bucket_from_placement(placement)?;
-    let mut generator = id_generator()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(generator.mint(handle, bucket)?)
-}
-
-fn id_generator() -> &'static Mutex<StructuredIdGenerator> {
-    static GENERATOR: OnceLock<Mutex<StructuredIdGenerator>> = OnceLock::new();
-    GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
+    let overflow = |timestamp_ms| ClockHealthError::TimestampOverflow { timestamp_ms };
+    if now_ms > FIELD_MAX {
+        return Err(overflow(now_ms).into());
+    }
+    let minted = ids.mint(now_ms);
+    let nonce = minted.random() as u64 & FIELD_MAX;
+    MetaResourceId::from_parts(minted.timestamp_ms(), handle, bucket, nonce)
+        .map_err(|_| overflow(minted.timestamp_ms()).into())
 }
 
 #[cfg(test)]
@@ -1020,9 +1031,14 @@ mod tests {
         let (handle, placement) =
             super::resolve_create_placement(config, actor, group_id, &normalized, false)
                 .expect("test config provisions a metadata binding and a held bucket");
-        super::mint_document_id(handle, &placement)
-            .expect("mint")
-            .as_ulid()
+        super::mint_document_id(
+            handle,
+            &placement,
+            &mut IdMint::new(0x5eed),
+            1_700_000_000_000,
+        )
+        .expect("mint")
+        .as_ulid()
     }
 
     fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateDocumentConfig {

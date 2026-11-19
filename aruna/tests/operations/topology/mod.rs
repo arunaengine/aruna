@@ -1826,9 +1826,16 @@ pub async fn run_writer(
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
-            .as_ulid();
+        let document_id = mint_local_document(
+            &config,
+            &actor,
+            group_id,
+            &document_path,
+            &mut crate::fresh_ids(),
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
+        .as_ulid();
         let payload = payload(label, writer, index, document_id);
         let result = drive(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {

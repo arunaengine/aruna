@@ -19,6 +19,7 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
 use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -390,9 +391,11 @@ async fn run_sampler(
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed index={index}: {error:?}"))?
-            .as_ulid();
+        let (mut ids, now_ms) = (IdMint::new(rand::random()), unix_timestamp_millis());
+        let document_id =
+            mint_local_document(&config, &actor, group_id, &document_path, &mut ids, now_ms)
+                .map_err(|error| format!("mint failed index={index}: {error:?}"))?
+                .as_ulid();
         let t0 = Instant::now();
         let result = drive(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {

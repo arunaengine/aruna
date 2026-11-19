@@ -70,6 +70,8 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
         &test.actor,
         group_id,
         "datasets/lost-response",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     let config = CreateDocumentConfig {
@@ -164,6 +166,8 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
         &test.actor,
         group_id,
         "datasets/public-dataset",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
 
@@ -313,6 +317,8 @@ async fn create_reduces_effects() -> Result<(), Box<dyn std::error::Error>> {
         &test.actor,
         group_id,
         "datasets/generated-fast-path",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     let before = test

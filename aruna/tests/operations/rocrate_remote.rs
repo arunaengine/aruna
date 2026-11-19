@@ -252,7 +252,15 @@ async fn setup_remote(
         user_id: owner,
         realm_id,
     };
-    let document_id = mint_local_document(&config, &exporter_actor, group_id, DOC_PATH)?.as_ulid();
+    let document_id = mint_local_document(
+        &config,
+        &exporter_actor,
+        group_id,
+        DOC_PATH,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let arn = VersionedObjectArn::new(realm_id, holder.net.node_id(), BUCKET, KEY, version_id)?;
     let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_iri(hash));
     create_document(&exporter, owner, group_id, realm_id, document_id, jsonld).await?;
