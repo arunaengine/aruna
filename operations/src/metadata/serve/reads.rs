@@ -3,78 +3,112 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::{AuthToken, MetadataError, MetadataQueryResults, MetadataSearchHit};
+use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use ulid::Ulid;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
+use aruna_core::structs::storage::release::HolderAnswer;
 
+use super::ServeNode;
 use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::links::local::{LinksLocalOperation, SetPreviewOperation};
-use crate::metadata::api::links::types::{LinkNodePage, LinkNodeRequest, SetPreviewPage};
+use crate::metadata::api::links::types::{LinkNodePage, SetPreviewPage};
+use crate::metadata::api::preflight::local::references_preflight_local;
+use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::read_peer::ReadPeerOperation;
+use crate::metadata::local_query::LocalQueryOperation;
+use crate::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage as Message, metadata_read_error,
+};
+use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
+use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use crate::metadata::secondary_ids::IdentifierMatch;
+use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::local_search::LocalBucketSearch;
+use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
+use crate::s3::bucket::search::{BucketPage, SearchBucketsError, SearchBucketsInput};
+use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObjectsInput};
+use crate::s3::object::search_scan::SearchObjectsOperation;
 
-/// A read that runs as the checked caller.
-#[derive(Debug, PartialEq)]
-pub(crate) enum CallerRead {
-    Identifier(IdentifierQuery),
-    Links(Box<LinkNodeRequest>),
-    /// The group owning a bucket; only a known caller may ask.
-    Owner(String),
-    Preview {
-        set_id: Ulid,
-        limit: usize,
-    },
-}
-
+/// The reply a forwarded read answers with.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ReadReply {
+pub(crate) enum ReadReply {
     Identifier,
     Links,
     Owner,
     Preview,
+    Query,
+    Search,
+    Preflight,
+    Buckets,
+    Objects,
+    Release,
 }
 
 impl ReadReply {
-    fn of(read: &CallerRead) -> Self {
-        match read {
-            CallerRead::Identifier(_) => Self::Identifier,
-            CallerRead::Links(_) => Self::Links,
-            CallerRead::Owner(_) => Self::Owner,
-            CallerRead::Preview { .. } => Self::Preview,
-        }
+    /// The reply of `request`, or `None` when it is no forwarded read.
+    pub(crate) fn of(request: &Message) -> Option<Self> {
+        Some(match request {
+            Message::LookupIdentifier { .. } => Self::Identifier,
+            Message::DataLinks { .. } => Self::Links,
+            Message::BucketOwner { .. } => Self::Owner,
+            Message::SetPreview { .. } => Self::Preview,
+            Message::QueryGraphs { .. } => Self::Query,
+            Message::SearchGraphs { .. } | Message::FilteredSearchGraphs { .. } => Self::Search,
+            Message::ReferencePreflight { .. } => Self::Preflight,
+            Message::SearchBuckets { .. } => Self::Buckets,
+            Message::SearchObjects { .. } => Self::Objects,
+            Message::ReleaseHolder { .. } => Self::Release,
+            _ => return None,
+        })
     }
 
-    fn refused(self, error: MetadataReadError) -> MetadataTransportMessage {
-        let result = Err(error);
+    // The reader a search check admits; the other reads check the caller as a plain read.
+    fn reader(self) -> Option<PeerReader> {
         match self {
-            Self::Identifier => MetadataTransportMessage::IdentifierMatches { result },
-            Self::Links => MetadataTransportMessage::DataLinkResults { result },
-            Self::Owner => MetadataTransportMessage::BucketOwnerResult { result },
-            Self::Preview => MetadataTransportMessage::SetPreviewResults { result },
+            Self::Buckets => Some(PeerReader::Buckets),
+            Self::Objects => Some(PeerReader::Objects),
+            Self::Release => Some(PeerReader::Release),
+            _ => None,
         }
     }
 
-    fn answer(self, result: IoResult) -> Result<MetadataTransportMessage, IoError> {
+    pub(crate) fn refused(self, error: MetadataReadError) -> Message {
+        match self {
+            Self::Identifier => Message::IdentifierMatches { result: Err(error) },
+            Self::Links => Message::DataLinkResults { result: Err(error) },
+            Self::Owner => Message::BucketOwnerResult { result: Err(error) },
+            Self::Preview => Message::SetPreviewResults { result: Err(error) },
+            Self::Query => Message::QueryResults { result: Err(error) },
+            Self::Search => Message::SearchResults { result: Err(error) },
+            Self::Preflight => Message::ReferencePreflightResults { result: Err(error) },
+            Self::Buckets => Message::BucketSearchResults { result: Err(error) },
+            Self::Objects => Message::ObjectSearchResults { result: Err(error) },
+            Self::Release => Message::ReleaseHolderResults { result: Err(error) },
+        }
+    }
+
+    fn answer(self, result: IoResult) -> Result<Message, IoError> {
         Ok(match self {
-            Self::Identifier => MetadataTransportMessage::IdentifierMatches {
+            Self::Identifier => Message::IdentifierMatches {
                 result: (result.child::<Vec<IdentifierMatch>, MetadataApiError>()?)
-                    .map_err(|_| MetadataReadError::Unavailable),
+                    .map_err(unavailable),
             },
-            Self::Links => MetadataTransportMessage::DataLinkResults {
+            Self::Links => Message::DataLinkResults {
                 result: (result.child::<LinkNodePage, MetadataApiError>()?)
                     .map(Box::new)
                     .map_err(read_error),
             },
-            Self::Owner => MetadataTransportMessage::BucketOwnerResult {
+            Self::Owner => Message::BucketOwnerResult {
                 result: (result.child::<BucketInfo, GetBucketError>()?)
                     .map(|info| info.group_id)
                     .map_err(|error| match error {
@@ -82,89 +116,303 @@ impl ReadReply {
                         _ => MetadataReadError::Unavailable,
                     }),
             },
-            Self::Preview => MetadataTransportMessage::SetPreviewResults {
+            Self::Preview => Message::SetPreviewResults {
                 result: (result.child::<SetPreviewPage, MetadataApiError>()?)
                     .map(Box::new)
                     .map_err(read_error),
+            },
+            Self::Query => Message::QueryResults {
+                result: (result.child::<MetadataQueryResults, MetadataError>()?)
+                    .map_err(metadata_read_error),
+            },
+            Self::Search => Message::SearchResults {
+                result: (result.child::<Vec<MetadataSearchHit>, MetadataError>()?)
+                    .map_err(metadata_read_error),
+            },
+            Self::Preflight => Message::ReferencePreflightResults {
+                result: (result.child::<ReferenceNodeExecution, MetadataApiError>()?)
+                    .map(Box::new)
+                    .map_err(read_error),
+            },
+            Self::Buckets => Message::BucketSearchResults {
+                result: (result.child::<BucketPage, SearchBucketsError>()?).map_err(unavailable),
+            },
+            Self::Objects => Message::ObjectSearchResults {
+                result: (result.child::<SearchNodePage, SearchObjectsError>()?)
+                    .map_err(unavailable),
+            },
+            Self::Release => Message::ReleaseHolderResults {
+                result: (result.child::<HolderAnswer, PublishError>()?).map_err(
+                    |error| match error {
+                        PublishError::Forbidden(_) => MetadataReadError::Forbidden,
+                        _ => MetadataReadError::Unavailable,
+                    },
+                ),
             },
         })
     }
 }
 
-/// Checks the caller `peer` forwarded, then answers its read; a node without a realm answers
-/// unavailable.
+fn unavailable<E>(_: E) -> MetadataReadError {
+    MetadataReadError::Unavailable
+}
+
+// Takes the caller's token out of a forwarded read.
+fn take_token(request: &mut Message) -> Option<AuthToken> {
+    match request {
+        Message::LookupIdentifier { auth_token, .. }
+        | Message::DataLinks { auth_token, .. }
+        | Message::BucketOwner { auth_token, .. }
+        | Message::SetPreview { auth_token, .. }
+        | Message::QueryGraphs { auth_token, .. }
+        | Message::SearchGraphs { auth_token, .. }
+        | Message::FilteredSearchGraphs { auth_token, .. }
+        | Message::ReferencePreflight { auth_token, .. }
+        | Message::SearchBuckets { auth_token, .. }
+        | Message::SearchObjects { auth_token, .. }
+        | Message::ReleaseHolder { auth_token, .. } => auth_token.take(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadStage {
+    Check,
+    /// A preflight reads this node's S3 endpoint before it runs.
+    Endpoint(Option<AuthContext>, Box<ReferenceNodeRequest>),
+    Read,
+}
+
+/// Checks the caller `peer` forwarded, then answers its read; a node without a realm, or a
+/// graph read without the graph store, answers unavailable.
 #[derive(Debug, PartialEq)]
 pub(crate) struct CallerReadOperation {
     peer: NodeId,
-    realm_id: Option<RealmId>,
-    token: Option<AuthToken>,
-    read: Option<CallerRead>,
+    node: ServeNode,
+    request: Option<Message>,
     reply: ReadReply,
+    stage: ReadStage,
 }
 
-type ReadTurn = Result<Next<MetadataTransportMessage>, IoError>;
+type ReadTurn = Result<Next<Message>, IoError>;
 
 impl CallerReadOperation {
-    pub(crate) fn new(
-        (peer, realm_id): (NodeId, Option<RealmId>),
-        token: Option<AuthToken>,
-        read: CallerRead,
-    ) -> Self {
+    pub(crate) fn new(peer: NodeId, node: ServeNode, request: Message, reply: ReadReply) -> Self {
         Self {
             peer,
-            realm_id,
-            token,
-            reply: ReadReply::of(&read),
-            read: Some(read),
+            node,
+            request: Some(request),
+            reply,
+            stage: ReadStage::Check,
         }
     }
 
-    fn run(&mut self, realm_id: RealmId, auth: Option<AuthContext>, read: CallerRead) -> ReadTurn {
-        let call = match read {
-            CallerRead::Identifier(query) => {
+    fn refused(&self, error: MetadataReadError) -> ReadTurn {
+        Ok(Next::Done(self.reply.refused(error)))
+    }
+
+    fn call(&mut self, call: IoCall) -> ReadTurn {
+        self.stage = ReadStage::Read;
+        Ok(Next::Call(call))
+    }
+
+    fn run(&mut self, (node, realm_id): (NodeId, RealmId), auth: Option<AuthContext>) -> ReadTurn {
+        let request = self.request.take().ok_or(IoError::Unexpected {
+            expected: "a forwarded read",
+            got: "none",
+        })?;
+        let call = match (request, auth) {
+            (
+                Message::LookupIdentifier {
+                    kind,
+                    value,
+                    endpoint,
+                    ..
+                },
+                auth,
+            ) => {
+                let query = IdentifierQuery {
+                    kind,
+                    value,
+                    endpoint,
+                };
                 IoCall::child(IdentifierLookupOperation::new(realm_id, auth, query))
             }
-            CallerRead::Links(request) => {
+            (Message::DataLinks { request, .. }, auth) => {
                 IoCall::child(LinksLocalOperation::new(realm_id, auth, *request))
             }
-            CallerRead::Owner(_) if auth.is_none() => {
-                return Ok(Next::Done(
-                    self.reply.refused(MetadataReadError::Unauthorized),
-                ));
+            (Message::BucketOwner { bucket, .. }, Some(_)) => {
+                IoCall::child(GetBucketOperation::new(bucket))
             }
-            CallerRead::Owner(bucket) => IoCall::child(GetBucketOperation::new(bucket)),
-            CallerRead::Preview { set_id, limit } => IoCall::child(SetPreviewOperation::new(
+            (Message::SetPreview { set_id, limit, .. }, auth) => IoCall::child(
+                SetPreviewOperation::new((realm_id, auth), set_id, None, limit),
+            ),
+            (
+                Message::QueryGraphs {
+                    graph_iris, sparql, ..
+                },
+                auth,
+            ) => IoCall::child(LocalQueryOperation::new(
                 (realm_id, auth),
-                set_id,
-                None,
-                limit,
+                graph_iris,
+                sparql,
             )),
+            (
+                Message::SearchGraphs {
+                    graph_iris,
+                    query,
+                    limit,
+                    group_id,
+                    ..
+                },
+                auth,
+            ) => {
+                let ask = (query, limit.clamp(1, MAX_PAGINATION_DEPTH));
+                let scope = (graph_iris, group_id);
+                IoCall::child(LocalSearchOperation::new(
+                    (realm_id, auth),
+                    scope,
+                    ask,
+                    None,
+                ))
+            }
+            (
+                Message::FilteredSearchGraphs {
+                    graph_iris,
+                    query,
+                    limit,
+                    predicate_iri,
+                    object_iri,
+                    group_id,
+                    ..
+                },
+                auth,
+            ) => {
+                let ask = (query, limit.clamp(1, MAX_PAGINATION_DEPTH));
+                let scope = (graph_iris, group_id);
+                let reference = Some((predicate_iri, object_iri));
+                IoCall::child(LocalSearchOperation::new(
+                    (realm_id, auth),
+                    scope,
+                    ask,
+                    reference,
+                ))
+            }
+            (Message::ReferencePreflight { request, .. }, auth) => {
+                self.stage = ReadStage::Endpoint(auth, request);
+                return Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![
+                    node,
+                ]))));
+            }
+            (
+                Message::SearchBuckets {
+                    query,
+                    key,
+                    extras,
+                    limit,
+                    group_id,
+                    start_after,
+                    database,
+                    ..
+                },
+                Some(auth),
+            ) => IoCall::child(LocalBucketSearch::new(SearchBucketsInput {
+                auth,
+                realm_id,
+                node_id: node,
+                query,
+                key,
+                extras,
+                limit,
+                group_id,
+                start_after: start_after.map(Into::into),
+                database,
+            })),
+            (
+                Message::SearchObjects {
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    start_after,
+                    as_of,
+                    ..
+                },
+                Some(auth),
+            ) => {
+                let input = SearchObjectsInput {
+                    auth,
+                    realm_id,
+                    node_id: node,
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    start_after,
+                    as_of,
+                };
+                IoCall::child(SearchObjectsOperation::new(input, self.node.indexed))
+            }
+            (Message::ReleaseHolder { bucket, ask, .. }, Some(auth)) => {
+                let answer =
+                    HolderAnswerOperation::new((realm_id, node), &auth, (bucket.as_str(), ask));
+                IoCall::child(answer)
+            }
+            // The owner of a bucket and the searches need a known caller.
+            _ => return self.refused(MetadataReadError::Unauthorized),
         };
-        Ok(Next::Call(call))
+        self.call(call)
     }
 }
 
 impl Operation for CallerReadOperation {
-    type Output = MetadataTransportMessage;
+    type Output = Message;
     type Error = IoError;
 
     fn first(&mut self) -> ReadTurn {
-        let Some(realm_id) = self.realm_id else {
-            return Ok(Next::Done(
-                self.reply.refused(MetadataReadError::Unavailable),
-            ));
+        let graph_read = matches!(self.reply, ReadReply::Query | ReadReply::Search);
+        let Some((_, realm_id)) = self.node.local else {
+            return self.refused(MetadataReadError::Unavailable);
         };
-        let check = ReadPeerOperation::new((self.peer, realm_id), self.token.take(), false);
-        Ok(Next::Call(IoCall::child(check)))
+        if graph_read && !self.node.graph {
+            return self.refused(MetadataReadError::Unavailable);
+        }
+        let caller = (self.peer, realm_id);
+        let token = self.request.as_mut().and_then(take_token);
+        let check = match self.reply.reader() {
+            Some(reader) => IoCall::child(SearchPeerOperation::new(caller, token, reader)),
+            None => IoCall::child(ReadPeerOperation::new(caller, token, false)),
+        };
+        Ok(Next::Call(check))
     }
 
     fn next(&mut self, result: IoResult) -> ReadTurn {
-        let (Some(realm_id), Some(read)) = (self.realm_id, self.read.take()) else {
-            return self.reply.answer(result).map(Next::Done);
-        };
-        match result.child::<Option<AuthContext>, MetadataReadError>()? {
-            Ok(auth) => self.run(realm_id, auth, read),
-            Err(error) => Ok(Next::Done(self.reply.refused(error))),
+        let local = self.node.local.ok_or(IoError::Unexpected {
+            expected: "this node's realm",
+            got: "none",
+        })?;
+        match std::mem::replace(&mut self.stage, ReadStage::Read) {
+            ReadStage::Check => {
+                let caller = match self.reply.reader() {
+                    Some(_) => (result.child::<AuthContext, MetadataReadError>()?).map(Some),
+                    None => result.child::<Option<AuthContext>, MetadataReadError>()?,
+                };
+                match caller {
+                    Ok(auth) => self.run(local, auth),
+                    Err(error) => self.refused(error),
+                }
+            }
+            ReadStage::Endpoint(auth, request) => {
+                let (node, realm_id) = local;
+                let infos = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+                let endpoint = (infos.ok())
+                    .and_then(|mut infos| infos.remove(&node))
+                    .and_then(|info| info.urls.s3);
+                let preflight =
+                    references_preflight_local((realm_id, node), auth, *request, endpoint);
+                self.call(IoCall::child(preflight))
+            }
+            ReadStage::Read => self.reply.answer(result).map(Next::Done),
         }
     }
 }

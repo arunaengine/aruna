@@ -11,15 +11,25 @@ use aruna_core::realm_vault::RealmSecretRef;
 use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
-use self::reads::{CallerRead, CallerReadOperation};
+use self::reads::{CallerReadOperation, ReadReply};
 use crate::distribution::imports::{HandedImport, StagingSpecOperation};
-use crate::metadata::identifier_lookup::IdentifierQuery;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::promotion::{PromotionAnswer, PromotionRequest, ServePromotionOperation};
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
 use crate::replication::page::PageAnswer;
 use crate::replication::page::deliver::ServePageOperation;
 use crate::replication::queue::BlobQueueError;
+
+/// What this node offers the requests it serves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ServeNode {
+    /// This node and its realm, when it serves one.
+    pub local: Option<(NodeId, RealmId)>,
+    /// Whether the graph store runs here.
+    pub graph: bool,
+    /// Whether an object search may use the range indexes.
+    pub indexed: bool,
+}
 
 /// A reply and, for an export, the body sent after it.
 pub type ServedReply = (MetadataTransportMessage, Option<Vec<u8>>);
@@ -104,12 +114,11 @@ impl Waiting {
     }
 }
 
-/// Answers one metadata request `peer` sent to this node; `local` names this node and its
-/// realm when it serves one.
+/// Answers one metadata request `peer` sent to this node.
 #[derive(Debug, PartialEq)]
 pub struct ServeRequestOperation {
     peer: NodeId,
-    local: Option<(NodeId, RealmId)>,
+    node: ServeNode,
     message: Option<MetadataTransportMessage>,
     waiting: Option<Waiting>,
 }
@@ -117,14 +126,10 @@ pub struct ServeRequestOperation {
 type ServeTurn = Result<Next<ServedReply>, ServeError>;
 
 impl ServeRequestOperation {
-    pub fn new(
-        peer: NodeId,
-        local: Option<(NodeId, RealmId)>,
-        message: MetadataTransportMessage,
-    ) -> Self {
+    pub fn new(peer: NodeId, node: ServeNode, message: MetadataTransportMessage) -> Self {
         Self {
             peer,
-            local,
+            node,
             message: Some(message),
             waiting: None,
         }
@@ -135,19 +140,9 @@ impl ServeRequestOperation {
         Ok(Next::Call(call))
     }
 
-    fn read(
-        &mut self,
-        token: Option<aruna_core::metadata::AuthToken>,
-        read: CallerRead,
-    ) -> ServeTurn {
-        let caller = (self.peer, self.local.map(|(_, realm_id)| realm_id));
-        let read = CallerReadOperation::new(caller, token, read);
-        self.call(Waiting::Read, IoCall::child(read))
-    }
-
     // A realm request needs this node's realm; without one it answers unavailable.
     fn realm(&mut self, ask: RealmAsk, serve: impl FnOnce(RealmId, NodeId) -> IoCall) -> ServeTurn {
-        match self.local {
+        match self.node.local {
             Some((node, realm_id)) => self.call(Waiting::Realm(ask), serve(realm_id, node)),
             None => Ok(Next::Done((
                 ask.refused(MetadataReadError::Unavailable),
@@ -167,32 +162,11 @@ impl Operation for ServeRequestOperation {
             expected: "a request",
             got: "none",
         })?;
+        if let Some(reply) = ReadReply::of(&message) {
+            let read = CallerReadOperation::new(peer, self.node, message, reply);
+            return self.call(Waiting::Read, IoCall::child(read));
+        }
         match message {
-            MetadataTransportMessage::LookupIdentifier {
-                auth_token,
-                kind,
-                value,
-                endpoint,
-            } => {
-                let query = IdentifierQuery {
-                    kind,
-                    value,
-                    endpoint,
-                };
-                self.read(auth_token, CallerRead::Identifier(query))
-            }
-            MetadataTransportMessage::DataLinks {
-                auth_token,
-                request,
-            } => self.read(auth_token, CallerRead::Links(request)),
-            MetadataTransportMessage::BucketOwner { auth_token, bucket } => {
-                self.read(auth_token, CallerRead::Owner(bucket))
-            }
-            MetadataTransportMessage::SetPreview {
-                auth_token,
-                set_id,
-                limit,
-            } => self.read(auth_token, CallerRead::Preview { set_id, limit }),
             MetadataTransportMessage::StagingSpec {
                 transfer_id,
                 job_id,
@@ -201,7 +175,7 @@ impl Operation for ServeRequestOperation {
                 self.call(Waiting::Spec, IoCall::child(spec))
             }
             MetadataTransportMessage::ReferencePage { page } => {
-                let serve = ServePageOperation::new(self.local, peer, *page);
+                let serve = ServePageOperation::new(self.node.local, peer, *page);
                 self.call(Waiting::Page, IoCall::child(serve))
             }
             MetadataTransportMessage::HandRealmKey { key } => {
