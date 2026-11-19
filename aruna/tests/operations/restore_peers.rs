@@ -9,7 +9,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
-use aruna_operations::shard::restore::irokle::TopicId;
+use irokle::TopicId;
 use aruna_operations::shard::restore_plan::ShardRestoreCursor;
 use aruna_operations::tests::shard::flat_config;
 use std::sync::Arc;

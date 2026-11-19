@@ -27,9 +27,9 @@ use crate::shard::restore::{RestorePassOperation, RestoredPass};
 use crate::shard::restore_plan::{ShardRestoreCursor, sync_eligible_node};
 
 /// Shortest wait between two bounded recovery passes while work remains local.
-pub(crate) const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
+pub const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
 /// Longest wait between passes once the remainder is blocked on absent peers.
-pub(crate) const RECOVERY_RETRY_MAX: Duration = Duration::from_secs(30);
+pub const RECOVERY_RETRY_MAX: Duration = Duration::from_secs(30);
 /// Longest time a waiting recovery takes to notice a stop.
 const STOP_CHECK: Duration = Duration::from_secs(1);
 

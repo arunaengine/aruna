@@ -28,7 +28,7 @@ use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::{unexpected, unexpected_event};
 
-pub(crate) const OUTBOX_BATCH_SIZE: usize = 512;
+pub const OUTBOX_BATCH_SIZE: usize = 512;
 pub const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
