@@ -5,7 +5,6 @@
 use std::time::Duration;
 
 pub mod backend_import;
-pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
 pub mod demand;
@@ -33,7 +32,6 @@ pub mod persistent_id;
 pub mod protocol;
 pub mod prune;
 pub mod quota;
-pub mod read_access;
 pub mod recent;
 pub mod records;
 pub mod remote_key;

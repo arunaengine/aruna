@@ -17,9 +17,9 @@ use aruna_core::structs::storage::origin::SourcePin;
 use serde::Serialize;
 use ulid::Ulid;
 
-use crate::jobs::read_access::SourceReadError;
 use crate::jobs::records::verify::FamilyView;
 use crate::realm::peer_trust::is_sync_eligible;
+use crate::s3::object::read_access::SourceReadError;
 use aruna_core::job_request::{
     self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError,
 };

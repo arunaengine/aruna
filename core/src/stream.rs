@@ -12,6 +12,8 @@ use std::task::{Context, Poll};
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+/// A stream of byte chunks a backend reads or writes.
+pub type ByteStream = BackendStream<Result<bytes::Bytes, StreamError>>;
 
 #[derive(Debug)]
 pub struct StreamError(pub BoxError);

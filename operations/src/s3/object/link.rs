@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
+use aruna_core::stream::ByteStream;
 use std::ops::Range;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -27,15 +28,13 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::delegate::DelegationInput;
-use crate::jobs::read_access::SourceReadError;
-use crate::jobs::read_access::SourceReadOperation;
-use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
@@ -296,7 +295,7 @@ impl ReadTargetOperation {
         }
     }
 
-    fn read(&mut self) -> LinkTurn<ViewStream> {
+    fn read(&mut self) -> LinkTurn<ByteStream> {
         let arn = &self.target.arn;
         let range = self.range.take();
         if arn.node_id != self.node.local {
@@ -324,19 +323,19 @@ impl ReadTargetOperation {
 }
 
 impl Operation for ReadTargetOperation {
-    type Output = ViewStream;
+    type Output = ByteStream;
     type Error = LinkError;
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
 
-    fn first(&mut self) -> LinkTurn<ViewStream> {
+    fn first(&mut self) -> LinkTurn<ByteStream> {
         let check = AuthorizeTargetOperation::new(&self.caller.auth, &self.target, READ_OPERATION);
         Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn next(&mut self, result: IoResult) -> LinkTurn<ViewStream> {
+    fn next(&mut self, result: IoResult) -> LinkTurn<ByteStream> {
         match self.step {
             ReadTargetStep::Authorize => {
                 result.child::<(), LinkError>()??;

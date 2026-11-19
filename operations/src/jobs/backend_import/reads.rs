@@ -32,7 +32,7 @@ use super::{
     Claim, Exact, Hashed, ImportJob, ItemError, LIST_PAGE, PageReads, TWIN_SCAN, etag_differs,
     free_path, hash_failure, item, parse, read_listed, write_intents,
 };
-use crate::jobs::blob_request::BlobRequest;
+use crate::blob::request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::jobs::page_intents::intent_path;
 use crate::s3::imports::shared::SharedRule;

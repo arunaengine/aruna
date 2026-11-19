@@ -14,7 +14,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
-use aruna_core::stream::BackendStream;
+use aruna_core::stream::ByteStream;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobId, JobPayload,
     JobRecord, credential_job_id,
@@ -26,13 +26,12 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::jobs::read_access::SourceReadError;
-use crate::jobs::read_access::SourceReadOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
+use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
@@ -40,8 +39,6 @@ use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;
-
-pub type ViewStream = BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ViewError {
@@ -538,7 +535,7 @@ pub struct ViewEntryOperation {
     step: EntryStep,
 }
 
-type EntryNext = Result<Next<Option<ViewStream>>, ViewError>;
+type EntryNext = Result<Next<Option<ByteStream>>, ViewError>;
 
 impl ViewEntryOperation {
     pub fn head(auth: AuthContext, entry: ViewEntry, local: NodeId) -> Self {
@@ -595,7 +592,7 @@ impl ViewEntryOperation {
 }
 
 impl Operation for ViewEntryOperation {
-    type Output = Option<ViewStream>;
+    type Output = Option<ByteStream>;
     type Error = ViewError;
 
     fn first(&mut self) -> EntryNext {
