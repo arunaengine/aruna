@@ -5,10 +5,9 @@
 
 #[cfg(test)]
 use crate::notifications::inbox::UpsertInboxOperation;
-use aruna_core::id::NodeId;
-use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -16,6 +15,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_drivers::driver::{DriverContext, drive};
 #[cfg(test)]

@@ -1190,7 +1190,10 @@ mod authorization_tests {
 
     fn stranger(fixture: &Fixture) -> AuthContext {
         AuthContext {
-            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(5, 5), fixture.auth.realm_id),
+            user_id: aruna_core::user::id::UserId::local(
+                Ulid::from_parts(5, 5),
+                fixture.auth.realm_id,
+            ),
             realm_id: fixture.auth.realm_id,
             path_restrictions: None,
             session: None,

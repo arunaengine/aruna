@@ -15,7 +15,8 @@ fn binds_repository_login() {
     use crate::structs::identity::auth::AuthContext;
     use crate::structs::identity::realm::RealmId;
     let key = CredentialEncryptionKey::derive(&[1; 32]);
-    let user = crate::user::id::UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32]));
+    let user =
+        crate::user::id::UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32]));
     let group = Ulid::from_bytes([4; 16]);
     let connector = Ulid::from_bytes([5; 16]);
     let endpoint = "https://zenodo.org/api/";

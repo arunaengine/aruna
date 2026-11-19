@@ -738,7 +738,9 @@ mod tests {
             let bucket = BucketInfo {
                 group_id: Ulid::from_parts(2, 2),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
-                created_by: aruna_core::user::id::UserId::nil(snapshot.statements[0].statement.realm_id),
+                created_by: aruna_core::user::id::UserId::nil(
+                    snapshot.statements[0].statement.realm_id,
+                ),
                 cors_configuration: None,
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),

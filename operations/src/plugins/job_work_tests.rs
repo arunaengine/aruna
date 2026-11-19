@@ -87,7 +87,8 @@ async fn status_from_row() {
     }
     // A reinstall under the same id has another account and does not see the job.
     let mut other = install.clone();
-    other.account = aruna_core::user::id::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
+    other.account =
+        aruna_core::user::id::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
     let foreign = job_status(&fixture.ctx, (&other, local), &id.to_string()).await;
     assert_eq!(
         foreign.map(drop).map_err(|e| e.kind),

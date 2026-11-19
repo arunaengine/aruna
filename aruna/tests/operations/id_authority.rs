@@ -592,7 +592,10 @@ fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
     }
 }
 
-fn active_mapping(document_id: Ulid, minted_by: aruna_core::user::id::UserId) -> PersistentIdMapping {
+fn active_mapping(
+    document_id: Ulid,
+    minted_by: aruna_core::user::id::UserId,
+) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,
@@ -606,7 +609,10 @@ fn active_mapping(document_id: Ulid, minted_by: aruna_core::user::id::UserId) ->
     mapping
 }
 
-fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::user::id::UserId) -> PersistentIdMapping {
+fn withdrawn_mapping(
+    document_id: Ulid,
+    minted_by: aruna_core::user::id::UserId,
+) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,

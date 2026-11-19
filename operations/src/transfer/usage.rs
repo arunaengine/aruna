@@ -15,7 +15,9 @@ pub fn held_ranges(bucket: &str) -> HeldRangesOperation {
 mod tests {
     use super::*;
     use crate::replication::members::BoundRecordOperation;
-    use crate::transfer::charged_ranges::{HeldRange, UsageError, charged_rows, sum_held, sum_rows};
+    use crate::transfer::charged_ranges::{
+        HeldRange, UsageError, charged_rows, sum_held, sum_rows,
+    };
     use crate::transfer::replica_shares::{
         BindingShareOperation, GroupShare, ReplicaSharesOperation,
     };

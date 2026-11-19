@@ -5,6 +5,7 @@
 use super::storage::*;
 use super::*;
 use crate::test_support::test_endpoint;
+use ::irokle::sync::SyncData;
 use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::admin_checks::{has_write_permission, revocation_origin_known};
 use aruna_core::admin_documents::{
@@ -74,7 +75,6 @@ use aruna_core::sync_checks::{
     validate_watch_upsert,
 };
 use aruna_core::user::id::UserId;
-use ::irokle::sync::SyncData;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use tempfile::TempDir;

@@ -25,8 +25,8 @@ use ulid::Ulid;
 
 use super::access::Repository;
 use super::calls::{
-    StageTimes, busy_call, canonical_answer, canonical_call, configured_call, forget_call, git_call,
-    git_event, git_flag, has_store, kept_projection, last_call, metadata_event, noted,
+    StageTimes, busy_call, canonical_answer, canonical_call, configured_call, forget_call,
+    git_call, git_event, git_flag, has_store, kept_projection, last_call, metadata_event, noted,
     refresh_once_call, remember_call, timed_call, timed_outcome,
 };
 use super::generate::{checkpoint, generate};

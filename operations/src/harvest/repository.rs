@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageReadError};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
 use aruna_core::structs::execution::harvest::{

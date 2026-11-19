@@ -16,8 +16,8 @@ use aruna_core::structs::placement::policy::PlacementPolicyRef;
 
 use super::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::placement::policy::gate::{
-    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome, gate_decision,
-    union_refs, write_gate,
+    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
+    gate_decision, union_refs, write_gate,
 };
 use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::mutate_placement::node_kind;

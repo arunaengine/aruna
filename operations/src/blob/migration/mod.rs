@@ -762,7 +762,11 @@ impl MigrateVersionOperation {
     }
 
     /// The source bytes are known, so the intent proves the copy even if no later record lands.
-    fn write_intent(&self, target: &PlainTarget, created_by: aruna_core::user::id::UserId) -> WriteIntent {
+    fn write_intent(
+        &self,
+        target: &PlainTarget,
+        created_by: aruna_core::user::id::UserId,
+    ) -> WriteIntent {
         let source = self.old.as_ref().and_then(|old| old.get_blake3());
         WriteIntent {
             key: self.version_key.key.clone(),

@@ -1763,7 +1763,8 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let node_id = aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    let node_id =
+        aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
 
     Ok(StatusCode::NO_CONTENT)

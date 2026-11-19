@@ -436,4 +436,3 @@ impl Operation for ServeRequestOperation {
 #[cfg(test)]
 #[path = "serve_tests.rs"]
 mod tests;
-

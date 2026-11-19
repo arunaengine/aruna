@@ -665,7 +665,8 @@ async fn creates_tombstone() {
         outbound_handle: None,
     };
 
-    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id =
+        aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();
@@ -818,7 +819,8 @@ async fn deletes_version() {
         outbound_handle: None,
     };
 
-    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id =
+        aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();

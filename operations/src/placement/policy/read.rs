@@ -265,7 +265,11 @@ impl ReadPolicyOperation {
     }
 
     /// A refused candidate ends the read only when no holder is left to ask.
-    fn refuse(&mut self, error: ReadPolicyError, remaining: Vec<aruna_core::id::NodeId>) -> ReadTurn {
+    fn refuse(
+        &mut self,
+        error: ReadPolicyError,
+        remaining: Vec<aruna_core::id::NodeId>,
+    ) -> ReadTurn {
         if remaining.is_empty() {
             return Err(error);
         }

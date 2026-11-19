@@ -1327,7 +1327,10 @@ mod tests {
             },
             publication: PolicyPublication {
                 publisher: secret.public(),
-                created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([15_u8; 16]), realm_id),
+                created_by: aruna_core::user::id::UserId::local(
+                    Ulid::from_bytes([15_u8; 16]),
+                    realm_id,
+                ),
                 created_at_ms: 42,
                 event_id: Ulid::from_bytes([12_u8; 16]),
                 config_digest: [13_u8; 32],
@@ -1685,7 +1688,8 @@ mod tests {
     #[test]
     fn decodes_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
-        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
         let upload = MultipartUpload {
             backend: BackendRef::node_default(),
             storage_class: None,
@@ -1725,7 +1729,8 @@ mod tests {
     #[test]
     fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
-        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
         let key = MultipartPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
         let part = MultipartPart {
             part_number: 5,
@@ -2020,7 +2025,8 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
-        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
         let head_value =
             aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(

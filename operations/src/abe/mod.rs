@@ -528,7 +528,8 @@ mod tests {
     #[test]
     fn foreign_user_starts() {
         // A federated user served by realm 1 requests keys there under the ordinary checks.
-        let foreign = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign =
+            aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let auth = AuthContext {
             user_id: foreign,
             realm_id: RealmId([1; 32]),
@@ -939,7 +940,8 @@ mod tests {
             Err(KeyError::Denied)
         );
 
-        let foreign = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign =
+            aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         assert_eq!(snapshot(request.clone(), foreign, None, &config), Ok(()));
         let missing = snapshot(request.clone(), user, None, &config);

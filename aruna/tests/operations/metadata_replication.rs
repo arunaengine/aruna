@@ -1417,7 +1417,8 @@ async fn read_holder_set(
     node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
-) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::id::NodeId>)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::id::NodeId>)>, Box<dyn std::error::Error>>
+{
     let key = metadata_registry_key(group_id, document_id);
     match node
         .context
