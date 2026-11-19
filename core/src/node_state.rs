@@ -278,6 +278,8 @@ pub const DEPARTURE_KEY: &[u8] = b"departure";
 /// The operator's own compute drain, kept apart from an observed departure so
 /// returning to placement can never silently undrain a node an operator drained.
 pub const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
+/// The row that holds the start fence up: after a start, until the node caught up.
+pub const START_FENCE_KEY: &[u8] = b"start_fence";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DrainStateError {
@@ -292,9 +294,11 @@ pub enum DrainStateError {
 pub struct DrainState {
     pub operator_draining: bool,
     pub departure: Option<ComputeDepartureReport>,
+    /// The start fence holds, so the node advertises a drain until it caught up.
+    pub start_fenced: bool,
 }
 
-/// Reads both drain rows in one batch read.
+/// Reads the drain rows in one batch read.
 #[derive(Debug, Default, PartialEq)]
 pub struct DrainStateOperation;
 
@@ -304,7 +308,7 @@ impl DrainStateOperation {
     }
 }
 
-/// The operator drain row, then the departure report row.
+/// The operator drain row, the departure report row, then the start fence row.
 fn drain_reads() -> Vec<(KeySpace, Key)> {
     let read = |key: &[u8]| {
         (
@@ -312,7 +316,11 @@ fn drain_reads() -> Vec<(KeySpace, Key)> {
             Key::from(key.to_vec()),
         )
     };
-    vec![read(OPERATOR_DRAIN_KEY), read(DEPARTURE_KEY)]
+    vec![
+        read(OPERATOR_DRAIN_KEY),
+        read(DEPARTURE_KEY),
+        read(START_FENCE_KEY),
+    ]
 }
 
 impl Operation for DrainStateOperation {
@@ -333,6 +341,7 @@ impl Operation for DrainStateOperation {
         };
         let mut values = values.into_iter();
         let (drain, departure) = (values.next().flatten(), values.next().flatten());
+        let fence = values.next().flatten();
         let departure = departure
             .map(|bytes| postcard::from_bytes::<ComputeDepartureReport>(bytes.as_ref()))
             .transpose()
@@ -340,6 +349,7 @@ impl Operation for DrainStateOperation {
         Ok(Next::Done(DrainState {
             operator_draining: drain.is_some(),
             departure,
+            start_fenced: fence.is_some(),
         }))
     }
 }
@@ -432,15 +442,20 @@ mod drain_tests {
     }
 
     #[test]
-    fn reads_both_rows() {
+    fn reads_drain_rows() {
         let encoded = Value::from(postcard::to_allocvec(&report()).unwrap());
         let cases = [
-            (vec![None, None], DrainState::default()),
+            (vec![None, None, None], DrainState::default()),
             (
-                vec![Some(Value::from(vec![1])), Some(encoded)],
+                vec![
+                    Some(Value::from(vec![1])),
+                    Some(encoded),
+                    Some(Value::from(vec![])),
+                ],
                 DrainState {
                     operator_draining: true,
                     departure: Some(report()),
+                    start_fenced: true,
                 },
             ),
         ];
@@ -456,7 +471,7 @@ mod drain_tests {
     #[test]
     fn refuses_bad_answers() {
         let mut garbled = DrainStateOperation::new();
-        let values = vec![None, Some(Value::from(vec![0xff; 3]))];
+        let values = vec![None, Some(Value::from(vec![0xff; 3])), None];
         let answer = garbled.next(IoResult::Values(values));
         assert!(matches!(answer, Err(DrainStateError::Decode(_))));
         let mut wrong = DrainStateOperation::new();

@@ -592,6 +592,7 @@ mod tests {
         outcome::<_, DrainStateError>(Ok(DrainState {
             operator_draining,
             departure: None,
+            start_fenced: false,
         }))
     }
 

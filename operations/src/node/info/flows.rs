@@ -243,7 +243,7 @@ impl Operation for SeedInfoOperation {
             }
             SeedStep::Drain => {
                 let drain = child_answer::<DrainState, DrainStateError>(result)?;
-                self.compute_draining = drain.operator_draining;
+                self.compute_draining = drain.operator_draining || drain.start_fenced;
                 self.telemetry()
             }
             SeedStep::Telemetry => self.write(child_answer::<_, InfoFlowError>(result)?),
@@ -932,6 +932,7 @@ mod tests {
         child::<_, DrainStateError>(Ok(DrainState {
             operator_draining,
             departure: None,
+            start_fenced: false,
         }))
     }
 
@@ -955,6 +956,37 @@ mod tests {
         let mut operation = SeedInfoOperation::new(REALM, node(), urls(), facts(), publish);
         operation.stamp(NOW);
         operation
+    }
+
+    // Behind the start fence the node advertises a drain, so planners skip it until it caught up.
+    #[test]
+    fn fence_advertises_draining() {
+        let mut operation = seed(true);
+        operation.first().unwrap();
+        operation
+            .next(child::<_, GetConfigError>(Ok(config())))
+            .unwrap();
+        operation.next(row(Some(document(false)))).unwrap();
+        let inputs_read = child::<_, InfoFlowError>(Ok(inputs(Vec::new())));
+        operation.next(inputs_read).unwrap();
+        let fenced = child::<_, DrainStateError>(Ok(DrainState {
+            operator_draining: false,
+            departure: None,
+            start_fenced: true,
+        }));
+        assert_eq!(operation.next(fenced), Ok(Next::Call(telemetry_call())));
+        let mut sampled = telemetry();
+        sampled.utilization.download_slots = Some(Default::default());
+        let answer = operation.next(child::<_, InfoFlowError>(Ok(sampled)));
+        let document = NodeInfoDocument {
+            updated_at_ms: NOW,
+            epoch: epoch(4),
+            compute_draining: true,
+            reservation: inputs(Vec::new()).reservation,
+            ..document(false)
+        };
+        let write = IoCall::child(InfoWriteOperation::seed(REALM, document));
+        assert_eq!(answer, Ok(Next::Call(write)));
     }
 
     #[test]

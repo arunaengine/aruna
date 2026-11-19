@@ -11,6 +11,7 @@ use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::node_state::START_FENCE_KEY;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobId, left_executions};
 use aruna_core::structs::identity::realm::RealmId;
@@ -23,8 +24,6 @@ use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::secrets::owner::WriterView;
 
-/// The node-local row that holds the start fence up.
-pub const START_FENCE_KEY: &[u8] = b"start_fence";
 /// Delay after which fenced work is looked at again.
 pub const FENCE_RECHECK: Duration = Duration::from_secs(10);
 /// Reservation rows one page of the lift reads.
