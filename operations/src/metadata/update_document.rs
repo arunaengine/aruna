@@ -39,7 +39,7 @@ use ulid::Ulid;
 use crate::metadata::MetadataPhaseSource;
 use crate::metadata::call_results::{effect_event, page_rows, read_values};
 use crate::metadata::profile::rules::{
-    batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
+    batch_adds_profile, not_profiled_status, profile_path_rule, stale_status, stamp_unprofiled,
     submission_profile_tag,
 };
 use crate::metadata::repository::{
@@ -457,6 +457,7 @@ impl UpdateDocumentOperation {
             opening: None,
             fenced: Vec::new(),
             stage: CommitStage::Registry,
+            now_ms: 0,
         })
     }
 
@@ -545,6 +546,7 @@ pub struct UpdateCommitOperation {
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
     stage: CommitStage,
+    now_ms: u64,
 }
 
 impl UpdateCommitOperation {
@@ -700,6 +702,7 @@ impl UpdateCommitOperation {
         };
         profile_status.document_id = event.record.document_id;
         profile_status.dataset_revision = event.event_id;
+        stamp_unprofiled(&mut profile_status, self.now_ms);
         // The merged render is only known once the batch materializes, so the
         // accepted status carries no digest to be fresh against yet.
         profile_status.dataset_digest = None;
@@ -1093,6 +1096,10 @@ impl UpdateCommitOperation {
 impl Operation for UpdateCommitOperation {
     type Output = MetadataRegistryRecord;
     type Error = UpdateDocumentError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

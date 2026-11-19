@@ -713,7 +713,10 @@ impl ProfileAssessOperation {
         let report =
             checked(effect_event(result)?, None)?.map_err(|error| shacl_failure(error, None))?;
         Ok(Next::Done(MetadataProfilePreview {
-            status: not_profiled_status(self.document_id),
+            status: ProfileValidationStatus {
+                validated_at_ms: Some(self.now_ms),
+                ..not_profiled_status(self.document_id)
+            },
             structural_violations: report
                 .structural
                 .into_iter()

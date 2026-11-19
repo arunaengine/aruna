@@ -13,7 +13,6 @@ use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::metadata::is_rocrate_specification;
 use aruna_core::profile_shapes::CRAQLE_BASE_IRI;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis as now_ms;
 use oxrdf::Dataset;
 use oxrdf::GraphName;
 use oxrdf::NamedNode;
@@ -84,6 +83,7 @@ pub(crate) fn batch_adds_profile(batch: &MetadataBatch) -> bool {
     })
 }
 
+/// The status of a document without a Profile; the commit that keeps it stamps its time.
 pub(crate) fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
     ProfileValidationStatus {
         document_id,
@@ -93,11 +93,18 @@ pub(crate) fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus 
         profile_iri: None,
         profile_revision: None,
         evaluator: EVALUATOR_NAME.to_string(),
-        validated_at_ms: Some(now_ms()),
+        validated_at_ms: None,
         findings: Vec::new(),
         completeness: ProfileValidationCompleteness::Complete,
         stale_reason: None,
         dataset_digest: None,
+    }
+}
+
+/// Stamps a not-profiled status with the time of the commit that keeps it.
+pub(crate) fn stamp_unprofiled(status: &mut ProfileValidationStatus, now_ms: u64) {
+    if status.state == ProfileValidationState::NotProfiled && status.validated_at_ms.is_none() {
+        status.validated_at_ms = Some(now_ms);
     }
 }
 

@@ -42,7 +42,8 @@ use ulid::Ulid;
 use crate::metadata::call_results::{effect_event, read_value, read_values};
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::rules::{
-    crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
+    crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
+    submission_profile_tag,
 };
 use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
@@ -347,6 +348,7 @@ impl CreateDocumentOperation {
             stage: CommitStage::Fence,
             pending: None,
             created: None,
+            now_ms: 0,
         }
     }
 }
@@ -426,6 +428,7 @@ pub struct CreateCommitOperation {
     stage: CommitStage,
     pending: Option<Resolved>,
     created: Option<CreateDocumentResult>,
+    now_ms: u64,
 }
 
 impl CreateCommitOperation {
@@ -643,6 +646,7 @@ impl CreateCommitOperation {
         };
         status.document_id = create_event.record.document_id;
         status.dataset_revision = create_event.event_id;
+        stamp_unprofiled(&mut status, self.now_ms);
         let mut writes = create_projection_entries(&create_event)?;
         writes.push(raw_budget_entry(&raw_budget)?);
         writes.push(create_acceptance_entry(&create_event)?);
@@ -728,6 +732,10 @@ type CommitTurn = Result<Next<CreateDocumentResult>, CreateDocumentError>;
 impl Operation for CreateCommitOperation {
     type Output = CreateDocumentResult;
     type Error = CreateDocumentError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -1288,6 +1296,24 @@ mod tests {
                 event_id: event.event_id,
             }))
         );
+    }
+
+    #[test]
+    fn unprofiled_status_stamped() {
+        // The not-profiled status reads no clock when built, so equal inputs give equal
+        // operations, and the commit stamps it with the runner's time.
+        let (actor, realm_config, config) = held_create(13, "datasets/fast-create");
+        let built = CreateDocumentOperation::new_generated_id(config.clone());
+        assert_eq!(built, CreateDocumentOperation::new_generated_id(config));
+        let mut commit = built.commit_operation();
+        commit.stamp(7);
+        let Ok(Next::Call(IoCall::Write(rows))) = commit_turn(&mut commit, &actor, &realm_config)
+        else {
+            panic!("expected the create writes");
+        };
+        let (_, _, value) = row(&rows, aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE);
+        let status: ProfileValidationStatus = postcard::from_bytes(value).unwrap();
+        assert_eq!(status.validated_at_ms, Some(7));
     }
 
     #[test]
