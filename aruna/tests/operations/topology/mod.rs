@@ -48,6 +48,7 @@ use aruna_core::types::GroupId;
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_drivers::testing::poll_until;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
@@ -1612,8 +1613,8 @@ pub async fn respawn_with_retry(
     dir: &Path,
     hold_shutdown: bool,
 ) -> Result<TestNode, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    let mut last = String::new();
+    let spawned = poll_until(Duration::from_secs(20), async || {
         let spawned = spawn_node_with(
             realm_id,
             Some(secret_key.clone()),
@@ -1621,15 +1622,15 @@ pub async fn respawn_with_retry(
             hold_shutdown,
         );
         match spawned.await {
-            Ok(node) => return Ok(node),
+            Ok(node) => Some(node),
             Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(format!("respawn failed after retries: {error}").into());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                last = error.to_string();
+                None
             }
         }
-    }
+    })
+    .await;
+    spawned.ok_or_else(|| format!("respawn failed after retries: {last}").into())
 }
 
 /// Installs the default realm config with every node as a management node, then repeats

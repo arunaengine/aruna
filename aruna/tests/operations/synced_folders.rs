@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::convergence::HANG_CAP;
 use crate::topology;
 
 use aruna_core::structs::storage::format::Compression;
@@ -26,6 +27,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::testing::poll_until;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
@@ -50,7 +52,7 @@ use aruna_operations::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, offer_directory,
 };
 use futures_util::StreamExt;
-use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
+use topology::{TestResult, Topology, wait_for_convergence, wait_until};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;
@@ -440,20 +442,22 @@ async fn pull_done(
     peer: aruna_core::NodeId,
     token: &AuthToken,
     pull: &SyncPull,
-    mut status: SyncPullStatus,
+    status: SyncPullStatus,
 ) -> TestResult<SyncPullAck> {
-    hang_cap("a sync pull never finished", async {
-        loop {
-            match status {
-                SyncPullStatus::Done(ack) => return Ok(ack),
-                SyncPullStatus::Pending { .. } => {}
-                other => return Err(format!("the pull ended without a version: {other:?}").into()),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            status = pull_status(context, peer, token.clone(), pull).await;
+    let mut first = Some(status);
+    let ended = poll_until(HANG_CAP, async || {
+        let status = match first.take() {
+            Some(status) => status,
+            None => pull_status(context, peer, token.clone(), pull).await,
+        };
+        match status {
+            SyncPullStatus::Done(ack) => Some(Ok(ack)),
+            SyncPullStatus::Pending { .. } => None,
+            other => Some(Err(format!("the pull ended without a version: {other:?}").into())),
         }
     })
-    .await
+    .await;
+    ended.unwrap_or_else(|| panic!("hang cap fired: `a sync pull never finished`"))
 }
 
 /// Two pulls of one device version released together run once, commit it once and answer

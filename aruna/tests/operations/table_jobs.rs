@@ -23,6 +23,7 @@ use aruna_core::jobs::JobRunOutcome;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
+use aruna_drivers::testing::poll_until;
 
 // A job cancelled or shut down while its source's `Retry-After` pauses it ends with that stop,
 // not with a failed attempt.
@@ -32,7 +33,7 @@ async fn paused_job_stops() {
         throttled: true,
         ..Site::ncbi(endpoint)
     };
-    let (endpoint, _site, server) = serve(throttled).await;
+    let (endpoint, site, server) = serve(throttled).await;
     let fixture = Fixture::new(&endpoint, summary_table()).await;
     for (seed, cancel) in [(20u8, true), (21u8, false)] {
         let ctx = fixture.context(seed).await;
@@ -40,8 +41,12 @@ async fn paused_job_stops() {
             true => ctx.cancel.clone(),
             false => ctx.shutdown.clone(),
         };
+        // The source answers each request with a pause, so the run pauses once it asked.
+        let asked = site.requests.lock().unwrap().len();
         let stopping = async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let more = async || (site.requests.lock().unwrap().len() > asked).then_some(());
+            let paused = poll_until(std::time::Duration::from_secs(60), more).await;
+            assert!(paused.is_some(), "the run never asked its source");
             stop.cancel();
         };
         let run = run_staging_job(&ctx, &fixture.spec);
