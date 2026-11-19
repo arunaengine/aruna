@@ -230,7 +230,7 @@ impl GraphHandle {
 }
 
 pub(crate) fn warn_slow_call(operation: &'static str, graph_iri: Option<&str>, duration: Duration) {
-    CRAQLE_LATENCY.record(operation, duration);
+    CRAQLE_LATENCY.record(operation, duration, Instant::now());
     if duration >= SLOW_CALL {
         warn!(
             event = "metadata.backend.slow_call",
