@@ -176,11 +176,23 @@ fn offer_picks_route() {
     let frame = JobRecordFrame::new(records[0].clone()).unwrap();
 
     let mut local = configured(&fixture);
+    local.seed(3);
     let target = ExecutionTargetId {
         node_id: fixture.holder.public(),
         ..launch.target.clone()
     };
-    assert!(is_child(&local.offer(frame.clone(), target, 7)));
+    let here = LaunchNode {
+        local: fixture.holder.public(),
+        realm_id: REALM,
+        now_ms: 5_000,
+        execution_id: Ulid::from_parts(5_000, 4),
+        limits: None,
+    };
+    let admit = AdmitLaunchOperation::new(LaunchFrame::new(records[0].clone()).unwrap(), here);
+    assert_eq!(
+        local.offer(frame.clone(), target, 7),
+        Ok(Next::Call(IoCall::child(admit)))
+    );
     assert_eq!(local.step, RoundStep::AdmittedHere);
 
     let mut remote = configured(&fixture);

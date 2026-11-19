@@ -53,12 +53,12 @@ use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -90,7 +90,7 @@ fn doc_id(seed: u64) -> Ulid {
 }
 
 fn job_id() -> JobId {
-    mint_job_id(
+    fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
