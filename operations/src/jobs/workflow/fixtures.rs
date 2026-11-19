@@ -34,7 +34,7 @@ pub(super) fn job() -> JobId {
     JobId::from_bytes([1; 16])
 }
 
-pub(super) fn token() -> Ulid {
+pub(crate) fn token() -> Ulid {
     Ulid::from_bytes([2; 16])
 }
 
@@ -50,7 +50,7 @@ pub(super) fn group_spec(group_id: Ulid) -> ExecutionSpec {
     ExecutionSpec { group_id, ..spec() }
 }
 
-pub(super) fn spec() -> ExecutionSpec {
+pub(crate) fn spec() -> ExecutionSpec {
     ExecutionSpec {
         group_id: Ulid::from_bytes([3; 16]),
         name: None,
@@ -78,7 +78,7 @@ pub(super) fn record() -> JobRecord {
     JobRecord::new(job(), payload, user, node(), 1, 1, None)
 }
 
-pub(super) fn claimed() -> JobRecord {
+pub(crate) fn claimed() -> JobRecord {
     let mut job = record();
     job.claim = Some(JobClaim {
         holder_node_id: node(),
@@ -188,7 +188,7 @@ pub(super) fn control() -> AttemptControl {
     }
 }
 
-pub(super) fn child<T, E>(result: Result<T, E>) -> IoResult
+pub(crate) fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + std::fmt::Debug + PartialEq + 'static,
     E: Send + std::fmt::Debug + PartialEq + 'static,
@@ -196,7 +196,7 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-pub(super) fn compute(answer: ComputeAnswer) -> IoResult {
+pub(crate) fn compute(answer: ComputeAnswer) -> IoResult {
     IoResult::Event(Box::new(Event::Compute(Box::new(answer))))
 }
 

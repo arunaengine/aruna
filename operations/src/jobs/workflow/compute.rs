@@ -9,7 +9,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 
 /// The call that carries one compute effect.
-pub(super) fn compute_call(effect: ComputeEffect) -> IoCall {
+pub(crate) fn compute_call(effect: ComputeEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Compute(Box::new(effect))))
 }
 
@@ -23,7 +23,7 @@ pub(super) fn attempt_call(backend: &str, fence: &FenceContext, request: Compute
 }
 
 /// The answer of the compute call `result` belongs to.
-pub(super) fn compute_answer(result: IoResult) -> Result<ComputeAnswer, IoError> {
+pub(crate) fn compute_answer(result: IoResult) -> Result<ComputeAnswer, IoError> {
     match result.event()? {
         Event::Compute(answer) => Ok(*answer),
         other => Err(IoError::Unexpected {

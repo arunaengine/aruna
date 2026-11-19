@@ -55,10 +55,10 @@ use settle::{
 };
 use supervise::SuperviseOperation;
 
+use super::device_admission::session_network;
 use super::key_locks::ParkLockedOperation;
 use super::lifecycle::LifecycleError;
 use super::lifecycle::held::HeldReservations;
-use super::lifecycle::ids::session_of;
 use super::lifecycle::updates::PublishProgressOperation;
 use super::store::attempt_intent::AttemptCommit;
 use super::store::job_calls::{
@@ -113,14 +113,10 @@ pub struct ResolveBackendOperation {
 
 impl ResolveBackendOperation {
     pub fn new(spec: &ExecutionSpec, job_id: JobId) -> Self {
-        let network = match spec.tags.get(prepare::NETWORK_TAG_KEY).map(String::as_str) {
-            Some("open") => NetworkAccess::Open,
-            _ => NetworkAccess::Isolated,
-        };
         Self {
             backend: spec.backend.clone(),
             constraint: (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire),
-            session: session_of(spec).map(|_| network),
+            session: session_network(spec),
             job_id,
             receipted: None,
             stored: (0, [0; 32]),
@@ -747,6 +743,6 @@ impl Operation for ExecutionRunOperation {
 }
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod run_tests;

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::LocalAdmission;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 
 use super::attempt_intent::{AttemptCommit, RecordIntentOperation};
@@ -188,6 +189,19 @@ pub fn transition_to_preparing(job_id: JobId, token: Ulid, now_ms: u64) -> Store
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
+        Ok(JobMutation::Persist)
+    })
+}
+
+/// Stores the backend values a device job now starts under, while `token` holds its claim.
+pub fn store_admission(
+    job_id: JobId,
+    token: Ulid,
+    admission: LocalAdmission,
+) -> StoreCall<JobRecord> {
+    change_job(job_id, move |record| {
+        guard_token(record, token)?;
+        record.local_admission = Some(admission.clone());
         Ok(JobMutation::Persist)
     })
 }
