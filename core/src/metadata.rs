@@ -1373,8 +1373,8 @@ pub enum MetadataEffect {
         graph_iri: String,
     },
     ListGraphs,
-    /// Every live registry record of this node, from the metadata handle's cache.
-    CachedRecords,
+    /// Builds the graph store's query indexes when they are missing.
+    EnsureIndexes,
     ContainsGraph {
         graph_iri: String,
     },
@@ -1539,7 +1539,7 @@ impl MetadataEffect {
             MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
-            MetadataEffect::CachedRecords => "cached_records",
+            MetadataEffect::EnsureIndexes => "ensure_indexes",
             MetadataEffect::ContainsGraph { .. } => "contains_graph",
             MetadataEffect::ContainsDot { .. } => "contains_dot",
             MetadataEffect::PlanBatch { .. } => "plan_batch",
@@ -1600,7 +1600,7 @@ impl MetadataEffect {
             | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ListGraphs
-            | MetadataEffect::CachedRecords
+            | MetadataEffect::EnsureIndexes
             | MetadataEffect::CheckStructure { .. }
             | MetadataEffect::CheckProfile { .. }
             | MetadataEffect::CachedShapes { .. }
@@ -1696,10 +1696,8 @@ pub enum MetadataEvent {
     GraphListResult {
         graph_iris: Vec<String>,
     },
-    CachedRecords {
-        records:
-            std::sync::Arc<Vec<crate::structs::storage::metadata_registry::MetadataRegistryRecord>>,
-    },
+    /// The graph store's query indexes exist.
+    IndexesReady,
     ContainsGraphResult {
         graph_iri: String,
         exists: bool,

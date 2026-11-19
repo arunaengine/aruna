@@ -89,6 +89,15 @@ impl GraphHandle {
                     .insert(profile_id, revision, Arc::new(shapes));
                 return MetadataEvent::ProfileShapes { shapes: None };
             }
+            MetadataEffect::EnsureIndexes => {
+                return match self.ensure_query_indexes().await {
+                    Ok(()) => MetadataEvent::IndexesReady,
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
+                };
+            }
             MetadataEffect::FlushGraph => {
                 return match self.flush_persistence().await {
                     Ok(()) => MetadataEvent::GraphFlushed,
@@ -142,10 +151,7 @@ impl GraphHandle {
             effect => effect,
         };
         let graph_iri = effect.graph_iri();
-        if matches!(
-            effect,
-            MetadataEffect::SyncBestEffort { .. } | MetadataEffect::CachedRecords
-        ) {
+        if matches!(effect, MetadataEffect::SyncBestEffort { .. }) {
             return MetadataEvent::Error {
                 graph_iri,
                 error: MetadataError::InvalidEffect,
@@ -1005,7 +1011,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::IriReferences { .. }
         | MetadataEffect::FlushGraph
         | MetadataEffect::MergeRows { .. }
-        | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
+        | MetadataEffect::EnsureIndexes => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

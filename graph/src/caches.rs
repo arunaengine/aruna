@@ -537,6 +537,12 @@ impl crate::GraphHandle {
             .store_lifecycle_deleted(graph_iri, deleted);
     }
 
+    /// Drops a deleted graph's registry rows and marks it deleted.
+    pub fn forget_graph(&self, graph_iri: String) {
+        self.inner.visibility.remove_graph(&graph_iri);
+        (self.inner.visibility).store_lifecycle_deleted(graph_iri, true);
+    }
+
     /// The cached deletion state of `graph_iri`, an expired one included, and its freshness.
     pub fn cached_lifecycle(&self, graph_iri: &str) -> Option<(bool, bool)> {
         self.inner.visibility.lifecycle_deleted_any(graph_iri)

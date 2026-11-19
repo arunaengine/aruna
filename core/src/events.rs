@@ -915,7 +915,7 @@ impl MetadataEvent {
                 QueryResult,
                 GraphDeleted,
                 GraphListResult,
-                CachedRecords,
+                IndexesReady,
                 ContainsGraphResult,
                 ContainsDotResult,
                 VersionedExport,
