@@ -953,8 +953,6 @@ enum InputOutcome {
     Pending(PendingInputResponse),
 }
 
-/// Brings one object into the workspace bucket. A source stored here is
-/// deduplicated inline; one behind a connector is pulled by a job or linked.
 /// The spec of the execution that runs the session. A logical id answers with the request,
 /// while the backend the run was placed on is stored only in its physical execution.
 async fn running_spec(
@@ -1022,6 +1020,8 @@ fn gate_refusal(error: PolicyGateError) -> ServerError {
     }
 }
 
+/// Brings one object into the workspace bucket. A source stored here is
+/// deduplicated inline; one behind a connector is pulled by a job or linked.
 async fn stage_one(
     state: &ServerState,
     auth: &AuthContext,
