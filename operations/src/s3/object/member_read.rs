@@ -644,7 +644,7 @@ impl MemberReadOperation {
             binding,
             object,
             origin: ReadOrigin::Caller,
-            seed: rand::random(),
+            seed: 0,
             now_ms: 0,
             range_id: None,
             coordinator: None,
@@ -935,6 +935,10 @@ impl Operation for MemberReadOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.seed = entropy;
     }
 }
 

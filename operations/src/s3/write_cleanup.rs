@@ -6,6 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
@@ -78,6 +79,8 @@ pub(crate) fn record_rows(
 /// queue, so they are never lost to both.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RollbackWrite {
+    now_ms: u64,
+    ids: IdMint,
     location: BackendLocation,
     queued: bool,
 }
@@ -85,6 +88,8 @@ pub(crate) struct RollbackWrite {
 impl RollbackWrite {
     pub(crate) fn new(location: BackendLocation) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             location,
             queued: false,
         }
@@ -112,12 +117,20 @@ impl Operation for RollbackWrite {
         };
         let location = self.location.clone();
         let work = BlobCleanupWork::DeleteBlob { location };
-        let key = Ulid::generate().to_bytes().to_vec().into();
+        let key = self.ids.mint(self.now_ms).to_bytes().to_vec().into();
         let value = work.to_bytes();
         let value = value.map_err(|error| IoError::Codec(error.to_string()))?;
         let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
         self.queued = true;
         Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -125,6 +138,8 @@ impl Operation for RollbackWrite {
 /// the cleanup worker settles the reservation later and nothing it frees is leaked.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReleaseWrite {
+    now_ms: u64,
+    ids: IdMint,
     id: Ulid,
     reconcile: Option<BlobCleanupWork>,
     queued: bool,
@@ -133,6 +148,8 @@ pub(crate) struct ReleaseWrite {
 impl ReleaseWrite {
     pub(crate) fn new(id: Ulid, reconcile: Option<BlobCleanupWork>) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             id,
             reconcile,
             queued: false,
@@ -169,7 +186,7 @@ impl Operation for ReleaseWrite {
         );
         let key = match &work {
             BlobCleanupWork::ReconcileWrite { location, .. } => location.ulid,
-            _ => Ulid::generate(),
+            _ => self.ids.mint(self.now_ms),
         };
         let value = work.to_bytes();
         let value = value.map_err(|error| IoError::Codec(error.to_string()))?;
@@ -177,6 +194,14 @@ impl Operation for ReleaseWrite {
         let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
         self.queued = true;
         Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

@@ -15,7 +15,6 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -146,6 +145,7 @@ pub fn schedule_drain() -> Effect {
 /// Merges one refresh request into its queued job, in one transaction.
 #[derive(Debug, PartialEq)]
 struct RefreshJobWrite {
+    now_ms: u64,
     refresh: ReferenceRefresh,
     writing: bool,
 }
@@ -163,7 +163,7 @@ impl RefreshJobWrite {
             }),
             Some(Err(_)) | None => Some(ReferenceRefreshRecord::new(
                 self.refresh.clone(),
-                unix_timestamp_millis(),
+                self.now_ms,
             )),
         }
     }
@@ -194,6 +194,10 @@ impl Operation for RefreshJobWrite {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -216,6 +220,7 @@ impl QueueRefreshOperation {
         Ok(Next::Call(IoCall::child(RefreshJobWrite {
             refresh: self.refresh.clone(),
             writing: false,
+            now_ms: 0,
         })))
     }
 
@@ -271,6 +276,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::StorageHandle;
 
     use crate::s3::object::metadata_drain::{
@@ -543,6 +549,7 @@ mod tests {
         let mut write = RefreshJobWrite {
             refresh: newer.clone(),
             writing: false,
+            now_ms: 0,
         };
         assert_eq!(write.transaction(), TransactionMode::Write);
         assert_eq!(
@@ -562,6 +569,7 @@ mod tests {
         let mut older = RefreshJobWrite {
             refresh: refresh(&test, source_metadata(3, "c"), at),
             writing: false,
+            now_ms: 0,
         };
         older.first().unwrap();
         let answer = IoResult::Values(vec![Some(stored.into())]);

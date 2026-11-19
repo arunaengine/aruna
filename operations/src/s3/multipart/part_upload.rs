@@ -12,6 +12,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, NODE_SUBJECT_KEYSPACE, PURGE_FENCE_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
@@ -31,7 +32,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::types::{Key, Value};
 use bytes::Bytes;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -353,6 +354,8 @@ impl UploadPartOperation {
             backend_etag: self.backend_etag.clone(),
             piece: self.piece.clone(),
             step: RecordStep::Fence,
+            now_ms: 0,
+            ids: IdMint::default(),
         };
         self.call(PartStep::Publish, IoCall::child(record))
     }
@@ -506,6 +509,8 @@ type RecordTurn = Result<Next<()>, UploadPartError>;
 /// cleanup of the part it replaces.
 #[derive(Debug, PartialEq)]
 struct PartRecordWrite {
+    now_ms: u64,
+    ids: IdMint,
     bucket: String,
     key: String,
     upload_id: Ulid,
@@ -569,7 +574,7 @@ impl PartRecordWrite {
         let record = MultipartPart {
             part_number: self.part_number,
             location: self.location.clone(),
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             backend_etag: self.backend_etag.clone(),
             piece: self.piece.clone(),
         };
@@ -590,7 +595,7 @@ impl PartRecordWrite {
             let work = BlobCleanupWork::DeleteBlob { location };
             writes.push((
                 BLOB_CLEANUP_KEYSPACE.to_string(),
-                Ulid::generate().to_bytes().to_vec().into(),
+                self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
                 work.to_bytes()?.into(),
             ));
         }
@@ -622,6 +627,14 @@ impl Operation for PartRecordWrite {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -765,6 +778,8 @@ mod test {
             backend_etag: op.backend_etag.clone(),
             piece: op.piece.clone(),
             step: RecordStep::Existing,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 

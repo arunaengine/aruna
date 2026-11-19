@@ -8,6 +8,7 @@ use crate::s3::bucket::key::rows::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
@@ -24,7 +25,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemovalStep {
@@ -95,6 +95,7 @@ pub struct RemovalResult {
 
 #[derive(Debug, PartialEq)]
 pub struct RemoveHolderOperation {
+    ids: IdMint,
     input: RemovalInput,
     step: RemovalStep,
     creator: Option<UserId>,
@@ -109,6 +110,7 @@ pub struct RemoveHolderOperation {
 impl RemoveHolderOperation {
     pub fn new(input: RemovalInput) -> Self {
         Self {
+            ids: IdMint::default(),
             input,
             step: RemovalStep::ReadBucket,
             creator: None,
@@ -215,7 +217,7 @@ impl RemoveHolderOperation {
         });
         let reason = breaks.then(|| "recovery weakened with confirmation".to_string());
         let record = BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id: grant.bucket_id,
             at_ms: self.input.now_ms,
             action: AuditAction::HolderRemoval,
@@ -295,6 +297,10 @@ impl Operation for RemoveHolderOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

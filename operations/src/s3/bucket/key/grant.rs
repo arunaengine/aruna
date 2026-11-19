@@ -10,6 +10,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -22,7 +23,6 @@ use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketA
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
-use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GrantStep {
@@ -85,6 +85,7 @@ pub struct GrantResult {
 
 #[derive(Debug, PartialEq)]
 pub struct GrantHolderOperation {
+    ids: IdMint,
     input: GrantInput,
     step: GrantStep,
     key: Option<BucketKeyRef>,
@@ -95,6 +96,7 @@ pub struct GrantHolderOperation {
 impl GrantHolderOperation {
     pub fn new(input: GrantInput) -> Self {
         Self {
+            ids: IdMint::default(),
             input,
             step: GrantStep::ReadBucket,
             key: None,
@@ -186,7 +188,7 @@ impl GrantHolderOperation {
         }
         // The grant and its audit record commit together.
         let record = BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id: key.bucket_id,
             at_ms: self.input.now_ms,
             action: AuditAction::HolderGrant,
@@ -259,6 +261,10 @@ impl Operation for GrantHolderOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

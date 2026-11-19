@@ -18,7 +18,7 @@ use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -109,6 +109,7 @@ type HeadTurn = Result<Next<HeadObjectResult>, HeadObjectError>;
 /// that source for its current metadata, outside the snapshot.
 #[derive(Debug, PartialEq)]
 pub struct HeadObjectOperation {
+    now_ms: u64,
     input: HeadObjectInput,
     state: HeadObjectState,
     found: Option<FoundVersion>,
@@ -117,6 +118,7 @@ pub struct HeadObjectOperation {
 impl HeadObjectOperation {
     pub fn new(input: HeadObjectInput) -> Self {
         Self {
+            now_ms: 0,
             input,
             state: HeadObjectState::Lookup,
             found: None,
@@ -188,7 +190,8 @@ impl HeadObjectOperation {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let mut found = self.found.take().ok_or(IoError::Unfinished)?;
                 found.source_metadata = Some(metadata);
-                found.last_refresh = Some(SystemTime::now());
+                found.last_refresh =
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms));
                 found.location = None;
                 found.created_at = None;
                 Ok(Next::Done(self.result(found)))
@@ -233,6 +236,10 @@ impl Operation for HeadObjectOperation {
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker
         )
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 

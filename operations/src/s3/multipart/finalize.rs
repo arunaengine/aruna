@@ -278,7 +278,8 @@ impl CompleteUploadOperation {
         let location = location.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         let version_id = self.version_id;
         let version_id = version_id.ok_or(CompleteUploadError::CompleteUploadFailed)?;
-        let created_at = *self.version_created_at.get_or_insert_with(SystemTime::now);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let created_at = *self.version_created_at.get_or_insert(now);
         let upload_record = self.upload_record.as_ref();
         let upload_record = upload_record.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         let group_id = upload_record.group_id;
@@ -326,7 +327,7 @@ impl CompleteUploadOperation {
             (self.input.realm_id, group_id, self.input.node_id),
             (&self.input.bucket, &self.input.key),
             version_id,
-            unix_timestamp_millis(),
+            self.now_ms,
         );
         let mut rows = vec![(
             BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -508,9 +509,10 @@ impl CompleteUploadOperation {
             });
         }
 
-        let mut writes = self.plain_records(rule_exists)?;
+        let release = self.ids.mint(self.now_ms);
+        let mut writes = self.plain_records(rule_exists, release)?;
         for work in works {
-            let key = cleanup_key(&work);
+            let key = cleanup_key(&work, self.ids.mint(self.now_ms));
             writes.push((
                 BLOB_CLEANUP_KEYSPACE.to_string(),
                 key,
