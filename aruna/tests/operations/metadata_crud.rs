@@ -15,7 +15,9 @@ use aruna_core::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
-use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventPayload, MetadataEventRecord};
+use aruna_core::metadata::{
+    GraphLifecycleRecord, MetadataEffect, MetadataEventPayload, MetadataEventRecord,
+};
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
@@ -37,6 +39,7 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
+use aruna_operations::metadata::registry_cache::RegistryReadOperation;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
@@ -685,14 +688,14 @@ async fn projector_cleans_registry() -> Result<(), Box<dyn std::error::Error>> {
         "Deleted Repair Dataset",
     );
     write_registry_rows(&test, &record).await?;
-    let metadata_handle = test
-        .context
-        .metadata_handle
-        .as_ref()
-        .expect("metadata handle installed");
-    let warm = aruna_operations::metadata::list_cached_group(&test.context, group_id).await?;
-    assert_eq!(warm.as_ref(), &vec![record.clone()]);
-    metadata_handle.cache_registry_records(std::slice::from_ref(&record));
+    let graph = test.context.graph_handle.as_ref().expect("graph store");
+    let warm = cached_group(&test, group_id).await?;
+    assert_eq!(warm, vec![record.clone()]);
+    let cache = MetadataEffect::CacheRecords {
+        records: vec![record.clone()],
+        generation: None,
+    };
+    graph.run(cache).await;
     write_tombstone(&test, &record).await?;
 
     let projected = project_create_events(
@@ -704,9 +707,19 @@ async fn projector_cleans_registry() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(projected, 0);
     assert_projection_absent(&test, &record).await?;
-    let visible = aruna_operations::metadata::list_cached_group(&test.context, group_id).await?;
+    let visible = cached_group(&test, group_id).await?;
     assert!(visible.is_empty());
     Ok(())
+}
+
+// The group's records in the registry cache, filling it when empty.
+async fn cached_group(
+    test: &TestContext,
+    group_id: Ulid,
+) -> Result<Vec<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
+    let registry = drive(RegistryReadOperation::new(), &test.context).await?;
+    let in_group = registry.iter().filter(|record| record.group_id == group_id);
+    Ok(in_group.cloned().collect())
 }
 
 fn build_create_event(

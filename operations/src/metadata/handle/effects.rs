@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 use tracing::{Instrument, debug_span, field};
 
 use super::MetadataHandle;
-use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_graph_deleted};
+use super::lifecycle::{effect_rejects_deleted, metadata_graph_deleted};
 use crate::driver::DriverContext;
 
 const GRAPH_FENCE_SHARDS: usize = 32;
@@ -50,17 +50,13 @@ impl MetadataHandle {
         effect: MetadataEffect,
     ) -> Event {
         let started = Instant::now();
-        let event = run_effect(self, context, effect).await;
+        let event = run_effect(context, effect).await;
         aruna_core::telemetry::record_stage("craqle", started.elapsed());
         Event::Metadata(event)
     }
 }
 
-async fn run_effect(
-    metadata: &MetadataHandle,
-    context: &DriverContext,
-    effect: MetadataEffect,
-) -> MetadataEvent {
+async fn run_effect(context: &DriverContext, effect: MetadataEffect) -> MetadataEvent {
     let Some(graph) = context.graph_handle.as_ref() else {
         return MetadataEvent::Error {
             graph_iri: None,
@@ -93,31 +89,12 @@ async fn run_effect(
         }
         _ => None,
     };
-    if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
-        metadata
-            .inner
-            .visibility_cache
-            .remove_graph_records(graph_iri);
-        metadata
-            .inner
-            .visibility_cache
-            .remove_lifecycle_entry(graph_iri);
-    }
     if let Some(event) = deleted_event(context, &effect, graph_iri.as_deref()).await {
         return event;
     }
     match effect {
         MetadataEffect::SyncBestEffort { graph_iri, peers } => {
             super::lifecycle::sync_best_effort(context, graph_iri, peers)
-        }
-        MetadataEffect::CachedRecords => {
-            match list_local_records(metadata.inner.clone(), graph).await {
-                Ok(records) => MetadataEvent::CachedRecords { records },
-                Err(error) => MetadataEvent::Error {
-                    graph_iri: None,
-                    error,
-                },
-            }
         }
         other => graph.run(other).await,
     }

@@ -97,7 +97,8 @@ fn filtered_query_caches() {
         results: results.clone(),
     });
     assert_eq!(query.next(answered), Ok(Next::Call(store)));
-    assert_eq!(query.next(entry(None)), Ok(Next::Done(results)));
+    let stored = answer(MetadataEvent::QueryCacheStored { accepted: true });
+    assert_eq!(query.next(stored), Ok(Next::Done(results)));
 }
 
 #[test]

@@ -56,7 +56,7 @@ fn sweep_collects_deleted() {
         next: None,
     };
     let deleted = HashSet::from([record(1).graph_iri]);
-    assert_eq!(sweep.next(page), Ok(Next::Done(deleted)));
+    assert_eq!(sweep.next(page), Ok(Next::Done((deleted, 1))));
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn scope_drops_deleted() {
         ],
         generation: 3,
     };
-    let refreshed = scope.next(child(Ok::<_, MetadataError>(deleted)));
+    let refreshed = scope.next(child(Ok::<_, MetadataError>((deleted, 1))));
     assert_eq!(
         refreshed,
         Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(

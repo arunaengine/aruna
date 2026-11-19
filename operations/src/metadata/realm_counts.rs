@@ -3,10 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, decode};
 use aruna_core::structs::identity::group::Group;
@@ -15,6 +13,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use thiserror::Error;
 
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
+use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
 
 const GROUP_PAGE_SIZE: usize = 1_000;
 
@@ -51,8 +50,7 @@ impl Operation for RealmDocumentsOperation {
     type Error = RealmCountError;
 
     fn first(&mut self) -> Result<Next<Option<u64>>, RealmCountError> {
-        let cached = Effect::Metadata(MetadataEffect::CachedRecords);
-        Ok(Next::Call(IoCall::from(cached)))
+        Ok(Next::Call(IoCall::child(RegistryReadOperation::new())))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<u64>>, RealmCountError> {
@@ -61,22 +59,14 @@ impl Operation for RealmDocumentsOperation {
             let in_realm = live.iter().filter(|row| row.realm_id == self.realm_id);
             return Ok(Next::Done(Some(in_realm.count() as u64)));
         }
-        match result.event()? {
-            Event::Metadata(MetadataEvent::CachedRecords { records }) => {
+        match result.child::<Registry, MetadataError>()? {
+            Ok(records) => {
                 self.filtering = true;
                 let live = LiveRecordsOperation::new(records.to_vec(), None);
                 Ok(Next::Call(IoCall::child(live)))
             }
-            Event::Metadata(MetadataEvent::Error {
-                error: MetadataError::HandleMissing,
-                ..
-            }) => Ok(Next::Done(None)),
-            Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
-            other => Err(IoError::Unexpected {
-                expected: "MetadataEvent::CachedRecords",
-                got: other.label(),
-            }
-            .into()),
+            Err(MetadataError::HandleMissing) => Ok(Next::Done(None)),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -181,19 +171,17 @@ mod tests {
         (Key::from(vec![1]), encode(&group).unwrap())
     }
 
-    fn metadata(event: MetadataEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Metadata(event)))
+    fn registry(answer: Result<Registry, MetadataError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(answer))
     }
 
     #[test]
     fn documents_count_realm() {
         let mut count = RealmDocumentsOperation::new(realm());
-        let cached = IoCall::from(Effect::Metadata(MetadataEffect::CachedRecords));
-        assert_eq!(count.first(), Ok(Next::Call(cached)));
+        let read = IoCall::child(RegistryReadOperation::new());
+        assert_eq!(count.first(), Ok(Next::Call(read)));
         let records = vec![record(realm()), record(other_realm())];
-        let answer = count.next(metadata(MetadataEvent::CachedRecords {
-            records: Arc::new(records.clone()),
-        }));
+        let answer = count.next(registry(Ok(Arc::new(records.clone()))));
         let live = LiveRecordsOperation::new(records.clone(), None);
         assert_eq!(answer, Ok(Next::Call(IoCall::child(live))));
         let live: Result<_, LiveRecordsError> = Ok(records);
@@ -205,20 +193,14 @@ mod tests {
     fn missing_handle_unknown() {
         // An absent count must stay distinguishable from zero documents.
         let mut count = RealmDocumentsOperation::new(realm());
-        let answer = count.next(metadata(MetadataEvent::Error {
-            graph_iri: None,
-            error: MetadataError::HandleMissing,
-        }));
+        let answer = count.next(registry(Err(MetadataError::HandleMissing)));
         assert_eq!(answer, Ok(Next::Done(None)));
     }
 
     #[test]
     fn backend_failure_fails() {
         let mut count = RealmDocumentsOperation::new(realm());
-        let answer = count.next(metadata(MetadataEvent::Error {
-            graph_iri: None,
-            error: MetadataError::ChannelClosed,
-        }));
+        let answer = count.next(registry(Err(MetadataError::ChannelClosed)));
         let expected = RealmCountError::Metadata(MetadataError::ChannelClosed);
         assert_eq!(answer, Err(expected));
     }

@@ -50,7 +50,7 @@ use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::MetadataQueryResults;
+use aruna_core::metadata::{MetadataEffect, MetadataQueryResults};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
@@ -422,8 +422,10 @@ async fn delete_metadata_document(
     document_id: Ulid,
 ) -> Result<(), DeleteDocumentError> {
     drive_retry(|| operation.fresh_copy(), context, &document_id.to_bytes()).await?;
-    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.remove_cached_record(document_id);
+    if let Some(graph) = context.graph_handle.as_ref() {
+        graph
+            .run(MetadataEffect::UncacheRecord { document_id })
+            .await;
     }
     Ok(())
 }

@@ -4,27 +4,23 @@
 
 use crate::metadata::message_kind::MetadataRequestDelivery;
 use aruna_core::structs::storage::format::Compression;
-use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::metadata::{MetadataError, REGISTRY_CANDIDATE_LIMIT};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
-use ulid::Ulid;
 
 use super::contact::PeerContacts;
 use crate::auth::bearer_token::{
@@ -41,7 +37,6 @@ mod forward_serve;
 pub(crate) mod frames;
 use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
-pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::pull_serve::{accept_pull, pull_status};
 mod ingress;
 mod lifecycle;
@@ -57,8 +52,6 @@ const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 const GRAPH_SYNC_ATTEMPTS: usize = 3;
 const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
-pub(crate) const METADATA_QUERY_DEADLINE: Duration = Duration::from_secs(10);
-const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -199,7 +192,6 @@ struct MetadataInner {
     storage_handle: StorageHandle,
     auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
-    visibility_cache: MetadataVisibilityCache,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     peer_contacts: PeerContacts,
     sync_pulls: self::pull_serve::PullRegistry,
@@ -249,63 +241,6 @@ impl AuthValidationState {
     }
 }
 
-struct MetadataVisibilityCache {
-    registry: Mutex<Option<RegistryCacheEntry>>,
-    registry_fill: Arc<tokio::sync::Mutex<()>>,
-    lifecycle_deleted: Mutex<HashMap<String, LifecycleDeletedEntry>>,
-    generation: AtomicU64,
-}
-
-struct RegistryCacheEntry {
-    records: BTreeMap<Ulid, MetadataRegistryRecord>,
-    snapshot: Option<Arc<Vec<MetadataRegistryRecord>>>,
-    group_snapshots: HashMap<GroupId, Arc<Vec<MetadataRegistryRecord>>>,
-    expires_at: Instant,
-}
-
-impl RegistryCacheEntry {
-    fn snapshot(&mut self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
-        if self.records.len() > REGISTRY_CANDIDATE_LIMIT {
-            return None;
-        }
-        Some(
-            self.snapshot
-                .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
-                .clone(),
-        )
-    }
-
-    fn group_snapshot(&mut self, group_id: GroupId) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
-        if let Some(records) = self.group_snapshots.get(&group_id) {
-            return (records.len() <= REGISTRY_CANDIDATE_LIMIT).then(|| records.clone());
-        }
-        let mut group_records = Vec::new();
-        for record in self
-            .records
-            .values()
-            .filter(|record| record.group_id == group_id)
-        {
-            if group_records.len() == REGISTRY_CANDIDATE_LIMIT {
-                return None;
-            }
-            group_records.push(record.clone());
-        }
-        let records = Arc::new(group_records);
-        self.group_snapshots.insert(group_id, records.clone());
-        Some(records)
-    }
-}
-
-struct LifecycleDeletedEntry {
-    deleted: bool,
-    expires_at: Instant,
-}
-
-struct VisibilityFillResult {
-    records: Arc<Vec<MetadataRegistryRecord>>,
-    store_accepted: bool,
-}
-
 impl std::fmt::Debug for MetadataHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataHandle").finish_non_exhaustive()
@@ -331,7 +266,6 @@ impl MetadataHandle {
                 ),
                 storage_handle,
                 net_handle,
-                visibility_cache: MetadataVisibilityCache::new(),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
@@ -385,29 +319,6 @@ impl MetadataHandle {
     /// The device pulls this node is running.
     pub(crate) fn sync_pulls(&self) -> &self::pull_serve::PullRegistry {
         &self.inner.sync_pulls
-    }
-
-    pub fn cache_registry_record(&self, record: MetadataRegistryRecord) {
-        self.inner
-            .visibility_cache
-            .upsert_registry_records(std::slice::from_ref(&record));
-    }
-
-    pub fn cache_registry_records(&self, records: &[MetadataRegistryRecord]) {
-        self.inner.visibility_cache.upsert_registry_records(records);
-    }
-
-    pub(crate) fn remove_cached_record(&self, document_id: Ulid) {
-        self.inner
-            .visibility_cache
-            .remove_registry_record(document_id);
-    }
-
-    /// Test hook: marks all visibility cache entries as expired so the next
-    /// read exercises the stale-serving + background-refill path.
-    #[doc(hidden)]
-    pub fn expire_visibility_caches(&self) {
-        self.inner.visibility_cache.expire_now();
     }
 }
 

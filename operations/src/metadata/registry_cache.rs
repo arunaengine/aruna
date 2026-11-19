@@ -17,9 +17,11 @@ use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::event;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
+use tracing::{debug_span, field};
 
 use crate::metadata::call_results::page_rows;
-use crate::metadata::visible_scope::DeletedGraphsOperation;
+use crate::metadata::span_timing::ReadTiming;
+use crate::metadata::visible_scope::{DeletedGraphs, DeletedGraphsOperation};
 
 /// The live registry records of this node, ordered by document id.
 pub type Registry = Arc<Vec<MetadataRegistryRecord>>;
@@ -66,6 +68,8 @@ pub(crate) struct RegistryFillOperation {
     generation: u64,
     records: Vec<MetadataRegistryRecord>,
     stage: Option<FillStage>,
+    pages: u64,
+    timing: ReadTiming,
 }
 
 impl RegistryFillOperation {
@@ -85,6 +89,7 @@ impl RegistryFillOperation {
     }
 
     fn registry_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<Registry> {
+        self.pages += 1;
         if self.records.len().saturating_add(rows.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(limit_exceeded());
         }
@@ -98,6 +103,8 @@ impl RegistryFillOperation {
         match next {
             Some(after) => self.registry_page(Some(after)),
             None => {
+                self.timing.note("registry_pages", self.pages);
+                self.timing.note("record_count", self.records.len() as u64);
                 self.stage = Some(FillStage::Lifecycle);
                 Ok(Next::Call(IoCall::child(DeletedGraphsOperation::new())))
             }
@@ -137,6 +144,10 @@ impl Operation for RegistryFillOperation {
         Some(HoldScope::RegistryFill)
     }
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     fn first(&mut self) -> Turn<Registry> {
         self.stage = Some(FillStage::Snapshot);
         Ok(Next::Call(graph_call(MetadataEffect::RegistrySnapshot)))
@@ -151,6 +162,15 @@ impl Operation for RegistryFillOperation {
                     ..
                 } => Ok(Next::Done(records)),
                 MetadataEvent::RegistrySnapshot { generation, .. } => {
+                    self.timing.open(debug_span!(
+                        "metadata.visibility.fill",
+                        registry_pages = field::Empty,
+                        lifecycle_pages = field::Empty,
+                        record_count = field::Empty,
+                        deleted_count = field::Empty,
+                        store_accepted = field::Empty,
+                        elapsed_ms = field::Empty,
+                    ));
                     self.generation = generation;
                     self.registry_page(None)
                 }
@@ -161,12 +181,18 @@ impl Operation for RegistryFillOperation {
                 self.registry_read(rows, next)
             }
             Some(FillStage::Lifecycle) => {
-                let deleted = result.child::<HashSet<String>, MetadataError>()??;
+                let (deleted, pages) = result.child::<DeletedGraphs, MetadataError>()??;
+                self.timing.note("lifecycle_pages", pages);
+                self.timing.note("deleted_count", deleted.len() as u64);
                 self.store(&deleted)
             }
             // A fill the cache refused still answers with what it read.
             Some(FillStage::Store(registry)) => match cache_answer(result)? {
-                MetadataEvent::RegistryStored { .. } => Ok(Next::Done(registry)),
+                MetadataEvent::RegistryStored { accepted } => {
+                    self.timing.note("store_accepted", accepted);
+                    self.timing.finish(None);
+                    Ok(Next::Done(registry))
+                }
                 other => Err(unexpected(&other)),
             },
             None => Err(MetadataError::Backend("registry fill not started".into())),
@@ -181,17 +207,26 @@ enum ReadStage {
 }
 
 /// This node's live registry records from the registry cache. A fresh snapshot answers at once;
-/// an expired one answers too and is refilled after the answer; without one the cache is filled
-/// first.
+/// an expired one answers too and starts a refill run beside the caller; without one the cache
+/// is filled first.
 #[derive(Debug, PartialEq)]
 pub struct RegistryReadOperation {
     stage: ReadStage,
+    timing: ReadTiming,
 }
 
 impl RegistryReadOperation {
     pub fn new() -> Self {
         Self {
             stage: ReadStage::Snapshot,
+            timing: ReadTiming::default(),
+        }
+    }
+
+    fn cached(&self, hit: bool, stale: bool) {
+        self.timing.note("cache_hit", hit);
+        if hit {
+            self.timing.note("stale", stale);
         }
     }
 }
@@ -200,11 +235,39 @@ impl Operation for RegistryReadOperation {
     type Output = Registry;
     type Error = MetadataError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     fn first(&mut self) -> Turn<Registry> {
+        self.timing.open(debug_span!(
+            "metadata.registry.list_local",
+            cache_hit = field::Empty,
+            stale = field::Empty,
+            record_count = field::Empty,
+            elapsed_ms = field::Empty,
+        ));
         Ok(Next::Call(graph_call(MetadataEffect::RegistrySnapshot)))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Registry> {
+        let turn = self.step(result);
+        if let Ok(
+            Next::Done(records)
+            | Next::Then {
+                output: records, ..
+            },
+        ) = &turn
+        {
+            self.timing.note("record_count", records.len() as u64);
+            self.timing.finish(None);
+        }
+        turn
+    }
+}
+
+impl RegistryReadOperation {
+    fn step(&mut self, result: IoResult) -> Turn<Registry> {
         if self.stage == ReadStage::Fill {
             return Ok(Next::Done(result.child::<Registry, MetadataError>()??));
         }
@@ -213,16 +276,56 @@ impl Operation for RegistryReadOperation {
                 records: Some(records),
                 fresh,
                 ..
-            } => match fresh {
-                true => Ok(Next::Done(records)),
-                false => Ok(Next::Then {
-                    output: records,
-                    calls: vec![IoCall::child(RegistryFillOperation::new())],
-                }),
-            },
+            } => {
+                self.cached(true, !fresh);
+                match fresh {
+                    true => Ok(Next::Done(records)),
+                    false => Ok(Next::Then {
+                        output: records,
+                        calls: vec![IoCall::background(RegistryFillOperation::new())],
+                    }),
+                }
+            }
             MetadataEvent::RegistrySnapshot { records: None, .. } => {
+                self.cached(false, false);
                 self.stage = ReadStage::Fill;
                 Ok(Next::Call(IoCall::child(RegistryFillOperation::new())))
+            }
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
+/// Builds the graph store's query indexes and fills the registry cache, so the first query after
+/// boot finds both warm.
+#[derive(Debug, PartialEq, Default)]
+pub struct WarmCachesOperation {
+    indexed: bool,
+}
+
+impl WarmCachesOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for WarmCachesOperation {
+    type Output = ();
+    type Error = MetadataError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(graph_call(MetadataEffect::EnsureIndexes)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.indexed {
+            result.child::<Registry, MetadataError>()??;
+            return Ok(Next::Done(()));
+        }
+        match cache_answer(result)? {
+            MetadataEvent::IndexesReady => {
+                self.indexed = true;
+                Ok(Next::Call(IoCall::child(RegistryReadOperation::new())))
             }
             other => Err(unexpected(&other)),
         }

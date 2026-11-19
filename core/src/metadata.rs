@@ -1263,6 +1263,16 @@ impl MetadataQueryResults {
             Self::Graph(_) => "graph",
         }
     }
+
+    /// Records the kind and size of these results on a query span.
+    pub fn record_on(&self, span: &tracing::Span) {
+        span.record("result", self.kind());
+        match self {
+            Self::Solutions(rows) => span.record("row_count", rows.len() as u64),
+            Self::Boolean(_) => span.record("row_count", 1u64),
+            Self::Graph(triples) => span.record("triple_count", triples.len() as u64),
+        };
+    }
 }
 
 /// A row of SPARQL solutions: variable name to term text.
@@ -1363,8 +1373,8 @@ pub enum MetadataEffect {
         graph_iri: String,
     },
     ListGraphs,
-    /// Every live registry record of this node, from the metadata handle's cache.
-    CachedRecords,
+    /// Builds the graph store's query indexes when they are missing.
+    EnsureIndexes,
     ContainsGraph {
         graph_iri: String,
     },
@@ -1529,7 +1539,7 @@ impl MetadataEffect {
             MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
-            MetadataEffect::CachedRecords => "cached_records",
+            MetadataEffect::EnsureIndexes => "ensure_indexes",
             MetadataEffect::ContainsGraph { .. } => "contains_graph",
             MetadataEffect::ContainsDot { .. } => "contains_dot",
             MetadataEffect::PlanBatch { .. } => "plan_batch",
@@ -1590,7 +1600,7 @@ impl MetadataEffect {
             | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ListGraphs
-            | MetadataEffect::CachedRecords
+            | MetadataEffect::EnsureIndexes
             | MetadataEffect::CheckStructure { .. }
             | MetadataEffect::CheckProfile { .. }
             | MetadataEffect::CachedShapes { .. }
@@ -1686,10 +1696,8 @@ pub enum MetadataEvent {
     GraphListResult {
         graph_iris: Vec<String>,
     },
-    CachedRecords {
-        records:
-            std::sync::Arc<Vec<crate::structs::storage::metadata_registry::MetadataRegistryRecord>>,
-    },
+    /// The graph store's query indexes exist.
+    IndexesReady,
     ContainsGraphResult {
         graph_iri: String,
         exists: bool,
@@ -1756,6 +1764,10 @@ pub enum MetadataEvent {
         generation: u64,
     },
     /// Whether a registry fill or deletion refresh was kept.
+    /// Whether the query cache kept a result.
+    QueryCacheStored {
+        accepted: bool,
+    },
     RegistryStored {
         accepted: bool,
     },

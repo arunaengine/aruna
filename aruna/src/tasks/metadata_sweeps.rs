@@ -10,6 +10,7 @@ use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::registry_cache::WarmCachesOperation;
 use aruna_operations::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
 use aruna_operations::metadata::visibility_index::{
     PassOutcome, REBUILD_INTERVAL, VisibilityPassOperation, WORK_INTERVAL,
@@ -27,7 +28,7 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
         if context.metadata_handle.is_none() {
             return;
         }
-        if let Err(error) = aruna_operations::metadata::warm_caches(&context).await {
+        if let Err(error) = drive(WarmCachesOperation::new(), &context).await {
             warn!(error = %error, "Metadata visibility cache warmup failed");
             return;
         }

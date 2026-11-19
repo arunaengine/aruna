@@ -1,14 +1,9 @@
-//! Tests graph lifecycle: live group records, scan caps, tombstone blocking and the graph fence.
+//! Tests graph lifecycle: tombstones block applies and deletes wait for the graph fence.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::auth::{auth_storage, node_id_seed};
-use super::effect::memory_handle;
-use super::visibility::{group_record, registry_record};
 use super::*;
-use crate::driver::drive;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::list::GroupRecordsOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
@@ -17,73 +12,25 @@ use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
 use byteview::ByteView;
-async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => panic!("unexpected batch write result: {other:?}"),
+pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
+    let document_id = Ulid::generate();
+    MetadataRegistryRecord {
+        realm_id: RealmId([7u8; 32]),
+        group_id: Ulid::generate(),
+        document_id,
+        document_path: document_path.to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: true,
+        permission_path: format!("/metadata/{document_path}"),
+        placement: PlacementRef::NIL,
+        holder_node_ids: Vec::new(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        establishing_event_id: Ulid::nil(),
+        last_event_id: Ulid::nil(),
     }
 }
-fn registry_entries(record: &MetadataRegistryRecord) -> Vec<(String, ByteView, ByteView)> {
-    aruna_core::storage_entries::registry_write_entries(record).expect("registry entries encode")
-}
-#[tokio::test]
-async fn group_records_live() {
-    let (_storage_dir, storage) = auth_storage();
-    let group_id = Ulid::generate();
-    let live = group_record(group_id, "datasets/live");
-    let gone = group_record(group_id, "datasets/gone");
-    let tombstone = GraphLifecycleRecord::deleted(
-        gone.graph_iri.clone(),
-        gone.realm_id,
-        gone.group_id,
-        gone.document_id,
-        2,
-    );
-    let mut writes = registry_entries(&live);
-    writes.extend(registry_entries(&gone));
-    writes.push(
-        aruna_core::storage_entries::graph_lifecycle_entry(&tombstone).expect("tombstone encodes"),
-    );
-    store_entries(&storage, writes).await;
-    let (_metadata_dir, handle) = memory_handle(storage);
 
-    let records = drive(GroupRecordsOperation::new(group_id, 16), &handle)
-        .await
-        .expect("group listing succeeds");
-
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.document_id)
-            .collect::<Vec<_>>(),
-        vec![live.document_id]
-    );
-}
-#[tokio::test]
-async fn group_records_capped() {
-    // The scan must refuse to answer past its candidate budget instead of
-    // returning a silently truncated group listing.
-    let (_storage_dir, storage) = auth_storage();
-    let group_id = Ulid::generate();
-    let mut writes = registry_entries(&group_record(group_id, "datasets/one"));
-    writes.extend(registry_entries(&group_record(group_id, "datasets/two")));
-    store_entries(&storage, writes).await;
-    let (_metadata_dir, handle) = memory_handle(storage);
-
-    let within = drive(GroupRecordsOperation::new(group_id, 2), &handle)
-        .await
-        .expect("group listing succeeds");
-    let over = drive(GroupRecordsOperation::new(group_id, 1), &handle).await;
-
-    assert_eq!(within.len(), 2);
-    assert_eq!(over, Err(MetadataApiError::ServiceUnavailable));
-}
 #[tokio::test]
 async fn tombstone_blocks_apply() {
     let (_storage_dir, storage) = auth_storage();

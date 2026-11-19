@@ -57,7 +57,7 @@ fn fresh_snapshot_answers() {
 fn stale_snapshot_refills() {
     let mut read = RegistryReadOperation::new();
     read.first().unwrap();
-    let refill = IoCall::child(RegistryFillOperation::new());
+    let refill = IoCall::background(RegistryFillOperation::new());
     let expected = Next::Then {
         output: Arc::new(vec![record(1)]),
         calls: vec![refill],
@@ -99,9 +99,8 @@ fn fill_stores_registry() {
     };
     let sweep = IoCall::child(DeletedGraphsOperation::new());
     assert_eq!(fill.next(registry), Ok(Next::Call(sweep)));
-    let lifecycle = child(Ok::<_, MetadataError>(HashSet::from([gone
-        .graph_iri
-        .clone()])));
+    let deleted = HashSet::from([gone.graph_iri.clone()]);
+    let lifecycle = child(Ok::<_, MetadataError>((deleted, 1)));
     let store = MetadataEffect::StoreRegistry {
         records: vec![live.clone()],
         lifecycle: vec![
@@ -113,6 +112,20 @@ fn fill_stores_registry() {
     assert_eq!(fill.next(lifecycle), Ok(Next::Call(graph_call(store))));
     let stored = answer(MetadataEvent::RegistryStored { accepted: true });
     assert_eq!(fill.next(stored), Ok(Next::Done(Arc::new(vec![live]))));
+}
+
+#[test]
+fn warmup_fills_registry() {
+    let mut warm = WarmCachesOperation::new();
+    let indexes = graph_call(MetadataEffect::EnsureIndexes);
+    assert_eq!(warm.first(), Ok(Next::Call(indexes)));
+    let read = IoCall::child(RegistryReadOperation::new());
+    assert_eq!(
+        warm.next(answer(MetadataEvent::IndexesReady)),
+        Ok(Next::Call(read))
+    );
+    let filled = child(Ok::<_, MetadataError>(Arc::new(vec![record(1)])));
+    assert_eq!(warm.next(filled), Ok(Next::Done(())));
 }
 
 #[test]

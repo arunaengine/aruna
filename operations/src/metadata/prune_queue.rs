@@ -725,7 +725,8 @@ pub fn jobs_queued() -> DuePruneOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
+    use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
     use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -860,11 +861,17 @@ mod tests {
             registry_write_entries(&record).expect("registry entries"),
         )
         .await;
-        metadata_handle.expire_visibility_caches();
-        let stale = crate::metadata::list_cached_group(&context, record.group_id)
+        graph_handle.expire_caches();
+        let in_group = |registry: Registry| -> Vec<_> {
+            let in_group = registry
+                .iter()
+                .filter(|row| row.group_id == record.group_id);
+            in_group.cloned().collect()
+        };
+        let stale = drive(RegistryReadOperation::new(), &context)
             .await
             .expect("registry cache fills");
-        assert_eq!(stale.as_ref(), &vec![record.clone()]);
+        assert_eq!(in_group(stale), vec![record.clone()]);
         let tombstone = GraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
             record.realm_id,
@@ -881,10 +888,10 @@ mod tests {
         let processed = process_graph_tombstones(&context, vec![tombstone.clone()]).await;
 
         assert_eq!(processed.enqueued, 1);
-        let listed = crate::metadata::list_cached_group(&context, record.group_id)
+        let listed = drive(RegistryReadOperation::new(), &context)
             .await
             .expect("registry cache reads");
-        assert!(listed.is_empty());
+        assert!(in_group(listed).is_empty());
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].graph_iri, record.graph_iri);

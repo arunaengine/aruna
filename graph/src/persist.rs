@@ -91,7 +91,7 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::IriReferences { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ListGraphs
-        | MetadataEffect::CachedRecords
+        | MetadataEffect::EnsureIndexes
         | MetadataEffect::ContainsGraph { .. }
         | MetadataEffect::ContainsDot { .. }
         | MetadataEffect::GraphSnapshot { .. }

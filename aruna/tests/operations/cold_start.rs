@@ -21,6 +21,7 @@ use aruna_graph::{GraphHandle, GraphOptions, MetadataSearchStorage};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
+use aruna_operations::metadata::registry_cache::{RegistryReadOperation, WarmCachesOperation};
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 
@@ -203,20 +204,20 @@ async fn first_cold_query() -> Result<(), BoxError> {
 
     // Cold fill of the handle-owned list-path registry cache over the same storage.
     let list_fill_started = Instant::now();
-    let listed = aruna_operations::metadata::list_cached_records(&handle).await?;
+    let listed = drive(RegistryReadOperation::new(), &handle).await?;
     println!(
         "registry cache cold fill: {:?} ({} records)",
         list_fill_started.elapsed(),
         listed.len()
     );
 
-    // Warmed boot path: a third handle primed via warm_caches before the
+    // Warmed boot path: a third handle primed by the warm-up operation before the
     // first query, mirroring spawn_metadata_warmup at node boot.
     drop(handle);
     let handle = open_handle(metadata_dir.path(), &storage)?;
     let warmup_started = Instant::now();
-    aruna_operations::metadata::warm_caches(&handle).await?;
-    println!("warm_caches after reopen: {:?}", warmup_started.elapsed());
+    drive(WarmCachesOperation::new(), &handle).await?;
+    println!("warm-up after reopen: {:?}", warmup_started.elapsed());
     let warmed = timed_query(&handle, "first query (after warmup)").await?;
 
     println!("summary: docs={docs} cold={cold:?} warm={warm:?} warmed-first={warmed:?}");
