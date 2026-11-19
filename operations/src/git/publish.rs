@@ -437,7 +437,8 @@ impl Operation for PublishRecordOperation {
                 if !stored_answer(result)? {
                     let realm_id = self.document.realm_id;
                     let peers = std::mem::take(&mut self.peers);
-                    let writes = pack_writes(&pack, realm_id, peers, &self.fence)?;
+                    let place = (peers, &self.fence, self.mint.mint(self.now_ms));
+                    let writes = pack_writes(&pack, realm_id, place)?;
                     self.writes.extend(writes);
                 }
                 self.commit()
