@@ -8,7 +8,6 @@
 use aruna_core::id_mint::IdMint;
 use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
@@ -56,12 +55,10 @@ const WALK_BYTES: usize = 4 * 1024 * 1024;
 /// Page transactions one rebuild or refill run commits.
 const WALK_PAGES: usize = 8;
 
-/// Where the passes go on; a restart begins again at the start.
-static CURSORS: Mutex<Option<MaintainCursors>> = Mutex::new(None);
-
-/// What range maintenance keeps between its passes.
+/// What range maintenance keeps between its passes. The caller holds it; a restart begins again
+/// at the start.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct MaintainCursors {
+pub struct MaintainCursors {
     /// The account row after which the next pass continues.
     accounts: Option<Vec<u8>>,
     refresh: Option<RefreshCursor>,
@@ -79,29 +76,22 @@ pub struct MaintainPass {
 }
 
 impl MaintainPass {
-    /// Keeps the cursors for the next pass; returns when it should run and the handed imports
-    /// to start now.
-    pub fn finish(self) -> (Duration, Vec<KeptStart>) {
-        if let Ok(mut kept) = CURSORS.lock() {
-            *kept = Some(self.cursors);
-        }
-        (self.after, self.imports)
+    /// When the next pass should run, the handed imports to start now and the cursors the next
+    /// pass goes on from.
+    pub fn finish(self) -> (Duration, Vec<KeptStart>, MaintainCursors) {
+        (self.after, self.imports, self.cursors)
     }
 }
 
-/// One bounded pass over the range accounts and this node's other range work, resuming where
-/// the last finished pass stopped.
+/// One bounded pass over the range accounts and this node's other range work, resuming at
+/// `cursors`, where the last finished pass stopped.
 pub fn maintain_ranges(
     ids: NodeRealm,
     fresh: &BTreeMap<NodeId, HeldHeartbeat>,
     capacity: Option<u64>,
+    cursors: MaintainCursors,
 ) -> MaintainRangesOperation {
-    let kept = CURSORS.lock().ok().and_then(|cursors| cursors.clone());
-    MaintainRangesOperation::new(
-        ids,
-        kept.unwrap_or_default(),
-        balance_inputs(fresh, capacity),
-    )
+    MaintainRangesOperation::new(ids, cursors, balance_inputs(fresh, capacity))
 }
 
 /// How long to wait after a pass the runner could not finish.
