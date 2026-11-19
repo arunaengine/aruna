@@ -11,7 +11,7 @@ use crate::s3::object::get::{
     ObjectRangeRequest, Turn,
 };
 use crate::s3::object::read::{
-    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info, slice_blob,
+    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -2734,10 +2734,7 @@ async fn slices_routed_range() {
             .into_iter()
             .map(|chunk| Ok(bytes::Bytes::from_static(chunk.as_bytes())))
             .collect();
-        let mut blob = slice_blob(
-            BackendStream::new(futures_util::stream::iter(chunks)),
-            range,
-        );
+        let mut blob = BackendStream::new(futures_util::stream::iter(chunks)).slice(range);
         let mut bytes = Vec::new();
         while let Some(chunk) = blob.0.next().await {
             bytes.extend_from_slice(&chunk.unwrap());

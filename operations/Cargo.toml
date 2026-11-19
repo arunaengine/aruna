@@ -54,7 +54,6 @@ byteview = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 globset = { workspace = true }
-futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
@@ -93,6 +92,7 @@ aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-tasks = { workspace = true }
 axum = { workspace = true }
 flate2 = { workspace = true }
+futures-util = { workspace = true }
 proptest = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }

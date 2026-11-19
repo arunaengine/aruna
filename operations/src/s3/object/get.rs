@@ -18,7 +18,6 @@ use crate::s3::object::put::abe::keyed;
 use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::id_mint::IdMint;
-use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, SystemTime};
@@ -1452,7 +1451,7 @@ impl GetObjectOperation {
             return Err(self.unexpected("Event::Blob(BlobEvent::ReadFinished)", event));
         };
         if let Some(lease) = self.reference_lease.take() {
-            blob = leased(blob, lease);
+            blob = blob.keep(lease);
         }
         let location = self.location.clone();
         let location = location.ok_or(GetObjectError::GetObjectFailed)?;
@@ -1616,7 +1615,7 @@ impl GetObjectOperation {
         mut blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> Turn {
         if let Some(lease) = self.reference_lease.take() {
-            blob = leased(blob, lease);
+            blob = blob.keep(lease);
         }
         let source_metadata = self.source_metadata.clone();
         let mut source_metadata = source_metadata.ok_or(GetObjectError::GetObjectFailed)?;
@@ -1957,17 +1956,6 @@ impl Operation for AdvanceReference {
     fn seed(&mut self, entropy: u128) {
         self.ids = IdMint::new(entropy);
     }
-}
-
-/// Keeps `lease` with the stream until the stream ends.
-pub(crate) fn leased(
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    lease: ReadLease,
-) -> BackendStream<Result<Bytes, StreamError>> {
-    BackendStream(Box::pin(blob.0.map(move |chunk| {
-        let _lease = &lease;
-        chunk
-    })))
 }
 
 /// A reference version has no archive, so its lease names the bucket id, which no archive uses.

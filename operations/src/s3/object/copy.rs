@@ -34,7 +34,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -49,10 +48,9 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -607,11 +605,7 @@ impl CopyBytesOperation {
         let body = match (adopt.is_some(), self.progress.take()) {
             (true, _) => None,
             (false, Some(PulledBytes(pulled))) => {
-                Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
-                    if let Ok(bytes) = chunk {
-                        pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    }
-                }))))
+                Some(source.blob.counted(pulled))
             }
             (false, None) => Some(source.blob),
         };
@@ -949,6 +943,7 @@ impl Operation for KeepReferenceOperation {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+    use std::sync::atomic::Ordering;
     use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
     #[allow(unused_imports)]
     pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};

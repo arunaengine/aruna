@@ -4,10 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use aruna_core::task::PullProgress;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -32,7 +30,6 @@ use aruna_core::structs::{
     SyncPullAck, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
-use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -438,16 +435,6 @@ pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
 
 type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
 
-/// The device's bytes as the write consumes them, adding each chunk to `bytes_done`.
-fn counted(blob: PullBody, bytes_done: Arc<AtomicU64>) -> PullBody {
-    let chunks = blob.0.inspect(move |chunk| {
-        if let Ok(chunk) = chunk {
-            bytes_done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        }
-    });
-    BackendStream(Box::pin(chunks))
-}
-
 /// Why a device read failed. Bytes that do not answer for the hash the upload named are the
 /// request's own fault: retrying re-reads the same mismatch, so the row is parked for the owner
 /// instead. Everything else is infrastructure.
@@ -688,7 +675,7 @@ impl Operation for CommitPullOperation {
                     .map_err(unavailable);
                 let blob = match read {
                     Ok(Ok(BaoReadOutput::Stream { blob, .. })) => {
-                        counted(blob, self.bytes_done.0.clone())
+                        blob.counted(self.bytes_done.0.clone())
                     }
                     // A metadata-only answer to a full read is a broken exchange, not an absent
                     // object: parking the upload on it would lose the file.
@@ -1216,6 +1203,7 @@ mod tests {
 
     use super::*;
     use aruna_core::UserId;
+    use std::sync::Arc;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::events::{Event, StorageEvent};

@@ -3,9 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -182,8 +180,7 @@ impl GetRoutedOperation {
         };
         let kept = (read.location.as_ref()).filter(|location| kept_copy(location));
         if let Some(path) = kept.map(|location| location.backend_path.clone()) {
-            let empty = BackendStream(Box::pin(futures_util::stream::empty()));
-            let blob = std::mem::replace(&mut read.blob, empty);
+            let blob = std::mem::replace(&mut read.blob, BackendStream::empty());
             return self.call(RoutedStep::Pin(Box::new(read)), pin_call(&path, blob));
         }
         Ok(Next::Done(read))
@@ -196,7 +193,7 @@ impl GetRoutedOperation {
         let mut result = *result;
         if let Some(range) = self.input.range.clone() {
             let resolved = range.resolve(result.info.size)?;
-            result.blob = slice_blob(result.blob, resolved.range.clone());
+            result.blob = result.blob.slice(resolved.range.clone());
             result.resolved_range = Some(resolved);
         }
         Ok(Next::Done(result))
@@ -271,32 +268,6 @@ fn kept_copy(location: &BackendLocation) -> bool {
     HiddenBlobKey::try_from(location)
         .and_then(|key| key.namespace())
         .is_ok_and(|namespace| namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE)
-}
-
-/// The bytes of `range` from a stream of the whole object; the rest is skipped.
-pub(super) fn slice_blob(
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    range: Range<u64>,
-) -> BackendStream<Result<Bytes, StreamError>> {
-    let sliced = blob
-        .0
-        .scan(0u64, move |offset, chunk| {
-            let start = *offset;
-            let item = match chunk {
-                Ok(_) if start >= range.end => return futures_util::future::ready(None),
-                Ok(chunk) => {
-                    let len = chunk.len() as u64;
-                    *offset = start + len;
-                    let from = range.start.saturating_sub(start).min(len) as usize;
-                    let to = (range.end - start).min(len) as usize;
-                    (from < to).then(|| Ok(chunk.slice(from..to)))
-                }
-                Err(error) => Some(Err(error)),
-            };
-            futures_util::future::ready(Some(item))
-        })
-        .filter_map(futures_util::future::ready);
-    BackendStream(Box::pin(sliced))
 }
 
 /// Keeps a reference's bytes. Outputs `true` once they are kept before the read is served.
