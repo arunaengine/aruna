@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
-    ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
-    WitnessBudgetRecord,
+    ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId,
+    JobFamilyRecord, JobId, JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent,
+    LocalExecution, LogicalJobSpec, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -83,6 +83,7 @@ impl FamilyView {
             launch: evidence.launch,
             receipt: evidence.receipt,
             previous_update: evidence.previous_update,
+            output: evidence.output,
             local,
         }
     }
@@ -97,6 +98,7 @@ pub struct Evidence<'a> {
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
     pub previous_update: Option<&'a ExecutionUpdate>,
+    pub output: Option<&'a ExecutionOutputRecord>,
 }
 
 /// The predecessor rows one set of candidates must be judged against. A key is
@@ -175,6 +177,21 @@ impl EvidencePlan {
                     0,
                 ));
             }
+            JobFamilyRecord::Stop(stop) => {
+                let execution = stop.execution_id.to_bytes();
+                self.keys
+                    .insert(id_key(&family, JobRecordKind::Receipt, execution, 0));
+                self.keys.insert(id_key(
+                    &family,
+                    JobRecordKind::Update,
+                    execution,
+                    stop.update_sequence,
+                ));
+                if stop.output_digest.is_some() {
+                    self.keys
+                        .insert(id_key(&family, JobRecordKind::Output, execution, 0));
+                }
+            }
         }
     }
 }
@@ -187,6 +204,7 @@ pub struct EvidenceSet {
     launches: Vec<LaunchIntent>,
     receipts: Vec<ExecutionReceipt>,
     updates: Vec<ExecutionUpdate>,
+    outputs: Vec<ExecutionOutputRecord>,
 }
 
 impl EvidenceSet {
@@ -199,8 +217,8 @@ impl EvidenceSet {
             JobFamilyRecord::Launch(launch) => self.launches.push(launch.as_ref().clone()),
             JobFamilyRecord::Receipt(receipt) => self.receipts.push(receipt.as_ref().clone()),
             JobFamilyRecord::Update(update) => self.updates.push(update.as_ref().clone()),
-            JobFamilyRecord::Claim(_) | JobFamilyRecord::Output(_) | JobFamilyRecord::Cancel(_) => {
-            }
+            JobFamilyRecord::Output(output) => self.outputs.push(output.as_ref().clone()),
+            JobFamilyRecord::Claim(_) | JobFamilyRecord::Cancel(_) | JobFamilyRecord::Stop(_) => {}
         }
     }
 
@@ -239,6 +257,15 @@ impl EvidenceSet {
             },
             JobFamilyRecord::Cancel(cancel) => Evidence {
                 spec: self.spec_by_job(cancel.job_id),
+                ..Evidence::default()
+            },
+            JobFamilyRecord::Stop(stop) => Evidence {
+                receipt: self.receipt_by_execution(stop.execution_id),
+                previous_update: self.update_by_sequence(stop.execution_id, stop.update_sequence),
+                output: self
+                    .outputs
+                    .iter()
+                    .find(|output| output.execution_id == stop.execution_id),
                 ..Evidence::default()
             },
         }

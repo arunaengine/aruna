@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
+    ExecutionStop, JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordError, JobRecordKey,
+    JobRecordKind, LocalExecution, PhysicalExecutionState, StopEvidence,
 };
 
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
@@ -277,4 +278,57 @@ fn waits_for_predecessor() {
         Admission::Pending(PendingNeed::Evidence(JobRecordKind::Update))
     );
     assert!(plan.admitted.is_empty());
+}
+
+#[test]
+fn stop_waits_terminal() {
+    // A stop is admitted only next to the receipt and the terminal update it names, and only
+    // when the receipted executor signed it.
+    let family = Family::new([41u8; 32]);
+    let view = family.view();
+    let run = family.run(1, 0, PhysicalExecutionState::Failed);
+    let (JobFamilyRecord::Receipt(receipt), JobFamilyRecord::Update(update)) =
+        (&run[4].record, &run[7].record)
+    else {
+        panic!("the run fixture keeps its order");
+    };
+    let stop = JobFamilyRecord::Stop(Box::new(ExecutionStop {
+        execution_id: receipt.execution_id,
+        submission_id: family.submission_id,
+        request_digest: family.request_digest,
+        executor_node_id: family.target.public(),
+        receipt_digest: receipt.digest().expect("receipt digest"),
+        update_sequence: update.sequence,
+        update_digest: update.digest().expect("update digest"),
+        output_digest: None,
+        evidence: StopEvidence::Tombstoned,
+        stopped_at_ms: 1_100,
+    }));
+    let partial = stored(&run[..7]);
+    let signed = family.sign(&family.target, stop.clone());
+
+    let (admission, plan) = plan_append(&state(Some(&view), &partial), &[], signed, None);
+    assert_eq!(
+        admission,
+        Admission::Pending(PendingNeed::Evidence(JobRecordKind::Update))
+    );
+    let (admission, plan) = plan_append(
+        &state(Some(&view), &partial),
+        &plan.pending,
+        run[7].clone(),
+        None,
+    );
+    assert_eq!(admission, Admission::Authentic);
+    assert_eq!(
+        plan.admitted.len(),
+        2,
+        "the terminal update admits the stop"
+    );
+
+    let forged = family.sign(&family.holder, stop);
+    let (admission, _) = plan_append(&state(Some(&view), &stored(&run)), &[], forged, None);
+    assert_eq!(
+        admission,
+        Admission::Rejected(JobRecordError::WrongPublisher(JobRecordKind::Stop))
+    );
 }

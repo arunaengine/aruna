@@ -45,6 +45,7 @@ pub const JOB_RECEIPT_DOMAIN: &[u8] = b"aruna-job-receipt-v1";
 pub const JOB_UPDATE_DOMAIN: &[u8] = b"aruna-job-update-v1";
 pub const JOB_OUTPUT_DOMAIN: &[u8] = b"aruna-job-output-v1";
 pub const JOB_CANCEL_DOMAIN: &[u8] = b"aruna-job-cancel-v1";
+pub const JOB_STOP_DOMAIN: &[u8] = b"aruna-job-stop-v1";
 pub const JOB_ENVELOPE_DOMAIN: &[u8] = b"aruna-job-envelope-v1";
 
 /// Objects one execution may publish in its immutable output record.
@@ -509,6 +510,32 @@ pub struct ExecutionOutputRecord {
     pub committed_at_ms: u64,
 }
 
+/// How the executor knows that one execution stopped for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopEvidence {
+    /// The terminal cleanup removed the backend attempt and recorded its tombstone.
+    Tombstoned,
+    /// No attempt intent was written, and the intent comes before any submit.
+    NothingSubmitted,
+}
+
+/// The executor's signed statement that one receipted execution stopped and runs no
+/// more. It follows the receipt and the terminal update it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStop {
+    pub execution_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub executor_node_id: NodeId,
+    pub receipt_digest: [u8; 32],
+    /// Sequence of the terminal update, so a holder reads it by its key.
+    pub update_sequence: u64,
+    pub update_digest: [u8; 32],
+    pub output_digest: Option<[u8; 32]>,
+    pub evidence: StopEvidence,
+    pub stopped_at_ms: u64,
+}
+
 /// Token-free evidence of how the publishing node authorized the caller against
 /// the stored spec. Bearer tokens never replicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +609,7 @@ pub enum JobRecordKind {
     Update,
     Output,
     Cancel,
+    Stop,
 }
 
 impl JobRecordKind {
@@ -595,6 +623,7 @@ impl JobRecordKind {
             JobRecordKind::Update => 5,
             JobRecordKind::Output => 6,
             JobRecordKind::Cancel => 7,
+            JobRecordKind::Stop => 8,
         }
     }
 
@@ -608,6 +637,7 @@ impl JobRecordKind {
             5 => Ok(JobRecordKind::Update),
             6 => Ok(JobRecordKind::Output),
             7 => Ok(JobRecordKind::Cancel),
+            8 => Ok(JobRecordKind::Stop),
             _ => Err(JobRecordError::MalformedKey),
         }
     }
@@ -838,6 +868,22 @@ impl JobRecordBody for JobCancelRecord {
     }
 }
 
+impl JobRecordBody for ExecutionStop {
+    const DOMAIN: &'static [u8] = JOB_STOP_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Stop;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.execution_id.to_bytes())
+    }
+}
+
 /// One immutable record of a job family. Every variant has exactly one permitted
 /// author and is never rewritten under the same key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,6 +896,7 @@ pub enum JobFamilyRecord {
     Update(Box<ExecutionUpdate>),
     Output(Box<ExecutionOutputRecord>),
     Cancel(JobCancelRecord),
+    Stop(Box<ExecutionStop>),
 }
 
 impl JobFamilyRecord {
@@ -863,6 +910,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(_) => JobRecordKind::Update,
             JobFamilyRecord::Output(_) => JobRecordKind::Output,
             JobFamilyRecord::Cancel(_) => JobRecordKind::Cancel,
+            JobFamilyRecord::Stop(_) => JobRecordKind::Stop,
         }
     }
 
@@ -878,6 +926,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => update.family(),
             JobFamilyRecord::Output(output) => output.family(),
             JobFamilyRecord::Cancel(cancel) => cancel.family(),
+            JobFamilyRecord::Stop(stop) => stop.family(),
         }
     }
 
@@ -891,6 +940,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => update.canonical_bytes(),
             JobFamilyRecord::Output(output) => output.canonical_bytes(),
             JobFamilyRecord::Cancel(cancel) => cancel.canonical_bytes(),
+            JobFamilyRecord::Stop(stop) => stop.canonical_bytes(),
         }
     }
 
@@ -908,6 +958,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => (update.subject(), update.sequence()),
             JobFamilyRecord::Output(output) => (output.subject(), output.sequence()),
             JobFamilyRecord::Cancel(cancel) => (cancel.subject(), cancel.sequence()),
+            JobFamilyRecord::Stop(stop) => (stop.subject(), stop.sequence()),
         };
         JobRecordKey {
             family: self.family(),
@@ -964,6 +1015,7 @@ pub struct JobRecordContext<'a> {
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
     pub previous_update: Option<&'a ExecutionUpdate>,
+    pub output: Option<&'a ExecutionOutputRecord>,
     pub local: Option<&'a LocalExecution>,
 }
 
@@ -981,6 +1033,7 @@ impl<'a> JobRecordContext<'a> {
             launch: None,
             receipt: None,
             previous_update: None,
+            output: None,
             local: None,
         }
     }
@@ -1099,6 +1152,7 @@ impl JobRecordEnvelope {
             JobFamilyRecord::Update(update) => self.verify_update(update, context),
             JobFamilyRecord::Output(output) => self.verify_output(output, context),
             JobFamilyRecord::Cancel(cancel) => self.verify_cancel(cancel, context),
+            JobFamilyRecord::Stop(stop) => self.verify_stop(stop, context),
         }
     }
 
@@ -1361,6 +1415,54 @@ impl JobRecordEnvelope {
             // The publishing holder's signature is its statement that it checked
             // group cancel permission; the payload field alone grants nothing.
             CancelAuthority::GroupAdmin => Ok(RecordVerdict::Authentic),
+        }
+    }
+}
+
+impl JobRecordEnvelope {
+    /// Only the receipted executor states a stop, and only after this node holds the receipt,
+    /// the terminal update and the output record it names.
+    fn verify_stop(
+        &self,
+        stop: &ExecutionStop,
+        context: &JobRecordContext<'_>,
+    ) -> Result<RecordVerdict, JobRecordError> {
+        self.author(stop.executor_node_id, JobRecordKind::Stop)?;
+        let Some(receipt) = context.receipt else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Receipt));
+        };
+        if stop.execution_id != receipt.execution_id
+            || stop.executor_node_id != receipt.executor_node_id
+            || stop.receipt_digest != receipt.digest()?
+        {
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt));
+        }
+        let Some(update) = context.previous_update else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Update));
+        };
+        let named = update
+            .result
+            .as_ref()
+            .and_then(|result| result.output_digest);
+        if update.execution_id != stop.execution_id
+            || update.sequence != stop.update_sequence
+            || update.digest()? != stop.update_digest
+            || !update.state.is_terminal()
+            || named != stop.output_digest
+        {
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Update));
+        }
+        let Some(digest) = stop.output_digest else {
+            return Ok(RecordVerdict::Authentic);
+        };
+        match context.output {
+            None => Ok(RecordVerdict::MissingEvidence(JobRecordKind::Output)),
+            Some(output)
+                if output.execution_id == stop.execution_id && output.digest()? == digest =>
+            {
+                Ok(RecordVerdict::Authentic)
+            }
+            Some(_) => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Output)),
         }
     }
 }

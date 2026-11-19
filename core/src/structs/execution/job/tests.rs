@@ -2028,3 +2028,90 @@ fn owner_index_scoped() {
     let ka = owner_index_key(a, 1_000, id);
     assert!(!ka.starts_with(owner_index_prefix(b).as_ref()));
 }
+
+/// The stop of the successful sample execution, naming its terminal update and output.
+fn sample_stop() -> ExecutionStop {
+    ExecutionStop {
+        execution_id: Ulid::from_bytes([13u8; 16]),
+        submission_id: submission(),
+        request_digest: [1u8; 32],
+        executor_node_id: node_id(9),
+        receipt_digest: sample_receipt().digest().expect("receipt digests"),
+        update_sequence: 1,
+        update_digest: success_update().digest().expect("update digests"),
+        output_digest: Some(output_record().digest().expect("output digests")),
+        evidence: StopEvidence::Tombstoned,
+        stopped_at_ms: 1_700_000_003_000,
+    }
+}
+
+#[test]
+fn stop_needs_evidence() {
+    // A stop stays pending until this node holds the receipt, the terminal update and the
+    // output record it names; a running update is no terminal one.
+    let view = LocalView::new();
+    let (receipt, update, output) = (sample_receipt(), success_update(), output_record());
+    let stop = envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9);
+    let receipted = JobRecordContext {
+        receipt: Some(&receipt),
+        ..view.context()
+    };
+    let updated = JobRecordContext {
+        previous_update: Some(&update),
+        ..receipted
+    };
+    let complete = JobRecordContext {
+        output: Some(&output),
+        ..updated
+    };
+
+    let missing = |kind| Ok(RecordVerdict::MissingEvidence(kind));
+    assert_eq!(
+        stop.verify(&view.context()),
+        missing(JobRecordKind::Receipt)
+    );
+    assert_eq!(stop.verify(&receipted), missing(JobRecordKind::Update));
+    assert_eq!(stop.verify(&updated), missing(JobRecordKind::Output));
+    assert_eq!(stop.verify(&complete), Ok(RecordVerdict::Authentic));
+
+    let running = sample_update();
+    let early = ExecutionStop {
+        update_sequence: 0,
+        update_digest: running.digest().expect("update digests"),
+        output_digest: None,
+        ..sample_stop()
+    };
+    let checked = JobRecordContext {
+        previous_update: Some(&running),
+        ..receipted
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(early)), 9).verify(&checked),
+        Err(JobRecordError::EvidenceMismatch(JobRecordKind::Update))
+    );
+}
+
+#[test]
+fn stop_rejects_signer() {
+    // Only the receipted executor states that its execution stopped.
+    let view = LocalView::new();
+    let (receipt, update, output) = (sample_receipt(), success_update(), output_record());
+    let complete = JobRecordContext {
+        receipt: Some(&receipt),
+        previous_update: Some(&update),
+        output: Some(&output),
+        ..view.context()
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 2).verify(&complete),
+        Err(JobRecordError::WrongPublisher(JobRecordKind::Stop))
+    );
+    let claimed = ExecutionStop {
+        executor_node_id: node_id(2),
+        ..sample_stop()
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(claimed)), 2).verify(&complete),
+        Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt))
+    );
+}

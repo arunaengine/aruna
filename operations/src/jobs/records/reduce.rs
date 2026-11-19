@@ -47,7 +47,10 @@ pub fn reduce_family(
                     Some(output.as_ref().clone());
             }
             JobFamilyRecord::Cancel(_) => cancelled = true,
-            JobFamilyRecord::Spec(_) | JobFamilyRecord::Budget(_) | JobFamilyRecord::Launch(_) => {}
+            JobFamilyRecord::Spec(_)
+            | JobFamilyRecord::Budget(_)
+            | JobFamilyRecord::Launch(_)
+            | JobFamilyRecord::Stop(_) => {}
         }
     }
 

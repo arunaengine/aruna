@@ -46,8 +46,8 @@ pub struct AuditQuery {
 /// identities it names.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobAuditRecord {
-    /// `spec`, `claim`, `budget`, `launch`, `receipt`, `update`, `output` or
-    /// `cancel`.
+    /// `spec`, `claim`, `budget`, `launch`, `receipt`, `update`, `output`, `cancel` or
+    /// `stop`.
     pub kind: String,
     /// Digest of the canonical record bytes.
     pub digest: String,
@@ -202,6 +202,11 @@ fn audit_record(
             record.spec_digest = Some(hex32(&cancel.spec_digest));
             record.at_ms = cancel.requested_at_ms;
         }
+        JobFamilyRecord::Stop(stop) => {
+            record.execution_id = Some(stop.execution_id.to_string());
+            record.sequence = Some(stop.update_sequence);
+            record.at_ms = stop.stopped_at_ms;
+        }
     }
     Some(record)
 }
@@ -216,6 +221,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
         JobFamilyRecord::Update(_) => "update",
         JobFamilyRecord::Output(_) => "output",
         JobFamilyRecord::Cancel(_) => "cancel",
+        JobFamilyRecord::Stop(_) => "stop",
     }
 }
 
