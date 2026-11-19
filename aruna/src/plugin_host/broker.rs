@@ -17,14 +17,16 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
+use aruna_operations::plugins::admitted::{
+    Admitted, CancelAsk, ChangeAsk, InfoAsk, ListAsk, NativeAsk, OutputsAsk, StateAsk,
+};
 use aruna_operations::plugins::check::RunScope;
 use aruna_operations::plugins::creates::{FinishCreate, stored_created};
 use aruna_operations::plugins::dataset::file_entity;
 use aruna_operations::plugins::grants::object_path;
 use aruna_operations::plugins::held::{AskRelease, HeldSecrets};
 use aruna_operations::plugins::host_calls::{
-    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
-    begun_reply, call_intent, version_id,
+    CallEnd, CallFailure, RecordCall, StateChange, begun_reply, call_intent, version_id,
 };
 use aruna_operations::plugins::host_steps::{
     AdmitCall, ApplyChange, CallStep, ChangeInput, CheckConfigured, CheckReply, ConfiguredCall,
@@ -32,17 +34,17 @@ use aruna_operations::plugins::host_steps::{
     PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReplyPlan,
 };
 use aruna_operations::plugins::intents::{begin, unknown_row};
-use aruna_operations::plugins::job_work::{CancelWork, JobState};
+use aruna_operations::plugins::job_work::JobState;
 use aruna_operations::plugins::objects::{LocalObject, Unmarked};
 use aruna_operations::plugins::outgoing::{
     SendConnection, declared_method, stored_whole, too_large, whole_text,
 };
 use aruna_operations::plugins::rows::write_rows;
-use aruna_operations::plugins::state::{MAX_STATE_KEY, read_state};
+use aruna_operations::plugins::state::MAX_STATE_KEY;
 use aruna_operations::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
 use aruna_operations::plugins::unavailable;
 use aruna_operations::plugins::work::RequestContext;
-use aruna_operations::plugins::work_calls::{JobOutputs, JobRow};
+use aruna_operations::plugins::work_calls::JobRow;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_plugin_types::calls::{
     Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
@@ -121,16 +123,6 @@ impl RunBroker {
         Ok((install, auth))
     }
 
-    /// Steps 0 to 2, and the account restricted to every grant of `permission`.
-    async fn listing(
-        &self,
-        permission: Permission,
-    ) -> Result<(PluginInstall, AuthContext), HostError> {
-        let check = GrantedCall::listing(&self.scope, permission);
-        let Granted { install, auth } = drive(check, &self.ctx).await?;
-        Ok((install, auth))
-    }
-
     fn read_place(&self, cx: &CallContext) -> ReadPlace {
         ReadPlace {
             scope: self.scope.clone(),
@@ -198,14 +190,6 @@ impl RunBroker {
         failure.error
     }
 
-    /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
-    /// intent pending, which a later attempt reads as unknown as well.
-    async fn mark_unknown(&self, intent: &Intent, reason: &str) {
-        if let Ok(row) = unknown_row(self.scope.run.run_id, &call_intent(intent), reason) {
-            let _ = drive(write_rows(vec![row]), &self.ctx).await;
-        }
-    }
-
     /// The intent's earlier outcome, or `None` when the effect may be dispatched now.
     async fn begun(&self, intent: &Intent) -> Result<Option<String>, HostError> {
         let begun = drive(begin(self.scope.run.run_id, call_intent(intent)), &self.ctx).await;
@@ -213,11 +197,21 @@ impl RunBroker {
         begun_reply(begun).map_err(|failure| self.failed(failure))
     }
 
+    /// Native work through the run's call history, with its time and id minted here.
+    fn native_ask(&self, intent: &Intent, request: WorkRequest) -> NativeAsk {
+        let minted = (unix_timestamp_millis(), Ulid::generate());
+        NativeAsk {
+            scope: self.scope.clone(),
+            intent: call_intent(intent),
+            request,
+            place: (minted, self.ctx.node_and_realm()),
+        }
+    }
+
     /// Starts native work through the run's call history.
     async fn native(&self, intent: &Intent, request: WorkRequest) -> Result<String, HostError> {
-        let minted = (unix_timestamp_millis(), Ulid::generate());
-        let place = (minted, self.ctx.node_and_realm());
-        let call = NativeCall::new(&self.scope, call_intent(intent), request, place);
+        let ask = self.native_ask(intent, request);
+        let call = NativeCall::new(&ask.scope, ask.intent, ask.request, ask.place);
         let started = drive(call, &self.ctx).await;
         started.map_err(|failure| self.failed(failure))
     }
@@ -363,9 +357,13 @@ impl Broker for RunBroker {
         version: Option<String>,
     ) -> Result<ObjectInfo, HostError> {
         let path = self.expand(text)?;
-        let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
         let place = (self.scope.realm_id, self.scope.local);
-        let info = ObjectInfoCall::new(place, &install, &path, version.as_deref())?;
+        let ask = InfoAsk {
+            place,
+            path: path.clone(),
+            version,
+        };
+        let info = Admitted::new(&self.scope, Some((Permission::ObjectsRead, &path)), ask);
         let info = drive(info, &self.ctx).await;
         info.map_err(|failure| self.failed(failure))
     }
@@ -376,11 +374,13 @@ impl Broker for RunBroker {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
-        let (install, _) = self.listing(Permission::ObjectsRead).await?;
-        let prefix = self.expand(prefix)?;
-        let place = (self.scope.realm_id, self.scope.local);
-        let list = ObjectListCall::new(place, &install, &prefix, cursor.as_deref())?;
-        let page = drive(list, &self.ctx).await;
+        let ask = ListAsk {
+            place: (self.scope.realm_id, self.scope.local),
+            group_id: self.scope.run.group_id,
+            prefix: prefix.to_string(),
+            cursor,
+        };
+        let page = drive(Admitted::new(&self.scope, None, ask), &self.ctx).await;
         page.map_err(|failure| self.failed(failure))
     }
 
@@ -441,7 +441,6 @@ impl Broker for RunBroker {
     }
 
     async fn jobs_copy(&self, _cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
-        self.admitted(None).await?;
         let version = (copy.version.as_deref()).map(version_id).transpose()?;
         let request = CopyRequest {
             source: self.expand(&copy.source)?,
@@ -449,7 +448,9 @@ impl Broker for RunBroker {
             target: self.expand(&copy.target)?,
             ordinal: copy.intent.ordinal,
         };
-        self.native(&copy.intent, WorkRequest::Copy(request)).await
+        let ask = self.native_ask(&copy.intent, WorkRequest::Copy(request));
+        let started = drive(Admitted::new(&self.scope, None, ask), &self.ctx).await;
+        started.map_err(|failure| self.failed(failure))
     }
 
     async fn jobs_download(
@@ -547,9 +548,12 @@ impl Broker for RunBroker {
         id: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
-        let install = self.admitted(None).await?;
-        let place = (&install, self.scope.local);
-        Ok(drive(JobOutputs::new(place, id, cursor), &self.ctx).await?)
+        let ask = OutputsAsk {
+            local: self.scope.local,
+            id: id.to_string(),
+            cursor,
+        };
+        Ok(drive(Admitted::new(&self.scope, None, ask), &self.ctx).await?)
     }
 
     async fn jobs_cancel(
@@ -559,16 +563,16 @@ impl Broker for RunBroker {
         _intent: Intent,
     ) -> Result<(), HostError> {
         // Asking again changes nothing, so a rerun cancels again instead of reading an intent.
-        let install = self.admitted(None).await?;
-        let cancel = CancelWork::new(&install, id, unix_timestamp_millis());
-        Ok(drive(cancel, &self.ctx).await?)
+        let cancel = CancelAsk { id: id.to_string() };
+        Ok(drive(Admitted::new(&self.scope, None, cancel), &self.ctx).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
         check_key(key)?;
-        let install = self.admitted(None).await?;
-        let entry = drive(read_state(install.install_id, key), &self.ctx).await;
-        let entry = entry.map_err(|error| unavailable(error.0))?;
+        let read = StateAsk {
+            key: key.to_string(),
+        };
+        let entry = drive(Admitted::new(&self.scope, None, read), &self.ctx).await?;
         Ok(entry.map(|entry| Entry {
             version: entry.version,
             value: entry.value,
@@ -577,28 +581,28 @@ impl Broker for RunBroker {
 
     async fn state_put(&self, _cx: &CallContext, put: StatePut) -> Result<u64, HostError> {
         check_key(&put.key)?;
-        let install = self.admitted(None).await?;
         let change = StateChange::Put(StateWrite {
             intent: call_intent(&put.intent),
             key: put.key,
             value: put.value,
             expected: put.expected,
         });
-        let ids = (self.scope.run.run_id, install.install_id);
-        let put = drive(StateCall::new(ids, change), &self.ctx).await;
+        let run_id = self.scope.run.run_id;
+        let put = Admitted::new(&self.scope, None, ChangeAsk { run_id, change });
+        let put = drive(put, &self.ctx).await;
         put.map_err(|failure| self.failed(failure))
     }
 
     async fn state_remove(&self, _cx: &CallContext, remove: StateRemove) -> Result<(), HostError> {
         check_key(&remove.key)?;
-        let install = self.admitted(None).await?;
         let change = StateChange::Remove(StateRemoval {
             intent: call_intent(&remove.intent),
             key: remove.key,
             expected: remove.expected,
         });
-        let ids = (self.scope.run.run_id, install.install_id);
-        let removed = drive(StateCall::new(ids, change), &self.ctx).await;
+        let run_id = self.scope.run.run_id;
+        let remove = Admitted::new(&self.scope, None, ChangeAsk { run_id, change });
+        let removed = drive(remove, &self.ctx).await;
         removed.map(drop).map_err(|failure| self.failed(failure))
     }
 
@@ -620,7 +624,8 @@ impl Broker for RunBroker {
 
     async fn log(&self, _cx: &CallContext, level: &str, message: &str) {
         let message = &self.scrub(message);
-        if self.admitted(None).await.is_ok() {
+        let admit = AdmitCall::new(&self.scope, None);
+        if drive(admit, &self.ctx).await.is_ok() {
             let mut run = self
                 .log
                 .lock()
@@ -633,9 +638,13 @@ impl Broker for RunBroker {
         }
     }
 
+    /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
+    /// intent pending, which a later attempt reads as unknown as well.
     async fn abandoned(&self, _cx: &CallContext, intent: &Intent) {
         let reason = "the call did not finish in time";
-        self.mark_unknown(intent, reason).await;
+        if let Ok(row) = unknown_row(self.scope.run.run_id, &call_intent(intent), reason) {
+            let _ = drive(write_rows(vec![row]), &self.ctx).await;
+        }
     }
 }
 

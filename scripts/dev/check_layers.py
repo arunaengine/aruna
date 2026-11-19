@@ -110,7 +110,7 @@ COUNTS = (
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
     ("runner_refs", "runner references into domain modules"),
     ("core_clocks", "clock and random calls in core production code"),
-    ("trigger_arms", "trigger shell arms that call async code"),
+    ("trigger_arms", "trigger shell arms that do more than drive one operation"),
     ("state_clones", "match self.state.clone() in operations"),
     ("async_parallel", "files with parallel work only through async code"),
     ("test_sleeps", "real sleeps in tests without paused time"),
@@ -138,6 +138,7 @@ DEF_RE = re.compile(r"\b(?:struct|enum|trait|type|fn|const|static|mod|union)\s+(
 USE_RE = re.compile(r"\buse\s+((?:crate|super|self)\b[^;]*);")
 INLINE_RE = re.compile(r"\bcrate(?:::\w+)+")
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+DRIVE_RE = re.compile(r"\bdrive\s*\(")
 MATCH_RE = re.compile(r"\bmatch\b")
 STATE_CLONE = re.compile(r"\bmatch\s+self\s*\.\s*state\s*\.\s*clone\s*\(\s*\)")
 PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinSet|try_join\w*)\b")
@@ -540,9 +541,16 @@ def trigger_arms(sources):
         impl_re = re.compile(r"\bimpl\b[^{;]*\b" + trait + r"\s+for\b[^{;]*\{")
         for impl in impl_re.finditer(source.masked):
             body = source.masked[impl.end() - 1 : pair_end(source.masked, impl.end() - 1, BRACE_RE)]
-            for method in re.finditer(r"\basync\s+fn\s+(\w+)", body):
-                found.append(f"{rel}: {trait}::{method.group(1)}")
+            for name, keyword, start, end in function_bodies(body):
+                if body[:keyword].rstrip().endswith("async") and not one_drive(body[start:end]):
+                    found.append(f"{rel}: {trait}::{name}")
     return found
+
+
+def one_drive(body):
+    """Whether an async arm only builds one operation, drives it and maps the result."""
+    awaits = body.count(".await")
+    return awaits == 0 or (awaits == 1 and DRIVE_RE.search(body) is not None)
 
 
 def function_bodies(masked):

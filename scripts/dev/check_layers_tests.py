@@ -210,8 +210,12 @@ class TriggerTest(unittest.TestCase):
         )
 
     def test_broker_impl(self):
-        rel = "operations/src/plugins/broker.rs"
-        text = "impl Broker for RunBroker {\n    async fn get(&self) {}\n    fn sync(&self) {}\n}\nasync fn free() {}\n"
+        rel = "aruna/src/plugin_host/broker.rs"
+        text = (
+            "impl Broker for RunBroker {\n    async fn get(&self) { self.a().await; drive(b).await }\n"
+            "    async fn one(&self) { Ok(drive(op, c).await?) }\n    fn sync(&self) {}\n}\n"
+            "async fn free() { x.await; y.await }\n"
+        )
         with tempfile.TemporaryDirectory() as root:
             write_tree(root, {rel: text})
             source = check_layers.load_source(root, rel)

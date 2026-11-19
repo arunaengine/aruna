@@ -61,7 +61,7 @@
     "silent_skips": 9,
     "state_clones": 2,
     "test_sleeps": 64,
-    "trigger_arms": 24,
+    "trigger_arms": 10,
     "upward_refs": 220
   }
 }
