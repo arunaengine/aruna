@@ -389,7 +389,6 @@ mod tests {
     #[tokio::test]
     async fn actions_refuse_deleting() {
         use super::super::actions::{ActionError, ApplyActionInput, apply_action};
-        use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
         use aruna_core::structs::{ActionKind, ActionScope};
 
         let (_dir, context) = context().await;
@@ -466,6 +465,7 @@ mod tests {
     }
 
     async fn bucket_gone(context: &Arc<DriverContext>, bucket: &str) -> bool {
+        use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
         let bucket = GetBucketOperation::new(bucket.to_string());
         matches!(drive(bucket, context).await, Err(GetBucketError::NotFound))
     }
