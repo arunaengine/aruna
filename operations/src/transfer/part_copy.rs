@@ -16,8 +16,8 @@ use crate::transfer::copy::{
     CopySourceConditions, evaluate_source_conditions, source_etag, source_modified,
 };
 use crate::transfer::read::{ReadSourceOperation, TokenRead};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -457,7 +457,7 @@ mod test {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn test_node_id() -> aruna_core::NodeId {
+    fn test_node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 
@@ -553,7 +553,7 @@ mod test {
         context: &DriverContext,
         realm_id: RealmId,
         group_id: GroupId,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
         bucket: &str,
         key: &str,
         data: &'static [u8],

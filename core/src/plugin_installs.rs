@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
+use crate::id::NodeId;
 use crate::plugins::{valid_digest, valid_name, valid_version};
 use crate::secrets::{SecretName, SecretScope};
 use crate::types::{GroupId, RoleId};

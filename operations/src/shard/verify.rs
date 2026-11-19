@@ -4,12 +4,12 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::manifest_entry_digest;
 use aruna_core::document::{ShardManifest, shard_topic_id};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, ShardNetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, ShardNetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::resolve_shard_holders;

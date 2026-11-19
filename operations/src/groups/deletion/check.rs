@@ -5,8 +5,8 @@
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::{

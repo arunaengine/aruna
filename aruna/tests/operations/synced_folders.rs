@@ -393,7 +393,7 @@ async fn wakes_replication_drain() -> TestResult<()> {
 /// shell serves it.
 async fn served_pull(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     request: MetadataTransportMessage,
 ) -> SyncPullStatus {
     let view = needs_view(&request);
@@ -415,7 +415,7 @@ async fn served_pull(
 /// Starts pulling one device version of `peer` and answers at once.
 async fn accept_pull(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     auth_token: AuthToken,
     pull: SyncPull,
 ) -> SyncPullStatus {
@@ -427,7 +427,7 @@ async fn accept_pull(
 /// Where the pull of one device version of `peer` stands on this node.
 async fn pull_status(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     auth_token: AuthToken,
     pull: &SyncPull,
 ) -> SyncPullStatus {
@@ -439,7 +439,7 @@ async fn pull_status(
 /// Polls an accepted pull until the realm node answers for good.
 async fn pull_done(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     token: &AuthToken,
     pull: &SyncPull,
     status: SyncPullStatus,

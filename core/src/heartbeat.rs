@@ -9,9 +9,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::NodeId;
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::compute::{ExecutorAvailability, MAX_ADVERTISED_EXECUTORS};
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::MAX_KIND_LEN;
 use crate::structs::storage::node_info::{AdvertisementEpoch, NodeInfoDocument, NodeUtilization};

@@ -1178,7 +1178,7 @@ async fn authoring_docs_resource() {
 }
 
 /// Publishes `api` as the api address of `node_id`.
-async fn publish_api(state: &ServerState, node_id: aruna_core::NodeId, api: &str) {
+async fn publish_api(state: &ServerState, node_id: aruna_core::id::NodeId, api: &str) {
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::structs::storage::node_info::{
         AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,

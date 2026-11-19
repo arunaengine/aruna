@@ -500,13 +500,13 @@ pub enum NetEvent {
     /// The last contact of each asked peer this node saw, in unix milliseconds.
     PeerContacts(std::collections::BTreeMap<NodeId, u64>),
     /// This node's id, or `None` on a node without a net handle.
-    LocalNode(Option<crate::NodeId>),
+    LocalNode(Option<crate::id::NodeId>),
     /// The realm this node serves, `None` without a network.
     LocalRealm(Option<crate::structs::identity::realm::RealmId>),
     /// Whether the issuer key is a valid public key; `false` also when it went unchecked.
     IssuerKey(bool),
     /// This node's id and the holders its watch interest matches; `None` without a net handle.
-    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
+    WatchHolders(Option<(crate::id::NodeId, Vec<crate::id::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
     /// Whether the peer set follows the configuration, or why it does not.
@@ -542,7 +542,7 @@ pub enum NetEvent {
     TopicPeers(Result<(), TopicPeerError>),
     /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
     /// unreadable.
-    MissingTopicPeers(Result<Option<Vec<crate::NodeId>>, String>),
+    MissingTopicPeers(Result<Option<Vec<crate::id::NodeId>>, String>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// A local signal or change was taken; nothing is read back.

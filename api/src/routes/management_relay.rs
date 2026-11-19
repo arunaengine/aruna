@@ -5,7 +5,7 @@
 use crate::error::ServerError;
 use crate::routes::assistant::PROXY_BODY_LIMIT;
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::member_read::MemberMethod;
 use aruna_core::structs::SESSION_HEADER;
 use aruna_core::structs::identity::auth::AuthContext;

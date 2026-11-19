@@ -5,9 +5,9 @@
 
 use std::time::Instant;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::FrameShape;
+use aruna_core::id::NodeId;
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;

@@ -1986,7 +1986,7 @@ async fn reports_device_seen() {
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         now_ms,
     );
-    let device = |node_id: aruna_core::NodeId| {
+    let device = |node_id: aruna_core::id::NodeId| {
         nodes
             .iter()
             .find(|node| node.node_id == node_id.to_string() && node.kind == NodeKindInfo::User)

@@ -50,7 +50,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-fn local_node(context: &DriverContext) -> Option<aruna_core::NodeId> {
+fn local_node(context: &DriverContext) -> Option<aruna_core::id::NodeId> {
     context.net_handle.as_ref().map(|net| net.node_id())
 }
 

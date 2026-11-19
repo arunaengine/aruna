@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::member_read::MemberMethod;
 use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;

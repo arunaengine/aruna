@@ -716,7 +716,7 @@ pub(super) mod pure_tests {
             local_bucket: "folder-x".to_string(),
             group_id: Ulid::from_bytes([2u8; 16]),
             remote: RemoteBinding {
-                node_id: aruna_core::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
+                node_id: aruna_core::id::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
                 bucket: "lab".to_string(),
                 prefix: String::new(),
             },

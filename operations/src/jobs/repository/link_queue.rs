@@ -885,7 +885,7 @@ pub struct OwnerHoldsOperation {
     scope: NodeScope,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     document_id: Ulid,
-    owner_node: aruna_core::NodeId,
+    owner_node: aruna_core::id::NodeId,
 }
 
 impl OwnerHoldsOperation {

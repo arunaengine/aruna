@@ -94,7 +94,7 @@ async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
     usage
 }
 
-fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
+fn node_info_bytes(node_id: aruna_core::id::NodeId) -> Vec<u8> {
     NodeInfoDocument {
         node_id,
         executors: Vec::new(),

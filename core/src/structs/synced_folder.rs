@@ -666,7 +666,7 @@ pub enum SyncRefusal {
     Unavailable,
     /// The target key belongs to a range of a distributed bucket that this node does not
     /// coordinate; the named coordinator node takes the pull.
-    Coordinator(crate::NodeId),
+    Coordinator(crate::id::NodeId),
 }
 
 /// A stable label of `refusal` for logs.

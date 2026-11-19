@@ -737,7 +737,7 @@ mod tests {
         let bucket = format!("{realm}/01JMETADATA0123456789ABCDE/");
         assert_eq!(parse_tail(&bucket), Some((realm, bucket.clone())));
         let key = SigningKey::from_bytes(&[4; 32]).verifying_key();
-        let node = aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap();
+        let node = aruna_core::id::NodeId::from_bytes(key.as_bytes()).unwrap();
         let arn = format!("arn:aruna:{realm}:{node}:s3/reads/a%20b@01JMETADATA0123456789ABCDE");
         assert_eq!(parse_tail(&arn), Some((realm, arn.clone())));
         for bad in [

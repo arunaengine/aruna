@@ -600,7 +600,7 @@ pub mod test {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_drivers::driver::{DriverContext, drive};
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 

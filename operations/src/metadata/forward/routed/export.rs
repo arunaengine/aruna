@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MaterializationState, MetadataEffect, MetadataEvent};
 use aruna_core::operation::Operation;
 use aruna_core::placement::read_holder_sets;

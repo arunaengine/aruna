@@ -5,10 +5,10 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification_watch::{

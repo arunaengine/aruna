@@ -3,12 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-
 #[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentEvent, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
 use byteview::ByteView;

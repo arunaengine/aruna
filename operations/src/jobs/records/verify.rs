@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
     JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,

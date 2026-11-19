@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 

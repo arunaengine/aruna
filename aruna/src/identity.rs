@@ -7,12 +7,12 @@ pub mod enrollment;
 
 use enrollment::{EnrollmentPlan, plan_enrollment};
 
-use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;

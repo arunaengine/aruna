@@ -9,7 +9,7 @@ use crate::lookup::bucket_info;
 use crate::routes::storage::blobs::plaintext_holder;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::PolicyRequestExtras;

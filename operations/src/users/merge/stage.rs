@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::MergeError;
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,

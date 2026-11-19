@@ -7,9 +7,9 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::effects::{Effect, StorageEffect};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use crate::metadata::{MetadataEventPayload, MetadataEventRecord};
 use crate::structs::identity::realm::RealmId;

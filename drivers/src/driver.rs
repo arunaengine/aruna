@@ -6,7 +6,6 @@ use aruna_blob::blob::BlobHandle;
 use aruna_blob::blob::group::GroupHold;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::CallRun;
 use aruna_core::compute::ResourceEnvelope;
@@ -14,6 +13,7 @@ use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEff
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
@@ -123,7 +123,7 @@ impl DriverContext {
     }
 
     /// This node; `None` on a node without a net transport.
-    pub fn node_id(&self) -> Option<aruna_core::NodeId> {
+    pub fn node_id(&self) -> Option<aruna_core::id::NodeId> {
         self.net_handle.as_ref().map(|net| net.node_id())
     }
 
@@ -131,7 +131,7 @@ impl DriverContext {
     pub fn node_and_realm(
         &self,
     ) -> Option<(
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::identity::realm::RealmId,
     )> {
         self.net_handle

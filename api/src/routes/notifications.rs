@@ -11,8 +11,8 @@ use crate::routes::notification_calls::{
     unread_for_user,
 };
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::id::NodeId;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,

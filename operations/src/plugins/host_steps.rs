@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::entity_patch::craqle_patch_request;
+use aruna_core::id::NodeId;
 use aruna_core::injection::OutgoingRequest;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;

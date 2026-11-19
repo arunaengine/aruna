@@ -6,7 +6,7 @@
 use super::staging::{self, LegacyStaging};
 use super::{Rewrites, decode_error, session_refs};
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
@@ -605,7 +605,7 @@ mod tests {
     use super::{LegacyExportResult, LegacyExportSpec, LegacyJob, LegacyPayload, LegacyResult};
     use crate::migrate::migrate_output;
     use crate::migrate::tests::{read, write};
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_STATE_KEYSPACE};
     use aruna_core::structs::execution::job::{
         CapturedInput, ExecutionSpec, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,

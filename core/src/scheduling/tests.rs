@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::policy::PlacementSelector;
 use crate::structs::placement::record::LabelMatch;

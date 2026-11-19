@@ -1762,7 +1762,7 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1803,7 +1803,7 @@ async fn evict_device(
     Path(node_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = authorize_onboarding_admin(&state, auth).await?;
-    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1815,7 +1815,7 @@ async fn evict_device(
 async fn evict_node(
     state: &Arc<ServerState>,
     auth: &AuthContext,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     scope: DeviceEvictionScope,
 ) -> ServerResult<()> {
     if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {

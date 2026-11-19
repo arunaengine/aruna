@@ -27,7 +27,7 @@ mod tests {
     use aruna_storage::storage::worker::FjallStorage;
     use ulid::Ulid;
 
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::execution::notification_watch::{
         WatchAuthorizationBinding, WatchSubscription,
     };

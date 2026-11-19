@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::{Event, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{MemoryPermit, PluginEvent, PublishedPlugin};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};

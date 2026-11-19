@@ -23,9 +23,9 @@ pub use status::StoreStatusOperation;
 use crate::replication::sync_relationship::SyncRelationshipError;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::SyncRelationship;

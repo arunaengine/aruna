@@ -107,13 +107,13 @@ async fn nonholder_audit_trail() -> TestResult<()> {
     assert_eq!(deduped, DOCUMENTS, "paging returned a duplicate record");
 
     // An unreachable node is reported, never hidden behind a complete-looking page.
-    let mut peers: Vec<aruna_core::NodeId> = realm
+    let mut peers: Vec<aruna_core::id::NodeId> = realm
         .nodes
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != reader.node_id())
         .map(TestNode::node_id)
         .collect();
-    let dead: Vec<aruna_core::NodeId> = (200u8..=204)
+    let dead: Vec<aruna_core::id::NodeId> = (200u8..=204)
         .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
         .collect();
     peers.extend(dead.iter().copied());
@@ -196,8 +196,8 @@ async fn fan_out(
     realm: &Topology,
     reader: &TestNode,
     group_id: Ulid,
-    peers: &[aruna_core::NodeId],
-    dead: &[aruna_core::NodeId],
+    peers: &[aruna_core::id::NodeId],
+    dead: &[aruna_core::id::NodeId],
 ) -> TestResult<AuditAggregate> {
     let page = RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(

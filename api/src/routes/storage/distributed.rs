@@ -6,7 +6,7 @@
 use aruna_drivers::driver::drive;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::request::PublishRefusal;

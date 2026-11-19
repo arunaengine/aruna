@@ -126,8 +126,8 @@ pub(crate) fn fence_answer(
 pub struct MappingRoute {
     pub realm_id: RealmId,
     pub placement: PlacementRef,
-    pub peers: Vec<aruna_core::NodeId>,
-    pub actor: aruna_core::NodeId,
+    pub peers: Vec<aruna_core::id::NodeId>,
+    pub actor: aruna_core::id::NodeId,
     /// Activation generation the mapping's bucket resolved at. `0` means the
     /// realm has no activation yet, so no transition can be in flight.
     pub generation: u64,
@@ -139,7 +139,7 @@ pub(crate) fn mapping_route_for(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     document_id: Ulid,
-    actor: aruna_core::NodeId,
+    actor: aruna_core::id::NodeId,
 ) -> Option<MappingRoute> {
     let placement = mapping_placement(config, realm_id, document_id).ok()?;
     Some(MappingRoute {
@@ -162,7 +162,7 @@ pub(crate) fn mapping_placement(
 
 /// A context without a net handle replicates nothing, so its transitions record a
 /// fixed placeholder actor rather than inventing an identity.
-pub(crate) fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::NodeId {
+pub(crate) fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::id::NodeId {
     route
         .as_ref()
         .map(|route| route.actor)

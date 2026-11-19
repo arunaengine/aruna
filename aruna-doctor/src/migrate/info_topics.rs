@@ -200,7 +200,7 @@ pub(super) mod tests {
 
     const REALM: RealmId = RealmId([3u8; 32]);
 
-    pub(in crate::migrate) fn node(seed: u8) -> aruna_core::NodeId {
+    pub(in crate::migrate) fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 

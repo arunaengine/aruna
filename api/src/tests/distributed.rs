@@ -6,11 +6,11 @@ use crate::server::state::ServerState;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, write_doc};
 use aruna_blob::blob::BlobHandler;
-use aruna_core::NodeId;
 use aruna_core::download_slots::DownloadSlots;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::heartbeat::NodeHeartbeat;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE,

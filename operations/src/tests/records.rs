@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::compute::ExecutionTargetId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
     ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,

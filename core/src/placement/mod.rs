@@ -10,8 +10,8 @@ pub mod resolver;
 pub mod selector;
 pub mod transition;
 
-use crate::NodeId;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmConfigDocument;
 use crate::structs::placement::record::{
     DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, shard_for_subject,

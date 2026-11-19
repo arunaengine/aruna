@@ -54,7 +54,7 @@ async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
 async fn seed_config(
     storage: &StorageHandle,
     config: &RealmConfigDocument,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) {
     let target = DocumentTarget::RealmConfig {
         realm_id: RealmId(REALM.0),

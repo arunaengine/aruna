@@ -7,9 +7,9 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_ORIGIN_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
@@ -698,7 +698,7 @@ mod tests {
     use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
     use aruna_drivers::driver::{DriverContext, drive};
 
-    fn node_id() -> aruna_core::NodeId {
+    fn node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()
     }
 

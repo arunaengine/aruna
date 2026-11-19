@@ -6,9 +6,9 @@ pub mod node;
 pub mod owner;
 pub mod realm;
 
-use aruna_core::NodeId;
 use aruna_core::calls::IoCall;
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 use aruna_core::secrets::widens_use;
 use aruna_core::secrets::{

@@ -15,9 +15,9 @@ use super::{
     realm_role_path, realm_user_path, revoked_token_path, role_definition_value,
     strategy_binding_path, user_attribute_path, user_subject_path,
 };
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
 use crate::auth::REVOCATION_GRACE_SECS;
+use crate::id::NodeId;
 use crate::structs::identity::realm::{
     GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmNodeKind, UserCapOverride,

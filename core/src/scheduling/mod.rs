@@ -33,7 +33,7 @@ pub struct PlannedInput {
     pub bytes: u64,
     pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
-    pub source_node_id: Option<crate::NodeId>,
+    pub source_node_id: Option<crate::id::NodeId>,
     pub transfer_ms: u64,
     pub known_link: bool,
 }
@@ -99,7 +99,7 @@ impl CandidateVerdict {
 /// One target of a planning round as an external report shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanCandidate {
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub executor_kind: Option<String>,
     pub verdict: CandidateVerdict,
     /// Place among the alternatives, counted from one. Absent for the selected

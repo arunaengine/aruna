@@ -7,12 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::NodeId;
 use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::document::DocumentTarget;
 use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
 use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
+use crate::id::NodeId;
 use crate::keyspaces::NODE_INFO_KEYSPACE;
 use crate::operation::Operation;
 use crate::structs::identity::realm::RealmConfigDocument;

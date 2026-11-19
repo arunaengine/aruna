@@ -94,7 +94,7 @@ fn lost_race_continues() {
     );
 }
 
-fn other_node() -> aruna_core::NodeId {
+fn other_node() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()
 }
 

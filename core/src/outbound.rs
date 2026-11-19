@@ -10,9 +10,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::calls::IoError;
 use crate::compute::SharedSecret;
+use crate::id::NodeId;
 use crate::injection::OutgoingRequest;
 use crate::structs::execution::email::SmtpTls;
 use crate::structs::execution::setting::SettingChannel;

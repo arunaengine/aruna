@@ -6,11 +6,11 @@ use super::{
     MergeError, MergeOutcome, MergeState, MergeUsersConfig, MergeUsersOperation, Phase, plan,
 };
 use crate::auth::revoke_token::RevokeTokenError;
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::AdminDocumentState;

@@ -68,9 +68,9 @@ use crate::s3::util::{
     parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
 use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::compute::session::{SessionRequest, TouchedObject};
+use aruna_core::id::NodeId;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;

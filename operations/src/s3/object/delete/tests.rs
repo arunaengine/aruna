@@ -57,7 +57,7 @@ fn read(value: Option<aruna_core::types::Value>) -> IoResult {
     IoResult::Values(vec![value])
 }
 
-fn test_node_id() -> aruna_core::NodeId {
+fn test_node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
 

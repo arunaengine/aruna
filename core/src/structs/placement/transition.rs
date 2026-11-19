@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::identity::realm::{RealmId, RealmNodeKind};
 use crate::structs::placement::record::{AffinityRule, PlacementOverride};
 

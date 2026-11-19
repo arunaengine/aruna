@@ -58,7 +58,7 @@ const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The call that sends `message` to `peer`, or why it does not encode.
 pub(crate) fn peer_call(
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     message: &MetadataTransportMessage,
 ) -> Result<aruna_core::calls::IoCall, String> {
     peer_call_within(peer, message, PEER_DEADLINE)
@@ -66,7 +66,7 @@ pub(crate) fn peer_call(
 
 /// [`peer_call`] with an answer due within `timeout`.
 pub(crate) fn peer_call_within(
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     message: &MetadataTransportMessage,
     timeout: std::time::Duration,
 ) -> Result<aruna_core::calls::IoCall, String> {

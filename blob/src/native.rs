@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::StagingSourceEvent;
+use aruna_core::id::NodeId;
 use aruna_core::native_reference::{
     MAX_HEADER_SIZE, NativeReferenceRequest, NativeReferenceResponse, relationship_request,
 };

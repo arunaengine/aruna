@@ -16,8 +16,8 @@ pub mod repository;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE};
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::{outside_answer, outside_call};

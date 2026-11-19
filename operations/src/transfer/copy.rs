@@ -962,7 +962,7 @@ pub(crate) mod test {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    fn test_node_id() -> aruna_core::NodeId {
+    fn test_node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 

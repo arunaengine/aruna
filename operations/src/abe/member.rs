@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{KeyAction, KeyError, KeyOperation, KeyResult};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;

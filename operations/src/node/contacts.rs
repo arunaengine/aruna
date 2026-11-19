@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 
 /// The last contact of each peer this node saw, in unix milliseconds; a peer never seen, or a

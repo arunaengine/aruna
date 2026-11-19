@@ -1018,9 +1018,9 @@ impl Operation for RebuildIndexOperation {
 mod tests {
     use super::*;
     use crate::metadata::repository::create_outbox_entries;
-    use aruna_core::NodeId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::Actor;

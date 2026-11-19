@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange};
 use crate::structured_id::PlacementHandle;
 

@@ -6,10 +6,10 @@
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::errors::StorageError;
 use crate::events::Event;
+use crate::id::NodeId;
 use crate::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
 use crate::operation::{Operation, TransactionMode};
 use crate::rows::read_row;

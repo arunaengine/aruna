@@ -1698,8 +1698,8 @@ mod tests {
         ManagedCopyRecord, ManagedCopyState, VersionKey, bucket_permission_path,
         group_permission_path, key_content_type, object_permission_path,
     };
-    use crate::NodeId;
     use crate::errors::ConversionError;
+    use crate::id::NodeId;
     use crate::structs::execution::source_access::SourceMetadata;
     use crate::structs::execution::source_connector::SourceConnectorKind;
     use crate::structs::execution::staging::{

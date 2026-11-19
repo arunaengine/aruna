@@ -842,7 +842,7 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::Compression;

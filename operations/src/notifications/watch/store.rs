@@ -261,7 +261,7 @@ pub struct CreateWatchOperation {
 impl CreateWatchOperation {
     pub fn new(
         (watch_id, outbox_id): (Ulid, Ulid),
-        local: aruna_core::NodeId,
+        local: aruna_core::id::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
         authorization: WatchAuthorizationBinding,

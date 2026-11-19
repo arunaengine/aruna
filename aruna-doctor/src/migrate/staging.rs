@@ -5,7 +5,7 @@
 
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     StagingJobCheckpoint, StagingJobError, StagingJobItem, StagingJobPhase, StagingJobPrefix,
     StagingJobSpec,

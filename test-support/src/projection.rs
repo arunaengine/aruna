@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::projection::{

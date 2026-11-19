@@ -8,7 +8,7 @@
 use std::pin::Pin;
 use std::task::Poll;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::distribution::delegation::{

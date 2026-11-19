@@ -5,11 +5,11 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,

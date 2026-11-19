@@ -851,7 +851,7 @@ pub enum NetEffect {
     /// Skips a holder that failed in holder choices for a while; answers
     /// `NetEvent::HolderAvoided`.
     AvoidHolder {
-        node_id: crate::NodeId,
+        node_id: crate::id::NodeId,
         now_ms: u64,
     },
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.

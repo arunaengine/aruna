@@ -463,8 +463,8 @@ mod failure_tests {
 #[cfg(test)]
 mod tests {
     use super::{ARUNA_DATA_PREFIX, ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier};
-    use crate::NodeId;
     use crate::errors::ConversionError;
+    use crate::id::NodeId;
     use crate::structs::identity::realm::RealmId;
     use proptest::prelude::*;
     use std::str::FromStr;

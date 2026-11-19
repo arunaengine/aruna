@@ -62,7 +62,7 @@ mod tests {
 
     use crate::notifications::watch::records::WATCH_CAP_REACHED;
     use crate::tests::notifications::{context, temp_storage, user};
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::MAX_PREFIX_LEN;
     use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};

@@ -4,10 +4,10 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{ShardMembership, ShardNetEffect};
 use aruna_core::events::ShardNetEvent;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use irokle::TopicId;

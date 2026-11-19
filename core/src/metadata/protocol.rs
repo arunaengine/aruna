@@ -4,7 +4,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use crate::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
 use crate::calls::{IoCall, IoError, IoResult};
@@ -14,6 +13,7 @@ use crate::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, Receip
 use crate::effects::{FrameShape, MetadataRequestEffect};
 use crate::events::{Event, NetEvent, PeerRequestError};
 use crate::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
+use crate::id::NodeId;
 use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
@@ -803,10 +803,10 @@ pub struct RealmDocuments {
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,
     /// Display names of realm nodes from the serving node's realm config state.
-    pub node_names: std::collections::BTreeMap<crate::NodeId, String>,
+    pub node_names: std::collections::BTreeMap<crate::id::NodeId, String>,
     /// Map places of realm nodes from the serving node's realm config state.
     pub node_places:
-        std::collections::BTreeMap<crate::NodeId, crate::structs::identity::realm::NodePlace>,
+        std::collections::BTreeMap<crate::id::NodeId, crate::structs::identity::realm::NodePlace>,
 }
 
 /// One page of immutable records plus the cursor of the next one.

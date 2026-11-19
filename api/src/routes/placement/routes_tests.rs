@@ -44,7 +44,7 @@ use ulid::Ulid;
 const BUCKET: &str = "datasets";
 const KEY: &str = "raw/sample.fastq";
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[3u8; 32]).public()
 }
 

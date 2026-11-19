@@ -16,7 +16,7 @@ use aruna_drivers::driver::drive;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::member_read::{MemberBody, MemberMethod, TrailerValue};
 use aruna_core::outbound::xml_field;
 use aruna_core::stream::BackendStream;

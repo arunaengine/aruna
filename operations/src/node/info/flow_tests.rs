@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::compute::quota::ResourceTotals;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
+use aruna_core::id::NodeId;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::NodeUrls;

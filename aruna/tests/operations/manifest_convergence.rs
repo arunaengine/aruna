@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::metadata_calls::read_mapping;
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::placement::{

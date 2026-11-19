@@ -75,7 +75,7 @@ pub fn foreign_owner(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,

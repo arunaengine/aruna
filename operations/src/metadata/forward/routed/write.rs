@@ -5,9 +5,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::{Event, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource, MetadataEffect};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::placement::resolve_shard_holders;

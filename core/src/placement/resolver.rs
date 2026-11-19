@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::NodeId;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
 use crate::structs::placement::record::{
     AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,

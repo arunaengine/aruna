@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::snapshot::{Installed, install};
 use super::{DistributionError, DistributionView, PublisherCutoff, SignedSnapshot};
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation};
+use crate::id::NodeId;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmId};
 
 /// At most this many publisher and set pairs wait for their publisher's membership.

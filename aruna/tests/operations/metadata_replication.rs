@@ -16,6 +16,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
@@ -36,7 +37,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::user::id::UserId;
-use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
+use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -419,7 +420,7 @@ async fn seed_and_update(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> Result<(PlacementRef, Vec<aruna_core::NodeId>, Ulid), Box<dyn std::error::Error>> {
+) -> Result<(PlacementRef, Vec<aruna_core::id::NodeId>, Ulid), Box<dyn std::error::Error>> {
     let created = drive(
         CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
@@ -496,8 +497,8 @@ async fn drain_origin(
     nodes: &[TestNode],
     realm_id: RealmId,
     placement: &PlacementRef,
-    initial_holders: &[aruna_core::NodeId],
-) -> Result<aruna_core::NodeId, Box<dyn std::error::Error>> {
+    initial_holders: &[aruna_core::id::NodeId],
+) -> Result<aruna_core::id::NodeId, Box<dyn std::error::Error>> {
     let obsolete = nodes[0].net.node_id();
     let updated_config = drive(
         MutatePlacementOperation::new(MutatePlacementConfig {
@@ -534,7 +535,7 @@ async fn drain_origin(
 async fn assert_update_reaches(
     nodes: &[TestNode],
     realm_id: RealmId,
-    replacement: aruna_core::NodeId,
+    replacement: aruna_core::id::NodeId,
     group_id: Ulid,
     document_id: Ulid,
     update_event_id: Ulid,
@@ -1326,7 +1327,7 @@ async fn publish_to_peer(
     event_id: Ulid,
     target: DocumentTarget,
     bytes: Vec<u8>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     placement: aruna_core::structs::placement::record::PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
@@ -1354,7 +1355,7 @@ async fn publish_to_peer(
 }
 
 fn publish_change(
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     target: &DocumentTarget,
     bytes: &[u8],
     placement: aruna_core::structs::placement::record::PlacementRef,
@@ -1416,7 +1417,7 @@ async fn read_holder_set(
     node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
-) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::NodeId>)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::id::NodeId>)>, Box<dyn std::error::Error>> {
     let key = metadata_registry_key(group_id, document_id);
     match node
         .context
@@ -1499,10 +1500,10 @@ async fn wait_persisted_update(
 
 async fn wait_holder_set(
     nodes: &[TestNode],
-    node_ids: &[aruna_core::NodeId],
+    node_ids: &[aruna_core::id::NodeId],
     group_id: Ulid,
     document_id: Ulid,
-    expected_holders: &[aruna_core::NodeId],
+    expected_holders: &[aruna_core::id::NodeId],
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence(
         &format!("metadata holder indexes did not converge to {expected_holders:?}"),
@@ -1526,7 +1527,7 @@ async fn wait_holder_set(
     .await
 }
 
-fn same_holder_set(left: &[aruna_core::NodeId], right: &[aruna_core::NodeId]) -> bool {
+fn same_holder_set(left: &[aruna_core::id::NodeId], right: &[aruna_core::id::NodeId]) -> bool {
     left.len() == right.len()
         && left.iter().copied().collect::<HashSet<_>>()
             == right.iter().copied().collect::<HashSet<_>>()

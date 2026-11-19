@@ -4,7 +4,7 @@
 
 use std::str::FromStr;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::NotificationKind;
 use aruna_core::structs::execution::notification_watch::{

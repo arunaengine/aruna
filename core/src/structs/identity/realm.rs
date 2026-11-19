@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::auth::{
     MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS, revocation_live, revocation_retained,
     user_cutoff_hash,
 };
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::id_mint::named_id;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
 use crate::structs::execution::job::{JobId, SubmissionId};
@@ -42,7 +42,7 @@ use ulid::Ulid;
 pub const ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
 
 /// This node's id and realm, while it has a realm transport.
-pub type NodeRealm = Option<(crate::NodeId, RealmId)>;
+pub type NodeRealm = Option<(crate::id::NodeId, RealmId)>;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
@@ -1270,9 +1270,9 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 
 #[cfg(test)]
 mod test {
-    use crate::NodeId;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
+    use crate::id::NodeId;
     use crate::reducer::AdminDocumentState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::execution::job::SubmissionId;

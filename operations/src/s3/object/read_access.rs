@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -257,7 +257,7 @@ mod storage_tests {
     use ulid::Ulid;
 
     use super::*;
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::read_grant::READ_OPERATION;
     use aruna_drivers::driver::{DriverContext, drive};

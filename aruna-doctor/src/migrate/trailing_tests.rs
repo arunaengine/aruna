@@ -6,7 +6,7 @@ use super::super::tests::{read, write};
 use super::super::{migrate, migrate_output};
 use super::*;
 use crate::error::CliError;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
 use aruna_core::structs::execution::job::JobId;

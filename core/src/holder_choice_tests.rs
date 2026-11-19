@@ -21,7 +21,7 @@ use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
 use crate::types::{Key, Value};
 
-fn node(seed: u8) -> crate::NodeId {
+fn node(seed: u8) -> crate::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
@@ -156,7 +156,7 @@ fn links_rank_bandwidth() {
 
 const REALM: RealmId = RealmId([1; 32]);
 
-fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::NodeId>) -> IoResult {
+fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::id::NodeId>) -> IoResult {
     let facts = HolderFacts {
         local: node(9),
         realm_id: REALM,

@@ -568,7 +568,7 @@ mod pure_tests {
         }
     }
 
-    fn data_path(node_id: crate::NodeId, bucket: &str, key: &str) -> String {
+    fn data_path(node_id: crate::id::NodeId, bucket: &str, key: &str) -> String {
         crate::structs::execution::notification_watch::watch_resource_path(
             Ulid::from_bytes([6u8; 16]),
             node_id,

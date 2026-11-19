@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::compute::ExecutionTargetId;
 use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::structs::MintPersistentSpec;
 use crate::structs::checksum::ChecksumAlgorithm;
 use crate::structs::execution::harvest::HarvestJobSpec;

@@ -12,7 +12,7 @@ use crate::job_service::{
     read_report_routed, resolve_job_owner,
 };
 use crate::jobs::family_report;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::JobKind;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::request_policy::PolicyRequestExtras;

@@ -5,9 +5,9 @@
 #[cfg(test)]
 mod tests {
     use crate::notifications::watch::origin::EmitEventOperation;
-    use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::execution::notification::NotificationRecord;

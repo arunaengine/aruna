@@ -730,7 +730,7 @@ struct QueryNamesResult {
     names: Vec<String>,
     nodes_queried: usize,
     nodes_failed: usize,
-    failed_partitions: Vec<aruna_core::NodeId>,
+    failed_partitions: Vec<aruna_core::id::NodeId>,
 }
 
 struct SearchPathsResult {
@@ -868,7 +868,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
 async fn install_realm_config(
     nodes: &[&DistributedMetadataNode],
     realm_id: RealmId,
-    user_node: Option<(aruna_core::NodeId, aruna_core::user::id::UserId)>,
+    user_node: Option<(aruna_core::id::NodeId, aruna_core::user::id::UserId)>,
 ) {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();

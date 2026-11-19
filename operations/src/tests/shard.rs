@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 

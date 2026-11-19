@@ -5,8 +5,8 @@
 
 use std::fmt::Debug;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::fence::LocalFence;

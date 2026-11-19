@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{

@@ -6,9 +6,9 @@
 #[path = "persistent_id_forward.rs"]
 pub mod forward;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::read_row;
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(read_mapping(&ctx, id).await.unwrap().unwrap(), mapping);
     }
 
-    fn node() -> aruna_core::NodeId {
+    fn node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 

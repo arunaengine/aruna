@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,
 };
+use crate::id::NodeId;
 use crate::reducer::*;
 use crate::structs::identity::auth::{Actor, Permission};
 use crate::structs::identity::realm::{

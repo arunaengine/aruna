@@ -15,11 +15,11 @@ use crate::forward::fetch::PeerFrame;
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
 use crate::forward::write_peer::forwarded_checks;
-use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::events::PeerRequestError;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, WriteAuthError, peer_call, peer_reply, transport_message_kind,

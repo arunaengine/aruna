@@ -158,7 +158,7 @@ fn validate_endpoint(arn: &ArunaArn, endpoint: &str) -> Result<(), ConversionErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeId;
+    use crate::id::NodeId;
     use crate::structs::identity::realm::RealmId;
     use crate::user::id::UserId;
 

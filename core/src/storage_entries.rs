@@ -5,13 +5,13 @@
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision, DocumentTarget,
     ShardManifestEntry,
 };
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{
     COMMIT_MESSAGE_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
@@ -929,13 +929,13 @@ mod tests {
         shard_manifest_prefix, stale_conflict_deletes, sync_conflict_entry, sync_conflict_key,
         sync_revision_entry, sync_revision_key, updated_index_key,
     };
-    use crate::NodeId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::ShardManifestEntry;
     use crate::document::{
         DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision,
         DocumentTarget,
     };
+    use crate::id::NodeId;
     use crate::keyspaces::{
         DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
         IRI_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,

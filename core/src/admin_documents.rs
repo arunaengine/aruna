@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::identity::auth::{Actor, Permission, Role};
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
@@ -520,7 +520,7 @@ pub fn roles_narrowed(
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
-    use crate::NodeId;
+    use crate::id::NodeId;
     use crate::structs::identity::auth::Permission;
     use crate::structs::identity::realm::{
         MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,

@@ -5,12 +5,12 @@
 use std::collections::BTreeMap;
 
 use crate::jobs::demand::{DemandError, DemandSnapshotOperation, merge_view};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
 };
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;

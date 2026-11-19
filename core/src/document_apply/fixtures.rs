@@ -25,7 +25,7 @@ pub(super) fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])
 }
 
-pub(super) fn node() -> crate::NodeId {
+pub(super) fn node() -> crate::id::NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()
 }
 

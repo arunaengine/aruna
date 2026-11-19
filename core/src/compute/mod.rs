@@ -18,10 +18,10 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::NodeId;
 use crate::calls::{IoCall, IoError, IoResult};
 use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
+use crate::id::NodeId;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::EffectiveResources;
 use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};

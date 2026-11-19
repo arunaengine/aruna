@@ -4,11 +4,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     DISTRIBUTION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
@@ -1573,11 +1573,11 @@ mod pure_tests {
         RealmId::from_bytes([7u8; 32])
     }
 
-    fn node_from_seed(seed: u8) -> aruna_core::NodeId {
+    fn node_from_seed(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn read_request(local_node: aruna_core::NodeId, hash: [u8; 32]) -> BaoReadRequest {
+    fn read_request(local_node: aruna_core::id::NodeId, hash: [u8; 32]) -> BaoReadRequest {
         let realm_id = test_realm();
         BaoReadRequest {
             auth_context: AuthContext {
@@ -1605,7 +1605,7 @@ mod pure_tests {
         }
     }
 
-    fn read_path(local_node: aruna_core::NodeId) -> String {
+    fn read_path(local_node: aruna_core::id::NodeId) -> String {
         aruna_core::structs::storage::blob::object_permission_path(
             test_realm(),
             Ulid::from(5u128),
@@ -1615,7 +1615,7 @@ mod pure_tests {
         )
     }
 
-    fn realm_value(peer: aruna_core::NodeId) -> byteview::ByteView {
+    fn realm_value(peer: aruna_core::id::NodeId) -> byteview::ByteView {
         let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
         config.ensure_node(peer, RealmNodeKind::Server);
         postcard::to_allocvec(&config).unwrap().into()
@@ -2176,15 +2176,15 @@ mod pure_tests {
         assert!(!decide(None));
     }
 
-    fn device_realm_value(peer: aruna_core::NodeId, owner: UserId) -> byteview::ByteView {
+    fn device_realm_value(peer: aruna_core::id::NodeId, owner: UserId) -> byteview::ByteView {
         let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
         config.ensure_node(peer, RealmNodeKind::User { owner });
         postcard::to_allocvec(&config).unwrap().into()
     }
 
     fn device_operation(
-        local_node: aruna_core::NodeId,
-        peer: aruna_core::NodeId,
+        local_node: aruna_core::id::NodeId,
+        peer: aruna_core::id::NodeId,
         asserted: UserId,
     ) -> IncomingBaoOperation {
         let mut request = read_request(local_node, [4u8; 32]);

@@ -5,10 +5,10 @@
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::realm::peer_trust::ensure_realm_peer;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
@@ -1237,7 +1237,7 @@ mod pure_tests {
         assert!(operation.abort().is_empty());
     }
 
-    fn peer_realm(peer: aruna_core::NodeId) -> Vec<u8> {
+    fn peer_realm(peer: aruna_core::id::NodeId) -> Vec<u8> {
         let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         realm.ensure_node(peer, RealmNodeKind::Server);
         postcard::to_allocvec(&realm).unwrap()

@@ -5,11 +5,11 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
-use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;

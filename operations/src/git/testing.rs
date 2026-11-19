@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -10,6 +9,7 @@ use aruna_core::git::{
     CommitInfo, GitAnswer, GitChange, GitEvent, GitNode, GitRecord, StoredObject,
 };
 use aruna_core::git_state::{GitState, Projection};
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;

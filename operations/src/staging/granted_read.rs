@@ -4,11 +4,11 @@
 
 use std::ops::Range;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::native_reference::{GrantedBody, GrantedReadEffect, NativeRange};
 use aruna_core::operation::Operation;

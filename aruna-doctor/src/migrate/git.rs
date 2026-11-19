@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::session_refs::Layout;
-use aruna_core::NodeId;
 use aruna_core::git::{
     GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, RefUpdate, StoredObject,
 };
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;

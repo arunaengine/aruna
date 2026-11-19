@@ -9,10 +9,10 @@ use crate::replication::sync_relationship::{
     CreateRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
 };
-use aruna_core::NodeId;
 use aruna_core::calls::CallRun;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };

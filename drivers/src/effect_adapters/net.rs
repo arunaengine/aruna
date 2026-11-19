@@ -9,7 +9,6 @@ use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
@@ -20,6 +19,7 @@ use aruna_core::events::{
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use aruna_core::id::NodeId;
 use aruna_core::member_read::{MemberFetch, TrailerSeal};
 use aruna_core::native_reference::{
     DelegatedBody, DelegatedReadEffect, GrantedBody, GrantedReadEffect, NativeAuthority,

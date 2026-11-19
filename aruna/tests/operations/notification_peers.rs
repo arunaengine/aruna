@@ -4,9 +4,9 @@
 
 use aruna::inbound::initialize_incoming_fixture;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,

@@ -309,7 +309,7 @@ struct OutboxRotation {
     /// Topics whose FIFO is blocked for the rest of this rotation.
     blocked_topics: HashSet<irokle::TopicId>,
     /// Admin origin streams blocked for the rest of this rotation.
-    blocked_origins: HashSet<aruna_core::NodeId>,
+    blocked_origins: HashSet<aruna_core::id::NodeId>,
     /// Topics this node can never publish onto, for the rest of this rotation.
     undeliverable_topics: HashSet<irokle::TopicId>,
     totals: RotationTotals,
@@ -318,12 +318,12 @@ struct OutboxRotation {
 }
 
 struct DrainSubBatch {
-    peers: Vec<aruna_core::NodeId>,
+    peers: Vec<aruna_core::id::NodeId>,
     documents: Vec<DocumentSyncPublish>,
     topics: Vec<irokle::TopicId>,
     /// Admin origin of each entry, so a blocked publish also blocks the rest of
     /// that origin's sequence.
-    origins: Vec<Option<aruna_core::NodeId>>,
+    origins: Vec<Option<aruna_core::id::NodeId>>,
     targets: Vec<DocumentTarget>,
     record_keys: Vec<Vec<u8>>,
 }
@@ -337,7 +337,7 @@ struct DrainSyncOutcome {
     deleted: usize,
     /// Ordering domains to block for the rest of the rotation.
     blocked_topics: Vec<irokle::TopicId>,
-    blocked_origins: Vec<aruna_core::NodeId>,
+    blocked_origins: Vec<aruna_core::id::NodeId>,
 }
 
 /// Per-invocation defer state. The block sets are seeded from the open rotation;
@@ -348,7 +348,7 @@ struct DrainDeferState {
     topic_exists: HashMap<irokle::TopicId, bool>,
     topic_held: HashMap<irokle::TopicId, bool>,
     deferred_topics: HashSet<irokle::TopicId>,
-    blocked_origins: HashSet<aruna_core::NodeId>,
+    blocked_origins: HashSet<aruna_core::id::NodeId>,
     undeliverable_topics: HashSet<irokle::TopicId>,
 }
 
@@ -735,7 +735,7 @@ impl OperationsTaskHandler {
 
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `RestoreTopicsOperation`).
-    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
+    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::id::NodeId) {
         let task_id = TaskKey::SyncPlacements { realm_id, node_id };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
             warn!(task_id = ?task_id, "Cannot schedule shard placement sync without task handle");

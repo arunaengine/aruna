@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -351,7 +351,7 @@ mod tests {
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 

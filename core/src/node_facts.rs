@@ -4,9 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::NodeId;
 use crate::compute::offer::ExecutorOffer;
 use crate::download_slots::DownloadSlots;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::node_info::CLASS_LABEL_PREFIX;
 use crate::structs::storage::routing::BackendCatalog;

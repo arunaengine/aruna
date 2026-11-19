@@ -5,9 +5,9 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};

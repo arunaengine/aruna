@@ -6,7 +6,7 @@
 use super::session_refs::{self, Layout};
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;

@@ -69,7 +69,7 @@ fn abe_error(error: AbeError) -> ServerError {
 pub(crate) async fn drive_key(
     bucket: String,
     auth: AuthContext,
-    node: aruna_core::NodeId,
+    node: aruna_core::id::NodeId,
     action: KeyAction,
     context: &DriverContext,
 ) -> Result<KeyResult, KeyError> {

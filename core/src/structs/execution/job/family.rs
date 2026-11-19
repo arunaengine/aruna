@@ -406,7 +406,7 @@ impl TryFrom<String> for ResultMessage {
 }
 
 /// Ordering of one output inside a canonical set.
-fn output_order(object: &OutputObject) -> (crate::NodeId, &str, &str, Ulid) {
+fn output_order(object: &OutputObject) -> (crate::id::NodeId, &str, &str, Ulid) {
     (
         object.node_id,
         &object.bucket,

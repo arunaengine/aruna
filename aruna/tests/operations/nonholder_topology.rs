@@ -97,7 +97,7 @@ const JOB_BUDGET: JobClassBudget = JobClassBudget {
 fn derived_owner(
     realm: &Topology,
     job_id: aruna_core::structs::execution::job::JobId,
-) -> TestResult<aruna_core::NodeId> {
+) -> TestResult<aruna_core::id::NodeId> {
     Ok(realm.config.job_owner(job_id)?)
 }
 

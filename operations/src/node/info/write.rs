@@ -4,11 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::document::{DocumentChange, DocumentTarget};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };

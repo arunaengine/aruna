@@ -273,13 +273,13 @@ mod tests {
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
     use crate::sync::outbox_record::{new_identified_record, write_outbox_effect};
-    use aruna_core::NodeId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
     use aruna_core::row_plan::PlanOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;

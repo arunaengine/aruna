@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};

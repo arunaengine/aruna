@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
 use aruna_core::plugin_runs::{Decisions, EventBatch, HookRequest, PluginRun};
 use aruna_core::plugins::Released;

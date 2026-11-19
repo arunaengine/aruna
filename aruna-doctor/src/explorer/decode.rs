@@ -1058,7 +1058,7 @@ mod tests {
         }
     }
 
-    fn test_node() -> aruna_core::NodeId {
+    fn test_node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[6u8; 32]).public()
     }
 

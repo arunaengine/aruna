@@ -4,11 +4,11 @@
 
 use super::stage::Change;
 use super::{Account, Documents, MergeError, MergeOutcome, MergeState, MergeUsersOperation, plan};
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, Next};
 use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use aruna_core::storage_entries::{subject_index_key, subject_index_value, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

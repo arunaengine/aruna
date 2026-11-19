@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::federation::MAX_NAME_LEN;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
 use crate::user::id::UserId;

@@ -6,10 +6,10 @@
 use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;

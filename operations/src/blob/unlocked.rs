@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_CLAIM_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,

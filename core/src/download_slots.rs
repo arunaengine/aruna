@@ -3,13 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::id::NodeId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-
-use crate::NodeId;
 
 /// Downloads one node serves at once.
 const DOWNLOAD_SLOTS: u32 = 256;

@@ -249,8 +249,8 @@ impl Operation for LocalBucketSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::NodeId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use std::time::SystemTime;
     use ulid::Ulid;

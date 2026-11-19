@@ -9,9 +9,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };

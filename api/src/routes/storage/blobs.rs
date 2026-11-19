@@ -8,7 +8,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_path};
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::replication_protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
 };

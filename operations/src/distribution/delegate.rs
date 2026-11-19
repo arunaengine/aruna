@@ -6,7 +6,7 @@
 // The target checks the issuer, the validity window and a single-use nonce, then runs its own
 // permission checks.
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{NodeRealm, RealmId};
 use aruna_core::structs::storage::distribution::delegation::{

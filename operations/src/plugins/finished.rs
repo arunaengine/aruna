@@ -6,8 +6,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};

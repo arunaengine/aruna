@@ -9,10 +9,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
-use crate::NodeId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::LINK_CHANGE_KEYSPACE;
 use crate::metadata::ProfileValidationFinding;
 use crate::structs::execution::harvest::RepositoryConnectorKind;

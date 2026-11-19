@@ -112,7 +112,6 @@ pub use document::{
     DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
     DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
 };
-pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use structured_id::{
     BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,

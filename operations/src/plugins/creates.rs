@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::{Operation, TransactionMode};

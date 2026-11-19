@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::structs::placement::policy::{MAX_LABEL_LEN, MAX_VALUE_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::record::{
     AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy,

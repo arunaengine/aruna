@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::offer::ExecutorOffer;
@@ -14,6 +13,7 @@ use aruna_core::compute::quota::{
     availability,
 };
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };

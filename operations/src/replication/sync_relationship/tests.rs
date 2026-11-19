@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::replication::mirror_repair::MirrorRecordOperation;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;

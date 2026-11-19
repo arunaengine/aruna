@@ -229,7 +229,7 @@ enum RequestedObjectId {
     CanonicalW3id([u8; 32]),
     ContentHashArn {
         realm_id: aruna_core::structs::identity::realm::RealmId,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
         hash: [u8; 32],
     },
     VersionedObject(VersionedObjectArn),
@@ -256,11 +256,11 @@ struct ResolvedObject {
     /// The owning node's published base URL when the bytes live there.
     origin: Option<String>,
     /// The members that keep the bytes of a distributed object; empty for ordinary objects.
-    holders: Vec<aruna_core::NodeId>,
+    holders: Vec<aruna_core::id::NodeId>,
     /// The base URL of the holder chosen to serve; its access URL is pinned there.
     pinned: Option<String>,
     /// The node that answered for bytes that live elsewhere.
-    answered_by: Option<aruna_core::NodeId>,
+    answered_by: Option<aruna_core::id::NodeId>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -979,7 +979,7 @@ async fn redeem(
 async fn chosen_holder(
     state: &ServerState,
     resolved: &ResolvedObject,
-) -> Option<aruna_core::NodeId> {
+) -> Option<aruna_core::id::NodeId> {
     if resolved.holders.is_empty() {
         return None;
     }
@@ -1009,7 +1009,7 @@ async fn pin_holder(state: &ServerState, resolved: &mut ResolvedObject) {
 /// The pinned download URL of `object_id` on `node_id`.
 async fn pinned_url(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
 ) -> Option<String> {
     let origin = owner_origin(state, node_id).await.ok()??;
@@ -1023,7 +1023,7 @@ async fn pinned_url(
 /// pinned URL to request with the same credential instead.
 async fn holder_hint(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
 ) -> Response {
     match pinned_url(state, node_id, object_id).await {
@@ -1042,7 +1042,7 @@ async fn holder_hint(
 /// caller is authenticated. The URL is never logged.
 async fn holder_redirect(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
     ticket: Option<TicketInput>,
 ) -> Response {
@@ -1403,7 +1403,7 @@ async fn resolve_at(
     state: &ServerState,
     auth: &AuthContext,
     requested_id: &str,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object: &ObjectRef<'_>,
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
@@ -1458,7 +1458,7 @@ async fn resolve_at(
 /// The owner's published base URL, or `None` when it has not published one.
 async fn owner_origin(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> Result<Option<String>, DrsError> {
     let documents = drive(
         ReadInfoOperation::new(vec![node_id]),
@@ -1599,7 +1599,7 @@ async fn resolve_content_hash(
     requested_id: &str,
     requested_scope: Option<(
         aruna_core::structs::identity::realm::RealmId,
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
     )>,
     hash: &[u8; 32],
 ) -> Result<ResolveOutcome, DrsError> {

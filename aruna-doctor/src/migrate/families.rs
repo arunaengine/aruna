@@ -6,8 +6,8 @@
 use super::jobs::LegacyInput;
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
 use aruna_core::compute::ExecutionTargetId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE,
@@ -506,8 +506,8 @@ mod tests {
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
     use aruna::tasks::runner::recover_stale_jobs;
-    use aruna_core::NodeId;
     use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
         FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,

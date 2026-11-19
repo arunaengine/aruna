@@ -7,8 +7,8 @@ use crate::topology;
 use std::collections::BTreeMap;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
 use aruna_core::StructuredId;
+use aruna_core::id::NodeId;
 use aruna_core::placement::transition::{preview_transition, transition_health};
 use aruna_core::placement::{holds_placement, resolve_shard_holders};
 use aruna_core::structs::identity::realm::RealmNodeKind;

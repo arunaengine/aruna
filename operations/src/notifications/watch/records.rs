@@ -126,7 +126,7 @@ pub(crate) fn watch_subscription_target(owner: UserId, watch_id: Ulid) -> Docume
 
 /// The rows that replicate a new subscription, published under `outbox_id`.
 pub(crate) fn watch_upsert_replication(
-    (local_node_id, outbox_id): (aruna_core::NodeId, Ulid),
+    (local_node_id, outbox_id): (aruna_core::id::NodeId, Ulid),
     subscription: &WatchSubscription,
 ) -> Result<WatchReplication, WatchSubscriptionError> {
     let revision = DocumentChange {
@@ -160,7 +160,7 @@ pub(crate) fn watch_upsert_replication(
 
 /// The rows that replicate a deleted subscription, published under `outbox_id`.
 pub(crate) fn watch_delete_replication(
-    (local_node_id, outbox_id): (aruna_core::NodeId, Ulid),
+    (local_node_id, outbox_id): (aruna_core::id::NodeId, Ulid),
     owner: UserId,
     watch_id: Ulid,
     now_ms: u64,

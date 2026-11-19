@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{

@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
 use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{

@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::SECONDARY_ID_KEYSPACE;
 use crate::structs::execution::job::JobId;
 use crate::structs::placement::record::PlacementRef;

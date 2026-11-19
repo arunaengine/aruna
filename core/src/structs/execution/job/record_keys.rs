@@ -5,8 +5,8 @@
 use super::{
     JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
 };
-use crate::NodeId;
 use crate::effects::{FetchCursor, FrameBoundsError};
+use crate::id::NodeId;
 use crate::types::Key;
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.

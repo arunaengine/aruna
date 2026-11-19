@@ -56,7 +56,7 @@ fn creator_auth(run: &RunIdentity) -> AuthContext {
 
 #[derive(Debug, PartialEq)]
 enum SourceStep {
-    Role(aruna_core::NodeId),
+    Role(aruna_core::id::NodeId),
     Authorize,
     Read,
     Copies,
@@ -180,7 +180,7 @@ impl InputSourceOperation {
     /// One exact realm version a device fetches for itself. It plans nothing, so the request's
     /// own version is the only authority, and the bytes land in the run's workspace as a local
     /// copy, never as a reference. A device is never a managed-copy destination.
-    fn device(&mut self, holder: aruna_core::NodeId) -> SourceNext {
+    fn device(&mut self, holder: aruna_core::id::NodeId) -> SourceNext {
         let InputSource::S3 {
             bucket,
             key,

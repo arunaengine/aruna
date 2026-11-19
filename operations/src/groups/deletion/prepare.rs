@@ -4,10 +4,10 @@
 
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };

@@ -256,7 +256,7 @@ async fn create_metadata_document(
 
 async fn wait_holder_document(
     nodes: &[TestNode],
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     target: &DocumentTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for holder in holders {
@@ -296,7 +296,7 @@ async fn wait_for_document(
 async fn wait_policy_convergence(
     nodes: &[TestNode],
     realm_id: RealmId,
-    draining_node: aruna_core::NodeId,
+    draining_node: aruna_core::id::NodeId,
     replica_count: u32,
 ) -> Result<Vec<RealmConfigDocument>, Box<dyn std::error::Error>> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
@@ -376,7 +376,7 @@ fn assert_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) 
     );
 }
 
-fn sort_node_ids(nodes: &mut [aruna_core::NodeId]) {
+fn sort_node_ids(nodes: &mut [aruna_core::id::NodeId]) {
     nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 }
 

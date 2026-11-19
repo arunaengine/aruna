@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::placement::record::{DEFAULT_LOCATION, LabelMatch, MAX_LOCATION_LEN};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};

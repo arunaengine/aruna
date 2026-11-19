@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::errors::StorageError;
+use crate::id::NodeId;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
@@ -1982,7 +1982,7 @@ mod tests {
         ProfileValidationState, ProfileValidationStatus, RAW_BYTES_LIMIT, apply_raw_remove,
         apply_raw_upsert, compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
-    use crate::NodeId;
+    use crate::id::NodeId;
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;

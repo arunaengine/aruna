@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};

@@ -12,11 +12,11 @@ mod snapshot;
 
 use crate::distribution::inventory::outside_answer;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, VaultQuery};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::*;
 use aruna_core::operation::{Operation, TransactionMode};

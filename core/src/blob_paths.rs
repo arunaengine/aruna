@@ -86,7 +86,7 @@ mod tests {
         version_id: Ulid,
         realm_id: RealmId,
         group_id: Ulid,
-        node_id: crate::NodeId,
+        node_id: crate::id::NodeId,
         bucket: &str,
         key: &str,
     ) -> HashIndex {

@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget};
 use crate::auth::valid_revocation_expiry;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::reducer::{AdminDocumentState, REVOCATIONS_PER_ORIGIN, config_node_path};
 use crate::structs::identity::auth::Role;
 use crate::structs::identity::realm::RealmId;

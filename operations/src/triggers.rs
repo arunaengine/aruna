@@ -6,9 +6,9 @@
 use std::fmt::Display;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;

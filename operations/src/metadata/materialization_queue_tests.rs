@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::metadata::revision_read::RawViewOperation;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_CAPTURE_KEYSPACE,
     RAW_REVISION_KEYSPACE,

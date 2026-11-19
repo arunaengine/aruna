@@ -11,8 +11,8 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 
-use aruna_core::NodeId;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,

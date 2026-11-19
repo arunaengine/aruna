@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

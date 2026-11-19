@@ -11,7 +11,7 @@ use super::{
     DistributionMember, DistributionSnapshot, KeyRange, MemberState, MetadataCoverage,
     OriginalEpoch,
 };
-use crate::NodeId;
+use crate::id::NodeId;
 
 /// Where one write goes.
 #[derive(Clone, Debug, Eq, PartialEq)]

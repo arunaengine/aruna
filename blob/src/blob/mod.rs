@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::handle::StorageHandle;

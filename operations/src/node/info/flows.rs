@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{
@@ -13,6 +12,7 @@ use aruna_core::compute::quota::{
 };
 use aruna_core::events::Event;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::node_state::{

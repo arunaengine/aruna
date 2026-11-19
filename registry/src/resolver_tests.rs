@@ -135,9 +135,9 @@ impl Sites {
     }
 }
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
-    aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap()
+    aruna_core::id::NodeId::from_bytes(key.as_bytes()).unwrap()
 }
 
 fn redirect(target: &str) -> Answer {

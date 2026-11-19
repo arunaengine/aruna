@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::calls::IoError;
+use crate::id::NodeId;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::bucket_metadata::ReleaseRef;

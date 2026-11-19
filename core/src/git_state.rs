@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::git::{GitPack, GitRecord, LfsLock, StoredObject};
+use crate::id::NodeId;
 use crate::structs::storage::dataset_location::DatasetLocation;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

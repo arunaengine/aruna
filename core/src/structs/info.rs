@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::alpn::Alpn;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::{Backend, BlobTimeoutConfig};
 use iroh::EndpointAddr;

@@ -12,9 +12,9 @@ mod pulls;
 mod reads;
 mod writes;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::Here;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::RealmSecretRef;

@@ -10,7 +10,7 @@ use aruna_drivers::driver::{DriverContext, drive, drive_until};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;

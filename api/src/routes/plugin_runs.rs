@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunTrigger};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, PluginAudit};

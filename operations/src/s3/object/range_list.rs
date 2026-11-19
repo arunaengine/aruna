@@ -3,12 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::Event;
 use aruna_core::heartbeat::HeartbeatEffect;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;

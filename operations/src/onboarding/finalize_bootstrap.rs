@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, TopicPeerError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingSecretError, OnboardingSecretRecord, OnboardingTicket,
@@ -612,10 +612,10 @@ mod tests {
     use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::NodeId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
         OnboardingMode, OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState,

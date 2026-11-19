@@ -4,8 +4,8 @@
 
 use super::abe::{AbeError, AbeParameters, GRANT_PURPOSE, ObjectEnvelope, check_object};
 use super::encryption::{BucketEncryption, EncryptionMode};
-use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
+use crate::id::NodeId;
 use crate::key_seal::{SealedSecret, open_sealed};
 use crate::keyspaces::ABE_DUE_KEYSPACE;
 use crate::structs::identity::auth::PathRestriction;

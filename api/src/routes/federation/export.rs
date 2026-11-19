@@ -369,7 +369,7 @@ pub async fn delete_grant(
 async fn check_holder(
     context: &Arc<DriverContext>,
     spec: &ExportRoCrateSpec,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> Result<(), GrantError> {
     let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
     let local = context.net_handle.as_ref().map(|net| net.node_id());

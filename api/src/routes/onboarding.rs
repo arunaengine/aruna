@@ -5,8 +5,8 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs as now_timestamp;
-use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateSecretRequest,
     CreateSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,

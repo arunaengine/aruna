@@ -7,7 +7,6 @@ use crate::document_sync::storage::batch_write_to;
 use crate::document_sync::tests::runner::apply_admin_operation;
 use crate::document_sync::{DocumentSyncService, node_to_peer};
 use crate::test_support::test_endpoint;
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,
@@ -19,6 +18,7 @@ use aruna_core::document::{
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,

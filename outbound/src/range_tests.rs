@@ -4,8 +4,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use aruna_core::NodeId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::user::id::UserId;

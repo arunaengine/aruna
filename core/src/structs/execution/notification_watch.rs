@@ -10,9 +10,9 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{WATCH_INTEREST_KEYSPACE, WATCH_OUTBOX_KEYSPACE};
 use crate::structs::execution::notification::NotificationKind;
 use crate::structs::identity::auth::PathRestriction;

@@ -401,7 +401,7 @@ impl TryFrom<SelectorBody> for PlacementSelector {
         let node_id = value
             .node_id
             .map(|node_id| {
-                aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::BadRequest)
+                aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::BadRequest)
             })
             .transpose()?;
         Ok(Self {

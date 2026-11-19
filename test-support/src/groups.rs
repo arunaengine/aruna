@@ -53,7 +53,7 @@ pub fn context(path: &std::path::Path) -> DriverContext {
 }
 
 /// The node id of seed `seed`.
-pub fn node(seed: u8) -> aruna_core::NodeId {
+pub fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 

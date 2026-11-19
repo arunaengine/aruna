@@ -25,7 +25,7 @@ pub struct AuthorizedRenameOperation {
     scope: (
         aruna_core::structs::identity::realm::RealmId,
         aruna_core::types::GroupId,
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
     ),
 }
 

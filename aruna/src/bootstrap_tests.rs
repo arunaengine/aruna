@@ -9,10 +9,10 @@ use super::{
 };
 use crate::inbound::initialize_incoming_fixture;
 use crate::tasks::incoming::OutboxDrainer;
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::execution::notification_watch::{
@@ -692,7 +692,7 @@ fn readiness_requires_all() {
 async fn read_digest(
     context: &DriverContext,
     realm_id: RealmId,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> WatchInterestDigest {
     match context
         .storage_handle

@@ -47,7 +47,7 @@ pub(crate) async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
 
 /// A realm with a management node, a server and a device of the nil user, and its signing key.
 pub(crate) fn promotion_realm(
-    nodes: [aruna_core::NodeId; 3],
+    nodes: [aruna_core::id::NodeId; 3],
 ) -> (
     ed25519_dalek::SigningKey,
     aruna_core::structs::identity::realm::RealmId,

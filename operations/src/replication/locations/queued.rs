@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::LocationSummaryError;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;

@@ -4,9 +4,9 @@
 
 use crate::topology;
 
-use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::document::shard_topic_id;
+use aruna_core::id::NodeId;
 use aruna_core::placement::transition::preview_transition;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::transition::TransitionLimits;

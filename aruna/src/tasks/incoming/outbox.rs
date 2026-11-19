@@ -148,7 +148,7 @@ impl DrainSubBatch {
 
     /// Ordering domains blocked together when a publish or sync leaves records
     /// behind.
-    pub(super) fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::NodeId>) {
+    pub(super) fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::id::NodeId>) {
         (
             self.topics.clone(),
             self.origins.iter().flatten().copied().collect(),
@@ -323,7 +323,7 @@ pub(super) fn partition_drain_records(
 
 /// The admin origin stream a record belongs to. Origin sequence is ordered
 /// within one origin node.
-pub(super) fn admin_origin(record: &DocumentOutboxRecord) -> Option<aruna_core::NodeId> {
+pub(super) fn admin_origin(record: &DocumentOutboxRecord) -> Option<aruna_core::id::NodeId> {
     match &record.event {
         DocumentOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
         _ => None,
@@ -664,8 +664,8 @@ impl OperationsTaskHandler {
         // Pull a missing shard genesis from stamped ex-holders and live holders.
         // Only current or draining former holders may adopt it for publication.
         let mut missing_topics: BTreeMap<
-            Vec<aruna_core::NodeId>,
-            (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
+            Vec<aruna_core::id::NodeId>,
+            (Vec<aruna_core::id::NodeId>, BTreeSet<irokle::TopicId>),
         > = BTreeMap::new();
         for (_, record, topic) in &records {
             if !record.target.uses_shard_topic()
@@ -858,7 +858,7 @@ impl OperationsTaskHandler {
 
 /// Sub-batches keyed by whether their records only sync and by their sorted peers.
 type PublishGroups =
-    BTreeMap<(bool, Vec<aruna_core::NodeId>), (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>)>;
+    BTreeMap<(bool, Vec<aruna_core::id::NodeId>), (Vec<aruna_core::id::NodeId>, Vec<DrainSubBatch>)>;
 
 impl OperationsTaskHandler {
     /// Groups records by peers into sub-batches. A record already published by this process

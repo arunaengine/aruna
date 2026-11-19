@@ -10,10 +10,10 @@ use crate::realm::peer_trust::is_sync_eligible;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, WriteAuthError, peer_call, peer_reply,
