@@ -434,11 +434,22 @@ impl Operation for SessionJobOperation {
 pub struct FamilyResponderOperation {
     job_id: JobId,
     now_ms: u64,
+    reader: Option<UserId>,
 }
 
 impl FamilyResponderOperation {
     pub fn new(job_id: JobId, now_ms: u64) -> Self {
-        Self { job_id, now_ms }
+        Self {
+            job_id,
+            now_ms,
+            reader: None,
+        }
+    }
+
+    /// The read of `reader`, who is told when its own job was pruned.
+    pub fn for_reader(mut self, reader: UserId) -> Self {
+        self.reader = Some(reader);
+        self
     }
 }
 
@@ -447,7 +458,10 @@ impl Operation for FamilyResponderOperation {
     type Error = JobRouteError;
 
     fn first(&mut self) -> Result<Next<Option<NodeId>>, JobRouteError> {
-        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let mut read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        if let Some(reader) = self.reader {
+            read = read.for_reader(reader);
+        }
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -877,6 +891,11 @@ mod tests {
             partial.next(view(&family, true)),
             Err(JobRouteError::Unavailable(_))
         ));
+        // The caller is passed on, so the submitter of a pruned job is told so.
+        let owner = family.spec().created_by;
+        let mut read = FamilyResponderOperation::new(job(), 1).for_reader(owner);
+        let projection = FamilyProjectionOperation::new(job(), 1).for_reader(owner);
+        assert_eq!(read.first(), Ok(Next::Call(IoCall::child(projection))));
     }
 
     // A report is read only by the submitter, whose paged inputs are filled next.

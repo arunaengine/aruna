@@ -413,6 +413,7 @@ impl Operation for ArtifactRouteOperation {
             return self.local();
         }
         let responder = FamilyResponderOperation::new(self.job_id, self.now_ms);
+        let responder = responder.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(responder)))
     }
 

@@ -281,6 +281,7 @@ impl RoutedCancelOperation {
             .map(|auth_token| JobRequest::Cancel { auth_token, job_id });
         self.step = RoutedStep::Route;
         let route = FamilyRouteOperation::new(job_id, request, node, self.now_ms);
+        let route = route.for_reader(self.auth.user_id);
         Ok(Next::Call(IoCall::child(route)))
     }
 
