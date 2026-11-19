@@ -172,7 +172,6 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         // claims no tenant backend at all.
         BlobEffect::ServeSourceRead { .. }
         | BlobEffect::CollectStream { .. }
-        | BlobEffect::MemberGet(_)
         | BlobEffect::SpoolHidden { .. }
         | BlobEffect::SpoolLocal { .. }
         | BlobEffect::Remote(_)

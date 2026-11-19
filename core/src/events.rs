@@ -194,8 +194,6 @@ pub enum BlobEvent {
     StreamCollected {
         bytes: Result<Vec<u8>, String>,
     },
-    /// What another member answered a forwarded read.
-    MemberAnswered(Box<crate::member_read::MemberAnswer>),
     /// Whether the reservation is settled; `false` keeps it for a later pass.
     ReservationReconciled {
         done: bool,
@@ -930,7 +928,6 @@ impl Event {
                     DeleteFinished,
                     ReservationReleased,
                     StreamCollected,
-                    MemberAnswered,
                     ReservationReconciled,
                     HiddenSpooled,
                     HiddenRead,
@@ -1134,6 +1131,7 @@ impl Event {
                     Answered,
                     MailRefreshed,
                     RangeListed,
+                    MemberAnswered,
                     ConnectionAnswered
                 }
             ),

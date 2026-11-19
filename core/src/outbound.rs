@@ -37,6 +37,8 @@ pub enum OutboundEffect {
     RefreshMail(Option<Ulid>),
     /// Lists one key range at the member that holds it.
     ListRange(Box<RangeListing>),
+    /// Sends one object read to another member and streams its answer.
+    MemberFetch(Box<crate::member_read::MemberFetch>),
     /// Sends one request of a plugin connection and answers with what the service said.
     Connection(Box<ConnectionCall>),
 }
@@ -66,7 +68,7 @@ pub struct StoredBackoff {
     pub delay_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum OutboundEvent {
     /// The status the receiver answered with.
     Posted {
@@ -86,6 +88,8 @@ pub enum OutboundEvent {
     MailRefreshed,
     /// The answer to an [`OutboundEffect::ListRange`].
     RangeListed(Box<RangeAnswer>),
+    /// The answer to an [`OutboundEffect::MemberFetch`].
+    MemberAnswered(Box<crate::member_read::MemberAnswer>),
     /// The answer to an [`OutboundEffect::Connection`].
     ConnectionAnswered {
         result: Result<ConnectionAnswer, ConnectionError>,

@@ -172,8 +172,6 @@ pub enum BlobEffect {
     CollectStream {
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
-    /// Sends one GET to another member and streams its answer; answered by `MemberAnswered`.
-    MemberGet(Box<crate::member_read::MemberGet>),
     /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
     ReconcileReservation {
         location: BackendLocation,

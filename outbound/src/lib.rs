@@ -5,6 +5,7 @@
 mod backoff;
 mod connection;
 mod mail;
+mod member_read;
 mod range_listing;
 mod transfers;
 
@@ -108,6 +109,9 @@ impl OutboundHandle {
             OutboundEffect::ListRange(listing) => OutboundEvent::RangeListed(Box::new(
                 self.list_range(*listing, &range_listing::NoSigner).await,
             )),
+            OutboundEffect::MemberFetch(request) => {
+                OutboundEvent::MemberAnswered(Box::new(self.fetch_member(*request).await))
+            }
             OutboundEffect::Connection(call) => OutboundEvent::ConnectionAnswered {
                 result: self.inner.connections.send(*call).await,
             },
