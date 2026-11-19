@@ -180,6 +180,7 @@ impl InstallCaller {
             expected,
             install: Some(install.clone()),
             audit,
+            proven: Default::default(),
         }))
     }
 

@@ -535,6 +535,7 @@ impl RemoveInstall {
             expected: Some(removing.revision),
             install: None,
             audit: Some(self.caller.audit(action, removing)),
+            proven: Default::default(),
         }))
     }
 }

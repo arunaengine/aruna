@@ -572,7 +572,10 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
             ServerError::Forbidden
         }
         InstallError::Record(
-            RecordError::Stale(_) | RecordError::StorageError(StorageError::TransactionConflict),
+            RecordError::Stale(_)
+            | RecordError::Retired
+            | RecordError::Unproven
+            | RecordError::StorageError(StorageError::TransactionConflict),
         ) => ServerError::Conflict(message),
         InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
         InstallError::Manifest(_) | InstallError::Record(_) => {
