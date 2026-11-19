@@ -111,7 +111,7 @@ async fn event_input() {
         .await
         .unwrap();
     let (event, _) = created(&install, "D1");
-    let run = event_run(&config, &install, &event, 0).unwrap();
+    let run = event_run(&config, &install, &event, (Ulid::generate(), 0)).unwrap();
     assert_eq!(run.handler, "dataset_created");
     let call = invocation(
         &run,
@@ -150,7 +150,7 @@ async fn sync_input() {
         .await
         .unwrap();
     let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
-    let run = event_run(&config, &install, &event, 0).unwrap();
+    let run = event_run(&config, &install, &event, (Ulid::generate(), 0)).unwrap();
     assert_eq!(run.handler, "sync_completed");
     let call = invocation(
         &run,
@@ -181,7 +181,7 @@ async fn event_rechecked() {
         .unwrap();
     let (event, base) = created(&install, "D1");
     // An earlier attempt passed the check and was cut short; its grant is removed since.
-    let mut run = event_run(&config, &install, &event, 0).unwrap();
+    let mut run = event_run(&config, &install, &event, (Ulid::generate(), 0)).unwrap();
     drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     (run.state, run.attempts) = (RunState::Running, 1);
     drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();

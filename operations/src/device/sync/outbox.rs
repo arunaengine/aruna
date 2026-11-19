@@ -24,7 +24,6 @@ use aruna_core::structs::{
     EntrySide, EntryState, FolderState, LocalOrigin, SyncBase, SyncPull, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -91,11 +90,13 @@ impl DrainQueue for UploadQueue {
 pub struct DrainOutboxOperation {
     ids: NodeRealm,
     draining: bool,
+    now_ms: u64,
 }
 
 /// One pass over the upload outbox; see [`DrainOutboxOperation`].
 pub fn drain_sync_outbox(ids: Option<(NodeId, RealmId)>) -> DrainOutboxOperation {
     DrainOutboxOperation {
+        now_ms: 0,
         ids,
         draining: false,
     }
@@ -115,6 +116,10 @@ impl Operation for DrainOutboxOperation {
     type Output = DrainOutcome;
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<DrainOutcome>, IoError> {
         match self.ids {
             Some((_, realm_id)) => Ok(Next::Call(realm_config(realm_id))),
@@ -129,7 +134,7 @@ impl Operation for DrainOutboxOperation {
         let (node_id, realm_id) = self.ids.ok_or(IoError::Unfinished)?;
         let limit = Self::limit(config_of(result)?);
         let queue = UploadQueue { realm_id, node_id };
-        let drain = DrainOperation::new(queue, unix_timestamp_millis(), limit);
+        let drain = DrainOperation::new(queue, self.now_ms, limit);
         self.draining = true;
         Ok(Next::Call(IoCall::child(drain)))
     }
@@ -413,6 +418,7 @@ struct SettleUploadOperation {
     ack: SyncPullAck,
     step: SettleStep,
     holds: bool,
+    now_ms: u64,
 }
 
 /// What the pending call of a settle answers.
@@ -426,6 +432,7 @@ enum SettleStep {
 impl SettleUploadOperation {
     fn new(upload: SyncUpload, ack: SyncPullAck) -> Self {
         Self {
+            now_ms: 0,
             upload,
             ack,
             step: SettleStep::Rows,
@@ -448,6 +455,10 @@ impl Operation for SettleUploadOperation {
     type Output = ();
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -467,7 +478,7 @@ impl Operation for SettleUploadOperation {
                     (rows.next().flatten()).and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
                 let held =
                     (rows.next().flatten()).and_then(|bytes| SyncUpload::from_bytes(&bytes).ok());
-                let base = settled_base(&self.upload, &self.ack, current);
+                let base = settled_base(&self.upload, &self.ack, current, self.now_ms);
                 let (folder_id, relative) = (self.upload.folder_id, &self.upload.relative);
                 let row = base_entry(folder_id, relative, &base).map_err(|_| {
                     warn!(%relative, "Failed to encode a synced base");
@@ -545,7 +556,12 @@ impl Operation for LocalOriginOperation {
 
 /// The base one acknowledged pull leaves behind. A pending entry keeps the
 /// state and the observation the owner was shown; only the synced bytes move.
-fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase>) -> SyncBase {
+fn settled_base(
+    upload: &SyncUpload,
+    ack: &SyncPullAck,
+    current: Option<SyncBase>,
+    now_ms: u64,
+) -> SyncBase {
     let pending = current
         .as_ref()
         .is_some_and(|base| base.pending_at.is_some());
@@ -578,14 +594,14 @@ fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase
         (true, Some(base)) => SyncBase {
             synced,
             local_version_id: upload.local_version,
-            synced_at_ms: unix_timestamp_millis(),
+            synced_at_ms: now_ms,
             remote: Some(remote),
             ..base
         },
         (_, _) => SyncBase {
             synced,
             local_version_id: upload.local_version,
-            synced_at_ms: unix_timestamp_millis(),
+            synced_at_ms: now_ms,
             entry: match upload.deleted {
                 true => EntryState::LocalDeleted,
                 false => EntryState::InSync,

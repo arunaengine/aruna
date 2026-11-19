@@ -17,7 +17,6 @@ use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Value;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -93,6 +92,7 @@ pub(super) struct HandoffWrite {
     config: HandoffConfig,
     stage: Stage,
     batch: Batch,
+    now_ms: u64,
 }
 
 impl HandoffWrite {
@@ -101,6 +101,7 @@ impl HandoffWrite {
             config,
             stage: Stage::Read,
             batch: Batch::default(),
+            now_ms: 0,
         }
     }
 
@@ -146,7 +147,7 @@ impl HandoffWrite {
                 node_id: self.config.node_id,
             },
         )?;
-        overlay_reducer_state(&mut config, &change.state, unix_timestamp_millis());
+        overlay_reducer_state(&mut config, &change.state, self.now_ms);
         let document = DocumentTarget::RealmConfig { realm_id };
         let placement = target_placement_ref(&config, &document, Default::default());
         self.batch.writes.push((
@@ -172,6 +173,10 @@ impl HandoffWrite {
 impl Operation for HandoffWrite {
     type Output = ();
     type Error = MergeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

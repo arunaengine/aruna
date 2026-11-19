@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::fmt;
+
 use sha2::{Digest, Sha256};
 
 /// One header or query pair.
@@ -87,7 +89,7 @@ pub struct ObjectPage {
 }
 
 /// The method of a request through a service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
     Head,
@@ -95,6 +97,21 @@ pub enum Method {
     Put,
     Patch,
     Delete,
+}
+
+/// Writes `Method::Post` as the WIT type did, since that text is in upload intents, logs and
+/// test records.
+impl fmt::Debug for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Get => "Method::Get",
+            Self::Head => "Method::Head",
+            Self::Post => "Method::Post",
+            Self::Put => "Method::Put",
+            Self::Patch => "Method::Patch",
+            Self::Delete => "Method::Delete",
+        })
+    }
 }
 
 /// The status, and the headers and body the code may read of an answer.
@@ -148,6 +165,26 @@ impl Intent {
         Self {
             ordinal,
             digest: hasher.finalize().into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_text_kept() {
+        let methods = [
+            (Method::Get, "Method::Get"),
+            (Method::Head, "Method::Head"),
+            (Method::Post, "Method::Post"),
+            (Method::Put, "Method::Put"),
+            (Method::Patch, "Method::Patch"),
+            (Method::Delete, "Method::Delete"),
+        ];
+        for (method, text) in methods {
+            assert_eq!(format!("{method:?}"), text);
         }
     }
 }

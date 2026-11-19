@@ -79,7 +79,12 @@ async fn reserved(
 ) -> (WorkRow, PluginWorkSpec) {
     let data = format!("/{}/g/{}/data", fixture.actor.realm_id, install.group_id);
     let target = format!("{data}/{}/in/reads.fq", fixture.actor.node_id);
-    let mut row = WorkRow::reserved(install, WorkKind::Download, Ulid::generate(), 1);
+    let mut row = WorkRow::reserved(
+        install,
+        WorkKind::Download,
+        (Ulid::generate(), Ulid::generate()),
+        1,
+    );
     row.version_id = Some(Ulid::generate());
     row.target = Some(target.clone());
     row.context = Some(RequestContext {

@@ -9,13 +9,13 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::native_reference::{GrantedBody, GrantedReadEffect, NativeRange};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::read_grant::{
     self, GrantScope, GrantedRequest, HEAD_OPERATION, READ_OPERATION, SignedGrant,
 };
-use aruna_core::time::unix_timestamp_millis;
 
 /// Seconds a granted request this node signs stays valid.
 const GRANTED_SECS: u64 = 15;
@@ -29,6 +29,8 @@ pub struct GrantedReadOperation {
     grant: SignedGrant,
     range: Option<Range<u64>>,
     head: bool,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl GrantedReadOperation {
@@ -41,6 +43,8 @@ impl GrantedReadOperation {
         head: bool,
     ) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             ids,
             holder,
             grant: grant.clone(),
@@ -49,7 +53,10 @@ impl GrantedReadOperation {
         }
     }
 
-    fn request(&self, range: Option<NativeRange>) -> Result<GrantedRequest, StagingSourceError> {
+    fn request(
+        &mut self,
+        range: Option<NativeRange>,
+    ) -> Result<GrantedRequest, StagingSourceError> {
         let (issuer, realm_id) = self.ids.ok_or(StagingSourceError::HandleMissing)?;
         let operation = match self.head {
             true => HEAD_OPERATION,
@@ -67,8 +74,8 @@ impl GrantedReadOperation {
             target: self.holder,
             operation: operation.to_string(),
             request_digest: digest,
-            nonce: rand::random(),
-            issued_at: unix_timestamp_millis() / 1000,
+            nonce: self.mint.mint(self.now_ms).to_bytes(),
+            issued_at: self.now_ms / 1000,
             valid_secs: GRANTED_SECS,
             grant: self.grant.clone(),
         })
@@ -79,11 +86,19 @@ impl Operation for GrantedReadOperation {
     type Output = GrantedBody;
     type Error = StagingSourceError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<GrantedBody>, StagingSourceError> {
         if self.ids.is_none() {
             return Err(StagingSourceError::HandleMissing);
         }
-        let GrantScope::Version(arn) = &self.grant.grant.scope else {
+        let GrantScope::Version(arn) = self.grant.grant.scope.clone() else {
             return Err(StagingSourceError::AccessDenied);
         };
         let range = NativeRange::checked(self.range.clone())?;

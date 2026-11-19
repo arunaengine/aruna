@@ -7,6 +7,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
@@ -111,6 +112,7 @@ pub struct AdmitForwardedOperation {
     submission_id: SubmissionId,
     request: SubmissionRequest,
     node: Option<IngressNode>,
+    ids: IdMint,
     step: ForwardedStep,
 }
 
@@ -130,6 +132,7 @@ impl AdmitForwardedOperation {
             submission_id,
             request,
             node,
+            ids: IdMint::default(),
             step: ForwardedStep::Token,
         }
     }
@@ -255,7 +258,11 @@ impl AdmitForwardedOperation {
             self.request.captured_inputs.clear();
         }
         self.request.input_pages = manifest;
-        let admit = self.node()?.admission(&self.request, identity, config);
+        let mut mint = self.ids;
+        let admit = self
+            .node()?
+            .admission(&self.request, identity, config, &mut mint);
+        self.ids = mint;
         let admit = admit.map_err(admission_refusal)?;
         self.step = ForwardedStep::Admit;
         Ok(Next::Call(IoCall::child(admit)))
@@ -277,6 +284,10 @@ fn admission_refusal(error: SubmitJobError) -> SubmissionRefusal {
 impl Operation for AdmitForwardedOperation {
     type Output = SubmissionAck;
     type Error = SubmissionRefusal;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> ForwardedNext {
         let check = WritePeerOperation::new(self.peer, self.token.clone());

@@ -153,6 +153,7 @@ mod tests {
             "/reports/january".to_string(),
             false,
             r#"{"@graph":[]}"#.to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         )
     }
 

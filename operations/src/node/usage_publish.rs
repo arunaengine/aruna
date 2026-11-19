@@ -8,6 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, done};
@@ -298,6 +299,8 @@ pub struct PublishUsageOperation {
     scope: UsageScope,
     published: PublishedUsage,
     step: PublishStep,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl PublishUsageOperation {
@@ -308,28 +311,21 @@ impl PublishUsageOperation {
         full: bool,
         refresh: bool,
     ) -> Self {
-        Self::with_generation(keys, serving_realm, full, refresh, Ulid::generate())
-    }
-
-    fn with_generation(
-        (node_id, realm_id): (NodeId, RealmId),
-        serving_realm: Option<RealmId>,
-        full: bool,
-        refresh: bool,
-        retry_generation: Ulid,
-    ) -> Self {
+        let (node_id, realm_id) = keys;
         Self {
             node_id,
             realm_id,
             serving_realm,
             full,
             refresh,
-            retry_generation,
+            retry_generation: Ulid::nil(),
             pages: marker_pages(),
             observed: Vec::new(),
             scope: UsageScope::default(),
             published: PublishedUsage::default(),
             step: PublishStep::Markers,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -410,7 +406,16 @@ impl Operation for PublishUsageOperation {
     type Output = PublishedUsage;
     type Error = UsagePublishError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> PublishTurn {
+        self.retry_generation = self.ids.mint(self.now_ms);
         Ok(Next::Call(self.pages.call()))
     }
 
@@ -657,8 +662,11 @@ mod tests {
     }
 
     fn publish(full: bool, refresh: bool) -> PublishUsageOperation {
-        let generation = Ulid::from_parts(1, 1);
-        PublishUsageOperation::with_generation((node(), REALM), None, full, refresh, generation)
+        // The run's stamp and seed give the retry generation `Ulid::from_parts(1, 1)`.
+        let mut operation = PublishUsageOperation::new((node(), REALM), None, full, refresh);
+        operation.stamp(1);
+        operation.seed(1);
+        operation
     }
 
     fn dirty_group() -> (Key, Value) {

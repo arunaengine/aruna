@@ -39,7 +39,7 @@ use aruna_tasks::InboundTaskHandler;
 pub(crate) use aruna_operations::testing::RecordingTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
-    aruna_operations::jobs::submit::mint_job_id(
+    aruna_operations::testing::fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )

@@ -3,10 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Instant;
-
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::entity_patch::craqle_patch_request;
@@ -27,6 +23,8 @@ use aruna_plugin_types::permission::Permission;
 use craqle::GraphId;
 use oxrdf::Term;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use ulid::Ulid;
 
 use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
@@ -100,6 +98,7 @@ fn api_error(error: MetadataApiError) -> CallError {
 pub struct AdmitCall {
     scope: RunScope,
     target: Option<(Permission, String)>,
+    now_ms: u64,
 }
 
 impl AdmitCall {
@@ -107,13 +106,14 @@ impl AdmitCall {
         Self {
             scope: scope.clone(),
             target: target.map(|(permission, path)| (permission, path.to_string())),
+            now_ms: 0,
         }
     }
 }
 
-fn admitted_install(result: IoResult) -> Result<PluginInstall, CallError> {
+fn admitted_install(result: IoResult, now_ms: u64) -> Result<PluginInstall, CallError> {
     let install = result.child::<PluginInstall, CallError>()??;
-    match take_call(install.install_id, Instant::now()) {
+    match take_call(install.install_id, now_ms) {
         true => Ok(install),
         false => Err(CallError(HostError::new(
             ErrorKind::Limit,
@@ -126,6 +126,10 @@ impl Operation for AdmitCall {
     type Output = PluginInstall;
     type Error = CallError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<PluginInstall>, CallError> {
         let target = (self.target.as_ref()).map(|(permission, path)| (*permission, path.as_str()));
         let check = CheckCall::new(&self.scope, target);
@@ -133,7 +137,7 @@ impl Operation for AdmitCall {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, CallError> {
-        Ok(Next::Done(admitted_install(result)?))
+        Ok(Next::Done(admitted_install(result, self.now_ms)?))
     }
 }
 
@@ -150,6 +154,7 @@ pub struct GrantedCall {
     scope: RunScope,
     permission: Permission,
     target: Option<String>,
+    now_ms: u64,
 }
 
 impl GrantedCall {
@@ -159,6 +164,7 @@ impl GrantedCall {
             scope: scope.clone(),
             permission,
             target: Some(target.to_string()),
+            now_ms: 0,
         }
     }
 
@@ -168,6 +174,7 @@ impl GrantedCall {
             scope: scope.clone(),
             permission,
             target: None,
+            now_ms: 0,
         }
     }
 }
@@ -176,6 +183,10 @@ impl Operation for GrantedCall {
     type Output = Granted;
     type Error = CallError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<Granted>, CallError> {
         let target = (self.target.as_deref()).map(|target| (self.permission, target));
         let check = CheckCall::new(&self.scope, target);
@@ -183,7 +194,7 @@ impl Operation for GrantedCall {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Granted>, CallError> {
-        let install = admitted_install(result)?;
+        let install = admitted_install(result, self.now_ms)?;
         let patterns = match &self.target {
             Some(target) => matching(&install, self.permission, target)?,
             None => patterns_for(&parse_grants(&install.grants), self.permission),

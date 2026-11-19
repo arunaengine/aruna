@@ -17,6 +17,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
@@ -272,6 +273,8 @@ pub struct MergeUsersOperation {
     pages: PrefixPages,
     revocation: Option<Revocation>,
     marks: Option<DueMarks>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 type MergeTurn = Result<Next<MergeOutcome>, MergeError>;
@@ -290,6 +293,8 @@ impl MergeUsersOperation {
             pages: PrefixPages::new(AUTH_KEYSPACE, Vec::new(), SCAN_PAGE),
             revocation: None,
             marks: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -560,7 +565,7 @@ impl MergeUsersOperation {
     /// The merged account loses READ everywhere, so encrypted buckets are marked for a new epoch.
     fn mark(&mut self) -> Next<MergeOutcome> {
         self.state = MergeState::Marks;
-        let marks = DueMarks::new(None, aruna_core::time::unix_timestamp_millis());
+        let marks = DueMarks::new(None, self.now_ms);
         let first = marks.first();
         self.marks = Some(marks);
         Next::Call(first)
@@ -731,6 +736,14 @@ fn parse_users(values: &[Option<Value>]) -> Result<[User; 2], MergeError> {
 impl Operation for MergeUsersOperation {
     type Output = MergeOutcome;
     type Error = MergeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         match self.phase {

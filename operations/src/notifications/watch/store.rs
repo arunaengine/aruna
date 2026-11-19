@@ -4,6 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
@@ -59,12 +60,13 @@ impl Change {
     fn writes(
         &self,
         replication: Option<&WatchReplication>,
+        generation: Ulid,
     ) -> Result<Vec<(KeySpace, Key, Value)>, String> {
         let mut writes = Vec::with_capacity(4);
         if let Change::Create(subscription) = self {
             writes.push(watch_write_entry(subscription).map_err(|error| error.to_string())?);
         }
-        writes.push(dirty_marker_write(self.owner().realm_id));
+        writes.push(dirty_marker_write(self.owner().realm_id, generation));
         if let Some(replication) = replication {
             let target = watch_subscription_target(self.owner(), self.watch_id());
             let revision = sync_revision_entry(&target, &replication.revision)
@@ -95,13 +97,16 @@ struct WatchRowsOperation {
     change: Change,
     replication: Option<WatchReplication>,
     state: RowsState,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl WatchRowsOperation {
     fn write(&mut self) -> Result<Next<bool>, WatchSubscriptionError> {
+        let generation = self.ids.mint(self.now_ms);
         let writes = self
             .change
-            .writes(self.replication.as_ref())
+            .writes(self.replication.as_ref(), generation)
             .map_err(WatchSubscriptionError::Storage)?;
         self.state = RowsState::Write;
         Ok(Next::Call(IoCall::Write(writes)))
@@ -111,6 +116,14 @@ impl WatchRowsOperation {
 impl Operation for WatchRowsOperation {
     type Output = bool;
     type Error = WatchSubscriptionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let call = match &self.change {
@@ -192,6 +205,8 @@ impl StoreWatchOperation {
             change: self.change.clone(),
             replication: self.replication.clone(),
             state: RowsState::Count,
+            now_ms: 0,
+            ids: IdMint::default(),
         };
         Next::Call(IoCall::child(rows))
     }
@@ -325,6 +340,8 @@ mod call_tests {
             change,
             replication: None,
             state: RowsState::Count,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 

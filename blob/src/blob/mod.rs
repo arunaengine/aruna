@@ -28,6 +28,7 @@ mod io;
 mod local_spool;
 pub mod pithos;
 mod plain;
+mod read_pins;
 mod registry;
 mod replication;
 mod runtime;
@@ -89,6 +90,8 @@ pub struct BlobHandler {
     close_lock: Arc<StdRwLock<()>>,
     rejected_writes: Arc<AtomicU64>,
     frame_indexes: Arc<StdMutex<frames::IndexCache>>,
+    /// Reads that hold kept copies; eviction leaves those copies to the hidden sweep.
+    read_pins: read_pins::ReadPins,
     /// This node's measurements of each external source. Memory only.
     source_stats: Arc<StdMutex<source::SourceTable>>,
     writes_in_flight: Arc<AtomicUsize>,

@@ -196,10 +196,7 @@ impl RoleRemoval {
         input: RemoveGroupConfig,
         guard: Option<aruna_core::plugin_installs::InstallGuard>,
     ) -> Self {
-        let marks = DueMarks::new(
-            Some(input.group_id),
-            aruna_core::time::unix_timestamp_millis(),
-        );
+        let marks = DueMarks::new(Some(input.group_id), 0);
         Self {
             input,
             guard,
@@ -366,6 +363,10 @@ impl RoleRemoval {
 impl Operation for RoleRemoval {
     type Output = RemovedRole;
     type Error = RemoveGroupError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

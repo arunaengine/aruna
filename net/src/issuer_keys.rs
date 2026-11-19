@@ -73,6 +73,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_capacity() {
+        let keys = IssuerKeys::default();
+        let now = Instant::now();
+        for index in 0..=KEY_CACHE_CAPACITY {
+            let mut seed = [1u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let key = *iroh::SecretKey::from_bytes(&seed).public().as_bytes();
+            assert!(keys.check_at(key, now));
+        }
+        assert_eq!(keys.entries().len(), KEY_CACHE_CAPACITY);
+    }
+
+    #[test]
     fn expired_key_rechecked() {
         let keys = IssuerKeys::default();
         let first = Instant::now();

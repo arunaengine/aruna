@@ -33,6 +33,9 @@ use tracing::{debug, error, info, warn};
 /// the start.
 static UNVERIFIED_CURSOR: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
+/// Where range maintenance goes on; a restart begins again at the start.
+static RANGE_CURSORS: std::sync::Mutex<Option<MaintainCursors>> = std::sync::Mutex::new(None);
+
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
     marker: std::path::PathBuf,
@@ -69,6 +72,7 @@ use aruna_operations::device::sync::{
     UPLOAD_DEFER_AFTER,
 };
 use aruna_operations::device::sync_note::{NoteSyncOperation, SyncNote};
+use aruna_operations::distribution::sharding::MaintainCursors;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
@@ -1061,18 +1065,23 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use aruna_operations::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
+                let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
                 let mut after = match aruna_drivers::driver::drive(
                     maintain_ranges(
                         context.node_and_realm(),
                         &context.fresh_heartbeats(),
                         context.here().capacity,
+                        kept.unwrap_or_default(),
                     ),
                     context,
                 )
                 .await
                 {
                     Ok(pass) => {
-                        let (after, imports) = pass.finish();
+                        let (after, imports, cursors) = pass.finish();
+                        if let Ok(mut kept) = RANGE_CURSORS.lock() {
+                            *kept = Some(cursors);
+                        }
                         for start in imports {
                             let started =
                                 aruna_operations::jobs::handed_imports::StartKeptOperation::new(

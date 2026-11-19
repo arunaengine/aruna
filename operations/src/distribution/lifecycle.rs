@@ -6,6 +6,7 @@
 // A transfer away drains its uploads before its fence is stated; a deletion purges the member
 // bucket once it commits. Every pass is bounded and resumes from durable state.
 
+use aruna_core::id_mint::IdMint;
 use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -32,7 +33,6 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionSnapshot, DistributionView, KeyRange,
     MemberState, MetadataCoverage, Statement, StatementClaim, StatementKind,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -902,6 +902,7 @@ struct HandOverOperation {
     range: Option<KeyRange>,
     step: HandStep,
     watermark: Vec<u8>,
+    now_ms: u64,
 }
 
 impl HandOverOperation {
@@ -910,6 +911,7 @@ impl HandOverOperation {
             .find(|range| range.range_id == open.range_id)
             .cloned();
         Self {
+            now_ms: 0,
             scope,
             open,
             budget,
@@ -941,7 +943,7 @@ impl HandOverOperation {
             range_id: range.range_id,
             transfer_id: self.open.transfer_id,
             epoch: range.epoch,
-            since_ms: unix_timestamp_millis(),
+            since_ms: self.now_ms,
             uploads_open: true,
         };
         let copies = self.scope.snapshot.byte_holders(range, None).len();
@@ -964,7 +966,7 @@ impl HandOverOperation {
             return self.abort(target);
         };
         let ends = grace.since_ms.saturating_add(UPLOAD_GRACE_MS);
-        if unix_timestamp_millis() < ends {
+        if self.now_ms < ends {
             self.step = HandStep::Uploads;
             let look = RangeUploadsOperation::new(target, false);
             return Ok(Next::Call(IoCall::child(look)));
@@ -1027,6 +1029,10 @@ impl HandOverOperation {
 impl Operation for HandOverOperation {
     type Output = Worked;
     type Error = PurgeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Working {
         if self.range.is_none() {
@@ -1494,11 +1500,15 @@ struct UnbindOperation {
     binding: DistributionBinding,
     drop_fence: bool,
     writes: usize,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl UnbindOperation {
     fn new(bucket: &str, binding: DistributionBinding, drop_fence: bool) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             bucket: bucket.to_string(),
             binding,
             drop_fence,
@@ -1524,7 +1534,7 @@ impl UnbindOperation {
         info.distribution = None;
         let bucket = info.to_bytes().map_err(failed)?;
         let mut writes = vec![(S3_BUCKET_KEYSPACE.to_string(), self.key(), bucket.into())];
-        writes.extend(dirty_rows([info.group_id], Ulid::generate()));
+        writes.extend(dirty_rows([info.group_id], self.mint.mint(self.now_ms)));
         self.writes = 1;
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -1533,6 +1543,14 @@ impl UnbindOperation {
 impl Operation for UnbindOperation {
     type Output = ();
     type Error = PurgeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

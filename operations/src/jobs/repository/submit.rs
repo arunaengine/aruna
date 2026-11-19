@@ -5,6 +5,7 @@
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::job::{
@@ -95,6 +96,7 @@ pub(crate) struct LinkJobOperation {
     job: Option<LinkJob>,
     key: String,
     now_ms: u64,
+    ids: IdMint,
     step: SubmitStep,
 }
 
@@ -106,6 +108,7 @@ impl LinkJobOperation {
             job: Some(job),
             key,
             now_ms: 0,
+            ids: IdMint::default(),
             step: SubmitStep::Config,
         }
     }
@@ -137,12 +140,16 @@ impl Operation for LinkJobOperation {
         self.now_ms = now_ms;
     }
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Turn {
         let job = self.job.as_ref().ok_or_else(spent)?;
         let realm = job.realm();
         let subject = job.dedup_key(&self.key);
         let Some((node, serving)) = self.scope.node else {
-            let job_id = mint_unplaced(&subject)?;
+            let job_id = mint_unplaced(&subject, &mut self.ids, self.now_ms)?;
             return self.submit(job_id);
         };
         if node != self.owner || serving != realm {
@@ -164,7 +171,8 @@ impl Operation for LinkJobOperation {
                     })?;
                 let job = self.job.as_ref().ok_or_else(spent)?;
                 let subject = job.dedup_key(&self.key);
-                let job_id = mint_configured_job(&config, self.owner, &subject)?;
+                let (owner, now_ms) = (self.owner, self.now_ms);
+                let job_id = mint_configured_job(&config, owner, &subject, &mut self.ids, now_ms)?;
                 self.submit(job_id)
             }
             SubmitStep::Submit => {

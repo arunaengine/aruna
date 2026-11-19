@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -80,6 +80,7 @@ pub struct CreateSourceOperation {
     input: CreateSourceInput,
     stage: Stage,
     source: Option<HarvestSource>,
+    now_ms: u64,
 }
 
 /// One source per connector and namespace, so a repeated submission keeps its cursor.
@@ -100,6 +101,7 @@ impl CreateSourceOperation {
             input,
             stage: Stage::Read,
             source: None,
+            now_ms: 0,
         }
     }
 
@@ -162,7 +164,7 @@ impl CreateSourceOperation {
             self.input.target_prefix.clone(),
             self.input.selector.clone(),
             self.input.schedule_interval_ms,
-            SystemTime::now(),
+            SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             self.input.created_by,
         );
         let (keyspace, key) = self.source_row();
@@ -177,6 +179,10 @@ impl CreateSourceOperation {
 impl Operation for CreateSourceOperation {
     type Output = HarvestSource;
     type Error = CreateSourceError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, CreateSourceError> {
         self.normalize()?;

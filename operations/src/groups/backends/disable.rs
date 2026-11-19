@@ -10,7 +10,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::GroupId;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -45,6 +45,7 @@ pub struct SetDisabledOperation {
     backend_id: Ulid,
     disabled: bool,
     updated: Option<GroupStorage>,
+    now_ms: u64,
 }
 
 impl SetDisabledOperation {
@@ -54,6 +55,7 @@ impl SetDisabledOperation {
             backend_id,
             disabled,
             updated: None,
+            now_ms: 0,
         }
     }
 
@@ -76,7 +78,7 @@ impl SetDisabledOperation {
         // backend just before this commit needs its credentials to survive.
         let updated = GroupStorage {
             disabled: self.disabled,
-            updated_at: SystemTime::now(),
+            updated_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             ..record
         };
         let writes = record_writes(&updated)?;
@@ -88,6 +90,10 @@ impl SetDisabledOperation {
 impl Operation for SetDisabledOperation {
     type Output = GroupStorage;
     type Error = SetDisabledError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -144,6 +150,7 @@ mod pure_tests {
     /// The operation after its record read went out, inside its transaction.
     fn reading(group_id: Ulid, disabled: bool) -> SetDisabledOperation {
         let mut operation = SetDisabledOperation::new(group_id, backend_id(), disabled);
+        operation.stamp(5_000);
         assert_eq!(operation.transaction(), TransactionMode::Write);
         operation.first().unwrap();
         operation
@@ -169,7 +176,10 @@ mod pure_tests {
         operation
             .next(read_result(record(group_id, false)))
             .unwrap();
-        assert!(written(&mut operation).updated_at > SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            written(&mut operation).updated_at,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(5_000)
+        );
     }
 
     #[test]

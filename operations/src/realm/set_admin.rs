@@ -195,7 +195,7 @@ impl SetAdminWrite {
             narrowed: false,
             admins: HashSet::new(),
             deletes: Vec::new(),
-            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+            marks: DueMarks::new(None, 0),
         }
     }
 
@@ -324,6 +324,10 @@ impl SetAdminWrite {
 impl Operation for SetAdminWrite {
     type Output = HashSet<UserId>;
     type Error = SetAdminError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

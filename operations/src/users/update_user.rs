@@ -11,6 +11,7 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -25,7 +26,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Key, KeySpace};
 use aruna_core::user::validation::{
     UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
@@ -336,6 +336,8 @@ pub(crate) struct UserWrite {
     written: Option<UserWritten>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl UserWrite {
@@ -350,7 +352,9 @@ impl UserWrite {
             deactivating: false,
             written: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, current_timestamp_ms()),
+            marks: DueMarks::new(None, 0),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -514,10 +518,13 @@ impl UserWrite {
             self.fence.add(realm_id, config, [placement]);
         }
         let generation = self.fence.generation(&realm_id, &placement);
+        let event_id = self.ids.mint(self.now_ms);
         let document_revision = local_sync_change(
             previous_document_revision.as_ref(),
             &self.input.actor,
             placement,
+            self.now_ms,
+            event_id,
         );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
@@ -609,6 +616,15 @@ impl Operation for UserWrite {
     type Output = UserWritten;
     type Error = UpdateUserError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -664,8 +680,9 @@ pub(crate) fn local_sync_change(
     previous_change: Option<&DocumentChange>,
     actor: &Actor,
     placement: PlacementRef,
+    updated_at_ms: u64,
+    event_id: Ulid,
 ) -> DocumentChange {
-    let updated_at_ms = current_timestamp_ms();
     let minimum_generation = previous_change
         .map(|change| change.current.generation.saturating_add(1))
         .unwrap_or_default();
@@ -673,7 +690,7 @@ pub(crate) fn local_sync_change(
         base: previous_change.map(|change| change.current),
         current: DocumentSyncRevision {
             generation: updated_at_ms.max(minimum_generation),
-            event_id: Ulid::generate(),
+            event_id,
             actor: actor.node_id,
             updated_at_ms,
         },

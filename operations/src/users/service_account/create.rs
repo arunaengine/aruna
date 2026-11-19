@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -163,6 +164,8 @@ struct ServiceWrite {
     fence: aruna_core::placement::fence::WriteFence,
     stage: Stage,
     user: Option<User>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl ServiceWrite {
@@ -176,6 +179,8 @@ impl ServiceWrite {
             fence: Default::default(),
             stage: Stage::Config,
             user: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -217,13 +222,15 @@ impl ServiceWrite {
         let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::User {
             user_id: user.user_id,
         });
+        let revision =
+            initial_sync_change(actor, placement, self.now_ms, self.ids.mint(self.now_ms));
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
                 ByteView::from(user.user_id.to_bytes()),
                 ByteView::from(user.to_bytes(actor)?),
             ),
-            sync_revision_entry(&document_target, &initial_sync_change(actor, placement))?,
+            sync_revision_entry(&document_target, &revision)?,
         ];
         // Ownership first, so receivers admit the name change as the owning group's administrator.
         let marker = marker.map(|(key, value)| AdminDocumentOperation::UserAttributeSet {
@@ -278,6 +285,14 @@ impl ServiceWrite {
 impl Operation for ServiceWrite {
     type Output = User;
     type Error = CreateServiceError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

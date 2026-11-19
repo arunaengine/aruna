@@ -13,9 +13,11 @@ use ulid::Ulid;
 use super::refresh::{RefreshOutcome, RefreshReplicaOperation, refusal_reason};
 use super::replica::{
     DeselectDocumentOperation, ReplicaOrigin, ReplicaRecord, ReplicaScanError, SelectionError,
-    TrackCreatedOperation, cache_budget,
+    TrackCreatedOperation,
 };
-use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
+use super::replica_store::{
+    cache_budget, cache_usage, delete_replica, read_replica, store_replica,
+};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 fn refresh_call(ids: NodeRealm, document_id: Ulid) -> IoCall {
@@ -154,6 +156,7 @@ pub fn deselect_document(document_id: Ulid) -> DeselectDocumentOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KeepStep {
     Read,
+    Budget,
     Stale,
     Usage,
     Reserve,
@@ -176,7 +179,7 @@ pub fn keep_read(ids: NodeRealm, record: &MetadataRegistryRecord) -> KeepReadOpe
     KeepReadOperation {
         ids,
         record: record.clone(),
-        budget: cache_budget(),
+        budget: 0,
         step: KeepStep::Read,
     }
 }
@@ -190,8 +193,8 @@ impl KeepReadOperation {
     fn read(&mut self, replica: Option<ReplicaRecord>) -> Result<Next<()>, IoError> {
         let Some(replica) = replica else {
             // A graph cannot be removed locally yet, so a full cache takes no new copy.
-            self.step = KeepStep::Usage;
-            return Ok(Next::Call(IoCall::child(cache_usage())));
+            self.step = KeepStep::Budget;
+            return Ok(Next::Call(IoCall::child(cache_budget())));
         };
         // A pinned or edited copy follows the refresh beat instead.
         let current = replica.record.as_ref();
@@ -229,6 +232,11 @@ impl Operation for KeepReadOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         match self.step {
             KeepStep::Read => self.read(replica_of(result)?),
+            KeepStep::Budget => {
+                self.budget = result.child::<u64, IoError>()??;
+                self.step = KeepStep::Usage;
+                Ok(Next::Call(IoCall::child(cache_usage())))
+            }
             KeepStep::Stale => {
                 result.child::<RefreshOutcome, IoError>()??;
                 Ok(Next::Done(()))

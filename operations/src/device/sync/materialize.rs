@@ -14,7 +14,6 @@ use aruna_core::structs::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
     SyncedBytes, SyncedFolder, WriteGuard,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use bytes::Bytes;
 use thiserror::Error;
@@ -90,6 +89,7 @@ pub struct MaterializeEntryOperation {
     input: MaterializeInput,
     /// The outcome of the file write, once it is known.
     outcome: Option<MaterializeOutcome>,
+    now_ms: u64,
 }
 
 impl PartialEq for MaterializeEntryOperation {
@@ -103,6 +103,7 @@ impl PartialEq for MaterializeEntryOperation {
 impl MaterializeEntryOperation {
     pub fn new(input: MaterializeInput) -> Self {
         Self {
+            now_ms: 0,
             input,
             outcome: None,
         }
@@ -115,7 +116,7 @@ impl MaterializeEntryOperation {
         outcome: &MaterializeOutcome,
         written: Option<(String, [u8; 32], u64)>,
     ) -> SyncBase {
-        let now = unix_timestamp_millis();
+        let now = self.now_ms;
         let mark = PendingMark {
             fingerprint: self.input.local_fingerprint.clone(),
             remote_version: Some(self.input.remote_version),
@@ -260,6 +261,10 @@ impl Operation for MaterializeEntryOperation {
     type Output = MaterializeOutcome;
     type Error = MaterializeError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<MaterializeOutcome>, MaterializeError> {
         let root = self.input.folder.root.clone();
         let relative = self.input.relative.clone();
@@ -271,7 +276,7 @@ impl Operation for MaterializeEntryOperation {
             true => LocalFileEffect::WriteConflicted {
                 root,
                 relative,
-                at_ms: unix_timestamp_millis(),
+                at_ms: self.now_ms,
                 blob,
             },
             false => LocalFileEffect::Write {

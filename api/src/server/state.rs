@@ -21,7 +21,7 @@ use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerKeyCache, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -53,7 +53,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 
-/// Identity, realm trust roots, and the shared issuer-key cache. The `Arc`
+/// Identity and realm trust roots. The `Arc`
 /// fields are the node's shared owners: cloning the state clones these handles
 /// and never recreates the guarded contents.
 #[derive(Clone, Debug)]
@@ -69,9 +69,6 @@ struct IdentityState {
     credential_encryption_key: CredentialEncryptionKey,
     // Contains OIDC config and Client.
     oidc_validator: Option<Arc<OidcValidator>>,
-    // Bounded TTL + LRU cache of trusted issuer decoding keys. One cache per
-    // node: every state clone must observe the same cache identity.
-    issuer_keys: Arc<IssuerKeyCache>,
     // Contains trusted realms. A mutation inserts under the write guard and
     // persists the snapshot after the guard drops, so no lock crosses I/O.
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
@@ -301,7 +298,6 @@ impl ServerState {
                 node_capabilities,
                 credential_encryption_key,
                 oidc_validator,
-                issuer_keys: Arc::new(IssuerKeyCache::new()),
                 trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
                 initial_admin_claim,
             },
@@ -660,17 +656,13 @@ impl ServerState {
         }
     }
 
-    pub async fn issuer_cache_len(&self) -> usize {
-        self.identity.issuer_keys.len()
-    }
-
     async fn token_checks(&self, revocation: RevocationCheck) -> TokenChecks {
         let trusted = self.identity.trusted_realms_list.read().await;
         TokenChecks {
             trust: IssuerTrust::Listed(trusted.iter().copied().collect()),
             revocation,
             linked_realm: Some(self.get_realm_id()),
-            keys: IssuerKeys::Cached(self.identity.issuer_keys.clone()),
+            keys: IssuerKeys::Net,
         }
     }
 

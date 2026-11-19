@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{
@@ -92,6 +93,8 @@ impl From<IoError> for CreateConnectorError {
 pub struct CreateConnectorOperation {
     input: CreateConnectorInput,
     result: Option<CreateConnectorResult>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl CreateConnectorOperation {
@@ -99,6 +102,8 @@ impl CreateConnectorOperation {
         Self {
             input,
             result: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 }
@@ -186,6 +191,14 @@ impl Operation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
     type Error = CreateConnectorError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, CreateConnectorError> {
         validate_connector(
             &self.input.name,
@@ -194,9 +207,9 @@ impl Operation for CreateConnectorOperation {
             &self.input.public_config,
             &self.input.secret_config,
         )?;
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let connector = RepositoryConnector::new(
-            ulid::Ulid::generate(),
+            self.ids.mint(self.now_ms),
             self.input.group_id,
             self.input.name.clone(),
             self.input.kind,
@@ -427,5 +440,21 @@ mod tests {
             result.connector
         );
         assert!(result.has_secret_config);
+    }
+
+    // The runner's stamp and entropy give the connector its id and times.
+    #[test]
+    fn stamp_names_connector() {
+        let mut op = CreateConnectorOperation::new(input());
+        op.stamp(1_700_000_000_000);
+        op.seed(7);
+        assert!(matches!(op.first(), Ok(Next::Call(_))));
+        let connector = &op.result.as_ref().unwrap().connector;
+        assert_eq!(
+            connector.connector_id,
+            ulid::Ulid::from_parts(1_700_000_000_000, 7)
+        );
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        assert_eq!((connector.created_at, connector.updated_at), (at, at));
     }
 }

@@ -15,7 +15,6 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{EntryState, SyncBase, SyncedFolder};
-use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -269,11 +268,13 @@ struct MarkFailedOperation {
     relative: String,
     message: String,
     writing: bool,
+    now_ms: u64,
 }
 
 impl MarkFailedOperation {
     fn new(folder_id: Ulid, relative: String, message: String) -> Self {
         Self {
+            now_ms: 0,
             folder_id,
             relative,
             message,
@@ -285,6 +286,10 @@ impl MarkFailedOperation {
 impl Operation for MarkFailedOperation {
     type Output = ();
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -310,7 +315,7 @@ impl Operation for MarkFailedOperation {
             entry: EntryState::Error {
                 reason: self.message.clone(),
             },
-            synced_at_ms: unix_timestamp_millis(),
+            synced_at_ms: self.now_ms,
             ..base
         };
         let row = base_entry(self.folder_id, &self.relative, &base).map_err(codec)?;
