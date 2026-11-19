@@ -1445,6 +1445,10 @@ pub enum MetadataEffect {
         graph_iri: String,
         document_path: String,
     },
+    /// Every `(subject, predicate, object)` triple of a graph whose object is an IRI.
+    IriReferences {
+        graph_iri: String,
+    },
     /// The summary of a graph at a document cursor, from this node's summary cache when it
     /// holds that cursor.
     ExportSummaryAt {
@@ -1519,6 +1523,7 @@ impl MetadataEffect {
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
             MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
             MetadataEffect::DescribeTitle { .. } => "describe_title",
+            MetadataEffect::IriReferences { .. } => "iri_references",
             MetadataEffect::MergeRows { .. } => "merge_rows",
             MetadataEffect::FlushGraph => "flush_graph",
             MetadataEffect::CacheGeneration => "cache_generation",
@@ -1547,6 +1552,7 @@ impl MetadataEffect {
             | MetadataEffect::ExportRoCrateSummary { graph_iri }
             | MetadataEffect::ExportSummaryAt { graph_iri, .. }
             | MetadataEffect::DescribeTitle { graph_iri, .. }
+            | MetadataEffect::IriReferences { graph_iri }
             | MetadataEffect::DeleteGraph { graph_iri }
             | MetadataEffect::ContainsGraph { graph_iri }
             | MetadataEffect::ContainsDot { graph_iri, .. }
@@ -1700,6 +1706,10 @@ pub enum MetadataEvent {
     /// The title of a document, or `None` when it has neither a name nor a path.
     DocumentTitle {
         title: Option<String>,
+    },
+    /// The IRI-object triples of one graph, as `(subject, predicate, object)`.
+    IriReferences {
+        references: Vec<(String, String, String)>,
     },
     /// The query cache's stamp and its entry, if it holds a current one; a store answers
     /// without an entry.

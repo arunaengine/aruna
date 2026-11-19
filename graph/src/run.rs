@@ -81,6 +81,15 @@ impl GraphHandle {
                 let result = crate::merge::run_merge(job, budget).await;
                 return MetadataEvent::RowsMerged { result };
             }
+            MetadataEffect::IriReferences { graph_iri } => {
+                return match self.iri_references(graph_iri).await {
+                    Ok(references) => MetadataEvent::IriReferences { references },
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
+                };
+            }
             MetadataEffect::DescribeTitle {
                 graph_iri,
                 document_path,
@@ -970,6 +979,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::QueryCachePut { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
+        | MetadataEffect::IriReferences { .. }
         | MetadataEffect::FlushGraph
         | MetadataEffect::MergeRows { .. }
         | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),

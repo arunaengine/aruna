@@ -908,6 +908,7 @@ impl MetadataEvent {
                 CachedGroup,
                 QueryCacheEntry,
                 DocumentTitle,
+                IriReferences,
                 RowsMerged,
                 GraphFlushed,
                 ProfileShapes,
