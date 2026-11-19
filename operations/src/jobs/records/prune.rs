@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
     FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, INPUT_PAGE_KEYSPACE, LAUNCH_CLOSURE_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, LAUNCH_CLOSURE_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::record_keys::{prune_due_key, prune_slot_key};
@@ -22,12 +22,12 @@ pub use super::prune_pass::{FamilyTimerOperation, PruneFamiliesOperation};
 /// Due index rows one pass reads, and body rows one page transaction deletes.
 pub const FAMILY_PRUNE_PAGE: usize = 256;
 
-/// The keyspaces that hold a family's bodies under its prefix, deleted page by page.
-pub(super) const BODY_SPACES: [&str; 6] = [
+/// The keyspaces that hold a family's bodies under its prefix, deleted page by page. Input pages
+/// are keyed by submission and go first, through their own keys.
+pub(super) const BODY_SPACES: [&str; 5] = [
     FAMILY_RECORD_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_PENDING_KEYSPACE,
-    INPUT_PAGE_KEYSPACE,
     PLAN_EXPLAIN_KEYSPACE,
     LAUNCH_CLOSURE_KEYSPACE,
 ];

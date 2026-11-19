@@ -17,6 +17,7 @@ pub mod pages;
 pub mod project;
 pub mod prune;
 mod prune_family;
+mod prune_pages;
 mod prune_pass;
 pub mod reduce;
 pub mod transport;

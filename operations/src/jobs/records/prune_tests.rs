@@ -86,7 +86,7 @@ fn stale_row_dropped() {
     assert_eq!(prune.next(stored), Ok(Next::Done(PruneStep::Moved)));
 }
 
-// Behind an unfinished tombstone the bodies go page by page; the last page finishes it.
+// Behind an unfinished tombstone the input pages go first, then the bodies page by page.
 #[test]
 fn tombstone_pages_bodies() {
     let tombstone = FamilyTombstone {
@@ -97,8 +97,13 @@ fn tombstone_pages_bodies() {
     let stored = Some(Value::from(to_bytes(&tombstone).unwrap().as_slice()));
     let mut prune = PruneFamilyOperation::new(family(), 7, None);
     prune.first().unwrap();
+    let pages = IoCall::child(super::super::prune_pages::PrunePagesOperation::new(family()));
+    let read = prune.next(IoResult::Values(vec![slot(7), stored]));
+    assert_eq!(read, Ok(Next::Call(pages)));
+    // Without own input pages left the body pages follow.
+    let none = child(Ok::<JobDeletes, PruneError>(Vec::new()));
     assert!(matches!(
-        prune.next(IoResult::Values(vec![slot(7), stored])),
+        prune.next(none),
         Ok(Next::Call(IoCall::Page { .. }))
     ));
     let key = Key::from(&b"record"[..]);

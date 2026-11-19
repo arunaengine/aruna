@@ -52,7 +52,7 @@ impl From<IoError> for PageReadError {
     }
 }
 
-fn page_key(submission: &SubmissionId, digest: &[u8; 32]) -> Key {
+pub(crate) fn page_key(submission: &SubmissionId, digest: &[u8; 32]) -> Key {
     let mut key = submission_prefix(*submission).to_vec();
     key.extend_from_slice(digest);
     Key::from(key.as_slice())
@@ -78,7 +78,7 @@ pub(crate) fn page_rows(
 }
 
 /// The page a stored row holds, checked against the digest it is kept under.
-fn stored_page(row: &[u8], digest: &[u8; 32]) -> Result<InputPage, PageReadError> {
+pub(crate) fn stored_page(row: &[u8], digest: &[u8; 32]) -> Result<InputPage, PageReadError> {
     let page: InputPage =
         postcard::from_bytes(row).map_err(|error| PageReadError::Storage(error.to_string()))?;
     match page.digest().map_err(PageError::from)? == *digest {

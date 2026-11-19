@@ -32,6 +32,7 @@ use super::prune::{
     BODY_SPACES, FAMILY_PRUNE_PAGE, PruneCommitOperation, PruneError, PruneStep, index_rows,
     slot_of, slot_rows,
 };
+use super::prune_pages::PrunePagesOperation;
 use super::reduce::reduce_family;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::closure::CloseLaunchesOperation;
@@ -43,6 +44,7 @@ use crate::secrets::owner::WriterView;
 #[derive(Debug, PartialEq)]
 enum FamilyStep {
     Rows,
+    Pages,
     Body(usize),
     Records,
     Pending,
@@ -346,12 +348,21 @@ impl Operation for PruneFamilyOperation {
                     .map(|value| from_bytes::<FamilyTombstone>(&value))
                     .transpose()?;
                 if self.tombstone.is_some_and(|tombstone| !tombstone.finished) {
-                    return self.body_page(0);
+                    self.step = FamilyStep::Pages;
+                    let pages = PrunePagesOperation::new(self.family);
+                    return Ok(Next::Call(IoCall::child(pages)));
                 }
                 self.step = FamilyStep::Records;
                 Ok(Next::Call(IoCall::child(LoadFamilyOperation::family(
                     self.family,
                 ))))
+            }
+            FamilyStep::Pages => {
+                let pages = result.child::<JobDeletes, PruneError>()??;
+                if pages.is_empty() {
+                    return self.body_page(0);
+                }
+                self.commit(PruneStep::Paged, true, (pages, Vec::new()))
             }
             FamilyStep::Body(space) => {
                 let name = BODY_SPACES[space];

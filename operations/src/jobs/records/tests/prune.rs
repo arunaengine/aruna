@@ -7,20 +7,22 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE, INPUT_PAGE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::record_keys::{
     alias_key, family_prefix, prune_due_key, prune_slot_key, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
-    FamilyTombstone, JobRecordEnvelope, PhysicalExecutionState, RETENTION_MS,
+    FamilyTombstone, InputPage, JobFamilyRecord, JobRecordEnvelope, PageEntries, PageManifest,
+    PhysicalExecutionState, RETENTION_MS,
 };
 use aruna_core::types::{Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 
 use crate::jobs::lifecycle::family_reads::FamilyProjectionOperation;
+use crate::jobs::records::pages::{page_key, page_rows};
 use crate::jobs::records::prune::{FamilyPruneOutcome, PruneFamiliesOperation};
 use crate::jobs::route::JobRouteError;
 use crate::tests::records::{Family, context, read_row};
@@ -204,4 +206,91 @@ async fn drops_stale_row() {
     assert_eq!(slot(&ctx, &family).await, Some(later));
     assert_eq!(index_rows(&ctx).await, 2);
     assert!(tombstone(&ctx, &family).await.is_none());
+}
+
+/// An input page with no entries and its one-page manifest.
+fn input_page(index: u32) -> (InputPage, PageManifest) {
+    let page = InputPage {
+        index,
+        entries: PageEntries::Launch(Vec::new()),
+        next: None,
+    };
+    let first = page.digest().expect("page digest");
+    let manifest = PageManifest {
+        count: 0,
+        pages: 1,
+        first,
+    };
+    (page, manifest)
+}
+
+/// Re-signs the record at `index` after `change` edited it.
+fn resign(
+    family: &Family,
+    records: &mut [JobRecordEnvelope],
+    index: usize,
+    change: impl FnOnce(&mut JobFamilyRecord),
+) {
+    let mut record = records[index].record.clone();
+    change(&mut record);
+    records[index] = family.sign(&family.holder, record);
+}
+
+async fn stored_page(ctx: &DriverContext, family: &Family, page: &InputPage) -> bool {
+    let digest = page.digest().expect("page digest");
+    let key = page_key(&family.submission_id, &digest).to_vec();
+    read_row(ctx, INPUT_PAGE_KEYSPACE, key)
+        .await
+        .expect("page read")
+        .is_some()
+}
+
+#[tokio::test]
+async fn prunes_input_pages() {
+    // The pruned family's own input pages go with it; a page another family of the same
+    // submission still names stays.
+    let family = Family::new([94u8; 32]);
+    let sibling = Family::new([98u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let ((own, own_manifest), (shared, shared_manifest)) = (input_page(1), input_page(2));
+    let submission = family.submission_id;
+    write(
+        &ctx,
+        page_rows(&submission, &[own.clone(), shared.clone()]).unwrap(),
+    )
+    .await;
+    let mut records = family.stopped_run();
+    resign(&family, &mut records, 0, |record| {
+        if let JobFamilyRecord::Spec(spec) = record {
+            spec.input_pages = Some(own_manifest);
+        }
+    });
+    resign(&family, &mut records, 3, |record| {
+        if let JobFamilyRecord::Launch(launch) = record {
+            launch.input_pages = Some(shared_manifest);
+        }
+    });
+    let mut other = sibling.spec();
+    other.input_pages = Some(shared_manifest);
+    let other = sibling.sign(&sibling.holder, JobFamilyRecord::Spec(Box::new(other)));
+    seed(&ctx, &family, &records, 2_000).await;
+    let other_value = Value::from(to_bytes(&other).unwrap().as_slice());
+    let other_row = (
+        FAMILY_RECORD_KEYSPACE.to_string(),
+        record_key(&other.key()),
+        other_value,
+    );
+    write(&ctx, vec![other_row]).await;
+
+    for _ in 0..4 {
+        pass(&ctx).await;
+    }
+
+    assert!(
+        tombstone(&ctx, &family)
+            .await
+            .is_some_and(|tombstone| tombstone.finished)
+    );
+    assert!(!stored_page(&ctx, &family, &own).await);
+    assert!(stored_page(&ctx, &family, &shared).await);
 }
