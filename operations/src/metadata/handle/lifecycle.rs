@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::sync::sync_graph_once;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -753,7 +753,7 @@ pub(super) async fn fill_visibility_caches(
         .collect::<Vec<_>>();
     records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
-    warn_unprojected_graphs(graph, records.as_ref()).await;
+    graph.warn_unprojected(records.as_ref()).await;
     let store_accepted = inner.visibility_cache.store_visibility_fill(
         records.clone(),
         lifecycle_entries,
@@ -819,61 +819,6 @@ pub(super) async fn list_deleted_iris(
         }
     }
     Ok((deleted, pages))
-}
-
-async fn warn_unprojected_graphs(graph: &GraphHandle, records: &[MetadataRegistryRecord]) {
-    let projected = records
-        .iter()
-        .map(|record| record.graph_iri.clone())
-        .collect::<BTreeSet<_>>();
-    let policies = match graph.graph_policies().await {
-        Ok(policies) => policies,
-        Err(error) => {
-            warn!(
-                event = "metadata.authorization.graph_scan_failed",
-                error = %error,
-                "Could not audit metadata graphs against the authorization projection"
-            );
-            return;
-        }
-    };
-    let graphs = policies.keys().cloned().collect::<BTreeSet<_>>();
-    let missing = graphs.difference(&projected).cloned().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        warn!(
-            event = "metadata.authorization.projection_missing",
-            count = missing.len() as u64,
-            sample_graph_iris = ?missing.iter().take(8).collect::<Vec<_>>(),
-            "excluding metadata graphs missing from the authorization projection"
-        );
-    }
-    let unmaterialized = projected.difference(&graphs).cloned().collect::<Vec<_>>();
-    if !unmaterialized.is_empty() {
-        warn!(
-            event = "metadata.authorization.graph_missing",
-            count = unmaterialized.len() as u64,
-            sample_graph_iris = ?unmaterialized.iter().take(8).collect::<Vec<_>>(),
-            "metadata authorization projection references graphs missing from Craqle"
-        );
-    }
-    let stale = records
-        .iter()
-        .filter(|record| {
-            policies.get(&record.graph_iri).is_some_and(|policy| {
-                policy.public != record.public
-                    || policy.permission_paths != [record.permission_path.clone()]
-            })
-        })
-        .map(|record| record.graph_iri.as_str())
-        .collect::<Vec<_>>();
-    if !stale.is_empty() {
-        warn!(
-            event = "metadata.authorization.projection_stale",
-            count = stale.len() as u64,
-            sample_graph_iris = ?stale.iter().take(8).collect::<Vec<_>>(),
-            "metadata authorization projection disagrees with Craqle graph policy"
-        );
-    }
 }
 
 /// Every live registry record of this node, from the visibility cache.

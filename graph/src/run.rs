@@ -31,6 +31,9 @@ impl GraphHandle {
         if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
             self.inner.visibility.remove_graph(graph_iri);
         }
+        if let MetadataEffect::StoreRegistry { records, .. } = &effect {
+            self.warn_unprojected(records).await;
+        }
         let mutates_graph = effect.mutates_graph();
         let event = self.run_store(effect).await;
         if mutates_graph && !matches!(event, MetadataEvent::Error { .. }) {

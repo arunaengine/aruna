@@ -12,6 +12,7 @@ use aruna_core::metadata::{MetadataQueryResults, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use lru::LruCache;
+use tracing::warn;
 use ulid::Ulid;
 
 /// How long a registry snapshot or deletion state counts as fresh.
@@ -544,6 +545,63 @@ impl crate::GraphHandle {
     /// Marks every registry and deletion entry expired, so the next read takes the stale path.
     pub fn expire_caches(&self) {
         self.inner.visibility.expire_now();
+    }
+
+    /// Warns about registry records and stored graphs that disagree, before a registry fill is
+    /// kept: graphs without a record, records without a graph, and stale graph policies.
+    pub async fn warn_unprojected(&self, records: &[MetadataRegistryRecord]) {
+        let projected = records
+            .iter()
+            .map(|record| record.graph_iri.clone())
+            .collect::<BTreeSet<_>>();
+        let policies = match self.graph_policies().await {
+            Ok(policies) => policies,
+            Err(error) => {
+                warn!(
+                    event = "metadata.authorization.graph_scan_failed",
+                    error = %error,
+                    "Could not audit metadata graphs against the authorization projection"
+                );
+                return;
+            }
+        };
+        let graphs = policies.keys().cloned().collect::<BTreeSet<_>>();
+        let missing = graphs.difference(&projected).cloned().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            warn!(
+                event = "metadata.authorization.projection_missing",
+                count = missing.len() as u64,
+                sample_graph_iris = ?missing.iter().take(8).collect::<Vec<_>>(),
+                "excluding metadata graphs missing from the authorization projection"
+            );
+        }
+        let unmaterialized = projected.difference(&graphs).cloned().collect::<Vec<_>>();
+        if !unmaterialized.is_empty() {
+            warn!(
+                event = "metadata.authorization.graph_missing",
+                count = unmaterialized.len() as u64,
+                sample_graph_iris = ?unmaterialized.iter().take(8).collect::<Vec<_>>(),
+                "metadata authorization projection references graphs missing from Craqle"
+            );
+        }
+        let stale = records
+            .iter()
+            .filter(|record| {
+                policies.get(&record.graph_iri).is_some_and(|policy| {
+                    policy.public != record.public
+                        || policy.permission_paths != [record.permission_path.clone()]
+                })
+            })
+            .map(|record| record.graph_iri.as_str())
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            warn!(
+                event = "metadata.authorization.projection_stale",
+                count = stale.len() as u64,
+                sample_graph_iris = ?stale.iter().take(8).collect::<Vec<_>>(),
+                "metadata authorization projection disagrees with Craqle graph policy"
+            );
+        }
     }
 }
 
