@@ -797,6 +797,7 @@ fn sample_projection() -> JobProjection {
         }],
         outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
         cancel_requested: false,
+        expiry_reason: None,
     }
 }
 
@@ -855,7 +856,7 @@ fn canonical_encodings() {
             "e8f39031f13bb2f7f9b0844e2819c4cb55c5f3df1e32b76af0545313e2a06c8b",
             "fa8a28492ffd1463afacabcff2dba75da4da8d3af61977e902bd291e971d98fd",
             "da845a6ec08937f98ab8cd3df645b29f3ac9e25ea36e2ecb21c79b47dca1018b",
-            "bb342189b2c25f4c3c70813b14199b2e1c0fc2b54e8869e05fff02957ffc5d79",
+            "4fc7a54b9e841491ec560e5aa7d9c7559b9bbdb966cb63dc7e97a0d93ad64894",
         ]
     );
     assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);

@@ -893,6 +893,10 @@ the link's group, who may manage the link.
 - `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed`,
   `cancelled` or `not_run`. A distributed job is `not_run` when every execution and launch still
   open belongs to a node that left the realm; such a job is not launched again.
+- `expiry_reason` is present when a holder cancelled a distributed job that has no outcome:
+  `retention` (every execution stopped and retention passed), `stale_spec` (its spec was older
+  than the horizon) or `budget_used` (no target accepted it within its launches). It is not a
+  failure; submit the job again to run it.
 - A distributed execution job carries a `family` block reduced from the replicated records: the
   request's `submission_id`, the currently canonical alias, the canonical execution and its exact
   output VersionIds, how many physical executions and duplicate successes are known, the projection

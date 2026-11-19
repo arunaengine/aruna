@@ -709,6 +709,7 @@ async fn write_family(
             outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new())
                 .expect("empty outputs"),
             cancel_requested: false,
+            expiry_reason: None,
         }),
     };
     write_row(

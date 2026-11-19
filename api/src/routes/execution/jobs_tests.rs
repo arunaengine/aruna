@@ -84,6 +84,7 @@ fn family_report_fixture() -> FamilyReport {
             state: JobState::Indeterminate,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: None,

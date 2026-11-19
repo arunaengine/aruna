@@ -577,6 +577,29 @@ pub enum CancelAuthority {
     Deletion,
     /// A holder saw the plugin install of a task removed; its signature is that statement.
     InstallRemoved,
+    /// A holder ended a family that has no outcome; it names the submitter, not a caller.
+    Expiry(ExpiryReason),
+}
+
+/// Why a family without an outcome was cancelled. It is no failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExpiryReason {
+    /// Every execution stopped, every launch closed, and retention passed.
+    Retention,
+    /// The origin's own spec was refused as older than the horizon.
+    StaleSpec,
+    /// The holder's launch budget is used up and its launches are settled.
+    BudgetUsed,
+}
+
+impl ExpiryReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::StaleSpec => "stale_spec",
+            Self::BudgetUsed => "budget_used",
+        }
+    }
 }
 
 /// Replicated cancellation intent for one `(submission_id, request_digest)`
@@ -1446,7 +1469,7 @@ impl JobRecordEnvelope {
             return Err(JobRecordError::Unauthorized);
         }
         match cancel.authority {
-            CancelAuthority::Submitter | CancelAuthority::Deletion => {
+            CancelAuthority::Submitter | CancelAuthority::Deletion | CancelAuthority::Expiry(_) => {
                 match cancel.requested_by == spec.created_by {
                     true => Ok(RecordVerdict::Authentic),
                     false => Err(JobRecordError::Unauthorized),
@@ -1623,6 +1646,8 @@ pub struct JobProjection {
     /// Outputs of the canonical execution, in their one canonical order.
     pub outputs: OutputSet,
     pub cancel_requested: bool,
+    /// Set when a holder cancelled the family because it expired without an outcome.
+    pub expiry_reason: Option<ExpiryReason>,
 }
 
 impl JobProjection {

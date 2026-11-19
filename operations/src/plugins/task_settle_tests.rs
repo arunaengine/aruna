@@ -81,6 +81,7 @@ fn settles_terminal_states() {
         executions: Vec::<ProjectedExecution>::new(),
         outputs: OutputSet::new(Vec::new()).unwrap(),
         cancel_requested: false,
+        expiry_reason: None,
     };
     for waiting in [
         LogicalJobState::Queued,

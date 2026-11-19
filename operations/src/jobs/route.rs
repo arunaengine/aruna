@@ -256,6 +256,7 @@ mod pure_tests {
             state: JobState::Succeeded,
             attempts: 1,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 1,
             updated_at_ms: 2,
             finished_at_ms: Some(2),

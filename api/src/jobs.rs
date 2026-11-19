@@ -927,6 +927,10 @@ pub struct JobStatusResponse {
     pub state: String,
     pub attempts: u32,
     pub cancel_requested: bool,
+    /// Present when a holder cancelled the job because it expired without an outcome:
+    /// `retention`, `stale_spec` or `budget_used`. It is not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -987,6 +991,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         state: job.state.name().to_string(),
         attempts: job.attempts,
         cancel_requested: job.cancel_requested,
+        expiry_reason: job.expiry_reason.map(|reason| reason.name().to_string()),
         created_at: rfc3339(job.created_at_ms),
         updated_at: rfc3339(job.updated_at_ms),
         finished_at: job.finished_at_ms.map(rfc3339),

@@ -1093,6 +1093,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
             state: JobState::Succeeded,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: Some(20),

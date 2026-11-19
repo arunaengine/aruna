@@ -5,10 +5,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::structs::execution::job::{
-    ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate, JobFamilyId,
-    JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
-    LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution, SubmissionClaim,
-    canonical_execution_key, verify_update_chain,
+    CancelAuthority, ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate,
+    JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,
+    JobRecordError, LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution,
+    SubmissionClaim, canonical_execution_key, verify_update_chain,
 };
 use ulid::Ulid;
 
@@ -29,6 +29,7 @@ pub fn reduce_family(
     let mut claims: Vec<SubmissionClaim> = Vec::new();
     let mut executions: BTreeMap<Ulid, ExecutionRecords> = BTreeMap::new();
     let mut cancelled = false;
+    let mut expiry_reason = None;
 
     for envelope in records.iter().filter(|record| record.family() == family) {
         match &envelope.record {
@@ -46,7 +47,13 @@ pub fn reduce_family(
                 executions.entry(output.execution_id).or_default().output =
                     Some(output.as_ref().clone());
             }
-            JobFamilyRecord::Cancel(_) => cancelled = true,
+            JobFamilyRecord::Cancel(cancel) => {
+                cancelled = true;
+                // Holders may name different reasons; the smallest is the same everywhere.
+                if let CancelAuthority::Expiry(reason) = cancel.authority {
+                    expiry_reason = Some(expiry_reason.map_or(reason, |first| reason.min(first)));
+                }
+            }
             JobFamilyRecord::Spec(_)
             | JobFamilyRecord::Budget(_)
             | JobFamilyRecord::Launch(_)
@@ -148,6 +155,7 @@ pub fn reduce_family(
         executions: projected,
         outputs,
         cancel_requested: cancelled,
+        expiry_reason,
     }))
 }
 

@@ -25,8 +25,9 @@ use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::RoCrateLimits;
 use crate::structs::execution::job::{
-    InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
-    JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
+    ExpiryReason, InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord,
+    JobResultPayload, JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId,
+    WorkspaceMode,
 };
 use crate::structs::execution::table::GzipCursor;
 use crate::structs::storage::blob::BackendLocation;
@@ -119,6 +120,8 @@ pub struct JobStatusView {
     pub state: JobState,
     pub attempts: u32,
     pub cancel_requested: bool,
+    /// Set when a holder cancelled the job because it expired without an outcome.
+    pub expiry_reason: Option<ExpiryReason>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -167,6 +170,7 @@ impl From<&JobRecord> for JobStatusView {
             state: record.state,
             attempts: record.attempts,
             cancel_requested: record.cancel_requested,
+            expiry_reason: None,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
             finished_at_ms: record.finished_at_ms,

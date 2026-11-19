@@ -88,6 +88,7 @@ mod tests {
             executions: Vec::new(),
             outputs: OutputSet::new(Vec::new()).expect("empty outputs"),
             cancel_requested: false,
+            expiry_reason: None,
         }
     }
 

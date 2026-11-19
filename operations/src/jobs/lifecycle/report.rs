@@ -442,6 +442,7 @@ mod tests {
             executions: Vec::new(),
             outputs: OutputSet::try_from(Vec::new()).expect("no outputs"),
             cancel_requested: false,
+            expiry_reason: None,
         }
     }
 
