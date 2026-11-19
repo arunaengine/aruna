@@ -200,7 +200,7 @@ impl MergeUsersOperation {
         let user_id = user.user_id;
         let mut change = Change::new(state.as_ref(), AdminDocumentTarget::User { user_id })?;
         for op in ops {
-            change.apply(&actor, op)?;
+            change.apply(&actor, op, self.ids.mint(self.now_ms))?;
         }
         let document = DocumentTarget::User { user_id };
         let placement = self.placement(config, &document);
@@ -369,6 +369,7 @@ impl MergeUsersOperation {
                     node_id,
                     kind: RealmNodeKind::User { owner: survivor },
                 },
+                self.ids.mint(self.now_ms),
             )?;
         }
         overlay_reducer_state(&mut documents.config, &change.state, self.now_ms);

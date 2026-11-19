@@ -172,6 +172,7 @@ impl Fixture {
                     display_name: group.display_name.clone(),
                     owner,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let writes = vec![

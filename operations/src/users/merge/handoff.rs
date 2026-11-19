@@ -10,6 +10,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
@@ -93,6 +94,7 @@ pub(super) struct HandoffWrite {
     stage: Stage,
     batch: Batch,
     now_ms: u64,
+    ids: IdMint,
 }
 
 impl HandoffWrite {
@@ -102,6 +104,7 @@ impl HandoffWrite {
             stage: Stage::Read,
             batch: Batch::default(),
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -146,6 +149,7 @@ impl HandoffWrite {
             AdminDocumentOperation::MergeCoordinatorSet {
                 node_id: self.config.node_id,
             },
+            self.ids.mint(self.now_ms),
         )?;
         overlay_reducer_state(&mut config, &change.state, self.now_ms);
         let document = DocumentTarget::RealmConfig { realm_id };
@@ -173,6 +177,10 @@ impl HandoffWrite {
 impl Operation for HandoffWrite {
     type Output = ();
     type Error = MergeError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;

@@ -466,7 +466,8 @@ impl UserWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(admin_target));
-        let mut admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let mut admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         let subject_claims = match self.input.subject.as_ref() {
             Some(_) if !self.input.system => return Err(UpdateUserError::Unauthorized),
             Some(subject) => {
@@ -497,6 +498,7 @@ impl UserWrite {
                 AdminDocumentOperation::SubjectIdAdded {
                     subject_id: subject.clone(),
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
         let previous_document_revision = revision_value
@@ -702,10 +704,12 @@ pub(crate) fn local_sync_change(
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &UpdateUserInput,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::new();
     for operation in admin_document_operations(input) {
-        events.push(state.apply_operation(&input.actor, operation)?);
+        events.push(state.apply_operation(&input.actor, operation, ids.mint(now_ms))?);
     }
 
     Ok(events)
@@ -1108,7 +1112,9 @@ mod pure_tests {
             let config = AdminDocumentTarget::RealmConfig { realm_id };
             let mut state = AdminDocumentState::new(config);
             let pin = AdminDocumentOperation::MergeCoordinatorSet { node_id };
-            state.apply_operation(&local, pin).unwrap();
+            state
+                .apply_operation(&local, pin, ulid::Ulid::generate())
+                .unwrap();
             reducer_state_entry(&state).unwrap().2
         };
         for (coordinator, refused) in [(other, true), (local.node_id, false)] {

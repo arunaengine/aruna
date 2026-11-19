@@ -230,6 +230,7 @@ mod tests {
                     display_name: "Group".into(),
                     owner: admin.user_id,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let requester = Actor {
@@ -248,6 +249,7 @@ mod tests {
                         created_at: 1,
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let (_, key, value) = reducer_state_entry(&state).unwrap();

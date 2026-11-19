@@ -759,7 +759,8 @@ impl Operation for MergeUsersOperation {
         }
         self.outcome = None;
         self.state = MergeState::JoinedCutoff;
-        let revocation = Revocation::new(self.cutoff_config());
+        let mut revocation = Revocation::new(self.cutoff_config());
+        revocation.set_event(self.ids.mint(self.now_ms));
         let first = revocation.first();
         self.revocation = Some(revocation);
         Ok(Next::Call(first))
