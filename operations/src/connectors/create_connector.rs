@@ -301,7 +301,7 @@ impl Operation for SourceConnectorOperation {
                 Ok(Next::Call(IoCall::Effect(Box::new(read))))
             }
             Stage::Secret => {
-                let secret = parse_secret_read(rows::event(result)?, chosen)?;
+                let secret = parse_secret_read(result.event()?, chosen)?;
                 match (secret, self.existing.take()) {
                     (Some(_), _) => Err(SourceConnectorError::IdTaken),
                     (None, Some(existing)) => Ok(Next::Done(SourceConnectorResult {
@@ -311,8 +311,8 @@ impl Operation for SourceConnectorOperation {
                     (None, None) => Ok(self.scan_ids(None)),
                 }
             }
-            Stage::Scan => self.scanned(rows::event(result)?, chosen),
-            Stage::Write => self.written(rows::event(result)?),
+            Stage::Scan => self.scanned(result.event()?, chosen),
+            Stage::Write => self.written(result.event()?),
         }
     }
 }

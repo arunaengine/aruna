@@ -10,7 +10,6 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 
@@ -100,7 +99,7 @@ impl Operation for MirrorRequestOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataError> {
-        let answer = match event(result)? {
+        let answer = match result.event()? {
             Event::Net(NetEvent::MetadataAnswer(answer)) => *answer,
             other => {
                 return Err(MetadataError::Backend(format!(

@@ -9,7 +9,6 @@ use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::effects::{Effect, IterStart, StorageEffect};
 use crate::events::{Event, StorageEvent};
 use crate::operation::{Operation, TransactionMode};
-use crate::rows::{all_values, done, event};
 use crate::types::{Key, KeySpace, Value};
 
 /// A plan asked for rows that are not known yet.
@@ -288,12 +287,12 @@ where
         match std::mem::replace(&mut self.phase, Phase::Planning) {
             Phase::Planning => Err(unfinished()),
             Phase::Reading(rows) => {
-                let values = all_values(result)?;
+                let values = result.values()?;
                 self.rows.learn(rows, values);
                 self.replay()
             }
             Phase::Scanning(request) => {
-                let values = match event(result)? {
+                let values = match result.event()? {
                     Event::Storage(StorageEvent::IterResult { values, .. }) => values,
                     Event::Storage(StorageEvent::Error { error }) => {
                         return Err(IoError::Storage(error).into());
@@ -310,11 +309,11 @@ where
                 self.replay()
             }
             Phase::Deleting(writes, output) => {
-                done(result)?;
+                result.done()?;
                 Ok(self.write(writes, output.ok_or_else(unfinished)?))
             }
             Phase::Writing(output) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(output.ok_or_else(unfinished)?))
             }
         }

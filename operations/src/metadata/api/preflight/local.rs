@@ -10,7 +10,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE};
 use aruna_core::metadata::IriIndexRecord;
 use aruna_core::operation::Operation;
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::HashIndex;
@@ -394,7 +393,7 @@ impl Operation for LocalPreflightOperation {
                 self.classified(walk, page)
             }
             LocalStage::Freshness(returned) => {
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let freshness = iri_freshness(&returned, values).map_err(unavailable)?;
                 self.stage = LocalStage::Pending(freshness);
                 let pending = PendingRecordsOperation::new(None, REGISTRY_CANDIDATE_LIMIT);

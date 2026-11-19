@@ -20,7 +20,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::*;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{StagedCall, all_values, done, event, page, values};
+use aruna_core::rows::{StagedCall, values};
 use aruna_core::structs::execution::notification;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
@@ -470,7 +470,7 @@ impl Operation for KeyOperation {
                 self.settings_read(value)
             }
             State::Snapshot => {
-                self.snapshot_read(all_values(result)?)?;
+                self.snapshot_read(result.values()?)?;
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
@@ -485,7 +485,7 @@ impl Operation for KeyOperation {
                 self.prepare()
             }
             State::Unlock => {
-                let Event::Blob(BlobEvent::KeyStatus { generations }) = event(result)? else {
+                let Event::Blob(BlobEvent::KeyStatus { generations }) = result.event()? else {
                     return self.fail(AbeError::Context);
                 };
                 let key = self.snapshot.as_ref().map(|s| s.parameters.key);
@@ -504,17 +504,17 @@ impl Operation for KeyOperation {
                 let [value] = values::<1>(result)?;
                 self.existing_read(value)
             }
-            State::Reuse => self.reuse_read(page(result)?.0),
-            State::Count => self.count_read(page(result)?.0),
-            State::Holders => self.notify_holders(page(result)?.0),
-            State::Issue => self.issue_read(event(result)?),
+            State::Reuse => self.reuse_read(result.page()?.0),
+            State::Count => self.count_read(result.page()?.0),
+            State::Holders => self.notify_holders(result.page()?.0),
+            State::Issue => self.issue_read(result.event()?),
             State::Cleanup | State::Write => {
-                done(result)?;
+                result.done()?;
                 self.flush()
             }
-            State::Heads => self.heads_read(page(outside_answer(result)?)?.0),
-            State::Writes => self.writes_read(all_values(outside_answer(result)?)?),
-            State::Envelopes => self.envelopes_read(all_values(outside_answer(result)?)?),
+            State::Heads => self.heads_read(outside_answer(result)?.page()?.0),
+            State::Writes => self.writes_read(outside_answer(result)?.values()?),
+            State::Envelopes => self.envelopes_read(outside_answer(result)?.values()?),
         }
     }
 }

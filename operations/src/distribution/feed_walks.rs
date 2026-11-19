@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::table::search_terms;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -336,7 +336,7 @@ impl Operation for SettleFeedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<usize>, FeedError> {
         if let Some(dropped) = self.dropped {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(dropped));
         }
         let settled = std::mem::take(&mut self.settled);
@@ -610,7 +610,7 @@ impl Operation for FeedWalk {
                 other => Err(wrong_index(other)),
             },
             FeedState::MarkBuilding => {
-                done(result)?;
+                result.done()?;
                 self.settle_batch()
             }
             FeedState::Describe => {
@@ -758,7 +758,7 @@ impl Operation for OpenWalk {
                 other => Err(wrong_index(other)),
             },
             OpenState::Write => {
-                done(result)?;
+                result.done()?;
                 self.opened += 1;
                 self.next_key()
             }
@@ -1092,7 +1092,7 @@ impl Operation for StateWalk {
                 other => Err(wrong_index(other)),
             },
             StateStep::DeleteGone => {
-                done(result)?;
+                result.done()?;
                 self.changed += 1;
                 self.next_range()
             }
@@ -1133,7 +1133,7 @@ impl Operation for StateWalk {
                 other => Err(wrong_index(other)),
             },
             StateStep::BuildState => {
-                done(result)?;
+                result.done()?;
                 if self.build.as_ref().ok_or(FeedError::NotFinished)?.done {
                     return self.prune_keep(StateStep::BuildPrune);
                 }
@@ -1167,7 +1167,7 @@ impl Operation for StateWalk {
                 other => Err(wrong_index(other)),
             },
             StateStep::MarkBuilding => {
-                done(result)?;
+                result.done()?;
                 self.changed += 1;
                 self.next_range()
             }

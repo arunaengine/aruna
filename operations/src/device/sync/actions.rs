@@ -10,7 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, outside_answer, outside_call, read_row};
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, SyncActionRecord,
@@ -282,7 +282,7 @@ fn write_call(rows: Vec<(String, Key, aruna_core::types::Value)>) -> IoCall {
 }
 
 fn row_written(result: IoResult) -> Result<(), ActionError> {
-    (outside_answer(result).and_then(done)).map_err(|_| ActionError::Unavailable)
+    (outside_answer(result).and_then(IoResult::done)).map_err(|_| ActionError::Unavailable)
 }
 
 /// What the pending call of an action on one entry answers.

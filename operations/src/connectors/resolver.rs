@@ -120,7 +120,7 @@ impl Operation for ResolveConnectorOperation {
             let read = read_secret_effect(self.input.connector_id, None);
             return Ok(Next::Call(read.into()));
         };
-        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        let secret = parse_secret_read(result.event()?, self.input.connector_id)?;
         let access = build_source_access(
             connector.kind,
             &connector.public_config,
@@ -262,7 +262,7 @@ impl Operation for ResolveBindingOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Resolved {
-        let event = rows::event(result)?;
+        let event = result.event()?;
         match self.state {
             ResolveBindingState::ReadRoot => self.root_read(event),
             ResolveBindingState::MatchConnector => self.matched(event),

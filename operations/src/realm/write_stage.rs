@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::StorageError;
 use aruna_core::id_mint::IdMint;
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::types::{Key, KeySpace, Value};
 
 use crate::auth::epoch_due::DueMarks;
@@ -72,13 +72,13 @@ impl WriteStage {
         match self.stage {
             Stage::Read => Ok(WriteStep::Read(values::<2>(result)?)),
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 let deletes = std::mem::take(&mut self.deletes);
                 Ok(WriteStep::Call(IoCall::Delete(deletes)))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 if !self.narrowed {
                     return Ok(WriteStep::Done);
                 }

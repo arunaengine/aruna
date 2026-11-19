@@ -12,7 +12,6 @@ use aruna_core::effects::{Effect, NetEffect, ShardNetEffect};
 use aruna_core::events::{Event, GenesisProbe, NetEvent, ShardNetEvent};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use tracing::{debug, warn};
 
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
@@ -37,14 +36,14 @@ fn shard_call(effect: ShardNetEffect) -> IoCall {
 }
 
 fn net_answer(result: IoResult) -> Result<NetEvent, MetadataError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(answer) => Ok(answer),
         other => Err(unexpected(other.label())),
     }
 }
 
 fn graph_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
         Event::Metadata(answer) => Ok(answer),
         other => Err(unexpected(other.label())),

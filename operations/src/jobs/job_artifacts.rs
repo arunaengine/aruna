@@ -13,7 +13,6 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, WireArtifact, WireRange};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportRoCrateSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
@@ -249,7 +248,7 @@ impl Operation for ArtifactRangeOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ArtifactRead>, JobReadError> {
-        match event(result)? {
+        match result.event()? {
             Event::Blob(BlobEvent::HiddenRead { blob, stream_size }) => {
                 Ok(Next::Done(ArtifactRead { blob, stream_size }))
             }
@@ -386,7 +385,7 @@ impl ArtifactRouteOperation {
     }
 
     fn reply(&self, result: IoResult) -> RouteNext {
-        match event(result)? {
+        match result.event()? {
             Event::Net(NetEvent::JobControl(JobControlEvent::Response(response))) => {
                 self.answered(*response, None)
             }

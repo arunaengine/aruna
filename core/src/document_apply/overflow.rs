@@ -22,7 +22,7 @@ use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
 use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::Operation;
-use crate::rows::{done, event, page, values};
+use crate::rows::values;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::{Key, Value};
@@ -217,7 +217,7 @@ impl ReplayOverflowOperation {
     }
 
     fn on_page(&mut self, result: IoResult) -> ReplayNext {
-        let page = match event(result)? {
+        let page = match result.event()? {
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::OverflowPage(page))) => *page,
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
                 return Err(ApplyError::Failed(error));
@@ -345,12 +345,12 @@ impl Operation for ReplayOverflowOperation {
     fn next(&mut self, result: IoResult) -> ReplayNext {
         match self.phase {
             Phase::Listing => {
-                let (rows, _) = page(result)?;
+                let (rows, _) = result.page()?;
                 self.checkpoints = rows.into();
                 self.next_checkpoint()
             }
             Phase::Removing | Phase::SavingScan | Phase::EndingFull => {
-                done(result)?;
+                result.done()?;
                 self.next_checkpoint()
             }
             Phase::Reading => {
@@ -390,11 +390,11 @@ impl Operation for ReplayOverflowOperation {
                 self.next_event()
             }
             Phase::MarkingFull => {
-                done(result)?;
+                result.done()?;
                 self.next_event()
             }
             Phase::EndingScan => {
-                done(result)?;
+                result.done()?;
                 let sweep = self.sweep()?;
                 let call = match sweep.full.clone() {
                     Some(value) => write_row(sweep.key.clone(), value),
@@ -407,7 +407,7 @@ impl Operation for ReplayOverflowOperation {
                 }
             }
             Phase::MovingCheckpoint => {
-                done(result)?;
+                result.done()?;
                 let call = delete_rows(vec![self.sweep()?.full_key.clone()]);
                 self.call(Phase::EndingFull, call)
             }

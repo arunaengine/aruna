@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{all_values, done, page, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -332,19 +332,19 @@ impl Operation for ResolvePolicyOperation {
                     self.start_read()
                 }
             },
-            ResolveState::Revalidate => self.accept_cached(all_values(result)?),
+            ResolveState::Revalidate => self.accept_cached(result.values()?),
             ResolveState::Resolve => {
                 let read = result.child::<(AuthenticPolicy, PolicySource), ReadPolicyError>()?;
                 self.after_read(read)
             }
-            ResolveState::Scan => match outside_answer(result).and_then(page) {
+            ResolveState::Scan => match outside_answer(result).and_then(IoResult::page) {
                 Ok((rows, _)) => self.scanned(rows),
                 Err(error) => {
                     warn!(error = %error, "Policy cache scan failed");
                     self.finish()
                 }
             },
-            ResolveState::Evict => match outside_answer(result).and_then(done) {
+            ResolveState::Evict => match outside_answer(result).and_then(IoResult::done) {
                 Ok(()) => self.emit_store(),
                 Err(error) => {
                     warn!(error = %error, "Policy cache eviction failed");
@@ -352,7 +352,7 @@ impl Operation for ResolvePolicyOperation {
                 }
             },
             ResolveState::Store => {
-                if let Err(error) = outside_answer(result).and_then(done) {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(error = %error, "Policy cache write failed");
                 }
                 self.finish()

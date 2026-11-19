@@ -24,7 +24,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -465,7 +465,7 @@ impl Operation for PublishOperation {
             },
             // A missed drain timer leaves the durable outbox row for the next drain.
             PublishState::Write => {
-                done(result)?;
+                result.done()?;
                 let output = self.revision.take().ok_or(PublishError::NotFinished)?;
                 Ok(Next::Then {
                     output,

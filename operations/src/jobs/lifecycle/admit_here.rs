@@ -14,7 +14,6 @@ use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::page;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::execution::job::{
@@ -141,7 +140,7 @@ impl Operation for ObservedStateOperation {
             };
             return Ok(Next::Done(state_of(projection)));
         }
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let cached = rows
             .first()
             .and_then(|(_, value)| ProjectionCache::decode(value));
@@ -420,7 +419,7 @@ impl Operation for AdmitHereOperation {
                 self.claims()
             }
             AdmitStep::Claims => {
-                let (rows, _) = page(result)?;
+                let (rows, _) = result.page()?;
                 match rows.is_empty() {
                     true => self.quota(),
                     false => self.admit((None, None)),

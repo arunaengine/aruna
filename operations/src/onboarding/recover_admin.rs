@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use thiserror::Error;
@@ -182,11 +182,11 @@ impl Operation for RecoverInitialOperation {
                 self.handle_states(values)
             }
             Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.write_replacement()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.input.record.clone()))
             }
         }

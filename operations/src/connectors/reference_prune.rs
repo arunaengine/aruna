@@ -14,7 +14,6 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -85,7 +84,7 @@ impl Operation for RestorePruneOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PruneError> {
-        match (self.scheduling, rows::event(result)?) {
+        match (self.scheduling, result.event()?) {
             (false, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 if values.is_empty() {
                     return Ok(Next::Done(()));
@@ -157,7 +156,7 @@ impl Operation for PruneReferencesOperation {
             self.remaining |= result.child::<bool, PruneError>()??;
             return Ok(self.next_page());
         }
-        let event = rows::event(result)?;
+        let event = result.event()?;
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             let expected = "StorageEvent::IterResult";
             return Err(IoError::Unexpected {
@@ -289,7 +288,7 @@ impl Operation for PrunePageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, PruneError> {
         match self.stage {
             Stage::Rows => {
-                let (values, next) = rows::page(result)?;
+                let (values, next) = result.page()?;
                 self.rows = values.into_iter().map(|(row, _)| row).collect();
                 self.next = next;
                 let reads = (self.rows.iter())
@@ -304,13 +303,13 @@ impl Operation for PrunePageOperation {
                 self.stage = Stage::Versions;
                 Ok(Next::Call(IoCall::Read(reads)))
             }
-            Stage::Versions => self.plan_page(rows::all_values(result)?),
+            Stage::Versions => self.plan_page(result.values()?),
             Stage::Queue => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(self.delete_rows())
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.queued))
             }
         }

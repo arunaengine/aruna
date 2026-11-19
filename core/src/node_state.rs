@@ -9,7 +9,7 @@ use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::compute::quota::ComputeDepartureReport;
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
 use crate::operation::Operation;
-use crate::rows::{done, values};
+use crate::rows::values;
 use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, node_info_key};
 use crate::types::{Key, KeySpace, Value};
 use thiserror::Error;
@@ -378,7 +378,7 @@ impl Operation for SetDrainOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
         if self.writing {
-            return done(result).map(|()| Next::Done(true));
+            return result.done().map(|()| Next::Done(true));
         }
         let [flag] = values::<1>(result)?;
         if flag.is_some() == self.draining {

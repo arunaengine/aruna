@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::handle_allocation::HandleAllocationCursor;
 use aruna_core::structs::placement::record::HandleRange;
@@ -132,7 +132,7 @@ impl Operation for AllocateHandleOperation {
         let Some(allocated) = self.allocated else {
             return self.allocate(result);
         };
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(allocated))
     }
 }

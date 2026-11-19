@@ -581,7 +581,7 @@ fn raw_decoding_key(issuer_pubkey: [u8; 32]) -> Result<DecodingKey, ArunaBearerE
 
 // Whether the net handle answered that the issuer key is a checked public key.
 fn checked_key(result: IoResult) -> bool {
-    let answer = aruna_core::rows::event(result);
+    let answer = result.event();
     matches!(answer, Ok(Event::Net(NetEvent::IssuerKey(true))))
 }
 

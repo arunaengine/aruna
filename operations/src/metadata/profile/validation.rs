@@ -17,7 +17,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::profile_shapes::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     metadata_document_key, profile_validation_entry, profile_validation_key,
 };
@@ -1124,7 +1124,7 @@ impl Operation for RevalidateCommitOperation {
                 self.raw_turn(turn)
             }
             CommitStage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.status.clone()))
             }
         }

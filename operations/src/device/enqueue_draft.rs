@@ -7,7 +7,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::MetadataActor;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::metadata_actor_entry;
 use thiserror::Error;
 
@@ -104,7 +104,7 @@ impl Operation for EnqueueDraftOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<PublishEntry>, EnqueueDraftError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.input.entry.clone()));
         }
         let (rows, _) = result.page()?;

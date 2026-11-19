@@ -17,7 +17,6 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -329,7 +328,7 @@ impl Operation for LocalMembersOperation {
                 .collect();
             return Ok(Next::Call(IoCall::Read(reads)));
         }
-        let values = all_values(result)?;
+        let values = result.values()?;
         for ((set_id, _), value) in std::mem::take(&mut self.sets).into_iter().zip(values) {
             let bucket = value
                 .map(|value| BucketInfo::from_bytes(&value))
@@ -435,7 +434,7 @@ impl Operation for AssociateVersionsOperation {
             }
             return Ok(Next::Call(IoCall::Read(reads)));
         }
-        let values = all_values(result)?;
+        let values = result.values()?;
         let candidates = std::mem::take(&mut self.candidates);
         let found: Vec<_> = (candidates.into_iter().zip(values))
             .filter(|(_, value)| value.is_some())
@@ -633,7 +632,7 @@ impl Operation for RetryUnverifiedOperation {
             }
             RetryStage::Local(posting) => {
                 let reads = set_reads(&self.members, posting.version_id);
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let local = (reads.into_iter().zip(values))
                     .find(|(_, value)| value.is_some())
                     .map(|((set_id, _), _)| set_id);

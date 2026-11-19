@@ -235,7 +235,7 @@ impl Operation for ReplaceSourceOperation {
                 Ok(Next::Call(read_secret_effect(connector_id, None).into()))
             }
             Stage::Secret => {
-                let current = parse_secret_read(rows::event(result)?, connector_id)?;
+                let current = parse_secret_read(result.event()?, connector_id)?;
                 if !secret_config_changed(current.as_ref(), self.replacement_secret.as_ref()) {
                     return self.write_records();
                 }
@@ -249,7 +249,7 @@ impl Operation for ReplaceSourceOperation {
                 self.scanned(step)
             }
             Stage::Records => {
-                rows::done(result)?;
+                result.done()?;
                 let effect = match self.replacement_secret.as_ref() {
                     Some(secret) => write_secret_effect(secret, None)?,
                     None => delete_secret_effect(connector_id, None),
@@ -257,7 +257,7 @@ impl Operation for ReplaceSourceOperation {
                 self.stage = Stage::SecretWritten;
                 Ok(Next::Call(effect.into()))
             }
-            Stage::SecretWritten => self.secret_written(rows::event(result)?),
+            Stage::SecretWritten => self.secret_written(result.event()?),
         }
     }
 

@@ -55,7 +55,7 @@ impl Operation for ClaimNameOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ShareError> {
         if self.writing {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         let held = result
@@ -102,7 +102,7 @@ impl Operation for ReleaseNameOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
-        rows::done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

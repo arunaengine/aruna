@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{decode, done, encoded_row, read_row};
+use aruna_core::rows::{decode, encoded_row, read_row};
 use aruna_core::storage_entries::metadata_document_key;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
@@ -305,7 +305,7 @@ impl Operation for PidTransitionOperation {
                 self.fenced()
             }
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 if self.deletes.is_empty() {
                     return self.committed();
                 }
@@ -315,7 +315,7 @@ impl Operation for PidTransitionOperation {
                 ))))
             }
             Step::Delete => {
-                done(result)?;
+                result.done()?;
                 self.committed()
             }
         }

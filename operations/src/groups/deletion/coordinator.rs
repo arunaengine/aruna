@@ -10,7 +10,6 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::metadata::AuthToken;
 use aruna_core::onboarding::OnboardingTicket;
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group_delete::{
@@ -102,7 +101,7 @@ impl Operation for SyncDecisionOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -574,7 +573,7 @@ impl Operation for PublishDecisionOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
         match self.stage {
             PublishStage::Sync => {
-                done(result)?;
+                result.done()?;
                 self.local.ok_or_else(network_missing)?;
                 self.stage = PublishStage::Config;
                 Ok(Next::Call(config_call(self.plan.realm_id)))
@@ -660,7 +659,7 @@ impl Operation for InstallOnboardingOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupDeletionError> {
         if self.syncing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         finished(result)?;

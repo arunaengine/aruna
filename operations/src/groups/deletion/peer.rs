@@ -11,7 +11,6 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof, GroupDeletionError,
@@ -263,7 +262,7 @@ impl Operation for ApplyControlOperation {
                 let sign = Effect::Net(NetEffect::SignDeletePlan(plan));
                 Ok(Next::Call(IoCall::Effect(Box::new(sign))))
             }
-            ControlStage::Signed => match event(result)? {
+            ControlStage::Signed => match result.event()? {
                 Event::Net(NetEvent::DeletePlanSigned(signed)) => Ok(Next::Done(Some(
                     signed.map_err(GroupDeletionError::Unavailable)?,
                 ))),

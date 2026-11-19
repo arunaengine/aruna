@@ -12,7 +12,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -298,11 +298,11 @@ impl Operation for RemoveNodeOperation {
             RemoveNodeState::WriteDocumentState {
                 stale_conflict_deletes,
             } => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Delete(stale_conflict_deletes)))
             }
             RemoveNodeState::DeleteAdminConflicts => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

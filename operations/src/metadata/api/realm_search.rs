@@ -14,7 +14,6 @@ use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::metadata::{AuthToken, MetadataError, MetadataSearchHit};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
@@ -472,7 +471,7 @@ impl Operation for MetadataSearchOperation {
                 self.paged(parts)
             }
             SearchStage::Sign(unsigned) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for search cursor signing".to_string(),
                     ));

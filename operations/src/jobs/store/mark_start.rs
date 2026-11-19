@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 
 use super::mutation::{MutateJobCalls, NoGuard, forward};
 use super::*;
@@ -127,7 +127,7 @@ where
                 Ok(Next::Call(IoCall::Write(vec![row])))
             }
             StartStep::WriteLaunch => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

@@ -87,7 +87,7 @@ impl Operation for GetSourceOperation {
             let read = read_secret_effect(self.input.connector_id, None);
             return Ok(Next::Call(IoCall::Effect(Box::new(read))));
         };
-        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        let secret = parse_secret_read(result.event()?, self.input.connector_id)?;
         Ok(Next::Done(GetSourceResult {
             connector,
             has_secret_config: secret.is_some(),

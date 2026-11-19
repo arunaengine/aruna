@@ -96,7 +96,7 @@ pub(super) fn written(result: IoResult) -> Result<(), IoError> {
         {
             Ok(())
         }
-        other => rows::done(other),
+        other => other.done(),
     }
 }
 
@@ -268,7 +268,7 @@ impl Operation for NodeSecretsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeSecretError> {
-        let values = match rows::event(result)? {
+        let values = match result.event()? {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values,
             other => return Err(unexpected_iter(&other).into()),
         };

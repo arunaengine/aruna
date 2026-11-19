@@ -119,7 +119,7 @@ impl Operation for ListRepositoryOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ReadConnectorError> {
         if self.listed {
-            let values = rows::all_values(result)?;
+            let values = result.values()?;
             if values.len() != self.connectors.len() {
                 return Err(ReadConnectorError::Unexpected);
             }
@@ -131,7 +131,7 @@ impl Operation for ListRepositoryOperation {
                 .collect();
             return Ok(Next::Done(views));
         }
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         for (_, value) in values {
             let connector = RepositoryConnector::from_bytes(&value);
             self.connectors

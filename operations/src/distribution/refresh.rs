@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, NODE_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -451,7 +451,7 @@ impl RefreshRangesOperation {
                 self.walked_head()
             }
             State::WriteRound => {
-                done(result).map_err(text)?;
+                result.done().map_err(text)?;
                 self.pages += 1;
                 self.busy |= self.walk.take().is_some_and(|walk| !walk.walked.finished);
                 self.next_range()

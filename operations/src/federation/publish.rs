@@ -14,7 +14,7 @@ use aruna_core::events::Event;
 use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, encoded_row, read_row, values};
+use aruna_core::rows::{encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
@@ -215,7 +215,7 @@ impl Operation for PublishOperation {
                 self.on_read(config.as_deref(), stored.as_deref())
             }
             Some(publication) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(publication))
             }
         }

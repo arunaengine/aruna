@@ -17,7 +17,7 @@ use aruna_core::metadata::{
     MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -383,7 +383,7 @@ impl Operation for RejectEditOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         let Ok(Some(mut current)) = actor_answer(result) else {

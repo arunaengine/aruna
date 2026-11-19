@@ -12,7 +12,7 @@ use aruna_core::events::Event;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryLink;
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
@@ -354,7 +354,7 @@ impl Operation for AnnounceTopicOperation {
                 [None] => Ok(Next::Done(())),
             },
             Phase::Writing => {
-                done(result)?;
+                result.done()?;
                 self.phase = Phase::Scheduling;
                 let schedule = Box::new(schedule_drain_effect());
                 Ok(Next::Call(IoCall::Effect(schedule)))

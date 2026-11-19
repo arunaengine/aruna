@@ -206,7 +206,7 @@ impl Operation for CreateSourceOperation {
                 }
                 self.decide(existing, false)
             }
-            Stage::Write => match group_write_result(rows::event(result)?) {
+            Stage::Write => match group_write_result(result.event()?) {
                 Ok(()) => (self.source.take().map(Next::Done)).ok_or(CreateSourceError::Failed),
                 Err(GroupWriteError::Taken) => {
                     self.stage = Stage::Reread;

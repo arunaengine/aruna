@@ -7,7 +7,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows;
 use aruna_core::structs::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
 };
@@ -86,7 +85,7 @@ impl Operation for GetCentralOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<CentralRead>, CentralStoreError> {
-        let values = rows::all_values(result)?;
+        let values = result.values()?;
         let central = decode_central(values[0].as_ref())?;
         let usage = decode_usage(values[1].as_ref())?;
         Ok(Next::Done((central, usage)))
@@ -123,7 +122,7 @@ impl Operation for SetCentralOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, CentralStoreError> {
         if self.written {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         if decode_central(result.value()?.as_ref())? != self.expected {
@@ -174,7 +173,7 @@ impl Operation for ChargeUsageOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantUsage>, CentralStoreError> {
         if let Some(charged) = self.charged.take() {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(charged));
         }
         let usage = decode_usage(result.value()?.as_ref())?;

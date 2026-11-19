@@ -25,7 +25,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
     event_log_key, graph_lifecycle_key, materialization_job_entry, materialization_status_key,
@@ -89,7 +89,7 @@ impl Operation for StoreSkewOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -982,7 +982,7 @@ impl ProjectEventsOperation {
             ));
         };
         match expected {
-            Answer::Done => Ok(done(result)?),
+            Answer::Done => Ok(result.done()?),
             Answer::Child => Ok(result.child::<(), MetadataProjectionError>()??),
             Answer::Ignored => {
                 let _ = result.event();
@@ -1109,10 +1109,10 @@ impl Operation for ProjectionCommitOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
         if self.writes.is_empty() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let read: Vec<Option<Value>> = aruna_core::rows::all_values(result)?;
+        let read: Vec<Option<Value>> = result.values()?;
         let lifecycle_reads = self.graph_iris.len();
         if read.len() != lifecycle_reads + self.fence.reads().len() {
             return Err(MetadataProjectionError::UnexpectedEvent(
@@ -1186,7 +1186,7 @@ impl ProjectLoggedOperation {
     }
 
     fn events_read(&mut self, result: IoResult) -> LoggedTurn {
-        let read = aruna_core::rows::all_values(result)?;
+        let read = result.values()?;
         let mut events = Vec::new();
         let mut orphans = Vec::new();
         for ((document_id, event_id), value) in self.targets.iter().copied().zip(read) {
@@ -1248,7 +1248,7 @@ impl Operation for ProjectLoggedOperation {
         match self.stage {
             LoggedStage::Events => self.events_read(result),
             LoggedStage::Orphans => {
-                done(result)?;
+                result.done()?;
                 let project = self.project.take().ok_or_else(|| {
                     MetadataProjectionError::UnexpectedEvent("the projection is missing".into())
                 })?;
@@ -1344,7 +1344,7 @@ impl Operation for DrainProjectionOperation {
                 Ok(Next::Call(IoCall::Delete(malformed)))
             }
             DrainStage::Malformed(targets) => {
-                done(result)?;
+                result.done()?;
                 self.project(targets)
             }
             DrainStage::Project => {

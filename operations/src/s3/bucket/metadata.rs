@@ -10,7 +10,6 @@ use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
@@ -164,7 +163,7 @@ impl Operation for PutMetadataOperation {
         if let IoResult::Done = result {
             return Ok(Next::Done(()));
         }
-        Ok(Next::Call(self.write(all_values(result)?)?))
+        Ok(Next::Call(self.write(result.values()?)?))
     }
 
     fn transaction(&self) -> TransactionMode {

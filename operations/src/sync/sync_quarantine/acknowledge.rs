@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::{SyncQuarantineRecord, quarantine_row_entry, quarantine_usage_entry};
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -90,7 +90,7 @@ impl Operation for AcknowledgeQuarantineOperation {
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             Phase::Writing(record) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(Some(record)))
             }
         }

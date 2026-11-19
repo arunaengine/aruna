@@ -14,7 +14,6 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::metadata::{AuthToken, ProfileValidationStatus};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -123,7 +122,7 @@ impl Operation for DatasetSummaryOperation {
     // The summary is read from the dataset's holders with the caller's own access.
     fn next(&mut self, result: IoResult) -> Result<Next<DatasetDescription>, DescriptionError> {
         if let Some(request) = self.request.take() {
-            let Ok(Event::Net(NetEvent::LocalNode(local_node))) = event(result) else {
+            let Ok(Event::Net(NetEvent::LocalNode(local_node))) = result.event() else {
                 return Err(DescriptionError::Unavailable);
             };
             let export = summary_export(local_node, request);

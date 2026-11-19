@@ -11,7 +11,7 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters,
@@ -468,7 +468,7 @@ impl Operation for PublishUsageOperation {
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             PublishStep::Write => {
-                done(result).map_err(|error| failed(format!("snapshot write failed: {error}")))?;
+                result.done().map_err(|error| failed(format!("snapshot write failed: {error}")))?;
                 self.replicate()
             }
             PublishStep::Replicate => match result.child::<(), ReplicateDocumentsError>()? {
@@ -568,7 +568,7 @@ impl Operation for RetrySignalOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if !self.scheduling {
-            done(result)?;
+            result.done()?;
             return self.schedule();
         }
         match result.event()? {
@@ -619,7 +619,7 @@ impl Operation for ClearMarkersOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.deleting {
-            return done(result).map(Next::Done);
+            return result.done().map(Next::Done);
         }
         let current = result.values()?;
         let deletes: Vec<_> = (self.observed.iter().zip(current))

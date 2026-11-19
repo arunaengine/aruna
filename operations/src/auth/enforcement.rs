@@ -14,7 +14,6 @@ use aruna_core::request_policy::{
     CompiledPolicySet, CompiledSets, PolicyCompileError, PolicyDecision, PolicyRequest,
     RequestPolicy,
 };
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
@@ -152,7 +151,7 @@ type CompiledSet = Result<Arc<CompiledPolicySet>, PolicyCompileError>;
 
 /// The compiled sets of a compile answer, in the order the call named them.
 fn compiled_sets(result: IoResult) -> Result<Vec<CompiledSet>, PolicyEnforcementError> {
-    match aruna_core::rows::event(result)? {
+    match result.event()? {
         Event::Storage(StorageEvent::PoliciesCompiled(CompiledSets(sets))) => Ok(sets),
         other => Err(PolicyEnforcementError::Unavailable(format!(
             "expected the compiled policies, got {}",
@@ -241,7 +240,7 @@ impl Operation for EnforcePolicyOperation {
             let evaluator = compiled_policies(result)?;
             return evaluator.evaluate(&self.request).map(Next::Done);
         }
-        let sets = read_policies(self.realm_id, self.group_id, all_values(result)?)?;
+        let sets = read_policies(self.realm_id, self.group_id, result.values()?)?;
         self.compiling = true;
         Ok(Next::Call(sets.compile()))
     }
@@ -338,7 +337,7 @@ impl Operation for PolicyBulkOperation {
         if self.plan()?.scopes.is_empty() {
             return Ok(Next::Done(HashMap::new()));
         }
-        let sets = self.policy_sets(all_values(result)?)?;
+        let sets = self.policy_sets(result.values()?)?;
         self.compiling = true;
         Ok(Next::Call(sets.compile()))
     }

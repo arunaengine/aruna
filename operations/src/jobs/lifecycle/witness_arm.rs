@@ -10,7 +10,7 @@ use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
@@ -273,14 +273,14 @@ impl Operation for ArmFamilyOperation {
                 self.replace(existing)
             }
             ArmState::Write => {
-                done(result)?;
+                result.done()?;
                 self.state = ArmState::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             ArmState::Delete => {
-                done(result)?;
+                result.done()?;
                 let due_at_ms = self.deadline.map_or(self.now_ms, |next| next.due_at_ms);
                 let after = Duration::from_millis(due_at_ms.saturating_sub(self.now_ms));
                 let drain = IoCall::Effect(Box::new(schedule_witness_drain(after)));
@@ -409,14 +409,14 @@ impl Operation for ChangeDeadlineOperation {
                 self.apply(current)
             }
             ChangeState::Write => {
-                done(result)?;
+                result.done()?;
                 self.state = ChangeState::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             ChangeState::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(true))
             }
         }

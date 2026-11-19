@@ -10,7 +10,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use byteview::ByteView;
@@ -322,7 +322,7 @@ impl Operation for ClaimStateOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         let [stored] = values::<1>(result)?;

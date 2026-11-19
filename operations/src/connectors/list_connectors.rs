@@ -6,7 +6,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
@@ -81,7 +80,7 @@ impl Operation for ListSourceOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ListSourceError> {
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         for (_, value) in values {
             self.connectors.push(SourceConnector::from_bytes(&value)?);
         }

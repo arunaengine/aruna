@@ -15,7 +15,6 @@ use aruna_core::operation::Operation;
 use aruna_core::repository::remote::{
     NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, StopReason,
 };
-use aruna_core::rows::{event, page};
 use aruna_core::structs::execution::harvest::{
     HarvestCursor, HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSource,
     IncomingRecord, ProvenanceDecision, RepositoryConnector, RepositoryConnectorKind,
@@ -469,7 +468,7 @@ impl Operation for HarvestJobOperation {
     fn next(&mut self, result: IoResult) -> Turn<HarvestCounts> {
         match std::mem::replace(&mut self.step, HarvestStep::Gate) {
             HarvestStep::Source => {
-                let source = parse_source_read(event(result)?)
+                let source = parse_source_read(result.event()?)
                     .map_err(read_failure)?
                     .ok_or_else(|| permanent("harvest source not found"))?;
                 let call = read_connector_effect(source.group_id, source.connector_id, None);
@@ -478,7 +477,7 @@ impl Operation for HarvestJobOperation {
                 Ok(Next::Call(call.into()))
             }
             HarvestStep::Connector => {
-                let connector = parse_connector_read(event(result)?)
+                let connector = parse_connector_read(result.event()?)
                     .map_err(read_failure)?
                     .ok_or_else(|| permanent("repository connector not found"))?;
                 self.connector(connector)
@@ -499,7 +498,7 @@ impl Operation for HarvestJobOperation {
                 self.save_source(&source, AfterSave::Listing)
             }
             HarvestStep::Save(then) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 self.after_save(then)
             }
             HarvestStep::Gate => {
@@ -807,12 +806,12 @@ impl ApplyRecordOperation {
 }
 
 fn stored_record(result: IoResult) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    parse_registry_read(event(result)?)
+    parse_registry_read(result.event()?)
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
 
 fn confirm_absent(result: IoResult, document_id: Ulid) -> Result<(), HarvestFailure> {
-    let (rows, _) = page(result)
+    let (rows, _) = result.page()
         .map_err(|error| retryable(format!("harvest pending projection scan: {error}")))?;
     if rows.is_empty() {
         return Ok(());
@@ -859,7 +858,7 @@ impl Operation for ApplyRecordOperation {
     fn next(&mut self, result: IoResult) -> ApplyTurn {
         match std::mem::replace(&mut self.step, ApplyStep::Provenance) {
             ApplyStep::Provenance => {
-                let existing = parse_provenance_read(event(result)?).map_err(read_failure)?;
+                let existing = parse_provenance_read(result.event()?).map_err(read_failure)?;
                 self.decide(existing)
             }
             // A pending row before the create leaves a retry the same id, so a replay converges
@@ -881,7 +880,7 @@ impl Operation for ApplyRecordOperation {
                 self.write_row(ApplyStep::MintPending(document_id))
             }
             ApplyStep::MintPending(document_id) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 self.create_access(document_id)
             }
             ApplyStep::CreateAccess(document_id) => {
@@ -984,7 +983,7 @@ impl Operation for ApplyRecordOperation {
                 self.write_row(ApplyStep::Final(RecordApplied::Tombstoned))
             }
             ApplyStep::Final(applied) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 Ok(Next::Done(applied))
             }
         }

@@ -15,7 +15,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::storage_entries::{reducer_state_entry, subject_index_writes, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -309,7 +309,7 @@ impl Operation for ResolveOidcOperation {
                 self.fence_or_finish()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 self.fence_or_finish()
             }
             Stage::Fence => {

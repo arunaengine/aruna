@@ -21,7 +21,7 @@ use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use aruna_core::rows::{PrefixPages, done, read_row};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -1181,7 +1181,7 @@ impl Operation for FenceAttemptOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let current = stored_generation(result.value()?.as_ref());

@@ -516,13 +516,13 @@ impl Operation for OwnerSecretOperation {
                     self.reader.start(None),
                 ))))
             }
-            Stage::Reading => match self.reader.step(rows::event(result)?, None)? {
+            Stage::Reading => match self.reader.step(result.event()?, None)? {
                 Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
                 None => self.read_managers(),
             },
             Stage::Managers => self.write(result.value()?.as_deref()),
             Stage::Write => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Then {
                     output: self.result.take().flatten(),
                     calls: drains(self.notices),
@@ -638,7 +638,7 @@ impl Operation for OwnerSecretsOperation {
             self.view = Some(WriterView::read(result.value()?.as_deref())?);
             return Ok(self.page(self.after.clone()));
         }
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         for (_, value) in values {
             self.documents.push(SecretDocument::from_bytes(&value)?);
         }
@@ -722,10 +722,10 @@ impl Operation for ReadbackOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         if let Some(entry) = self.entry.take() {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(entry));
         }
-        match self.reader.step(rows::event(result)?, None)? {
+        match self.reader.step(result.event()?, None)? {
             Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
             None => self.audit(),
         }

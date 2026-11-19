@@ -9,7 +9,6 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{metadata_document_key, parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
@@ -270,7 +269,7 @@ impl Operation for TimestampSweepOperation {
             }
             SweepState::Records => self.read_records(result.values()?),
             SweepState::Delete => {
-                done(result)?;
+                result.done()?;
                 self.deleted_batch()
             }
         }

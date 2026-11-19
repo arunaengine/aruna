@@ -527,7 +527,7 @@ impl Operation for ApplyBatchOperation {
                 self.follow_up(follow, *item)
             }
             Wait::Synced(parked, item) => {
-                crate::rows::done(result)?;
+                result.done()?;
                 self.after_sync(parked, *item)
             }
             Wait::Parked(item) => {
@@ -552,7 +552,7 @@ impl Operation for ApplyBatchOperation {
                 self.retry_sync(follow.retry_parked, *item)
             }
             Wait::RetrySynced(parked, item) => {
-                crate::rows::done(result)?;
+                result.done()?;
                 self.retry_sync(parked, *item)
             }
             Wait::RetryParked(item) => {

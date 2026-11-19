@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::RUN_PUBLISH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobRecord, JobResultPayload, LocalCrate, OutputObject,
     RunCrateStatus, run_crate_key,
@@ -390,12 +390,12 @@ impl Operation for PublishRunOperation {
             }
             PublishStep::Bucket => self.bucket_checked(result),
             PublishStep::Freeze => {
-                done(result)?;
+                result.done()?;
                 self.next_pull()
             }
             PublishStep::Pull => self.pulled(result.child::<SyncPullAck, SyncRefusal>()?),
             PublishStep::StoreCopies => {
-                done(result)?;
+                result.done()?;
                 self.write_crate()
             }
             PublishStep::Crate => {

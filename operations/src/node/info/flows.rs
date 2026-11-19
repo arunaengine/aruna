@@ -20,7 +20,7 @@ use aruna_core::node_state::{
     ReadInfoOperation, SetDrainOperation,
 };
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{done, encoded_row};
+use aruna_core::rows::encoded_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
@@ -586,7 +586,7 @@ impl Operation for DepartureStateOperation {
                 Ok(Next::Call(IoCall::Write(vec![row])))
             }
             DepartureStep::Report => {
-                done(result)?;
+                result.done()?;
                 self.revise()
             }
             DepartureStep::Revise => {

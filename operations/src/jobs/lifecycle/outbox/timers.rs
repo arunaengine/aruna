@@ -8,7 +8,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::page;
 use aruna_core::types::Key;
 
 use super::{OUTBOX_RETRY_AFTER, schedule_outbox_drain};
@@ -42,7 +41,7 @@ impl Operation for LifecycleTimersOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Effect>>, IoError> {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         Ok(Next::Done(lifecycle_timers(!rows.is_empty())))
     }
 }

@@ -9,7 +9,6 @@ use aruna_core::events::{Event, NetEvent, PeerAuthRefusal};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
@@ -205,7 +204,7 @@ impl Operation for WritePeerOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match std::mem::replace(&mut self.stage, PeerStage::Realm) {
             PeerStage::Realm => {
-                let Event::Net(NetEvent::LocalRealm(local_realm)) = event(result)? else {
+                let Event::Net(NetEvent::LocalRealm(local_realm)) = result.event()? else {
                     return Err(unavailable(MetadataError::InvalidEffect));
                 };
                 self.local_realm = local_realm;
@@ -238,7 +237,7 @@ impl Operation for WritePeerOperation {
             }
             // The caller is accepted; a missed contact refresh only dates the peer's liveness.
             PeerStage::Contact(auth) => {
-                let _ = event(result);
+                let _ = result.event();
                 Ok(Next::Done(auth))
             }
         }

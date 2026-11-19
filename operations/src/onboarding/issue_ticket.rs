@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use ed25519_dalek::SigningKey;
@@ -167,7 +167,7 @@ impl Operation for IssueSyncOperation {
         if !self.deleted.done() {
             return self.take_deletions(result).map(Next::Call);
         }
-        done(result)?;
+        result.done()?;
         self.issue().map(Next::Done)
     }
 }

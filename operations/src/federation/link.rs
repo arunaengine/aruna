@@ -423,7 +423,6 @@ mod tests {
     };
     use aruna_core::handoff::secret_nonce;
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::rows::done;
     use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
@@ -749,7 +748,7 @@ mod tests {
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateUserError> {
-            done(result)?;
+            result.done()?;
             Ok(Next::Done(()))
         }
     }

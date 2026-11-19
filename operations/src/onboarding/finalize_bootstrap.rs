@@ -14,7 +14,6 @@ use aruna_core::onboarding::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::placement::{holds_placement, target_placement_ref};
-use aruna_core::rows::event;
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
@@ -138,7 +137,7 @@ enum FinalizeStage {
 type FinalizeTurn = Result<Next<BootstrapFinalizeOutput>, BootstrapFinalizeError>;
 
 fn topic_peers_done(result: IoResult) -> Result<(), BootstrapFinalizeError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(NetEvent::TopicPeers(Ok(()))) => Ok(()),
         Event::Net(NetEvent::TopicPeers(Err(TopicPeerError::NoNetwork))) => {
             Err(BootstrapFinalizeError::NetHandleUnavailable)

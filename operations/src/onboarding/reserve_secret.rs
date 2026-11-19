@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Value;
 use byteview::ByteView;
@@ -304,7 +304,7 @@ impl Operation for ReserveSecretOperation {
             }
             Stage::Count { .. } => self.handle_page(result),
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 self.record
                     .take()
                     .map(Next::Done)

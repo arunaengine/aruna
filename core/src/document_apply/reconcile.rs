@@ -27,7 +27,7 @@ use crate::events::{Event, NetEvent};
 use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::{HoldScope, Operation, TransactionMode};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use crate::rows::{done, event, read_row};
+use crate::rows::read_row;
 use crate::structs::SyncRejection;
 use crate::structs::identity::realm::RealmId;
 use crate::types::{Key, Value};
@@ -346,7 +346,7 @@ pub(super) fn net_answer(
     result: IoResult,
     expected: &'static str,
 ) -> Result<DocumentNetEvent, ApplyError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
             Err(ApplyError::Failed(error))
         }
@@ -421,11 +421,11 @@ impl Operation for ReconcileTopicsOperation {
                 )
             }
             Stage::RecordingOverflow(cursor, outcome) => {
-                done(result)?;
+                result.done()?;
                 self.settle(cursor, *outcome)
             }
             Stage::WritingCursor(topic, satisfied) => {
-                done(result)?;
+                result.done()?;
                 self.topic_done(topic, satisfied)
             }
             Stage::WritingEvidence(topic, satisfied) => {
@@ -436,7 +436,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.topic_done(topic, satisfied)
             }
             Stage::SavingDeferred => {
-                done(result)?;
+                result.done()?;
                 self.apply_creates()
             }
             Stage::ApplyingCreates => {
@@ -444,7 +444,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.on_creates(outcome)
             }
             Stage::SavingUpdated => {
-                done(result)?;
+                result.done()?;
                 self.retry_parked()
             }
             Stage::RetryingParked => {

@@ -17,7 +17,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::graph_prune_entry;
 use aruna_core::structs::storage::data::link::document_key;
 use aruna_core::types::{Key, KeySpace};
@@ -286,7 +286,7 @@ impl Operation for DeletedIndexOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataError> {
         match self.stage {
             IndexStage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.delete_next()
             }
             _ => self.page_read(result),
@@ -330,7 +330,7 @@ impl Operation for EnqueuePruneOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataGraphError> {
         if !self.written {
-            done(result)?;
+            result.done()?;
             self.written = true;
             return Ok(Next::Call(IoCall::Effect(Box::new(schedule_prune_drain()))));
         }
@@ -660,7 +660,7 @@ impl Operation for PruneBatchOperation {
                 self.next_group()
             }
             BatchStage::Finish => {
-                done(result)?;
+                result.done()?;
                 Ok(self.result())
             }
         }

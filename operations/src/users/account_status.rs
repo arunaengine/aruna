@@ -11,7 +11,6 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::done;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
@@ -335,7 +334,7 @@ impl Operation for AccountStatusOperation {
             IoResult::Values(values) if self.administrator.is_none() => self.authorize(values),
             IoResult::Event(event) => self.answered(*event),
             result => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

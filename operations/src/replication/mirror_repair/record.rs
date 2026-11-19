@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -174,7 +173,7 @@ impl Operation for MirrorRecordOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
         if self.changing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let value = one_value(result)?;

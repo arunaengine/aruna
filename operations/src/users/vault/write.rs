@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultSignEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, event, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultAppended, VaultChange,
@@ -485,7 +485,7 @@ impl Operation for AppendVaultOperation {
                 self.read_rows(planned)
             }
             Stage::Rows(planned) => self.take_rows(planned, result),
-            Stage::Sign(unsigned) => match event(result)? {
+            Stage::Sign(unsigned) => match result.event()? {
                 Event::Net(NetEvent::VaultSign(VaultSignEvent::Signed(signed))) => {
                     self.write_signed(*unsigned, *signed)
                 }
@@ -499,12 +499,12 @@ impl Operation for AppendVaultOperation {
                 }),
             },
             Stage::Delete(writes) => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Write;
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let output = self.output.take().ok_or(AppendVaultError::NotFinished)?;
                 Ok(Next::Then {
                     output,

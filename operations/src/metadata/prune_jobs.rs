@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PRUNE_JOB_KEYSPACE;
 use aruna_core::metadata::GraphPruneRecord;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{graph_prune_entry, graph_prune_key};
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -157,14 +157,14 @@ impl Operation for DuePruneOperation {
         match self.step {
             Step::Scan => self.scanned(result),
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = Step::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Step::Delete => {
-                done(result)?;
+                result.done()?;
                 let unfinished = IoError::Unfinished;
                 Ok(Next::Done(self.due.take().ok_or(unfinished)?))
             }
@@ -222,7 +222,7 @@ impl Operation for RescheduleOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         if self.written {
             return Ok(Next::Done(()));
         }

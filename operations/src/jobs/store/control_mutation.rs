@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 
 use super::mutation::{read_record, record_read};
 use super::*;
@@ -167,14 +167,14 @@ where
                 self.change(value)
             }
             ControlStep::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = ControlStep::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             ControlStep::Delete => {
-                done(result)?;
+                result.done()?;
                 self.changed
                     .take()
                     .map(Next::Done)

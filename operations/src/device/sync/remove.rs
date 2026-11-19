@@ -9,7 +9,6 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
 
 use super::actions::ActionError;
@@ -105,7 +104,7 @@ impl Operation for RemoveEntryOperation {
         match self.step {
             RemoveStep::MoveFile => Ok(Next::Call(self.moved(result.event()?)?)),
             RemoveStep::WriteRows if !self.refused => {
-                done(result)?;
+                result.done()?;
                 self.step = RemoveStep::DeleteBase;
                 let key = base_key(self.folder.folder_id, &self.relative);
                 Ok(Next::Call(IoCall::Delete(vec![(
@@ -114,7 +113,7 @@ impl Operation for RemoveEntryOperation {
                 )])))
             }
             RemoveStep::WriteRows | RemoveStep::DeleteBase => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.record.clone()))
             }
         }

@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DEVICE_REPLICA_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::rows::{outside_answer, outside_call};
 use tracing::warn;
 use ulid::Ulid;
@@ -168,7 +168,7 @@ impl Operation for StoreBudgetOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

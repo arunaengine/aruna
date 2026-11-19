@@ -16,7 +16,7 @@ use aruna_core::effects::Effect;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::sync_relationship_prefix;
@@ -271,12 +271,12 @@ impl Operation for PageImportOperation {
                 self.write_rows(versions)
             }
             PageStep::WriteRows => {
-                done(result)?;
+                result.done()?;
                 let deletes = self.input.deletes.clone();
                 self.call(PageStep::DeleteRows, IoCall::Delete(deletes))
             }
             PageStep::DeleteRows => {
-                done(result)?;
+                result.done()?;
                 self.update_usage()
             }
             PageStep::Usage => self.step_usage(result),

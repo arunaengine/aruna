@@ -9,7 +9,7 @@ use aruna_core::effects::{HolderList, MAX_FETCH_HOLDERS, PolicyFetchEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent};
 use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
-use aruna_core::rows::{event, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -382,7 +382,7 @@ impl Operation for ReadPolicyOperation {
                     None => self.plan_fetch(),
                 }
             }
-            ReadPolicyState::Fetch { asked } => match event(result)? {
+            ReadPolicyState::Fetch { asked } => match result.event()? {
                 Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
                     PolicyFetchEvent::Fetched {
                         publisher,

@@ -25,7 +25,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{page, values};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
@@ -191,7 +191,7 @@ impl ReportDetailsOperation {
     }
 
     fn siblings(&mut self, result: IoResult) -> DetailNext {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let digests: BTreeSet<[u8; 32]> = rows
             .iter()
             .filter_map(|(key, _)| key.get(32..64)?.try_into().ok())
@@ -220,7 +220,7 @@ impl ReportDetailsOperation {
     }
 
     fn stored_plan(&mut self, result: IoResult) -> DetailNext {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let explain = rows
             .iter()
             .find_map(|(_, value)| from_bytes::<WitnessExplain>(value).ok());

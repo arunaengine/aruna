@@ -10,7 +10,6 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
@@ -113,7 +112,7 @@ impl Operation for CommitRowsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ReconcileError> {
-        done(result)?;
+        result.done()?;
         Ok(match self.deletes.take() {
             Some(deletes) => Next::Call(IoCall::Delete(deletes)),
             None => Next::Done(()),

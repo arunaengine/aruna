@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
@@ -98,7 +98,7 @@ impl Operation for ClaimFillOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Claimed>, KeepError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(Claimed::Claimed));
         }
         let [value] = values::<1>(result)?;
@@ -378,11 +378,11 @@ impl Operation for PublishKeptOperation {
                 self.handle_order(rows, next)
             }
             PublishStep::Delete(writes) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             PublishStep::Write => {
-                done(result)?;
+                result.done()?;
                 let output = self.output.take().ok_or(KeepError::NotFinished)?;
                 Ok(Next::Done(output))
             }

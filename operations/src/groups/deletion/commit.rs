@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{
     conflict_write_entries, group_deletion_entries, reducer_state_key, stale_conflict_deletes,
 };
@@ -114,7 +114,7 @@ impl Operation for CommitOperation {
                 Ok(Next::Call(IoCall::Sync))
             }
             Step::Persist => {
-                done(result)?;
+                result.done()?;
                 if !self.scheduled {
                     return self.finish();
                 }
@@ -479,13 +479,13 @@ impl Operation for CommitWrite {
                 self.authorized(values)
             }
             (Stage::Write, result) => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Backends;
                 Ok(Next::Call(self.backends.call()))
             }
             (Stage::Backends, result) => self.drop_backends(result),
             (Stage::Delete, result) => {
-                done(result)?;
+                result.done()?;
                 if self.fence.is_empty() {
                     return self.finish();
                 }

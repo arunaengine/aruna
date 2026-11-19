@@ -17,7 +17,6 @@ use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
-use crate::rows::event;
 use crate::structs::execution::job::SubmissionId;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
 use crate::structs::placement::policy::document::PlacementPolicyDocument;
@@ -1294,7 +1293,7 @@ pub fn peer_reply(
     peer: NodeId,
     result: IoResult,
 ) -> Result<Result<MetadataTransportMessage, PeerRequestError>, IoError> {
-    let Event::Net(NetEvent::MetadataAnswer(answer)) = event(result)? else {
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = result.event()? else {
         return Err(IoError::Unexpected {
             expected: "a peer answer",
             got: "another event",

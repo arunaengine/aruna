@@ -13,7 +13,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -279,14 +279,14 @@ impl Operation for InstallEntryOperation {
                 Ok(Next::Call(self.write(document, state)?))
             }
             Phase::Write { stale } => {
-                done(result)?;
+                result.done()?;
                 match stale.is_empty() {
                     true => Ok(self.finish()),
                     false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
             }
             Phase::DeleteConflicts => {
-                done(result)?;
+                result.done()?;
                 Ok(self.finish())
             }
         }

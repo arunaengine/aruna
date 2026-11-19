@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
@@ -102,7 +102,7 @@ impl Operation for WriteAuditOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let [bucket, creation] = values::<2>(result)?;

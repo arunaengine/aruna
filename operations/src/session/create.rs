@@ -12,7 +12,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
@@ -362,11 +362,11 @@ impl Operation for CreateSessionOperation {
                 self.handle_sessions(values)
             }
             Stage::DeleteStale => {
-                done(result)?;
+                result.done()?;
                 self.write_session()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let session = self
                     .session
                     .clone()

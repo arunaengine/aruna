@@ -9,7 +9,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::SyncState;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 
@@ -264,7 +263,7 @@ impl Operation for RestoreTimerOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
         if self.arming {
-            return match event(result)? {
+            return match result.event()? {
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     Err(SyncMirrorError::Mirror(message))
                 }

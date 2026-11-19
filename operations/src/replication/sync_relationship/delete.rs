@@ -4,7 +4,6 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 
 use super::{SyncRelationshipDirection, SyncRelationshipError, delete_call};
@@ -34,7 +33,7 @@ impl Operation for DeleteRelationshipOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncRelationshipError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

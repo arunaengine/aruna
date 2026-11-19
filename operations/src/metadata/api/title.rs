@@ -6,7 +6,6 @@ use aruna_core::calls::{IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
 use super::MetadataApiError;
@@ -46,7 +45,7 @@ impl Operation for DocumentTitleOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, MetadataApiError> {
-        Ok(Next::Done(match event(result)? {
+        Ok(Next::Done(match result.event()? {
             Event::Metadata(MetadataEvent::DocumentTitle { title }) => title,
             Event::Metadata(MetadataEvent::Error {
                 error: MetadataError::HandleMissing,

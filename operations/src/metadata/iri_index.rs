@@ -20,7 +20,6 @@ use aruna_core::metadata::{
     MetadataError, MetadataEvent,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{all_values, event};
 use aruna_core::storage_entries::{
     iri_object_prefix, iri_reference_entry, iri_reference_prefix, materialization_status_key,
 };
@@ -500,7 +499,7 @@ impl Operation for ProjectRowsOperation {
         let (document_id, cursor, graph_iri) = self.document.clone();
         match std::mem::replace(&mut self.stage, ProjectStage::References) {
             ProjectStage::References => {
-                let references = match event(result)? {
+                let references = match result.event()? {
                     Event::Metadata(MetadataEvent::IriReferences { references }) => references,
                     Event::Metadata(MetadataEvent::Error { error, .. }) => {
                         return Err(MetadataIriError::UnexpectedEvent(error.to_string()));
@@ -706,7 +705,7 @@ impl Operation for RebuildIrisOperation {
                 Ok(Next::Call(IoCall::Read(reads)))
             }
             Some(RebuildStage::Statuses(live)) => {
-                let values = all_values(result).map_err(|error| backend(&error))?;
+                let values = result.values().map_err(|error| backend(&error))?;
                 for (record, value) in live.into_iter().zip(values) {
                     let status = value.and_then(|bytes| {
                         postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok()

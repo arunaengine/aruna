@@ -10,7 +10,6 @@ use aruna_core::metadata::{
     MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use byteview::ByteView;
 use thiserror::Error;
 use tracing::warn;
@@ -108,7 +107,7 @@ impl Operation for InstallGraphOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, InstallError> {
         if self.installed {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         match result.event()? {

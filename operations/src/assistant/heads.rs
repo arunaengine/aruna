@@ -10,7 +10,6 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows;
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
 
 /// Lists one user's live chat heads, newest change first.
@@ -34,7 +33,7 @@ impl Operation for ListChatOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
-        let (rows, _) = rows::page(result)?;
+        let (rows, _) = result.page()?;
         let mut heads = decode_heads(rows)?;
         heads.retain(AssistantChatHead::is_live);
         heads.sort_by_key(|head| std::cmp::Reverse(head.updated_at));
@@ -157,7 +156,7 @@ impl Operation for WriteChatOperation {
                 }
             },
             WriteHeadStage::Count => {
-                let (rows, _) = rows::page(result)?;
+                let (rows, _) = result.page()?;
                 let live = decode_heads(rows)?
                     .iter()
                     .filter(|head| head.is_live())
@@ -165,7 +164,7 @@ impl Operation for WriteChatOperation {
                 self.create(live)
             }
             WriteHeadStage::Written(head) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(head))
             }
         }
@@ -240,7 +239,7 @@ impl Operation for DeleteChatOperation {
                 _ => Ok(Next::Done(())),
             },
             DeleteChatStage::Turns(head) => {
-                let (rows, _) = rows::page(result)?;
+                let (rows, _) = result.page()?;
                 if rows.is_empty() {
                     return self.tombstone(head);
                 }
@@ -252,11 +251,11 @@ impl Operation for DeleteChatOperation {
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             DeleteChatStage::Deleted(head) => {
-                rows::done(result)?;
+                result.done()?;
                 self.tombstone(head)
             }
             DeleteChatStage::Written => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
