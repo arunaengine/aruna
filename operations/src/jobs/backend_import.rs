@@ -43,7 +43,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::page_intents::PathIntents;
-use crate::placement::policy::{GateContext, PolicyGateError};
+use crate::placement::policy::gate::{GateContext, PolicyGateError};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::imports::shared::{self, SharedRule, claim_file};
 use crate::s3::object::put::{

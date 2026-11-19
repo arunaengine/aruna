@@ -51,7 +51,8 @@ use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
-use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::subject::SubjectScanMode;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };

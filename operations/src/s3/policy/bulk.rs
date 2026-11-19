@@ -834,8 +834,8 @@ mod tests {
         BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
         PolicyBulkOperation,
     };
-    use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
+    use crate::placement::policy::gate::GateOperation;
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket::placement::{PutPlacementInput, PutPlacementOperation};

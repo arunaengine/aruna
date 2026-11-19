@@ -8,10 +8,10 @@ use crate::distribution::inventory::{
     InventoryChange, InventoryError, InventoryUpdate, outside_answer,
 };
 use crate::groups::backends::{BackendFenceError, backend_key};
-use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::{
+use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::object::put::abe::{abe_reads, keyed, parse_abe};
 use crate::s3::object::put::{owner_call, path_owned, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};

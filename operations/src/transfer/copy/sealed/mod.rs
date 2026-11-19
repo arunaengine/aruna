@@ -8,11 +8,11 @@ use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, outside_answer, stamp_head, stamp_version,
     version_written,
 };
-use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::{
+use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_published, publication_rows};

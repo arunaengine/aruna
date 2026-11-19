@@ -45,7 +45,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
-use aruna_operations::placement::policy::PolicyCacheEntry;
+use aruna_operations::placement::policy::cache::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1008,7 +1008,7 @@ mod tests {
     };
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
-    use aruna_operations::placement::policy::PolicyCacheEntry;
+    use aruna_operations::placement::policy::cache::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,

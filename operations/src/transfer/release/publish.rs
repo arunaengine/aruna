@@ -47,7 +47,7 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,

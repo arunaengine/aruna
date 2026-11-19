@@ -15,10 +15,11 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 
 use super::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
-use crate::placement::policy::{
-    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
-    ReadPolicyError, gate_decision, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome, gate_decision,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::replication_protocol::BaoReadRequest;
 

@@ -34,7 +34,7 @@ use aruna_operations::groups::routing::BucketRules;
 use aruna_operations::groups::routing::SnapshotOperation;
 use aruna_operations::metadata::api::object_search::search_objects;
 use aruna_operations::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
-use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::placement::policy::gate::GateOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::head::HeadObjectInput;
 use aruna_operations::s3::object::head::HeadObjectOperation;

@@ -6,7 +6,7 @@ pub mod sealed;
 
 use crate::distribution::held::record_only;
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{

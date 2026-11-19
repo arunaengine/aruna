@@ -38,7 +38,7 @@ use crate::distribution::resolve::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};

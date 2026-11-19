@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
-use crate::placement::policy::PolicyGateError;
+use crate::placement::policy::gate::PolicyGateError;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite};

@@ -44,9 +44,10 @@ use ulid::Ulid;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
-use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::s3::object::get::reference_archive;

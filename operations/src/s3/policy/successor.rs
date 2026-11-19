@@ -8,7 +8,7 @@ use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::placement::policy::{PolicyGateError, split_drift_reads};
+use crate::placement::policy::gate::{PolicyGateError, split_drift_reads};
 use crate::s3::object::put::abe::keyed;
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{

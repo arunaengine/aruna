@@ -48,7 +48,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation};
 use crate::jobs::store::job_calls::reserve_output_commits;
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::replication::managed_read::LocalUserOperation;
 use crate::replication::source_rules::SourceAuthOperation;

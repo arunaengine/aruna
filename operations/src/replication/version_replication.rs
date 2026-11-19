@@ -9,9 +9,10 @@ use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
-use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::replication::error::ReplicationError;
 use crate::s3::object::put::abe::keyed;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

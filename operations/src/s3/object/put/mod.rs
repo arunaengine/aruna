@@ -5,10 +5,11 @@
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_authority};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
-use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
-    split_drift_reads, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, split_drift_reads,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::purge_fence::{
     PurgeFenceError, check_fence_row, check_published, fence_key, publication_rows,
 };

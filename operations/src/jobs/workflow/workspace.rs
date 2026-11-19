@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::groups::routing::RoutingInputsError;
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::placement::policy::GateContextError;
+use crate::placement::policy::gate::GateContextError;
 use crate::replication::bao_read::BaoReadError;
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::{PutObjectError, PutObjectResult};

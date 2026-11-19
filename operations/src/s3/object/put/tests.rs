@@ -2378,7 +2378,7 @@ mod routing {
 /// the shared placement gate, which runs as a child.
 mod decisions {
     use super::*;
-    use crate::placement::policy::PolicyCacheStats;
+    use crate::placement::policy::cache::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementSubject, VerifiedPolicy,
     };

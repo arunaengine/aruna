@@ -33,8 +33,8 @@ use crate::metadata::device::serve::{
 use crate::metadata::persistent_id::forward::ServePidOperation;
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::metadata::serve::publish::serve_publish;
-use crate::placement::policy::transport::PolicyAnswer;
-use crate::placement::policy::{ApplyPolicyOperation, ServePolicyOperation};
+use crate::placement::policy::forward::ApplyPolicyOperation;
+use crate::placement::policy::transport::{PolicyAnswer, ServePolicyOperation};
 use crate::s3::bucket::forward::BucketForwardOperation;
 use crate::transfer::forward::serve_admission;
 use crate::users::vault_route::{ApplyVaultOperation, ServeVaultOperation};
