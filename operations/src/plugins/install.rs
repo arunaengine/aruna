@@ -181,8 +181,13 @@ impl InstallCaller {
     }
 
     /// The audit row of `action` on `install` by this caller.
-    pub fn audit(&self, action: AdminAuditAction, install: &PluginInstall) -> AdminAuditRecord {
-        AdminAuditRecord::for_install(action, self.actor.user_id, install)
+    pub fn audit(
+        &self,
+        audit_id: ulid::Ulid,
+        action: AdminAuditAction,
+        install: &PluginInstall,
+    ) -> AdminAuditRecord {
+        AdminAuditRecord::for_install(audit_id, action, self.actor.user_id, install)
     }
 
     /// Removes the rules of a removing or abandoned install from its group secrets.
@@ -522,6 +527,8 @@ pub(crate) struct SettleInstall {
     record: PluginInstall,
     audit: Option<AdminAuditAction>,
     phase: SettlePhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl SettleInstall {
@@ -535,6 +542,8 @@ impl SettleInstall {
             record,
             audit,
             phase: SettlePhase::Config,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -569,6 +578,14 @@ impl SettleInstall {
 impl Operation for SettleInstall {
     type Output = PluginInstall;
     type Error = InstallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<PluginInstall>, InstallError> {
         Ok(Next::Call(config_call(self.caller.actor.realm_id)))
@@ -605,7 +622,9 @@ impl Operation for SettleInstall {
                     return Ok(self.abandon("rules", error.0));
                 }
                 let next = self.settled(&manifest, prerequisites);
-                let audit = self.audit.map(|action| self.caller.audit(action, &next));
+                let audit = self
+                    .audit
+                    .map(|action| self.caller.audit(self.ids.mint(self.now_ms), action, &next));
                 let write = self.caller.write(Some(self.record.revision), &next, audit);
                 self.phase = SettlePhase::Write(Box::new(next));
                 Ok(Next::Call(write))

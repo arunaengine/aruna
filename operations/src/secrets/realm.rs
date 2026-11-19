@@ -133,7 +133,7 @@ impl RealmSecretOperation {
             self.input.change.clone(),
             self.input.actor.user_id,
             self.input.now_ms,
-            self.input.write_id,
+            (self.input.write_id, self.ids.mint(self.input.now_ms)),
         )?;
         let mut operations = Vec::new();
         if let (Some(info), Some(fields)) = (&applied.info, &applied.value) {

@@ -108,7 +108,12 @@ fn secret_audit(write_id: Option<Ulid>) -> AdminAuditRecord {
         incarnation: Some(Ulid::from_parts(4, 4)),
         write_id,
     };
-    AdminAuditRecord::for_secret(AdminAuditAction::SecretRead, user(1), secret)
+    AdminAuditRecord::for_secret(
+        ulid::Ulid::from_parts(1, 3),
+        AdminAuditAction::SecretRead,
+        user(1),
+        secret,
+    )
 }
 
 #[test]
