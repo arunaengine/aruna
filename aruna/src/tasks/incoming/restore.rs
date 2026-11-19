@@ -7,6 +7,9 @@ use crate::tasks::runner::{claim_producer, spawn_job};
 use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
 use aruna_operations::jobs::records::prune::{FamilyTimerOperation, PruneFamiliesOperation};
+use aruna_operations::node::catch_up::{
+    CATCH_UP_REFRESH, CatchUpOperation, catch_up_timer, next_pass,
+};
 use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -370,6 +373,10 @@ impl TaskQueues {
             return;
         }
         arm_prune_timer(&context).await;
+        if stopped() {
+            return;
+        }
+        arm_catch_up(&task_handle).await;
         if stopped() {
             return;
         }
@@ -895,6 +902,18 @@ impl OperationsTaskHandler {
         self.reschedule_timer(TaskKey::PruneFamilies, after).await;
     }
 
+    /// One realm config catch-up pass; a node without a network refreshes nothing.
+    pub(super) async fn catch_up(&self) {
+        let after = match self.context.node_and_realm() {
+            Some((local, realm_id)) => {
+                let pass = drive(CatchUpOperation::new(local, realm_id), &self.context).await;
+                next_pass(&pass)
+            }
+            None => CATCH_UP_REFRESH,
+        };
+        self.reschedule_timer(TaskKey::ConfigCatchUp, after).await;
+    }
+
     pub(super) async fn drain_blob_cleanup(&self) {
         let node = CleanupNode {
             routing: node_routing(&self.context),
@@ -1063,6 +1082,15 @@ async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle
             .await
     {
         warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+}
+
+/// Arms the first realm config catch-up pass of this start.
+async fn arm_catch_up(task_handle: &TaskHandle) {
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(catch_up_timer()).await
+    {
+        warn!(message = %message, "Failed to arm the realm config catch-up");
     }
 }
 

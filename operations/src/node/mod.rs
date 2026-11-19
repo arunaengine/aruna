@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod api_state;
+pub mod catch_up;
 pub mod contacts;
 pub mod counter_check;
 pub mod heartbeat;
