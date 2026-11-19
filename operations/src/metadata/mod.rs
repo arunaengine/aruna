@@ -111,8 +111,8 @@ impl MetadataPhaseSource {
 pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{
-    MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, list_cached_group,
-    list_cached_records, pull_status, send_metadata_effect, warm_caches,
+    MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, pull_status,
+    send_metadata_effect,
 };
 pub(crate) use message_kind::transport_message_kind;
 pub use protocol::{

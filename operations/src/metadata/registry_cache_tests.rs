@@ -116,6 +116,20 @@ fn fill_stores_registry() {
 }
 
 #[test]
+fn warmup_fills_registry() {
+    let mut warm = WarmCachesOperation::new();
+    let indexes = graph_call(MetadataEffect::EnsureIndexes);
+    assert_eq!(warm.first(), Ok(Next::Call(indexes)));
+    let read = IoCall::child(RegistryReadOperation::new());
+    assert_eq!(
+        warm.next(answer(MetadataEvent::IndexesReady)),
+        Ok(Next::Call(read))
+    );
+    let filled = child(Ok::<_, MetadataError>(Arc::new(vec![record(1)])));
+    assert_eq!(warm.next(filled), Ok(Next::Done(())));
+}
+
+#[test]
 fn oversized_fill_fails() {
     let mut fill = RegistryFillOperation::new();
     fill.first().unwrap();

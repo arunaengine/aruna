@@ -229,6 +229,42 @@ impl Operation for RegistryReadOperation {
     }
 }
 
+/// Builds the graph store's query indexes and fills the registry cache, so the first query after
+/// boot finds both warm.
+#[derive(Debug, PartialEq, Default)]
+pub struct WarmCachesOperation {
+    indexed: bool,
+}
+
+impl WarmCachesOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for WarmCachesOperation {
+    type Output = ();
+    type Error = MetadataError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(graph_call(MetadataEffect::EnsureIndexes)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.indexed {
+            result.child::<Registry, MetadataError>()??;
+            return Ok(Next::Done(()));
+        }
+        match cache_answer(result)? {
+            MetadataEvent::IndexesReady => {
+                self.indexed = true;
+                Ok(Next::Call(IoCall::child(RegistryReadOperation::new())))
+            }
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "registry_cache_tests.rs"]
 mod call_tests;

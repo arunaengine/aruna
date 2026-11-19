@@ -7,7 +7,8 @@ use super::*;
 use crate::driver::drive;
 use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::read_types::metadata_read_request;
-use aruna_core::metadata::GraphLifecycleRecord;
+use crate::metadata::registry_cache::RegistryReadOperation;
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect};
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {
@@ -145,15 +146,15 @@ async fn pending_summary_listed() {
 
 pub(super) async fn seed_registry_cache(test: &MetadataTest, record: &MetadataRegistryRecord) {
     seed_policy_docs(test, record.group_id).await;
-    let handle = test
-        .context
-        .metadata_handle
-        .as_ref()
-        .expect("metadata handle");
-    crate::metadata::list_cached_group(&test.context, record.group_id)
+    let graph = test.context.graph_handle.as_ref().expect("graph store");
+    drive(RegistryReadOperation::new(), &test.context)
         .await
         .expect("registry cache fills");
-    handle.cache_registry_record(record.clone());
+    let cache = MetadataEffect::CacheRecords {
+        records: vec![record.clone()],
+        generation: None,
+    };
+    graph.run(cache).await;
 }
 
 // Policy loading fails closed without realm config and group documents.

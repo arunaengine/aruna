@@ -781,7 +781,17 @@ async fn lazy_matches_eager() -> Result<(), BoxError> {
     let late_record = visibility_record(group_id, "datasets/probe-late", true);
     create_crate(&harness, &late_record.graph_iri, "probe late").await?;
     write_registry_records(&harness, std::slice::from_ref(&late_record)).await?;
-    harness.handle.cache_registry_record(late_record.clone());
+    let cache = MetadataEffect::CacheRecords {
+        records: vec![late_record.clone()],
+        generation: None,
+    };
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .expect("graph")
+        .run(cache)
+        .await;
     let names = query_names_as(&harness, None).await?;
     assert!(contains_name(&names, "probe late"));
 
