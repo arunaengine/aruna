@@ -1,6 +1,5 @@
-//! The plugin host's node-wide state, kept for the life of the node process: the host call and
-//! webhook rates per install, the memory budget of artifact copies, when each account no install
-//! names was first seen, and the secrets each run holds. Operations reach it through effects.
+//! The plugin host's node-wide process state: call and webhook rates, the artifact memory budget,
+//! when unnamed accounts were first seen, and run secrets. Operations reach it through effects.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
