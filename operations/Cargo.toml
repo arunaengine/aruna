@@ -65,7 +65,6 @@ aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-tasks = { workspace = true }
 axum = { workspace = true }
-flate2 = { workspace = true }
 futures-util = { workspace = true }
 proptest = { workspace = true }
 reqwest = { workspace = true }
@@ -73,5 +72,4 @@ rand = { workspace = true }
 spareval = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true }
 zip = { workspace = true }

@@ -702,10 +702,6 @@ impl<P: Operation> CallRun<P> {
         self.operation.hold_scope()
     }
 
-    pub fn expected_error(error: &P::Error) -> bool {
-        P::expected_error(error)
-    }
-
     pub fn is_conflict(error: &P::Error) -> bool {
         P::is_conflict(error)
     }
