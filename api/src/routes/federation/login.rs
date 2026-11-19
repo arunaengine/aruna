@@ -445,6 +445,7 @@ mod tests {
             secret_nonce(&SECRET),
             Some("Ada".to_string()),
             unix_timestamp_secs(),
+            ulid::Ulid::from_bytes([7; 16]),
         )
         .unwrap();
         Signed::sign(payload, &home).unwrap()

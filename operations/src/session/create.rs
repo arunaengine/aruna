@@ -311,6 +311,7 @@ impl CreateSessionOperation {
         if self.config.restrictions.is_some() {
             let (actor, group_id) = self.issuer.unwrap_or((self.config.user_id, None));
             let mut audit = AdminAuditRecord::new(
+                self.ids.mint(self.now_ms),
                 AdminAuditAction::RestrictedTokenIssued,
                 actor,
                 self.config.user_id,

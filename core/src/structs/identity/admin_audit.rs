@@ -96,9 +96,10 @@ pub struct AdminAuditRecord {
 }
 
 impl AdminAuditRecord {
-    pub fn new(action: AdminAuditAction, actor: UserId, target: UserId) -> Self {
+    /// A record under `audit_id`, which orders the audit rows by time.
+    pub fn new(audit_id: Ulid, action: AdminAuditAction, actor: UserId, target: UserId) -> Self {
         Self {
-            audit_id: Ulid::generate(),
+            audit_id,
             action,
             actor,
             target,
@@ -208,8 +209,12 @@ mod tests {
     fn group_rows_indexed() {
         let realm = RealmId::from_bytes([1; 32]);
         let actor = UserId::local(Ulid::from_parts(1, 1), realm);
-        let mut record =
-            AdminAuditRecord::new(AdminAuditAction::ServiceAccountCreated, actor, actor);
+        let mut record = AdminAuditRecord::new(
+            Ulid::from_parts(1, 2),
+            AdminAuditAction::ServiceAccountCreated,
+            actor,
+            actor,
+        );
         assert_eq!(record.entries().unwrap().len(), 1);
         let group = Ulid::from_parts(2, 2);
         record.group_id = Some(group);

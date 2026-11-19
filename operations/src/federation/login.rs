@@ -11,6 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::federation::{FederationError, RealmDescriptor, Signed};
 use aruna_core::handoff::{FEDERATED_SESSION_SECS, HandoffError, LoginHandoff, check_handoff};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
@@ -73,20 +74,25 @@ impl From<IoError> for IssueHandoffError {
 #[derive(Debug, PartialEq)]
 pub struct IssueHandoffOperation {
     config: IssueHandoffConfig,
+    ids: IdMint,
 }
 
 impl IssueHandoffOperation {
     pub fn new(config: IssueHandoffConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            ids: IdMint::default(),
+        }
     }
 
     /// Signs the handoff with the name of the read user; a missing user signs without one.
-    fn sign(&self, user: Option<User>) -> Result<Signed<LoginHandoff>, IssueHandoffError> {
+    fn sign(&mut self, user: Option<User>) -> Result<Signed<LoginHandoff>, IssueHandoffError> {
         let name = match user {
             Some(user) if user.is_deactivated() => return Err(IssueHandoffError::Deactivated),
             Some(user) => Some(user.name).filter(|name| !name.is_empty()),
             None => None,
         };
+        let handoff_id = self.ids.mint(self.config.now.saturating_mul(1000));
         let config = &self.config;
         let handoff = LoginHandoff::new(
             config.auth_context.realm_id,
@@ -95,6 +101,7 @@ impl IssueHandoffOperation {
             config.nonce.clone(),
             name,
             config.now,
+            handoff_id,
         )?;
         Ok(Signed::sign(handoff, &config.node_capabilities)?)
     }
@@ -103,6 +110,10 @@ impl IssueHandoffOperation {
 impl Operation for IssueHandoffOperation {
     type Output = Signed<LoginHandoff>;
     type Error = IssueHandoffError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, IssueHandoffError> {
         let auth = &self.config.auth_context;
