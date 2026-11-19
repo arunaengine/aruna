@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::local_query::QUERY_MAX_BYTES;
 use super::fanout_types::{MetadataFanoutOperation, pattern_contains_service};
 use super::{ApiQueryMode, MetadataApiError, NodeId, QUERY_MAX_ROWS, Span, debug_span, field};
+use crate::metadata::local_query::QUERY_MAX_BYTES;
 
 pub(super) fn ensure_query_mode(mode: &Option<ApiQueryMode>) {
     match mode {

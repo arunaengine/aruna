@@ -27,7 +27,6 @@ use aruna_storage::key_index::RangeIndexes;
 use ulid::Ulid;
 
 use super::contact::PeerContacts;
-use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
@@ -44,13 +43,11 @@ use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::pull_serve::{accept_pull, pull_status};
-pub use self::query::query_authorized_local;
 pub use self::search::search_authorized_local;
 mod ingress;
 mod lifecycle;
 mod peer_auth;
 mod pull_serve;
-mod query;
 mod search;
 mod sync;
 mod transport;
@@ -205,7 +202,6 @@ struct MetadataInner {
     auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
     visibility_cache: MetadataVisibilityCache,
-    query_cache: MetadataQueryCache,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     peer_contacts: PeerContacts,
     sync_pulls: self::pull_serve::PullRegistry,
@@ -343,7 +339,6 @@ impl MetadataHandle {
                 storage_handle,
                 net_handle,
                 visibility_cache: MetadataVisibilityCache::new(),
-                query_cache: MetadataQueryCache::new(),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
@@ -413,10 +408,6 @@ impl MetadataHandle {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);
-    }
-
-    pub(in crate::metadata) fn query_cache(&self) -> &MetadataQueryCache {
-        &self.inner.query_cache
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next

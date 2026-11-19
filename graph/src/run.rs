@@ -39,8 +39,8 @@ impl GraphHandle {
         event
     }
 
-    /// The cache arms answer here; the store effects run on the blocking pool. Searches,
-    /// queries and best-effort sync need a read scope or the network and are refused here.
+    /// The cache and scoped read arms answer here; the store effects run on the blocking pool.
+    /// Unscoped searches and best-effort sync need a read scope or the network and are refused.
     async fn run_store(&self, effect: MetadataEffect) -> MetadataEvent {
         let effect = match self.run_cache(effect) {
             Ok(event) => return event,
@@ -142,7 +142,6 @@ impl GraphHandle {
         if matches!(
             effect,
             MetadataEffect::SearchGraphs { .. }
-                | MetadataEffect::QueryGraphs { .. }
                 | MetadataEffect::SyncBestEffort { .. }
                 | MetadataEffect::CachedRecords
         ) {
@@ -983,7 +982,6 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
-        | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncBestEffort { .. }
         | MetadataEffect::CheckStructure { .. }
         | MetadataEffect::CheckProfile { .. }

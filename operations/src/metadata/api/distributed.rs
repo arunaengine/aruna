@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::local_query::QUERY_MAX_BYTES;
 use super::distributed_types::query_select_limit;
 use super::{
     BucketPage, MetadataApiError, MetadataQueryResults, MetadataReadError, MetadataSearchHit,
     QUERY_MAX_ROWS, Span,
 };
+use crate::metadata::local_query::QUERY_MAX_BYTES;
 
 pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {
     match result {

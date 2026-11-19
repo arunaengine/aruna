@@ -6,16 +6,15 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use aruna_core::events::Event;
-use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tokio::sync::Semaphore;
-use tracing::{Instrument, Span, debug_span, field};
+use tracing::{Instrument, debug_span, field};
 
 use super::MetadataHandle;
 use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_graph_deleted};
 use super::search::list_visible_graphs;
 use crate::driver::DriverContext;
-use crate::metadata::query_cache::{CacheStamp, CachedQuery, QueryCacheKey};
 
 const GRAPH_FENCE_SHARDS: usize = 32;
 
@@ -63,66 +62,6 @@ async fn run_effect(
     context: &DriverContext,
     effect: MetadataEffect,
 ) -> MetadataEvent {
-    let cache = &metadata.inner.visibility_cache;
-    let queries = metadata.query_cache();
-    match effect {
-        MetadataEffect::QueryCacheGet { key } => {
-            let stamp = queries.stamp(cache.current_generation());
-            let entry = queries.get(&QueryCacheKey::from_bytes(key), stamp, Instant::now());
-            let entry = entry.map(|cached| ((*cached.results).clone(), cached.nodes_queried));
-            return MetadataEvent::QueryCacheEntry {
-                stamp: stamp.parts(),
-                entry,
-            };
-        }
-        MetadataEffect::QueryCachePut {
-            key,
-            stamp,
-            results,
-            nodes_queried,
-        } => {
-            let cached = CachedQuery {
-                results: std::sync::Arc::new(results),
-                nodes_queried,
-            };
-            let generation = cache.current_generation();
-            let key = QueryCacheKey::from_bytes(key);
-            let stamp = CacheStamp::from_parts(stamp);
-            queries.insert(key, cached, stamp, generation, Instant::now());
-            return MetadataEvent::QueryCacheEntry {
-                stamp: stamp.parts(),
-                entry: None,
-            };
-        }
-        MetadataEffect::CacheGeneration => {
-            return MetadataEvent::CacheGeneration {
-                generation: cache.current_generation(),
-            };
-        }
-        MetadataEffect::CacheRecords {
-            records,
-            generation,
-        } => {
-            cache.upsert_at(&records, generation);
-            return MetadataEvent::CacheGeneration {
-                generation: cache.current_generation(),
-            };
-        }
-        MetadataEffect::UncacheRecord { document_id } => {
-            cache.remove_registry_record(document_id);
-            return MetadataEvent::CacheGeneration {
-                generation: cache.current_generation(),
-            };
-        }
-        MetadataEffect::CachedGroup { group_id } => {
-            let records = match cache.records_group_any(group_id) {
-                Some((records, true)) => Some(records.as_ref().clone()),
-                _ => None,
-            };
-            return MetadataEvent::CachedGroup { records };
-        }
-        _ => {}
-    }
     let Some(graph) = context.graph_handle.as_ref() else {
         return MetadataEvent::Error {
             graph_iri: None,
@@ -171,21 +110,6 @@ async fn run_effect(
     match effect {
         MetadataEffect::SyncBestEffort { graph_iri, peers } => {
             super::lifecycle::sync_best_effort(context, graph_iri, peers)
-        }
-        MetadataEffect::QueryGraphs {
-            auth_context,
-            graph_iris,
-            sparql,
-        } => {
-            match super::query::query_authorized_local(context, auth_context, graph_iris, sparql)
-                .await
-            {
-                Ok(results) => MetadataEvent::QueryResult { results },
-                Err(error) => MetadataEvent::Error {
-                    graph_iri: None,
-                    error,
-                },
-            }
         }
         MetadataEffect::SearchGraphs {
             auth_context,
@@ -245,16 +169,7 @@ async fn run_effect(
                 },
             }
         }
-        other => {
-            let mutates_graph = other.mutates_graph();
-            let event = graph.run(other).await;
-            // Successful mutations invalidate query results through this
-            // counter; lifecycle cache changes use their own generation.
-            if mutates_graph && !matches!(event, MetadataEvent::Error { .. }) {
-                metadata.inner.query_cache.bump_apply();
-            }
-            event
-        }
+        other => graph.run(other).await,
     }
 }
 
@@ -353,19 +268,5 @@ pub async fn export_rocrate_jsonld(
             "unexpected metadata export event: {}",
             other.label()
         ))),
-    }
-}
-
-pub(super) fn record_query_counts(span: &Span, results: &MetadataQueryResults) {
-    match results {
-        MetadataQueryResults::Solutions(rows) => {
-            span.record("row_count", rows.len() as u64);
-        }
-        MetadataQueryResults::Boolean(_) => {
-            span.record("row_count", 1u64);
-        }
-        MetadataQueryResults::Graph(triples) => {
-            span.record("triple_count", triples.len() as u64);
-        }
     }
 }

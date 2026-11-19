@@ -83,7 +83,6 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::AddGraphPeer { .. }
         | MetadataEffect::DeleteGraph { .. } => true,
         MetadataEffect::SyncBestEffort { .. }
-        | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::GetGraphPolicy { .. }
         | MetadataEffect::ExportRoCrate { .. }

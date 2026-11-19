@@ -1,30 +1,15 @@
-//! Caches metadata query results per caller scope with entry, byte and time bounds.
+//! Derives the query cache keys that keep each caller scope's results apart.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
 use aruna_core::NodeId;
-use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use lru::LruCache;
-
-/// Backstop staleness of a cached result. Matches the visibility cache TTL so
-/// a query never promises fresher data than the listing path does.
-pub(super) const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(super) const CACHE_MAX_ENTRIES: usize = 512;
-pub(super) const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const TAG_EAGER: u8 = 1;
 const TAG_LAZY: u8 = 2;
 const TAG_FANOUT: u8 = 3;
 const NO_CREDENTIAL: &[u8] = b"aruna.metadata.query.anonymous";
-const ENTRY_OVERHEAD: usize = 64;
 
 // Length prefixes keep concatenated components unambiguous, so no two
 // different component lists can hash to the same key.
@@ -80,10 +65,6 @@ impl QueryCacheKey {
     /// The key as an effect carries it.
     pub(super) fn bytes(self) -> [u8; 32] {
         self.0
-    }
-
-    pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
     }
 }
 
@@ -167,209 +148,9 @@ pub(super) fn remote_key(input: &RemoteKeyInput<'_>) -> QueryCacheKey {
     QueryCacheKey(*hasher.finalize().as_bytes())
 }
 
-/// Invalidation stamp: the visibility generation covers registry and
-/// lifecycle changes, the apply counter covers graph content written by
-/// replayed or already-durable effects that skip the lifecycle read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CacheStamp {
-    generation: u64,
-    applies: u64,
-}
-
-impl CacheStamp {
-    /// The stamp as an operation carries it between the read and the store.
-    pub(super) fn parts(self) -> [u64; 2] {
-        [self.generation, self.applies]
-    }
-
-    pub(super) fn from_parts([generation, applies]: [u64; 2]) -> Self {
-        Self {
-            generation,
-            applies,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct CachedQuery {
-    pub(super) results: Arc<MetadataQueryResults>,
-    /// Partitions merged into this result; zero for a local evaluation.
-    pub(super) nodes_queried: usize,
-}
-
-struct CacheEntry {
-    value: CachedQuery,
-    stamp: CacheStamp,
-    expires_at: Instant,
-    bytes: usize,
-}
-
-struct CacheState {
-    entries: LruCache<QueryCacheKey, CacheEntry>,
-    bytes: usize,
-}
-
-/// Bounded LRU of SPARQL results shared by every caller whose authorization
-/// resolves to the same scope.
-pub(super) struct MetadataQueryCache {
-    state: Mutex<CacheState>,
-    applies: AtomicU64,
-    ttl: Duration,
-    max_bytes: usize,
-}
-
-impl Default for MetadataQueryCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MetadataQueryCache {
-    pub(super) fn new() -> Self {
-        Self::with_limits(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES, QUERY_CACHE_TTL)
-    }
-
-    pub(super) fn with_limits(max_entries: usize, max_bytes: usize, ttl: Duration) -> Self {
-        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
-        Self {
-            state: Mutex::new(CacheState {
-                entries: LruCache::new(capacity),
-                bytes: 0,
-            }),
-            applies: AtomicU64::new(0),
-            ttl,
-            max_bytes,
-        }
-    }
-
-    /// Marks every cached result stale after a graph-mutating effect applied.
-    pub(super) fn bump_apply(&self) {
-        self.applies.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(super) fn stamp(&self, generation: u64) -> CacheStamp {
-        CacheStamp {
-            generation,
-            applies: self.applies.load(Ordering::Acquire),
-        }
-    }
-
-    pub(super) fn get(
-        &self,
-        key: &QueryCacheKey,
-        stamp: CacheStamp,
-        now: Instant,
-    ) -> Option<CachedQuery> {
-        let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        let entry = state.entries.get(key)?;
-        if entry.stamp != stamp || entry.expires_at <= now {
-            let bytes = entry.bytes;
-            state.entries.pop(key);
-            state.bytes = state.bytes.saturating_sub(bytes);
-            return None;
-        }
-        Some(entry.value.clone())
-    }
-
-    pub(super) fn insert(
-        &self,
-        key: QueryCacheKey,
-        value: CachedQuery,
-        stamp: CacheStamp,
-        generation: u64,
-        now: Instant,
-    ) -> bool {
-        // A mutation that landed while the query ran already invalidated this
-        // result, and shared entries make the generation check mandatory.
-        if stamp != self.stamp(generation) {
-            return false;
-        }
-        let bytes = ENTRY_OVERHEAD.saturating_add(results_bytes(&value.results));
-        if bytes > self.max_bytes {
-            return false;
-        }
-        let entry = CacheEntry {
-            value,
-            stamp,
-            expires_at: now + self.ttl,
-            bytes,
-        };
-        let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        if let Some((_, replaced)) = state.entries.push(key, entry) {
-            state.bytes = state.bytes.saturating_sub(replaced.bytes);
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        while state.bytes > self.max_bytes {
-            let Some((_, evicted)) = state.entries.pop_lru() else {
-                break;
-            };
-            state.bytes = state.bytes.saturating_sub(evicted.bytes);
-        }
-        true
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .entries
-            .len()
-    }
-}
-
-fn results_bytes(results: &MetadataQueryResults) -> usize {
-    const CELL_OVERHEAD: usize = 48;
-    match results {
-        MetadataQueryResults::Boolean(_) => 0,
-        MetadataQueryResults::Solutions(rows) => rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|(name, value)| name.len() + value.len() + CELL_OVERHEAD)
-                    .sum::<usize>()
-                    + CELL_OVERHEAD
-            })
-            .sum(),
-        MetadataQueryResults::Graph(triples) => triples
-            .iter()
-            .map(|(subject, predicate, object)| {
-                subject.len() + predicate.len() + object.len() + CELL_OVERHEAD
-            })
-            .sum(),
-    }
-}
-
 #[cfg(test)]
 mod pure_tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-
-    const TTL: Duration = Duration::from_secs(30);
-
-    fn cache() -> MetadataQueryCache {
-        MetadataQueryCache::with_limits(8, 1 << 20, TTL)
-    }
-
-    fn key(sparql: &str) -> QueryCacheKey {
-        local_key(LocalScopeKind::Lazy, &graphs_digest(&[]), sparql)
-    }
-
-    fn rows(count: usize) -> MetadataQueryResults {
-        MetadataQueryResults::Solutions(
-            (0..count)
-                .map(|index| BTreeMap::from([("name".to_string(), format!("value-{index:06}"))]))
-                .collect(),
-        )
-    }
-
-    fn cached(results: MetadataQueryResults) -> CachedQuery {
-        CachedQuery {
-            results: Arc::new(results),
-            nodes_queried: 1,
-        }
-    }
 
     fn remote(realm: RealmId) -> QueryCacheKey {
         remote_key(&RemoteKeyInput {
@@ -381,51 +162,6 @@ mod pure_tests {
             allow_partial: false,
             target_nodes: None,
         })
-    }
-
-    #[test]
-    fn returns_stored_entry() {
-        let cache = cache();
-        let stamp = cache.stamp(7);
-        let now = Instant::now();
-        assert!(cache.insert(key("ASK { ?s ?p ?o }"), cached(rows(3)), stamp, 7, now));
-        let hit = cache
-            .get(&key("ASK { ?s ?p ?o }"), stamp, now)
-            .expect("entry must be cached");
-        assert_eq!(*hit.results, rows(3));
-        assert!(cache.get(&key("ASK { ?x ?y ?z }"), stamp, now).is_none());
-    }
-
-    #[test]
-    fn stale_generation_misses() {
-        let cache = cache();
-        let now = Instant::now();
-        cache.insert(key("q"), cached(rows(1)), cache.stamp(1), 1, now);
-        assert!(cache.get(&key("q"), cache.stamp(2), now).is_none());
-        // The miss must also drop the entry instead of resurrecting it later.
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn apply_bump_invalidates() {
-        let cache = cache();
-        let now = Instant::now();
-        let stamp = cache.stamp(1);
-        cache.insert(key("q"), cached(rows(1)), stamp, 1, now);
-        cache.bump_apply();
-        assert!(cache.get(&key("q"), cache.stamp(1), now).is_none());
-    }
-
-    #[test]
-    fn insert_checks_generation() {
-        // A visibility-only change during evaluation must not be stored: keys
-        // are shared by digest, so the entry would leak across callers.
-        let cache = cache();
-        let now = Instant::now();
-        let stamp = cache.stamp(1);
-        assert!(!cache.insert(key("q"), cached(rows(1)), stamp, 2, now));
-        assert_eq!(cache.len(), 0);
-        assert!(cache.insert(key("q"), cached(rows(1)), stamp, 1, now));
     }
 
     #[test]
@@ -467,56 +203,5 @@ mod pure_tests {
             wide,
             local_key(LocalScopeKind::Eager, &graphs_digest(&visible), sparql)
         );
-    }
-
-    #[test]
-    fn byte_budget_evicts() {
-        let cache = MetadataQueryCache::with_limits(64, 4096, TTL);
-        let stamp = cache.stamp(1);
-        let now = Instant::now();
-        for index in 0..16 {
-            assert!(cache.insert(key(&format!("q{index}")), cached(rows(4)), stamp, 1, now));
-        }
-        assert!(cache.len() < 16, "byte budget never evicted");
-        assert!(cache.get(&key("q15"), stamp, now).is_some());
-        assert!(cache.get(&key("q0"), stamp, now).is_none());
-        // A result larger than the whole budget is never admitted.
-        assert!(!cache.insert(key("huge"), cached(rows(4096)), stamp, 1, now));
-    }
-
-    #[test]
-    fn capacity_evicts_bytes() {
-        let entry_bytes = ENTRY_OVERHEAD + results_bytes(&rows(4));
-        let cache = MetadataQueryCache::with_limits(2, 2 * entry_bytes, TTL);
-        let stamp = cache.stamp(1);
-        let now = Instant::now();
-        for index in 0..3 {
-            assert!(cache.insert(key(&format!("q{index}")), cached(rows(4)), stamp, 1, now));
-        }
-        // The capacity eviction must release the evicted bytes; if they leak,
-        // the byte budget evicts a second, still live entry.
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(&key("q0"), stamp, now).is_none());
-        assert!(cache.get(&key("q1"), stamp, now).is_some());
-        assert!(cache.get(&key("q2"), stamp, now).is_some());
-        // Replacing a key subtracts the old entry's bytes exactly once.
-        assert!(cache.insert(key("q1"), cached(rows(4)), stamp, 1, now));
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(&key("q1"), stamp, now).is_some());
-        assert!(cache.get(&key("q2"), stamp, now).is_some());
-    }
-
-    #[test]
-    fn ttl_expires_entry() {
-        let cache = cache();
-        let stamp = cache.stamp(1);
-        let now = Instant::now();
-        cache.insert(key("q"), cached(rows(1)), stamp, 1, now);
-        assert!(
-            cache
-                .get(&key("q"), stamp, now + TTL - Duration::from_secs(1))
-                .is_some()
-        );
-        assert!(cache.get(&key("q"), stamp, now + TTL).is_none());
     }
 }

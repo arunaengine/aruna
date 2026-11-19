@@ -36,6 +36,7 @@ use crate::metadata::forward::read::admits_profile_peer;
 use crate::metadata::forward::routed::export::ExportWithinOperation;
 use crate::metadata::forward::routed::export::ensure_export_limit;
 use crate::metadata::live_records::LiveRecordOperation;
+use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::metadata::profile::validation::RevalidateOperation;
 use crate::metadata::profile::validation::ValidationStatusOperation;
@@ -48,9 +49,8 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::NodeId;
-use aruna_core::events::Event;
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::{MetadataEffect, MetadataEvent, MetadataQueryResults};
+use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
@@ -582,13 +582,6 @@ pub(crate) async fn apply_document_query(
     )
     .await
     .map_err(read_error)?;
-    let query = MetadataEffect::QueryGraphs {
-        auth_context: auth,
-        graph_iris: Some(vec![record.graph_iri]),
-        sparql,
-    };
-    match super::send_metadata_effect(context, query).await {
-        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-        _ => Err(MetadataReadError::Unavailable),
-    }
+    let query = LocalQueryOperation::new((realm_id, auth), Some(vec![record.graph_iri]), sparql);
+    (drive(query, context.as_ref()).await).map_err(|_| MetadataReadError::Unavailable)
 }

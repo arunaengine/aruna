@@ -450,12 +450,7 @@ impl MetadataHandle {
             .graph_handle
             .as_ref()
             .ok_or(MetadataError::HandleMissing)?;
-        let applied = graph.reconcile().await?;
-        // Peer sync invalidates summaries because their cursor may precede newly applied content.
-        if !applied.is_empty() {
-            self.inner.query_cache.bump_apply();
-        }
-        Ok(applied.len())
+        Ok(graph.reconcile().await?.len())
     }
 
     /// Removes the local copy of every deleted graph; returns how many were removed.

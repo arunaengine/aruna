@@ -339,17 +339,25 @@ struct QueryState {
 pub(crate) struct QueryCache {
     state: Mutex<QueryState>,
     applies: AtomicU64,
+    ttl: Duration,
+    max_bytes: usize,
 }
 
 impl QueryCache {
     pub(crate) fn new() -> Self {
-        let capacity = NonZeroUsize::new(CACHE_MAX_ENTRIES).unwrap_or(NonZeroUsize::MIN);
+        Self::with_limits(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES, QUERY_CACHE_TTL)
+    }
+
+    fn with_limits(max_entries: usize, max_bytes: usize, ttl: Duration) -> Self {
+        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
         Self {
             state: Mutex::new(QueryState {
                 entries: LruCache::new(capacity),
                 bytes: 0,
             }),
             applies: AtomicU64::new(0),
+            ttl,
+            max_bytes,
         }
     }
 
@@ -366,8 +374,8 @@ impl QueryCache {
         &self,
         key: &[u8; 32],
         stamp: [u64; 2],
+        now: Instant,
     ) -> Option<(MetadataQueryResults, usize)> {
-        let now = Instant::now();
         let mut state = locked(&self.state);
         let entry = state.entries.get(key)?;
         if entry.stamp != stamp || entry.expires_at <= now {
@@ -385,21 +393,21 @@ impl QueryCache {
         &self,
         key: [u8; 32],
         (results, nodes_queried): (MetadataQueryResults, usize),
-        stamp: [u64; 2],
-        generation: u64,
+        (stamp, generation): ([u64; 2], u64),
+        now: Instant,
     ) -> bool {
         if stamp != self.stamp(generation) {
             return false;
         }
         let bytes = ENTRY_OVERHEAD.saturating_add(results_bytes(&results));
-        if bytes > CACHE_MAX_BYTES {
+        if bytes > self.max_bytes {
             return false;
         }
         let entry = QueryEntry {
             results: Arc::new(results),
             nodes_queried,
             stamp,
-            expires_at: Instant::now() + QUERY_CACHE_TTL,
+            expires_at: now + self.ttl,
             bytes,
         };
         let mut state = locked(&self.state);
@@ -407,7 +415,7 @@ impl QueryCache {
             state.bytes = state.bytes.saturating_sub(replaced.bytes);
         }
         state.bytes = state.bytes.saturating_add(bytes);
-        while state.bytes > CACHE_MAX_BYTES {
+        while state.bytes > self.max_bytes {
             let Some((_, evicted)) = state.entries.pop_lru() else {
                 break;
             };
@@ -450,7 +458,7 @@ impl crate::GraphHandle {
         Ok(match effect {
             MetadataEffect::QueryCacheGet { key } => {
                 let stamp = queries.stamp(generation());
-                let entry = queries.get(&key, stamp);
+                let entry = queries.get(&key, stamp, Instant::now());
                 MetadataEvent::QueryCacheEntry { stamp, entry }
             }
             MetadataEffect::QueryCachePut {
@@ -459,7 +467,8 @@ impl crate::GraphHandle {
                 results,
                 nodes_queried,
             } => {
-                queries.insert(key, (results, nodes_queried), stamp, generation());
+                let entry = (results, nodes_queried);
+                queries.insert(key, entry, (stamp, generation()), Instant::now());
                 MetadataEvent::QueryCacheEntry { stamp, entry: None }
             }
             MetadataEffect::QueryCacheStamp => MetadataEvent::QueryCacheEntry {
@@ -537,3 +546,7 @@ impl crate::GraphHandle {
         self.inner.visibility.expire_now();
     }
 }
+
+#[cfg(test)]
+#[path = "caches_tests.rs"]
+mod tests;

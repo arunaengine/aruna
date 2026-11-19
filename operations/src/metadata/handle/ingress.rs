@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;
-use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataSearchHit,
-};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataSearchHit};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
@@ -35,6 +33,7 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
+use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
@@ -357,12 +356,16 @@ impl MetadataHandle {
                 Box::pin(async {
                     match self.read_caller(context, peer, auth_token, false).await {
                         Ok(auth_context) => {
-                            let query = MetadataEffect::QueryGraphs {
-                                auth_context,
-                                graph_iris,
-                                sparql,
+                            let net = self.inner.net_handle.as_ref();
+                            let result = match net.map(|net| *net.realm_id()) {
+                                Some(realm_id) => {
+                                    let caller = (realm_id, auth_context);
+                                    let query =
+                                        LocalQueryOperation::new(caller, graph_iris, sparql);
+                                    drive(query, context).await.map_err(metadata_read_error)
+                                }
+                                None => Err(MetadataReadError::Unavailable),
                             };
-                            let result = query_answer(self.run_effect(context, query).await);
                             MetadataTransportMessage::QueryResults { result }
                         }
                         Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
@@ -1485,15 +1488,6 @@ impl MetadataHandle {
             None => close_stream(&mut stream).await,
         }
         Ok(())
-    }
-}
-
-/// The answer of a local query effect, as the asking peer reads it.
-fn query_answer(event: Event) -> Result<MetadataQueryResults, MetadataReadError> {
-    match event {
-        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(metadata_read_error(error)),
-        _ => Err(MetadataReadError::Unavailable),
     }
 }
 

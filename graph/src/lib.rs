@@ -271,6 +271,9 @@ impl GraphHandle {
         for graph in &applied {
             self.inner.summaries.remove(graph);
         }
+        if !applied.is_empty() {
+            self.inner.queries.bump_apply();
+        }
         Ok(applied)
     }
 

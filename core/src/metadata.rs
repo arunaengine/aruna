@@ -1369,11 +1369,6 @@ pub enum MetadataEffect {
         /// Only entities that conform to this profile IRI.
         conforms_to: Option<String>,
     },
-    QueryGraphs {
-        auth_context: Option<AuthContext>,
-        graph_iris: Option<Vec<String>>,
-        sparql: String,
-    },
     DeleteGraph {
         graph_iri: String,
     },
@@ -1543,7 +1538,6 @@ impl MetadataEffect {
             MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
             MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
             MetadataEffect::SearchGraphs { .. } => "search_graphs",
-            MetadataEffect::QueryGraphs { .. } => "query_graphs",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
             MetadataEffect::CachedRecords => "cached_records",
@@ -1607,9 +1601,6 @@ impl MetadataEffect {
             | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris
-                .as_ref()
-                .and_then(|graph_iris| graph_iris.first().cloned()),
-            MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
                 .as_ref()
                 .and_then(|graph_iris| graph_iris.first().cloned()),
             MetadataEffect::ListGraphs

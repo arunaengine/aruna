@@ -10,7 +10,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::metadata::{
-    AuthToken, MergeError, MergeJob, MergeOutput, MetadataEffect, MetadataEvent,
+    AuthToken, MergeError, MergeJob, MergeOutput, MetadataEffect, MetadataError, MetadataEvent,
     MetadataQueryResults, QUERY_MAX_ROWS, SolutionRow,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -32,14 +32,15 @@ use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation};
 use super::read_types::MetadataQueryExecution;
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::forward::fetch::{peer_call, peer_reply};
+use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
 
 /// Where one partition query runs.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Partition {
-    /// This node's graphs, under the caller's own authority.
-    Local(Option<AuthContext>),
+    /// This node's graphs of the realm, under the caller's own authority.
+    Local(RealmId, Option<AuthContext>),
     /// A peer, under the forwarded credential.
     Remote {
         node: NodeId,
@@ -124,13 +125,13 @@ impl TieFetchOperation {
 
     fn run(&self, sparql: String) -> Result<IoCall, MetadataReadError> {
         Ok(match &self.partition {
-            Partition::Local(auth) => {
-                let effect = MetadataEffect::QueryGraphs {
-                    auth_context: auth.clone(),
-                    graph_iris: self.graph_iris.clone(),
+            Partition::Local(realm_id, auth) => {
+                let caller = (*realm_id, auth.clone());
+                IoCall::child(LocalQueryOperation::new(
+                    caller,
+                    self.graph_iris.clone(),
                     sparql,
-                };
-                IoCall::Effect(Box::new(Effect::Metadata(effect)))
+                ))
             }
             Partition::Remote { node, auth_token } => {
                 let message = MetadataTransportMessage::QueryGraphs {
@@ -146,13 +147,8 @@ impl TieFetchOperation {
 
     fn answer(&self, result: IoResult) -> Result<MetadataQueryResults, MetadataReadError> {
         match &self.partition {
-            Partition::Local(_) => match event(result)? {
-                Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-                Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    Err(metadata_read_error(error))
-                }
-                _ => Err(MetadataReadError::Unavailable),
-            },
+            Partition::Local(..) => (result.child::<MetadataQueryResults, MetadataError>()?)
+                .map_err(metadata_read_error),
             Partition::Remote { node, .. } => match peer_reply(*node, result)? {
                 Ok(MetadataTransportMessage::QueryResults { result }) => result,
                 _ => Err(MetadataReadError::Unavailable),
@@ -269,6 +265,7 @@ fn merge_stats(left: MetadataFanoutStats, right: MetadataFanoutStats) -> Metadat
 /// How the query fanout asks each node: a tie fetch here or at a peer.
 #[derive(Debug, PartialEq)]
 struct QueryCalls {
+    realm_id: RealmId,
     auth: Option<AuthContext>,
     auth_token: Option<AuthToken>,
     graph_iris: Option<Vec<String>>,
@@ -291,7 +288,7 @@ impl NodeCalls for QueryCalls {
     type Part = MetadataQueryResults;
 
     fn local(&self, _node: NodeId) -> Effect {
-        self.fetch(Partition::Local(self.auth.clone()))
+        self.fetch(Partition::Local(self.realm_id, self.auth.clone()))
     }
 
     // Each fetch of a tie refetch asks within what is left of the query deadline.
@@ -509,6 +506,7 @@ impl DistributedQueryOperation {
         };
         let ties = ordered.as_ref().and(self.select_limit);
         let calls = QueryCalls {
+            realm_id: self.realm_id,
             auth: self.caller.0.clone(),
             auth_token: fanout_bearer(self.caller.1.as_deref()),
             graph_iris: self.graph_iris.clone(),
