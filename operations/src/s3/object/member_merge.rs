@@ -378,3 +378,404 @@ pub struct MergedObjectsOperation<K> {
     step: ObjectsStep,
 }
 
+impl<K> MergedObjectsOperation<K>
+where
+    K: ListingKeys + Clone + 'static,
+{
+    pub fn new(
+        from: MergeCaller,
+        shows: MergeShows<K>,
+        input: ListBucketInput,
+        (resume, bounded): (Option<MergeResume>, bool),
+    ) -> Self {
+        Self {
+            from,
+            shows,
+            input,
+            resume,
+            bounded,
+            view: None,
+            fence: None,
+            ranges: VecDeque::new(),
+            resumed: None,
+            page: MergedObjects::default(),
+            last_prefix: None,
+            page_prefix: None,
+            last_key: None,
+            first: true,
+            bytes: 0,
+            visited: 0,
+            current: None,
+            step: ObjectsStep::View,
+        }
+    }
+
+    fn snapshot(&self) -> Result<&DistributionSnapshot, IoError> {
+        Ok(self.view.as_ref().ok_or(IoError::Unfinished)?.snapshot())
+    }
+
+    /// The position after the last entry of this page.
+    fn marker(&self) -> Result<Option<ListContinuationToken>, MergeError> {
+        let (key, prefix) = (self.last_key.as_deref(), self.page_prefix.as_deref());
+        merged_marker(&self.input.bucket, key, prefix)
+            .map_err(|_| MergeError::Failed("invalid listing marker".to_string()))
+    }
+
+    fn plan(&mut self) -> ObjectsTurn {
+        let input = &self.input;
+        let resume = match &input.continuation_token {
+            Some(token) => Some((
+                (BlobHeadKey::from_bytes(&token.last_key).map_err(|_| MergeError::Token)?).key,
+                token.last_common_prefix.clone(),
+            )),
+            None => (input.start_after.clone())
+                .filter(|start| !start.is_empty())
+                .map(|start| (start, None)),
+        };
+        self.last_prefix = resume.as_ref().and_then(|(_, group)| group.clone());
+        // A sealed position resumes its range at the member that sealed it.
+        let from = match self.resume.take() {
+            Some(MergeResume::From(lower)) => Some(lower),
+            Some(MergeResume::Sealed {
+                lower,
+                node,
+                copy,
+                cursor,
+                group,
+            }) => {
+                self.last_prefix = group;
+                self.resumed = Some((node, copy, cursor));
+                Some(lower)
+            }
+            _ => None,
+        };
+        let prefix = self.input.prefix.clone().unwrap_or_default();
+        let ranges = (self.snapshot()?.listed_ranges(&prefix).into_iter())
+            .filter(|range| {
+                let after = resume.as_ref().is_none_or(|(key, _)| {
+                    (range.upper.as_deref()).is_none_or(|upper| key.as_str() < upper)
+                });
+                after
+                    && from
+                        .as_deref()
+                        .is_none_or(|from| range.lower.as_str() >= from)
+            })
+            .cloned()
+            .collect();
+        self.ranges = ranges;
+        self.next_range()
+    }
+
+    fn finish(&mut self, next: Option<MergeResume>) -> ObjectsTurn {
+        self.page.next = next;
+        Ok(Next::Done(std::mem::take(&mut self.page)))
+    }
+
+    fn next_range(&mut self) -> ObjectsTurn {
+        let Some(range) = self.ranges.pop_front() else {
+            return self.finish(None);
+        };
+        let visited = self.visited;
+        self.visited += 1;
+        let max = (self.input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS);
+        let remaining = max.saturating_sub(self.page.objects.len() + self.page.prefixes.len());
+        let full = self.bounded && (visited == MAX_PAGE_RANGES || self.bytes >= MAX_PAGE_BYTES);
+        if remaining == 0 || full {
+            self.page.token = self.marker()?;
+            // Nothing listed yet: the next page starts at this range.
+            let next = (self.page.token.is_none()).then(|| MergeResume::From(range.lower.clone()));
+            return self.finish(next);
+        }
+        let resumed = self.resumed.take();
+        // A copy may be behind its coordinator, so a range resumed at one is marked stale.
+        if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
+            self.page.stale.push(range.range_id);
+        }
+        let local = match &resumed {
+            Some((node, ..)) => *node == self.shows.node.local,
+            None => {
+                let fence = self.fence.as_ref().ok_or(IoError::Unfinished)?;
+                let member = self.from.binding.member_id;
+                self.snapshot()?.lists_locally(member, &range, fence)
+            }
+        };
+        let asked = resumed.clone();
+        self.current = Some(ObjectsRange {
+            range,
+            remaining,
+            resumed,
+            local,
+        });
+        match (local, asked) {
+            (true, _) => self.list_here(),
+            (false, Some((node, copy, cursor))) => {
+                let start = Some(("continuation-token", cursor));
+                self.ask(start, (copy, Some(node)), ObjectsStep::Asked(copy))
+            }
+            (false, None) => {
+                let start = self.remote_start()?;
+                self.ask(start.clone(), (false, None), ObjectsStep::Primary(start))
+            }
+        }
+    }
+
+    /// Where a holder resumes the first listed range: at the full position of the request, so
+    /// a common prefix is skipped as a whole and not listed again after its name.
+    fn remote_start(&self) -> Result<Option<(&'static str, String)>, MergeError> {
+        if !self.first {
+            return Ok(None);
+        }
+        Ok(match &self.input.continuation_token {
+            Some(token) => {
+                let token = encode_list_token(token)
+                    .map_err(|error| MergeError::Failed(error.to_string()))?;
+                Some(("continuation-token", token))
+            }
+            None => (self.input.start_after.clone())
+                .filter(|start| !start.is_empty())
+                .map(|start| ("start-after", start)),
+        })
+    }
+
+    fn ask(
+        &mut self,
+        start: Option<(&'static str, String)>,
+        (copies, only): (bool, Option<NodeId>),
+        step: ObjectsStep,
+    ) -> ObjectsTurn {
+        let input = &self.input;
+        let current = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        let mut base = vec![
+            ("list-type", "2".to_string()),
+            ("max-keys", current.remaining.to_string()),
+        ];
+        base.extend(input.prefix.clone().map(|prefix| ("prefix", prefix)));
+        base.extend(input.delimiter.clone().map(|group| ("delimiter", group)));
+        base.extend(start);
+        let query = range_query(&base, &current.range);
+        let request = ("ListObjectsV2", input.bucket.as_str(), query);
+        let asked = (&current.range, copies, only);
+        let ask = AskMembersOperation::new(&self.from, self.snapshot()?, asked, request);
+        self.step = step;
+        Ok(Next::Call(IoCall::child(ask)))
+    }
+
+    fn list_here(&mut self) -> ObjectsTurn {
+        let current = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        let mut sub = self.input.clone();
+        sub.max_keys = Some(current.remaining);
+        if !self.first || current.resumed.is_some() {
+            (sub.continuation_token, sub.start_after) = (None, None);
+        }
+        let hidden = match &current.resumed {
+            Some((_, _, cursor)) => {
+                Some(open_cursor::<HiddenCursor>(cursor).ok_or(MergeError::Token)?)
+            }
+            None => None,
+        };
+        let range = &current.range;
+        let source = RecordSource {
+            bounds: Some((range.lower.clone(), range.upper.clone())),
+        };
+        let shows = &self.shows;
+        let rule = LinkShows {
+            keys: shows.keys.clone(),
+            caller: shows.caller.clone(),
+            realm_id: shows.realm_id,
+            node: shows.node,
+        };
+        let list = VisiblePageOperation::new(source, rule, sub, hidden);
+        self.step = ObjectsStep::Local;
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn local_listed(&mut self, page: VisiblePage<ListedObject>) -> ObjectsTurn {
+        let (token, sealed) = match page.next {
+            Some(NextPage::After(token)) => (Some(token), None),
+            Some(NextPage::Sealed(sealed)) => (None, Some(sealed)),
+            None => (None, None),
+        };
+        let objects = (page.objects.into_iter())
+            .map(|object| MergedObject::Local(Box::new(object)))
+            .collect();
+        let part = ObjectsPart {
+            objects,
+            prefixes: page.prefixes,
+            token,
+            sealed,
+        };
+        let current = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        // Listing here instead of the coordinator lists this member's copy.
+        let copy = (current.resumed.as_ref()).map_or(!current.local, |(_, copy, _)| *copy);
+        self.apply(part, self.shows.node.local, copy)
+    }
+
+    /// Narrows a holder's page to what this node's own rules of the caller allow.
+    fn remote_listed(&mut self, body: &str, lister: NodeId, copy: bool) -> ObjectsTurn {
+        let mut part = remote_objects(body)?;
+        let keys = &self.shows.keys;
+        (part.objects).retain(|object| keys.allows(object.key()));
+        (part.prefixes).retain(|prefix| keys.groups(prefix));
+        self.apply(part, lister, copy)
+    }
+
+    fn apply(&mut self, part: ObjectsPart, lister: NodeId, copy: bool) -> ObjectsTurn {
+        let current = self.current.take().ok_or(IoError::Unfinished)?;
+        self.first = false;
+        let keys = (part.objects.iter().map(MergedObject::key))
+            .chain(part.prefixes.iter().map(String::as_str));
+        self.bytes += keys.map(str::len).sum::<usize>();
+        for prefix in part.prefixes {
+            if self.last_prefix.as_deref() == Some(prefix.as_str()) {
+                continue;
+            }
+            self.last_prefix = Some(prefix.clone());
+            self.page_prefix = Some(prefix.clone());
+            self.page.prefixes.push(prefix);
+        }
+        if let Some(object) = part.objects.last() {
+            self.last_key = Some(object.key().to_string());
+        }
+        self.page.objects.extend(part.objects);
+        // A range that stopped among hidden entries goes on from its member's cursor.
+        if let Some(cursor) = part.sealed {
+            return self.finish(Some(MergeResume::Sealed {
+                lower: current.range.lower,
+                node: lister,
+                copy,
+                cursor,
+                group: self.last_prefix.clone(),
+            }));
+        }
+        if part.token.is_some() {
+            self.page.token = part.token;
+            return self.finish(None);
+        }
+        self.next_range()
+    }
+
+    /// The range's lister cannot answer, so this member's copy or another lists.
+    fn lister_failed(&mut self, start: Option<(&'static str, String)>) -> ObjectsTurn {
+        let current = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        self.page.stale.push(current.range.range_id);
+        let member = self.from.binding.member_id;
+        let here = (self.snapshot()?.record_holders(&current.range).iter())
+            .any(|holder| holder.member_id == member);
+        match here {
+            true => self.list_here(),
+            false => self.ask(start, (true, None), ObjectsStep::Asked(true)),
+        }
+    }
+}
+
+impl<K> Operation for MergedObjectsOperation<K>
+where
+    K: ListingKeys + Clone + 'static,
+{
+    type Output = MergedObjects;
+    type Error = MergeError;
+
+    fn first(&mut self) -> ObjectsTurn {
+        Ok(Next::Call(IoCall::child(bound_view(&self.from.binding))))
+    }
+
+    fn next(&mut self, result: IoResult) -> ObjectsTurn {
+        match std::mem::replace(&mut self.step, ObjectsStep::Local) {
+            ObjectsStep::View => {
+                self.view = Some(result.child::<DistributionView, GuardError>()??);
+                self.step = ObjectsStep::Fence;
+                let fence = local_fence(self.from.binding.set_id);
+                Ok(Next::Call(IoCall::child(fence)))
+            }
+            ObjectsStep::Fence => {
+                self.fence = Some(result.child::<LocalFence, GuardError>()??);
+                self.plan()
+            }
+            ObjectsStep::Local => {
+                let page = result
+                    .child::<VisiblePage<ListedObject>, VisibleError<LinkError, ListBucketError>>(
+                    )?;
+                self.local_listed(page.map_err(MergeError::Listing)?)
+            }
+            ObjectsStep::Primary(start) => match result.child::<(String, NodeId), MergeError>()? {
+                Ok((body, lister)) => self.remote_listed(&body, lister, false),
+                Err(error) if error.unreachable() => self.lister_failed(start),
+                Err(error) => Err(error),
+            },
+            ObjectsStep::Asked(copy) => {
+                let (body, lister) = result.child::<(String, NodeId), MergeError>()??;
+                self.remote_listed(&body, lister, copy)
+            }
+        }
+    }
+}
+
+/// One range's entries of a marker listing, with the keys the merge orders them by.
+#[derive(Debug, PartialEq)]
+pub struct MarkerPart<P> {
+    pub part: P,
+    keys: Vec<String>,
+    prefixes: Vec<String>,
+    next: Option<(String, Option<String>)>,
+}
+
+/// A merged marker listing: its parts in key order, its common prefixes and next markers.
+#[derive(Debug, PartialEq)]
+pub struct MergedMarkers<P> {
+    pub parts: Vec<P>,
+    pub prefixes: Vec<String>,
+    pub next: Option<(String, Option<String>)>,
+}
+
+/// What one kind of marker listing does for one range.
+pub trait MarkerSource: Send + Debug + PartialEq {
+    type Part: Send + Debug + PartialEq + 'static;
+    fn prefix(&self) -> Option<&str>;
+    fn key_marker(&self) -> Option<&str>;
+    fn id_marker(&self) -> Option<&str>;
+    fn binding(&self) -> &DistributionBinding;
+    fn needs_fence(&self) -> bool;
+    fn is_local(
+        &self,
+        snapshot: &DistributionSnapshot,
+        fence: Option<&LocalFence>,
+        range: &KeyRange,
+    ) -> bool;
+    /// The call that lists `range` from `markers`, at most `remaining` entries.
+    fn call(
+        &self,
+        (snapshot, range, local): (&DistributionSnapshot, &KeyRange, bool),
+        markers: (Option<String>, Option<String>),
+        remaining: usize,
+    ) -> Result<IoCall, MergeError>;
+    fn take(&self, local: bool, result: IoResult) -> Result<MarkerPart<Self::Part>, MergeError>;
+}
+
+#[derive(Debug, PartialEq)]
+enum MarkerStep {
+    View,
+    Fence,
+    Part(bool),
+}
+
+type MarkerTurn<P> = Result<Next<MergedMarkers<P>>, MergeError>;
+
+/// One merged marker listing page over every range under the prefix.
+#[derive(Debug, PartialEq)]
+pub struct MergedMarkersOperation<S: MarkerSource> {
+    source: S,
+    max: usize,
+    view: Option<DistributionView>,
+    fence: Option<LocalFence>,
+    ranges: VecDeque<KeyRange>,
+    parts: Vec<S::Part>,
+    prefixes: Vec<String>,
+    entries: usize,
+    next_markers: Option<(String, Option<String>)>,
+    last: Option<String>,
+    first: bool,
+    bytes: usize,
+    visited: usize,
+    step: MarkerStep,
+}
+
