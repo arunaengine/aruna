@@ -25,10 +25,23 @@ fn config() -> IoResult {
     child(Ok::<_, GetConfigError>(config))
 }
 
+fn contact_call() -> Result<Next<Option<AuthContext>>, MetadataReadError> {
+    let contact = Effect::Net(NetEffect::PeerContact(node(1)));
+    Ok(Next::Call(IoCall::Effect(Box::new(contact))))
+}
+
+fn contacted() -> IoResult {
+    IoResult::Event(Box::new(aruna_core::events::Event::Net(
+        aruna_core::events::NetEvent::PeerContact,
+    )))
+}
+
+// The bearer check refreshes the last contact itself, so the read adds no refresh.
 #[test]
 fn bearer_read_checked() {
     let mut read = ReadPeerOperation::new((node(1), realm()), bearer(), false);
-    assert!(runs_child(read.first()));
+    let check = WritePeerOperation::new(node(1), bearer().unwrap());
+    assert_eq!(read.first(), Ok(Next::Call(IoCall::child(check))));
     let auth = AuthContext::anonymous(realm());
     assert_eq!(read.next(caller(realm())), Ok(Next::Done(Some(auth))));
 }
@@ -67,7 +80,20 @@ fn replay_read_refused() {
 fn anonymous_member_reads() {
     let mut read = ReadPeerOperation::new((node(1), realm()), None, true);
     assert!(runs_child(read.first()));
-    assert_eq!(read.next(config()), Ok(Next::Done(None)));
+    assert_eq!(read.next(config()), contact_call());
+    assert_eq!(read.next(contacted()), Ok(Next::Done(None)));
+}
+
+// An internal token is checked quietly; the accepted read refreshes the contact afterwards.
+#[test]
+fn internal_read_contacts() {
+    let token = AuthToken::Internal(AuthContext::anonymous(realm()));
+    let mut read = ReadPeerOperation::new((node(1), realm()), Some(token.clone()), false);
+    let check = WritePeerOperation::quiet(node(1), token);
+    assert_eq!(read.first(), Ok(Next::Call(IoCall::child(check))));
+    assert_eq!(read.next(caller(realm())), contact_call());
+    let auth = AuthContext::anonymous(realm());
+    assert_eq!(read.next(contacted()), Ok(Next::Done(Some(auth))));
 }
 
 #[test]
@@ -99,11 +125,13 @@ fn bucket_search_anonymous() {
     assert_eq!(search.next(config()), Ok(Next::Done(anonymous)));
 }
 
+// A search caller's check leaves the peer's last contact as it was.
 #[test]
 fn bearer_search_checked() {
     let reader = PeerReader::Objects;
     let mut search = SearchPeerOperation::new((node(1), realm()), bearer(), reader);
-    assert!(runs_child(search.first()));
+    let check = WritePeerOperation::quiet(node(1), bearer().unwrap());
+    assert_eq!(search.first(), Ok(Next::Call(IoCall::child(check))));
     let auth = AuthContext::anonymous(realm());
     assert_eq!(search.next(caller(realm())), Ok(Next::Done(auth)));
 }

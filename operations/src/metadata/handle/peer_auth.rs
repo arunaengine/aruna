@@ -58,7 +58,6 @@ impl MetadataHandle {
                 .await
                 .map_err(WritePeerError::Unavailable)?
                 .ok_or(WritePeerError::Unauthorized)?;
-            self.note_peer_contact(peer);
             return Ok(auth);
         };
         let auth = self
@@ -87,17 +86,23 @@ impl MetadataHandle {
             .await
             .map_err(WritePeerError::Unavailable)?;
         }
-        self.note_peer_contact(peer);
         Ok(auth)
     }
 
-    /// The answer to a forwarded token, in the terms an operation receives.
+    /// The answer to a forwarded token, in the terms an operation receives. An accepted caller
+    /// refreshes the peer's last-contact time when the request asks for it.
     pub(crate) async fn check_write_peer(
         &self,
         request: WritePeerRequest,
     ) -> Result<Box<AuthContext>, PeerAuthRefusal> {
-        self.authorize_write_peer(request.peer, Some(request.token))
+        let (peer, contact) = (request.peer, request.contact);
+        self.authorize_write_peer(peer, Some(request.token))
             .await
+            .inspect(|_| {
+                if contact {
+                    self.note_peer_contact(peer);
+                }
+            })
             .map(Box::new)
             .map_err(|error| match error {
                 WritePeerError::Unauthorized => PeerAuthRefusal::Unauthorized,
@@ -109,7 +114,7 @@ impl MetadataHandle {
 
     /// This node's own liveness observation, taken where the peer identity is
     /// authorized. Never realm state: it is neither replicated nor published.
-    fn note_peer_contact(&self, peer: NodeId) {
+    pub(crate) fn note_peer_contact(&self, peer: NodeId) {
         self.inner.peer_contacts.note(peer, unix_timestamp_millis());
     }
 

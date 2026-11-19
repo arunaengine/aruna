@@ -130,6 +130,8 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::WritePeerAuth(request)) => {
             Box::pin(metadata::dispatch_peer_auth(*request, context)).await
         }
+        // Peer contacts live in the metadata handle the runner holds.
+        Effect::Net(NetEffect::PeerContact(peer)) => metadata::dispatch_contact(peer, context),
         // The routed export reads through the handles the runner holds.
         Effect::Net(NetEffect::DatasetSummary(request)) => {
             metadata::dispatch_summary(*request, context).await

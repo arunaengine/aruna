@@ -838,6 +838,9 @@ pub enum NetEffect {
     /// Checks a forwarded caller's token for a write from `peer`; answers
     /// `NetEvent::WritePeerAuth`.
     WritePeerAuth(Box<WritePeerRequest>),
+    /// Refreshes the last-contact time of a peer whose request was just accepted; answers
+    /// `NetEvent::PeerContact`.
+    PeerContact(NodeId),
     /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
     DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
     /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
@@ -962,6 +965,8 @@ pub struct MetadataRequestEffect {
 pub struct WritePeerRequest {
     pub peer: NodeId,
     pub token: crate::metadata::AuthToken,
+    /// Whether an accepted caller refreshes the peer's last-contact time.
+    pub contact: bool,
 }
 
 /// Shows the frame size only: a frame can carry credentials or the realm key.

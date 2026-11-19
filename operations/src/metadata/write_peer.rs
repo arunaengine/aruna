@@ -17,8 +17,23 @@ pub struct WritePeerOperation {
 }
 
 impl WritePeerOperation {
+    /// The check of a forwarded caller that refreshes the peer's last-contact time once accepted.
     pub fn new(peer: NodeId, token: AuthToken) -> Self {
-        let request = WritePeerRequest { peer, token };
+        let request = WritePeerRequest {
+            peer,
+            token,
+            contact: true,
+        };
+        Self { request }
+    }
+
+    /// The same check, leaving the peer's last-contact time as it was.
+    pub fn quiet(peer: NodeId, token: AuthToken) -> Self {
+        let request = WritePeerRequest {
+            peer,
+            token,
+            contact: false,
+        };
         Self { request }
     }
 }
