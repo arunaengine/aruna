@@ -4,5 +4,6 @@
 
 pub mod documents;
 pub mod jobs;
+pub mod metadata;
 pub mod projection;
 pub mod tokens;

@@ -25,7 +25,7 @@ use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDo
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::revision_read::RawViewOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
-use aruna_operations::testing::process_prune_batch;
+use aruna_test_support::metadata::process_prune_batch;
 
 pub(super) const LINK_TOKEN: &str = "link-token";
 

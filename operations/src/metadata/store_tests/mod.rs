@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::testing::export_rocrate_jsonld;
+use aruna_test_support::metadata::export_rocrate_jsonld;
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_core::NodeId;
 use aruna_core::events::Event;

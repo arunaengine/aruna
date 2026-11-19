@@ -24,7 +24,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::DriverContext;
 use aruna_graph::GraphHandle;
-use aruna_operations::testing::process_materialization_batch;
+use aruna_test_support::metadata::process_materialization_batch;
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
@@ -362,7 +362,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     );
     materialize_entity_upsert(metadata_handle, &patch_event).await?;
     let projected: serde_json::Value = serde_json::from_str(
-        &aruna_operations::testing::export_rocrate_jsonld(
+        &aruna_test_support::metadata::export_rocrate_jsonld(
             metadata_handle,
             create_event.record.graph_iri.clone(),
         )

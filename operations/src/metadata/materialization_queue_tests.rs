@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use std::thread;
 use tempfile::tempdir;
 
-use crate::testing::process_materialization_batch;
+use aruna_test_support::metadata::process_materialization_batch;
 use aruna_drivers::testing::write_entries;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;

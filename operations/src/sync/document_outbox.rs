@@ -276,7 +276,7 @@ mod tests {
     use crate::sync::outbox_record::{
         new_identified_record, new_outbox_record, write_outbox_effect,
     };
-    use crate::testing::{read_outbox_record, read_outbox_records};
+    use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{

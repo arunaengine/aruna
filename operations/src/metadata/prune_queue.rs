@@ -729,7 +729,7 @@ pub fn jobs_queued() -> DuePruneOperation {
 mod tests {
     use super::*;
     use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
-    use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
+    use aruna_test_support::metadata::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};

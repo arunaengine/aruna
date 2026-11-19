@@ -60,10 +60,10 @@ use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::drain_projection_queue;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
 use aruna_test_support::projection::schedule_projection_drain;
-use aruna_operations::testing::{process_graph_tombstones, prune_jobs_exist};
+use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use serde_json::json;
@@ -256,7 +256,7 @@ async fn public_routes_work() {
     assert_eq!(raw.context_digest.len(), 64);
     assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
     assert!(raw.projected_event_id.is_none());
-    let projected_jsonld = aruna_operations::testing::export_rocrate_jsonld(
+    let projected_jsonld = aruna_test_support::metadata::export_rocrate_jsonld(
         test.state.get_ctx().as_ref(),
         created.summary.graph_iri.clone(),
     )
