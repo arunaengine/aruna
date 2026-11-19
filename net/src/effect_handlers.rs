@@ -309,11 +309,16 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         }
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Shard(_) => NetEvent::Shard(Box::new(ShardNetEvent::NoNetwork)),
-        NetEffect::EnsureTopics { .. } | NetEffect::AllowTopicPeers { .. } => {
+        NetEffect::EnsureTopics { .. }
+        | NetEffect::AllowTopicPeers { .. }
+        | NetEffect::SyncTopic { .. } => {
             NetEvent::TopicPeers(Err(aruna_core::events::TopicPeerError::Failed(
                 "topic peers must be set by the operations runner".to_string(),
             )))
         }
+        NetEffect::MissingTopicPeers { .. } => NetEvent::MissingTopicPeers(Err(
+            "topic members must be read by the operations runner".to_string(),
+        )),
         NetEffect::RevocationClaims(_) => NetEvent::RevocationClaims(Err(
             "token checks must be dispatched by the operations runner".to_string(),
         )),
@@ -687,6 +692,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Shard(_) => "shard",
         NetEffect::EnsureTopics { .. } => "ensure_topics",
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
+        NetEffect::SyncTopic { .. } => "sync_topic",
+        NetEffect::MissingTopicPeers { .. } => "missing_topic_peers",
         NetEffect::RevocationClaims(_) => "revocation_claims",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",

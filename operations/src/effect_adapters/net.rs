@@ -192,20 +192,50 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
 
 /// Runs the topic peer effects through the handle; hands any other effect back.
 async fn set_topic_peers(effect: NetEffect, context: &DriverContext) -> Result<Event, NetEffect> {
-    let (topics, peers, create) = match effect {
-        NetEffect::EnsureTopics { topics, peers } => (topics, peers, true),
-        NetEffect::AllowTopicPeers { topics, peers } => (topics, peers, false),
+    let Some(net) = &context.net_handle else {
+        return match effect {
+            NetEffect::MissingTopicPeers { .. } => Ok(Event::Net(NetEvent::MissingTopicPeers(
+                Err("no network".to_string()),
+            ))),
+            NetEffect::EnsureTopics { .. }
+            | NetEffect::AllowTopicPeers { .. }
+            | NetEffect::SyncTopic { .. } => Ok(Event::Net(NetEvent::TopicPeers(Err(
+                TopicPeerError::NoNetwork,
+            )))),
+            other => Err(other),
+        };
+    };
+    let result = match effect {
+        NetEffect::EnsureTopics { topics, peers } => net.ensure_sync_topics(&topics, peers).await,
+        NetEffect::AllowTopicPeers { topics, peers } => net.allow_topic_peers(&topics, peers).await,
+        NetEffect::SyncTopic { topic, peers } => net.sync_topic_peers(topic, peers).await,
+        NetEffect::MissingTopicPeers { topic, peers } => {
+            let missing = missing_peers(net, topic, peers);
+            return Ok(Event::Net(NetEvent::MissingTopicPeers(missing)));
+        }
         other => return Err(other),
     };
-    let result = match &context.net_handle {
-        None => Err(TopicPeerError::NoNetwork),
-        Some(net) => match create {
-            true => net.ensure_sync_topics(&topics, peers).await,
-            false => net.allow_topic_peers(&topics, peers).await,
-        }
-        .map_err(|error| TopicPeerError::Failed(error.to_string())),
-    };
+    let result = result.map_err(|error| TopicPeerError::Failed(error.to_string()));
     Ok(Event::Net(NetEvent::TopicPeers(result)))
+}
+
+/// The peers of `peers` that are not members of `topic`, or `None` without its state here.
+fn missing_peers(
+    net: &NetHandle,
+    topic: irokle::TopicId,
+    peers: Vec<NodeId>,
+) -> Result<Option<Vec<NodeId>>, String> {
+    let sync_node = net.document_sync_node();
+    let state = irokle::Storage::topic_state(sync_node.storage(), &topic)
+        .map_err(|error| error.to_string())?;
+    Ok(state.map(|state| {
+        (peers.into_iter())
+            .filter(|peer| {
+                let member = irokle::PeerId::from_bytes(*peer.as_bytes());
+                !state.members.contains(&member)
+            })
+            .collect()
+    }))
 }
 
 /// Signs a granted read with this node's key, sends it and opens the holder's answer.

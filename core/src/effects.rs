@@ -866,6 +866,17 @@ pub enum NetEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
+    /// Syncs one topic with these peers; answers `NetEvent::TopicPeers`.
+    SyncTopic {
+        topic: irokle::TopicId,
+        peers: Vec<NodeId>,
+    },
+    /// The peers of `peers` that one topic does not have as members; answers
+    /// `NetEvent::MissingTopicPeers`.
+    MissingTopicPeers {
+        topic: irokle::TopicId,
+        peers: Vec<NodeId>,
+    },
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
