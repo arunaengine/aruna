@@ -23,7 +23,7 @@ pub(crate) mod graph_deleted;
 pub(crate) mod handle;
 pub mod id_mapping;
 pub mod identifier_lookup;
-mod iri_index;
+pub(crate) mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
 pub mod materialization_queue;

@@ -744,7 +744,7 @@ pub trait MarkerSource: Send + Debug + PartialEq {
     /// The call that lists `range` from `markers`, at most `remaining` entries.
     fn call(
         &self,
-        (snapshot, range, local): (&DistributionSnapshot, &KeyRange, bool),
+        scope: (&DistributionSnapshot, &KeyRange, bool),
         markers: (Option<String>, Option<String>),
         remaining: usize,
     ) -> Result<IoCall, MergeError>;

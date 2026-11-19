@@ -20,8 +20,9 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, KeyRange, LocalFence, RouteError, WriteRoute,
+    DistributionBinding, DistributionView, KeyRange, RouteError, WriteRoute,
 };
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::structs::{

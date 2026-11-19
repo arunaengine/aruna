@@ -482,7 +482,7 @@ impl DistributedQueryOperation {
     fn fanout(&mut self) -> Result<Next<QueryAnswer>, MetadataApiError> {
         let ordered = match self.single_dataset() {
             true => None,
-            false => ordered_query(&self.query)?.map(|(partition, _)| partition),
+            false => ordered_query(&self.query)?,
         };
         let ties = ordered.as_ref().and(self.select_limit);
         let calls = QueryCalls {
