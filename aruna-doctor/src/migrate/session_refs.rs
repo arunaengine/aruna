@@ -214,9 +214,43 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
         visitor.visit_newtype_struct(self)
     }
 
+    /// A struct, such as a clock, with every field at its zero value.
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, E> {
+        visitor.visit_seq(ZeroFields::<E> {
+            left: fields.len(),
+            error: PhantomData,
+        })
+    }
+
     serde::forward_to_deserialize_any! {
         i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char bytes byte_buf unit
-        unit_struct tuple_struct struct enum identifier ignored_any
+        unit_struct tuple_struct enum identifier ignored_any
+    }
+}
+
+/// The fields of a struct an older layout lacks, each at its zero value.
+struct ZeroFields<E> {
+    left: usize,
+    error: PhantomData<E>,
+}
+
+impl<'de, E: serde::de::Error> SeqAccess<'de> for ZeroFields<E> {
+    type Error = E;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, E> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        self.left -= 1;
+        seed.deserialize(Zero(PhantomData)).map(Some)
     }
 }
 

@@ -200,8 +200,9 @@ fn spec_row() -> Vec<u8> {
 
 #[test]
 fn deletes_unnamed_jobs() {
-    // Job, launch and reservation rows without the backend names, and a spec whose execution
-    // spec lacks it, go with the job's index rows and the spec's family. Current rows stay.
+    // Job, launch and reservation rows as alpha.206 stored them, without the backend names, the
+    // local admission and the cited clock, and a spec whose execution spec lacks the name, go with
+    // the job's index rows and the spec's family. Current rows stay.
     let temp = tempdir().unwrap();
     let path = temp.path().join("db");
     let intent = AttemptIntent {
