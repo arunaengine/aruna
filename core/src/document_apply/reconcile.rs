@@ -20,10 +20,13 @@ use crate::deferred_topics::{
     remove_deferred_topic,
 };
 use crate::document::{
-    DocumentEffect, DocumentNetEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+    AppliedStep, AppliedSync, DocumentEffect, DocumentNetEvent, DocumentReconcileResult,
+    DocumentTarget, ReconcileBatch, applied_sync_entry,
 };
 use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
+use crate::id::NodeId;
+use crate::id_mint::IdMint;
 use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::{HoldScope, Operation, TransactionMode};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
@@ -118,6 +121,7 @@ enum Stage {
     Applying(BatchCursor),
     CheckingOverflow(BatchCursor, Box<BatchOutcome>),
     RecordingOverflow(BatchCursor, Box<BatchOutcome>),
+    QueuingFollowUps(BatchCursor, Box<BatchOutcome>),
     WritingCursor(irokle::TopicId, BTreeSet<DocumentSyncDependency>),
     WritingEvidence(irokle::TopicId, BTreeSet<DocumentSyncDependency>),
     SavingDeferred,
@@ -141,6 +145,10 @@ pub struct ReconcileTopicsOperation {
     cursor_writes: Vec<(irokle::TopicId, Row)>,
     rejections: Vec<SyncRejection>,
     saved_deferred: Vec<u8>,
+    /// The node whose drain runs the follow-ups of what the pass applies, when it queues them.
+    followups: Option<NodeId>,
+    ids: IdMint,
+    now_ms: u64,
     stage: Stage,
 }
 
@@ -158,8 +166,30 @@ impl ReconcileTopicsOperation {
             cursor_writes: Vec::new(),
             rejections: Vec::new(),
             saved_deferred: Vec::new(),
+            followups: None,
+            ids: IdMint::default(),
+            now_ms: 0,
             stage: Stage::Planning,
         }
+    }
+
+    /// Also stores the follow-ups of what each batch applies as applied sync rows for `node_id`'s
+    /// drain, before the cursor that would lose them can move.
+    pub fn queuing_followups(mut self, node_id: NodeId) -> Self {
+        self.followups = Some(node_id);
+        self
+    }
+
+    /// The applied sync row that queues `result`'s follow-ups, when this pass queues them.
+    fn followup_sync(&mut self, result: DocumentReconcileResult) -> Option<AppliedSync> {
+        let node_id = self.followups?;
+        Some(AppliedSync {
+            id: self.ids.mint(self.now_ms),
+            node_id,
+            realm_id: Some(self.realm_id),
+            result,
+            next: AppliedStep::Usage,
+        })
     }
 
     /// Also reloads the realm's peers when the pass applied a realm config.
@@ -214,17 +244,33 @@ impl ReconcileTopicsOperation {
     }
 
     fn settle(&mut self, cursor: BatchCursor, mut outcome: BatchOutcome) -> PassNext {
+        let applied = DocumentReconcileResult {
+            targets: outcome.applied_targets.clone(),
+            metadata_graph_tombstones: outcome.graph_tombstones.clone(),
+            ..DocumentReconcileResult::default()
+        };
+        self.result.targets.append(&mut outcome.applied_targets);
+        self.result
+            .metadata_graph_tombstones
+            .append(&mut outcome.graph_tombstones);
+        self.pending_creates.append(&mut outcome.pending_creates);
+        let queued = !applied.targets.is_empty() || !applied.metadata_graph_tombstones.is_empty();
+        // The follow-ups of what the batch applied are stored before its cursor can move.
+        if let Some(sync) = self.followup_sync(applied).filter(|_| queued) {
+            let row = applied_sync_entry(&sync).map_err(invalid)?;
+            let stage = Stage::QueuingFollowUps(cursor, Box::new(outcome));
+            return self.call(stage, IoCall::Write(vec![row]));
+        }
+        self.advance(cursor, outcome)
+    }
+
+    fn advance(&mut self, cursor: BatchCursor, mut outcome: BatchOutcome) -> PassNext {
         let BatchCursor {
             topic_id,
             key,
             value,
             ..
         } = cursor;
-        self.result.targets.append(&mut outcome.applied_targets);
-        self.result
-            .metadata_graph_tombstones
-            .append(&mut outcome.graph_tombstones);
-        self.pending_creates.append(&mut outcome.pending_creates);
         if !outcome.cross_topic.is_empty() {
             remove_deferred_topic(&mut self.work.deferred, topic_id);
             for dependency in outcome.cross_topic {
@@ -294,11 +340,13 @@ impl ReconcileTopicsOperation {
     }
 
     fn apply_creates(&mut self) -> PassNext {
+        let followups = self.followup_sync(DocumentReconcileResult::default());
         let plan = CreateBatchPlan::new(
             std::mem::take(&mut self.pending_creates),
             std::mem::take(&mut self.cursor_writes),
             std::mem::take(&mut self.rejections),
-        )?;
+        )?
+        .queuing(followups);
         self.call(Stage::ApplyingCreates, plan_call(plan))
     }
 
@@ -424,6 +472,10 @@ impl Operation for ReconcileTopicsOperation {
                 result.done()?;
                 self.settle(cursor, *outcome)
             }
+            Stage::QueuingFollowUps(cursor, outcome) => {
+                result.done()?;
+                self.advance(cursor, *outcome)
+            }
             Stage::WritingCursor(topic, satisfied) => {
                 result.done()?;
                 self.topic_done(topic, satisfied)
@@ -465,6 +517,14 @@ impl Operation for ReconcileTopicsOperation {
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::DocumentReconcile)
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

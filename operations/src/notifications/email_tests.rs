@@ -556,22 +556,28 @@ async fn enqueue_always_queues() {
 #[tokio::test]
 async fn restore_prunes_password() {
     // A deletion that arrives through restart recovery clears the cached password too.
-    use aruna_core::document::{DocumentNetEvent, DocumentTarget};
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, DocumentTarget, applied_sync_entry,
+    };
     let staging = setup_driver_context().await;
     let context = Arc::new(staging.driver_context.clone());
     seed_profile(&context, Some(profile(1, true))).await;
     seed_profile(&context, None).await;
-    let applied = DocumentNetEvent::DocumentsReconciled {
-        applied: 1,
-        targets: vec![DocumentTarget::RealmConfig {
-            realm_id: user().realm_id,
-        }],
-        metadata_create_events: Vec::new(),
-        metadata_graph_tombstones: Vec::new(),
+    let targets = vec![DocumentTarget::RealmConfig {
+        realm_id: user().realm_id,
+    }];
+    let applied = AppliedSync {
+        id: Ulid::from_parts(1, 1),
+        node_id: node(),
+        realm_id: context.node_and_realm().map(|(_, realm_id)| realm_id),
+        result: DocumentReconcileResult {
+            targets,
+            ..DocumentReconcileResult::default()
+        },
+        next: AppliedStep::Usage,
     };
-    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
-    let apply = crate::shard::pull::ApplyPulledOperation::new(node(), realm_id, applied);
-    assert!(aruna_drivers::driver::drive(apply, &context).await.unwrap());
+    let row = applied_sync_entry(&applied).unwrap();
+    aruna_drivers::testing::write_entries(&context.storage_handle, vec![row]).await;
     let followups = crate::node::applied_drain::AppliedDrainOperation::new();
     aruna_drivers::driver::drive(followups, &context)
         .await

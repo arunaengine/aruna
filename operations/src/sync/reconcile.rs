@@ -18,6 +18,7 @@ pub struct SyncTopicsOperation {
     realm_id: RealmId,
     effect: Option<DocumentEffect>,
     fetched: Option<DocumentNetEvent>,
+    followups: Option<NodeId>,
     reconciling: bool,
 }
 
@@ -32,12 +33,18 @@ impl SyncTopicsOperation {
         Self::with(realm_id, DocumentEffect::SyncDocument { topic, peers })
     }
 
-    /// Reconciles after a fetch that already ended with `fetched`.
-    pub(crate) fn after_fetch(realm_id: RealmId, fetched: DocumentNetEvent) -> Self {
+    /// Reconciles after a fetch that already ended with `fetched` and stores the follow-ups of
+    /// what it applies for `node_id`'s drain.
+    pub(crate) fn after_fetch(
+        realm_id: RealmId,
+        fetched: DocumentNetEvent,
+        node_id: NodeId,
+    ) -> Self {
         Self {
             realm_id,
             effect: None,
             fetched: Some(fetched),
+            followups: Some(node_id),
             reconciling: false,
         }
     }
@@ -47,6 +54,7 @@ impl SyncTopicsOperation {
             realm_id,
             effect: Some(effect),
             fetched: None,
+            followups: None,
             reconciling: false,
         }
     }
@@ -58,7 +66,10 @@ impl SyncTopicsOperation {
         match fetched {
             DocumentNetEvent::DocumentsSynced { topics } => {
                 self.reconciling = true;
-                let reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                let mut reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                if let Some(node_id) = self.followups {
+                    reconcile = reconcile.queuing_followups(node_id);
+                }
                 Ok(Next::Call(IoCall::child(reconcile)))
             }
             DocumentNetEvent::Error { error, .. } => Err(ApplyError::Failed(error)),
@@ -110,6 +121,10 @@ mod tests {
         RealmId::from_bytes([1; 32])
     }
 
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
     fn topic() -> irokle::TopicId {
         irokle::TopicId::from_bytes([3; 32])
     }
@@ -146,8 +161,9 @@ mod tests {
         let fetched = DocumentNetEvent::DocumentsSynced {
             topics: vec![topic()],
         };
-        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched, node());
         let reconcile = ReconcileTopicsOperation::new(realm(), vec![topic()]);
+        let reconcile = reconcile.queuing_followups(node());
         let expected = Next::Call(IoCall::child(reconcile));
         assert_eq!(operation.first(), Ok(expected));
     }
@@ -158,7 +174,7 @@ mod tests {
             target: None,
             error: "no peer".to_string(),
         };
-        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched, node());
         let expected = ApplyError::Failed("no peer".to_string());
         assert_eq!(operation.first(), Err(expected));
     }

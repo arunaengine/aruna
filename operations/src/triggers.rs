@@ -214,9 +214,10 @@ impl TimerRun for WatchDrainOperation {
 }
 
 impl TimerRun for AppliedDrainOperation {
-    /// A finished run waits for the next applied reconcile; a failed one runs again later.
+    /// A finished run waits for the next applied reconcile; one that kept a row after a failed
+    /// follow-up, or that failed itself, runs again later.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map(|()| None).map_err(TimerFailure::from)
+        result.map_err(TimerFailure::from)
     }
 }
 
