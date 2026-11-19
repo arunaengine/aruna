@@ -14,13 +14,15 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::share::{SHARE_CREDENTIAL_PREFIX, ShareLink};
-use aruna_operations::s3::object::range_list::{DelegatedCaller, MemberAccess};
+use aruna_operations::s3::object::member_read::{MemberFailure, MemberRefusal};
+use aruna_operations::s3::object::range_list::MemberAccess;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use s3s::dto::StreamingBlob;
 
 use super::visit::{range_unavailable, unavailable};
 use crate::error::ServerError;
+use crate::s3::service::delegated_caller;
 use crate::server::state::ServerState;
 
 /// What a visit sends other members about `info`'s bucket: the creator narrowed as `auth` is,
@@ -57,35 +59,37 @@ pub(crate) fn share_listing(
     expiry: u64,
 ) -> MemberAccess {
     let user = share_access(state, link, (auth, info), expiry);
-    let credential_expiry = (user.expiry.duration_since(UNIX_EPOCH)).map_or(0, |end| end.as_secs());
-    MemberAccess::Delegated(DelegatedCaller {
-        user_id: user.user_identity,
-        group_id: user.group_id,
-        credential_id: user.access_key,
-        restrictions: user.path_restrictions,
-        credential_expiry,
-    })
-}
-
-/// A member's refusal of a listing as a visitor's answer, like [`member_error`].
-pub(crate) fn listing_refusal(refusal: RangeRefusal) -> ServerError {
-    match refusal.status {
-        403 => unavailable(),
-        404 => ServerError::NotFound,
-        400 => ServerError::BadRequestReason(refusal.message),
-        _ => range_unavailable("cannot be reached"),
-    }
+    MemberAccess::Delegated(delegated_caller(&user))
 }
 
 /// A member's refusal as a visitor's answer; a denial reads like an ended link.
-pub(crate) fn member_error(error: &s3s::S3Error) -> ServerError {
-    let message = error.message().unwrap_or_default().to_string();
-    match error.status_code().map(|status| status.as_u16()) {
+fn refused_visit(status: Option<u16>, message: String) -> ServerError {
+    match status {
         Some(403) => unavailable(),
         Some(404) => ServerError::NotFound,
         Some(400) => ServerError::BadRequestReason(message),
         _ => range_unavailable("cannot be reached"),
     }
+}
+
+/// A member's refusal of a listing as a visitor's answer.
+pub(crate) fn listing_refusal(refusal: RangeRefusal) -> ServerError {
+    refused_visit(Some(refusal.status), refusal.message)
+}
+
+/// A failed read at another member as a visitor's answer.
+pub(crate) fn read_refusal(failure: MemberFailure) -> ServerError {
+    let status = failure.refusal.status();
+    let message = match failure.refusal {
+        MemberRefusal::Refused { message, .. } => message,
+        _ => String::new(),
+    };
+    refused_visit(Some(status), message)
+}
+
+fn member_error(error: &s3s::S3Error) -> ServerError {
+    let status = error.status_code().map(|status| status.as_u16());
+    refused_visit(status, error.message().unwrap_or_default().to_string())
 }
 
 /// The body of a visitor's upload.

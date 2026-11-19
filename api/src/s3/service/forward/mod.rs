@@ -358,19 +358,28 @@ fn unreachable_error(forward: &Forward, reach: &str) -> S3Error {
 
 /// The coordinator's refusal as this node's answer; a denial says why node globs help.
 fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) -> S3Error {
-    let code = xml_field(body, "Code")
+    let message = xml_field(body, "Message").unwrap_or_default();
+    refused_error(forward.node_id, status, xml_field(body, "Code"), message)
+}
+
+/// A member's refusal, given its status and S3 error fields, as this node's answer.
+fn refused_error(
+    node_id: NodeId,
+    status: http::StatusCode,
+    code: Option<String>,
+    message: String,
+) -> S3Error {
+    let code = code
         .map(|code| {
             S3ErrorCode::from_bytes(code.as_bytes())
                 .unwrap_or_else(|| S3ErrorCode::Custom(code.into()))
         })
         .unwrap_or(S3ErrorCode::InternalError);
-    let message = xml_field(body, "Message").unwrap_or_default();
     let message = match status {
         http::StatusCode::FORBIDDEN => format!(
-            "The node {} denied the request: {message} Every member checks the \
+            "The node {node_id} denied the request: {message} Every member checks the \
              caller on its own path; grant the bucket with a node glob such as \
-             /{{realm}}/g/{{group}}/data/*/{{bucket}}/**.",
-            forward.node_id
+             /{{realm}}/g/{{group}}/data/*/{{bucket}}/**."
         ),
         _ => message,
     };

@@ -47,7 +47,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::relay::{
-    UploadStream, counted_blob, listing_refusal, member_error, share_access, share_listing,
+    UploadStream, counted_blob, listing_refusal, read_refusal, share_access, share_listing,
     upload_error,
 };
 use super::{ShareModeBody, log_event, rfc3339};
@@ -58,11 +58,11 @@ use crate::forwarded::client_ip;
 use crate::lookup::{ObjectOutput, bucket_info};
 use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
-use crate::routes::federation::import::shared_stream;
 use crate::routes::storage::objects::{page_error, page_node};
-use crate::s3::service::{ArunaS3Service, ReadAnswer};
+use crate::s3::service::{ArunaS3Service, delegated_caller};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_operations::s3::object::member_read::{MemberKey, MemberRead, MemberReadOperation};
 use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -603,14 +603,26 @@ pub(crate) async fn head_version(
     if info.distribution.is_none() {
         return current_version(state, bucket, key).await;
     }
-    let service = member_service(state).await;
-    match service.member_head(user, (bucket, info), key).await {
-        Ok(ReadAnswer::Local(_)) => current_version(state, bucket, key).await,
-        Ok(ReadAnswer::Forwarded(response, _)) => Ok((response.headers().get("x-amz-version-id"))
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| Ulid::from_string(value).ok())),
-        Err(error) => Err(member_error(&error)),
+    match read_member(state, user, info, MemberKey::head(bucket, key)).await? {
+        MemberRead::Local(_) => current_version(state, bucket, key).await,
+        MemberRead::Remote { body, .. } => Ok(body.version()),
     }
+}
+
+/// Reads `key` where an S3 request of `user` would be answered.
+async fn read_member(
+    state: &ServerState,
+    user: &UserAccess,
+    info: &BucketInfo,
+    key: MemberKey,
+) -> ServerResult<MemberRead> {
+    let Some(binding) = info.distribution.clone() else {
+        return Ok(MemberRead::Local(None));
+    };
+    let context = state.get_ctx();
+    let ids = context.node_and_realm();
+    let read = MemberReadOperation::new(ids, delegated_caller(user), binding, key);
+    drive(read, &context).await.map_err(read_refusal)
 }
 
 async fn member_service(state: &ServerState) -> ArunaS3Service {
@@ -741,15 +753,14 @@ pub async fn download_file(
     let remote = match info.distribution.is_some() {
         true => {
             let user = share_access(&state, &link, (&auth, &info), ticket.expires_at);
-            let service = member_service(&state).await;
-            let read = service.member_get(&user, (&bucket, &info), &ticket.key, ticket.version_id);
-            match read.await.map_err(|error| member_error(&error))? {
-                ReadAnswer::Forwarded(response, _) => {
-                    let size = (response.headers().get(header::CONTENT_LENGTH))
-                        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
-                    Some((shared_stream(response.bytes_stream()), size))
+            let key = MemberKey::get(&bucket, &ticket.key, ticket.version_id);
+            match read_member(&state, &user, &info, key).await? {
+                MemberRead::Remote { body, .. } => {
+                    let size =
+                        (body.header("content-length")).and_then(|value| value.parse::<u64>().ok());
+                    Some((body.stream, size))
                 }
-                ReadAnswer::Local(_) => None,
+                MemberRead::Local(_) => None,
             }
         }
         false => None,

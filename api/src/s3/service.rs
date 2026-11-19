@@ -14,7 +14,7 @@ mod payload;
 mod pinned;
 
 pub(crate) use forward::forwarded_digest;
-pub(crate) use forward::reads::ReadAnswer;
+pub(crate) use forward::reads::delegated_caller;
 
 use crate::s3::auth::DelegatedRequest;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -127,6 +127,7 @@ use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjec
 use aruna_operations::s3::object::get::GetObjectInput as GOI;
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
+use aruna_operations::s3::object::member_read::MemberRead;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::read::{
     GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
@@ -2153,33 +2154,27 @@ impl S3 for ArunaS3Service {
         let key = req.input.key;
         let response_bucket = bucket.clone();
         let response_key = key.clone();
-        let request = || {
-            forward::reads::read_request(
-                http::Method::GET,
-                "GetObject",
-                &bucket,
-                &key,
-                req.uri.query(),
-                &req.headers,
-            )
-        };
-        let pinned = version_id.is_some();
+        let member_key = forward::reads::member_key(
+            false,
+            (&bucket, &key, version_id),
+            req.uri.query(),
+            &req.headers,
+        );
         let answer = self
-            .answer_read(
+            .member_read(
                 &req.extensions,
                 &user_access,
                 bucket_info.as_ref(),
-                (&key, pinned),
-                request,
+                member_key.clone(),
             )
             .await?;
         let stale = match answer {
-            forward::reads::ReadAnswer::Forwarded(response, stale) => {
-                let mut response = forward::reads::forwarded_get(response);
+            MemberRead::Remote { body, stale } => {
+                let mut response = forward::reads::forwarded_get(body);
                 forward::reads::mark_stale(&mut response.headers, stale.as_slice());
                 return Ok(response);
             }
-            forward::reads::ReadAnswer::Local(stale) => stale,
+            MemberRead::Local(stale) => stale,
         };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
@@ -2228,32 +2223,20 @@ impl S3 for ArunaS3Service {
                 if let Some(range_id) = stale {
                     return Err(forward::reads::stale_error(error, range_id));
                 }
-                let miss = self
-                    .copy_miss(&req.extensions, bucket_info.as_ref(), &response_key, &error)
-                    .await?;
-                let Some(coordinator) = miss else {
-                    return Err(forward::catch_up_miss(
+                let caller = (&user_access, bucket_info.as_ref());
+                let miss = self.missed_read(&req.extensions, caller, member_key, &error);
+                return match miss.await? {
+                    MemberRead::Remote { body, .. } => Ok(forward::reads::forwarded_get(body)),
+                    // While the coordinator cannot answer, this copy's miss stands, marked.
+                    MemberRead::Local(Some(range_id)) => {
+                        Err(forward::reads::stale_error(error, range_id))
+                    }
+                    MemberRead::Local(None) => Err(forward::catch_up_miss(
                         error,
                         catching_up,
                         bucket_info.as_ref(),
-                    ));
+                    )),
                 };
-                let request = forward::reads::read_request(
-                    http::Method::GET,
-                    "GetObject",
-                    &response_bucket,
-                    &response_key,
-                    req.uri.query(),
-                    &req.headers,
-                );
-                // While the coordinator cannot answer, this copy's miss stands, marked.
-                let response = match self.forward_read(&user_access, &coordinator, request).await {
-                    Err(failed) if forward::list::unreachable(&failed) => {
-                        return Err(forward::reads::stale_error(error, coordinator.range_id));
-                    }
-                    answer => answer?,
-                };
-                return Ok(forward::reads::forwarded_get(response));
             }
         };
         self.record_touch(
@@ -2466,33 +2449,27 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
-        let request = || {
-            forward::reads::read_request(
-                http::Method::HEAD,
-                "HeadObject",
-                &bucket,
-                &key,
-                req.uri.query(),
-                &req.headers,
-            )
-        };
-        let pinned = version_id.is_some();
+        let member_key = forward::reads::member_key(
+            true,
+            (&bucket, &key, version_id),
+            req.uri.query(),
+            &req.headers,
+        );
         let answer = self
-            .answer_read(
+            .member_read(
                 &req.extensions,
                 &user_access,
                 bucket_info.as_ref(),
-                (&key, pinned),
-                request,
+                member_key.clone(),
             )
             .await?;
         let stale = match answer {
-            forward::reads::ReadAnswer::Forwarded(response, stale) => {
-                let mut response = forward::reads::forwarded_head(&response);
+            MemberRead::Remote { body, stale } => {
+                let mut response = forward::reads::forwarded_head(&body);
                 forward::reads::mark_stale(&mut response.headers, stale.as_slice());
                 return Ok(response);
             }
-            forward::reads::ReadAnswer::Local(stale) => stale,
+            MemberRead::Local(stale) => stale,
         };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {
@@ -2508,32 +2485,20 @@ impl S3 for ArunaS3Service {
                 if let Some(range_id) = stale {
                     return Err(forward::reads::stale_error(error, range_id));
                 }
-                let miss = self
-                    .copy_miss(&req.extensions, bucket_info.as_ref(), &key, &error)
-                    .await?;
-                let Some(coordinator) = miss else {
-                    return Err(forward::catch_up_miss(
+                let caller = (&user_access, bucket_info.as_ref());
+                let miss = self.missed_read(&req.extensions, caller, member_key, &error);
+                return match miss.await? {
+                    MemberRead::Remote { body, .. } => Ok(forward::reads::forwarded_head(&body)),
+                    // While the coordinator cannot answer, this copy's miss stands, marked.
+                    MemberRead::Local(Some(range_id)) => {
+                        Err(forward::reads::stale_error(error, range_id))
+                    }
+                    MemberRead::Local(None) => Err(forward::catch_up_miss(
                         error,
                         catching_up,
                         bucket_info.as_ref(),
-                    ));
+                    )),
                 };
-                let request = forward::reads::read_request(
-                    http::Method::HEAD,
-                    "HeadObject",
-                    &bucket,
-                    &key,
-                    req.uri.query(),
-                    &req.headers,
-                );
-                // While the coordinator cannot answer, this copy's miss stands, marked.
-                let response = match self.forward_read(&user_access, &coordinator, request).await {
-                    Err(failed) if forward::list::unreachable(&failed) => {
-                        return Err(forward::reads::stale_error(error, coordinator.range_id));
-                    }
-                    answer => answer?,
-                };
-                return Ok(forward::reads::forwarded_head(&response));
             }
         };
 
