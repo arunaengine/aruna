@@ -1659,7 +1659,11 @@ fn writer_reads_trail() {
     let writer = || {
         let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
         let output = hashed(test_location(config.user_id));
-        let mut child = publishing(config, output);
+        // The run starts late enough that the version id bounds the trail read.
+        let mut operation = PutObjectOperation::new(config);
+        operation.stamp(1_000);
+        let mut child = publisher(operation, output.clone());
+        child.output = Some(output);
         // The version is not registered, so the trail is read before the head moves, in the
         // incarnation the bucket's creation row names.
         let turn = child.history_read(None);
