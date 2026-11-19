@@ -114,11 +114,13 @@ pub(crate) enum Forward {
     Done(Message),
 }
 
-/// The child and reply of a forwarded request, or the request back when it is none of these.
+/// The child and reply of a forwarded request, or the request back when it is none of these;
+/// `fresh` is the id a group deletion request is applied under.
 pub(crate) fn forward_call(
     peer: NodeId,
     (local, here): (Option<(NodeId, RealmId)>, Option<&Here>),
     message: Message,
+    fresh: ulid::Ulid,
 ) -> Result<Forward, Message> {
     let refused = ForwardReply::Refused("");
     let (call, reply) = match message {
@@ -217,7 +219,7 @@ pub(crate) fn forward_call(
             )
         }
         request @ Message::GroupDeletion { .. } => {
-            let apply = ApplyRequestOperation::new(local, peer, request, ulid::Ulid::generate());
+            let apply = ApplyRequestOperation::new(local, peer, request, fresh);
             (IoCall::child(apply), ForwardReply::Deletion)
         }
         other => return Err(other),

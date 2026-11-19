@@ -786,8 +786,15 @@ async fn create_stamps_origin() -> TestResult<()> {
     let group_id = Ulid::from_bytes([21; 16]);
     let path = "datasets/stamped-by-origin";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let expected = realm
         .origin_placement(origin, group_id, document_id, path)
         .expect("a Management node holds buckets");
@@ -843,8 +850,15 @@ async fn read_misses_nonholder() -> TestResult<()> {
     let group_id = Ulid::from_bytes([31; 16]);
     let path = "datasets/read-off-holders";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = create_document(
         &realm,
         origin,
@@ -906,8 +920,15 @@ async fn bystander_writes_forward() -> TestResult<()> {
 
     let path = "datasets/bystander-writes";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = create_document(
         &realm,
         origin,
@@ -1054,8 +1075,15 @@ async fn document_sparql_routes() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let path = "datasets/sparql-routes";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = create_document(
         &realm,
         origin,
@@ -1112,8 +1140,15 @@ async fn document_export_routes() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let path = "datasets/export-routes";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = create_document(
         &realm,
         origin,
@@ -1179,8 +1214,15 @@ async fn user_create_forwards() -> TestResult<()> {
 
     let path = "datasets/forwarded-by-user";
     let user = realm.user_node();
-    let document_id =
-        mint_forward_document(&realm.config, &realm.actor(user), group_id, path)?.as_ulid();
+    let document_id = mint_forward_document(
+        &realm.config,
+        &realm.actor(user),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     assert_eq!(
         realm.origin_placement(user, group_id, document_id, path),
         None
@@ -1376,8 +1418,15 @@ async fn pinned_create_repeats() -> TestResult<()> {
     assert_eq!(local.target, origin.node_id());
 
     let user = realm.user_node();
-    let document_id =
-        mint_forward_document(&realm.config, &realm.actor(user), group_id, path)?.as_ulid();
+    let document_id = mint_forward_document(
+        &realm.config,
+        &realm.actor(user),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement =
         resolve_metadata_id(&realm.config, realm.realm_id, Some(group_id), document_id)?;
     let holders = realm.holders(&placement);

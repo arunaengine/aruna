@@ -581,7 +581,7 @@ impl OperationsTaskHandler {
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
         let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+        let drain = DrainProjectionOperation::new(local_node);
         match drive(drain, &self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)

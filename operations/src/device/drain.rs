@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataActor, MetadataError};
 use aruna_core::operation::Operation;
@@ -216,6 +217,7 @@ pub(super) struct ForwardEntryOperation {
     attempts: u32,
     token: Option<AuthToken>,
     state: Option<PublishState>,
+    ids: IdMint,
 }
 
 type ForwardTurn = Result<Next<()>, IoError>;
@@ -237,6 +239,7 @@ impl ForwardEntryOperation {
             document_id: Ulid::nil(),
             token: None,
             state: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -434,6 +437,10 @@ impl Operation for ForwardEntryOperation {
         self.now_ms = now_ms;
     }
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     /// Mints the entry's realm document id when it has none and claims it as `Publishing`. The
     /// minted id is stored before the forward, so a crash re-forwards the same id and the
     /// holder's create fence dedups it.
@@ -446,7 +453,8 @@ impl Operation for ForwardEntryOperation {
             _ => {
                 let actor = self.actor();
                 let (group, path) = (entry.group_id, &entry.document_path);
-                match mint_forward_document(&self.config, &actor, group, path) {
+                let (ids, now_ms) = (&mut self.ids, self.now_ms);
+                match mint_forward_document(&self.config, &actor, group, path, ids, now_ms) {
                     Ok(minted) => minted.as_ulid(),
                     // Placement or configuration is not settled yet; try again later.
                     Err(error) => {

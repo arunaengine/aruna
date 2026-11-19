@@ -87,6 +87,8 @@ fn mint_local(
         },
         group_id,
         path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )
     .expect("mint local structured id")
     .as_ulid()

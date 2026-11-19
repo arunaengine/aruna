@@ -761,8 +761,15 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
         user_id: realm.user_id,
         realm_id: realm.realm_id,
     };
-    let document_id =
-        mint_local_document(&config, &actor, group_id, "datasets/nonholder")?.as_ulid();
+    let document_id = mint_local_document(
+        &config,
+        &actor,
+        group_id,
+        "datasets/nonholder",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
 
     let created = drive(
         CreateDocumentOperation::new(CreateDocumentConfig {
@@ -1106,6 +1113,8 @@ fn forward_id(
         },
         group_id,
         path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid())
 }

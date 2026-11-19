@@ -72,8 +72,15 @@ async fn keeps_owner_reads() -> TestResult<()> {
     );
     let path = "datasets/field-notes";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     realm
         .create_document(origin, group_id, document_id, path, "notes")
         .await?;
@@ -119,8 +126,15 @@ async fn keeps_owner_exports() -> TestResult<()> {
     );
     let path = "datasets/exported";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     realm
         .create_document(origin, group_id, document_id, path, "notes")
         .await?;
@@ -172,8 +186,15 @@ async fn keeps_selected_document() -> TestResult<()> {
     );
     let path = "datasets/selected";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     realm
         .create_document(origin, group_id, document_id, path, "notes")
         .await?;
@@ -212,8 +233,15 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
     );
     let path = "datasets/replaced";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = realm
         .create_document(origin, group_id, document_id, path, "scaffold-notes")
         .await?;

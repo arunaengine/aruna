@@ -128,7 +128,15 @@ async fn run_writer(
     let mut batch = Vec::new();
     for index in 0..PER_WRITER {
         let document_path = format!("datasets/probe-{writer}-{index}");
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)?.as_ulid();
+        let document_id = mint_local_document(
+            &config,
+            &actor,
+            group_id,
+            &document_path,
+            &mut crate::fresh_ids(),
+            aruna_core::time::unix_timestamp_millis(),
+        )?
+        .as_ulid();
         let payload = if index % 2 == 0 {
             scaffold_payload(writer, index)
         } else {

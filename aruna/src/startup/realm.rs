@@ -14,9 +14,7 @@ use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
-use aruna_operations::metadata::projection::{
-    MetadataProjectionError, ReplayPageOperation, max_clock_skew,
-};
+use aruna_operations::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
@@ -425,7 +423,7 @@ async fn replay_until_stopped(
     let mut after = None;
     let mut projected = 0usize;
     while should_continue() {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {

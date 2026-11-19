@@ -6,6 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, METADATA_ACTOR_KEYSPACE,
     METADATA_CHECKPOINT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
@@ -36,7 +37,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::MetadataPhaseSource;
 use crate::metadata::call_results::{effect_event, page_rows, read_values};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::{
@@ -197,8 +197,10 @@ pub struct UpdateDocumentOperation {
     expected_graph: Option<String>,
     /// The author's commit message for the ARC snapshot of this update.
     message: Option<String>,
-    /// Phase-time and identity sampling; production keeps the defaults.
-    phase_source: MetadataPhaseSource,
+    /// The runner's time of the current step.
+    now_ms: u64,
+    /// The fresh ids of this run.
+    ids: IdMint,
     stage: UpdateStage,
 }
 
@@ -226,9 +228,8 @@ impl UpdateDocumentOperation {
         };
         Self {
             config,
-            // The event identity is minted from the phase source on the first
-            // real transition, so replacing the source before `first` is not
-            // shadowed by an incidental constructor sample.
+            // The event identity is minted on the first step, after the runner stamped and
+            // seeded the run.
             event_id: Ulid::nil(),
             record: None,
             planned_batch,
@@ -238,7 +239,8 @@ impl UpdateDocumentOperation {
             route_profile_status,
             expected_graph: None,
             message: None,
-            phase_source: MetadataPhaseSource::default(),
+            now_ms: 0,
+            ids: IdMint::new(0),
             stage: UpdateStage::Record,
         }
     }
@@ -253,15 +255,6 @@ impl UpdateDocumentOperation {
     /// Records `message` as the commit message of this update's ARC snapshot.
     pub fn with_message(mut self, message: Option<String>) -> Self {
         self.message = message;
-        self
-    }
-
-    /// Replaces the phase-time and identity source and re-mints the event
-    /// identity from it. Set before `first`; production never calls this.
-    #[cfg(test)]
-    pub(crate) fn with_phase_source(mut self, phase_source: MetadataPhaseSource) -> Self {
-        self.phase_source = phase_source;
-        self.event_id = phase_source.next_id();
         self
     }
 
@@ -451,7 +444,6 @@ impl UpdateDocumentOperation {
             realm_config: self.realm_config.take(),
             route_profile_status: self.route_profile_status.take(),
             message: self.message.clone(),
-            phase_source: self.phase_source,
             raw_budget: None,
             accepted_create: None,
             window: None,
@@ -480,9 +472,17 @@ impl Operation for UpdateDocumentOperation {
     type Output = MetadataRegistryRecord;
     type Error = UpdateDocumentError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> UpdateTurn {
         if self.event_id.is_nil() {
-            self.event_id = self.phase_source.next_id();
+            self.event_id = self.ids.mint(self.now_ms);
         }
         let key = metadata_registry_key(self.config.group_id, self.config.document_id);
         let read = vec![(METADATA_INDEX_KEYSPACE.to_string(), key)];
@@ -536,7 +536,6 @@ pub struct UpdateCommitOperation {
     realm_config: Option<RealmConfigDocument>,
     route_profile_status: Option<ProfileValidationStatus>,
     message: Option<String>,
-    phase_source: MetadataPhaseSource,
     raw_budget: Option<RawOriginBudget>,
     accepted_create: Option<MetadataEventRecord>,
     /// The latest checkpoint; raw budgets count events from it on.
@@ -553,7 +552,7 @@ pub struct UpdateCommitOperation {
 impl UpdateCommitOperation {
     fn updated_record(&self, mut record: MetadataRegistryRecord) -> MetadataRegistryRecord {
         record.public = self.config.public;
-        record.updated_at_ms = self.phase_source.now_ms();
+        record.updated_at_ms = self.now_ms;
         record
     }
 
@@ -650,7 +649,7 @@ impl UpdateCommitOperation {
         next_raw_budget: &RawOriginBudget,
     ) -> Result<Vec<(String, Key, Value)>, UpdateDocumentError> {
         let event = self.update_event()?;
-        let now = self.phase_source.now_ms();
+        let now = self.now_ms;
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
@@ -1364,6 +1363,8 @@ mod call_tests {
         operation: &mut UpdateDocumentOperation,
         record: &MetadataRegistryRecord,
     ) -> UpdateTurn {
+        operation.stamp(fixed_ms());
+        operation.seed(ENTROPY);
         operation.first().unwrap();
         operation
             .next(IoResult::Values(vec![encoded(record)]))
@@ -1379,7 +1380,9 @@ mod call_tests {
         let mut operation = operation;
         to_plan(&mut operation, record).unwrap();
         operation.planned_batch = Some(batch(record));
-        operation.commit_operation().unwrap()
+        let mut commit = operation.commit_operation().unwrap();
+        commit.stamp(fixed_ms());
+        commit
     }
 
     fn commit(
@@ -2114,20 +2117,22 @@ mod call_tests {
         1_700_000_000_000
     }
 
+    const ENTROPY: u128 = 0x7b;
+
+    /// The event id the pinned run mints.
     fn fixed_id() -> Ulid {
-        Ulid::from_bytes([0x7b; 16])
+        IdMint::new(ENTROPY).mint(fixed_ms())
     }
 
-    /// The update takes its event identity and phase time from the injected source, so
+    /// The update takes its event identity and time from the pinned stamp and seed, so
     /// identical inputs produce identical rows.
     #[test]
     fn update_source_pinned() {
         let record = record(&actor());
         let rows = || {
-            let operation = UpdateDocumentOperation::new(config(actor(), &record, upsert()))
-                .with_phase_source(MetadataPhaseSource::fixed(fixed_ms, fixed_id));
-            assert_eq!(operation.event_id, fixed_id());
+            let operation = UpdateDocumentOperation::new(config(actor(), &record, upsert()));
             let mut commit = commit_of(operation, &record);
+            assert_eq!(commit.event_id, fixed_id());
             let mut rows = written(commit_rows(&mut commit, &record, first_budget(&record)));
             // The plugin journal keys its rows with its own unique id.
             rows.retain(|(space, _, _)| space != aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE);

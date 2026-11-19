@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -231,6 +232,7 @@ pub struct AuthorizedCreateOperation {
     networked: bool,
     now_ms: u64,
     permission_started_ms: u64,
+    ids: IdMint,
 }
 
 impl AuthorizedCreateOperation {
@@ -253,24 +255,27 @@ impl AuthorizedCreateOperation {
             networked,
             now_ms: 0,
             permission_started_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
     fn minted(
-        &self,
+        &mut self,
         realm_config: &RealmConfigDocument,
         user_origin: bool,
     ) -> Result<Ulid, CreateAuthorizedError> {
         let actor = self.actor();
         let (group_id, path) = (self.create.group_id, self.create.path.as_str());
+        let (ids, now_ms) = (&mut self.ids, self.now_ms);
+        let forward = |ids: &mut IdMint| {
+            mint_forward_document(realm_config, &actor, group_id, path, ids, now_ms)
+        };
         if user_origin {
-            return Ok(mint_forward_document(realm_config, &actor, group_id, path)?.as_ulid());
+            return Ok(forward(ids)?.as_ulid());
         }
-        match mint_local_document(realm_config, &actor, group_id, path) {
+        match mint_local_document(realm_config, &actor, group_id, path, ids, now_ms) {
             Ok(document_id) => Ok(document_id.as_ulid()),
-            Err(CreateDocumentError::HoldsNoBucket) => {
-                Ok(mint_forward_document(realm_config, &actor, group_id, path)?.as_ulid())
-            }
+            Err(CreateDocumentError::HoldsNoBucket) => Ok(forward(ids)?.as_ulid()),
             Err(error) => Err(error.into()),
         }
     }
@@ -336,6 +341,10 @@ impl Operation for AuthorizedCreateOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> CreateTurn {
