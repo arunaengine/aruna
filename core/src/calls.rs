@@ -666,6 +666,10 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         self.operation.stamp(now_ms);
     }
 
+    fn seed(&mut self, entropy: u128) {
+        self.operation.seed(entropy);
+    }
+
     fn hold_scope(&self) -> Option<HoldScope> {
         self.operation.hold_scope()
     }

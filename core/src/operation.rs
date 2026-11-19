@@ -66,6 +66,9 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
 
+    /// See [`EffectOperation::seed`].
+    fn seed(&mut self, _entropy: u128) {}
+
     /// See [`EffectOperation::hold_scope`].
     fn hold_scope(&self) -> Option<HoldScope> {
         None
@@ -173,6 +176,10 @@ pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
     /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
     fn stamp(&mut self, _now_ms: u64) {}
 
+    /// The runner's random value for this run, given once before `start`. An operation that
+    /// mints ids keeps it in an [`crate::id_mint::IdMint`] instead of reading a random source.
+    fn seed(&mut self, _entropy: u128) {}
+
     /// The backend scope this operation holds from before its first effect until it ends, so
     /// no two operations with the same scope overlap.
     fn hold_scope(&self) -> Option<HoldScope> {
@@ -221,6 +228,8 @@ pub trait SubOperation: Send + std::fmt::Debug {
     fn abort(&mut self) -> Effects;
     /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
+    /// See [`EffectOperation::seed`].
+    fn seed(&mut self, _entropy: u128) {}
     /// The backend scope this child holds while it runs.
     fn hold_scope(&self) -> Option<HoldScope> {
         None
@@ -333,6 +342,12 @@ where
         }
     }
 
+    fn seed(&mut self, entropy: u128) {
+        if let Some(operation) = self.operation.as_mut() {
+            operation.seed(entropy);
+        }
+    }
+
     fn hold_scope(&self) -> Option<HoldScope> {
         self.operation.as_ref().and_then(O::hold_scope)
     }
@@ -381,6 +396,7 @@ where
         lost: 0,
         seed: seed.to_vec(),
         now_ms: None,
+        entropy: None,
         map_result,
     })
 }
@@ -392,6 +408,8 @@ struct RetrySubOperation<M: EffectOperation, B, F> {
     lost: u32,
     seed: Vec<u8>,
     now_ms: Option<u64>,
+    /// The runner's random value; each fresh build adds its count of lost runs.
+    entropy: Option<u128>,
     map_result: F,
 }
 
@@ -411,6 +429,9 @@ where
     fn run(&mut self, mut run: M) -> Effects {
         if let Some(now_ms) = self.now_ms {
             run.stamp(now_ms);
+        }
+        if let Some(entropy) = self.entropy {
+            run.seed(entropy.wrapping_add(u128::from(self.lost)));
         }
         let effects = run.start();
         self.settle(run, effects)
@@ -538,6 +559,13 @@ where
         self.now_ms = Some(now_ms);
         if let Some(Attempt::Running(run)) = self.attempt.as_mut() {
             run.stamp(now_ms);
+        }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = Some(entropy);
+        if let Some(Attempt::Running(run)) = self.attempt.as_mut() {
+            run.seed(entropy.wrapping_add(u128::from(self.lost)));
         }
     }
 

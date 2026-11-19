@@ -35,6 +35,7 @@ pub mod handoff;
 pub mod heartbeat;
 pub mod holder_choice;
 pub mod id;
+pub mod id_mint;
 pub mod injection;
 pub mod jobs;
 pub mod join_request;
