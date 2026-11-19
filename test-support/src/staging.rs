@@ -23,7 +23,6 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::jobs::ProgressReporter;
 use aruna_core::search::ObjectKeyMatch;
 use aruna_core::stream::BackendStream;
-use aruna_core::stream::StreamError;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobProgress, JobRecord, StagingJobPrefix,
@@ -598,7 +597,7 @@ pub async fn write_object(
         .quota
         .effective_group_ceiling(&bucket.group_id);
     let length = body.len() as u64;
-    let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(body)]));
+    let body = BackendStream::once(body);
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket.group_id,
