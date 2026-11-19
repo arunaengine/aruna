@@ -6,18 +6,14 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-};
+use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::plugin_installs::InstallState;
-use aruna_core::reducer::{InstallEntry, decode_reducer_state};
-use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::reducer::InstallEntry;
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 use aruna_core::structs::execution::job::{
@@ -29,9 +25,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use aruna_core::{NodeId, UserId};
 use tracing::warn;
-use ulid::Ulid;
 
-use super::rows::{StoreError, read_call, unexpected, values};
+use super::records::{ReadEntry, RecordError};
+use super::rows::{StoreError, unexpected};
 use super::screen::tagged;
 use crate::jobs::lifecycle::cancel::{
     CancelFamilyOperation, CancelLocalRunsOperation, PublishCancelOperation,
@@ -191,7 +187,7 @@ fn family_at(key: &[u8]) -> Option<JobFamilyId> {
 enum OrphanPhase {
     Page,
     Spec,
-    Entry(Box<LogicalJobSpec>, Ulid),
+    Entry(Box<LogicalJobSpec>),
     Publish,
 }
 
@@ -317,21 +313,13 @@ impl Operation for CancelOrphans {
                 let Some(Ok(task)) = tagged(&spec.payload) else {
                     return self.next_family();
                 };
-                let target = AdminDocumentTarget::RealmConfig {
-                    realm_id: self.config.realm_id,
-                };
-                let row = (DOCUMENT_STATE_KEYSPACE, reducer_state_key(&target).to_vec());
-                self.phase = OrphanPhase::Entry(spec, task.install_id);
-                Ok(Next::Call(read_call(vec![row])))
+                let read = ReadEntry::new(self.config.realm_id, task.install_id);
+                self.phase = OrphanPhase::Entry(spec);
+                Ok(Next::Call(IoCall::child(read)))
             }
-            OrphanPhase::Entry(spec, install_id) => {
-                let [state] = values::<1>(result)?;
-                let entry = match state {
-                    None => InstallEntry::Absent,
-                    Some(bytes) => decode_reducer_state(&bytes)
-                        .map_err(|error| StoreError(error.to_string()))?
-                        .install_entry(&install_id),
-                };
+            OrphanPhase::Entry(spec) => {
+                let entry = result.child::<InstallEntry, RecordError>()?;
+                let entry = entry.map_err(|error| StoreError(error.to_string()))?;
                 if !removal_confirmed(&entry, spec.created_by) {
                     return self.next_family();
                 }

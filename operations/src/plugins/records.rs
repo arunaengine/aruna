@@ -22,7 +22,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -311,6 +311,47 @@ impl Operation for InstallEntryOperation {
                 Ok(self.finish())
             }
         }
+    }
+}
+
+/// Reads the realm config's entry at an install's path, deletions and conflicts included.
+#[derive(Debug, PartialEq)]
+pub struct ReadEntry {
+    realm_id: RealmId,
+    install_id: Ulid,
+}
+
+impl ReadEntry {
+    pub fn new(realm_id: RealmId, install_id: Ulid) -> Self {
+        Self {
+            realm_id,
+            install_id,
+        }
+    }
+}
+
+impl Operation for ReadEntry {
+    type Output = InstallEntry;
+    type Error = RecordError;
+
+    fn first(&mut self) -> Result<Next<InstallEntry>, RecordError> {
+        let target = AdminDocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        let key = reducer_state_key(&target);
+        Ok(Next::Call(IoCall::Read(vec![(
+            DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<InstallEntry>, RecordError> {
+        let [state] = values::<1>(result)?;
+        let Some(state) = state else {
+            return Ok(Next::Done(InstallEntry::Absent));
+        };
+        let state = decode_reducer_state(state.as_ref()).map_err(ConversionError::from)?;
+        Ok(Next::Done(state.install_entry(&self.install_id)))
     }
 }
 

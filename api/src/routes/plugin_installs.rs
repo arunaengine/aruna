@@ -3,13 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::reducer::InstallEntry;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
@@ -22,9 +23,9 @@ use aruna_operations::plugins::install::{
     InstallCaller, InstallError, InstallPrepared, InstallRequest, PrepareInstall, Summary,
     installed_summary, pick_version, prepared_summary, read_manifest,
 };
-use aruna_operations::plugins::lifecycle::RemoveInstall;
+use aruna_operations::plugins::lifecycle::{RemoveConflicted, RemoveInstall};
 use aruna_operations::plugins::receiver::lost_reason;
-use aruna_operations::plugins::records::RecordError;
+use aruna_operations::plugins::records::{ReadEntry, RecordError};
 use aruna_operations::users::service_account::group_admin_path;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -419,7 +420,11 @@ the call and every other node relays it to one.
 
 **Behavior**
 - The install is marked `removing` first, so a retry after a failure finishes the removal.
-- The account id stays in audit rows."#,
+- The account id stays in audit rows.
+- An install whose record is in conflict with its own removal is removed again: every candidate
+  record is torn down and the conflict resolves to the removal. The caller must be an admin of
+  every candidate's group; a candidate that appears meanwhile answers 409, and a retry checks it.
+- A removed install's id is never installed again; a new install gets a new id."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 204, description = "The install is removed"),
@@ -434,9 +439,42 @@ pub async fn remove(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let (auth, install_id) = admin_call(&state, auth, &id).await?;
+    let (auth, install_id) = match admin_call(&state, auth.clone(), &id).await {
+        Err(ServerError::NotFound) => return remove_conflicted(&state, auth, &id).await,
+        called => called?,
+    };
     secret_session(&state, &auth, (Some(install_id), None)).await?;
     let remove = RemoveInstall::new(caller(&state, &auth), install_id);
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes an install whose path holds a conflict with a deletion. The caller must be admin of
+/// every candidate's group, with the same checks as a removal; any other path stays not found.
+async fn remove_conflicted(
+    state: &ServerState,
+    auth: AuthContext,
+    id: &str,
+) -> ServerResult<StatusCode> {
+    let install_id = parse_id(id)?;
+    let read = ReadEntry::new(state.get_realm_id(), install_id);
+    let entry = drive(read, &state.get_ctx()).await;
+    let entry = entry.map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    let InstallEntry::Conflict {
+        deletion: true,
+        installs,
+    } = entry
+    else {
+        return Err(ServerError::NotFound);
+    };
+    let mut proven = BTreeSet::new();
+    for candidate in &installs {
+        if proven.insert(candidate.group_id) {
+            ensure_admin(state, &auth, candidate.group_id).await?;
+        }
+        secret_session(state, &auth, (None, Some(&candidate.digest))).await?;
+    }
+    let remove = RemoveConflicted::new(caller(state, &auth), (install_id, proven));
     drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
