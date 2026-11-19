@@ -8,7 +8,6 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{

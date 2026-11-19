@@ -302,7 +302,6 @@ impl MetadataHandle {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(feature = "test-hooks")]
     pub fn repair_held(&self) -> bool {
         self.inner
             .repair_hold

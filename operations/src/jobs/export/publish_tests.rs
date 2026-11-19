@@ -5,9 +5,10 @@
 use aruna_core::jobs::JobStops;
 use aruna_core::structs::execution::job::{ExportReportDetail, ReasonCode};
 
-use super::super::tests::{destination, export_scope, op_spec};
+use super::super::tests::{export_scope, op_spec};
 use super::*;
 use crate::jobs::repository::test_support::{artifact, child};
+use crate::tests::export::destination;
 
 fn repository(checkpoint: ExportCheckpoint) -> RepositoryStepOperation {
     RepositoryStepOperation::new(export_scope(), destination(), checkpoint)

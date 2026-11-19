@@ -34,7 +34,6 @@ use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::format::StoredFormat;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use futures_util::io::AsyncWriteExt;
 use serde_json::Value as JsonValue;
 use serde_json::json;

@@ -947,26 +947,17 @@ pub(crate) mod test {
     pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
     use crate::tests::policy::{seed_gate, subject};
     use crate::tests::s3::{full_context, spawn_reference_server, write_version};
-    use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::PortableSourceDescriptor;
-    use aruna_core::structs::storage::blob::{
-        Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
-    };
+    use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
     use aruna_core::structs::storage::format::Compression;
-    use aruna_net::NetHandle;
-    use aruna_storage::storage;
-    use axum::{Router, routing::get};
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::time::Duration;
-    use tempfile::{TempDir, tempdir};
-    use tokio::net::TcpListener;
 
     fn test_node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()

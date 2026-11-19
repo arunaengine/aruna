@@ -629,7 +629,6 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_mirror_repair(&self) {
-        #[cfg(feature = "test-hooks")]
         if self
             .context
             .metadata_handle
