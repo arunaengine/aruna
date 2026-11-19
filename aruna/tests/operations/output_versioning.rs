@@ -7,7 +7,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::job_calls::insert_job;
-use crate::job_calls::record_attempt_intent;
 use crate::job_calls::reserve_output_commits;
 use aruna::tasks::runner::under_lease;
 use aruna_blob::blob::BlobHandler;
@@ -60,6 +59,7 @@ use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOper
 use aruna_operations::testing::fresh_job_id;
 use aruna_storage::storage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
+use aruna_test_support::jobs::record_attempt_intent;
 use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
