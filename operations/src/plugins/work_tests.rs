@@ -297,7 +297,9 @@ fn held_front_continues() {
     let after = Some(Key::from(b"window".to_vec()));
     let jobs = (1..=4).map(due_work).collect();
     let window = Ok::<_, PruneError>(DueJobs { jobs, after });
-    prune.next(IoResult::Child(ChildOutcome::new(window))).unwrap();
+    prune
+        .next(IoResult::Child(ChildOutcome::new(window)))
+        .unwrap();
     for _ in 1..=4 {
         assert!(matches!(prune.phase, KeepPhase::Holds(_)));
         let held = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(true)));
@@ -308,7 +310,9 @@ fn held_front_continues() {
         jobs: vec![due_work(5)],
         after: None,
     });
-    prune.next(IoResult::Child(ChildOutcome::new(window))).unwrap();
+    prune
+        .next(IoResult::Child(ChildOutcome::new(window)))
+        .unwrap();
     let settled = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(false)));
     prune.next(settled).unwrap();
     assert_eq!(prune.phase, KeepPhase::Prune);

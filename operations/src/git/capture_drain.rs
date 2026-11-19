@@ -10,7 +10,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
 use aruna_core::git::GitNode;
 use aruna_core::keyspaces::{MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
-use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord, MetadataRawRevision};
+use aruna_core::metadata::{
+    MaterializationState, MaterializationStatusRecord, MetadataRawRevision,
+};
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::materialization_status_key;
@@ -327,7 +329,9 @@ mod tests {
         let rows = vec![mark_row(EVENT, &first), mark_row(LATER, &second)];
         drain.next(IoResult::Page { rows, next: None }).unwrap();
         for (event_id, displayed) in [(EVENT, first), (LATER, second)] {
-            drain.next(status(LATER, MaterializationState::Materialized)).unwrap();
+            drain
+                .next(status(LATER, MaterializationState::Materialized))
+                .unwrap();
             let found = child(Ok::<_, StorageReadError>(Some(record())));
             let snapshot = capture(&GitNode::default(), &record(), Some(&displayed));
             assert_eq!(drain.next(found), Ok(Next::Call(IoCall::child(snapshot))));

@@ -231,7 +231,10 @@ fn queues_followups_first() {
         next: AppliedStep::Usage,
     };
     let row = applied_sync_entry(&applied).unwrap();
-    assert_eq!(pass.next(child(outcome)), Ok(Next::Call(IoCall::Write(vec![row]))));
+    assert_eq!(
+        pass.next(child(outcome)),
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    );
     assert_eq!(pass.next(IoResult::Done), cursor_write());
     let deferred = DeferredTopics::new();
     assert_eq!(pass.next(IoResult::Done), deferred_write(&deferred));

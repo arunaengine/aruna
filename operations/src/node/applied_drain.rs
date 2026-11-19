@@ -149,7 +149,7 @@ fn error_text<T, E: std::fmt::Display>(outcome: Result<T, E>) -> Option<String> 
 }
 
 impl Operation for AppliedDrainOperation {
-    type Output = ();
+    type Output = Option<Duration>;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {

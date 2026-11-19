@@ -381,7 +381,10 @@ fn commit_writes_first() {
     assert!(matches!(commit.first(), Ok(Next::Call(IoCall::Read(_)))));
     let written = commit.next(IoResult::Values(vec![None, None]));
     assert!(matches!(written, Ok(Next::Call(IoCall::Write(_)))));
-    assert!(matches!(commit.next(IoResult::Done), Ok(Next::Call(IoCall::Delete(_)))));
+    assert!(matches!(
+        commit.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(_)))
+    ));
     assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
     let conflict = Error::from(IoError::Conflict);
     assert!(CommitFinishOperation::is_conflict(&conflict));

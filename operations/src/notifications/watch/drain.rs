@@ -179,7 +179,10 @@ mod tests {
         drain.first().unwrap();
         let after = Key::from(vec![1]);
         drain
-            .next(page(vec![(key.clone(), value.clone())], Some(after.clone())))
+            .next(page(
+                vec![(key.clone(), value.clone())],
+                Some(after.clone()),
+            ))
             .unwrap();
         let open = IoResult::Child(ChildOutcome::new(Ok::<bool, IoError>(false)));
         let next_page = IoCall::Page {

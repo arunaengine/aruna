@@ -495,7 +495,10 @@ impl PruneKeepingWork {
             return self.due();
         }
         self.phase = KeepPhase::Prune;
-        let (kept, checked) = (std::mem::take(&mut self.kept), std::mem::take(&mut self.checked));
+        let (kept, checked) = (
+            std::mem::take(&mut self.kept),
+            std::mem::take(&mut self.checked),
+        );
         let prune = PruneJobsOperation::new(self.now(), self.page_size, kept).within(checked);
         Ok(Next::Call(IoCall::child(prune)))
     }

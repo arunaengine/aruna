@@ -1310,8 +1310,13 @@ async fn machine_until<P: Operation>(
         return operation.finalize();
     };
     let mut run = ParentRun(&mut operation, None);
-    let effects =
-        drive_effects(&mut run, context, 0, Some(deadline), Some(type_name::<CallRun<P>>()));
+    let effects = drive_effects(
+        &mut run,
+        context,
+        0,
+        Some(deadline),
+        Some(type_name::<CallRun<P>>()),
+    );
     let mut state = holding(scope, effects).await;
     let record = run.1;
     if !operation.is_complete() {

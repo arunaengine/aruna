@@ -348,7 +348,10 @@ impl RowPlan for CreateBatchPlan {
                 .filter(|(topic, _)| !held.contains(topic))
                 .map(|(_, write)| write.clone()),
         );
-        let followups = self.followups.clone().filter(|_| !outcome.accepted.is_empty());
+        let followups = self
+            .followups
+            .clone()
+            .filter(|_| !outcome.accepted.is_empty());
         if let Some(mut followups) = followups {
             for (target, record) in &outcome.accepted {
                 followups.result.targets.push(target.clone());
