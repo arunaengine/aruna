@@ -234,6 +234,7 @@ fn offer_picks_route() {
         now_ms: 5_000,
         execution_id: Ulid::from_parts(5_000, 4),
         limits: None,
+        config_digest: None,
     };
     let admit = AdmitLaunchOperation::new(LaunchFrame::new(records[0].clone()).unwrap(), here);
     assert_eq!(

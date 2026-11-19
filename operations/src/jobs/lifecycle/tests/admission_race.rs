@@ -113,6 +113,8 @@ pub(super) fn config(
         resources: resources(),
         subject_generation: receipt.subject_generation,
         subject_digest: receipt.subject_digest,
+        config_generation: receipt.config_generation,
+        config_digest: receipt.config_digest,
         record: Box::new(record),
         now_ms: 4_000,
         fence: None,

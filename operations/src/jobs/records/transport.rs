@@ -645,6 +645,7 @@ mod pure_tests {
             now_ms: 5,
             execution_id: ulid::Ulid::from_bytes([1u8; 16]),
             limits: None,
+            config_digest: None,
         }
     }
 

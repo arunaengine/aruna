@@ -107,6 +107,8 @@ async fn reserve(
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
             record: Box::new(record),
             now_ms: 4_000,
             fence: None,
@@ -145,6 +147,7 @@ fn holds_static_ceilings() {
     assert!(fits(&held, "lab", &resources(), &envelope(1)));
     assert!(!fits(
         &[],
+        "default",
         &resources(),
         &ResourceEnvelope {
             max_ram_bytes: Some(512),

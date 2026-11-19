@@ -740,6 +740,7 @@ fn reserve_decisions() {
         account: install.account,
         proposed: Some(Box::new(proposed(&install, 1))),
         mark: None,
+        limit: None,
         phase: ReservePhase::Reading,
     };
     let stored = values_result(vec![Some(encode(&row).unwrap())]);

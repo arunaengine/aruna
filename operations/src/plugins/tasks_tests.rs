@@ -52,7 +52,7 @@ fn builds_task_spec() {
     );
     assert_eq!(spec.tags[PLUGIN_WORK_TAG], work_id.to_string());
     assert_eq!(spec.tags[PLUGIN_REPORT_TAG], "/out/report.json");
-    assert_eq!(spec.tags[NETWORK_TAG], "open");
+    assert_eq!(spec.tags[NETWORK_TAG_KEY], "open");
     assert_eq!(
         spec.entrypoint,
         Some(vec![
@@ -81,7 +81,7 @@ fn builds_task_spec() {
     (closed.network, closed.command) = (Network::None, None);
     closed.parameters.clear();
     let spec = task_spec(&install(), work_id, (&closed, &BTreeMap::new()), &io()).unwrap();
-    assert!(!spec.tags.contains_key(NETWORK_TAG));
+    assert!(!spec.tags.contains_key(NETWORK_TAG_KEY));
     assert_eq!(spec.entrypoint, None);
 }
 

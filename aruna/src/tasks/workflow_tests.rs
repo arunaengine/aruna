@@ -93,7 +93,8 @@ fn attempt_scope(
     Arc::new(AttemptScope {
         job_id,
         token,
-        kind: backend.kind(),
+        // The registry of `with_backend` holds the test backend under this name.
+        backend: "docker".to_string(),
         fence: fence.clone(),
         spec: Arc::new(spec.clone()),
         bucket: bucket.to_string(),

@@ -1037,7 +1037,7 @@ async fn refuses_governed_source() {
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/ref.fna")],
@@ -1146,7 +1146,7 @@ async fn stage_governed(
     seed_reference(&state, "source", owner, vec![policy]).await;
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/ref.fna")],
