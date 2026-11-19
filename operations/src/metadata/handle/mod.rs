@@ -21,7 +21,6 @@ use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 
-use super::contact::PeerContacts;
 use crate::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
@@ -179,7 +178,6 @@ struct MetadataInner {
     auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
-    peer_contacts: PeerContacts,
     sync_pulls: self::pull_serve::PullRegistry,
     #[cfg(feature = "test-hooks")]
     drop_ack: AtomicBool,
@@ -255,7 +253,6 @@ impl MetadataHandle {
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
-                peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
                 #[cfg(feature = "test-hooks")]
                 drop_ack: AtomicBool::new(false),

@@ -10,6 +10,7 @@ mod config;
 mod connection_pool;
 mod connectivity;
 mod construction;
+pub mod contacts;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
@@ -129,6 +130,7 @@ struct NetInner {
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
+    peer_contacts: contacts::PeerContacts,
     download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
     avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
@@ -543,6 +545,11 @@ impl NetHandle {
     }
 
     /// Time since the last heartbeat of `node`, or since this node started without one.
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> contacts::PeerContacts {
+        self.inner.peer_contacts.clone()
+    }
+
     pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
         self.inner.heartbeats.silence(&node)
     }

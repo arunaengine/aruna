@@ -19,7 +19,6 @@ use crate::auth::error::ArunaBearerError;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::contact::PeerContacts;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
@@ -115,12 +114,9 @@ impl MetadataHandle {
     /// This node's own liveness observation, taken where the peer identity is
     /// authorized. Never realm state: it is neither replicated nor published.
     pub(crate) fn note_peer_contact(&self, peer: NodeId) {
-        self.inner.peer_contacts.note(peer, unix_timestamp_millis());
-    }
-
-    /// When this node last saw each authorized peer.
-    pub fn peer_contacts(&self) -> PeerContacts {
-        self.inner.peer_contacts.clone()
+        if let Some(net) = &self.inner.net_handle {
+            net.peer_contacts().note(peer, unix_timestamp_millis());
+        }
     }
 
     pub(crate) async fn claims_for_revocation(

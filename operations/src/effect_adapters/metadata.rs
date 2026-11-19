@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::effects::{MetadataRequestEffect, WritePeerRequest};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerAuthRefusal, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataError, MetadataEvent};
@@ -55,14 +54,6 @@ pub(super) async fn dispatch_peer_auth(
         )),
     };
     Event::Net(NetEvent::WritePeerAuth(answer))
-}
-
-/// Refreshes a peer's last-contact time where the metadata handle keeps it.
-pub(super) fn dispatch_contact(peer: NodeId, context: &DriverContext) -> Event {
-    if let Some(handle) = &context.metadata_handle {
-        handle.note_peer_contact(peer);
-    }
-    Event::Net(NetEvent::PeerContact)
 }
 
 /// Sends one encoded request and reports the answer with the time it took.

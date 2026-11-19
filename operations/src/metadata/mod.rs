@@ -10,7 +10,6 @@ pub(crate) mod builtin;
 pub(crate) mod call_results;
 pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_window;
-pub mod contact;
 pub mod create_document;
 pub mod create_entry;
 pub mod data_links;
@@ -111,7 +110,6 @@ impl MetadataPhaseSource {
 }
 
 pub use builtin::builtin_shapes;
-pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{
     MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, pull_status,
     send_metadata_effect,
