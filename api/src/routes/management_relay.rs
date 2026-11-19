@@ -262,13 +262,6 @@ async fn relay(
         RelayEnd::NoNode => ServerError::NoManagementNode.into_response(),
         RelayEnd::Failed => ServerError::RelayFailed.into_response(),
     }
-
-    if let Some((url, response)) = unknown {
-        return relayed_response(route, &url, response).await;
-    }
-
-    warn!(route, "No management node answered a relayed route");
-    ServerError::NoManagementNode.into_response()
 }
 
 /// Passes a call once to one named node, such as the receiver of a plugin install, and its
@@ -283,43 +276,33 @@ pub(crate) async fn relay_to_node(
 ) -> Response {
     let unavailable =
         |reason: String| ServerError::ServiceUnavailableReason(reason).into_response();
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await;
-    let Ok(config) = config else {
-        return unavailable("the realm configuration is not readable".into());
+    let Some(method) = MemberMethod::parse(method.as_str()) else {
+        return ServerError::RelayFailed.into_response();
     };
-    let documents = load_node_documents(state, &config).await;
-    let Some(target) = documents.get(&node).and_then(|doc| doc.urls.api.clone()) else {
-        return unavailable(format!("node {node} has no published address"));
-    };
-    let Some(hops) = passed_hops(state, headers, Some(node)) else {
-        return unavailable(format!(
-            "the call to node {node} would circle between nodes"
-        ));
-    };
-    let url = relay_url(&target, uri);
-    let mut outgoing = (RELAY_CLIENT.request(method, &url))
-        .header(RELAY_HOP_HEADER, hops)
-        .body(body);
     let forwarded = [
         header::AUTHORIZATION,
         header::CONTENT_TYPE,
         HeaderName::from_static(SESSION_HEADER),
     ];
-    for name in forwarded {
-        if let Some(value) = headers.get(&name) {
-            outgoing = outgoing.header(name, value.clone());
-        }
-    }
-    match outgoing.send().await {
-        Ok(response) => relayed_response("node", &url, response).await,
-        Err(error) => {
-            warn!(relay_target = %url, error = %error, "Relay to a node failed");
-            ServerError::RelayFailed.into_response()
-        }
+    let relay = NodeRelay {
+        realm_id: state.get_realm_id(),
+        local: state.get_node_id(),
+        node,
+        method,
+        path: uri.path().to_string(),
+        query: uri.query().map(str::to_string),
+        passed: passed_text(headers).to_string(),
+        headers: picked(headers, &forwarded),
+        body,
+    };
+    match drive(NodeRelayOperation::new(relay), &state.get_ctx()).await {
+        Ok(NodeRelayEnd::Reply(reply)) => relayed_response(reply),
+        Ok(NodeRelayEnd::NoConfig) => unavailable("the realm configuration is not readable".into()),
+        Ok(NodeRelayEnd::NoAddress) => unavailable(format!("node {node} has no published address")),
+        Ok(NodeRelayEnd::Circling) => unavailable(format!(
+            "the call to node {node} would circle between nodes"
+        )),
+        Ok(NodeRelayEnd::Failed) | Err(_) => ServerError::RelayFailed.into_response(),
     }
 }
 
@@ -330,107 +313,31 @@ fn healthy_first(mut targets: Vec<String>, failed: &BTreeMap<String, Instant>) -
 }
 
 /// Remembers a connect failure or gateway answer of a target; any other answer clears the mark.
-async fn record_outcome(
-    state: &Arc<ServerState>,
-    target: &str,
-    sent: &Result<reqwest::Response, reqwest::Error>,
-) {
-    let failed = match sent {
-        Ok(response) => gateway_failed(&Method::GET, response.status()),
-        Err(error) => error.is_connect(),
-    };
+async fn record_marks(state: &ServerState, marks: Vec<TargetMark>) {
     let cache = state.management_url_cache();
-    if !failed && !cache.read().await.failed.contains_key(target) {
-        return;
-    }
-    let mut cached = cache.write().await;
-    match failed {
-        true => {
-            cached.failed.retain(|_, at| is_fresh(Some(*at)));
-            cached.failed.insert(target.to_string(), Instant::now());
+    for TargetMark { target, failed } in marks {
+        if !failed && !cache.read().await.failed.contains_key(&target) {
+            continue;
         }
-        false => {
-            cached.failed.remove(target);
-        }
-    }
-}
-
-/// Whether a send failure may be retried against the next target. A connect
-/// failure, which reqwest also reports for a connect timeout, provably predates
-/// any processing; later failures are only safe to repeat for an idempotent method.
-fn may_try_next(method: &Method, is_connect: bool) -> bool {
-    is_connect || method == Method::GET
-}
-
-/// Whether a gateway answer may move a GET on: an ingress in front of a stopped management node
-/// answers 502, 503 or 504 instead of refusing the connection.
-fn gateway_failed(method: &Method, status: StatusCode) -> bool {
-    method == Method::GET
-        && matches!(
-            status,
-            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-        )
-}
-
-/// Whether a node-local enrollment miss may be tried on the next target.
-fn may_try_response(route: &str, status: StatusCode) -> bool {
-    matches!(
-        (route, status),
-        (
-            "/access/onboarding/secrets/{id}"
-                | "/access/onboarding/secrets/{id}/status"
-                | "/access/users/me/devices/{id}",
-            StatusCode::NOT_FOUND
-        ) | ("/access/onboarding/bootstrap", StatusCode::UNAUTHORIZED)
-    )
-}
-
-/// Published api urls are bare origins (`API_PUBLIC_URL`), so the nest comes
-/// from the incoming path; a target that already carries it contributes it.
-fn relay_url(target: &str, uri: &Uri) -> String {
-    let base = target.trim_end_matches('/');
-    let path = uri.path();
-    let suffix = match base.ends_with(API_PREFIX) {
-        true => path.strip_prefix(API_PREFIX).unwrap_or(path),
-        false => path,
-    };
-    match uri.query() {
-        Some(query) => format!("{base}{suffix}?{query}"),
-        None => format!("{base}{suffix}"),
-    }
-}
-
-async fn relayed_response(route: &'static str, url: &str, response: reqwest::Response) -> Response {
-    let status = response.status();
-    let headers = relayed_headers(response.headers());
-    match response.bytes().await {
-        Ok(body) => {
-            debug!(route, relay_target = %url, status = status.as_u16(), "Relayed a management route");
-            let mut relayed = (status, body).into_response();
-            relayed.headers_mut().remove(header::CONTENT_TYPE);
-            for (name, value) in headers {
-                relayed.headers_mut().insert(name, value);
+        let mut cached = cache.write().await;
+        match failed {
+            true => {
+                cached.failed.retain(|_, at| is_fresh(Some(*at)));
+                cached.failed.insert(target, Instant::now());
             }
-            relayed
-        }
-        Err(error) => {
-            warn!(route, relay_target = %url, error = %error, "Management relay response failed");
-            // The management node already answered, so it may have applied the call.
-            ServerError::RelayFailed.into_response()
+            false => {
+                cached.failed.remove(&target);
+            }
         }
     }
 }
 
-fn relayed_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    [&header::CONTENT_TYPE, &header::RETRY_AFTER, &header::ETAG]
-        .into_iter()
-        .filter_map(|name| {
-            headers
-                .get(name)
-                .cloned()
-                .map(|value| (name.clone(), value))
-        })
-        .collect()
+fn relayed_response(reply: RelayReply) -> Response {
+    let status = reply_status(&reply);
+    let mut relayed = (status, reply.body).into_response();
+    relayed.headers_mut().remove(header::CONTENT_TYPE);
+    add_headers(&mut relayed, &reply.headers);
+    relayed
 }
 
 /// Cached management targets; a stale window triggers a realm-config read,
@@ -448,23 +355,9 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
     if is_fresh(cached.refreshed_at) {
         return cached.urls.clone();
     }
-    match drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(config) => {
-            let documents = load_node_documents(state, &config).await;
-            let peers = peer_management_urls(state.get_node_id(), &config, &documents);
-            let installed = drive(
-                installed_management_urls(state.get_realm_id()),
-                &state.get_ctx(),
-            )
-            .await
-            .unwrap_or_default();
-            cached.urls = relay_targets(peers, installed);
-        }
+    let peers = PeerTargetsOperation::new(state.get_realm_id(), state.get_node_id());
+    match drive(peers, &state.get_ctx()).await {
+        Ok(urls) => cached.urls = urls,
         Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),
     }
     cached.refreshed_at = Some(Instant::now());
@@ -473,38 +366,6 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
 
 fn is_fresh(refreshed_at: Option<Instant>) -> bool {
     refreshed_at.is_some_and(|refreshed_at| refreshed_at.elapsed() < MANAGEMENT_URL_TTL)
-}
-
-/// The targets a relayed route is tried against. A device holds no peer
-/// node-info document, so the list a realm node installed on it is the only
-/// address it has for a management node.
-fn relay_targets(peers: Vec<String>, installed: Vec<String>) -> Vec<String> {
-    match peers.is_empty() {
-        true => installed,
-        false => peers,
-    }
-}
-
-/// Management peers in node-id order, this node excluded. The order is stable
-/// so repeated calls pin the same peer: an onboarding secret is minted into one
-/// management node's local store and its status and revoke must return there.
-fn peer_management_urls(
-    current: NodeId,
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    documents: &BTreeMap<NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
-) -> Vec<String> {
-    let ordered: BTreeMap<NodeId, String> = management_node_urls(config, documents)
-        .into_iter()
-        .filter(|(node_id, _)| *node_id != current)
-        .filter_map(|(node_id, url)| url.map(|url| (node_id, url)))
-        .collect();
-    let mut urls: Vec<String> = Vec::new();
-    for url in ordered.into_values() {
-        if !urls.contains(&url) {
-            urls.push(url);
-        }
-    }
-    urls
 }
 
 #[cfg(test)]
