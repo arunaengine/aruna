@@ -540,7 +540,12 @@ pub async fn reserve_output_commits(
     hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
     drive(
-        job_calls::reserve_output_commits(job_id, destinations.to_vec(), hints.clone()),
+        job_calls::reserve_output_commits(
+            job_id,
+            destinations.to_vec(),
+            hints.clone(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
         context,
     )
     .await
