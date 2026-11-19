@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_operations::notifications::email::{RefreshMailOperation, check_smtp};
+use aruna_operations::notifications::email::{CheckSmtpOperation, RefreshMailOperation};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };
@@ -227,7 +227,10 @@ pub async fn set_email_profile(
         password: None,
         from: request.from.trim().to_string(),
     };
-    check_smtp(&settings).map_err(ServerError::BadRequestReason)?;
+    drive(CheckSmtpOperation::new(settings.clone()), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(ServerError::BadRequestReason)?;
     let input = EmailInput {
         host: settings.host,
         port: request.port,

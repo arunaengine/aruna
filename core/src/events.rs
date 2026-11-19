@@ -1161,7 +1161,9 @@ impl Event {
                     MailRefreshed,
                     RangeListed,
                     MemberAnswered,
-                    ConnectionAnswered
+                    ConnectionAnswered,
+                    SmtpChecked,
+                    AddressChecked
                 }
             ),
         }

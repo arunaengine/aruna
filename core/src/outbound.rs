@@ -41,6 +41,10 @@ pub enum OutboundEffect {
     MemberFetch(Box<crate::member_read::MemberFetch>),
     /// Sends one request of a plugin connection and answers with what the service said.
     Connection(Box<ConnectionCall>),
+    /// Checks that a mail sender can be built from the settings: a valid sender address and host.
+    CheckSmtp(Box<SmtpSettings>),
+    /// Checks the format of one mail address.
+    CheckAddress(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +97,13 @@ pub enum OutboundEvent {
     /// The answer to an [`OutboundEffect::Connection`].
     ConnectionAnswered {
         result: Result<ConnectionAnswer, ConnectionError>,
+    },
+    /// Why no mail sender can be built from the settings, if any reason.
+    SmtpChecked {
+        result: Result<(), String>,
+    },
+    AddressChecked {
+        valid: bool,
     },
 }
 

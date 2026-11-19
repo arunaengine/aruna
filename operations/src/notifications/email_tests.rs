@@ -175,17 +175,53 @@ fn remove_writes_off() {
     assert_eq!(refused.next(failed), Err(EmailError::Setting(error())));
 }
 
-/// The address is trimmed and checked once, and each opt-in gets its own ids.
+/// The address is trimmed, and each opt-in gets its own ids.
 #[test]
 fn opt_in_trimmed() {
     let categories = BTreeSet::from(["share.upload".to_string()]);
     let opt_in =
         |address: &str| EmailOptIn::new(user(), node(), address.to_string(), categories.clone(), 5);
-    let valid = opt_in(" ada@example.org ");
-    assert_eq!(valid.address, ADDRESS);
-    assert!(valid.address_valid);
-    assert_ne!(valid.write_id, opt_in(ADDRESS).write_id);
-    assert!(!opt_in("not an address").address_valid);
+    let trimmed = opt_in(" ada@example.org ");
+    assert_eq!(trimmed.address, ADDRESS);
+    assert_ne!(trimmed.write_id, opt_in(ADDRESS).write_id);
+}
+
+#[test]
+fn smtp_check_answers() {
+    let settings = SmtpSettings {
+        host: "smtp.example.org".to_string(),
+        port: None,
+        tls: SmtpTls::Plain,
+        username: None,
+        password: None,
+        from: ADDRESS.to_string(),
+    };
+    let mut check = CheckSmtpOperation::new(settings.clone());
+    let effect = OutboundEffect::CheckSmtp(Box::new(settings));
+    assert_eq!(
+        check.first(),
+        Ok(Next::Call(IoCall::from(Effect::Outbound(effect))))
+    );
+    let refused = OutboundEvent::SmtpChecked {
+        result: Err("the SMTP host is invalid".to_string()),
+    };
+    assert_eq!(
+        check.next(IoResult::Event(Box::new(Event::Outbound(refused)))),
+        Ok(Next::Done(Err("the SMTP host is invalid".to_string())))
+    );
+    let mut other = CheckSmtpOperation::new(SmtpSettings {
+        host: String::new(),
+        port: None,
+        tls: SmtpTls::Plain,
+        username: None,
+        password: None,
+        from: String::new(),
+    });
+    other.first().unwrap();
+    assert!(matches!(
+        other.next(mail_refreshed()),
+        Err(IoError::Unexpected { .. })
+    ));
 }
 
 /// A user of a realm whose id is a realm key, so addresses can be sealed to it.

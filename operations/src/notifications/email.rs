@@ -26,9 +26,34 @@ use crate::notifications::setting_rows::{
 use crate::notifications::unexpected_event;
 use crate::realm_vault::{PruneCacheOperation, RealmSecretError};
 
-/// Whether a mail sender can be built from `settings`: a valid sender address and host.
-pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
-    aruna_outbound::SmtpMailer::new(settings).map(|_| ())
+/// Whether a mail sender can be built from `settings`: a valid sender address and host. The
+/// output is the reason it cannot.
+#[derive(Debug, PartialEq)]
+pub struct CheckSmtpOperation {
+    settings: SmtpSettings,
+}
+
+impl CheckSmtpOperation {
+    pub fn new(settings: SmtpSettings) -> Self {
+        Self { settings }
+    }
+}
+
+impl Operation for CheckSmtpOperation {
+    type Output = Result<(), String>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+        let check = OutboundEffect::CheckSmtp(Box::new(self.settings.clone()));
+        Ok(Next::Call(IoCall::from(Effect::Outbound(check))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
+        match result.event()? {
+            Event::Outbound(OutboundEvent::SmtpChecked { result }) => Ok(Next::Done(result)),
+            other => Err(unexpected_event("OutboundEvent::SmtpChecked", &other)),
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]

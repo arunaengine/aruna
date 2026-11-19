@@ -280,6 +280,13 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
         OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
+        // Both checks need no backend, so they answer as on a node with one.
+        OutboundEffect::CheckSmtp(settings) => OutboundEvent::SmtpChecked {
+            result: aruna_outbound::check_smtp(settings),
+        },
+        OutboundEffect::CheckAddress(address) => OutboundEvent::AddressChecked {
+            valid: aruna_outbound::valid_address(address),
+        },
         OutboundEffect::ListRange(_) => OutboundEvent::RangeListed(Box::new(RangeAnswer::Silent)),
         OutboundEffect::MemberFetch(_) => {
             OutboundEvent::MemberAnswered(Box::new(MemberAnswer::Silent))
