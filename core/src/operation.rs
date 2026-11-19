@@ -24,8 +24,10 @@ pub enum HoldScope {
     PluginInstall(ulid::Ulid),
     /// This node's writes to one metadata document, so its actor's dots stay in order.
     DocumentWrite(ulid::Ulid),
-    /// Drawing placement handles and provisioning bindings on this node.
+    /// Drawing placement handles on this node, so two draws never overlap.
     PlacementHandles,
+    /// Provisioning placement bindings on this node. A run holding it may draw a handle.
+    PlacementBindings,
     /// The local repository of one document: projections, snapshots and pushes.
     GitRepository(ulid::Ulid),
     /// Publishing local runs on this node, so a repeated request cannot mint a second crate.

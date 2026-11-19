@@ -269,7 +269,7 @@ fn binding(scope: PlacementScope, strategy_id: Ulid) -> PlacementBinding {
 }
 
 #[test]
-fn allocations_share_hold() {
+fn holds_stay_separate() {
     let realm_id = test_realm();
     let strategy = Ulid::from_bytes([2; 16]);
     let scope = PlacementScope::Realm(realm_id);
@@ -278,8 +278,9 @@ fn allocations_share_hold() {
         AllocateBindingOperation::new(actor(realm_id), scope, DocumentClass::Metadata, strategy);
     let provision = ProvisionBindingOperation::new(actor(realm_id), scope, strategy);
     assert_eq!(draw.hold_scope(), Some(HoldScope::PlacementHandles));
-    assert_eq!(allocate.hold_scope(), Some(HoldScope::PlacementHandles));
-    assert_eq!(provision.hold_scope(), Some(HoldScope::PlacementHandles));
+    // Children take their own hold, so a parent must not hold what its child waits for.
+    assert_eq!(allocate.hold_scope(), None);
+    assert_eq!(provision.hold_scope(), Some(HoldScope::PlacementBindings));
 }
 
 #[test]
@@ -362,6 +363,11 @@ fn existing_binding_reused() {
     let mut config = seeded_config();
     let strategy = seeded_strategy(&config);
     let scope = PlacementScope::Group(Ulid::from_bytes([3; 16]));
+    config.placement_handle_ranges.push(range(
+        node(1),
+        FIRST_GRANTABLE_HANDLE,
+        FIRST_GRANTABLE_HANDLE + 1024,
+    ));
     config.placement_bindings.push(binding(scope, strategy));
     assert_eq!(
         provisioning(scope, strategy).next(config_read(config)),

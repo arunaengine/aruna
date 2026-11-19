@@ -109,10 +109,6 @@ impl Operation for AllocateBindingOperation {
     type Output = PlacementBinding;
     type Error = HandleAllocationError;
 
-    fn hold_scope(&self) -> Option<HoldScope> {
-        Some(HoldScope::PlacementHandles)
-    }
-
     fn first(&mut self) -> Result<Next<PlacementBinding>, HandleAllocationError> {
         let draw = DrawHandleOperation::new(self.actor.realm_id, self.actor.node_id);
         Ok(Next::Call(IoCall::child(draw)))
@@ -169,7 +165,7 @@ impl Operation for ProvisionBindingOperation {
     type Error = HandleAllocationError;
 
     fn hold_scope(&self) -> Option<HoldScope> {
-        Some(HoldScope::PlacementHandles)
+        Some(HoldScope::PlacementBindings)
     }
 
     fn first(&mut self) -> Result<Next<PlacementBinding>, HandleAllocationError> {

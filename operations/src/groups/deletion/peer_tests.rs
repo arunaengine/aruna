@@ -95,10 +95,12 @@ fn abort_applies() {
 
 #[test]
 fn prepare_signs_plan() {
+    // Only the realm's coordinator, its lowest server node, may ask for a confirmation.
+    let coordinator = node(1).min(node(2));
     let action = GroupDeleteAction::Prepare {
-        plan: plan(node(1)),
+        plan: plan(coordinator),
     };
-    let mut operation = control(node(1), action);
+    let mut operation = control(coordinator, action);
     operation.next(config_answer(config())).unwrap();
     let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(done()) else {
         panic!("expected the signing effect");
