@@ -47,6 +47,7 @@ pub mod rows;
 pub mod rules;
 pub mod runs;
 pub(crate) mod secret_use;
+pub mod send_calls;
 pub mod settings;
 pub mod state;
 pub mod submit;
