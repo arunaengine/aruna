@@ -104,8 +104,7 @@ pub use keyspaces::*;
 pub use metadata::*;
 pub use onboarding::*;
 pub use structured_id::{
-    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle,
-    StructuredId, StructuredIdGenerator, SystemEnvironment,
+    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,
 };
 pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
