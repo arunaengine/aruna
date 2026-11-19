@@ -188,7 +188,7 @@ async fn marked_source_refused() {
     use aruna_plugins::broker::Broker;
 
     use crate::plugin_host::broker::RunBroker;
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
     use aruna_operations::plugins::submit::WorkRequest;
@@ -299,7 +299,7 @@ async fn versioned_info() {
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
     use crate::plugin_host::broker::RunBroker;
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
     use aruna_operations::plugins::test_support::scope;

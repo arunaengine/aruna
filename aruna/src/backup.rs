@@ -12,7 +12,7 @@ use aruna_storage::snapshot::{
 use tracing::warn;
 #[cfg(unix)]
 use {
-    aruna_operations::driver::DriverContext,
+    aruna_drivers::driver::DriverContext,
     aruna_tasks::shutdown::Shutdown,
     std::io::BufWriter,
     std::os::unix::fs::{FileTypeExt, PermissionsExt},

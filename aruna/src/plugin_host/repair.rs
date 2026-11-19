@@ -11,7 +11,7 @@ use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use super::{ready_artifact, serving_node};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::plugins::artifacts::{ArtifactError, RepairCopies};
 use aruna_operations::plugins::install::InstallError;
 use aruna_operations::plugins::reconcile::ReconcileInstalls;

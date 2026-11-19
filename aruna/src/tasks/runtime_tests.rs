@@ -19,10 +19,13 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::job::{JobError, JobState};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::context::ExternalReconciler;
-use aruna_operations::jobs::executor::RangeTurns;
-use aruna_operations::jobs::runtime::*;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::context::ExternalReconciler;
+use aruna_drivers::jobs::executor::RangeTurns;
+use aruna_drivers::jobs::runtime::*;
+use aruna_drivers::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
+use aruna_drivers::testing::import_record;
+use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
 use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
@@ -31,9 +34,7 @@ use aruna_operations::jobs::store::test_calls::{
     adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
     read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };
-use aruna_operations::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP, JOB_MAX_ATTEMPTS};
 use aruna_operations::testing::task_context;
-use aruna_operations::tests::jobs::import_record;
 use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;
@@ -320,7 +321,7 @@ async fn zombie_skips_cleanup() {
 #[tokio::test]
 async fn completion_wins_race() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([4u8; 16]);
     let mut record = probe_record(job_id, 1, 0, None);
     record.state = JobState::Running;
@@ -356,7 +357,7 @@ async fn completion_wins_race() {
 #[tokio::test]
 async fn recover_requeues_inflight() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([5u8; 16]);
     let mut record = probe_record(job_id, 3, 0, None);
@@ -512,7 +513,7 @@ fn checkpoint_requests_flush() {
 #[tokio::test]
 async fn progress_spares_attempts() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x16; 16]);
     insert_job(&context, &probe_record(job_id, 1, 0, None))
         .await
@@ -690,7 +691,7 @@ async fn cancel_beats_capacity() {
 #[tokio::test]
 async fn wait_times_out() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([6u8; 16]);
     insert_job(&context, &probe_record(job_id, 1, 0, None))
@@ -912,7 +913,7 @@ fn paused_runtime_starts() {
 #[tokio::test]
 async fn recover_reconciles_external() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let recorder = Arc::new(RecordingReconciler::default());
     let runtime = JobsRuntime::with_reconciler(recorder.clone());
     let job_id = JobId::from_bytes([0xE7; 16]);
@@ -990,7 +991,7 @@ impl ExternalReconciler for BlockingReconciler {
 #[tokio::test]
 async fn stop_between_units() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let reconciler = Arc::new(BlockingReconciler::default());
     let runtime = JobsRuntime::with_reconciler(reconciler.clone());
     let first = JobId::from_bytes([0xE9; 16]);
@@ -1034,7 +1035,7 @@ async fn stop_between_units() {
 #[tokio::test]
 async fn cancel_before_recovery() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let recorder = Arc::new(RecordingReconciler::default());
     let runtime = JobsRuntime::with_reconciler(recorder.clone());
     let job_id = JobId::from_bytes([0xEB; 16]);
@@ -1080,7 +1081,7 @@ impl ExternalReconciler for AdoptingReconciler {
 #[tokio::test]
 async fn recovery_spares_attempts() {
     let (_dir, storage) = temp_storage();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let runtime = JobsRuntime::with_reconciler(Arc::new(AdoptingReconciler));
     let job_id = JobId::from_bytes([0xE8; 16]);
     let token = Ulid::generate();

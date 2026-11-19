@@ -14,10 +14,10 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::context::ExternalReconciler;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
-use aruna_operations::jobs::context::ExternalReconciler;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::test_calls::{
     insert_job, read_job_record, record_attempt_intent,
 };

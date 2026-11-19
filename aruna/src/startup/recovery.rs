@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::node::recovery_run::{RecoveryConfig, RecoveryOperation};
 use aruna_operations::shard::recovery::{
     RecoveryError, RecoveryOutcome, RecoveryStatus, RecoveryStop,

@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::tasks::runner::{claim_producer, spawn_job};
-use aruna_operations::driver::node_routing;
+use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
 

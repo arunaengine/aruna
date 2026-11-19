@@ -9,8 +9,8 @@ use rand::RngExt;
 
 use super::job_host::{job_scope, run_hosted};
 use aruna_core::jobs::JobRunOutcome;
-use aruna_operations::driver::node_routing;
-use aruna_operations::jobs::context::JobContext;
+use aruna_drivers::driver::node_routing;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::export::{ExportJobOperation, ExportScope};
 use aruna_operations::jobs::import::{ImportJobOperation, ImportRun};
 

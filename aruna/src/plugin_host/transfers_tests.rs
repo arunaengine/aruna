@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::calls::*;
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::job_context;
 use aruna_operations::plugins::work::{Identity, RequestContext, WorkKind, reserve};

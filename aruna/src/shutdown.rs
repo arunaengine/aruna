@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use aruna_api::error::ServerSetupError;
 use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
-use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -966,7 +966,7 @@ mod tests {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::structs::execution::job::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
-        use aruna_operations::driver::DriverContext;
+        use aruna_drivers::driver::DriverContext;
         use std::sync::Arc;
 
         let driver_ctx = Arc::new(DriverContext {

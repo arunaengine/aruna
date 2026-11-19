@@ -262,7 +262,7 @@ async fn drain_retries_queueing() {
     let key = format!("webhook/{}", record.notification_id);
     let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
     let queued = aruna_operations::jobs::store::test_calls::find_dedup_plan(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         recipient,
         &key,
         None,

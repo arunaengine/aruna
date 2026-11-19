@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +14,7 @@ use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::edit_work;
 use aruna_operations::plugins::test_support::job_context;
@@ -226,7 +226,7 @@ async fn marked_source_kept() {
     let (base, seen) = server(201).await;
     let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
     let readable = aruna_operations::plugins::objects::Unmarked::new(("in", "a.txt"), None);
-    let version = aruna_operations::driver::drive(readable, &blob).await;
+    let version = aruna_drivers::driver::drive(readable, &blob).await;
     let version = version.unwrap().unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),

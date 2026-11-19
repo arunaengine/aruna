@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};
 use aruna_operations::s3::session::{PURGE_BATCH, PurgeSessionsOperation};
 use aruna_operations::s3::sweeps::RecoverySweepOperation;

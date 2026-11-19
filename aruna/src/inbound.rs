@@ -23,17 +23,17 @@ use aruna_core::task::TaskKey;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
 use aruna_net::job_control::{read_request, write_answer};
 use aruna_net::notification::{
     close_stream, drain_request, read_frame, write_frame, write_message,
 };
 use aruna_net::streams::BiStream;
-use aruna_operations::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
 use aruna_operations::metadata::audit_entry::inbound_admission;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
@@ -291,7 +291,7 @@ async fn peer_request(
                     *request,
                     node,
                 );
-            let result = Box::pin(aruna_operations::driver::drive(admit, context.as_ref())).await;
+            let result = Box::pin(aruna_drivers::driver::drive(admit, context.as_ref())).await;
             Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
         }
         MetadataTransportMessage::ResolveJobInputs {
@@ -307,7 +307,7 @@ async fn peer_request(
                         aruna_operations::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
                             peer, auth_token, &node, *request,
                         );
-                    Box::pin(aruna_operations::driver::drive(serve, context.as_ref())).await
+                    Box::pin(aruna_drivers::driver::drive(serve, context.as_ref())).await
                 }
                 None => Err(aruna_core::jobs::SubmissionRefusal::Unavailable),
             };

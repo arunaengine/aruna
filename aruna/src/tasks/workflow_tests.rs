@@ -24,9 +24,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive, node_routing};
-use aruna_operations::effect_adapters::job::with_job_host;
-use aruna_operations::jobs::context::JobContext;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::effect_adapters::job::with_job_host;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::store::test_calls::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
@@ -654,7 +654,7 @@ async fn inventory_failure_parks() {
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (ctx, _net) = net_context(storage.clone()).await;
     let (record, token, _attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
@@ -872,7 +872,7 @@ fn exited_zero() -> Result<AttemptStatus, BackendError> {
 async fn cancel_stops_capture() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
@@ -918,7 +918,7 @@ async fn cancel_stops_capture() {
 async fn cancelled_capture_settles() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
@@ -1061,7 +1061,7 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::
     let net = aruna_net::NetHandle::new(
         aruna_net::NetConfig {
             realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
@@ -1135,7 +1135,7 @@ async fn session_end_succeeds() {
     // Ending a session finishes its job, so quota is released at once.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Waiting);
     let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1199,7 +1199,7 @@ async fn session_idle_succeeds() {
     // The idle timer finishes the job on its own, with reason `idle`.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Waiting);
     let (ctx, net, _registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1233,7 +1233,7 @@ async fn session_kernel_fails() {
     // A kernel that died is a permanent execution failure, not a clean end.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Waiting);
     let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1280,7 +1280,7 @@ async fn skip_heartbeat() {
 async fn superseded_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Waiting);
     let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1330,7 +1330,7 @@ async fn superseded_releases_session() {
 async fn superseded_keeps_replacement() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Waiting);
     let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1396,7 +1396,7 @@ async fn superseded_keeps_replacement() {
 async fn cancel_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::NotFound);
     let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
@@ -1434,7 +1434,7 @@ async fn cancel_releases_session() {
 async fn cancel_beats_success() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
     let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
@@ -1544,7 +1544,7 @@ async fn anchor_survives_restart() {
     // pre-Running window, so the first derived anchor is the durable one.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (record, token, _attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     assert!(record.started_at_ms.is_none());
@@ -1640,7 +1640,7 @@ async fn recovery_reuses_credential() {
     };
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.mounts.store(true, Ordering::Relaxed);
@@ -1723,7 +1723,7 @@ async fn recovery_reuses_credential() {
 async fn workspace_run_credential() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     let registry = ExecutorRegistry::new()
@@ -1960,7 +1960,7 @@ async fn drifted_site_refuses() {
     // must refuse to start the accepted work, retryably.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
     store_site(&context, job_id, 99, [7u8; 32]).await;
@@ -1978,7 +1978,7 @@ async fn drift_requeues_attempt() {
     // the site may return, or another target may take the work.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let (record, token, _) = ready_with_intent(&context).await;
     store_site(&context, record.job_id, 99, [7u8; 32]).await;
@@ -2011,7 +2011,7 @@ async fn stored_site_starts() {
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
     let subject = NodeSubjectRecord::seed(PlacementSubject {
@@ -2107,7 +2107,7 @@ async fn lose_claim(context: &DriverContext, job_id: JobId, token: ulid::Ulid) -
 async fn heartbeat_consumed_once() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Pending);
     let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;
@@ -2145,7 +2145,7 @@ async fn heartbeat_consumed_once() {
 async fn recovery_wins_adoption() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Adopted);
     backend.logs_fail.store(true, Ordering::Relaxed);
     let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
@@ -2173,7 +2173,7 @@ async fn recovery_wins_adoption() {
 async fn heartbeat_failure_stops() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.image_stall.store(true, Ordering::Relaxed);
     let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
@@ -2204,7 +2204,7 @@ async fn heartbeat_failure_stops() {
 async fn cancellation_skips_adoption() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = aruna_operations::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Pending);
     let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;

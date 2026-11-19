@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
-use aruna_operations::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::git::GitNode;
 use aruna_operations::git::cleanup::remove_objects;
 use aruna_operations::git::pending::drain_merges;

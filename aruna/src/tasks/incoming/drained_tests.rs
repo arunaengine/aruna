@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use super::remove_drained_backends;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::groups::backends::{backend_key, index_key, record_writes};
 
 fn context(root: &str) -> DriverContext {

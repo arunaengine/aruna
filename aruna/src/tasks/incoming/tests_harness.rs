@@ -93,14 +93,14 @@ async fn paused_runtime_waits() {
         None,
     );
     insert_job(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         &record,
     )
     .await
     .expect("insert job");
     assert!(matches!(
         claim_job(
-            &aruna_operations::testing::test_context(storage.clone()),
+            &aruna_drivers::testing::test_context(storage.clone()),
             job_id,
             node(7),
             2
@@ -114,7 +114,7 @@ async fn paused_runtime_waits() {
     start_task_queues(context, task_handle, runtime.clone(), &shutdown).await;
 
     let stored = read_job_record(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         job_id,
         None,
     )
@@ -125,7 +125,7 @@ async fn paused_runtime_waits() {
     assert_eq!(
         recover_stale_jobs(
             &runtime,
-            &aruna_operations::testing::test_context(storage.clone())
+            &aruna_drivers::testing::test_context(storage.clone())
         )
         .await
         .unwrap(),
@@ -133,7 +133,7 @@ async fn paused_runtime_waits() {
     );
     runtime.start();
     let stored = read_job_record(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         job_id,
         None,
     )
@@ -175,14 +175,14 @@ async fn start_keeps_job() {
         None,
     );
     insert_job(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         &record,
     )
     .await
     .expect("insert job");
     assert!(matches!(
         claim_job(
-            &aruna_operations::testing::test_context(storage.clone()),
+            &aruna_drivers::testing::test_context(storage.clone()),
             job_id,
             node(7),
             2
@@ -204,7 +204,7 @@ async fn start_keeps_job() {
     queues.restore_and_start(&shutdown).await;
 
     let stored = read_job_record(
-        &aruna_operations::testing::test_context(storage.clone()),
+        &aruna_drivers::testing::test_context(storage.clone()),
         job_id,
         None,
     )

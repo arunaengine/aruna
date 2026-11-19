@@ -15,9 +15,9 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_core::device_wipe::DeviceWipe;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -558,7 +558,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
             .expect("storage opens");
-        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn bind_failure_releases() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_operations::jobs::runtime::JobsRuntime;
+        use aruna_drivers::jobs::runtime::JobsRuntime;
         use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -674,7 +674,7 @@ mod tests {
         )
         .await
         .expect("settings resolve");
-        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -769,7 +769,7 @@ mod tests {
         config: &crate::config::Config,
         storage: aruna_storage::StorageHandle,
     ) -> String {
-        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -782,7 +782,7 @@ mod tests {
             config,
             None,
             driver_ctx,
-            aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new_paused(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
             &aruna_tasks::shutdown::Shutdown::new(),
         )
@@ -834,7 +834,7 @@ mod tests {
         let started = bind_session_s3(
             None,
             "127.0.0.1",
-            std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            std::sync::Arc::new(aruna_drivers::driver::DriverContext {
                 storage_handle: aruna_storage::StorageHandle::new().0,
                 net_handle: None,
                 blob_handle: None,
@@ -865,7 +865,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
             .expect("storage opens");
-        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -915,7 +915,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
             .expect("storage opens");
-        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,

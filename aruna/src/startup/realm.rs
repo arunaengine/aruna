@@ -10,10 +10,10 @@ use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_drivers::driver::node_facts;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
-use aruna_operations::driver::node_facts;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::projection::{
     MetadataProjectionError, ReplayPageOperation, max_clock_skew,
 };
@@ -334,7 +334,7 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
         aruna_operations::placement::policy::SubjectTrigger::Reconcile(mode),
         aruna_core::time::unix_timestamp_millis(),
     );
-    aruna_operations::driver::drive(sync, ctx)
+    aruna_drivers::driver::drive(sync, ctx)
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -347,7 +347,7 @@ async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), Stri
     };
     let facts = node_facts(ctx);
     let seed = SeedInfoOperation::new(config.realm_id, config.node_id, urls, facts, false);
-    aruna_operations::driver::drive(seed, ctx)
+    aruna_drivers::driver::drive(seed, ctx)
         .await
         .map_err(|error| error.to_string())
 }

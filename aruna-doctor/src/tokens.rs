@@ -14,13 +14,13 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
@@ -539,8 +539,8 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
@@ -801,7 +801,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         });
-        let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+        let jobs_runtime = aruna_drivers::jobs::runtime::JobsRuntime::new();
         let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
@@ -893,7 +893,7 @@ mod tests {
                 // initial production node does.
                 true,
                 Some(Arc::new(OidcValidator::new().unwrap())),
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

@@ -5,7 +5,7 @@
 
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, ExportMetadataResult};
@@ -1452,7 +1452,7 @@ async fn removal_keeps_rest() {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),
@@ -1570,7 +1570,7 @@ async fn pending_graph_refused() {
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
         let expected = Some(Ulid::from_string(&pending).unwrap());
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),
@@ -1659,7 +1659,7 @@ async fn unprojected_event_refused() {
             fixture.actor.clone(),
             Some(record.last_event_id),
         );
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),

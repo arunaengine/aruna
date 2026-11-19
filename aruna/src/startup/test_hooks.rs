@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::node::recovery_run::RecoveryConfig;
 use aruna_operations::shard::recovery::RecoveryStatus;
 #[cfg(debug_assertions)]

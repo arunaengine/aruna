@@ -526,8 +526,8 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
     use aruna_storage::FjallStorage;
     use serde::Serialize;

@@ -31,12 +31,13 @@ use tokio::sync::mpsc;
 use ulid::Ulid;
 
 use crate::tasks::incoming::OperationsTaskHandler;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::sync::outbox_record::write_outbox_effect;
 use aruna_tasks::InboundTaskHandler;
 
-pub(crate) use aruna_operations::testing::{RecordingTaskHandler, freeze_clock};
+use aruna_drivers::testing::freeze_clock;
+pub(crate) use aruna_operations::testing::RecordingTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
     aruna_operations::jobs::submit::mint_job_id(
@@ -244,7 +245,7 @@ pub(crate) async fn make_net_handle(
         NetConfig {
             secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
