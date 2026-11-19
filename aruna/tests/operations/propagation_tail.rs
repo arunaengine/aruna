@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility};

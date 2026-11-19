@@ -113,7 +113,7 @@ struct TlsS3 {
 }
 
 async fn tls_s3(
-    context: Arc<aruna_operations::driver::DriverContext>,
+    context: Arc<aruna_drivers::driver::DriverContext>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     s3_host: &str,
@@ -380,7 +380,7 @@ async fn rest_bearer_tls() -> TestResult<()> {
                 seed.capabilities.clone(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -505,8 +505,8 @@ fn shutdown_sequence(
         https: None,
         monitoring: None,
         task_handle: aruna_tasks::TaskHandle::new(),
-        jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
-        driver_ctx: Arc::new(aruna_operations::driver::DriverContext::storage_only(
+        jobs_runtime: aruna_drivers::jobs::runtime::JobsRuntime::new(),
+        driver_ctx: Arc::new(aruna_drivers::driver::DriverContext::storage_only(
             storage_handle.clone(),
         )),
         net_handle: None,
@@ -525,7 +525,7 @@ async fn drained_stack(
     let dir = tempfile::tempdir().expect("temp dir");
     let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
         .expect("storage opens");
-    let context = Arc::new(aruna_operations::driver::DriverContext {
+    let context = Arc::new(aruna_drivers::driver::DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
         blob_handle: None,

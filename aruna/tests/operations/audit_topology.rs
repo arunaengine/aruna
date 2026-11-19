@@ -6,7 +6,7 @@ use crate::topology;
 
 use crate::metadata_calls::list_audit;
 use aruna_core::StructuredId;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
     LocalPageOperation,

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::identity::realm::RealmNodeKind;

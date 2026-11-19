@@ -13,8 +13,8 @@ use aruna_core::structs::execution::job::{JobError, JobId};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::context::JobContext;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::query::{

@@ -16,8 +16,8 @@ use aruna_core::keyspaces::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::identity::user::User;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -210,7 +210,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     start_task_queues(
         context.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     )
     .await;
@@ -268,7 +268,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             Some(Arc::new(OidcValidator::new().unwrap())),
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

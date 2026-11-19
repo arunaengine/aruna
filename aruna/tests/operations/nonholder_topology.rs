@@ -29,9 +29,10 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
@@ -41,7 +42,6 @@ use aruna_operations::jobs::lifecycle::submit_external::{
 };
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
@@ -207,7 +207,7 @@ async fn record_routes_owner() -> TestResult<()> {
 /// Submits one execution through `context`, as the API routes do.
 #[allow(clippy::too_many_arguments)]
 async fn submit_external_job(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     spec: aruna_core::structs::execution::job::ExecutionSpec,
     created_by: aruna_core::UserId,
     idempotency_key: Option<String>,
@@ -413,7 +413,7 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
         &node.context,
     )

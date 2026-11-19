@@ -37,10 +37,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_drivers::driver::node_facts;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::node_facts;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
 use aruna_operations::realm::announce_presence::{
@@ -878,7 +878,7 @@ async fn spawn_seed_at(
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
     // The single-node seed owns rank zero and creates shard geneses before writes.
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
             realm_id,
             net.node_id(),
@@ -1042,7 +1042,7 @@ async fn spawn_joiner_mode(
     mark_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     // Join co-holder shard topics before creating rank-zero geneses.
     // This ordering adopts geneses already created by the seed.
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::shard::restore::RestoreTopicsOperation::new(
             config.node_id,
             config.realm_id,
@@ -1051,7 +1051,7 @@ async fn spawn_joiner_mode(
     )
     .await
     .expect("shard topics restore");
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
             config.realm_id,
             config.node_id,
@@ -1145,7 +1145,7 @@ async fn initialize_context(
     start_task_queues(
         context.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     )
     .await;
@@ -1189,7 +1189,7 @@ async fn spawn_rest_server(
             capabilities,
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

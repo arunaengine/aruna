@@ -17,6 +17,7 @@ use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
     TokenRevokedOperation, UserCutoffOperation,
@@ -25,7 +26,6 @@ use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::testing::sync_topics;
 use aruna_storage::StorageHandle;
 use ed25519_dalek::SigningKey;
@@ -270,7 +270,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_drivers::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

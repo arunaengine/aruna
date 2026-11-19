@@ -19,9 +19,9 @@ use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::structs::storage::format::{
     Compression, CompressionMigration, EncodingClass, StoredLayout,
 };
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
-use aruna_operations::driver::{DriverContext, drive, node_routing};
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use std::sync::Arc;
 

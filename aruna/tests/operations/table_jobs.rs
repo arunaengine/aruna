@@ -21,8 +21,8 @@ use ulid::Ulid;
 
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::structs::execution::job::StagingJobSpec;
-use aruna_operations::driver::drive;
-use aruna_operations::jobs::context::JobContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 
 // A job cancelled or shut down while its source's `Retry-After` pauses it ends with that stop,
 // not with a failed attempt.
@@ -358,10 +358,10 @@ async fn import_records(
             return;
         }
         loop {
-            let drained = aruna_operations::driver::drive(
+            let drained = aruna_drivers::driver::drive(
                 aruna_operations::replication::drain::ProcessBatchOperation::new(
                     aruna_operations::replication::page::deliver::MetadataPages,
-                    aruna_operations::driver::node_routing(&drain),
+                    aruna_drivers::driver::node_routing(&drain),
                     (&drain).node_and_realm(),
                 ),
                 &drain,
@@ -456,7 +456,7 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     let set_id = snapshot.set_id();
     store_record(handle, set_id, bytes).await;
     let found = GetBucketOperation::new(spec.bucket.clone());
-    let mut bucket = aruna_operations::driver::drive(found, &ctx.driver)
+    let mut bucket = aruna_drivers::driver::drive(found, &ctx.driver)
         .await
         .unwrap();
     bucket.distribution = Some(binding(&snapshot, 2, 5));

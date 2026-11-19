@@ -26,9 +26,9 @@ use aruna_core::structs::identity::auth::{
 };
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
@@ -285,7 +285,7 @@ async fn spawn_node(
     start_task_queues(
         driver_ctx.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     )
     .await;
@@ -374,7 +374,7 @@ async fn spawn_node(
             },
             claims_on_register,
             Some(Arc::new(OidcValidator::new().unwrap())),
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

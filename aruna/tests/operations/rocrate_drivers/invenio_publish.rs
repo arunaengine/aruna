@@ -15,7 +15,7 @@ use super::*;
 use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::metadata::revision_read::RawViewOperation;
 

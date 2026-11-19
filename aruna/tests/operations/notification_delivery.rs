@@ -22,9 +22,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
 };
@@ -549,7 +549,7 @@ async fn build_node(
         outbound_handle: None,
     });
 
-    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+    let jobs_runtime = aruna_drivers::jobs::runtime::JobsRuntime::new();
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
@@ -590,7 +590,7 @@ async fn install_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_drivers::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

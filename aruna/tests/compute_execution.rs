@@ -22,9 +22,9 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::context::ExternalReconciler;
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::context::ExternalReconciler;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_operations::jobs::store::{JobMutation, row_calls};
 use aruna_operations::jobs::submit::mint_job_id;

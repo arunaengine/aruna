@@ -6,7 +6,7 @@ use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::job::StagingJobSpec;
-use aruna_operations::jobs::context::JobContext;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::staging::lanes::LANE_ROWS;
 use aruna_operations::jobs::staging::lanes::parse_lanes;
 use aruna_operations::tests::staging::spec;
@@ -128,10 +128,10 @@ async fn job_context(
     use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::object_permission_path;
+    use aruna_drivers::driver::drive;
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::driver::drive;
     use aruna_operations::tests::staging::{create_test_bucket, setup_driver_context};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -263,7 +263,7 @@ pub(crate) async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> 
         spec: std::sync::Arc::new(spec.clone()),
         job_id: ctx.job_id,
         claim_token: ctx.claim_token,
-        routing: aruna_operations::driver::node_routing(&ctx.driver),
+        routing: aruna_drivers::driver::node_routing(&ctx.driver),
         seed: 7,
     };
     let job = aruna_operations::jobs::staging::StagingJobOperation::new(run);

@@ -70,7 +70,7 @@ async fn peers_delete_together() {
         &second_context
     };
     for _ in 0..2 {
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             aruna_operations::groups::deletion::DeleteGroupOperation::new(
                 context.node_and_realm(),
                 auth.clone(),
@@ -118,7 +118,7 @@ async fn check_reports_nodes() {
     let second_context = Arc::new(second.context);
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
-    let replies = aruna_operations::driver::drive(
+    let replies = aruna_drivers::driver::drive(
         aruna_operations::groups::deletion::CheckGroupOperation::new(
             first_context.node_and_realm(),
             auth,

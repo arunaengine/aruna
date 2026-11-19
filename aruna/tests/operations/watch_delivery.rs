@@ -26,7 +26,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::user_call::WatchDispatchError;
@@ -48,7 +48,7 @@ use crate::user_calls::{create_for_user, delete_for_user, list_for_user, list_wa
 const LIST_LIMIT: usize = LIST_MAX_LIMIT;
 
 /// Emits like every caller: failures only warn inside the operation.
-async fn emit_watch_event(context: &aruna_operations::driver::DriverContext, event: WatchEvent) {
+async fn emit_watch_event(context: &aruna_drivers::driver::DriverContext, event: WatchEvent) {
     let _ = drive(EmitEventOperation::new(event), context).await;
 }
 
@@ -796,7 +796,7 @@ async fn install_config_document(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_drivers::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

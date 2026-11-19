@@ -9,7 +9,7 @@ use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::blob::never_expiry;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use base64::engine::general_purpose::STANDARD;
@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 const MONTH_SECS: u64 = 30 * 24 * 60 * 60;
 
 async fn create_bearer_token(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     user_id: aruna_core::UserId,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
@@ -905,7 +905,7 @@ async fn token_opens_scope() -> TestResult<()> {
                 key.to_string(),
                 *version,
             );
-            let (envelope, _) = aruna_operations::driver::drive(read, &seed.context).await?;
+            let (envelope, _) = aruna_drivers::driver::drive(read, &seed.context).await?;
             let opened = grants[0].open_object(private.bytes(), &envelope);
             assert_eq!(opened.is_ok(), key == "allowed/a.txt", "{key}");
             if let Ok(object) = opened {
@@ -1055,8 +1055,8 @@ async fn token_needs_credential() -> TestResult<()> {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::abe::AbeError;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyIssuer};
+    use aruna_drivers::driver::drive;
     use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
-    use aruna_operations::driver::drive;
     const BUCKET: &str = "token-live";
     let seed = spawn_complete_seed().await?;
 
