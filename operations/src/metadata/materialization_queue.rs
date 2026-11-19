@@ -2822,3 +2822,7 @@ fn is_terminal_error(error: &MetadataMaterializationError) -> bool {
 #[cfg(test)]
 #[path = "materialization_queue_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "materialization_calls.rs"]
+mod call_tests;

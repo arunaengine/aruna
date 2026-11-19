@@ -27,11 +27,11 @@ use aruna_core::time::unix_timestamp_millis;
 
 use crate::tests::metadata::storage_key_exists;
 
-fn node(seed: u8) -> NodeId {
+pub(super) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataEventRecord {
+pub(super) fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataEventRecord {
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let group_id = Ulid::from_parts(7, 1);
     let document_path = format!("datasets/{name}");
