@@ -20,12 +20,12 @@ use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, Realm
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSnapshot, SignedSnapshot, SignedStatement,
 };
 use aruna_core::structs::storage::format::Compression;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -46,27 +46,6 @@ use crate::s3::bucket::dataset::DatasetSummaryOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
-
-/// Why the publisher refused or could not take a request.
-#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PublishRefusal {
-    #[error("the bearer token is missing or invalid")]
-    Unauthorized,
-    #[error("caller may not administer the distributed bucket's owner group")]
-    Forbidden,
-    #[error("{0}")]
-    Rejected(String),
-    #[error("the statement is already part of the record")]
-    Replayed,
-    #[error("configuration changes unavailable: {0}")]
-    Unavailable(String),
-}
-
-impl From<IoError> for PublishRefusal {
-    fn from(error: IoError) -> Self {
-        Self::Unavailable(error.to_string())
-    }
-}
 
 impl From<PublishError> for PublishRefusal {
     fn from(error: PublishError) -> Self {

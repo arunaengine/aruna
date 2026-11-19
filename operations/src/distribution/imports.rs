@@ -15,7 +15,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::source_root::SourceRoot;
+use aruna_core::structs::storage::distribution::source_root::{HandedImport, SourceRoot};
 use aruna_core::structs::storage::distribution::{DistributionSnapshot, DistributionView};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
@@ -56,18 +56,6 @@ impl From<IoError> for ImportError {
 
 fn failed(error: impl std::fmt::Display) -> ImportError {
     ImportError(error.to_string())
-}
-
-/// A staging job a range's former coordinator hands over: its spec, the source root its
-/// connector reads, and where the job stood before the range was fenced.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandedImport {
-    pub spec: StagingJobSpec,
-    pub root: SourceRoot,
-    pub resume: Option<StagingJobCheckpoint>,
-    /// The connector's record when it holds no credentials, so the new coordinator can register
-    /// it under the same id, as the import's fan-out does.
-    pub shared: Option<SourceConnector>,
 }
 
 /// A fenced job as its former coordinator keeps it until the transfer is no longer open: its

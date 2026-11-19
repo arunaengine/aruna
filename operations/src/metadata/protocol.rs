@@ -20,6 +20,8 @@ use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
+use aruna_core::structs::storage::distribution::source_root::HandedImport;
 use aruna_core::structs::storage::distribution::{
     DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
 };
@@ -575,7 +577,7 @@ pub enum MetadataTransportMessage {
         statement: Box<SignedStatement>,
     },
     DistributionAccepted {
-        result: Result<DistributionRevision, crate::distribution::forward::PublishRefusal>,
+        result: Result<DistributionRevision, PublishRefusal>,
     },
     /// One node's data link postings for the caller's lookup, read under the caller's token.
     DataLinks {
@@ -608,7 +610,7 @@ pub enum MetadataTransportMessage {
         job_id: aruna_core::structs::execution::job::JobId,
     },
     StagingSpecResult {
-        result: Result<Box<crate::distribution::imports::HandedImport>, MetadataReadError>,
+        result: Result<Box<HandedImport>, MetadataReadError>,
     },
     /// Reference records of one range from its coordinator, applied in one transaction.
     ReferencePage {

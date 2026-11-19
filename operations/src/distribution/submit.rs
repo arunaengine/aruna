@@ -20,13 +20,13 @@ use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::forward::PublishRefusal;
 use super::publish::{PublishConfig, PublishError, PublishOperation};
 use crate::forward::transport::{peer_answer, peer_call};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::transport_message_kind;
 use crate::replication::queue::schedule_blob_drain;
 use aruna_core::structs::identity::realm::NodeRealm;
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
 
 type Revision = Result<DistributionRevision, PublishRefusal>;
 

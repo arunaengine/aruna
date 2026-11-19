@@ -28,7 +28,7 @@ use self::paths::{PathAsk, PathReadOperation};
 use self::pulls::{PullAsk, PullServeOperation};
 use self::reads::{CallerReadOperation, ReadReply};
 use self::writes::WriteServeOperation;
-use crate::distribution::imports::{HandedImport, StagingSpecOperation};
+use crate::distribution::imports::StagingSpecOperation;
 use crate::forward::transport::reject;
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::device_pull::SetListing;
@@ -39,6 +39,7 @@ use crate::replication::page::PageAnswer;
 use crate::replication::page::deliver::ServePageOperation;
 use crate::replication::queue::BlobQueueError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::storage::distribution::source_root::HandedImport;
 
 /// What this node offers the requests it serves.
 #[derive(Clone, Debug, PartialEq)]
