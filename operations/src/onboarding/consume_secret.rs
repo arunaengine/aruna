@@ -14,7 +14,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::onboarding::create_secret::secret_record_key;
-use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumeSecretInput {
@@ -163,16 +163,9 @@ impl Operation for ConsumeSecretOperation {
     }
 
     fn first(&mut self) -> ConsumeTurn {
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                ONBOARDING_KEYSPACE.to_string(),
-                secret_record_key(self.input.enrollment_id),
-            ),
-            (
-                ONBOARDING_KEYSPACE.to_string(),
-                secret_state_key(self.input.enrollment_id),
-            ),
-        ])))
+        Ok(Next::Call(crate::onboarding::secret_reads(
+            self.input.enrollment_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> ConsumeTurn {

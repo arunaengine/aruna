@@ -20,19 +20,20 @@ pub struct RepositoryCredential {
 }
 
 impl RepositoryCredential {
+    /// Seals `token` under `key` with `nonce`, which must never repeat under that key.
     pub fn seal(
-        key: &CredentialEncryptionKey,
+        (key, nonce): (&CredentialEncryptionKey, [u8; 24]),
         user: UserId,
         group: Ulid,
         connector: Ulid,
         endpoint: String,
         token: &str,
     ) -> Result<Self, RepositoryError> {
-        Self::seal_link(key, user, group, connector, None, endpoint, token)
+        Self::seal_link((key, nonce), user, group, connector, None, endpoint, token)
     }
 
     pub fn seal_link(
-        key: &CredentialEncryptionKey,
+        (key, nonce): (&CredentialEncryptionKey, [u8; 24]),
         user: UserId,
         group: Ulid,
         connector: Ulid,
@@ -49,7 +50,7 @@ impl RepositoryCredential {
             ));
         }
         let aad = token_aad(user, group, connector, link_id, &endpoint);
-        let sealed = EncryptedS3Secret::encrypt(key, token, &aad)
+        let sealed = EncryptedS3Secret::encrypt(key, token, &aad, nonce)
             .map_err(|_| RepositoryError("repository token encryption failed"))?;
         Ok(Self {
             endpoint,

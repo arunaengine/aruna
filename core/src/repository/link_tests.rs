@@ -6,17 +6,9 @@ use super::*;
 use crate::credential_encryption::CredentialEncryptionKey;
 use crate::repository::RepositoryCredential;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-use crate::structured_id::{BucketId, PlacementHandle};
 
 fn job(nonce: u64) -> JobId {
-    JobId::from_parts(
-        1_700_000_000_000,
-        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        nonce,
-    )
-    .unwrap()
+    crate::testing::job_at(1_700_000_000_000, nonce)
 }
 
 fn link() -> RepositoryLink {
@@ -351,7 +343,7 @@ fn binds_link_token() {
     let (user, group, connector) = (link.created_by, link.group_id, link.connector_id);
     let seal = |link_id| {
         RepositoryCredential::seal_link(
-            &key,
+            (&key, [3; 24]),
             user,
             group,
             connector,

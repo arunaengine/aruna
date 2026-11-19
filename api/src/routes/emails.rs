@@ -5,9 +5,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::notifications::email::{ReadEmailOperation, RemoveEmailOperation};

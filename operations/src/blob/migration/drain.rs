@@ -742,7 +742,7 @@ impl MigratePageOperation {
             return None;
         }
         let row = self.batch.ready()?;
-        let elapsed = aruna_core::time::unix_timestamp_millis().saturating_sub(self.begun_ms);
+        let elapsed = self.now_ms.saturating_sub(self.begun_ms);
         let spent = Duration::from_millis(elapsed) >= self.budget || self.worked >= MIGRATION_WORK;
         if self.started > 0 && spent {
             self.stop = Some(Stop::More);

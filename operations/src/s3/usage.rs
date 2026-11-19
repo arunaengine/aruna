@@ -69,6 +69,8 @@ pub struct UsageCounterUpdate {
     /// The distributed bucket rows of the changed keys, maintained in the same transaction.
     inventory: Option<InventoryUpdate>,
     phase: UsageUpdatePhase,
+    /// The id the dirty markers carry, given by the host when the update starts.
+    generation: ulid::Ulid,
 }
 
 /// What a write does to the version rows of its bucket.
@@ -220,6 +222,7 @@ impl UsageCounterUpdate {
             dirty_group: Some(group_id),
             inventory: None,
             phase: UsageUpdatePhase::Pending,
+            generation: ulid::Ulid::nil(),
         }
     }
 
@@ -240,6 +243,7 @@ impl UsageCounterUpdate {
             dirty_group: Some(group_id),
             inventory: None,
             phase: UsageUpdatePhase::Pending,
+            generation: ulid::Ulid::nil(),
         }
     }
 
@@ -289,14 +293,15 @@ impl UsageCounterUpdate {
             dirty_group: None,
             inventory: None,
             phase: UsageUpdatePhase::Pending,
+            generation: ulid::Ulid::nil(),
         }
     }
 
     /// Writes, in the counter update's transaction, the dirty markers the publisher
-    /// scans. The value is a fresh generation id: the publisher clears a marker only
+    /// scans. The value is the fresh generation id: the publisher clears a marker only
     /// if its stored generation still matches, so a mid-publish re-dirty keeps its retry.
     fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
-        let generation = ByteView::from(ulid::Ulid::generate().to_bytes().to_vec());
+        let generation = ByteView::from(self.generation.to_bytes().to_vec());
         let mut writes = vec![(
             NODE_STATS_KEYSPACE.to_string(),
             ByteView::from(DIRTY_GLOBAL_KEY.to_vec()),
@@ -337,7 +342,9 @@ impl UsageCounterUpdate {
     }
 
     /// The first call: the counter additions, which apply when the host's transaction commits.
-    pub fn start_calls(&mut self) -> StagedCall {
+    /// `generation` is a fresh id of the host's run, which the dirty markers carry.
+    pub fn start_calls(&mut self, generation: ulid::Ulid) -> StagedCall {
+        self.generation = generation;
         self.phase = UsageUpdatePhase::Adding;
         StagedCall::InTransaction(IoCall::AddUsage {
             space: USAGE_STATS_KEYSPACE.to_string(),
@@ -1231,7 +1238,9 @@ mod tests {
             },
         );
 
-        let StagedCall::InTransaction(IoCall::AddUsage { deltas, .. }) = update.start_calls()
+        let generation = Ulid::from_parts(7, 7);
+        let StagedCall::InTransaction(IoCall::AddUsage { deltas, .. }) =
+            update.start_calls(generation)
         else {
             panic!("expected the counter deltas");
         };
@@ -1258,6 +1267,9 @@ mod tests {
                 .iter()
                 .all(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
         );
+        // Each marker carries the generation the host minted.
+        let carried = generation.to_bytes();
+        assert!(writes.iter().all(|(.., value)| value.as_ref() == carried));
 
         let done = update.step_calls(IoResult::Done).unwrap();
         assert!(done.is_none());
@@ -1277,7 +1289,7 @@ mod tests {
         let mut update = update.in_bucket("data", RowChange::RemovedVersion);
         let StagedCall::InTransaction(IoCall::AddUsage {
             deltas, buckets, ..
-        }) = update.start_calls()
+        }) = update.start_calls(Ulid::from_parts(7, 7))
         else {
             panic!("expected the counter deltas");
         };
@@ -1298,7 +1310,8 @@ mod tests {
         // The reclaim sweep's physical debit names no group, so no bucket row moves.
         let stored = StoredDelta::new([1; 32], BackendRef::node_default(), -1, -5);
         let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data", RowChange::Kept);
-        let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) = update.start_calls()
+        let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) =
+            update.start_calls(Ulid::from_parts(7, 7))
         else {
             panic!("expected the counter deltas");
         };
@@ -1321,7 +1334,8 @@ mod tests {
             assert_eq!(RowChange::written(existing, marker), row);
             let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
             let mut update = update.in_bucket("data", row);
-            let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) = update.start_calls()
+            let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) =
+                update.start_calls(Ulid::from_parts(7, 7))
             else {
                 panic!("expected the counter deltas");
             };
@@ -1764,19 +1778,7 @@ mod tests {
     }
 
     async fn write_stat(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     fn logical(logical_bytes: u64) -> UsageCounters {
@@ -1944,7 +1946,7 @@ mod tests {
                 ..Default::default()
             };
             let mut update = UsageCounterUpdate::for_group(group_id, delta);
-            update.start_calls();
+            update.start_calls(Ulid::from_parts(7, 7));
             let Some(StagedCall::InTransaction(IoCall::Write(writes))) =
                 update.step_calls(IoResult::Done).unwrap()
             else {

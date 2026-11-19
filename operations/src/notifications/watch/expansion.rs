@@ -10,6 +10,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
@@ -110,8 +111,6 @@ pub struct WatchExpandOperation {
     /// The page cursor and the retry row of a drained retry; `None` for a fresh delivery.
     start: Option<Vec<u8>>,
     retry_key: Option<Vec<u8>>,
-    /// The interest marker row, made with the operation so its steps stay deterministic.
-    marker: (KeySpace, Key, Value),
     state: ExpandState,
     next: Option<Vec<u8>>,
     retry_value: Option<Vec<u8>>,
@@ -124,6 +123,8 @@ pub struct WatchExpandOperation {
     /// The suppressed deliveries, recorded as metrics once the run ends either way.
     suppressed: Vec<WatchMetricReason>,
     outcome: ExpandOutcome,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl WatchExpandOperation {
@@ -145,7 +146,6 @@ impl WatchExpandOperation {
             events,
             start,
             retry_key,
-            marker: dirty_marker_write(realm_id),
             state: ExpandState::List,
             next: None,
             retry_value: None,
@@ -157,6 +157,8 @@ impl WatchExpandOperation {
             queue_changed: false,
             suppressed: Vec::new(),
             outcome: ExpandOutcome::default(),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -424,7 +426,8 @@ impl WatchExpandOperation {
             return self.finish();
         }
         self.state = ExpandState::Marker;
-        Ok(Next::Call(IoCall::Write(vec![self.marker.clone()])))
+        let marker = dirty_marker_write(self.realm_id, self.ids.mint(self.now_ms));
+        Ok(Next::Call(IoCall::Write(vec![marker])))
     }
 
     /// A check that could not run now ends the run, recorded as one more suppression.
@@ -459,6 +462,14 @@ impl WatchExpandOperation {
 impl Operation for WatchExpandOperation {
     type Output = ExpandOutcome;
     type Error = ExpandError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Turn {
         if self.events.is_empty() {

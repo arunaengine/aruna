@@ -1449,6 +1449,7 @@ fn handoff_needs_coordinator() {
             .apply_operation(
                 &old,
                 AdminDocumentOperation::MergeCoordinatorSet { node_id },
+                ulid::Ulid::generate(),
             )
             .expect("pin applies");
         state

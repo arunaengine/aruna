@@ -108,3 +108,14 @@ pub(crate) async fn store_folder(
         false => Err(FolderError::Unavailable),
     }
 }
+
+/// A realm replica of the document `notes` in group 1.
+pub(crate) fn replica() -> crate::device::replica::ReplicaRecord {
+    let (document_id, group_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([1; 16]));
+    crate::device::replica::ReplicaRecord::new(
+        document_id,
+        group_id,
+        "notes".to_string(),
+        crate::device::replica::ReplicaOrigin::Realm,
+    )
+}

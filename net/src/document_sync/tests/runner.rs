@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::document::{DocumentEffect, DocumentReconcileResult};
 use aruna_core::document_apply::Step;
 use aruna_core::document_apply::admin::{AdminFollowUp, AdminOperationPlan};
@@ -29,7 +30,6 @@ use aruna_core::operation::{
     ByCalls, EffectOperation, Operation, Runnable, SubOperation, TransactionMode,
 };
 use aruna_core::row_plan::{PlanOperation, PlanRows, Planned, RowPlan};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
 

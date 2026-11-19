@@ -16,6 +16,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_CREATION_KEYSPACE, COPY_OWNER_KEYSPACE, DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE,
@@ -46,7 +47,7 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -195,6 +196,8 @@ pub struct DeleteObjectResult {
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteObjectOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: DeleteObjectInput,
     state: DeleteObjectState,
     version_id: Option<Ulid>,
@@ -245,6 +248,8 @@ pub struct DeleteObjectOperation {
 impl DeleteObjectOperation {
     pub fn new(input: DeleteObjectInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             state: DeleteObjectState::CheckPurgeFence,
             version_id: None,
@@ -738,7 +743,7 @@ impl DeleteObjectOperation {
             return self.start_usage_update();
         };
         let candidate = ReclaimCandidate {
-            enqueued_at: SystemTime::now(),
+            enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
         };
         let key =
             ReclaimCandidateKey::new(location.backend, location.encoding, location.blake3_hash);
@@ -814,7 +819,7 @@ impl DeleteObjectOperation {
         if update.is_noop() {
             return self.write_delete_audit();
         }
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage_update = Some(update);
         self.call(DeleteObjectState::UpdateUsage, call)
     }
@@ -890,10 +895,10 @@ impl DeleteObjectOperation {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             version_id,
-            occurred_at_ms: aruna_core::time::unix_timestamp_millis(),
+            occurred_at_ms: self.now_ms,
         };
         let value: Value = record.to_bytes()?.into();
-        let audit_id = Ulid::generate();
+        let audit_id = self.ids.mint(self.now_ms);
         let trail = trail_key(&record, incarnation, audit_id).into();
         let writes = vec![
             (
@@ -942,9 +947,10 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Turn {
-        let version_id = mint_version(self.set_hint);
+        let version_id = mint_version(self.ids.mint(self.now_ms), self.set_hint);
         self.version_id = Some(version_id);
-        self.deleted_version_created = Some(SystemTime::now());
+        self.deleted_version_created =
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms));
         self.read_current_lookup(version_id)
     }
 
@@ -963,10 +969,8 @@ impl DeleteObjectOperation {
     fn write_deleted_version(&mut self) -> Turn {
         let version_id = self.version_id;
         let version_id = version_id.ok_or(DeleteObjectError::InvalidOperationState)?;
-        let created_at = self
-            .deleted_version_created
-            .get_or_insert_with(SystemTime::now)
-            .to_owned();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let created_at = *self.deleted_version_created.get_or_insert(now);
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
         let generation = self.marker_head.as_ref().map_or(0, |head| head.generation);
@@ -1117,6 +1121,14 @@ impl Operation for DeleteObjectOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

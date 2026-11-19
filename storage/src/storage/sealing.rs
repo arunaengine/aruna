@@ -29,13 +29,21 @@ pub fn row_aad(key_space: &str, key: &[u8]) -> Vec<u8> {
     [key_space.as_bytes(), &[0], key].concat()
 }
 
+/// `N` fresh nonce bytes from the operating system.
+pub(super) fn fresh_nonce<const N: usize>() -> Result<[u8; N], StorageError> {
+    let mut nonce = [0u8; N];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| StorageError::WriteError("no system randomness for a nonce".into()))?;
+    Ok(nonce)
+}
+
 fn seal(
     secret_key: &CredentialEncryptionKey,
     key_space: &str,
     key: &Key,
     value: &Value,
 ) -> Result<Value, StorageError> {
-    seal_bytes(secret_key, value, &row_aad(key_space, key))
+    seal_bytes(secret_key, value, &row_aad(key_space, key), fresh_nonce()?)
         .map(Value::from)
         .map_err(|_| StorageError::WriteError("secret row could not be sealed".into()))
 }

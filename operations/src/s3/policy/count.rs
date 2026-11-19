@@ -59,8 +59,8 @@ fn decode_count(value: Option<Value>) -> Result<Option<CoverageCount>, Conversio
         .transpose()
 }
 
-/// Replaces the bucket's saved count with a fresh one and wakes the migration task once the
-/// record committed.
+/// Replaces the bucket's saved count with one started at the run's time and wakes the migration
+/// task once the record committed.
 #[derive(Debug, PartialEq)]
 pub struct StartCountOperation {
     bucket: String,
@@ -69,10 +69,10 @@ pub struct StartCountOperation {
 }
 
 impl StartCountOperation {
-    pub fn new(bucket: String, now_ms: u64) -> Self {
+    pub fn new(bucket: String) -> Self {
         Self {
             bucket,
-            record: CoverageCount::new(now_ms),
+            record: CoverageCount::new(0),
             written: false,
         }
     }
@@ -84,6 +84,10 @@ impl Operation for StartCountOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.record = CoverageCount::new(now_ms);
     }
 
     fn first(&mut self) -> Result<Next<CoverageCount>, StartCountError> {

@@ -7,18 +7,20 @@ use std::collections::VecDeque;
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
-use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
+use aruna_core::structs::execution::job::{JobPayload, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
 use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, job_placement, mint_job_id,
 };
 
 #[derive(Debug, Error, PartialEq)]
@@ -37,11 +39,12 @@ pub enum EnqueueError {
 /// and a failure is returned so the sender delivers again.
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDeliveriesOperation {
-    waiting: VecDeque<(&'static str, SubmitJobSpec, JobId)>,
+    waiting: VecDeque<(&'static str, SubmitJobSpec, (PlacementHandle, BucketId))>,
     /// The channel of the submit that runs.
     current: &'static str,
-    /// A job id that could not be minted, returned before any submit runs.
+    /// A job id that could not be placed, returned before any submit runs.
     failed: Option<EnqueueError>,
+    ids: IdMint,
 }
 
 impl EnqueueDeliveriesOperation {
@@ -78,12 +81,13 @@ impl EnqueueDeliveriesOperation {
             waiting: VecDeque::with_capacity(deliveries.len()),
             current: "delivery",
             failed: None,
+            ids: IdMint::default(),
         };
         for (channel, record, payload) in deliveries {
             let name = format!("{channel}/{}", record.notification_id);
             let dedup_key = user_dedup_key(record.recipient, &name);
-            let job_id = match mint(config, owner_node, &dedup_key) {
-                Ok(job_id) => job_id,
+            let placement = match place(config, owner_node, &dedup_key) {
+                Ok(placement) => placement,
                 Err(source) => {
                     let reason = source.to_string();
                     operation.failed = Some(EnqueueError::Submit { channel, reason });
@@ -101,42 +105,50 @@ impl EnqueueDeliveriesOperation {
                 workspace_bucket: None,
                 active_cap: None,
             };
-            (operation.waiting).push_back((channel, spec, job_id));
+            (operation.waiting).push_back((channel, spec, placement));
         }
         operation
     }
 
     /// Runs the next submit as a child that a lost conflict reruns, or ends once none is left.
-    fn submit(&mut self) -> Next<()> {
-        let Some((channel, spec, job_id)) = self.waiting.pop_front() else {
-            return Next::Done(());
+    fn submit(&mut self) -> Result<Next<()>, EnqueueError> {
+        let Some((channel, spec, (handle, bucket))) = self.waiting.pop_front() else {
+            return Ok(Next::Done(()));
         };
         self.current = channel;
+        let job_id = mint_job_id(handle, bucket, &mut self.ids, spec.now_ms).map_err(|error| {
+            let reason = SubmitJobError::from(error).to_string();
+            EnqueueError::Submit { channel, reason }
+        })?;
         let build = move || SubmitJobOperation::new(spec.clone(), job_id);
         let submit = boxed_retry(build, &job_id.to_bytes(), |result| {
             Event::Child(ChildOutcome::new(result))
         });
-        Next::Call(IoCall::Child(submit))
+        Ok(Next::Call(IoCall::Child(submit)))
     }
 }
 
-fn mint(
+fn place(
     config: Option<&RealmConfigDocument>,
     owner_node: NodeId,
     dedup_key: &[u8],
-) -> Result<JobId, SubmitJobError> {
+) -> Result<(PlacementHandle, BucketId), SubmitJobError> {
     let unavailable = || SubmitJobError::PlacementUnavailable("realm config unavailable".into());
-    mint_configured_job(config.ok_or_else(unavailable)?, owner_node, dedup_key)
+    job_placement(config.ok_or_else(unavailable)?, owner_node, dedup_key)
 }
 
 impl Operation for EnqueueDeliveriesOperation {
     type Output = ();
     type Error = EnqueueError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         match self.failed.take() {
             Some(error) => Err(error),
-            None => Ok(self.submit()),
+            None => self.submit(),
         }
     }
 
@@ -146,7 +158,7 @@ impl Operation for EnqueueDeliveriesOperation {
             channel: self.current,
             reason: error.to_string(),
         })?;
-        Ok(self.submit())
+        self.submit()
     }
 }
 
@@ -155,6 +167,7 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
+    use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::execution::notification::NotificationClass;
 
     fn upload() -> NotificationRecord {

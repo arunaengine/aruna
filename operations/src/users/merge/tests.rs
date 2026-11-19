@@ -457,6 +457,7 @@ fn pin(pinned: Option<NodeId>) -> Option<Value> {
             .apply_operation(
                 &actor(id(1)),
                 AdminDocumentOperation::MergeCoordinatorSet { node_id },
+                ulid::Ulid::generate(),
             )
             .unwrap();
     }

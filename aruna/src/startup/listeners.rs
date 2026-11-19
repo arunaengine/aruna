@@ -17,7 +17,8 @@ use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
+use aruna_operations::device::replica::DEFAULT_CACHE_BYTES;
+use aruna_operations::device::replica_store::store_cache_budget;
 use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -276,7 +277,10 @@ async fn bind_all(
             rocrate_limits: config.rocrate_limits.clone(),
         });
     if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
-        set_cache_budget(device_cache_env());
+        let budget = store_cache_budget(device_cache_env());
+        if let Err(error) = aruna_drivers::driver::drive(budget, &driver_ctx).await {
+            warn!(%error, "The device cache budget could not be stored");
+        }
     }
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {

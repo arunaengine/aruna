@@ -13,7 +13,6 @@ use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::storage::replication::ArunaArn;
 use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
-use crate::time::unix_timestamp_millis;
 use crate::types::Key;
 use byteview::ByteView;
 
@@ -127,6 +126,7 @@ impl BlobJobRecord {
         input: ReplicateScopeInput,
         source_delete_marker: Option<bool>,
         due_at_ms: u64,
+        job_id: Ulid,
     ) -> Self {
         let writer_auth_context = Some(input.auth_context.clone());
         Self {
@@ -142,7 +142,7 @@ impl BlobJobRecord {
             writer_auth_context,
             reference_advance: None,
             distribution: None,
-            job_id: Ulid::generate(),
+            job_id,
         }
     }
 
@@ -151,10 +151,11 @@ impl BlobJobRecord {
         source_delete_marker: Option<bool>,
         relationship_id: Ulid,
         due_at_ms: u64,
+        job_id: Ulid,
     ) -> Self {
         Self {
             relationship_id: Some(relationship_id),
-            ..Self::new(input, source_delete_marker, due_at_ms)
+            ..Self::new(input, source_delete_marker, due_at_ms, job_id)
         }
     }
 
@@ -378,6 +379,8 @@ pub fn relationship_job(
     relationship: SyncRelationship,
     inbound_origin: Option<&SyncOrigin>,
     upstream_sources: &[ArunaArn],
+    now_ms: u64,
+    job_id: Ulid,
 ) -> Option<BlobJobRecord> {
     let RelationshipJobTarget {
         bucket,
@@ -404,7 +407,6 @@ pub fn relationship_job(
         return None;
     }
 
-    let now_ms = unix_timestamp_millis();
     let origin = Some(match inbound_origin {
         Some(origin) => SyncOrigin {
             relationship_id: relationship.id,
@@ -443,6 +445,7 @@ pub fn relationship_job(
             Some(delete_marker),
             relationship.id,
             now_ms,
+            job_id,
         )
         .with_origin(origin)
         .with_sources(next_sources),

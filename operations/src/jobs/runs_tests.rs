@@ -98,12 +98,7 @@ fn user(seed: u8, realm_id: RealmId) -> UserId {
 }
 
 fn auth(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 #[tokio::test]

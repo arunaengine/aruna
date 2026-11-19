@@ -524,7 +524,13 @@ mod tests {
                 key: "key".to_string(),
                 size_bytes: 1,
             };
-            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
         };
         let gone = notice(recipient, "raw", 1_000);
         let kept = [
@@ -536,6 +542,7 @@ mod tests {
         assert_eq!(upsert_inbox_records(&storage, &stored).await, Ok(4));
 
         let deletion = NotificationRecord::new(
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -571,8 +578,15 @@ mod tests {
         let recipient = user(1, 2);
         let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group_id = ulid::Ulid::from_parts(1, 1);
-        let record =
-            |kind, at| NotificationRecord::new(recipient, NotificationClass::Direct, kind, at);
+        let record = |kind, at| {
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
+        };
         let notice = |bucket: &str, at| {
             let kind = NotificationKind::ShareUpload {
                 share_id: ulid::Ulid::generate(),

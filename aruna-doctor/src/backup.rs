@@ -167,7 +167,7 @@ fn queue_checks(main: &OptimisticTxDatabase) -> Result<(), SnapshotError> {
         open(STORAGE_CHECK_KEYSPACE)?,
         open(CHECK_QUEUE_KEYSPACE)?,
     );
-    let record = StorageCheck::new(aruna_core::time::unix_timestamp_millis())
+    let record = StorageCheck::new(aruna_clock::unix_timestamp_millis())
         .to_bytes()
         .map_err(std::io::Error::other)?;
     for entry in db.snapshot().iter(&buckets) {

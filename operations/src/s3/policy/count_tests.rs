@@ -51,7 +51,8 @@ fn value(bytes: Option<Vec<u8>>) -> IoResult {
 
 #[test]
 fn start_queues_count() {
-    let mut start = StartCountOperation::new("photos".to_string(), 7);
+    let mut start = StartCountOperation::new("photos".to_string());
+    start.stamp(7);
     assert_eq!(start.transaction(), TransactionMode::Write);
     assert!(matches!(start.first(), Ok(Next::Call(IoCall::Read(_)))));
     let Ok(Next::Call(IoCall::Write(rows))) = start.next(value(Some(b"bucket".to_vec()))) else {
@@ -70,7 +71,7 @@ fn start_queues_count() {
 
 #[test]
 fn missing_bucket_refused() {
-    let mut start = StartCountOperation::new("photos".to_string(), 7);
+    let mut start = StartCountOperation::new("photos".to_string());
     start.first().unwrap();
     assert_eq!(start.next(value(None)), Err(StartCountError::NoSuchBucket));
 }

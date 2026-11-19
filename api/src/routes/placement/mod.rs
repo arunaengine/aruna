@@ -10,6 +10,7 @@ use crate::lookup::bucket_info;
 use crate::metadata::forwarded_auth_token;
 use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_path};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -19,7 +20,6 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::placement::policy::GateOperation;
@@ -1302,7 +1302,7 @@ pub async fn mint_object_placement(
                 created_at: SystemTime::now(),
                 now_ms: unix_timestamp_millis(),
             },
-            mint_version(hint),
+            mint_version(Ulid::generate(), hint),
         ),
         &state.get_ctx(),
     )

@@ -31,7 +31,13 @@ fn spec() -> WebhookDeliverySpec {
         key: "a.csv".to_string(),
         size_bytes: 9,
     };
-    let mut notification = NotificationRecord::new(user(1, 2), NotificationClass::Direct, kind, 42);
+    let mut notification = NotificationRecord::new(
+        ulid::Ulid::generate(),
+        user(1, 2),
+        NotificationClass::Direct,
+        kind,
+        42,
+    );
     notification.notification_id = Ulid::from_parts(7, 7);
     WebhookDeliverySpec {
         subscription_id: Ulid::nil(),

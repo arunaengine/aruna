@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentOutboxEvent;
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -53,6 +54,8 @@ pub struct ClaimInitialOperation {
     stage: Stage,
     claimed: Option<RealmAuthorizationDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -103,6 +106,8 @@ impl ClaimInitialOperation {
             stage: Stage::Read,
             claimed: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -157,7 +162,13 @@ impl ClaimInitialOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input.actor, &role)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input.actor,
+            &role,
+            &mut self.ids,
+            self.now_ms,
+        )?;
         materialize_admin_assignment(
             &mut auth_doc,
             &reducer_state,
@@ -215,6 +226,14 @@ impl Operation for ClaimInitialOperation {
     type Output = ClaimInitialResult;
     type Error = ClaimInitialError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -269,6 +288,8 @@ fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     actor: &Actor,
     role: &Role,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     if should_seed_admin(state, role.role_id) {
@@ -277,6 +298,7 @@ fn apply_reducer_updates(
             AdminDocumentOperation::RealmRoleCreated {
                 role: AdminRoleDefinition::from(role),
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }
@@ -286,6 +308,7 @@ fn apply_reducer_updates(
             role_id: role.role_id,
             user_id: actor.user_id,
         },
+        ids.mint(now_ms),
     )?;
     admin_events.push(event);
 
@@ -482,7 +505,14 @@ mod tests {
         let actor = actor(realm_id, 12, 13);
         let (auth_doc, role) = auth_and_role(realm_id);
         let mut previous_state = AdminDocumentState::new(AdminDocumentTarget::Realm { realm_id });
-        super::apply_reducer_updates(&mut previous_state, &actor, &role).unwrap();
+        super::apply_reducer_updates(
+            &mut previous_state,
+            &actor,
+            &role,
+            &mut aruna_core::id_mint::IdMint::default(),
+            1,
+        )
+        .unwrap();
         let mut operation = ClaimInitialOperation::new(ClaimInitialInput {
             actor: actor.clone(),
         });

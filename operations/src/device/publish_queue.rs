@@ -12,7 +12,6 @@ use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -101,8 +100,8 @@ impl PublishEntry {
         document_path: String,
         public: bool,
         jsonld: String,
+        now: u64,
     ) -> Self {
-        let now = unix_timestamp_millis();
         Self {
             draft_id,
             owner,
@@ -129,8 +128,8 @@ impl PublishEntry {
         record: &MetadataRegistryRecord,
         batch: MetadataBatch,
         authored: MetadataBatchSource,
+        now: u64,
     ) -> Self {
-        let now = unix_timestamp_millis();
         Self {
             draft_id,
             owner,
@@ -378,6 +377,7 @@ mod pure_tests {
             "/notes".to_string(),
             false,
             "{}".to_string(),
+            10,
         )
     }
 
@@ -410,6 +410,7 @@ mod pure_tests {
             MetadataBatchSource::UpsertDataEntity {
                 jsonld: r#"{"@id":"data.csv"}"#.to_string(),
             },
+            10,
         );
         let decoded = PublishEntry::from_bytes(&entry.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded, entry);

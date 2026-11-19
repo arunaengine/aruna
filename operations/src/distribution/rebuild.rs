@@ -6,6 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, NODE_STATS_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
@@ -186,11 +187,15 @@ struct RebuildStepOperation {
     state: StepState,
     plan: Plan,
     end: Option<StepEnd>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl RebuildStepOperation {
     fn new(config: RebuildConfig, account: RangeAccount, kind: StepKind) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             config,
             account,
             kind,
@@ -274,7 +279,7 @@ impl RebuildStepOperation {
                 Some(mut activation) => {
                     if let Some(group) = self.config.group_id {
                         let key = dirty_share_key(group).into();
-                        let generation = Ulid::generate().to_bytes().to_vec().into();
+                        let generation = self.mint.mint(self.now_ms).to_bytes().to_vec().into();
                         let marker = (NODE_STATS_KEYSPACE.to_string(), key, generation);
                         activation.writes.push(marker);
                     }
@@ -339,6 +344,14 @@ impl RebuildStepOperation {
 impl Operation for RebuildStepOperation {
     type Output = StepEnd;
     type Error = RebuildError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<StepEnd>, RebuildError> {
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);

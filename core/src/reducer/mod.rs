@@ -236,14 +236,16 @@ impl AdminDocumentState {
         }
     }
 
+    /// Applies `op` by `actor` as a new event with the id `event_id`, which the caller's run mints.
     pub fn apply_operation(
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
+        event_id: Ulid,
     ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
-            event_id: Ulid::generate(),
+            event_id,
             target: self.target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -260,10 +262,11 @@ impl AdminDocumentState {
         actor: &Actor,
         op: AdminDocumentOperation,
         index: &mut RevocationIndex,
+        event_id: Ulid,
     ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
-            event_id: Ulid::generate(),
+            event_id,
             target: self.target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: observed.sequence_for(&actor.node_id) + 1,

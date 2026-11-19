@@ -529,8 +529,6 @@ mod tests {
         AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
@@ -743,13 +741,7 @@ mod tests {
     }
 
     fn job_id(timestamp_ms: u64) -> JobId {
-        JobId::from_parts(
-            timestamp_ms,
-            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-            BucketId::new(0).unwrap(),
-            0,
-        )
-        .unwrap()
+        aruna_core::testing::job_at(timestamp_ms, 0)
     }
 
     fn budget_of(slots: usize) -> JobClassBudget {

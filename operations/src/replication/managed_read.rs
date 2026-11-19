@@ -42,6 +42,7 @@ type ManagedTurn = Result<Next<BaoReadOutput>, BaoReadError>;
 /// need local compliance, and echoed refs are never authority.
 #[derive(Debug, PartialEq)]
 pub struct ManagedReadOperation {
+    now_ms: u64,
     node_id: NodeId,
     request: BaoReadRequest,
     step: ManagedStep,
@@ -55,6 +56,7 @@ pub struct ManagedReadOperation {
 impl ManagedReadOperation {
     pub fn new(node_id: NodeId, request: BaoReadRequest) -> Self {
         Self {
+            now_ms: 0,
             node_id,
             request,
             step: ManagedStep::Role,
@@ -84,8 +86,7 @@ impl ManagedReadOperation {
         }
         // An admission stop is not decided here: `write_gate` refuses once the source has
         // taught the refs that make this read a governed one.
-        let now_ms = aruna_core::time::unix_timestamp_millis();
-        let gate = GateOperation::new(self.request.realm_id, now_ms);
+        let gate = GateOperation::new(self.request.realm_id, self.now_ms);
         self.call(ManagedStep::Gate, IoCall::child(gate))
     }
 
@@ -159,6 +160,10 @@ impl Operation for ManagedReadOperation {
                 self.gate_checked(result.child::<PolicyGateOutcome, ReadPolicyError>()?)
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 

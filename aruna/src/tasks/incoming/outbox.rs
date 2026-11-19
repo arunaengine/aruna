@@ -725,7 +725,7 @@ impl OperationsTaskHandler {
         // Publish to the bucket's sync members (admitted targets and retained departing holders included), but
         // keep stamped peers above as genesis sources: a target must see writes made during the window.
         if let Some(config) = config {
-            let now_ms = aruna_core::time::unix_timestamp_millis();
+            let now_ms = aruna_clock::unix_timestamp_millis();
             for (_, record, _) in &mut records {
                 if !record.target.uses_shard_topic() {
                     continue;
@@ -1115,11 +1115,7 @@ impl OperationsTaskHandler {
     ) -> Result<(), ()> {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            let project = ProjectEventsOperation::new(
-                metadata_create_events,
-                local_node_id,
-                max_clock_skew(),
-            );
+            let project = ProjectEventsOperation::new(metadata_create_events, local_node_id);
             if let Err(error) = drive(project, &self.context).await {
                 warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
                 return Err(());
@@ -1140,8 +1136,7 @@ impl OperationsTaskHandler {
             create_event_targets.push((document_id, event_id));
         }
         let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let project =
-            ProjectLoggedOperation::new(create_event_targets, false, local_node, max_clock_skew());
+        let project = ProjectLoggedOperation::new(create_event_targets, false, local_node);
         if let Err(error) = drive(project, &self.context).await {
             warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());

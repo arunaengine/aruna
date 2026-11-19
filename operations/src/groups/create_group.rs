@@ -12,6 +12,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -30,7 +31,6 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 use tracing::trace;
-use ulid::Ulid;
 
 use super::CONFLICT_RETRIES;
 use crate::groups::update_group::{MAX_NAME_LEN, normalize_group_name};
@@ -109,6 +109,8 @@ struct GroupCreate {
     /// Bucket the group's authorization rows publish onto, read inside the write transaction.
     fence: aruna_core::placement::fence::WriteFence,
     stage: Stage,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl GroupCreate {
@@ -120,6 +122,8 @@ impl GroupCreate {
             realm_config: None,
             fence: Default::default(),
             stage: Stage::Config,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -145,7 +149,7 @@ impl GroupCreate {
 
     /// A new group with its default roles, owned by the actor.
     fn prepare(&mut self) -> Group {
-        let group_id = Ulid::generate();
+        let group_id = self.ids.mint(self.now_ms);
         let auth_doc = GroupAuthorizationDocument::default_group_doc(
             self.config.actor.user_id,
             self.config.actor.realm_id,
@@ -207,7 +211,7 @@ impl GroupCreate {
         Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
+    fn reducer_seed_writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
         let group_id = self
             .group
             .as_ref()
@@ -229,12 +233,14 @@ impl GroupCreate {
                 display_name: self.config.display_name.clone(),
                 owner: self.config.actor.user_id,
             },
+            self.ids.mint(self.now_ms),
         )?);
         admin_events.push(reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::GroupLocationSet {
                 location: Some(DatasetLocation::group_default(group_id)),
             },
+            self.ids.mint(self.now_ms),
         )?);
 
         for role in &roles {
@@ -243,6 +249,7 @@ impl GroupCreate {
                 AdminDocumentOperation::GroupRoleCreated {
                     role: AdminRoleDefinition::from(*role),
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
 
@@ -257,6 +264,7 @@ impl GroupCreate {
                     role_id: admin_role.role_id,
                     user_id,
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
 
@@ -330,6 +338,14 @@ impl GroupCreate {
 impl Operation for GroupCreate {
     type Output = CreatedGroup;
     type Error = CreateGroupError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -503,28 +519,7 @@ mod test {
     fn activated_config(
         actor: &Actor,
     ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
-        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(
-            actor.realm_id,
-            Vec::new(),
-            3,
-        );
-        config.ensure_node(
-            actor.node_id,
-            aruna_core::structs::identity::realm::RealmNodeKind::Server,
-        );
-        config
-            .strategies
-            .push(aruna_core::structs::placement::record::PlacementStrategy {
-                strategy_id: Ulid::from_bytes([5; 16]),
-                name: "default".to_string(),
-                replica_count: Some(1),
-                distinct_locations: false,
-                affinity: Vec::new(),
-                shard_count: 16,
-            });
-        config.default_strategy_id = Some(config.strategies[0].strategy_id);
-        config.snapshot_candidate_map();
-        config
+        crate::tests::groups::activated_config(actor)
     }
 
     /// Runs a create to the bucket fence read and answers it with `closed`.

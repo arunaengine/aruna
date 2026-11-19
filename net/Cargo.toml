@@ -17,6 +17,7 @@ autotests = false
 test-hooks = []
 
 [dependencies]
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
 blake3 = { workspace = true }
@@ -42,6 +43,7 @@ crossfire = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 
 [[test]]

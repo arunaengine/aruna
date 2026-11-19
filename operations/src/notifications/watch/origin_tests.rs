@@ -82,7 +82,7 @@ fn local_watch_expands() {
     ));
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     let prefix = watch_resource_path(Ulid::from_parts(5, 5), node_id(1), "bucket", "");
-    let watch = WatchSubscription::new(user(1, 2), prefix, mask, 1);
+    let watch = WatchSubscription::new(ulid::Ulid::generate(), user(1, 2), prefix, mask, 1);
     let page = WatchPage {
         subscriptions: vec![watch],
         next: None,

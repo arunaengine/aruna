@@ -366,14 +366,7 @@ pub(crate) fn config_oidc_providers(
 }
 
 pub(crate) fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
-    OidcProviderConfig {
-        id: id.to_string(),
-        issuer: format!("https://issuer.example/{issuer_suffix}"),
-        audience: "aruna".to_string(),
-        discovery_url: format!(
-            "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
-        ),
-    }
+    aruna_core::testing::oidc_provider(id, issuer_suffix)
 }
 
 pub(crate) fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscoveryConfig {

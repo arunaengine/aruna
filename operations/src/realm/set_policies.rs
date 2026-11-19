@@ -7,13 +7,13 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_POLICIES_PATH};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -174,6 +174,8 @@ struct PoliciesWrite {
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl PoliciesWrite {
@@ -183,7 +185,9 @@ impl PoliciesWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+            marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -244,6 +248,7 @@ impl PoliciesWrite {
             AdminDocumentOperation::ConfigPoliciesSet {
                 policies: self.config.policies.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Mirror the replicated overlay: a conflicted policies path leaves the
         // last agreed set in place instead of clobbering it with the input.
@@ -291,6 +296,15 @@ impl Operation for PoliciesWrite {
     type Output = RealmConfigDocument;
     type Error = SetPoliciesError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -300,18 +314,8 @@ impl Operation for PoliciesWrite {
     }
 
     fn first(&mut self) -> Result<Next<RealmConfigDocument>, SetPoliciesError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<RealmConfigDocument>, SetPoliciesError> {
@@ -386,12 +390,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn policies_config(

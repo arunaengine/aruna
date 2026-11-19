@@ -495,6 +495,16 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// Holds the kept copy at `backend_path` while `blob` streams, so eviction leaves its bytes
+    /// to the hidden sweep; answered by `BlobEvent::PinnedRead`.
+    PinRead {
+        backend_path: String,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Whether a read holds the kept copy at `backend_path`; answered by `BlobEvent::ReadHeld`.
+    ReadHeld {
+        backend_path: String,
+    },
     /// One repository, provider or stored artifact call of a job or link; answers
     /// `BlobEvent::Remote`.
     Remote(Box<crate::repository::remote::RemoteRequest>),
@@ -727,6 +737,9 @@ pub enum StorageEffect {
     },
     /// Opens a secret sealed to the realm keys. Only a node that holds them answers with it.
     RealmOpen(Box<crate::realm_vault::RealmSealed>),
+    /// Compiles each request policy set, a set of the same content once. Answers
+    /// `PoliciesCompiled` in the same order.
+    CompilePolicies(Vec<Vec<crate::request_policy::RequestPolicy>>),
 }
 
 impl StorageEffect {
@@ -842,6 +855,14 @@ pub enum NetEffect {
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
     /// Answers `NetEvent::CursorSigned`.
     CursorSign(Vec<u8>),
+    /// Seals a search or listing position with this process's key, so it names no key;
+    /// answers `NetEvent::PositionSealed`.
+    SealPosition(Vec<u8>),
+    /// Opens a position this process sealed; answers `NetEvent::PositionOpened`.
+    OpenPosition(Vec<u8>),
+    /// Draws a secret of this many letters and digits from the OS random source; answers
+    /// `NetEvent::SecretDrawn`.
+    DrawSecret(usize),
     /// Refreshes the last-contact time of a peer whose request was just accepted; answers
     /// `NetEvent::PeerContact`.
     PeerContact(NodeId),

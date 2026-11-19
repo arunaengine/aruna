@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use aruna::inbound::initialize_net_holder;
 use aruna::tasks::incoming::{drain_notification_outbox, start_task_queues};
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -20,7 +22,6 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -394,6 +395,7 @@ fn added_group_record(
     created_at_ms: u64,
 ) -> NotificationRecord {
     NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
@@ -725,6 +727,7 @@ impl SettingRealm {
     /// The delivery decision of node `index` for a notice of `owner`.
     async fn decide(&self, index: usize, owner: UserId) -> Delivery {
         let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
             owner,
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
@@ -744,7 +747,8 @@ impl SettingRealm {
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {
         let now_ms = unix_timestamp_millis();
-        let set = SetWebhookOperation::new(owner, self.id(index), url.to_string(), now_ms);
+        let secret = SecretBytes::new(rand::random::<[u8; 32]>().to_vec());
+        let set = SetWebhookOperation::new(owner, self.id(index), url.to_string(), secret, now_ms);
         Ok(drive(set, self.context(index)).await?)
     }
 

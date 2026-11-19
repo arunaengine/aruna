@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
@@ -399,6 +400,8 @@ pub struct PublishEntryOperation {
     config: PublishEntryConfig,
     phase: EntryPhase,
     output: Option<PublishedPlugin>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -444,6 +447,8 @@ impl PublishEntryOperation {
             config,
             phase: EntryPhase::Auth,
             output: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -529,7 +534,11 @@ impl PublishEntryOperation {
             version: plugin.version.clone(),
             plugin: Some(plugin.clone()),
         };
-        let event = reducer_state.apply_operation(&self.config.actor, operation)?;
+        let event = reducer_state.apply_operation(
+            &self.config.actor,
+            operation,
+            self.ids.mint(self.now_ms),
+        )?;
         document.plugins = reducer_state.materialized_plugins();
         let document_target = self.document();
         let placement = target_placement_ref(&document, &document_target, Default::default());
@@ -570,6 +579,14 @@ impl PublishEntryOperation {
 impl Operation for PublishEntryOperation {
     type Output = PublishedPlugin;
     type Error = EntryError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

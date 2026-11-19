@@ -7,8 +7,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use aruna_core::time::unix_timestamp_millis;
-
 /// Remote-recovery lifecycle. A locally safe node keeps serving while this is
 /// [`RecoveryState::Degraded`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,25 +194,23 @@ impl RecoveryStatus {
         self.inner.passes[outcome.index()].load(Ordering::Relaxed)
     }
 
-    /// Marks a bounded pass as started.
-    pub(crate) fn begin_pass(&self) {
+    /// Marks a bounded pass as started at `now_ms`.
+    pub(crate) fn begin_pass(&self, now_ms: u64) {
         self.inner
             .state
             .store(RecoveryState::Running.code(), Ordering::Relaxed);
         let _ = self.inner.last_progress_ms.compare_exchange(
             0,
-            unix_timestamp_millis(),
+            now_ms,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
     }
 
-    /// Publishes progress after a completed work unit.
-    pub fn note_progress(&self, topics_remaining: u64) {
+    /// Publishes progress after a completed work unit at `now_ms`.
+    pub fn note_progress(&self, topics_remaining: u64, now_ms: u64) {
         self.set_remaining(topics_remaining);
-        self.inner
-            .last_progress_ms
-            .store(unix_timestamp_millis(), Ordering::Relaxed);
+        self.inner.last_progress_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub(crate) fn set_remaining(&self, topics_remaining: u64) {
@@ -537,10 +533,11 @@ mod tests {
         assert_eq!(status.snapshot().state, RecoveryState::Pending);
         assert_eq!(status.snapshot().last_progress_timestamp, 0);
 
-        status.begin_pass();
+        // The snapshot shows unix seconds of the stamped milliseconds.
+        status.begin_pass(1_000);
         let started = status.snapshot();
         assert_eq!(started.state, RecoveryState::Running);
-        assert!(started.last_progress_timestamp > 0);
+        assert_eq!(started.last_progress_timestamp, 1);
 
         status.set_remaining(5);
         let unchanged = status.snapshot();
@@ -550,10 +547,10 @@ mod tests {
             started.last_progress_timestamp
         );
 
-        status.note_progress(4);
+        status.note_progress(4, 2_000);
         let snapshot = status.snapshot();
         assert_eq!(snapshot.topics_remaining, 4);
-        assert!(snapshot.last_progress_timestamp > 0);
+        assert_eq!(snapshot.last_progress_timestamp, 2);
 
         status.finish_pass(
             RecoveryOutcome::Partial,

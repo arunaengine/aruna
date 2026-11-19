@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
@@ -9,14 +10,17 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+#[cfg(test)]
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
 };
 use aruna_core::rows::{done, values};
+#[cfg(test)]
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, ReplicaQuota};
@@ -169,6 +173,8 @@ struct QuotaWrite {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl QuotaWrite {
@@ -178,6 +184,8 @@ impl QuotaWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -231,12 +239,14 @@ impl QuotaWrite {
             AdminDocumentOperation::ConfigQuotaSet {
                 quota: self.config.quota.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         let replicas_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigReplicasSet {
                 replicas: self.config.replicas.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
@@ -285,6 +295,14 @@ impl Operation for QuotaWrite {
     type Output = RealmConfigDocument;
     type Error = SetQuotaError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -294,18 +312,8 @@ impl Operation for QuotaWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetQuotaError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetQuotaError> {
@@ -422,12 +430,8 @@ mod tests {
     use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::realm::{
-        GroupQuotaOverride, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        RealmNodeKind, UserCapOverride,
+        GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
     use aruna_drivers::driver::{DriverContext, drive};
     use tempfile::tempdir;
@@ -442,12 +446,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn quota_config(actor: &Actor, quota: QuotaConfig) -> SetQuotaConfig {
@@ -462,23 +461,7 @@ mod tests {
     /// The realm admin role only grants what the operation checks, so the
     /// permission sub-operation decides on stored rules like production does.
     async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
-        for role in document.roles.values_mut() {
-            role.assigned_users.insert(actor.user_id);
-        }
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: (*actor.realm_id.as_bytes()).into(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_realm_admin(ctx, actor).await;
     }
 
     fn management_config(realm_id: RealmId, actor: &Actor) -> RealmConfigDocument {
@@ -488,22 +471,7 @@ mod tests {
     }
 
     async fn seed_config(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: actor.realm_id,
-        };
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_config(ctx, actor, document).await;
     }
 
     fn custom_quota() -> QuotaConfig {
@@ -713,6 +681,7 @@ mod tests {
                 AdminDocumentOperation::ConfigDescriptionSet {
                     description: "changed elsewhere".to_string(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let (_, _, reducer_value) = reducer_state_entry(&reducer).unwrap();

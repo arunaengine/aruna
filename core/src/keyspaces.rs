@@ -7,6 +7,8 @@ pub const GROUP_KEYSPACE: &str = "groups";
 pub const GROUP_DELETE_KEYSPACE: &str = "group_deletions";
 pub const OWNER_INDEX_KEYSPACE: &str = "group_owner_index";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
+/// The working rows of running provenance exports; a node start clears them.
+pub const PROVENANCE_SPOOL_KEYSPACE: &str = "provenance_spool";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const IRI_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";

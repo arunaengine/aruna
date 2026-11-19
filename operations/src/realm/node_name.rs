@@ -9,6 +9,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
@@ -228,6 +229,8 @@ struct NameWrite {
     stage: Stage,
     shown: Option<NodeDisplay>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl NameWrite {
@@ -237,6 +240,8 @@ impl NameWrite {
             stage: Stage::Read,
             shown: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -317,7 +322,11 @@ impl NameWrite {
         let placement = target_placement_ref(&document, &document_target, Default::default());
         let mut records = Vec::new();
         for operation in operations {
-            let admin_event = reducer_state.apply_operation(&self.config.actor, operation)?;
+            let admin_event = reducer_state.apply_operation(
+                &self.config.actor,
+                operation,
+                self.ids.mint(self.now_ms),
+            )?;
             records.push(new_identified_record(
                 admin_event.event_id,
                 self.config.actor.node_id,
@@ -351,6 +360,14 @@ impl NameWrite {
 impl Operation for NameWrite {
     type Output = NodeDisplay;
     type Error = NodeNameError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

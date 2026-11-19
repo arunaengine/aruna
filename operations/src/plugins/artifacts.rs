@@ -201,6 +201,7 @@ impl FetchArtifact {
         node: NodeId,
         chunk: Chunk,
     ) -> Result<Next<FetchedArtifact>, ArtifactError> {
+        let index = chunk.index;
         let arriving = self.arriving.as_mut().ok_or(IoError::Unfinished)?;
         arriving.bytes.extend(chunk.bytes.0);
         if index + 1 < chunk_count(arriving.total) {

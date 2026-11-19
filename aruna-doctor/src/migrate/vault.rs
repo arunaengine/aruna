@@ -68,7 +68,7 @@ pub(super) fn vault_rows(
         };
         let entry = VaultEntry::new(purpose, Ulid::from_bytes(id));
         let sealed = vault_key
-            .seal(entry, &SecretBytes::new(secret))
+            .seal(entry, &SecretBytes::new(secret), rand::random::<[u8; 12]>())
             .map_err(|error| decode_error(name, &key, error))?;
         moves.rows.push((entry.key(), sealed));
         moves.removed.push(key.to_vec());

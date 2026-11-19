@@ -95,6 +95,19 @@ pub enum GroupResult {
     Refused,
 }
 
+impl GroupResult {
+    /// The result of a finished child member, or `None` for any other member or result type.
+    pub fn child_outcome<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
+        let GroupResult::Done(event) = self else {
+            return None;
+        };
+        match *event {
+            Event::Child(outcome) => outcome.take(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum SubOperationEvent {
     GroupWritten {
@@ -214,6 +227,13 @@ pub enum BlobEvent {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
     },
     HiddenDeleted,
+    /// The stream of a `BlobEffect::PinRead`, which holds the copy until it ends or drops.
+    PinnedRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    ReadHeld {
+        held: bool,
+    },
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,
         next_cursor: Option<Vec<u8>>,
@@ -475,6 +495,8 @@ pub enum StorageEvent {
     RealmOpened {
         result: Result<SecretBytes, crate::realm_vault::RealmVaultError>,
     },
+    /// The compiled policy sets, in the order the effect named them.
+    PoliciesCompiled(crate::request_policy::CompiledSets),
 }
 
 #[derive(Debug, PartialEq)]
@@ -530,6 +552,12 @@ pub enum NetEvent {
     HolderAvoided,
     /// The cursor signature, or `None` when this node cannot sign the cursor.
     CursorSigned(Option<iroh::Signature>),
+    /// The sealed position, or `None` when it could not be sealed.
+    PositionSealed(Option<Vec<u8>>),
+    /// The opened position, or `None` when this process did not seal it.
+    PositionOpened(Option<Vec<u8>>),
+    /// The drawn secret; its `Debug` print never shows it.
+    SecretDrawn(crate::compute::Secret),
     /// The peer's last-contact time is refreshed.
     PeerContact,
     Shard(Box<ShardNetEvent>),
@@ -961,6 +989,8 @@ impl Event {
                     HiddenRead,
                     LocalSpooled,
                     HiddenDeleted,
+                    PinnedRead,
+                    ReadHeld,
                     HiddenListed,
                     ConnectionEstablished,
                     ConnectionClosed,
@@ -1039,6 +1069,7 @@ impl Event {
                     VaultResult,
                     Error,
                     RealmOpened,
+                    PoliciesCompiled,
                 }
             ),
             Event::Net(event) => variant_label!(
@@ -1065,6 +1096,9 @@ impl Event {
                     DelegationSign,
                     HolderAvoided,
                     CursorSigned,
+                    PositionSealed,
+                    PositionOpened,
+                    SecretDrawn,
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,

@@ -6,59 +6,35 @@
 use crate::auth::error::PolicyEnforcementError;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, RequestPolicy,
-    policy_set_hash,
+    CompiledPolicySet, CompiledSets, PolicyCompileError, PolicyDecision, PolicyRequest,
+    RequestPolicy,
 };
 use aruna_core::rows::all_values;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
-use lru::LruCache;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
 
-/// Compiled policy sets are content-addressed, so a bounded LRU without a TTL or
-/// invalidation protocol is enough: any change mints a new key and stale sets
-/// age out.
-const POLICY_CACHE_CAPACITY: usize = 256;
 const POLICY_BULK_LIMIT: usize = 1024;
 
-type PolicyProgramCache = Mutex<LruCache<[u8; 32], Arc<CompiledPolicySet>>>;
+/// The policy sets of one load, the realm's first, then the group's when a group is named.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PolicySets(Vec<Vec<RequestPolicy>>);
 
-fn program_cache() -> &'static PolicyProgramCache {
-    static CACHE: OnceLock<PolicyProgramCache> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(LruCache::new(
-            NonZeroUsize::new(POLICY_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
-        ))
-    })
-}
-
-/// Compiles a policy set once and caches it by content address. A compile
-/// failure is returned so enforcement stays fail-closed.
-fn compiled_set(policies: &[RequestPolicy]) -> Result<Arc<CompiledPolicySet>, PolicyCompileError> {
-    let key = policy_set_hash(policies);
-    let cache = program_cache();
-    if let Some(set) = lock(cache).get(&key).cloned() {
-        return Ok(set);
+impl PolicySets {
+    /// The call that compiles the sets through the storage handle's content-addressed cache.
+    pub(crate) fn compile(self) -> IoCall {
+        let effect = Effect::Storage(StorageEffect::CompilePolicies(self.0));
+        IoCall::Effect(Box::new(effect))
     }
-    let set = Arc::new(CompiledPolicySet::compile(policies)?);
-    lock(cache).put(key, set.clone());
-    Ok(set)
-}
-
-fn lock(
-    cache: &PolicyProgramCache,
-) -> std::sync::MutexGuard<'_, LruCache<[u8; 32], Arc<CompiledPolicySet>>> {
-    cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A realm and optional group policy set loaded and compiled once so a bulk
@@ -79,7 +55,7 @@ impl std::fmt::Debug for PolicyEvaluator {
     }
 }
 
-/// Compiled sets are shared through the content-addressed cache, so the same sets are one `Arc`.
+/// Compiled sets are shared through the storage handle's cache, so the same sets are one `Arc`.
 impl PartialEq for PolicyEvaluator {
     fn eq(&self, other: &Self) -> bool {
         let same_group = match (&self.group, &other.group) {
@@ -102,11 +78,16 @@ impl From<IoError> for PolicyEnforcementError {
 pub struct PolicyLoadOperation {
     realm_id: RealmId,
     group_id: Option<GroupId>,
+    compiling: bool,
 }
 
 impl PolicyLoadOperation {
     pub fn new(realm_id: RealmId, group_id: Option<GroupId>) -> Self {
-        Self { realm_id, group_id }
+        Self {
+            realm_id,
+            group_id,
+            compiling: false,
+        }
     }
 
     /// The policy sets that govern `request`: the realm's, and the group's its path names.
@@ -133,37 +114,59 @@ fn group_reads(group_id: GroupId) -> [(KeySpace, Key); 2] {
     ]
 }
 
-/// The evaluator from the rows [`policy_reads`] named, answered in that order. Missing state
-/// fails closed.
+/// The policy sets of the rows [`policy_reads`] named, answered in that order; compile them with
+/// [`PolicySets::compile`] and read the answer with [`compiled_policies`]. Missing state fails
+/// closed.
 pub(crate) fn read_policies(
     realm_id: RealmId,
     group_id: Option<GroupId>,
     values: Vec<Option<Value>>,
-) -> Result<PolicyEvaluator, PolicyEnforcementError> {
+) -> Result<PolicySets, PolicyEnforcementError> {
     let mut values = values.into_iter();
     let config = values.next().flatten().ok_or_else(realm_unavailable)?;
     let config = RealmConfigDocument::from_bytes(&config)
         .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
-    let realm = compile_scope(&config.request_policies, "realm")?;
-    let group = match group_id {
-        Some(_) => {
-            let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
-            else {
-                return Err(group_unavailable());
-            };
-            Some(group_policies(realm_id, &group, &auth)?)
-        }
-        None => None,
-    };
+    let mut sets = vec![config.request_policies];
+    if group_id.is_some() {
+        let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten()) else {
+            return Err(group_unavailable());
+        };
+        sets.push(group_policies(realm_id, &group, &auth)?);
+    }
+    Ok(PolicySets(sets))
+}
+
+/// The evaluator from the answer to [`PolicySets::compile`]: the realm set, then the group set.
+pub(crate) fn compiled_policies(
+    result: IoResult,
+) -> Result<PolicyEvaluator, PolicyEnforcementError> {
+    let mut sets = compiled_sets(result)?.into_iter();
+    let realm = compiled_scope(sets.next().ok_or_else(realm_unavailable)?, "realm")?;
+    let group = (sets.next())
+        .map(|set| compiled_scope(set, "group"))
+        .transpose()?;
     Ok(PolicyEvaluator { realm, group })
 }
 
-/// Compiles a group's policy set from its stored group and authorization rows.
+type CompiledSet = Result<Arc<CompiledPolicySet>, PolicyCompileError>;
+
+/// The compiled sets of a compile answer, in the order the call named them.
+fn compiled_sets(result: IoResult) -> Result<Vec<CompiledSet>, PolicyEnforcementError> {
+    match aruna_core::rows::event(result)? {
+        Event::Storage(StorageEvent::PoliciesCompiled(CompiledSets(sets))) => Ok(sets),
+        other => Err(PolicyEnforcementError::Unavailable(format!(
+            "expected the compiled policies, got {}",
+            other.label()
+        ))),
+    }
+}
+
+/// A group's policy set from its stored group and authorization rows.
 fn group_policies(
     realm_id: RealmId,
     group: &[u8],
     auth: &[u8],
-) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
+) -> Result<Vec<RequestPolicy>, PolicyEnforcementError> {
     let unavailable = |error: aruna_core::errors::ConversionError| {
         PolicyEnforcementError::Unavailable(error.to_string())
     };
@@ -174,7 +177,7 @@ fn group_policies(
         ));
     }
     let auth = GroupAuthorizationDocument::from_bytes(auth).map_err(unavailable)?;
-    compile_scope(&auth.policies, "group")
+    Ok(auth.policies)
 }
 
 impl Operation for PolicyLoadOperation {
@@ -187,13 +190,18 @@ impl Operation for PolicyLoadOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PolicyEvaluator>, PolicyEnforcementError> {
+        if self.compiling {
+            return compiled_policies(result).map(Next::Done);
+        }
         let IoResult::Values(values) = result else {
             return Err(PolicyEnforcementError::Unavailable(format!(
                 "expected the policy rows, got {}",
                 result.label()
             )));
         };
-        read_policies(self.realm_id, self.group_id, values).map(Next::Done)
+        let sets = read_policies(self.realm_id, self.group_id, values)?;
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 
@@ -204,6 +212,7 @@ pub struct EnforcePolicyOperation {
     realm_id: RealmId,
     group_id: Option<GroupId>,
     request: PolicyRequest,
+    compiling: bool,
 }
 
 impl EnforcePolicyOperation {
@@ -213,6 +222,7 @@ impl EnforcePolicyOperation {
             realm_id,
             group_id,
             request,
+            compiling: false,
         }
     }
 }
@@ -227,9 +237,13 @@ impl Operation for EnforcePolicyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PolicyEnforcementError> {
-        let values = all_values(result)?;
-        let evaluator = read_policies(self.realm_id, self.group_id, values)?;
-        evaluator.evaluate(&self.request).map(Next::Done)
+        if self.compiling {
+            let evaluator = compiled_policies(result)?;
+            return evaluator.evaluate(&self.request).map(Next::Done);
+        }
+        let sets = read_policies(self.realm_id, self.group_id, all_values(result)?)?;
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 
@@ -241,12 +255,14 @@ pub type PolicyEvaluators = HashMap<(RealmId, GroupId), PolicyEvaluator>;
 #[derive(Debug, PartialEq)]
 pub struct PolicyBulkOperation {
     plan: Result<BulkPlan, PolicyEnforcementError>,
+    compiling: bool,
 }
 
 impl PolicyBulkOperation {
     pub fn new(groups: impl IntoIterator<Item = (RealmId, GroupId)>) -> Self {
         Self {
             plan: bulk_plan(groups),
+            compiling: false,
         }
     }
 
@@ -254,26 +270,42 @@ impl PolicyBulkOperation {
         self.plan.as_ref().map_err(Clone::clone)
     }
 
-    fn evaluators(
+    /// Each realm's policy set in plan order, then each group's.
+    fn policy_sets(
         &self,
         values: Vec<Option<Value>>,
-    ) -> Result<PolicyEvaluators, PolicyEnforcementError> {
+    ) -> Result<PolicySets, PolicyEnforcementError> {
         let plan = self.plan()?;
         let mut values = values.into_iter();
-        let mut realms = HashMap::with_capacity(plan.realms.len());
-        for realm_id in &plan.realms {
+        let mut sets = Vec::with_capacity(plan.realms.len() + plan.scopes.len());
+        for _ in &plan.realms {
             let config = values.next().flatten().ok_or_else(realm_unavailable)?;
             let config = RealmConfigDocument::from_bytes(&config)
                 .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
-            realms.insert(*realm_id, compile_scope(&config.request_policies, "realm")?);
+            sets.push(config.request_policies);
         }
-        let mut evaluators = HashMap::with_capacity(plan.scopes.len());
-        for (realm_id, group_id) in &plan.scopes {
+        for (realm_id, _) in &plan.scopes {
             let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
             else {
                 return Err(group_unavailable());
             };
-            let group = Some(group_policies(*realm_id, &group, &auth)?);
+            sets.push(group_policies(*realm_id, &group, &auth)?);
+        }
+        Ok(PolicySets(sets))
+    }
+
+    fn evaluators(&self, result: IoResult) -> Result<PolicyEvaluators, PolicyEnforcementError> {
+        let plan = self.plan()?;
+        let mut sets = compiled_sets(result)?.into_iter();
+        let mut realms = HashMap::with_capacity(plan.realms.len());
+        for realm_id in &plan.realms {
+            let set = sets.next().ok_or_else(realm_unavailable)?;
+            realms.insert(*realm_id, compiled_scope(set, "realm")?);
+        }
+        let mut evaluators = HashMap::with_capacity(plan.scopes.len());
+        for (realm_id, group_id) in &plan.scopes {
+            let set = sets.next().ok_or_else(group_unavailable)?;
+            let group = Some(compiled_scope(set, "group")?);
             let realm = realms
                 .get(realm_id)
                 .cloned()
@@ -300,7 +332,15 @@ impl Operation for PolicyBulkOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PolicyEvaluators>, PolicyEnforcementError> {
-        self.evaluators(all_values(result)?).map(Next::Done)
+        if self.compiling {
+            return self.evaluators(result).map(Next::Done);
+        }
+        if self.plan()?.scopes.is_empty() {
+            return Ok(Next::Done(HashMap::new()));
+        }
+        let sets = self.policy_sets(all_values(result)?)?;
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 
@@ -377,13 +417,13 @@ pub(crate) fn group_from_path(path: &str) -> Option<GroupId> {
         .and_then(|value| Ulid::from_string(value).ok())
 }
 
-/// Compiles one scope's policy set, mapping a compile failure to a fail-closed
-/// error. An empty set is represented by an empty compiled program.
-fn compile_scope(
-    policies: &[RequestPolicy],
+/// One scope's compiled policy set, mapping a compile failure to a fail-closed error. An empty
+/// set is represented by an empty compiled program.
+fn compiled_scope(
+    compiled: CompiledSet,
     scope: &str,
 ) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match compiled_set(policies) {
+    match compiled {
         Ok(set) => Ok(set),
         Err(error) => {
             warn!(
@@ -430,6 +470,7 @@ fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::calls::compiled;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use ulid::Ulid;
 
@@ -444,28 +485,6 @@ mod tests {
         }
     }
 
-    /// The compiled-set cache is process-wide and keyed by content, so a test
-    /// that asserts on entry identity must own its policy id: a concurrent test
-    /// compiling the same bytes would otherwise replace the entry.
-    fn owned_policy(expression: &str) -> RequestPolicy {
-        RequestPolicy {
-            policy_id: Ulid::from_bytes([9u8; 16]),
-            ..policy(expression)
-        }
-    }
-
-    #[test]
-    fn caches_by_content() {
-        // Identical bytes reuse the same Arc; an edit mints a new entry.
-        let policies = [owned_policy("permission == 'write'")];
-        let first = compiled_set(&policies).unwrap();
-        let second = compiled_set(&policies).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        let edited = [owned_policy("permission == 'read'")];
-        let third = compiled_set(&edited).unwrap();
-        assert!(!Arc::ptr_eq(&first, &third));
-    }
-
     #[test]
     fn compile_failure_unavailable() {
         // A policy set that will not compile denies as unavailable, not allows.
@@ -474,6 +493,13 @@ mod tests {
             result,
             Err(PolicyEnforcementError::Unavailable(_))
         ));
+    }
+
+    fn compile_scope(
+        policies: &[RequestPolicy],
+        scope: &str,
+    ) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
+        compiled_scope(CompiledPolicySet::compile(policies).map(Arc::new), scope)
     }
 
     #[test]
@@ -494,7 +520,7 @@ mod tests {
     fn evaluates_member_paths() {
         // The DeleteObjects model: one loaded set, each member path decided
         // separately so a path rule can deny one member and allow another.
-        let set = compiled_set(&[policy("path.endsWith('/secret')")]).unwrap();
+        let set = compile_scope(&[policy("path.endsWith('/secret')")], "realm").unwrap();
         let denied = PolicyRequest::basic(
             "/r/g/x/data/secret".to_string(),
             "write".to_string(),
@@ -559,8 +585,11 @@ mod tests {
         };
         assert_eq!(reads.len(), 1);
         let row = Some(config.to_bytes(&actor).unwrap().into());
+        let Ok(Next::Call(compile)) = operation.next(IoResult::Values(vec![row])) else {
+            panic!("expected the policy compile");
+        };
         assert!(matches!(
-            operation.next(IoResult::Values(vec![row])),
+            operation.next(compiled(compile)),
             Err(PolicyEnforcementError::Denied { .. })
         ));
     }
@@ -627,7 +656,10 @@ mod tests {
         let mut values = vec![config_row(realm_id)];
         values.extend(group_rows(realm_id, first));
         values.extend(group_rows(realm_id, second));
-        let Ok(Next::Done(evaluators)) = operation.next(IoResult::Values(values)) else {
+        let Ok(Next::Call(compile)) = operation.next(IoResult::Values(values)) else {
+            panic!("expected the policy compile");
+        };
+        let Ok(Next::Done(evaluators)) = operation.next(compiled(compile)) else {
             panic!("expected the evaluators");
         };
         assert_eq!(evaluators.len(), 2);

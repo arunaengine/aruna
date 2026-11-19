@@ -31,8 +31,15 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
         user_id: UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
-    let document_id =
-        mint_local_document(&config, &actor, group_id, "datasets/manifest-canary")?.as_ulid();
+    let document_id = mint_local_document(
+        &config,
+        &actor,
+        group_id,
+        "datasets/manifest-canary",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
 
     let created = drive(
         CreateDocumentOperation::new(CreateDocumentConfig {

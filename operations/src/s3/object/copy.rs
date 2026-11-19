@@ -30,6 +30,7 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -345,6 +346,7 @@ enum CopyStep {
 /// one, a sealed source in the same bucket is aliased, anything else moves its bytes.
 #[derive(Debug, PartialEq)]
 pub struct CopyObjectOperation {
+    ids: IdMint,
     input: Option<CopyObjectInput>,
     routing: NodeRouting,
     progress: Option<PulledBytes>,
@@ -356,13 +358,14 @@ pub struct CopyObjectOperation {
 impl CopyObjectOperation {
     pub fn new(input: CopyObjectInput, routing: NodeRouting) -> Self {
         Self {
+            ids: IdMint::default(),
             input: Some(input),
             routing,
             progress: None,
             token: None,
             stamp: CopyStamp {
                 version: None,
-                fresh: Ulid::generate(),
+                fresh: Ulid::nil(),
                 now_ms: 0,
             },
             step: CopyStep::Fence,
@@ -480,6 +483,7 @@ impl Operation for CopyObjectOperation {
     }
 
     fn first(&mut self) -> CopyTurn<CopyResultData> {
+        self.stamp.fresh = self.ids.mint(self.stamp.now_ms);
         let Some(version_id) = self.stamp.version else {
             return self.check_fence();
         };
@@ -519,6 +523,10 @@ impl Operation for CopyObjectOperation {
                 result.child::<CopyResultData, CopyObjectError>()??,
             )),
         }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -1154,12 +1162,7 @@ pub(crate) mod test {
     }
 
     fn auth_context(user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id: user_id.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, user_id.realm_id)
     }
 
     async fn read_dest_version(

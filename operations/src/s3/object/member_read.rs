@@ -11,6 +11,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
+use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
 use aruna_core::member_read::{
     MemberAnswer, MemberBody, MemberFetch, MemberMethod, MemberSend, TrailerValue,
@@ -265,6 +266,7 @@ pub struct MemberCallOperation {
     read: bool,
     now_ms: u64,
     step: CallStep,
+    mint: IdMint,
 }
 
 impl MemberCallOperation {
@@ -276,6 +278,7 @@ impl MemberCallOperation {
         read: bool,
     ) -> Self {
         Self {
+            mint: IdMint::default(),
             ids,
             caller,
             target,
@@ -391,7 +394,8 @@ impl MemberCallOperation {
             request_digest: digest,
             payload,
         };
-        let delegation = unsigned_delegation(ids, input, now_secs);
+        let nonce = self.mint.mint(self.now_ms).to_bytes();
+        let delegation = unsigned_delegation(ids, input, (now_secs, nonce));
         let headers = headers.into_iter().collect();
         self.step = CallStep::Sign { base, headers };
         let sign = NetEffect::DelegationSign(Box::new(delegation));
@@ -439,6 +443,10 @@ impl MemberCallOperation {
 impl Operation for MemberCallOperation {
     type Output = MemberBody;
     type Error = MemberRefusal;
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> CallTurn {
         let urls = NodeUrlsOperation::new(self.target.node_id);
@@ -644,7 +652,7 @@ impl MemberReadOperation {
             binding,
             object,
             origin: ReadOrigin::Caller,
-            seed: rand::random(),
+            seed: 0,
             now_ms: 0,
             range_id: None,
             coordinator: None,
@@ -935,6 +943,10 @@ impl Operation for MemberReadOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.seed = entropy;
     }
 }
 

@@ -403,7 +403,7 @@ mod tests {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         };
-        BlobJobRecord::new(input, None, 5)
+        BlobJobRecord::new(input, None, 5, Ulid::generate())
     }
 
     /// The bytes alpha.200 stored for `job`: the record without its trailing job id.

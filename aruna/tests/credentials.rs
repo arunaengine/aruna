@@ -491,7 +491,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
 
     // Judged past the 366 day window the cutoff is gone, so a sweep then finds nothing; the
     // keys must be deleted before. A refused request deletes its key at once.
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let later = now + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 1;
     let node_id = seed.net.node_id();
     let sweep = |now| {
@@ -594,7 +594,9 @@ async fn token_reads_locked() -> TestResult<()> {
             .await?;
 
         // The client keeps the token key; the node issues its grant at once in node managed mode.
-        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key(
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )?;
         let token = hex::encode(private.bytes().expose());
         let created = http
             .post(format!("{}/api/v1/access/credentials", seed.base_url))
@@ -723,7 +725,9 @@ async fn token_reads_old() -> TestResult<()> {
         };
         seed.context.storage_handle.send_storage_effect(due).await;
 
-        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key(
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )?;
         let token = hex::encode(private.bytes().expose());
         let created = http
             .post(format!("{}/api/v1/access/credentials", seed.base_url))
@@ -852,7 +856,9 @@ async fn token_opens_scope() -> TestResult<()> {
         }
 
         // A token restricted to `allowed/` gets one grant of that subtree, issued at once.
-        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key(
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )?;
         let created = http
             .post(format!("{}/api/v1/access/credentials", seed.base_url))
             .bearer_auth(&admin)
@@ -1099,7 +1105,9 @@ async fn token_needs_credential() -> TestResult<()> {
         assert_eq!(locked.status(), StatusCode::OK);
 
         // A token of the locked bucket keeps an open request for a holder to publish.
-        let (public, _) = aruna_core::structs::storage::encryption::generate_key()?;
+        let (public, _) = aruna_core::structs::storage::encryption::generate_key(
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )?;
         let created = http
             .post(format!("{}/api/v1/access/credentials", seed.base_url))
             .bearer_auth(&admin)
@@ -1135,7 +1143,7 @@ async fn token_needs_credential() -> TestResult<()> {
             session: None,
         };
         let node = seed.net.node_id();
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
 
         // Once the credential expires, a holder can no longer publish its request.
         let action = KeyAction::Publish(grant.clone());
@@ -1237,7 +1245,9 @@ async fn token_limit_revokes() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(enabled.status(), StatusCode::OK);
-        let (public, _) = aruna_core::structs::storage::encryption::generate_key()?;
+        let (public, _) = aruna_core::structs::storage::encryption::generate_key(
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )?;
         let request = CreateS3Request {
             group_id: group.group_id.clone(),
             expires_in_seconds: Some(600),

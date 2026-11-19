@@ -41,7 +41,7 @@ use super::staging::StageLayout;
 use super::{
     BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, host_capabilities,
 };
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";

@@ -21,6 +21,7 @@ kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch", "dep:serde-saphyr
 slurm = ["apptainer"]
 
 [dependencies]
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true, optional = true, features = ["ssl"] }

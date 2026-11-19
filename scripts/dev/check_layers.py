@@ -37,12 +37,20 @@ ANY_CRATE = "*"
 # Internal normal dependencies the target table (target-architecture.md section 2) allows.
 CRATE_TARGETS = {
     "aruna": ANY_CRATE,
-    "aruna-api": ("aruna-core", "aruna-operations", "aruna-drivers", "aruna-wire"),
-    "aruna-doctor": ("aruna-core", "aruna-storage", "aruna-blob", "aruna-operations", "aruna-drivers"),
+    "aruna-api": ("aruna-core", "aruna-clock", "aruna-operations", "aruna-drivers", "aruna-wire"),
+    "aruna-doctor": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-storage",
+        "aruna-blob",
+        "aruna-operations",
+        "aruna-drivers",
+    ),
     "aruna-cli": ("aruna-wire", "aruna-plugins", "aruna-plugin-types"),
     "aruna-operations": ("aruna-core", "aruna-plugin-types"),
     "aruna-drivers": (
         "aruna-core",
+        "aruna-clock",
         "aruna-storage",
         "aruna-net",
         "aruna-blob",
@@ -52,16 +60,18 @@ CRATE_TARGETS = {
         "aruna-graph",
         "aruna-outbound",
     ),
-    "aruna-storage": ("aruna-core",),
-    "aruna-net": ("aruna-core", "aruna-storage"),
-    "aruna-blob": ("aruna-core", "aruna-kpabe", "aruna-storage", "aruna-net"),
+    "aruna-storage": ("aruna-core", "aruna-clock"),
+    "aruna-net": ("aruna-core", "aruna-clock", "aruna-storage"),
+    "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-storage", "aruna-net"),
     "aruna-tasks": ("aruna-core",),
-    "aruna-compute": ("aruna-core",),
+    "aruna-compute": ("aruna-core", "aruna-clock"),
     "aruna-plugins": ("aruna-plugin-types",),
     "aruna-plugin-types": (),
     "aruna-graph": ("aruna-core",),
     "aruna-outbound": ("aruna-core",),
     "aruna-core": ("aruna-kpabe",),
+    # Host clocks and the OS random source; core and operations never reach them.
+    "aruna-clock": ("aruna-core",),
     "aruna-kpabe": (),
     "aruna-kpabe-wasm": ("aruna-kpabe",),
     "aruna-wire": ("aruna-core",),
@@ -69,7 +79,7 @@ CRATE_TARGETS = {
     "aruna-plugin-fixture": ("aruna-plugin",),
     "elabftw-sync": ("aruna-plugin",),
     "dataset-announcer": ("aruna-plugin",),
-    "aruna-registry": ("aruna-core", "aruna-blob"),
+    "aruna-registry": ("aruna-core", "aruna-clock", "aruna-blob"),
     "aruna-compute-helper": (),
 }
 # Backends keep their table for test and build dependencies as well.
@@ -99,6 +109,7 @@ COUNTS = (
     ("group_mutual_pairs", "mutual module pairs inside a domain group"),
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
     ("runner_refs", "runner references into domain modules"),
+    ("core_clocks", "clock and random calls in core production code"),
     ("trigger_arms", "trigger shell arms that call async code"),
     ("state_clones", "match self.state.clone() in operations"),
     ("async_parallel", "files with parallel work only through async code"),
@@ -669,9 +680,18 @@ def measure(root):
     ]
     details["async_parallel"] = [source.rel for source in operations if PARALLEL_RE.search(source.masked)]
     details["test_sleeps"], details["silent_skips"] = test_habits(sources)
+    details["core_clocks"] = core_clocks(sources)
     duplicates = duplicate_groups(sources)
     details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
-    for key in ("trigger_arms", "state_clones", "async_parallel", "test_sleeps", "silent_skips", "duplicate_groups"):
+    for key in (
+        "trigger_arms",
+        "state_clones",
+        "async_parallel",
+        "test_sleeps",
+        "silent_skips",
+        "core_clocks",
+        "duplicate_groups",
+    ):
         counts[key] = len(details[key])
     return counts, details, async_lines(ops), ops, sources
 
@@ -686,6 +706,16 @@ def clock_calls(ops):
         for hit in CLOCK_RE.finditer(masked):
             found.append(f"{rel}:{masked.count(chr(10), 0, hit.start()) + 1}")
     return found
+
+
+def core_clocks(sources):
+    """Clock and random calls in production code of the core crate; the runner and inputs own them."""
+    return [
+        f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}"
+        for source in sources
+        if source.rel.startswith("core/src/")
+        for hit in CLOCK_RE.finditer(source.masked)
+    ]
 
 
 def clean_findings(ops, clean):

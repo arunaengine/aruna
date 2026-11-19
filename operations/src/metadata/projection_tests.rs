@@ -28,7 +28,7 @@ async fn project_create_events(
     events: Vec<MetadataEventRecord>,
     local_node_id: Option<NodeId>,
 ) -> Result<usize, MetadataProjectionError> {
-    let project = ProjectEventsOperation::new(events, local_node_id, max_clock_skew());
+    let project = ProjectEventsOperation::new(events, local_node_id);
     drive(project, context).await
 }
 
@@ -36,11 +36,7 @@ async fn drain_projection_queue(
     context: &DriverContext,
 ) -> Result<PendingProjectionResult, MetadataProjectionError> {
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    drive(
-        DrainProjectionOperation::new(local_node, max_clock_skew()),
-        context,
-    )
-    .await
+    drive(DrainProjectionOperation::new(local_node), context).await
 }
 
 async fn transactional_projection_write(
@@ -1117,7 +1113,7 @@ async fn skewed_direct_writes() {
     let storage =
         FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
     let now_ms = aruna_core::time::unix_timestamp_millis();
-    let event = skew_event(now_ms + max_clock_skew() + 60_000, now_ms);
+    let event = skew_event(now_ms + DEFAULT_SKEW_MS + 60_000, now_ms);
     let marker_key = pending_projection_key(event.record.document_id, event.event_id);
     write_entries(
         &storage,
@@ -1151,7 +1147,7 @@ async fn skewed_queue_keeps() {
     let storage =
         FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
     let now_ms = aruna_core::time::unix_timestamp_millis();
-    let event = skew_event(now_ms + max_clock_skew() + 60_000, now_ms);
+    let event = skew_event(now_ms + DEFAULT_SKEW_MS + 60_000, now_ms);
     let marker_key = pending_projection_key(event.record.document_id, event.event_id);
     write_entries(
         &storage,
@@ -1240,7 +1236,7 @@ fn no_cache() -> IoResult {
 
 #[test]
 fn empty_projects_nothing() {
-    let mut project = ProjectEventsOperation::new(Vec::new(), None, max_clock_skew());
+    let mut project = ProjectEventsOperation::new(Vec::new(), None);
     assert_eq!(project.first(), Ok(Next::Done(0)));
 }
 
@@ -1249,9 +1245,14 @@ fn received_create_projects() {
     // A create received from another node is projected, committed, cached and its marker
     // removed; it wakes the materialization drain.
     let event = create_event();
-    let mut project = ProjectEventsOperation::new(vec![event.clone()], None, max_clock_skew());
+    let mut project = ProjectEventsOperation::new(vec![event.clone()], None);
     project.stamp(event.occurred_at_ms);
-    assert!(matches!(project.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    let setting = read_row(NODE_STATE_KEYSPACE, CLOCK_SKEW_KEY.to_vec());
+    assert_eq!(project.first(), Ok(Next::Call(setting)));
+    assert!(matches!(
+        project.next(IoResult::Values(vec![None])),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert!(matches!(
         project.next(no_cache()),
         Ok(Next::Call(IoCall::Child(_)))
@@ -1311,9 +1312,12 @@ fn received_create_projects() {
 #[test]
 fn skewed_event_deferred() {
     let event = create_event();
-    let mut project = ProjectEventsOperation::new(vec![event.clone()], None, 0);
+    let mut project = ProjectEventsOperation::new(vec![event.clone()], None);
     project.stamp(event.occurred_at_ms.saturating_sub(1));
     project.first().unwrap();
+    // The node allows no skew at all.
+    let setting = Value::from(0u64.to_be_bytes().to_vec());
+    project.next(IoResult::Values(vec![Some(setting)])).unwrap();
     let Ok(Next::Call(IoCall::Write(markers))) = project.next(no_cache()) else {
         panic!("expected the retry marker");
     };
@@ -1355,7 +1359,7 @@ fn deleted_graph_conflicts() {
 fn missing_event_fails() {
     let event = create_event();
     let target = (event.record.document_id, event.event_id);
-    let mut direct = ProjectLoggedOperation::new([target], false, None, max_clock_skew());
+    let mut direct = ProjectLoggedOperation::new([target], false, None);
     direct.first().unwrap();
     assert_eq!(
         direct.next(IoResult::Values(vec![None])),
@@ -1364,7 +1368,7 @@ fn missing_event_fails() {
             event_id: target.1,
         })
     );
-    let mut drain = ProjectLoggedOperation::new([target], true, None, max_clock_skew());
+    let mut drain = ProjectLoggedOperation::new([target], true, None);
     drain.first().unwrap();
     assert_eq!(
         drain.next(IoResult::Values(vec![None])),
@@ -1380,7 +1384,7 @@ fn missing_event_fails() {
 
 #[test]
 fn malformed_marker_call() {
-    let mut drain = DrainProjectionOperation::new(None, max_clock_skew());
+    let mut drain = DrainProjectionOperation::new(None);
     drain.first().unwrap();
     let rows = vec![(Key::from(vec![1, 2, 3]), Value::from(Vec::new()))];
     let Ok(Next::Call(IoCall::Delete(deleted))) = drain.next(IoResult::Page { rows, next: None })

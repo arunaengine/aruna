@@ -28,7 +28,7 @@ fn token() -> RepositoryCredential {
         .get_or_init(|| {
             let link = link();
             RepositoryCredential::seal_link(
-                &credential_key(),
+                (&credential_key(), [3; 24]),
                 link.created_by,
                 link.group_id,
                 link.connector_id,

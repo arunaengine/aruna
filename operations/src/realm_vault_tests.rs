@@ -43,7 +43,7 @@ fn realm_config(revision: u8) -> (RealmConfigDocument, RealmSecretRef) {
         entry,
         revision: reference.revision,
         sealed: key()
-            .seal(&realm_id, entry, reference.revision, &secret)
+            .seal(&realm_id, (entry, reference.revision), &secret, 7)
             .unwrap(),
         changed_by: owner,
         changed_at_ms: 1,
@@ -346,6 +346,7 @@ mod settings {
                 &owner(),
                 id,
                 &secret,
+                &[7; 32],
             )
             .unwrap()
         });

@@ -627,6 +627,7 @@ pub async fn create_link(
         &view,
         Some(link_id),
         &request.access_token,
+        rand::random::<[u8; 24]>(),
     )
     .map_err(seal_error)?;
     let owner_node_url = state

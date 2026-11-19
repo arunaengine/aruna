@@ -51,6 +51,7 @@ fn response_hides_secrets() {
                 account_id: Some(Secret::new("secret-account")),
                 ..AssistantProviderSecret::empty()
             },
+            [3; 24],
         )
         .unwrap();
     let body = serde_json::to_string(&provider_summary(&provider)).unwrap();

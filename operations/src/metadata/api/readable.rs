@@ -15,7 +15,7 @@ use aruna_core::types::GroupId;
 
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::errors::AuthorizationError;
 
@@ -30,6 +30,7 @@ pub struct RecordReadableOperation {
     check: Option<CheckPermissionsConfig>,
     now_ms: u64,
     started_ms: u64,
+    compiling: bool,
 }
 
 impl RecordReadableOperation {
@@ -45,6 +46,7 @@ impl RecordReadableOperation {
             check: None,
             now_ms: 0,
             started_ms: 0,
+            compiling: false,
         }
     }
 
@@ -94,6 +96,19 @@ impl Operation for RecordReadableOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataApiError> {
+        if self.compiling {
+            // Policies see the permission the RBAC check enforced.
+            let request = policy_request_with(
+                &self.record.permission_path,
+                &Permission::READ,
+                self.auth.as_ref(),
+                PolicyRequestExtras::operation("metadata.read"),
+            );
+            compiled_policies(result)
+                .and_then(|evaluator| evaluator.evaluate(&request))
+                .map_err(|_| MetadataApiError::NotFound)?;
+            return Ok(Next::Done(()));
+        }
         // A private record's check is the request's "permission" stage, as the API reports it.
         if self.check.is_some() {
             let elapsed = self.now_ms.saturating_sub(self.started_ms);
@@ -108,17 +123,10 @@ impl Operation for RecordReadableOperation {
             }
             values = policies;
         }
-        // Policies see the permission the RBAC check enforced.
-        let request = policy_request_with(
-            &self.record.permission_path,
-            &Permission::READ,
-            self.auth.as_ref(),
-            PolicyRequestExtras::operation("metadata.read"),
-        );
-        read_policies(self.realm_id, Some(self.record.group_id), values)
-            .and_then(|evaluator| evaluator.evaluate(&request))
+        let sets = read_policies(self.realm_id, Some(self.record.group_id), values)
             .map_err(|_| MetadataApiError::NotFound)?;
-        Ok(Next::Done(()))
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 
@@ -141,6 +149,7 @@ pub(crate) struct PathPermissionOperation {
     check: CheckPermissionsConfig,
     now_ms: u64,
     started_ms: u64,
+    compiling: bool,
 }
 
 impl PathPermissionOperation {
@@ -161,6 +170,7 @@ impl PathPermissionOperation {
             check,
             now_ms: 0,
             started_ms: 0,
+            compiling: false,
         }
     }
 }
@@ -184,6 +194,20 @@ impl Operation for PathPermissionOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataApiError> {
+        if self.compiling {
+            // Policies must see the permission the RBAC check enforced; a fixed read would let a
+            // write-deny policy pass unevaluated.
+            let request = policy_request_with(
+                &self.check.path,
+                &self.check.required_permission,
+                Some(&self.check.auth_context),
+                PolicyRequestExtras::operation("metadata.read"),
+            );
+            compiled_policies(result)
+                .and_then(|evaluator| evaluator.evaluate(&request))
+                .map_err(|_| MetadataApiError::Forbidden)?;
+            return Ok(Next::Done(()));
+        }
         let elapsed = self.now_ms.saturating_sub(self.started_ms);
         record_stage("permission", Duration::from_millis(elapsed));
         let mut values = all_values(result)?;
@@ -192,18 +216,10 @@ impl Operation for PathPermissionOperation {
         if !self.check.allowed(values).map_err(path_error)? {
             return Err(MetadataApiError::Forbidden);
         }
-        // Policies must see the permission the RBAC check enforced; a fixed read would let a
-        // write-deny policy pass unevaluated.
-        let request = policy_request_with(
-            &self.check.path,
-            &self.check.required_permission,
-            Some(&self.check.auth_context),
-            PolicyRequestExtras::operation("metadata.read"),
-        );
-        read_policies(self.realm_id, Some(self.group_id), policies)
-            .and_then(|evaluator| evaluator.evaluate(&request))
+        let sets = read_policies(self.realm_id, Some(self.group_id), policies)
             .map_err(|_| MetadataApiError::Forbidden)?;
-        Ok(Next::Done(()))
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 

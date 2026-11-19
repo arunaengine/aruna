@@ -10,6 +10,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::Event;
 use aruna_core::heartbeat::HeartbeatEffect;
+use aruna_core::id_mint::IdMint;
 use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
@@ -140,6 +141,7 @@ pub struct RangeListOperation {
     access: MemberAccess,
     now_ms: u64,
     step: ListStep,
+    mint: IdMint,
 }
 
 type ListTurn = Result<Next<Option<RangePage>>, RangeListError>;
@@ -152,6 +154,7 @@ impl RangeListOperation {
         access: MemberAccess,
     ) -> Self {
         Self {
+            mint: IdMint::default(),
             local,
             target,
             query,
@@ -180,7 +183,7 @@ impl RangeListOperation {
         ))
     }
 
-    fn range_access(&self) -> RangeAccess {
+    fn range_access(&mut self) -> RangeAccess {
         match &self.access {
             MemberAccess::Bearer(token) => RangeAccess::Bearer(token.clone()),
             MemberAccess::Delegated(caller) => {
@@ -205,7 +208,8 @@ impl RangeListOperation {
                     request_digest: [0; 32],
                     payload: Payload::Empty,
                 };
-                let delegation = unsigned_delegation(self.local, input, now_secs);
+                let nonce = self.mint.mint(self.now_ms).to_bytes();
+                let delegation = unsigned_delegation(self.local, input, (now_secs, nonce));
                 RangeAccess::Delegated(Box::new(delegation))
             }
         }
@@ -271,6 +275,10 @@ impl RangeListOperation {
 impl Operation for RangeListOperation {
     type Output = Option<RangePage>;
     type Error = RangeListError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;

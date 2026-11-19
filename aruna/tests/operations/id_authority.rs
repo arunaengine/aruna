@@ -448,8 +448,15 @@ async fn premature_mapping_unavailable() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let path = "datasets/unprojected";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
@@ -493,7 +500,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         document_id,
         owner,
         "test denial".to_string(),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -507,6 +514,8 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         &realm.actor(realm.node(0)),
         group_id,
         "datasets/ghost",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     let absent = withdraw_pid_routed(
@@ -515,7 +524,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         never_created,
         owner,
         "test denial".to_string(),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -551,8 +560,15 @@ async fn delete_waits_projection() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let path = "datasets/lagging";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
@@ -785,7 +801,7 @@ async fn mint_routed(
                 realm.realm_id,
                 document_id,
                 realm.user_id,
-                aruna_core::time::unix_timestamp_millis(),
+                aruna_clock::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
@@ -821,7 +837,7 @@ async fn withdraw_routed(
                 document_id,
                 realm.user_id,
                 "test administrator withdrawal".to_string(),
-                aruna_core::time::unix_timestamp_millis(),
+                aruna_clock::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
@@ -898,8 +914,15 @@ async fn seed_document(
     // The id must be a structured MetaResourceId: routing resolves the mapping's
     // placement from the id itself, never from the deletable registry row.
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;

@@ -9,6 +9,7 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -19,7 +20,6 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, drive_until};
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
@@ -944,7 +944,11 @@ async fn serve_download(
 /// Signs a ticket for one redirect with this node's key; `now` is Unix seconds.
 fn issue_ticket(context: &DriverContext, input: TicketInput, now: u64) -> Option<SignedTicket> {
     let net = context.net_handle.as_ref()?;
-    let ticket = unsigned_ticket((net.node_id(), *net.realm_id()), input, now);
+    let ticket = unsigned_ticket(
+        (net.node_id(), *net.realm_id()),
+        input,
+        (now, rand::random()),
+    );
     let bytes = ticket.signing_bytes().ok()?;
     Some(SignedTicket {
         signature: net.sign(&bytes),

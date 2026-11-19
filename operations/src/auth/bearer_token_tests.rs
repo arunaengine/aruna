@@ -5,63 +5,11 @@
 use super::*;
 use crate::auth::create_token::{CreateTokenConfig, mint_token};
 use aruna_core::calls::ChildOutcome;
-use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::TokenRevocation;
 use ed25519_dalek::SigningKey;
 
 const FIXED_NOW: u64 = 1_800_000_000;
-
-fn pubkey_b64(key: &SigningKey) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
-}
-
-#[test]
-fn evicts_beyond_capacity() {
-    let cache = IssuerKeyCache::with_limits(2, KEY_CACHE_TTL);
-    for _ in 0..5 {
-        cache
-            .get_or_insert(&pubkey_b64(&generate_signing_key()))
-            .unwrap();
-    }
-    assert_eq!(cache.len(), 2);
-}
-
-fn backdate_entry(cache: &IssuerKeyCache, pubkey: &str, age: Duration) -> Instant {
-    let inserted_at = Instant::now().checked_sub(age).unwrap();
-    cache.entries().peek_mut(pubkey).unwrap().inserted_at = inserted_at;
-    inserted_at
-}
-
-fn entry_inserted_at(cache: &IssuerKeyCache, pubkey: &str) -> Instant {
-    cache.entries().peek(pubkey).unwrap().inserted_at
-}
-
-#[test]
-fn refreshes_expired_entries() {
-    let ttl = Duration::from_secs(3600);
-    let cache = IssuerKeyCache::with_limits(4, ttl);
-    let pubkey = pubkey_b64(&generate_signing_key());
-    cache.get_or_insert(&pubkey).unwrap();
-
-    // Just inside the TTL: served from cache, entry untouched.
-    let inside = backdate_entry(&cache, &pubkey, ttl - Duration::from_secs(60));
-    cache.get_or_insert(&pubkey).unwrap();
-    assert_eq!(entry_inserted_at(&cache, &pubkey), inside);
-
-    // Just past the TTL: refreshed in place without accumulating.
-    let expired = backdate_entry(&cache, &pubkey, ttl + Duration::from_secs(1));
-    cache.get_or_insert(&pubkey).unwrap();
-    assert!(entry_inserted_at(&cache, &pubkey) > expired);
-    assert_eq!(cache.len(), 1);
-}
-
-#[test]
-fn rejects_invalid_pubkey() {
-    let cache = IssuerKeyCache::new();
-    assert!(cache.get_or_insert("not-base64!!").is_err());
-    assert!(cache.is_empty());
-}
 
 fn actor(realm_id: RealmId) -> Actor {
     Actor {
@@ -234,20 +182,23 @@ fn linked_token() -> Minted {
         RealmId::from_bytes([14; 32]),
     );
     let now = FIXED_NOW;
-    let token = mint_token(&CreateTokenConfig {
-        time: now,
-        expiry: Some(now + 600),
-        user_id: local,
-        realm_id,
-        node_capabilities: NodeCapabilities::management_node(key).unwrap(),
-        session: Some(SessionRef {
-            sid: ulid::Ulid::from_bytes([3; 16]).to_string(),
-            kind: SessionKind::Federated,
-            name: None,
-            via: Some(via),
-        }),
-        restrictions: None,
-    })
+    let token = mint_token(
+        &CreateTokenConfig {
+            time: now,
+            expiry: Some(now + 600),
+            user_id: local,
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(key).unwrap(),
+            session: Some(SessionRef {
+                sid: ulid::Ulid::from_bytes([3; 16]).to_string(),
+                kind: SessionKind::Federated,
+                name: None,
+                via: Some(via),
+            }),
+            restrictions: None,
+        },
+        ulid::Ulid::from_bytes([4; 16]),
+    )
     .unwrap();
     Minted {
         token,
@@ -357,6 +308,16 @@ fn foreign_link_refused() {
         operation.first(),
         Err(ArunaBearerError::TokenRevoked)
     ));
+}
+
+#[test]
+fn untrusted_skips_net() {
+    // An untrusted issuer never reaches the net handle's key cache.
+    let minted = linked_token();
+    let mut operation = decoding(&minted, RevocationCheck::Skipped);
+    operation.checks.trust = IssuerTrust::Listed(HashSet::new());
+    operation.checks.keys = IssuerKeys::Net;
+    assert_eq!(operation.first(), Err(ArunaBearerError::RealmNotTrusted));
 }
 
 #[test]

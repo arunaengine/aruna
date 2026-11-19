@@ -18,6 +18,7 @@ use crate::job_calls::{claim_job, release_job, transition_to_running};
 use crate::job_calls::{insert_job, list_job_entries};
 use aruna::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -44,7 +45,6 @@ use aruna_core::structs::storage::bucket_metadata::release_marker;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
@@ -53,12 +53,12 @@ use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -90,7 +90,7 @@ fn doc_id(seed: u64) -> Ulid {
 }
 
 fn job_id() -> JobId {
-    mint_job_id(
+    fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )

@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{SOURCE_ID_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows;
@@ -114,6 +115,8 @@ pub struct SourceConnectorOperation {
     chosen_id: Option<Ulid>,
     /// An identical record of the chosen id this group already holds.
     existing: Option<SourceConnector>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl SourceConnectorOperation {
@@ -124,6 +127,8 @@ impl SourceConnectorOperation {
             result: None,
             chosen_id: None,
             existing: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -184,7 +189,7 @@ impl SourceConnectorOperation {
         &mut self,
         connector_id: Ulid,
     ) -> Result<Next<SourceConnectorResult>, SourceConnectorError> {
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let connector = SourceConnector::new(
             connector_id,
             self.input.group_id,
@@ -254,6 +259,14 @@ impl Operation for SourceConnectorOperation {
     type Output = SourceConnectorResult;
     type Error = SourceConnectorError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, SourceConnectorError> {
         validate_connector_input(
             &self.input.name,
@@ -262,7 +275,8 @@ impl Operation for SourceConnectorOperation {
             &self.input.secret_config,
         )?;
         let Some(connector_id) = self.chosen_id else {
-            return self.write_records(Ulid::generate());
+            let connector_id = self.ids.mint(self.now_ms);
+            return self.write_records(connector_id);
         };
         Ok(Next::Call(rows::read_row(
             SOURCE_INDEX_KEYSPACE,
@@ -459,5 +473,21 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1);
         let refused = [first, second].into_iter().find_map(Result::err);
         assert_eq!(refused, Some(SourceConnectorError::IdTaken));
+    }
+
+    // Without a chosen id the runner's stamp and entropy give the connector its id and times.
+    #[test]
+    fn stamp_names_connector() {
+        let mut op = SourceConnectorOperation::new(public_input(ulid::Ulid::nil(), "data"));
+        op.stamp(1_700_000_000_000);
+        op.seed(7);
+        assert!(matches!(op.first(), Ok(Next::Call(_))));
+        let connector = &op.result.as_ref().unwrap().connector;
+        assert_eq!(
+            connector.connector_id,
+            ulid::Ulid::from_parts(1_700_000_000_000, 7)
+        );
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        assert_eq!(connector.created_at, at);
     }
 }

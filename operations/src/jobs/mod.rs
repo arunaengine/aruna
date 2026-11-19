@@ -81,3 +81,29 @@ pub const JOB_RECONCILE_REARM: Duration = Duration::from_millis(JOB_HEARTBEAT_MS
 pub const JOB_PRUNE_PAGE: usize = 512;
 pub const PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Converts call failures into the storage, codec, unexpected and unfinished variants of an error.
+macro_rules! io_failure {
+    ($error:ty) => {
+        impl From<aruna_core::calls::IoError> for $error {
+            fn from(error: aruna_core::calls::IoError) -> Self {
+                use aruna_core::calls::IoError;
+                use aruna_core::errors::StorageError;
+                match error {
+                    IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+                    IoError::Storage(error) => Self::Storage(error),
+                    IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                        state: "call".to_string(),
+                        expected,
+                        got,
+                    },
+                    IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => {
+                        Self::NotFinished
+                    }
+                    IoError::Codec(error) => Self::Codec(error),
+                }
+            }
+        }
+    };
+}
+pub(crate) use io_failure;

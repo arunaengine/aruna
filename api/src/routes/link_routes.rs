@@ -397,6 +397,7 @@ pub async fn rotate_token(
         &connector,
         Some(link.link_id),
         &request.access_token,
+        rand::random::<[u8; 24]>(),
     )
     .map_err(seal_error)?;
     if secret.endpoint != link.endpoint {

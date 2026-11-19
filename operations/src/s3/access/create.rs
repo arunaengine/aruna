@@ -10,6 +10,7 @@ use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ACCESS_OWNER_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
@@ -22,27 +23,26 @@ use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{GroupId, Key, Value};
-use rand::distr::Alphanumeric;
-use rand::{RngExt, rng};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use ulid::Ulid;
 
 use super::index::{
     MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key, token_deletes, token_pages,
 };
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::key::rows::{Row, audit_row};
+use crate::s3::session::{draw_secret, drawn_secret};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
+/// The letters and digits of a new access secret.
+const ACCESS_SECRET_LEN: usize = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreateStep {
+    Secret,
     OwnerIndex,
     Credentials,
     DeleteStale,
@@ -98,6 +98,10 @@ pub struct CreateUserConfig {
 /// Creates the credential, its owner index entry and audit rows in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct CreateUserOperation {
+    /// The key id is minted when the run starts.
+    mint_key: bool,
+    now_ms: u64,
+    ids: IdMint,
     config: CreateUserConfig,
     key_id: String,
     encryption_key: CredentialEncryptionKey,
@@ -131,7 +135,7 @@ impl TokenPlan {
         values: Vec<Option<Value>>,
         caller: UserId,
         access_key: &str,
-        group: GroupId,
+        (group, ids): (GroupId, &mut IdMint),
     ) -> Result<(), CreateUserError> {
         let (_, node_id) = self.origin.ok_or(CreateUserError::CreateAccessFailed)?;
         let mut values = values.into_iter();
@@ -148,7 +152,7 @@ impl TokenPlan {
             let active = BucketEncryption::from_row(settings.as_deref())?.active_key();
             let key = active.ok_or_else(|| CreateUserError::NotEncrypted(bucket.clone()))?;
             let audit = BucketAuditRecord {
-                event_id: next_event_id(self.now_ms),
+                event_id: ids.mint(self.now_ms),
                 bucket_id: key.bucket_id,
                 at_ms: self.now_ms,
                 action: AuditAction::TokenCreated,
@@ -170,7 +174,10 @@ impl TokenPlan {
 
 impl CreateUserOperation {
     pub fn new(config: CreateUserConfig, encryption_key: CredentialEncryptionKey) -> Self {
-        Self::new_with_key(config, Ulid::generate().to_string(), encryption_key)
+        Self {
+            mint_key: true,
+            ..Self::new_with_key(config, String::new(), encryption_key)
+        }
     }
 
     pub fn new_with_key(
@@ -181,10 +188,13 @@ impl CreateUserOperation {
         Self {
             config,
             key_id,
+            mint_key: false,
+            now_ms: 0,
+            ids: IdMint::default(),
             encryption_key,
             pending_secret: None,
             access: None,
-            step: CreateStep::OwnerIndex,
+            step: CreateStep::Secret,
             index: BTreeSet::new(),
             replace: false,
             tokens: None,
@@ -227,16 +237,9 @@ impl CreateUserOperation {
     }
 
     /// Builds the credential and its one-time secret before any storage call.
-    fn prepare(&mut self) -> Result<(), CreateUserError> {
-        if let Some(restrictions) = self.config.path_restrictions.as_deref() {
-            validate_restriction_limits(restrictions)?;
-        }
+    /// Encrypts the drawn secret into the new credential, then reads the owner's index.
+    fn prepare(&mut self, drawn: Secret) -> CreateTurn {
         let access_key = UserAccess::build_access_key(&self.key_id)?;
-        let plaintext = rng()
-            .sample_iter(&Alphanumeric)
-            .take(30)
-            .map(char::from)
-            .collect::<String>();
         let mut access = UserAccess {
             access_key,
             user_identity: self.config.user_identity,
@@ -247,10 +250,21 @@ impl CreateUserOperation {
             issued_by: self.config.issued_by,
             revoked_at: None,
         };
-        access.encrypt_secret(&self.encryption_key, &plaintext)?;
-        self.pending_secret = Some(Secret::new(plaintext));
+        access.encrypt_secret(
+            &self.encryption_key,
+            drawn.expose(),
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
+        )?;
+        self.pending_secret = Some(drawn);
         self.access = Some(access);
-        Ok(())
+        let reads = vec![
+            (
+                ACCESS_OWNER_KEYSPACE.to_string(),
+                owner_key(self.config.user_identity),
+            ),
+            group_fence_key(self.config.group_id),
+        ];
+        self.call(CreateStep::OwnerIndex, IoCall::Read(reads))
     }
 
     /// Reads every indexed credential, and the new key unless the index already names it.
@@ -276,7 +290,7 @@ impl CreateUserOperation {
         let new_key = self.new_access()?.access_key.clone();
         let index = std::mem::take(&mut self.index);
         let mut read = read.into_iter();
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let mut active = BTreeSet::new();
         let mut stale = Vec::new();
         for key in &index {
@@ -385,11 +399,12 @@ impl CreateUserOperation {
             .tokens
             .as_mut()
             .ok_or(CreateUserError::CreateAccessFailed)?;
-        plan.check_buckets(read, caller, &access_key, group)?;
+        plan.check_buckets(read, caller, &access_key, (group, &mut self.ids))?;
         self.write_credentials()
     }
 
     fn write_credentials(&mut self) -> CreateTurn {
+        let audit_id = self.issuer.map(|_| self.ids.mint(self.now_ms));
         let access = self.new_access()?;
         let mut writes = vec![
             (
@@ -403,9 +418,10 @@ impl CreateUserOperation {
                 encode_index(&self.index)?,
             ),
         ];
-        if let Some(actor) = self.issuer {
+        if let (Some(actor), Some(audit_id)) = (self.issuer, audit_id) {
             let action = AdminAuditAction::ServiceCredentialIssued;
-            let mut audit = AdminAuditRecord::new(action, actor, self.config.user_identity);
+            let mut audit =
+                AdminAuditRecord::new(audit_id, action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
             audit.session_id = Some(access.access_key.clone());
             writes.extend(audit.entries()?);
@@ -430,20 +446,28 @@ impl Operation for CreateUserOperation {
     type Output = (String, Secret, UserAccess);
     type Error = CreateUserError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> CreateTurn {
-        self.prepare()?;
-        let reads = vec![
-            (
-                ACCESS_OWNER_KEYSPACE.to_string(),
-                owner_key(self.config.user_identity),
-            ),
-            group_fence_key(self.config.group_id),
-        ];
-        self.call(CreateStep::OwnerIndex, IoCall::Read(reads))
+        // Minted once, so a rerun after a conflict keeps the key id.
+        if std::mem::take(&mut self.mint_key) {
+            self.key_id = self.ids.mint(self.now_ms).to_string();
+        }
+        if let Some(restrictions) = self.config.path_restrictions.as_deref() {
+            validate_restriction_limits(restrictions)?;
+        }
+        self.call(CreateStep::Secret, draw_secret(ACCESS_SECRET_LEN))
     }
 
     fn next(&mut self, result: IoResult) -> CreateTurn {
         match self.step {
+            CreateStep::Secret => self.prepare(drawn_secret(result)?),
             CreateStep::OwnerIndex => self.index_read(values::<2>(result)?),
             CreateStep::Credentials => self.credentials_read(result.values()?),
             CreateStep::DeleteStale => {
@@ -472,12 +496,20 @@ impl Operation for CreateUserOperation {
 mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
+    use aruna_core::effects::{Effect, NetEffect};
+    use aruna_core::events::{Event, NetEvent};
     use aruna_core::keyspaces::{
         ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, ADMIN_AUDIT_KEYSPACE, GROUP_DELETE_KEYSPACE,
         TOKEN_GRANT_KEYSPACE,
     };
     use aruna_core::structs::storage::abe_access::token_prefix;
     use ulid::Ulid;
+
+    /// The fixed secret a test answers the draw with.
+    fn drawn() -> IoResult {
+        let secret = Secret::new("a".repeat(ACCESS_SECRET_LEN));
+        IoResult::Event(Box::new(Event::Net(NetEvent::SecretDrawn(secret))))
+    }
 
     fn owner_read(value: Option<Value>) -> IoResult {
         IoResult::Values(vec![value, None])
@@ -532,6 +564,7 @@ mod pure_tests {
         let key = "newkey".to_string();
         let mut op = CreateUserOperation::new_with_key(config, key, test_key());
         op.first().unwrap();
+        op.next(drawn()).unwrap();
         op.next(owner_read(Some(index_of(index)))).unwrap();
         op
     }
@@ -557,8 +590,12 @@ mod pure_tests {
         let mut op = CreateUserOperation::new(make_config(user_identity, group_id), test_key());
         assert_eq!(op.transaction(), TransactionMode::Write);
 
-        // The owner index is read with the group's deletion fence.
-        let Ok(Next::Call(IoCall::Read(reads))) = op.first() else {
+        // The secret is drawn first, then the owner index is read with the group's fence.
+        let Ok(Next::Call(IoCall::Effect(draw))) = op.first() else {
+            panic!("expected the secret draw");
+        };
+        assert_eq!(*draw, Effect::Net(NetEffect::DrawSecret(ACCESS_SECRET_LEN)));
+        let Ok(Next::Call(IoCall::Read(reads))) = op.next(drawn()) else {
             panic!("expected the owner index read");
         };
         assert_eq!(reads[0].0, ACCESS_OWNER_KEYSPACE);
@@ -568,7 +605,7 @@ mod pure_tests {
         let access = op.access.as_ref().unwrap();
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
-        assert_eq!(access.open_secret(&test_key()).unwrap().len(), 30);
+        assert_eq!(access.open_secret(&test_key()).unwrap(), "a".repeat(30));
         assert_eq!(access.path_restrictions, None);
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
@@ -603,6 +640,7 @@ mod pure_tests {
         let group_id = Ulid::from_parts(1, 2);
         let written = |mut op: CreateUserOperation| {
             op.first().unwrap();
+            op.next(drawn()).unwrap();
             op.next(owner_read(None)).unwrap();
             let access_key = op.access.as_ref().unwrap().access_key.clone();
             (access_key, writes_of(op.next(IoResult::Values(vec![None]))))
@@ -765,6 +803,7 @@ mod pure_tests {
         let config = make_config(UserId::default(), Ulid::from_parts(13, 13));
         let mut op = CreateUserOperation::new(config, test_key());
         op.first().unwrap();
+        op.next(drawn()).unwrap();
         assert!(matches!(
             error_of(op.next(IoResult::Done)),
             CreateUserError::StorageError(_)
@@ -774,7 +813,6 @@ mod pure_tests {
     mod tokens {
         use super::*;
         use aruna_core::structs::storage::encryption::EncryptionMode;
-        use aruna_core::structs::storage::format::Compression;
 
         const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
@@ -783,17 +821,7 @@ mod pure_tests {
         }
 
         fn info() -> BucketInfo {
-            BucketInfo {
-                group_id: Ulid::from_bytes([3; 16]),
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user(1),
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution: None,
-            }
+            crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
         }
 
         fn sealed() -> BucketEncryption {
@@ -820,6 +848,7 @@ mod pure_tests {
                 9,
             );
             operation.first().unwrap();
+            operation.next(drawn()).unwrap();
             operation.next(owner_read(None)).unwrap();
             let turn = operation.next(IoResult::Values(vec![None]));
             let Ok(Next::Call(IoCall::Read(reads))) = turn else {

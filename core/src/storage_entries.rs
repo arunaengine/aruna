@@ -942,9 +942,7 @@ mod tests {
         UPDATED_INDEX_KEYSPACE,
     };
     use crate::metadata::{GraphLifecycleRecord, IriIndexRecord};
-    use crate::reducer::{
-        AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
-    };
+    use crate::reducer::{AdminAttributeVersion, AdminConflict, AdminDocumentState};
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -1029,19 +1027,7 @@ mod tests {
     }
 
     fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
-        AdminConflict {
-            path: path.to_string(),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(format!("value-{first_seed}")),
-                    dot: dot(first_seed),
-                },
-                AdminConflictValue {
-                    value: Some(format!("value-{second_seed}")),
-                    dot: dot(second_seed),
-                },
-            ],
-        }
+        crate::testing::admin_conflict(path, first_seed, second_seed)
     }
 
     #[test]

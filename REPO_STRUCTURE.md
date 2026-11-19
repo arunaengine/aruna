@@ -38,6 +38,7 @@ They start an operation in the same way as an HTTP request does.
 | Drivers | `drivers` (`aruna-drivers`) | the drive loop, effect routing to the backends and the job runtime |
 | Backends | `storage`, `net`, `blob`, `tasks`, `compute`, `plugins` | Fjall, Iroh and document sync, blob backends, timers, executors, the WASM host |
 | Foundations | `core`, `kpabe` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers |
+| Foundations | `clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
 
 Today `operations` also holds async services: handles, workers, queue drains,
 the timer map in `operations/src/tasks/incoming/mod.rs`, the peer message map in

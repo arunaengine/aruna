@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::cursor;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 
@@ -44,8 +45,8 @@ use crate::s3::object::member_read::{
 use crate::s3::object::range_list::DelegatedCaller;
 use crate::s3::object::versions::{ListVersionsItem, ListVersionsResult};
 use crate::s3::object::visible::{
-    HiddenCursor, LinkShows, ListingKeys, NextPage, RecordSource, VisibleError, VisiblePage,
-    VisiblePageOperation, is_sealed, open_cursor,
+    LinkShows, ListingKeys, NextPage, RecordSource, VisibleError, VisiblePage,
+    VisiblePageOperation, is_sealed,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -568,9 +569,7 @@ where
             (sub.continuation_token, sub.start_after) = (None, None);
         }
         let hidden = match &current.resumed {
-            Some((_, _, cursor)) => {
-                Some(open_cursor::<HiddenCursor>(cursor).ok_or(MergeError::Token)?)
-            }
+            Some((_, _, cursor)) => Some(cursor::position_bytes(cursor).ok_or(MergeError::Token)?),
             None => None,
         };
         let range = &current.range;
@@ -584,7 +583,10 @@ where
             realm_id: shows.realm_id,
             node: shows.node,
         };
-        let list = VisiblePageOperation::new(source, rule, sub, hidden);
+        let mut list = VisiblePageOperation::new(source, rule, sub, None);
+        if let Some(sealed) = hidden {
+            list = list.opening(sealed);
+        }
         self.step = ObjectsStep::Local;
         Ok(Next::Call(IoCall::child(list)))
     }

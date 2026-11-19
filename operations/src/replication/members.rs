@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -72,6 +73,7 @@ pub(crate) fn member_jobs(
     snapshot: &DistributionSnapshot,
     obligation: &LiveObligationRecord,
     now_ms: u64,
+    ids: &mut IdMint,
 ) -> Vec<BlobJobRecord> {
     let admitted = snapshot
         .member(binding.member_id)
@@ -94,12 +96,16 @@ pub(crate) fn member_jobs(
                 replicate_delete_markers: true,
                 mode: ReplicationMode::Live,
             };
-            BlobJobRecord::new(input, Some(obligation.delete_marker), now_ms).with_member(
-                MemberTarget {
-                    set_id: binding.set_id,
-                    member_id: delivery.member_id,
-                },
+            BlobJobRecord::new(
+                input,
+                Some(obligation.delete_marker),
+                now_ms,
+                ids.mint(now_ms),
             )
+            .with_member(MemberTarget {
+                set_id: binding.set_id,
+                member_id: delivery.member_id,
+            })
         })
         .collect()
 }
@@ -547,7 +553,13 @@ mod tests {
             txn_id: None,
         };
         context.storage_handle.send_storage_effect(delete).await;
-        let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
+        let jobs = member_jobs(
+            &binding(&snapshot, 1, 5),
+            &snapshot,
+            &obligation,
+            9,
+            &mut IdMint::default(),
+        );
         let job = &jobs[0];
         let key = aruna_core::structs::storage::replication_queue::blob_job_key(job).unwrap();
         let value = job.to_bytes().unwrap().into();
@@ -590,7 +602,13 @@ mod tests {
         };
         let mut rows = vec![live_obligation_entry(&owed("a", 2_000)).unwrap()];
         let mut queued = owed("b", 1_000);
-        for job in member_jobs(&binding(&snapshot, 1, 5), &snapshot, &queued, 9) {
+        for job in member_jobs(
+            &binding(&snapshot, 1, 5),
+            &snapshot,
+            &queued,
+            9,
+            &mut IdMint::default(),
+        ) {
             let key = blob_job_key(&job).unwrap();
             rows.push((
                 REPLICATION_JOB_KEYSPACE.to_string(),
@@ -641,7 +659,13 @@ mod tests {
             Ulid::from_bytes([3; 16]),
             true,
         );
-        let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
+        let jobs = member_jobs(
+            &binding(&snapshot, 1, 5),
+            &snapshot,
+            &obligation,
+            9,
+            &mut IdMint::default(),
+        );
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
         assert_eq!(job.source_delete_marker, Some(true));
@@ -656,7 +680,16 @@ mod tests {
                 member_id: member(2),
             })
         );
-        assert!(member_jobs(&binding(&snapshot, 2, 5), &snapshot, &obligation, 9).is_empty());
+        assert!(
+            member_jobs(
+                &binding(&snapshot, 2, 5),
+                &snapshot,
+                &obligation,
+                9,
+                &mut IdMint::default()
+            )
+            .is_empty()
+        );
     }
 
     mod calls {

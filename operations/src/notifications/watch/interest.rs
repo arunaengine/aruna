@@ -646,15 +646,7 @@ mod tests {
     }
 
     fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+        crate::testing::path_context(root)
     }
 
     async fn ctx_with_net(
@@ -1221,7 +1213,7 @@ mod tests {
 
         // Two distinct generations for the same realm marker: only the observed
         // generation should be cleared.
-        let (space, key, first) = dirty_marker_write(realm_id);
+        let (space, key, first) = dirty_marker_write(realm_id, Ulid::from_parts(1, 1));
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1238,7 +1230,7 @@ mod tests {
 
         // A concurrent CRUD bumped the generation after we observed `first`.
         let observed = vec![(key.clone(), first)];
-        let (space2, key2, second) = dirty_marker_write(realm_id);
+        let (space2, key2, second) = dirty_marker_write(realm_id, Ulid::from_parts(2, 2));
         assert_eq!(key2, key);
         match ctx
             .storage_handle

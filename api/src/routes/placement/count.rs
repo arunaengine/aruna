@@ -8,7 +8,6 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::coverage::CoverageCount;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::s3::policy::count::{
     ReadCountOperation, StartCountError, StartCountOperation,
@@ -227,7 +226,7 @@ async fn count_here(
 ) -> ServerResult<CoverageCountResponse> {
     let context = state.get_ctx();
     if start {
-        let operation = StartCountOperation::new(bucket.to_string(), unix_timestamp_millis());
+        let operation = StartCountOperation::new(bucket.to_string());
         drive(operation, &context)
             .await
             .map_err(|error| match error {

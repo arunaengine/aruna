@@ -121,7 +121,10 @@ impl PutObjectOperation {
     }
 
     /// The release of the written file, committed with the version that reads the older one.
-    pub(super) fn dedup_release(&self) -> Option<Result<(String, Key, Value), ConversionError>> {
+    pub(super) fn dedup_release(
+        &self,
+        key: Ulid,
+    ) -> Option<Result<(String, Key, Value), ConversionError>> {
         let written = self.dedup.as_ref()?;
         let plain = self.plain.as_ref()?;
         let work = BlobCleanupWork::ReleaseRenamed {
@@ -130,7 +133,7 @@ impl PutObjectOperation {
             version_id: self.version_id?,
             version: plain.version.clone()?,
         };
-        let key = Ulid::generate().to_bytes().to_vec().into();
+        let key = key.to_bytes().to_vec().into();
         Some(work.to_bytes().map(|value| {
             let space = BLOB_CLEANUP_KEYSPACE.to_string();
             (space, key, value.into())

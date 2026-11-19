@@ -11,19 +11,19 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
 use byteview::ByteView;
 use std::collections::HashSet;
@@ -66,6 +66,8 @@ pub struct AddUserOperation {
     input: AddUserInput,
     step: Step,
     added: Option<(GroupAuthorizationDocument, bool)>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -123,6 +125,8 @@ impl AddUserOperation {
             input,
             step: Step::Check,
             added: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -175,7 +179,7 @@ impl AddUserOperation {
     /// The document, with the drain wake and a new member's notice made after it; their failures
     /// are only logged, as the change is already durable.
     fn finish(
-        &self,
+        &mut self,
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
         drain: Option<IoCall>,
@@ -193,7 +197,7 @@ impl AddUserOperation {
 
     /// The notice to a member the change newly added.
     fn added_notice(
-        &self,
+        &mut self,
         auth_doc: &GroupAuthorizationDocument,
         newly_added: bool,
     ) -> Option<IoCall> {
@@ -209,7 +213,8 @@ impl AddUserOperation {
                     realm_auth: None,
                     realm_id: self.input.actor.realm_id,
                 },
-                unix_timestamp_millis(),
+                self.now_ms,
+                &mut self.ids,
             );
             if let (false, Effect::SubOperation(child)) =
                 (records.is_empty(), emit_notifications_effect(records))
@@ -224,6 +229,14 @@ impl AddUserOperation {
 impl Operation for AddUserOperation {
     type Output = GroupAuthorizationDocument;
     type Error = AddUserError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {
         if self.input.user_id.is_nil() {
@@ -277,11 +290,13 @@ struct MemberAddition {
     written: Option<AddedMember>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl MemberAddition {
     fn new(input: AddUserInput) -> Self {
-        let marks = DueMarks::new(Some(input.group_id), unix_timestamp_millis());
+        let marks = DueMarks::new(Some(input.group_id), 0);
         Self {
             input,
             stage: Stage::Read,
@@ -290,6 +305,8 @@ impl MemberAddition {
             written: None,
             deletes: Vec::new(),
             marks,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -327,7 +344,13 @@ impl MemberAddition {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input,
+            &role_ids,
+            &mut self.ids,
+            self.now_ms,
+        )?;
 
         let was_member = auth_doc
             .roles
@@ -437,6 +460,15 @@ impl Operation for MemberAddition {
     type Output = AddedMember;
     type Error = AddUserError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -446,23 +478,8 @@ impl Operation for MemberAddition {
     }
 
     fn first(&mut self) -> Result<Next<AddedMember>, AddUserError> {
-        let target = AdminDocumentTarget::Group {
-            group_id: self.input.group_id,
-        };
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                AUTH_KEYSPACE.to_string(),
-                ByteView::from(self.input.group_id.to_bytes()),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-            (
-                REALM_CONFIG_KEYSPACE.to_string(),
-                ByteView::from(*self.input.actor.realm_id.as_bytes()),
-            ),
-        ])))
+        let reads = crate::groups::member_reads(self.input.group_id, self.input.actor.realm_id);
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AddedMember>, AddUserError> {
@@ -512,6 +529,8 @@ fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &AddUserInput,
     role_ids: &[RoleId],
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
@@ -519,6 +538,7 @@ fn apply_reducer_updates(
             let event = state.apply_operation(
                 &input.actor,
                 AdminDocumentOperation::GroupRoleAdded { role_id: *role_id },
+                ids.mint(now_ms),
             )?;
             admin_events.push(event);
         }
@@ -528,6 +548,7 @@ fn apply_reducer_updates(
                 role_id: *role_id,
                 user_id: input.user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }
@@ -552,17 +573,12 @@ pub mod test {
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use aruna_core::storage_entries::reducer_conflict_key;
-    use aruna_core::structs::execution::notification::{
-        NotificationOutboxRecord, NotificationRecord,
-    };
+    use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -606,19 +622,8 @@ pub mod test {
         add_seed: u8,
         remove_seed: u8,
     ) -> AdminConflict {
-        AdminConflict {
-            path: assignment_path(role_id, user_id),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(user_id.to_string()),
-                    dot: dot(add_seed),
-                },
-                AdminConflictValue {
-                    value: None,
-                    dot: dot(remove_seed),
-                },
-            ],
-        }
+        let path = assignment_path(role_id, user_id);
+        crate::tests::groups::assignment_conflict(path, user_id, add_seed, remove_seed)
     }
 
     fn assignment_conflict_state(
@@ -1158,36 +1163,7 @@ pub mod test {
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let actor = Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        drive(
-            CreateRealmOperation::new(CreateRealmConfig {
-                actor: actor.clone(),
-                realm_description: "Test realm".to_string(),
-                oidc_providers: Vec::new(),
-                node_location: None,
-                node_weight: None,
-                node_labels: Default::default(),
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        let (group, auth_doc) = drive(
-            CreateGroupOperation::new(CreateGroupConfig {
-                actor: actor.clone(),
-                display_name: "Test group".to_string(),
-                owner_cap: None,
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn named_role_ids(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
@@ -1199,27 +1175,7 @@ pub mod test {
     }
 
     async fn read_notification_outbox(context: &DriverContext) -> Vec<NotificationRecord> {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1024,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values
-                .into_iter()
-                .map(|(_, value)| {
-                    postcard::from_bytes::<NotificationOutboxRecord>(&value)
-                        .unwrap()
-                        .record
-                })
-                .collect(),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
+        crate::tests::groups::read_notification_outbox(context).await
     }
 
     fn seeded_user_role(group_id: Ulid, role_id: Ulid) -> GroupAuthorizationDocument {

@@ -9,6 +9,7 @@ use aruna_core::admin_documents::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{
@@ -26,7 +27,6 @@ use aruna_core::structs::placement::record::{
     PlacementBinding, PlacementScope, band_start, coordinator_spans, owned_pools,
 };
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -58,6 +58,8 @@ pub struct EnsureConfigOperation {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 struct EnsureResources {
@@ -133,6 +135,8 @@ impl EnsureConfigOperation {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -149,13 +153,13 @@ impl EnsureConfigOperation {
     }
 
     fn plan_resources(
-        &self,
+        &mut self,
         document: &RealmConfigDocument,
         reducer_state: &AdminDocumentState,
         fresh: bool,
     ) -> Result<EnsureResources, EnsureConfigError> {
         let seed_pool = (fresh && document.band_pools.is_empty()).then(|| BandPool {
-            pool_id: Ulid::generate(),
+            pool_id: self.ids.mint(self.now_ms),
             parent: None,
             issuer: self.config.actor.node_id,
             owner: self.config.actor.node_id,
@@ -181,7 +185,7 @@ impl EnsureConfigOperation {
                     .free_band_in(&spans)
                     .ok_or(EnsureConfigError::HandleSpaceExhausted)?;
                 HandleRange {
-                    range_id: Ulid::generate(),
+                    range_id: self.ids.mint(self.now_ms),
                     owner: self.config.target_node_id,
                     start,
                     end,
@@ -217,7 +221,7 @@ impl EnsureConfigOperation {
                 strategy_id,
                 allocator_range_id: Some(assigned_range.range_id),
                 allocated_by: Some(self.config.target_node_id),
-                allocated_at_ms: Some(unix_timestamp_millis()),
+                allocated_at_ms: Some(self.now_ms),
             })
         };
         let transfer_pool = self.transfer_pool(document, &pools, assigned_range);
@@ -231,7 +235,7 @@ impl EnsureConfigOperation {
     }
 
     fn transfer_pool(
-        &self,
+        &mut self,
         document: &RealmConfigDocument,
         pools: &[BandPool],
         assigned_range: HandleRange,
@@ -250,7 +254,7 @@ impl EnsureConfigOperation {
                 .into_iter()
                 .find(|pool| pool.start <= start && end <= pool.end)
                 .map(|parent| BandPool {
-                    pool_id: Ulid::generate(),
+                    pool_id: self.ids.mint(self.now_ms),
                     parent: Some(parent.pool_id),
                     issuer: self.config.actor.node_id,
                     owner: self.config.target_node_id,
@@ -268,7 +272,7 @@ impl EnsureConfigOperation {
     }
 
     fn apply_config_events(
-        &self,
+        &mut self,
         reducer_state: &mut AdminDocumentState,
         document: &RealmConfigDocument,
         fresh: bool,
@@ -282,12 +286,14 @@ impl EnsureConfigOperation {
                 &self.config.actor,
                 self.config.target_node_id,
                 self.config.target_node_kind.clone(),
+                self.ids.mint(self.now_ms),
             )?);
         }
         if let Some(pool) = resources.seed_pool {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::BandPoolAssigned { pool },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if !resources.range_is_noop {
@@ -296,18 +302,21 @@ impl EnsureConfigOperation {
                 AdminDocumentOperation::HandleRangeGranted {
                     range: resources.assigned_range,
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if let Some(binding) = resources.job_binding {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::PlacementBindingAppended { binding },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if let Some(pool) = resources.transfer_pool {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::BandPoolAssigned { pool },
+                self.ids.mint(self.now_ms),
             )?);
         }
         // Reducer events preserve fresh placement identity and family routing during rebuilds.
@@ -319,6 +328,8 @@ impl EnsureConfigOperation {
                 reducer_state,
                 &self.config.actor,
                 document,
+                &mut self.ids,
+                self.now_ms,
             )?);
         }
         Ok(events)
@@ -376,7 +387,7 @@ impl EnsureConfigOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
+        overlay_reducer_state(&mut document, &reducer_state, self.now_ms);
 
         let node_is_noop = previous_reducer_state.as_ref().is_some_and(|state| {
             node_ensure_noop(
@@ -406,7 +417,7 @@ impl EnsureConfigOperation {
             node_is_noop,
             resources,
         )?;
-        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
+        overlay_reducer_state(&mut document, &reducer_state, self.now_ms);
 
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
@@ -451,6 +462,14 @@ impl EnsureConfigOperation {
 impl Operation for EnsureConfigOperation {
     type Output = RealmConfigDocument;
     type Error = EnsureConfigError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -534,10 +553,11 @@ fn apply_node_ensure(
     actor: &Actor,
     node_id: NodeId,
     kind: RealmNodeKind,
+    event_id: Ulid,
 ) -> Result<AdminDocumentEvent, AdminDocumentError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
-        event_id: Ulid::generate(),
+        event_id,
         target: state.target.clone(),
         origin_node_id: actor.node_id,
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -817,6 +837,8 @@ mod pure_tests {
             target_node_kind: kind,
             ..config(actor.clone(), 3)
         });
+        operation.stamp(1_000);
+        operation.seed(u128::from(target.as_bytes()[0]) + 1);
         let writes = batch_write(
             operation
                 .emit_document_write(Some(document.to_bytes(actor).unwrap().into()), None)
@@ -1110,7 +1132,9 @@ mod pure_tests {
                 record: record.clone(),
             },
         ] {
-            state.apply_operation(&actor, op).unwrap();
+            state
+                .apply_operation(&actor, op, ulid::Ulid::generate())
+                .unwrap();
         }
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1140,6 +1164,7 @@ mod pure_tests {
                         owner: UserId::nil(realm_id),
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 
@@ -1159,6 +1184,7 @@ mod pure_tests {
                     node_id: device,
                     cutoffs: Vec::new(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         overlay_reducer_state(&mut config, &state, 0);

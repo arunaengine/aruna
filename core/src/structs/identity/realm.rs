@@ -9,6 +9,7 @@ use crate::auth::{
     user_cutoff_hash,
 };
 use crate::errors::ConversionError;
+use crate::id_mint::named_id;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
 use crate::structs::execution::job::{JobId, SubmissionId};
 use crate::structs::identity::auth::Actor;
@@ -140,9 +141,10 @@ impl std::fmt::Display for RealmLevelOperation {
 }
 
 impl RealmAuthorizationDocument {
+    /// The realm administrator role of a new realm; its id follows from the realm id.
     pub fn default_realm_doc(realm_id: RealmId) -> Self {
         let mut roles = HashMap::new();
-        let admin = Ulid::generate();
+        let admin = named_id(realm_id.as_bytes(), "realm_admin");
         roles.insert(
             admin,
             Role {
@@ -653,7 +655,7 @@ impl RealmConfigDocument {
     /// Control documents stay local everywhere because permission checks require local authorization data.
     pub fn seed_default_placement(&mut self) {
         let default_strategy = PlacementStrategy {
-            strategy_id: Ulid::generate(),
+            strategy_id: named_id(self.realm_id.as_bytes(), "default"),
             name: "default".to_string(),
             replica_count: Some(self.metadata_replication.default_replication_factor),
             distinct_locations: false,
@@ -661,7 +663,7 @@ impl RealmConfigDocument {
             shard_count: DEFAULT_SHARD_COUNT,
         };
         let everywhere_strategy = PlacementStrategy {
-            strategy_id: Ulid::generate(),
+            strategy_id: named_id(self.realm_id.as_bytes(), "everywhere"),
             name: "everywhere".to_string(),
             replica_count: None,
             distinct_locations: false,
@@ -671,7 +673,7 @@ impl RealmConfigDocument {
         // Submission families retain their dedicated immutable strategy and shard count, leaving ordinary
         // default-strategy administration independent.
         let job_family_strategy = PlacementStrategy {
-            strategy_id: Ulid::generate(),
+            strategy_id: named_id(self.realm_id.as_bytes(), "job-family"),
             name: "job-family".to_string(),
             replica_count: Some(self.metadata_replication.default_replication_factor),
             distinct_locations: false,
@@ -1604,6 +1606,7 @@ mod test {
                     expires_at: 1_000,
                     token_owner: owner,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 
@@ -1659,6 +1662,7 @@ mod test {
                     expires_at: 2_000,
                     token_owner: owner_a,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         reducer
@@ -1669,6 +1673,7 @@ mod test {
                     expires_at: 2_000,
                     token_owner: owner_b,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 

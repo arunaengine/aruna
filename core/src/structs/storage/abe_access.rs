@@ -523,7 +523,8 @@ mod tests {
                     object_key: object.into(),
                     bucket_public,
                 };
-                let (envelope, _) = create_envelope(plan).unwrap();
+                let (envelope, _) =
+                    create_envelope(plan, &mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
                 let context = envelope.context.bytes().unwrap();
                 Envelope::from_bytes(&public, &envelope.abe)
                     .is_ok_and(|abe| aruna_kpabe::open(&public, &key, &abe, &context).is_ok())

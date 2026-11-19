@@ -5,6 +5,9 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::cursor::sealed_position;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
@@ -18,10 +21,13 @@ use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::s3::object::search_scan::{open_position, seal_position};
 
 #[derive(Debug, PartialEq)]
 enum LocalStep {
+    /// The sealed position the scan resumes after is opened.
+    Open,
+    /// The position a cut scan stopped at is sealed.
+    Seal,
     Scan,
     LoadPolicies,
     CheckAnonymous,
@@ -128,8 +134,10 @@ impl LocalBucketSearch {
     fn after_hits(&mut self) -> LocalTurn {
         match self.next_start_after.take() {
             Some(key) if self.scanned_rows >= self.budget => {
-                let scanned_to = seal_position(&key).map_err(|_| SearchBucketsError::Position)?;
-                self.page(Some(scanned_to))
+                self.step = LocalStep::Seal;
+                Ok(Next::Call(
+                    Effect::Net(NetEffect::SealPosition(key.to_vec())).into(),
+                ))
             }
             Some(key) => {
                 self.start_after = Some(key);
@@ -183,19 +191,37 @@ impl Operation for LocalBucketSearch {
             return Err(SearchBucketsError::Extras);
         }
         // A cut scan's position comes back sealed, as it may name a bucket the caller cannot read.
-        let opened = (self.input.start_after.as_ref()).map(|after| open_position(after));
-        let Ok(opened) = opened.transpose() else {
-            return Ok(Next::Done(BucketPage {
-                retired: true,
-                ..BucketPage::default()
-            }));
-        };
-        self.start_after = opened.map(Key::from);
-        self.scan()
+        match self.input.start_after.clone() {
+            Some(after) if sealed_position(&after) => {
+                self.step = LocalStep::Open;
+                Ok(Next::Call(
+                    Effect::Net(NetEffect::OpenPosition(after.to_vec())).into(),
+                ))
+            }
+            after => {
+                self.start_after = after;
+                self.scan()
+            }
+        }
     }
 
     fn next(&mut self, result: IoResult) -> LocalTurn {
         match self.step {
+            // A position this node cannot open retires its scan instead of failing every page.
+            LocalStep::Open => match result.event()? {
+                Event::Net(NetEvent::PositionOpened(Some(plain))) => {
+                    self.start_after = Some(Key::from(plain));
+                    self.scan()
+                }
+                _ => Ok(Next::Done(BucketPage {
+                    retired: true,
+                    ..BucketPage::default()
+                })),
+            },
+            LocalStep::Seal => match result.event()? {
+                Event::Net(NetEvent::PositionSealed(Some(sealed))) => self.page(Some(sealed)),
+                _ => Err(SearchBucketsError::Position),
+            },
             LocalStep::Scan => {
                 let output = result.child::<SearchBucketsOutput, SearchBucketsError>()??;
                 self.scanned(output)
@@ -285,13 +311,17 @@ mod tests {
 
     #[test]
     fn foreign_position_retires() {
-        let mut forged = seal_position(b"bucket").unwrap();
-        *forged.last_mut().unwrap() ^= 1;
+        let forged = vec![aruna_core::cursor::SEALED_POSITION, 1, 2, 3];
         let mut search = LocalBucketSearch::new(SearchBucketsInput {
-            start_after: Some(Key::from(forged)),
+            start_after: Some(Key::from(forged.clone())),
             ..input()
         });
-        let Ok(Next::Done(page)) = search.first() else {
+        let open = Ok(Next::Call(
+            Effect::Net(NetEffect::OpenPosition(forged)).into(),
+        ));
+        assert_eq!(search.first(), open);
+        let unopened = Event::Net(NetEvent::PositionOpened(None));
+        let Ok(Next::Done(page)) = search.next(IoResult::Event(Box::new(unopened))) else {
             panic!("a position this node cannot open ends its part");
         };
         assert!(page.retired && page.hits.is_empty());
@@ -326,9 +356,14 @@ mod tests {
         let mut search = LocalBucketSearch::with_budget(input(), 1);
         search.first().unwrap();
         let next = Some(Key::from(b"bucket".to_vec()));
-        let Ok(Next::Done(page)) = search.next(scanned(Vec::new(), next)) else {
+        let seal = Ok(Next::Call(
+            Effect::Net(NetEffect::SealPosition(b"bucket".to_vec())).into(),
+        ));
+        assert_eq!(search.next(scanned(Vec::new(), next)), seal);
+        let sealed = Event::Net(NetEvent::PositionSealed(Some(vec![9, 9])));
+        let Ok(Next::Done(page)) = search.next(IoResult::Event(Box::new(sealed))) else {
             panic!("a used-up budget ends the page");
         };
-        assert!(page.scanned_to.is_some());
+        assert_eq!(page.scanned_to, Some(vec![9, 9]));
     }
 }

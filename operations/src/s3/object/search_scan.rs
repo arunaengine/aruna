@@ -35,9 +35,6 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 #[path = "index_search.rs"]
 mod index_search;
 
-pub use index_search::sealed_position;
-pub(crate) use index_search::{open_position, seal_position};
-
 const HEAD_SCAN_BATCH: usize = 1_000;
 /// Changed keys one node page passes at most; the page then ends at the last of them.
 const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;

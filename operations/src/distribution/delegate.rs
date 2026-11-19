@@ -41,11 +41,12 @@ pub struct DelegationInput {
     pub payload: Payload,
 }
 
-/// The delegation `issuer` makes for one verified request; `now` is Unix seconds.
+/// The delegation `issuer` makes for one verified request; `now` is Unix seconds and `nonce` a
+/// value the caller never uses twice.
 pub fn unsigned_delegation(
     (issuer, realm_id): (NodeId, RealmId),
     input: DelegationInput,
-    now: u64,
+    (now, nonce): (u64, [u8; 16]),
 ) -> Delegation {
     Delegation {
         realm_id,
@@ -64,7 +65,7 @@ pub fn unsigned_delegation(
         copy_source: input.copy_source,
         request_digest: input.request_digest,
         payload: input.payload,
-        nonce: rand::random(),
+        nonce,
         issued_at: now,
         valid_secs: DELEGATION_SECS,
     }

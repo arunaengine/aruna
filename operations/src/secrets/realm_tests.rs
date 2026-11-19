@@ -165,7 +165,9 @@ async fn early_value_kept() {
             entry: reference.entry,
             record: Some(record),
         };
-        let value = on_a.apply_operation(&other, vault).unwrap();
+        let value = on_a
+            .apply_operation(&other, vault, ulid::Ulid::generate())
+            .unwrap();
         let SecretChange::Create { name, kind, .. } = crate::secrets::tests::create() else {
             unreachable!("create() builds a create change");
         };
@@ -189,6 +191,7 @@ async fn early_value_kept() {
                 name,
                 info: Some(info),
             },
+            ulid::Ulid::generate(),
         );
         (value, named.unwrap())
     };

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ use super::entry::{EntryError, ReadEntry};
 use super::grants::InstallScope;
 use super::install::{pick_version, read_manifest};
 use super::rows::{Row, StoreError, read_call, values, write_rows};
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::sealed_value;
@@ -307,6 +308,7 @@ enum ReleasePhase {
     Selecting,
     ReadingAccount(Box<Admitted>),
     ReadingPolicies(Box<Admitted>),
+    CompilingPolicies(Box<Admitted>),
     Auditing(Box<Admitted>),
     Opening(Box<Admitted>),
     Refusing(Refusal),
@@ -321,6 +323,8 @@ pub(crate) struct ReleaseSecret {
     peer: NodeId,
     request: ReleaseRequest,
     phase: ReleasePhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ReleaseSecret {
@@ -335,6 +339,8 @@ impl ReleaseSecret {
             peer,
             request,
             phase: ReleasePhase::Selecting,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -349,10 +355,11 @@ impl ReleaseSecret {
     }
 
     fn audit_rows(
-        &self,
+        &mut self,
         refusal: Option<Refusal>,
         selected: Option<&Selected>,
     ) -> Result<Option<Vec<Row>>, ReleaseFailure> {
+        let audit_id = self.ids.mint(self.now_ms);
         let install = self.install()?;
         let Some(binding) = self.binding()? else {
             return Ok(None);
@@ -368,7 +375,7 @@ impl ReleaseSecret {
             run_id: self.request.run_id,
             refused: refusal.map(|refusal| refusal.as_str().to_string()),
         };
-        let record = AdminAuditRecord::for_use(install, secret, used);
+        let record = AdminAuditRecord::for_use(audit_id, install, secret, used);
         let rows = record.entries();
         Ok(Some(rows.map_err(|error| unavailable(error.to_string()))?))
     }
@@ -489,8 +496,18 @@ impl ReleaseSecret {
         result: IoResult,
     ) -> Result<Next<Released>, ReleaseFailure> {
         let group = Some(self.install()?.group_id);
-        let policies = read_policies(self.config.realm_id, group, result.values()?);
-        let policies = policies.map_err(|error| unavailable(error.to_string()))?;
+        let sets = read_policies(self.config.realm_id, group, result.values()?);
+        let sets = sets.map_err(|error| unavailable(error.to_string()))?;
+        self.phase = ReleasePhase::CompilingPolicies(admitted);
+        Ok(Next::Call(sets.compile()))
+    }
+
+    fn policies_compiled(
+        &mut self,
+        admitted: Box<Admitted>,
+        result: IoResult,
+    ) -> Result<Next<Released>, ReleaseFailure> {
+        let policies = compiled_policies(result).map_err(|error| unavailable(error.to_string()))?;
         let request = self.policy_request(&admitted)?;
         if policies.evaluate(&request).is_err() {
             return self.refuse(Refusal::Policy, Some(&admitted.selected));
@@ -518,6 +535,14 @@ impl Operation for ReleaseSecret {
     type Output = Released;
     type Error = ReleaseFailure;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<Released>, ReleaseFailure> {
         let install = self.install()?;
         if install.receiver != self.peer {
@@ -542,6 +567,7 @@ impl Operation for ReleaseSecret {
             }
             ReleasePhase::ReadingAccount(admitted) => self.account_read(admitted, result),
             ReleasePhase::ReadingPolicies(admitted) => self.policies_read(admitted, result),
+            ReleasePhase::CompilingPolicies(admitted) => self.policies_compiled(admitted, result),
             ReleasePhase::Auditing(admitted) => {
                 let written = result.child::<(), StoreError>()?;
                 written.map_err(|error| unavailable(error.to_string()))?;

@@ -120,7 +120,9 @@ impl RewriteVersionOperation {
             return self.end(RewriteOutcome::Moved);
         };
         self.state = RewriteState::UpdateUsage;
-        Ok(Next::Call(usage.start_calls().into_call()))
+        Ok(Next::Call(
+            usage.start_calls(self.ids.mint(self.now_ms)).into_call(),
+        ))
     }
 
     pub(super) fn handle_usage(&mut self, result: IoResult) -> Step {

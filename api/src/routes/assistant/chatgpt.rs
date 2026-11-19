@@ -6,13 +6,13 @@ use super::{ProviderModel, ensure_enabled, load_provider, save_provider, validat
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus,
 };
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::assistant::provider::CreateProviderOperation;
 use axum::Json;
@@ -449,7 +449,11 @@ pub async fn poll_login(
     provider.login_expires_at = None;
     provider.login_interval_seconds = None;
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((
@@ -524,7 +528,11 @@ pub(super) async fn refresh_provider(
     }
     provider.token_obtained_at = Some(unix_timestamp_secs());
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(state, provider.user_id, expected, provider).await
 }

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::shared::write_value;
 use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
 use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
@@ -17,8 +18,6 @@ use aruna_api::routes::storage::routing::{
 };
 use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
@@ -48,23 +47,6 @@ struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
     reader: AuthContext,
-}
-
-async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 /// An open multipart upload of `data`.

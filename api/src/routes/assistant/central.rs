@@ -12,6 +12,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::routes::info::is_realm_admin;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
@@ -22,7 +23,6 @@ use aruna_core::structs::{
     AssistantProviderStatus, AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, SESSION_HEADER,
     USER_HEADER, secs_to_midnight, utc_day,
 };
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::assistant::central::{
     CentralRead, CentralStoreError, ChargeUsageOperation, GetCentralOperation, SetCentralOperation,
@@ -211,8 +211,14 @@ fn build_central(
     let secret = central_secret(state, request.api_key, current)?;
     let key = state.credential_encryption_key();
     provider
-        .encrypt_secret(key, &secret)
-        .and_then(|_| provider.encrypt_headers(key, &AssistantHeaders(Default::default())))
+        .encrypt_secret(key, &secret, rand::random::<[u8; 24]>())
+        .and_then(|_| {
+            provider.encrypt_headers(
+                key,
+                &AssistantHeaders(Default::default()),
+                rand::random::<[u8; 24]>(),
+            )
+        })
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     Ok(CentralAssistant {
         provider,

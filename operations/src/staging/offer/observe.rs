@@ -4,13 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journaled};
@@ -27,7 +28,6 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
@@ -84,6 +84,8 @@ fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
 struct VersionChange {
     calls: VecDeque<IoCall>,
     usage: UsageCounterUpdate,
+    /// The dirty-marker generation the host minted for the usage update.
+    generation: Ulid,
     counting: bool,
 }
 
@@ -94,7 +96,7 @@ impl VersionChange {
         key: &str,
         (pointer, version_id): (Option<&CurrentVersionPointer>, Ulid),
         write: Effect,
-        usage: UsageCounterUpdate,
+        (usage, generation): (UsageCounterUpdate, Ulid),
     ) -> Result<Self, OfferError> {
         let next = CurrentVersionPointer::next_for(pointer, version_id)?;
         let alias = HeadAliasContext::new(
@@ -109,6 +111,7 @@ impl VersionChange {
         Ok(Self {
             calls: calls.collect(),
             usage,
+            generation,
             counting: false,
         })
     }
@@ -121,7 +124,7 @@ impl VersionChange {
             return None;
         }
         self.counting = true;
-        Some(self.usage.start_calls().into_call())
+        Some(self.usage.start_calls(self.generation).into_call())
     }
 
     /// The call after `result`, or `None` once the change is staged.
@@ -188,6 +191,8 @@ pub(in crate::staging) struct ObserveFileOperation {
     rows: CurrentRows,
     version_id: Option<Ulid>,
     change: Option<VersionChange>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type ObserveTurn = Result<Next<Ulid>, OfferError>;
@@ -195,6 +200,8 @@ type ObserveTurn = Result<Next<Ulid>, OfferError>;
 impl ObserveFileOperation {
     pub(in crate::staging) fn new(scope: ObservationScope, entry: &SourceEntry) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             binding: offered_binding(&scope.bucket, &entry.path, scope.node_id),
             metadata: entry_metadata(entry),
             path: entry.path.clone(),
@@ -223,13 +230,13 @@ impl ObserveFileOperation {
             return Ok(Next::Done(pointer.version_id));
         }
         let scope = &self.scope;
-        let version_id = Ulid::generate();
-        let now = SystemTime::now();
+        let version_id = self.mint.mint(self.now_ms);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let uploaded = SourceEvent::data_uploaded(
             (scope.realm_id, scope.group_id, scope.node_id),
             (&scope.bucket, &self.path),
             version_id,
-            unix_timestamp_millis(),
+            self.now_ms,
         );
         let version = BlobVersion::reference(
             self.binding.clone(),
@@ -252,6 +259,7 @@ impl ObserveFileOperation {
         };
         let usage = UsageCounterUpdate::for_group(scope.group_id, delta)
             .in_bucket(&scope.bucket, RowChange::AddedVersion);
+        let usage = (usage, self.mint.mint(self.now_ms));
         let mut change =
             VersionChange::new(scope, &self.path, (pointer, version_id), write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
@@ -264,6 +272,14 @@ impl ObserveFileOperation {
 impl Operation for ObserveFileOperation {
     type Output = Ulid;
     type Error = OfferError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -299,6 +315,8 @@ pub(in crate::staging) struct TombstoneOperation {
     key: String,
     rows: CurrentRows,
     change: Option<VersionChange>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type TombstoneTurn = Result<Next<bool>, OfferError>;
@@ -306,6 +324,8 @@ type TombstoneTurn = Result<Next<bool>, OfferError>;
 impl TombstoneOperation {
     pub(in crate::staging) fn new(scope: ObservationScope, key: String) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             scope,
             key,
             rows: CurrentRows::default(),
@@ -318,8 +338,9 @@ impl TombstoneOperation {
             return Ok(Next::Done(false));
         };
         let scope = &self.scope;
-        let version_id = Ulid::generate();
-        let marker = BlobVersion::deleted(SystemTime::now(), scope.user_id);
+        let version_id = self.mint.mint(self.now_ms);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let marker = BlobVersion::deleted(now, scope.user_id);
         let key = VersionKey::new(&scope.bucket, &self.key, version_id);
         let write = write_version_effect(&key, &marker)?;
         let size = live.offered_size(&scope.bucket, &self.key).unwrap_or(0);
@@ -331,6 +352,7 @@ impl TombstoneOperation {
         let usage = UsageCounterUpdate::for_group(scope.group_id, delta)
             .in_bucket(&scope.bucket, RowChange::AddedMarker);
         let pointer = self.rows.pointer.as_ref();
+        let usage = (usage, self.mint.mint(self.now_ms));
         let mut change = VersionChange::new(scope, &self.key, (pointer, version_id), write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
         self.change = Some(change);
@@ -341,6 +363,14 @@ impl TombstoneOperation {
 impl Operation for TombstoneOperation {
     type Output = bool;
     type Error = OfferError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

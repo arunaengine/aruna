@@ -268,25 +268,10 @@ impl Operation for RemoveBackendOperation {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::EncodingClass;
-    use aruna_core::structs::storage::group_backend::GroupBackendKind;
-    use std::collections::HashMap;
-    use std::time::SystemTime;
 
     pub(crate) fn record(backend_id: Ulid, disabled: bool) -> GroupStorage {
-        GroupStorage {
-            backend_id,
-            group_id: Ulid::from_bytes([1u8; 16]),
-            name: "tenant".to_string(),
-            kind: GroupBackendKind::S3,
-            public_config: HashMap::new(),
-            created_at: SystemTime::UNIX_EPOCH,
-            updated_at: SystemTime::UNIX_EPOCH,
-            created_by: Default::default(),
-            disabled,
-            cleanup: CleanupStrategy::Retain,
-        }
+        crate::testing::group_storage(backend_id, disabled)
     }
 
     fn read(stored: &GroupStorage) -> IoResult {

@@ -5,8 +5,8 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
-use aruna_core::events::{Event, GroupEvent};
-use aruna_core::jobs::{JobEffect, JobEvent, JobReport, JobStops};
+use aruna_core::events::GroupEvent;
+use aruna_core::jobs::{JobEffect, JobReport};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
@@ -17,6 +17,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 
+use super::job::{reported, stops_of};
 use super::walk::{
     Ahead, WalkPageOperation, WalkPlace, WalkedPage, directory_list_path, member, member_outcome,
     target_of,
@@ -401,29 +402,6 @@ impl Operation for LanesOperation {
 
 fn job_call(effect: JobEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Job(effect)))
-}
-
-/// Checks the answer to a progress report.
-fn reported(result: IoResult) -> Result<(), IoError> {
-    let event = result.event()?;
-    match event {
-        Event::Job(JobEvent::Reported) => Ok(()),
-        other => Err(IoError::Unexpected {
-            expected: "the recorded progress",
-            got: other.label(),
-        }),
-    }
-}
-
-fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
-    let event = result.event()?;
-    match event {
-        Event::Job(JobEvent::Stops(stops)) => Ok(stops),
-        other => Err(IoError::Unexpected {
-            expected: "the job's stop state",
-            got: other.label(),
-        }),
-    }
 }
 
 /// What one page of a lane left.
