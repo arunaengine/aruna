@@ -122,11 +122,13 @@ fn family_read_required() {
 fn budget_signed_first() {
     let fixture = Family::new([24u8; 32]);
     let mut operation = configured(&fixture);
-    let spec = fixture.sign(
-        &fixture.holder,
-        JobFamilyRecord::Spec(Box::new(fixture.spec())),
-    );
-    let records = child(Ok::<_, FamilyReadError>(vec![spec]));
+    let spec = fixture.spec();
+    let claim = JobFamilyRecord::Claim(fixture.claim(&spec));
+    let family = vec![
+        fixture.sign(&fixture.holder, JobFamilyRecord::Spec(Box::new(spec))),
+        fixture.sign(&fixture.holder, claim),
+    ];
+    let records = child(Ok::<_, FamilyReadError>(family));
     let next = operation.next(records).unwrap();
     let Next::Call(IoCall::Effect(effect)) = next else {
         panic!("expected the signature request");
