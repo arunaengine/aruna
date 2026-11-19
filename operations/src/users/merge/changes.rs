@@ -15,7 +15,6 @@ use aruna_core::storage_entries::{subject_index_key, subject_index_value, sync_r
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, RoleId, Value};
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, counted_attributes,
@@ -210,7 +209,9 @@ impl MergeUsersOperation {
             .map(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()))
             .transpose()
             .map_err(ConversionError::from)?;
-        let revision = local_sync_change(previous.as_ref(), &actor, placement);
+        let event_id = self.ids.mint(self.now_ms);
+        let revision =
+            local_sync_change(previous.as_ref(), &actor, placement, self.now_ms, event_id);
         self.batch.writes.push((
             document.storage_keyspace().to_string(),
             document.storage_key(),
@@ -370,11 +371,7 @@ impl MergeUsersOperation {
                 },
             )?;
         }
-        overlay_reducer_state(
-            &mut documents.config,
-            &change.state,
-            unix_timestamp_millis(),
-        );
+        overlay_reducer_state(&mut documents.config, &change.state, self.now_ms);
         let document = DocumentTarget::RealmConfig { realm_id };
         let placement = target_placement_ref(&documents.config, &document, Default::default());
         self.batch.writes.push((

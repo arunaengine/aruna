@@ -8,6 +8,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultSignEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, done, event, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -227,6 +228,7 @@ pub struct AppendVaultOperation {
     delete_heads: Vec<Ulid>,
     delete_markers: Vec<VaultRevision>,
     delete_live: bool,
+    ids: IdMint,
 }
 
 impl AppendVaultOperation {
@@ -245,6 +247,7 @@ impl AppendVaultOperation {
             delete_heads: Vec::new(),
             delete_markers: Vec::new(),
             delete_live: false,
+            ids: IdMint::default(),
         }
     }
 
@@ -363,7 +366,7 @@ impl AppendVaultOperation {
                 revision_id: if final_head {
                     self.config.record_id
                 } else {
-                    Ulid::generate()
+                    self.ids.mint(self.config.now_ms)
                 },
                 predecessors,
                 payload: None,
@@ -493,6 +496,10 @@ impl AppendVaultOperation {
 impl Operation for AppendVaultOperation {
     type Output = VaultAppended;
     type Error = AppendVaultError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 use aruna_core::structs::identity::auth::Actor;
@@ -147,6 +148,7 @@ pub struct ExpandPlacementOperation {
     /// Strategies still to look at.
     strategies: Vec<Ulid>,
     started: Vec<Ulid>,
+    ids: IdMint,
 }
 
 impl ExpandPlacementOperation {
@@ -159,6 +161,7 @@ impl ExpandPlacementOperation {
             config: None,
             strategies: Vec::new(),
             started: Vec::new(),
+            ids: IdMint::default(),
         }
     }
 
@@ -212,7 +215,7 @@ impl ExpandPlacementOperation {
             if buckets.is_empty() {
                 continue;
             }
-            let transition_id = Ulid::generate();
+            let transition_id = self.ids.mint(self.now_ms);
             let plan = plan_transition(
                 config,
                 TransitionRequest {
@@ -245,6 +248,10 @@ impl Operation for ExpandPlacementOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> ExpandTurn {

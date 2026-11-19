@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE,
     NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
@@ -81,6 +82,8 @@ impl CommitOperation {
             fence: Default::default(),
             stage: Stage::Read,
             backends,
+            now_ms: 0,
+            ids: IdMint::default(),
         };
         Self {
             write: Some(write),
@@ -174,6 +177,8 @@ struct CommitWrite {
     fence: WriteFence,
     stage: Stage,
     backends: PrefixPages,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 fn unavailable(error: AuthorizationError) -> GroupDeletionError {
@@ -333,7 +338,10 @@ impl CommitWrite {
         writes.push(self.membership.entry(record.plan.realm_id)?);
         deletes.extend(stale_conflict_deletes(Some(previous), Some(&reducer)));
         writes.extend(conflict_write_entries(&reducer)?);
-        writes.push(trail_drop(record.plan.group_id)?);
+        writes.push(trail_drop(
+            record.plan.group_id,
+            self.ids.mint(self.now_ms),
+        )?);
         if self.auth.is_some() {
             let config = self.config.as_ref().ok_or_else(|| {
                 GroupDeletionError::Unavailable("realm configuration is missing".into())
@@ -402,8 +410,10 @@ impl CommitWrite {
 }
 
 /// The cleanup queue drops the group's delete trail, a page at a time; the audit stays.
-fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletionError> {
-    let row = ulid::Ulid::generate();
+fn trail_drop(
+    group_id: ulid::Ulid,
+    row: ulid::Ulid,
+) -> Result<(String, Key, Value), GroupDeletionError> {
     let work = aruna_core::structs::storage::blob::BlobCleanupWork::DropTrail {
         group_id,
         bucket: None,
@@ -419,6 +429,14 @@ fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletio
 impl Operation for CommitWrite {
     type Output = AdminDocumentEvent;
     type Error = GroupDeletionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
