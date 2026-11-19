@@ -10,7 +10,6 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::Effect;
 use aruna_core::events::{Event, PeerAuthRefusal};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::{
@@ -45,6 +44,7 @@ use crate::forward::transport::reject;
 use crate::groups::list_groups::{ListGroupError, ListGroupOperation};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::protocol::{
     DeviceGroupDocuments, GraphState, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
@@ -98,10 +98,6 @@ fn peer_caller(
         return Err(SyncRefusal::Unauthorized);
     }
     Ok(auth)
-}
-
-fn metadata_call(effect: MetadataEffect) -> IoCall {
-    IoCall::from(Effect::Metadata(effect))
 }
 
 fn metadata_event(result: IoResult) -> Result<MetadataEvent, SyncRefusal> {

@@ -4,6 +4,7 @@
 
 use super::tests::{create_event, node};
 use super::*;
+use crate::metadata::deletion_guard::metadata_call;
 use aruna_core::storage_entries::create_event_entry;
 
 type Error = MetadataMaterializationError;
@@ -440,7 +441,7 @@ fn batch_syncs_graphs() {
         graph_iri: graph_iri.clone(),
         peers: vec![node(2)],
     };
-    let call = IoCall::Effect(Box::new(Effect::Metadata(sync)));
+    let call = metadata_call(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
     let scheduled = MetadataEvent::GraphSyncScheduled {
         graph_iri,

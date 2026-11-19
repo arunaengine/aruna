@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
@@ -31,6 +30,7 @@ use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
 use crate::jobs::repository::link_queue::QueueDeletedOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::effect_event;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
 use crate::tasks::queue_backoff::due_after;
@@ -89,7 +89,7 @@ impl From<IoError> for MetadataGraphError {
 }
 
 fn graph_effect(effect: MetadataEffect) -> IoCall {
-    IoCall::Effect(Box::new(Effect::Metadata(effect)))
+    metadata_call(effect)
 }
 
 /// A graph answer, or the error it carries.

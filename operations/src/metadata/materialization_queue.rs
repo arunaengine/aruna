@@ -42,6 +42,7 @@ use crate::jobs::repository::link_queue::{LinkTimerOperation, QueueRowsOperation
 use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
@@ -433,9 +434,7 @@ impl MaterializationBatchOperation {
             graph_iri: sync.graph_iri,
             peers: sync.peers,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(metadata_call(effect)))
     }
 
     // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
@@ -1942,7 +1941,7 @@ impl MaterializationJobOperation {
             policy: event_policy(event),
         };
         self.stage = JobStage::Policy;
-        Ok(graph_call(Effect::Metadata(effect)))
+        Ok(graph_call(effect))
     }
 
     /// Merges the origin's batch or joins a checkpoint's graph state, then re-renders and
@@ -1982,7 +1981,7 @@ impl MaterializationJobOperation {
                 MetadataEvent::BatchMerged { .. } | MetadataEvent::SnapshotInstalled { .. } => {
                     self.stage = JobStage::Export;
                     let export = MetadataEffect::ExportRoCrate { graph_iri };
-                    Ok(graph_call(Effect::Metadata(export)))
+                    Ok(graph_call(export))
                 }
                 other => Err(unexpected(other)),
             },
@@ -2225,8 +2224,8 @@ impl Operation for MaterializationJobOperation {
     }
 }
 
-fn graph_call(effect: Effect) -> Next<ProcessedMaterializationJob> {
-    Next::Call(IoCall::Effect(Box::new(effect)))
+fn graph_call(effect: MetadataEffect) -> Next<ProcessedMaterializationJob> {
+    Next::Call(metadata_call(effect))
 }
 
 /// The graph store's answer to one metadata effect; an error answer is the effect's failure.
@@ -2649,11 +2648,11 @@ fn graph_materialization_effect(
     event: &MetadataEventRecord,
     raw_revision: Option<&MetadataRawRevision>,
     rebuild: bool,
-) -> Effect {
+) -> MetadataEffect {
     let policy = event_policy(event);
     let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
     if rebuild && let Some(raw_revision) = raw_revision {
-        return Effect::Metadata(MetadataEffect::ApplyRoCrate {
+        return MetadataEffect::ApplyRoCrate {
             request: ApplyRoCrateRequest {
                 graph_iri: event.record.graph_iri.clone(),
                 jsonld: raw_revision.jsonld.clone(),
@@ -2661,7 +2660,7 @@ fn graph_materialization_effect(
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
             },
-        });
+        };
     }
     match &event.payload {
         MetadataEventPayload::Scaffold {
@@ -2669,7 +2668,7 @@ fn graph_materialization_effect(
             description,
             date_published,
             license,
-        } => Effect::Metadata(MetadataEffect::CreateCrate {
+        } => MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
                 graph_iri: event.record.graph_iri.clone(),
                 name: name.clone(),
@@ -2680,58 +2679,50 @@ fn graph_materialization_effect(
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
             },
-        }),
+        },
         MetadataEventPayload::RoCrate { jsonld }
-        | MetadataEventPayload::ReplaceRoCrate { jsonld } => {
-            Effect::Metadata(MetadataEffect::ApplyRoCrate {
-                request: ApplyRoCrateRequest {
-                    graph_iri: event.record.graph_iri.clone(),
-                    jsonld: jsonld.clone(),
-                    policy,
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            })
-        }
-        MetadataEventPayload::UpsertDataEntity { jsonld } => {
-            Effect::Metadata(MetadataEffect::UpsertDataEntity {
-                request: aruna_core::metadata::UpsertEntityRequest {
-                    graph_iri: event.record.graph_iri.clone(),
-                    jsonld: jsonld.clone(),
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            })
-        }
+        | MetadataEventPayload::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {
+            request: ApplyRoCrateRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: jsonld.clone(),
+                policy,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        },
+        MetadataEventPayload::UpsertDataEntity { jsonld } => MetadataEffect::UpsertDataEntity {
+            request: aruna_core::metadata::UpsertEntityRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: jsonld.clone(),
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        },
         MetadataEventPayload::UpsertContextualEntity { jsonld } => {
-            Effect::Metadata(MetadataEffect::UpsertContextualEntity {
+            MetadataEffect::UpsertContextualEntity {
                 request: aruna_core::metadata::UpsertEntityRequest {
                     graph_iri: event.record.graph_iri.clone(),
                     jsonld: jsonld.clone(),
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor,
                 },
-            })
+            }
         }
-        MetadataEventPayload::ApplyBatch { batch, .. } => {
-            Effect::Metadata(MetadataEffect::MergeBatch {
-                graph_iri: event.record.graph_iri.clone(),
-                batch: batch.clone(),
-            })
-        }
+        MetadataEventPayload::ApplyBatch { batch, .. } => MetadataEffect::MergeBatch {
+            graph_iri: event.record.graph_iri.clone(),
+            batch: batch.clone(),
+        },
         // A checkpoint without graph state joins an empty snapshot, which changes nothing.
-        MetadataEventPayload::Checkpoint { snapshot } => {
-            Effect::Metadata(MetadataEffect::InstallSnapshot {
-                graph_iri: event.record.graph_iri.clone(),
-                snapshot: snapshot.clone().unwrap_or_else(|| {
-                    Box::new(craqle::GraphReplicaSnapshot {
-                        graph: craqle::GraphId::new(&event.record.graph_iri),
-                        clock: craqle::VectorClock::default(),
-                        quads: Vec::new(),
-                    })
-                }),
-            })
-        }
+        MetadataEventPayload::Checkpoint { snapshot } => MetadataEffect::InstallSnapshot {
+            graph_iri: event.record.graph_iri.clone(),
+            snapshot: snapshot.clone().unwrap_or_else(|| {
+                Box::new(craqle::GraphReplicaSnapshot {
+                    graph: craqle::GraphId::new(&event.record.graph_iri),
+                    clock: craqle::VectorClock::default(),
+                    quads: Vec::new(),
+                })
+            }),
+        },
     }
 }
 

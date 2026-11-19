@@ -90,7 +90,7 @@ fn local_delete_uncaches() {
         delete.next(child(Ok::<_, DeleteDocumentError>(()))),
         Ok(Next::Then {
             output: (),
-            calls: vec![IoCall::Effect(Box::new(Effect::Metadata(uncache)))],
+            calls: vec![metadata_call(uncache)],
         })
     );
 }

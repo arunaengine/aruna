@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
@@ -11,6 +10,7 @@ use aruna_core::rows::event;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
 use super::MetadataApiError;
+use crate::metadata::deletion_guard::metadata_call;
 
 /// The title of one document. A node without a graph store gives none; a graph that cannot
 /// be described falls back to the document path, as an unnamed root does.
@@ -42,9 +42,7 @@ impl Operation for DocumentTitleOperation {
             graph_iri: self.graph_iri.clone(),
             document_path: self.document_path.clone(),
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(metadata_call(effect)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, MetadataApiError> {
@@ -78,7 +76,7 @@ mod tests {
     #[test]
     fn named_root_titles() {
         let mut title = title();
-        assert!(matches!(title.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        assert!(matches!(title.first(), Ok(Next::Call(IoCall::Child(_)))));
         let named = answer(MetadataEvent::DocumentTitle {
             title: Some("Field notes".to_string()),
         });

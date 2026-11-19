@@ -10,13 +10,14 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::git::{GitAnswer, GitCall, GitEffect, GitEvent, GitRequest, PushProof, Refs};
 use aruna_core::git_state::{Ancestry, Projection, ProjectionInputs};
-use aruna_core::metadata::{MetadataEffect, MetadataEvent};
+use aruna_core::metadata::MetadataEvent;
 use aruna_core::operation::{Operation, Runnable, SubOperation, boxed_suboperation};
 use bytes::Bytes;
 use ulid::Ulid;
 
 use super::GitError;
 use super::objects::Blob;
+pub(super) use crate::metadata::deletion_guard::metadata_call;
 
 fn store_call(call: GitCall) -> IoCall {
     IoCall::from(Effect::Git(Box::new(call)))
@@ -76,10 +77,6 @@ pub(super) fn collected(result: IoResult) -> Result<Bytes, GitError> {
         GitAnswer::Collected(bytes) => Ok(bytes),
         _ => Err(GitError::Unavailable),
     }
-}
-
-pub(super) fn metadata_call(effect: MetadataEffect) -> IoCall {
-    IoCall::from(Effect::Metadata(effect))
 }
 
 pub(super) fn metadata_event(result: IoResult) -> Result<MetadataEvent, GitError> {

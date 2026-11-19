@@ -44,6 +44,7 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::call_results::{effect_event, page_rows};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{
@@ -646,13 +647,11 @@ impl ProjectEventsOperation {
         if superseded && let MetadataEventPayload::ApplyBatch { batch, .. } = &current.event.payload
         {
             let Some(result) = answer else {
-                return Ok(Flow::Call(effect_call(Effect::Metadata(
-                    MetadataEffect::ContainsDot {
-                        graph_iri: current.event.record.graph_iri.clone(),
-                        actor: batch.actor,
-                        counter: batch.counter,
-                    },
-                ))));
+                return Ok(Flow::Call(metadata_call(MetadataEffect::ContainsDot {
+                    graph_iri: current.event.record.graph_iri.clone(),
+                    actor: batch.actor,
+                    counter: batch.counter,
+                })));
             };
             if !dot_answer(effect_event(result)?)? {
                 let job = MetadataMaterializationRecord::new(&current.event, self.now_ms);
@@ -913,9 +912,7 @@ impl ProjectEventsOperation {
                 Answer::Done,
             ),
             Tail::Uncache(document_id) => (
-                effect_call(Effect::Metadata(MetadataEffect::UncacheRecord {
-                    document_id,
-                })),
+                metadata_call(MetadataEffect::UncacheRecord { document_id }),
                 Answer::Ignored,
             ),
             Tail::Commit => {
@@ -931,10 +928,10 @@ impl ProjectEventsOperation {
                 (IoCall::child(commit), Answer::Child)
             }
             Tail::Cache => (
-                effect_call(Effect::Metadata(MetadataEffect::CacheRecords {
+                metadata_call(MetadataEffect::CacheRecords {
                     records: std::mem::take(&mut self.projected_records),
                     generation: self.cache_generation,
-                })),
+                }),
                 Answer::Ignored,
             ),
             Tail::Wake(wake) => (effect_call(wake.effect()), Answer::Wake),
@@ -1032,9 +1029,7 @@ impl Operation for ProjectEventsOperation {
         if self.events.is_empty() {
             return Ok(Next::Done(0));
         }
-        Ok(Next::Call(effect_call(Effect::Metadata(
-            MetadataEffect::CacheGeneration,
-        ))))
+        Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
     }
 
     fn next(&mut self, result: IoResult) -> ProjectTurn {
@@ -1421,13 +1416,11 @@ impl Operation for DotAppliedOperation {
     type Error = MetadataProjectionError;
 
     fn first(&mut self) -> Result<Next<bool>, MetadataProjectionError> {
-        Ok(Next::Call(effect_call(Effect::Metadata(
-            MetadataEffect::ContainsDot {
-                graph_iri: self.graph_iri.clone(),
-                actor: self.actor,
-                counter: self.counter,
-            },
-        ))))
+        Ok(Next::Call(metadata_call(MetadataEffect::ContainsDot {
+            graph_iri: self.graph_iri.clone(),
+            actor: self.actor,
+            counter: self.counter,
+        })))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, MetadataProjectionError> {

@@ -33,6 +33,7 @@ use ulid::Ulid;
 
 use crate::metadata::api::access::{child_results, children};
 use crate::metadata::call_results::page_rows;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 
@@ -493,9 +494,7 @@ impl Operation for ProjectRowsOperation {
     fn first(&mut self) -> Result<Next<ProjectedRows>, MetadataIriError> {
         let graph_iri = self.document.2.clone();
         let effect = MetadataEffect::IriReferences { graph_iri };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(metadata_call(effect)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ProjectedRows>, MetadataIriError> {
@@ -1479,11 +1478,8 @@ mod tests {
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
         let document = (document_id, Ulid::from_parts(2, 1), graph_iri.clone());
         let mut project = ProjectRowsOperation::new(document);
-        let effect = Effect::Metadata(MetadataEffect::IriReferences { graph_iri });
-        assert_eq!(
-            project.first(),
-            Ok(Next::Call(IoCall::Effect(Box::new(effect))))
-        );
+        let effect = MetadataEffect::IriReferences { graph_iri };
+        assert_eq!(project.first(), Ok(Next::Call(metadata_call(effect))));
         let references = MetadataEvent::IriReferences {
             references: Vec::new(),
         };

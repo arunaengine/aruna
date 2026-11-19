@@ -1264,7 +1264,7 @@ fn effect_uses_event() {
     let deterministic_actor = Some(deterministic_materialization_actor(event_id));
 
     match graph_materialization_effect(&event, None, false) {
-        Effect::Metadata(MetadataEffect::CreateCrate { request }) => {
+        MetadataEffect::CreateCrate { request } => {
             assert_eq!(
                 request.durability,
                 MetadataRequestDurability::WalAlreadyDurable
@@ -1281,7 +1281,7 @@ fn effect_uses_event() {
         },
     );
     match graph_materialization_effect(&rocrate, None, false) {
-        Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
+        MetadataEffect::ApplyRoCrate { request } => {
             assert_eq!(
                 request.durability,
                 MetadataRequestDurability::WalAlreadyDurable
@@ -1298,7 +1298,7 @@ fn effect_uses_event() {
         },
     );
     match graph_materialization_effect(&data, None, false) {
-        Effect::Metadata(MetadataEffect::UpsertDataEntity { request }) => {
+        MetadataEffect::UpsertDataEntity { request } => {
             assert_eq!(
                 request.durability,
                 MetadataRequestDurability::WalAlreadyDurable
@@ -1315,7 +1315,7 @@ fn effect_uses_event() {
         },
     );
     match graph_materialization_effect(&contextual, None, false) {
-        Effect::Metadata(MetadataEffect::UpsertContextualEntity { request }) => {
+        MetadataEffect::UpsertContextualEntity { request } => {
             assert_eq!(
                 request.durability,
                 MetadataRequestDurability::WalAlreadyDurable
@@ -1333,7 +1333,7 @@ fn effect_uses_event() {
         merged: None,
     };
     match graph_materialization_effect(&contextual, Some(&raw_revision), true) {
-        Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
+        MetadataEffect::ApplyRoCrate { request } => {
             assert_eq!(request.jsonld, raw_revision.jsonld);
             assert_eq!(
                 request.durability,
@@ -1345,7 +1345,7 @@ fn effect_uses_event() {
     }
     assert!(matches!(
         graph_materialization_effect(&contextual, Some(&raw_revision), false),
-        Effect::Metadata(MetadataEffect::UpsertContextualEntity { .. })
+        MetadataEffect::UpsertContextualEntity { .. }
     ));
 }
 

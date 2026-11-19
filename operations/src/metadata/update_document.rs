@@ -38,6 +38,7 @@ use ulid::Ulid;
 
 use crate::metadata::MetadataPhaseSource;
 use crate::metadata::call_results::{effect_event, page_rows, read_values};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status, stamp_unprofiled,
     submission_profile_tag,
@@ -269,7 +270,7 @@ impl UpdateDocumentOperation {
     fn plan_batch_effect(
         &self,
         record: &MetadataRegistryRecord,
-    ) -> Result<Option<Effect>, MetadataError> {
+    ) -> Result<Option<MetadataEffect>, MetadataError> {
         match &self.config.mutation {
             // A device already planned its batch, so there is nothing to plan.
             UpdateDocumentMutation::ApplyBatch { .. } | UpdateDocumentMutation::Checkpoint => {
@@ -293,13 +294,13 @@ impl UpdateDocumentOperation {
                 "metadata actor is missing before planning".to_string(),
             ));
         };
-        Ok(Some(Effect::Metadata(MetadataEffect::PlanBatch {
+        Ok(Some(MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor: actor.actor,
             counter: actor.counter,
             source: batch_source(&self.config.mutation)
                 .ok_or_else(|| MetadataError::Backend("a checkpoint plans no batch".to_string()))?,
-        })))
+        }))
     }
 
     fn record(&self) -> Result<&MetadataRegistryRecord, UpdateDocumentError> {
@@ -346,8 +347,8 @@ impl UpdateDocumentOperation {
         if let UpdateDocumentMutation::Checkpoint = self.config.mutation {
             let graph_iri = self.record()?.graph_iri.clone();
             self.stage = UpdateStage::Snapshot;
-            let snapshot = Effect::Metadata(MetadataEffect::GraphSnapshot { graph_iri });
-            return Ok(Next::Call(IoCall::Effect(Box::new(snapshot))));
+            let snapshot = MetadataEffect::GraphSnapshot { graph_iri };
+            return Ok(Next::Call(metadata_call(snapshot)));
         }
         if !self.plans_with_actor() {
             return self.commit();
@@ -392,7 +393,7 @@ impl UpdateDocumentOperation {
         match self.plan_batch_effect(&record)? {
             Some(effect) => {
                 self.stage = UpdateStage::Plan;
-                Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+                Ok(Next::Call(metadata_call(effect)))
             }
             None => self.commit(),
         }
@@ -1564,15 +1565,15 @@ mod call_tests {
             operation.next(IoResult::Values(vec![encoded(&record)])),
             Ok(Next::Call(IoCall::Read(reads)))
         );
-        let Ok(Next::Call(IoCall::Effect(plan))) =
-            operation.next(IoResult::Values(vec![None, None]))
-        else {
-            panic!("expected the batch plan");
+        let plan = operation.next(IoResult::Values(vec![None, None]));
+        let actor = operation.actor.as_ref().expect("actor taken");
+        let expected = MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor: actor.actor,
+            counter: actor.counter,
+            source: batch_source(&operation.config.mutation).expect("a batch source"),
         };
-        assert!(matches!(
-            *plan,
-            Effect::Metadata(MetadataEffect::PlanBatch { ref graph_iri, .. }) if *graph_iri == record.graph_iri
-        ));
+        assert_eq!(plan, Ok(Next::Call(metadata_call(expected))));
         assert!(matches!(
             operation.next(planned_answer(batch(&record))),
             Ok(Next::Call(IoCall::Child(_)))
@@ -2023,12 +2024,12 @@ mod call_tests {
             operation.next(IoResult::Values(vec![encoded(&record)])),
             Ok(Next::Call(IoCall::Read(reads)))
         );
-        let snapshot = Effect::Metadata(MetadataEffect::GraphSnapshot {
+        let snapshot = MetadataEffect::GraphSnapshot {
             graph_iri: record.graph_iri.clone(),
-        });
+        };
         assert_eq!(
             operation.next(IoResult::Values(vec![None])),
-            Ok(Next::Call(IoCall::Effect(Box::new(snapshot))))
+            Ok(Next::Call(metadata_call(snapshot)))
         );
         let failed = event(Event::Metadata(MetadataEvent::Error {
             graph_iri: Some(record.graph_iri.clone()),
@@ -2095,20 +2096,14 @@ mod call_tests {
         operation
             .next(IoResult::Values(vec![encoded(&record)]))
             .unwrap();
-        let Ok(Next::Call(IoCall::Effect(plan))) =
-            operation.next(IoResult::Values(vec![None, encoded(&previous)]))
-        else {
-            panic!("expected the batch plan");
+        let plan = operation.next(IoResult::Values(vec![None, encoded(&previous)]));
+        let expected = MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor: previous.actor,
+            counter: 42,
+            source: batch_source(&operation.config.mutation).expect("a batch source"),
         };
-        let Effect::Metadata(MetadataEffect::PlanBatch {
-            actor: planned,
-            counter,
-            ..
-        }) = *plan
-        else {
-            panic!("expected batch planning with the node actor");
-        };
-        assert_eq!((planned, counter), (previous.actor, 42));
+        assert_eq!(plan, Ok(Next::Call(metadata_call(expected))));
         assert!(operation.event_id > previous.last_event_id);
         let next = operation.actor.clone().expect("actor advanced");
         assert_eq!(next.last_event_id, operation.event_id);

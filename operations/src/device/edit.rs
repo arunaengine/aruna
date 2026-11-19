@@ -30,6 +30,7 @@ use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
 use crate::device::replica::{ReplicaRecord, mark_edited};
 use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
@@ -48,10 +49,6 @@ impl From<IoError> for DeviceEditError {
     fn from(_: IoError) -> Self {
         Self::Unavailable
     }
-}
-
-fn metadata_call(effect: MetadataEffect) -> IoCall {
-    IoCall::from(Effect::Metadata(effect))
 }
 
 fn metadata_event(result: IoResult) -> Result<MetadataEvent, IoError> {

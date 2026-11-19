@@ -25,6 +25,7 @@ use aruna_core::types::Key;
 use ulid::Ulid;
 
 use crate::metadata::call_results::{effect_event, page_rows};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::stale_status;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
@@ -165,9 +166,7 @@ impl ReadyBaseOperation {
             actor: batch.actor,
             counter: batch.counter,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            contains,
-        )))))
+        Ok(Next::Call(metadata_call(contains)))
     }
 
     fn dot_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
@@ -319,9 +318,7 @@ impl UpdateEntryOperation {
     /// The cache generation before the update, so a fill that started meanwhile wins.
     fn read_generation(&mut self) -> EntryTurn {
         self.stage = EntryStage::Generation;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            MetadataEffect::CacheGeneration,
-        )))))
+        Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
     }
 
     fn generation_read(&mut self, result: IoResult) -> EntryTurn {
@@ -350,9 +347,7 @@ impl UpdateEntryOperation {
         };
         self.updated = Some(updated);
         self.stage = EntryStage::Cache;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            cache,
-        )))))
+        Ok(Next::Call(metadata_call(cache)))
     }
 }
 
@@ -589,9 +584,7 @@ mod tests {
         // A checkpoint plans on no base and carries no Profile verdict.
         assert_eq!(
             entry.first(),
-            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-                MetadataEffect::CacheGeneration
-            )))))
+            Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
         );
         let generation = event(Event::Metadata(MetadataEvent::CacheGeneration {
             generation: 7,
@@ -603,12 +596,10 @@ mod tests {
         let updated = child(Ok::<_, UpdateDocumentError>(record()));
         assert_eq!(
             entry.next(updated),
-            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-                MetadataEffect::CacheRecords {
-                    records: vec![record()],
-                    generation: Some(7),
-                }
-            )))))
+            Ok(Next::Call(metadata_call(MetadataEffect::CacheRecords {
+                records: vec![record()],
+                generation: Some(7),
+            })))
         );
         let cached = event(Event::Metadata(MetadataEvent::CacheGeneration {
             generation: 8,
