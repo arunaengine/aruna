@@ -175,6 +175,8 @@ pub struct ExecutionSpec {
     pub output_prefixes: Vec<String>,
     /// How a claimed destination key is resolved while composing the workspace.
     pub collision_policy: CollisionPolicy,
+    /// Node-local backend name the run is pinned to; target admission sets it.
+    pub backend: Option<String>,
 }
 
 /// Exact source details resolved at ingress and carried into the stored job

@@ -15,6 +15,11 @@ pub struct AttemptIntent {
     pub executor_kind: String,
     pub pinned_image: String,
     pub attempt_epoch: u64,
+    /// Node-local name of the backend the attempt was submitted to.
+    pub backend: String,
+    pub config_generation: u64,
+    /// Where the attempt lives; reconcile and cleanup refuse a backend with another home.
+    pub home_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +615,19 @@ impl WorkspaceMode {
     }
 }
 
+/// The backend config a device job was admitted under; its start compares these values with
+/// the current ones before it prepares anything. Receipted jobs keep theirs in the reservation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAdmission {
+    pub backend: String,
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
+    pub home_digest: [u8; 32],
+    /// Generation and digest of the backend's execution subject, or `None` for a device
+    /// without a placement subject, which passes the subject check only while it has none.
+    pub subject: Option<(u64, [u8; 32])>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub job_id: JobId,
@@ -644,6 +662,8 @@ pub struct JobRecord {
     /// Local attempts are spent without job-specific evidence: no further attempt
     /// runs here, yet the distributed outcome stays `Indeterminate`.
     pub locally_exhausted: bool,
+    /// Written by the device at submission, never taken from the request.
+    pub local_admission: Option<LocalAdmission>,
 }
 
 impl JobRecord {
@@ -689,6 +709,7 @@ impl JobRecord {
             report_digest: None,
             retention_ms: RETENTION_MS,
             locally_exhausted: false,
+            local_admission: None,
         }
     }
 

@@ -44,7 +44,7 @@ pub struct NodeHeartbeat {
     pub epoch: AdvertisementEpoch,
     pub sequence: u64,
     pub utilization: NodeUtilization,
-    /// Availability per advertised executor kind, ordered by kind.
+    /// Availability per advertised backend name, ordered by name.
     pub availability: Vec<(String, ExecutorAvailability)>,
     pub reservation: ComputeReservationSnapshot,
     pub demand: ComputeDemandSnapshot,
@@ -65,8 +65,8 @@ pub struct RunningJobs {
 pub enum HeartbeatError {
     #[error("a heartbeat names at most {MAX_ADVERTISED_EXECUTORS} executors")]
     ExecutorCount,
-    #[error("executor kinds must be 1..={MAX_KIND_LEN} bytes, unique and ordered")]
-    ExecutorKind,
+    #[error("backend names must be 1..={MAX_KIND_LEN} bytes, unique and ordered")]
+    BackendName,
     #[error("snapshot epochs must name the heartbeat's advertisement")]
     EpochMismatch,
     #[error("a heartbeat is at most {MAX_HEARTBEAT_BYTES} bytes")]
@@ -86,14 +86,14 @@ impl NodeHeartbeat {
         let malformed = self
             .availability
             .iter()
-            .any(|(kind, _)| kind.is_empty() || kind.len() > MAX_KIND_LEN || kind.trim() != kind);
+            .any(|(name, _)| name.is_empty() || name.len() > MAX_KIND_LEN || name.trim() != name);
         if malformed
             || self
                 .availability
                 .windows(2)
                 .any(|pair| pair[0].0 >= pair[1].0)
         {
-            return Err(HeartbeatError::ExecutorKind);
+            return Err(HeartbeatError::BackendName);
         }
         self.demand.validate()?;
         let current = revision(&self.epoch);
@@ -348,18 +348,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unordered_kinds() {
+    fn rejects_unordered_names() {
         let mut beat = heartbeat(1);
         beat.availability = vec![
-            ("kubernetes".into(), availability()),
-            ("docker".into(), availability()),
+            ("lab".into(), availability()),
+            ("edge".into(), availability()),
         ];
-        assert_eq!(beat.validate(), Err(HeartbeatError::ExecutorKind));
+        assert_eq!(beat.validate(), Err(HeartbeatError::BackendName));
         beat.availability = vec![
-            ("docker".into(), availability()),
-            ("docker".into(), availability()),
+            ("lab".into(), availability()),
+            ("lab".into(), availability()),
         ];
-        assert_eq!(beat.validate(), Err(HeartbeatError::ExecutorKind));
+        assert_eq!(beat.validate(), Err(HeartbeatError::BackendName));
+        // Two backends of one kind are two names.
+        beat.availability = vec![
+            ("edge".into(), availability()),
+            ("lab".into(), availability()),
+        ];
+        assert_eq!(beat.validate(), Ok(()));
     }
 
     #[test]

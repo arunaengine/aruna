@@ -315,6 +315,9 @@ pub struct ExecutionReceipt {
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
     pub accepted_at_ms: u64,
+    /// Config of the backend the launch was accepted on; a change fences the start.
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
 }
 
 /// State of one physical execution. Terminal here means terminal for this
