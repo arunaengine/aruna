@@ -3,18 +3,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod exports;
+mod forwards;
 mod mirror;
 mod paths;
 mod reads;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::heartbeat::Here;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::RealmSecretRef;
 use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
 use self::exports::{ExportAsk, ExportServeOperation};
+use self::forwards::{Forward, ForwardReply, forward_call};
 use self::mirror::{MirrorRequest, MirrorServeOperation};
 use self::paths::{PathAsk, PathReadOperation};
 use self::reads::{CallerReadOperation, ReadReply};
@@ -29,7 +32,7 @@ use crate::replication::queue::BlobQueueError;
 use aruna_core::metadata::AuthToken;
 
 /// What this node offers the requests it serves.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServeNode {
     /// This node and its realm, when it serves one.
     pub local: Option<(NodeId, RealmId)>,
@@ -39,6 +42,8 @@ pub struct ServeNode {
     pub indexed: bool,
     /// The largest metadata document this node exports.
     pub metadata_bytes: u64,
+    /// This node's view of the realm, given only when [`needs_here`] asks for it.
+    pub here: Option<Here>,
 }
 
 /// A reply and, for an export, the body sent after it.
@@ -60,6 +65,7 @@ enum Waiting {
     Path,
     Mirror,
     Export,
+    Forward(ForwardReply),
     Spec,
     Page,
     Realm(RealmAsk),
@@ -126,6 +132,7 @@ impl Waiting {
                 }),
             },
             Self::Realm(ask) => ask.answer(result)?,
+            Self::Forward(reply) => reply.answer(result)?,
         };
         Ok((reply, None))
     }
@@ -158,7 +165,7 @@ impl ServeRequestOperation {
     }
 
     fn path(&mut self, token: Option<AuthToken>, digest: [u8; 32], ask: PathAsk) -> ServeTurn {
-        let read = PathReadOperation::new((self.peer, self.node), token, digest, ask);
+        let read = PathReadOperation::new((self.peer, self.node.clone()), token, digest, ask);
         self.call(Waiting::Path, IoCall::child(read))
     }
 
@@ -168,7 +175,7 @@ impl ServeRequestOperation {
     }
 
     fn export(&mut self, digest: [u8; 32], ask: ExportAsk) -> ServeTurn {
-        let export = ExportServeOperation::new((self.peer, self.node), digest, ask);
+        let export = ExportServeOperation::new((self.peer, self.node.clone()), digest, ask);
         self.call(Waiting::Export, IoCall::child(export))
     }
 
@@ -195,9 +202,15 @@ impl Operation for ServeRequestOperation {
             got: "none",
         })?;
         if let Some(reply) = ReadReply::of(&message) {
-            let read = CallerReadOperation::new(peer, self.node, message, reply);
+            let read = CallerReadOperation::new(peer, self.node.clone(), message, reply);
             return self.call(Waiting::Read, IoCall::child(read));
         }
+        let local = (self.node.local, self.node.here.as_ref());
+        let message = match forward_call(peer, local, message) {
+            Ok(Forward::Call(call, reply)) => return self.call(Waiting::Forward(reply), call),
+            Ok(Forward::Done(reply)) => return Ok(Next::Done((reply, None))),
+            Err(message) => message,
+        };
         match message {
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
@@ -349,3 +362,5 @@ impl Operation for ServeRequestOperation {
 #[cfg(test)]
 #[path = "serve_tests.rs"]
 mod tests;
+
+pub use self::forwards::needs_here;

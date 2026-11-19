@@ -35,8 +35,9 @@ use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeReco
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
+use aruna_operations::metadata::audit_entry::inbound_admission;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::protocol::MetadataTransportMessage;
+use aruna_operations::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
@@ -182,18 +183,29 @@ async fn serve_metadata_stream(
     let process_started = Instant::now();
     let deadline = request.audit_deadline;
     let audit = request.audit.then_some(deadline);
-    let (response, response_body) =
-        match peer_request(context, metadata, peer, request.message).await {
+    // An audit page is served only within the inbound audit slots.
+    let admission = request.audit.then(inbound_admission);
+    let (response, response_body) = match admission {
+        Some(None) => {
+            let result = Err(MetadataReadError::Unavailable);
+            (
+                MetadataTransportMessage::ForwardedAuditPage { result },
+                None,
+            )
+        }
+        _ => match peer_request(context, metadata, peer, request.message).await {
             Ok(response) => (response, None),
             Err(message) => {
                 metadata
                     .answer_request(context, peer, metadata_bytes, deadline, message)
                     .await
             }
-        };
+        },
+    };
     record_elapsed_ms(&span, "process_ms", process_started);
     MetadataHandle::write_answer(stream, audit, &response, response_body).await?;
     drop(request.budget);
+    drop(admission);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok(())
 }

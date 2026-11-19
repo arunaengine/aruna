@@ -17,6 +17,7 @@ fn local() -> ServeNode {
         graph: true,
         indexed: false,
         metadata_bytes: 1024,
+        here: None,
     }
 }
 
@@ -359,4 +360,53 @@ fn read_only_refused() {
     let guarded: Result<(), BucketGuardError> = Err(BucketGuardError::ReadOnly("target".into()));
     let denied = MetadataTransportMessage::Reject("access_denied".to_string());
     assert_eq!(mirror.next(child(guarded)), Ok(Next::Done(denied)));
+}
+
+#[test]
+fn refused_forward_prefixed() {
+    use super::forwards::ForwardReply;
+    let error = IoError::Unexpected {
+        expected: "a reply",
+        got: "none",
+    };
+    let failed: Result<MetadataTransportMessage, IoError> = Err(error.clone());
+    let reply = ForwardReply::Refused("group create failed: ").answer(child(failed));
+    let expected = format!("group create failed: {error}");
+    assert_eq!(reply, Ok(MetadataTransportMessage::Reject(expected)));
+}
+
+#[test]
+fn late_audit_unavailable() {
+    // An audit page the deadline cut off answers unavailable.
+    use super::forwards::ForwardReply;
+    use aruna_core::events::{GroupEvent, GroupResult};
+    let results = vec![GroupResult::Unfinished];
+    let late = IoResult::Group(GroupEvent::Finished { results });
+    assert_eq!(
+        ForwardReply::Audit.answer(late),
+        Ok(MetadataTransportMessage::ForwardedAuditPage {
+            result: Err(MetadataReadError::Unavailable)
+        })
+    );
+}
+
+#[test]
+fn audit_needs_caller() {
+    use super::forwards::PeerAuditOperation;
+    let request = aruna_core::audit::AuditPageRequest {
+        auth_token: None,
+        config_digest: [0u8; 32],
+        realm_id: RealmId([1u8; 32]),
+        group_id: ulid::Ulid::from_bytes([2u8; 16]),
+        document_id: None,
+        start_after: None,
+        limit: 10,
+    };
+    let mut audit = PeerAuditOperation::new(node(2), (node(1), RealmId([1u8; 32])), request);
+    assert!(runs_child(audit.first()));
+    let anonymous: Result<Option<AuthContext>, MetadataReadError> = Ok(None);
+    assert_eq!(
+        audit.next(child(anonymous)),
+        Err(MetadataReadError::Unauthorized)
+    );
 }

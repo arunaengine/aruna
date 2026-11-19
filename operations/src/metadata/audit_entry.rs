@@ -32,7 +32,7 @@ pub fn outbound_admission() -> Option<OwnedSemaphorePermit> {
 }
 
 /// A permit for serving one peer's audit page, or `None` while this node is saturated.
-pub(crate) fn inbound_admission() -> Option<OwnedSemaphorePermit> {
+pub fn inbound_admission() -> Option<OwnedSemaphorePermit> {
     AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().ok()
 }
 
