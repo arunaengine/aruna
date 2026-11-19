@@ -706,7 +706,7 @@ impl Operation for ListVersionsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::drive;
 
     fn limited_rounds(
         mut operation: ListVersionsOperation,
@@ -744,6 +744,7 @@ mod test {
         ));
     }
 
+    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
@@ -759,19 +760,6 @@ mod test {
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn created_by() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
@@ -884,7 +872,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (older, newer) = (versions[0], versions[1]);
@@ -932,7 +920,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (newer_head, older_larger_ulid) = (versions[0], versions[1]);
@@ -971,7 +959,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (older, newer) = (versions[0], versions[1]);
@@ -1016,7 +1004,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Two keys, "a" with two versions and "b" with one version.
         let a_versions = ordered_ulids(2);
@@ -1078,7 +1066,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
             let version_id = Ulid::generate();
@@ -1118,7 +1106,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
         let source_metadata = SourceMetadata {
@@ -1186,7 +1174,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
             let version_id = Ulid::generate();
@@ -1217,7 +1205,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Three delimiter groups; each head round makes bounded progress so the
         // low scan-round cap trips before the "c/" group is reached.
@@ -1277,7 +1265,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Seed more versions than the scan limit; every storage page must
         // remain available for response pagination.

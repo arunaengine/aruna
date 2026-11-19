@@ -142,7 +142,8 @@ impl Operation for GetAttributesOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::drive;
+    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
@@ -161,19 +162,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     #[test]
     fn answers_from_snapshot() {
@@ -382,7 +370,7 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
         let version_id = Ulid::generate();
@@ -425,7 +413,7 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
         let version_id = Ulid::generate();
@@ -454,7 +442,7 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
         let version_id = Ulid::generate();
@@ -512,7 +500,7 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
         write(

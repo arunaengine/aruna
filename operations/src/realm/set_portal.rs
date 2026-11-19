@@ -337,6 +337,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
+    use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -347,19 +348,6 @@ mod tests {
     };
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn actor(realm_id: RealmId) -> Actor {
         Actor {
@@ -423,7 +411,7 @@ mod tests {
     async fn stores_portal_features() {
         // A later config read must see the map, or portals would keep the old defaults.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor(RealmId::from_bytes([1u8; 32]));
         seed(&ctx, &actor).await;
 
@@ -444,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_invalid_names() {
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor(RealmId::from_bytes([1u8; 32]));
         seed(&ctx, &actor).await;
 

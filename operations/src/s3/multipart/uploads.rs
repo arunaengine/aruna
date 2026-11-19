@@ -239,7 +239,8 @@ impl Operation for ListUploadsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::drive;
+    use crate::testing::test_context;
     use crate::tests::s3::seed_upload;
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
@@ -257,19 +258,6 @@ mod test {
         fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
             self.max_scan_rows = max_scan_rows;
             self
-        }
-    }
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
         }
     }
 
@@ -319,7 +307,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -358,7 +346,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -393,7 +381,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
             seed_upload(
@@ -417,7 +405,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -452,7 +440,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -475,7 +463,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let first = Ulid::generate();
         let second = Ulid::generate();
@@ -520,7 +508,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = {
             let first = Ulid::generate();
@@ -574,7 +562,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a", "b", "c", "d"] {
             seed_upload(
@@ -620,7 +608,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let ids = [
             Ulid::from_bytes([1; 16]),
@@ -687,7 +675,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let lower = Ulid::from_bytes([1; 16]);
         let marker = Ulid::from_bytes([2; 16]);
@@ -729,7 +717,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["docs/1", "docs/2", "images/1", "readme"] {
             seed_upload(
@@ -766,7 +754,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a.txt", "dir/1", "dir/2", "z.txt"] {
             seed_upload(

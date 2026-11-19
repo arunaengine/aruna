@@ -37,24 +37,12 @@ use ulid::Ulid;
 use super::{RebuildStatsError, RebuildStatsOperation};
 use crate::driver::DriverContext;
 use crate::node::rebuild_counts::CounterDeltas;
+use crate::testing::path_context;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);
 const GROUP_B: GroupId = Ulid::from_parts(2, 2);
 /// Delete markers in beta, more than one walk page.
 const MARKERS: usize = 300;
-
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
-}
 
 fn location(blob_size: u64) -> BackendLocation {
     BackendLocation {
@@ -276,7 +264,7 @@ async fn commit_live(
 #[tokio::test]
 async fn walk_matches_totals() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     let plain_stored = fixture(&ctx).await;
 
     let (output, _) = run(RebuildStatsOperation::new(), &ctx, None).await;
@@ -326,7 +314,7 @@ async fn walk_matches_totals() {
 #[tokio::test]
 async fn walk_counts_concurrent() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     bucket(&ctx, "alpha", GROUP_A).await;
     let plain = location(100);
     let hash = [1u8; 32];
@@ -388,7 +376,7 @@ async fn walk_counts_concurrent() {
 #[tokio::test]
 async fn quota_buckets_first() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     let plain_stored = fixture(&ctx).await;
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -555,7 +543,7 @@ fn markers(count: i128) -> BucketDelta {
 async fn resumes_after_restart() {
     let temp = tempdir().unwrap();
     let root = temp.path().to_str().unwrap();
-    let ctx = context(root);
+    let ctx = path_context(root);
     fixture(&ctx).await;
     let (stopped, starts) = interrupt(RebuildStatsOperation::new(), &ctx, 2).await;
     assert!(!stopped.is_complete());
@@ -584,7 +572,7 @@ async fn resumes_after_restart() {
     let DriverContext { storage_handle, .. } = ctx;
     storage_handle.close().await;
 
-    let ctx = context(root);
+    let ctx = path_context(root);
     let object = UsageDelta {
         objects: 1,
         logical_bytes: 100,
