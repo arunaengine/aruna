@@ -18,6 +18,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
+use aruna_operations::metadata::provenance::ForgetSpoolOperation;
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
@@ -538,6 +539,10 @@ async fn fill(
         aruna_operations::notifications::email::RefreshMailOperation::new(config.realm_id);
     if let Err(error) = drive(refresh, &driver_ctx).await {
         warn!(%error, "Mail settings refresh stopped during startup");
+    }
+    // Exports cut off by the last stop left their working rows; no export runs before serving.
+    if let Err(error) = drive(ForgetSpoolOperation::all(), &driver_ctx).await {
+        warn!(%error, "Provenance working rows were not cleared during startup");
     }
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
