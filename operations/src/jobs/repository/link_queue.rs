@@ -2,19 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
+use aruna_core::keyspaces::{LINK_CHANGE_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
-    RepositoryLink,
+    RepositoryLink, link_change_document, schedule_drain,
 };
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
@@ -34,7 +34,7 @@ use super::link_store::{
 };
 use super::links::{
     ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation, id_key,
-    queue_row, schedule_drain,
+    queue_row,
 };
 use super::pull::CheckDueOperation;
 use super::push::{creator_auth, parse_checkpoint, read_checkpoint};
@@ -183,18 +183,28 @@ fn queue_pages() -> PrefixPages {
     PrefixPages::new(LINK_QUEUE_KEYSPACE, ByteView::from(Vec::new()), QUEUE_PAGE)
 }
 
+fn change_pages() -> PrefixPages {
+    PrefixPages::new(LINK_CHANGE_KEYSPACE, ByteView::from(Vec::new()), QUEUE_PAGE)
+}
+
 #[derive(Debug, PartialEq)]
 enum DrainStep {
+    Changes,
+    Queued(Vec<Key>),
+    Written(Vec<Key>),
+    Cleared,
     Page,
     Removed,
     Check(Ulid, Value),
     Settle(u64),
 }
 
-/// Runs every due check and returns the wait until the next one.
+/// Queues the checks of changed documents, runs every due check and returns the wait until the
+/// next one. Changes whose checks cannot be queued stay for the next run.
 #[derive(Debug, PartialEq)]
 pub struct DrainLinksOperation {
     scope: NodeScope,
+    changes: PrefixPages,
     pages: PrefixPages,
     rows: VecDeque<(Key, Value)>,
     next_due: Option<u64>,
@@ -207,13 +217,25 @@ impl DrainLinksOperation {
     pub fn new(scope: NodeScope) -> Self {
         Self {
             scope,
+            changes: change_pages(),
             pages: queue_pages(),
             rows: VecDeque::new(),
             next_due: None,
             started_ms: None,
             now_ms: 0,
-            step: DrainStep::Page,
+            step: DrainStep::Changes,
         }
+    }
+
+    fn queue_page(&mut self) -> Turn<Option<Duration>> {
+        self.step = DrainStep::Page;
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn clear(&mut self, keys: Vec<Key>) -> Turn<Option<Duration>> {
+        self.step = DrainStep::Cleared;
+        let rows = keys.into_iter().map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
+        Ok(Next::Call(IoCall::Delete(rows.collect())))
     }
 
     fn started(&self) -> u64 {
@@ -245,8 +267,7 @@ impl DrainLinksOperation {
             let wait = self.next_due.map(|due| due_after(self.now_ms, due));
             return Ok(Next::Done(wait));
         }
-        self.step = DrainStep::Page;
-        Ok(Next::Call(self.pages.call()))
+        self.queue_page()
     }
 }
 
@@ -260,11 +281,48 @@ impl Operation for DrainLinksOperation {
     }
 
     fn first(&mut self) -> Turn<Option<Duration>> {
-        Ok(Next::Call(self.pages.call()))
+        Ok(Next::Call(self.changes.call()))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
         match std::mem::replace(&mut self.step, DrainStep::Page) {
+            DrainStep::Changes => {
+                let rows = self.changes.take(result)?;
+                let keys: Vec<Key> = rows.into_iter().map(|(key, _)| key).collect();
+                if keys.is_empty() {
+                    return self.queue_page();
+                }
+                let documents: BTreeSet<Ulid> =
+                    keys.iter().filter_map(|key| link_change_document(key)).collect();
+                self.step = DrainStep::Queued(keys);
+                child(IoCall::child(QueueRowsOperation::new(documents)))
+            }
+            DrainStep::Queued(keys) => {
+                let queued = result.child::<Vec<(String, Key, Value)>, LinkError>()?;
+                match queued {
+                    Ok(rows) if rows.is_empty() => self.clear(keys),
+                    Ok(rows) => {
+                        self.step = DrainStep::Written(keys);
+                        Ok(Next::Call(IoCall::Write(rows)))
+                    }
+                    Err(error) => {
+                        warn!(%error, "Failed to queue the link checks of changed documents");
+                        self.queue_page()
+                    }
+                }
+            }
+            DrainStep::Written(keys) => {
+                result.done()?;
+                self.clear(keys)
+            }
+            DrainStep::Cleared => {
+                result.done()?;
+                if self.changes.done() {
+                    return self.queue_page();
+                }
+                self.step = DrainStep::Changes;
+                Ok(Next::Call(self.changes.call()))
+            }
             DrainStep::Page => {
                 self.rows = self.pages.take(result)?.into();
                 self.advance()

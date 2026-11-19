@@ -434,6 +434,8 @@ pub const LINK_SECRET_KEYSPACE: &str = "repository_link_secrets";
 pub const LINK_CONNECTOR_KEYSPACE: &str = "repository_link_connectors";
 /// Durable push checks per link id, drained by `TaskKey::DrainLinkQueue`.
 pub const LINK_QUEUE_KEYSPACE: &str = "repository_link_queue";
+/// Documents whose links need push checks, by change time; the link queue drain consumes them.
+pub const LINK_CHANGE_KEYSPACE: &str = "repository_link_changes";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
@@ -799,6 +801,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     LINK_SECRET_KEYSPACE,
     LINK_CONNECTOR_KEYSPACE,
     LINK_QUEUE_KEYSPACE,
+    LINK_CHANGE_KEYSPACE,
     JOB_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
     JOB_INDEX_KEYSPACE,

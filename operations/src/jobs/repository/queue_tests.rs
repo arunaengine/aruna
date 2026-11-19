@@ -8,7 +8,7 @@ use crate::jobs::repository::test_support::{
 };
 use crate::jobs::store::mutation::{Rows, run_in_memory};
 use aruna_core::events::StorageEvent;
-use aruna_core::repository::{LinkFailure, LinkPush};
+use aruna_core::repository::{LinkFailure, LinkPush, link_change_entry};
 
 fn entry(due_at_ms: u64) -> LinkQueueEntry {
     LinkQueueEntry {
@@ -102,7 +102,39 @@ fn drain() -> DrainLinksOperation {
     let mut operation = DrainLinksOperation::new(local_scope());
     operation.stamp(NOW_MS);
     operation.first().unwrap();
+    operation.next(queue_page(Vec::new())).unwrap();
     operation
+}
+
+// A changed document gets its checks queued, then its change row goes before the queue is read.
+#[test]
+fn drain_queues_changes() {
+    let mut operation = DrainLinksOperation::new(local_scope());
+    assert_eq!(operation.first(), Ok(Next::Call(change_pages().call())));
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    let queue = operation.next(queue_page(vec![(key.clone(), value)]));
+    let documents = QueueRowsOperation::new([link().document_id]);
+    assert_eq!(queue, Ok(Next::Call(IoCall::child(documents))));
+    let row = queue_row(link().link_id, &entry(1)).unwrap();
+    let write = operation.next(child::<_, LinkError>(Ok(vec![row.clone()])));
+    assert_eq!(write, Ok(Next::Call(IoCall::Write(vec![row]))));
+    let change = (LINK_CHANGE_KEYSPACE.to_string(), key);
+    let clear = operation.next(IoResult::Done);
+    assert_eq!(clear, Ok(Next::Call(IoCall::Delete(vec![change]))));
+    let page = operation.next(IoResult::Done);
+    assert_eq!(page, Ok(Next::Call(queue_pages().call())));
+}
+
+// Changes whose checks cannot be queued stay, and the due checks still run.
+#[test]
+fn failed_changes_stay() {
+    let mut operation = DrainLinksOperation::new(local_scope());
+    operation.first().unwrap();
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    operation.next(queue_page(vec![(key, value)])).unwrap();
+    let failed = child::<Vec<(String, Key, Value)>, _>(Err(LinkError::NoRevision));
+    let page = operation.next(failed);
+    assert_eq!(page, Ok(Next::Call(queue_pages().call())));
 }
 
 #[test]
