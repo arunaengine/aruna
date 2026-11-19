@@ -176,8 +176,8 @@ pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
     /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
     fn stamp(&mut self, _now_ms: u64) {}
 
-    /// The runner's random value for this run, given once before `start`. An operation that
-    /// mints ids keeps it in an [`crate::id_mint::IdMint`] instead of reading a random source.
+    /// The runner's entropy for this run, given once before `start`. It carries a run slot that
+    /// no other run of the process shares; keep it in an [`crate::id_mint::IdMint`] to mint ids.
     fn seed(&mut self, _entropy: u128) {}
 
     /// The backend scope this operation holds from before its first effect until it ends, so
