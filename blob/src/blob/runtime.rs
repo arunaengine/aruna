@@ -19,7 +19,7 @@ use aruna_core::native_reference::is_native;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::storage::blob::BackendConfig;
-use aruna_core::structs::storage::encryption::{generate_key, seal_copies};
+use aruna_core::structs::storage::encryption::{BucketKeyError, generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
@@ -905,7 +905,10 @@ impl BlobHandler {
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
             }
-            BlobEffect::GenerateBucketKey => match generate_key() {
+            BlobEffect::GenerateBucketKey => match (super::abe::fresh_rng())
+                .ok_or(BucketKeyError::Seal)
+                .and_then(|mut rng| generate_key(&mut rng))
+            {
                 Ok((public_key, private_key)) => BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
@@ -922,14 +925,18 @@ impl BlobHandler {
             } => {
                 let now_ms = aruna_clock::unix_timestamp_millis();
                 let origin = (realm_id, node_id);
-                let sealed = seal_copies(
-                    key,
-                    &public_key,
-                    private_key.bytes(),
-                    origin,
-                    &holders,
-                    now_ms,
-                );
+                let sealed =
+                    (super::abe::fresh_rng().ok_or(BucketKeyError::Seal)).and_then(|mut rng| {
+                        seal_copies(
+                            key,
+                            &public_key,
+                            private_key.bytes(),
+                            origin,
+                            &holders,
+                            now_ms,
+                            &mut rng,
+                        )
+                    });
                 match sealed {
                     Ok(copies) => BlobEvent::CopiesSealed { copies },
                     Err(error) => BlobEvent::Error(error.into()),

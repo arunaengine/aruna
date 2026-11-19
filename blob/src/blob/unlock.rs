@@ -658,7 +658,16 @@ impl super::BlobHandler {
         };
         let now_ms = aruna_clock::unix_timestamp_millis();
         let sealed = unlocked.and_then(|(secret, public_key)| {
-            seal_copies(key, &public_key, secret.bytes(), origin, holders, now_ms)
+            let mut rng = super::abe::fresh_rng().ok_or(BucketKeyError::Seal)?;
+            seal_copies(
+                key,
+                &public_key,
+                secret.bytes(),
+                origin,
+                holders,
+                now_ms,
+                &mut rng,
+            )
         });
         match sealed {
             Ok(copies) => BlobEvent::CopiesSealed { copies },

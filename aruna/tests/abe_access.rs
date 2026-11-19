@@ -225,7 +225,7 @@ async fn abe_read() -> TestResult<()> {
         let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SysRng)?;
         let aad = context.bytes()?;
         assert_eq!(aad,bytes(&proposal["aad"]));
-        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain).map_err(|_|aruna_kpabe::Error))?;
+        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_|aruna_kpabe::Error))?;
         let grant_route = format!("{request_route}/{request_id}/grant");
         let mut forged = context.clone(); forged.request.epochs = vec![2];
         let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -564,7 +564,14 @@ async fn abe_restart_child() -> TestResult<()> {
     let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
     let aad = context.bytes()?;
     let sealed = key.seal(|plain| {
-        seal_to(&user_public, GRANT_PURPOSE, &aad, plain).map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &user_public,
+            GRANT_PURPOSE,
+            &aad,
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     let grant_route = format!("{request_route}/{}/grant", context.request.request_id);
     let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -810,7 +817,7 @@ async fn abe_holders() -> TestResult<()> {
         let issued = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
         let seal = |record: &Value| -> TestResult<Value> {
             let context: GrantContext = postcard::from_bytes(&bytes(record))?;
-            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain).map_err(|_| aruna_kpabe::Error))?;
+            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_| aruna_kpabe::Error))?;
             Ok(submission(record, sealed.enc, &sealed.ciphertext))
         };
         let grant_route = format!("{requests}/{request_id}/grant");
@@ -1891,8 +1898,14 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
     let recipient = r.recipient_public.unwrap();
     let sealed = key.seal(|plain| {
-        seal_to(&recipient, GRANT_PURPOSE, &context.bytes().unwrap(), plain)
-            .map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &recipient,
+            GRANT_PURPOSE,
+            &context.bytes().unwrap(),
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     Ok(KeyGrant {
         context,

@@ -1297,13 +1297,16 @@ fn fence_values(
     let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
     let key = sealed_plan().key;
     let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
-    let (envelope, _) = create_envelope(EnvelopePlan {
-        parameters: parameters.clone(),
-        epoch: 1,
-        write_id: Ulid::from_parts(6, 6),
-        object_key: input.key.clone(),
-        bucket_public: [3; 32],
-    })
+    let (envelope, _) = create_envelope(
+        EnvelopePlan {
+            parameters: parameters.clone(),
+            epoch: 1,
+            write_id: Ulid::from_parts(6, 6),
+            object_key: input.key.clone(),
+            bucket_public: [3; 32],
+        },
+        &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+    )
     .unwrap();
     let row = pending.then(|| envelope.to_bytes().unwrap().into());
     let values = vec![

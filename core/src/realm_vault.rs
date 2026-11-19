@@ -4,7 +4,7 @@
 
 use crate::UserId;
 use crate::compute::SecretBytes;
-use crate::key_seal::{SealedSecret, open_sealed, seal_to};
+use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::secret_registers::SecretOwner;
 use crate::secrets::SecretName;
 use crate::structs::execution::setting::SettingChannel;
@@ -326,7 +326,12 @@ fn seal_bound(
         .map_err(|_| RealmVaultError::Seal)?
         .to_montgomery()
         .to_bytes();
-    let sealed = seal_to(&public, info, aad, secret.expose()).map_err(|_| RealmVaultError::Seal)?;
+    // The ephemeral key of a realm seal comes from a fresh operating-system seed.
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|_| RealmVaultError::Seal)?;
+    let mut rng = SeedRng::new(&seed);
+    let sealed = (seal_to(&public, info, aad, secret.expose(), &mut rng))
+        .map_err(|_| RealmVaultError::Seal)?;
     Ok([sealed.enc.as_slice(), &sealed.ciphertext].concat())
 }
 

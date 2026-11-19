@@ -3644,7 +3644,11 @@ fn abe_target_negotiates() {
     assert_eq!(envelope_plan.epoch, 2);
     assert_eq!(envelope_plan.bucket_public, plan.public_key);
     assert_eq!(envelope_plan.object_key, op.manifest.key);
-    let (envelope, _) = create_envelope(envelope_plan.clone()).unwrap();
+    let (envelope, _) = create_envelope(
+        envelope_plan.clone(),
+        &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+    )
+    .unwrap();
     let object = envelope.context.public_key;
     let event = Box::new(AbeEvent::Envelope(envelope));
     let effects = op.next(blob(BlobEvent::Abe(event)));
@@ -3822,7 +3826,9 @@ fn target_envelope(epoch: u64) -> ObjectEnvelope {
         object_key: make_manifest(ReplicationItemKind::Materialized).key,
         bucket_public: plan.public_key,
     };
-    create_envelope(plan).unwrap().0
+    create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32]))
+        .unwrap()
+        .0
 }
 
 #[test]
