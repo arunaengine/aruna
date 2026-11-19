@@ -13,10 +13,6 @@ use aruna_storage::StorageHandle;
 use byteview::ByteView;
 
 use super::AuthValidationState;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
 
@@ -141,18 +137,4 @@ async fn ensure_peer_configured(
             other.label()
         ))),
     }
-}
-
-pub(super) async fn config_digest_matches(
-    context: &DriverContext,
-    realm_id: RealmId,
-    expected: &[u8; 32],
-) -> bool {
-    drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .and_then(|config| config.digest().ok())
-        .as_ref()
-        == Some(expected)
 }

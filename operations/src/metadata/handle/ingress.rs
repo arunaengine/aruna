@@ -16,7 +16,7 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tracing::Span;
 
-use super::peer_auth::{authorize_peer, config_digest_matches};
+use super::peer_auth::authorize_peer;
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, read_budget,
     write_body_at, write_message_at, write_stream_body, write_transport_message,
@@ -357,218 +357,6 @@ impl MetadataHandle {
         }
     }
 
-    async fn path_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        match message {
-            query @ MetadataTransportMessage::QueryDocument { .. } => {
-                Box::pin(async {
-                    let result =
-                        super::forward_serve::apply_document_query(context, peer, query).await;
-                    MetadataTransportMessage::DocumentQueryResults { result }
-                })
-                .await
-            }
-            MetadataTransportMessage::ForwardPathLookup {
-                auth_token,
-                group_id,
-                document_path,
-                config_digest,
-            } => {
-                Box::pin(async {
-                    let result = match self.read_caller(context, peer, auth_token, true).await {
-                        Ok(auth) => match context.net_handle.as_ref() {
-                            Some(net) => {
-                                let realm_id = *net.realm_id();
-                                if !config_digest_matches(
-                                    context.as_ref(),
-                                    realm_id,
-                                    &config_digest,
-                                )
-                                .await
-                                {
-                                    Err(MetadataReadError::Unavailable)
-                                } else {
-                                    let local = super::super::api::path::LocalPathOperation::new(
-                                        realm_id,
-                                        (group_id, &document_path),
-                                        auth,
-                                        Some(net.node_id()),
-                                    );
-                                    let result = crate::driver::drive(local, context.as_ref())
-                                        .await
-                                        .map_err(crate::forward::transport::read_error);
-                                    if !config_digest_matches(
-                                        context.as_ref(),
-                                        realm_id,
-                                        &config_digest,
-                                    )
-                                    .await
-                                    {
-                                        Err(MetadataReadError::Unavailable)
-                                    } else {
-                                        result
-                                    }
-                                }
-                            }
-                            None => Err(MetadataReadError::Unavailable),
-                        },
-                        Err(error) => Err(error),
-                    };
-                    MetadataTransportMessage::ForwardedPathLookup { result }
-                })
-                .await
-            }
-            MetadataTransportMessage::ForwardPathResolution {
-                auth_token,
-                group_id,
-                document_path,
-                config_digest,
-            } => {
-                Box::pin(async {
-                    let result =
-                        match self.read_caller(context, peer, auth_token, false).await {
-                            Ok(auth) => match context.net_handle.as_ref() {
-                                Some(net) => {
-                                    let realm_id = *net.realm_id();
-                                    if !config_digest_matches(
-                                        context.as_ref(),
-                                        realm_id,
-                                        &config_digest,
-                                    )
-                                    .await
-                                    {
-                                        Err(MetadataReadError::Unavailable)
-                                    } else {
-                                        let request =
-                                            super::super::api::path_types::MetadataLookupRequest {
-                                                group_id,
-                                                document_path,
-                                                auth,
-                                            };
-                                        let lookup =
-                                            super::super::api::path::LookupPathOperation::local(
-                                                realm_id,
-                                                request,
-                                                Some(net.node_id()),
-                                            );
-                                        let result = crate::driver::drive(lookup, context.as_ref())
-                                        .await
-                                    .map(|result| {
-                                        Box::new(super::super::protocol::MetadataPathResolution {
-                                            winner: result.winner,
-                                            conflicts: result.conflicts,
-                                        })
-                                    })
-                                    .map_err(crate::forward::transport::read_error);
-                                        if !config_digest_matches(
-                                            context.as_ref(),
-                                            realm_id,
-                                            &config_digest,
-                                        )
-                                        .await
-                                        {
-                                            Err(MetadataReadError::Unavailable)
-                                        } else {
-                                            result
-                                        }
-                                    }
-                                }
-                                None => Err(MetadataReadError::Unavailable),
-                            },
-                            Err(error) => Err(error),
-                        };
-                    MetadataTransportMessage::ForwardedPathResolution { result }
-                })
-                .await
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        }
-    }
-
-    async fn export_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        metadata_bytes: u64,
-        message: MetadataTransportMessage,
-    ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
-        let mut response_body = None;
-        let response = match message {
-            forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
-                Box::pin(async {
-                    match super::forward_serve::apply_forwarded_export(
-                        context,
-                        peer,
-                        forward,
-                        metadata_bytes,
-                    )
-                    .await
-                    {
-                        Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
-                            Ok(bytes) => {
-                                let length = bytes.len() as u64;
-                                if length > metadata_body_limit(metadata_bytes) {
-                                    MetadataTransportMessage::ForwardedExport {
-                                        result: Err(MetadataReadError::Unavailable),
-                                    }
-                                } else {
-                                    response_body = Some(bytes);
-                                    MetadataTransportMessage::ForwardedExport { result: Ok(length) }
-                                }
-                            }
-                            Err(_) => MetadataTransportMessage::ForwardedExport {
-                                result: Err(MetadataReadError::Unavailable),
-                            },
-                        },
-                        Err(error) => {
-                            MetadataTransportMessage::ForwardedExport { result: Err(error) }
-                        }
-                    }
-                })
-                .await
-            }
-            forward @ MetadataTransportMessage::ForwardExportProfile { .. } => {
-                Box::pin(async {
-                    match super::forward_serve::apply_forwarded_profile(
-                        context,
-                        peer,
-                        forward,
-                        metadata_bytes,
-                    )
-                    .await
-                    {
-                        Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
-                            Ok(bytes) => {
-                                let length = bytes.len() as u64;
-                                if length > metadata_body_limit(metadata_bytes) {
-                                    MetadataTransportMessage::ForwardedExport {
-                                        result: Err(MetadataReadError::Unavailable),
-                                    }
-                                } else {
-                                    response_body = Some(bytes);
-                                    MetadataTransportMessage::ForwardedExport { result: Ok(length) }
-                                }
-                            }
-                            Err(_) => MetadataTransportMessage::ForwardedExport {
-                                result: Err(MetadataReadError::Unavailable),
-                            },
-                        },
-                        Err(error) => {
-                            MetadataTransportMessage::ForwardedExport { result: Err(error) }
-                        }
-                    }
-                })
-                .await
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        };
-        (response, response_body)
-    }
-
     /// This node's audit page for a peer, under its forwarded caller and the merge deadline.
     async fn serve_audit(
         &self,
@@ -864,6 +652,7 @@ impl MetadataHandle {
             local: context.node_and_realm(),
             graph: context.graph_handle.is_some(),
             indexed: context.storage_handle.range_indexes().is_some(),
+            metadata_bytes,
         };
         let serve = ServeRequestOperation::new(peer, serving, message);
         let message = match drive(serve, context.as_ref()).await {
@@ -875,16 +664,6 @@ impl MetadataHandle {
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
-            }
-            message @ (MetadataTransportMessage::QueryDocument { .. }
-            | MetadataTransportMessage::ForwardPathLookup { .. }
-            | MetadataTransportMessage::ForwardPathResolution { .. }) => {
-                (self.path_request(context, peer, message).await, None)
-            }
-            message @ (MetadataTransportMessage::ForwardExportDocument { .. }
-            | MetadataTransportMessage::ForwardExportProfile { .. }) => {
-                self.export_request(context, peer, metadata_bytes, message)
-                    .await
             }
             message @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }

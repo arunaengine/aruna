@@ -21,8 +21,6 @@ use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
-use crate::metadata::api::export_types::ExportMetadataRequest;
-use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::CreateDocumentConfig;
@@ -31,12 +29,7 @@ use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::DeleteDocumentError;
 use crate::metadata::delete_document::DeleteDocumentOperation;
-use crate::metadata::forward::profile_export::ProfileLocalOperation;
-use crate::metadata::forward::read::admits_profile_peer;
-use crate::metadata::forward::routed::export::ExportWithinOperation;
-use crate::metadata::forward::routed::export::ensure_export_limit;
 use crate::metadata::live_records::LiveRecordOperation;
-use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::metadata::profile::validation::RevalidateOperation;
 use crate::metadata::profile::validation::ValidationStatusOperation;
@@ -49,8 +42,8 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::NodeId;
+use aruna_core::metadata::MetadataEffect;
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::{MetadataEffect, MetadataQueryResults};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
@@ -439,151 +432,4 @@ async fn forwarded_create_replay(
         .await
         .map_err(|error| format!("metadata create replay read failed: {error}"))?;
     rows.map(|rows| replay_answer(config, rows)).transpose()
-}
-
-/// Answers a peer's Profile fetch. Every gate fails closed and none of them
-/// reads a caller identity, because the channel never carries one.
-pub(crate) async fn apply_forwarded_profile(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-    local_limit: u64,
-) -> Result<(ExportMetadataResult, u64), MetadataReadError> {
-    let MetadataTransportMessage::ForwardExportProfile {
-        config_digest,
-        profile_id,
-        expected_revision,
-    } = message
-    else {
-        return Err(MetadataReadError::Unavailable);
-    };
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(MetadataReadError::Unavailable)?;
-    if config.digest().ok() != Some(config_digest) {
-        return Err(MetadataReadError::Unavailable);
-    }
-    if !admits_profile_peer(&config, peer, realm_id) {
-        return Err(MetadataReadError::Forbidden);
-    }
-    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), profile_id) {
-        return Err(MetadataReadError::Unavailable);
-    }
-    let local = ProfileLocalOperation::new(realm_id, profile_id, expected_revision);
-    let export = drive(local, context.as_ref()).await?;
-    ensure_export_limit(&export, local_limit).map_err(read_error)?;
-    Ok((export, local_limit))
-}
-
-pub(crate) async fn apply_forwarded_export(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-    local_limit: u64,
-) -> Result<(ExportMetadataResult, u64), MetadataReadError> {
-    let MetadataTransportMessage::ForwardExportDocument {
-        auth_token,
-        config_digest,
-        document_id,
-        view,
-        metadata_bytes,
-        limit,
-        offset,
-        after,
-    } = message
-    else {
-        return Err(MetadataReadError::Unavailable);
-    };
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(MetadataReadError::Unavailable)?;
-    if config.digest().ok() != Some(config_digest) {
-        return Err(MetadataReadError::Unavailable);
-    }
-    context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let check = ReadPeerOperation::new((peer, realm_id), auth_token, false);
-    let auth = drive(check, context.as_ref()).await?;
-    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
-        return Err(MetadataReadError::Unavailable);
-    }
-    let metadata_bytes = metadata_bytes.min(local_limit);
-    let request = ExportMetadataRequest {
-        document_id,
-        auth,
-        view,
-        limit,
-        offset,
-        after,
-    };
-    let export = ExportWithinOperation::new(realm_id, request, metadata_bytes);
-    let export = drive(export, context.as_ref()).await.map_err(read_error)?;
-    Ok((export, metadata_bytes))
-}
-
-pub(crate) async fn apply_document_query(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> Result<MetadataQueryResults, MetadataReadError> {
-    let MetadataTransportMessage::QueryDocument {
-        auth_token,
-        config_digest,
-        document_id,
-        sparql,
-    } = message
-    else {
-        return Err(MetadataReadError::Unavailable);
-    };
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(MetadataReadError::Unavailable)?;
-    if config.digest().ok() != Some(config_digest)
-        || !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id)
-    {
-        return Err(MetadataReadError::Unavailable);
-    }
-    context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let check = ReadPeerOperation::new((peer, realm_id), auth_token, false);
-    let auth = drive(check, context.as_ref()).await?;
-    let record = drive(
-        VisibleRecordOperation::new(
-            realm_id,
-            GetVisibleRequest {
-                document_id,
-                auth: auth.clone(),
-            },
-        ),
-        context.as_ref(),
-    )
-    .await
-    .map_err(read_error)?;
-    let query = LocalQueryOperation::new((realm_id, auth), Some(vec![record.graph_iri]), sparql);
-    (drive(query, context.as_ref()).await).map_err(|_| MetadataReadError::Unavailable)
 }
