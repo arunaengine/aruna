@@ -86,7 +86,7 @@ impl JobHost for ContextHost {
 
 /// Drives a job's operation with the job's host answering its effects. A failure of the run
 /// itself is retryable, since the job's checkpoint stays.
-pub(crate) async fn run_hosted<O, K>(ctx: &JobContext, operation: O) -> JobRunOutcome
+pub async fn run_hosted<O, K>(ctx: &JobContext, operation: O) -> JobRunOutcome
 where
     O: Runnable<K, Output = JobRunOutcome>,
     O::Error: Display,

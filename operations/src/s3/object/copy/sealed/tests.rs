@@ -412,8 +412,9 @@ async fn governed_copy_registered() {
     // the source refs, and registered on this node.
     use crate::driver::drive;
     use crate::placement::policy::GateOperation;
-    use crate::s3::object::copy::test::{admits, full_context, seed_bucket};
+    use crate::s3::object::copy::test::{admits, seed_bucket};
     use crate::tests::policy::{seed_gate, subject};
+    use crate::tests::s3::full_context;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::ManagedCopyKey;

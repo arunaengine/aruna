@@ -456,38 +456,9 @@ pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
     use super::*;
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+    use crate::tests::staging::test_spec;
     use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
     use aruna_core::structs::execution::staging::StagingStrategy;
-
-    pub(super) fn test_spec() -> StagingJobSpec {
-        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
-        StagingJobSpec {
-            auth_context: aruna_core::structs::identity::auth::AuthContext {
-                user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            group_id: Ulid::from_bytes([3; 16]),
-            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
-            connector_id: Ulid::from_bytes([5; 16]),
-            bucket: "bucket".to_string(),
-            bucket_identity: (
-                Ulid::nil(),
-                std::time::SystemTime::UNIX_EPOCH,
-                Default::default(),
-            ),
-            strategy: StagingStrategy::Reference,
-            items: Vec::new(),
-            prefixes: vec![aruna_core::structs::execution::job::StagingJobPrefix {
-                source_prefix: "refseq".to_string(),
-                target_prefix: String::new(),
-            }],
-            checksum_manifest: None,
-            table: None,
-            mirrors: Vec::new(),
-        }
-    }
 
     /// A run of the test spec.
     pub(super) fn test_run() -> StagingRun {

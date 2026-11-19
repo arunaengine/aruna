@@ -14,9 +14,10 @@ autotests = false
 
 [features]
 # Test seams and shared test helpers; only dev-dependencies enable it.
-test-hooks = ["dep:tempfile"]
+test-hooks = ["dep:tempfile", "dep:axum"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
