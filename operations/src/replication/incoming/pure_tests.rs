@@ -3565,6 +3565,7 @@ fn reading_abe() -> IncomingVersionOperation {
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     );
+    op.seed(7);
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some(op.target_authorization_path(group_id));
     op.first().unwrap();

@@ -848,7 +848,7 @@ mod tests {
             assert_eq!(opened.as_slice(), private.bytes().expose());
         }
         // A key that does not match the generation's public key is never sealed.
-        let (other, _) = generate_key(&mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
+        let (other, _) = generate_key(&mut crate::key_seal::SeedRng::new(&[8; 32])).unwrap();
         let wrong = seal_copies(
             key,
             &other,
