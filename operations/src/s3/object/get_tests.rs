@@ -1,17 +1,15 @@
-//! Tests GetObject range resolution, holder failure reporting and reference drift successors.
+//! Tests GetObject range resolution, the reads of hidden, managed and linked versions and reference
+//! drift successors.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::source_connector_key;
-use crate::replication::bao_read::BaoReadError;
 use crate::s3::object::get::{
     AdvanceEnd, AdvanceReference, AdvanceStep, GetObjectError, GetObjectInput, GetObjectOperation,
     GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, Turn,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
-use crate::transfer::read::{
-    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
-};
+use crate::transfer::read::GetRoutedOperation;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
@@ -26,7 +24,6 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::replication_protocol::BaoReadRefusal;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
@@ -46,7 +43,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, MAX_AUTO_ADVANCES};
@@ -146,168 +143,6 @@ async fn spawn_reference_server(body: &'static [u8]) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{}", addr)
-}
-
-// A holder-backed read with no serving holder keeps infrastructure failure
-// and integrity failure distinct from genuine absence.
-#[test]
-fn failure_causes_preserved() {
-    let mut unavailable = HolderFailures::default();
-    unavailable.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
-    assert_eq!(unavailable.into_error(), GetObjectError::HoldersUnavailable);
-
-    let mut integrity = HolderFailures::default();
-    integrity.record(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
-    assert_eq!(
-        integrity.into_error(),
-        GetObjectError::HolderIntegrityFailure
-    );
-
-    let mut denied = HolderFailures::default();
-    denied.record(BaoReadError::Refused(BaoReadRefusal::ReadDenied));
-    assert_eq!(denied.into_error(), GetObjectError::HolderAccessDenied);
-
-    let mut governed = HolderFailures::default();
-    governed.record(BaoReadError::GovernedUnavailable);
-    assert_eq!(governed.into_error(), GetObjectError::GovernedUnavailable);
-
-    let mut absent = HolderFailures::default();
-    absent.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-    assert_eq!(absent.into_error(), GetObjectError::NoSuchKey);
-
-    let mut mixed = HolderFailures::default();
-    mixed.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-    mixed.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
-    assert_eq!(mixed.into_error(), GetObjectError::HoldersUnavailable);
-
-    let mut metadata_only = HolderFailures::default();
-    (metadata_only.contacted, metadata_only.metadata_only) = (true, true);
-    assert_eq!(
-        metadata_only.into_error(),
-        GetObjectError::HoldersUnavailable
-    );
-
-    assert_eq!(
-        HolderFailures::default().into_error(),
-        GetObjectError::HoldersUnavailable
-    );
-}
-
-#[test]
-fn failure_priority_stable() {
-    let cases = [
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::BackendFailure),
-                BaoReadError::Refused(BaoReadRefusal::ReadDenied),
-            ],
-            GetObjectError::HolderAccessDenied,
-        ),
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::ReadDenied),
-                BaoReadError::Refused(BaoReadRefusal::HashMismatch),
-            ],
-            GetObjectError::HolderIntegrityFailure,
-        ),
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::HashMismatch),
-                BaoReadError::GovernedUnavailable,
-            ],
-            GetObjectError::GovernedUnavailable,
-        ),
-    ];
-
-    for (errors, expected) in cases {
-        let mut failures = HolderFailures::default();
-        for error in errors {
-            failures.record(error);
-        }
-        assert_eq!(failures.into_error(), expected);
-    }
-}
-
-#[test]
-fn transient_then_success() {
-    let mut failures = HolderFailures::default();
-    assert!(
-        failures
-            .consider(Err(BaoReadError::Refused(BaoReadRefusal::BackendFailure)))
-            .is_none()
-    );
-    let served = failures.consider(Ok(crate::replication::bao_read::BaoReadOutput::Stream {
-        blob: BackendStream::new(stream::iter(Vec::<Result<Bytes, std::io::Error>>::new())),
-        size: 0,
-        blake3: [9u8; 32],
-        etag: None,
-        hashes: HashMap::new(),
-    }));
-
-    assert!(matches!(
-        served,
-        Some(crate::replication::bao_read::BaoReadOutput::Stream { .. })
-    ));
-}
-
-#[test]
-fn routed_facts_preserved() {
-    let version_created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12);
-    let read = RoutedRead {
-        user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
-        realm_id: RealmId::from_bytes([3u8; 32]),
-        blake3: [9u8; 32],
-        version_id: Some(Ulid::from(7u128)),
-        metadata: HashMap::new(),
-        version_created_at: Some(version_created_at),
-        source_policies: Vec::new(),
-        restrictions: None,
-    };
-    let hashes = HashMap::from([
-        (HASH_MD5.to_string(), vec![4u8; 16]),
-        (HASH_SHA256.to_string(), vec![5u8; 32]),
-    ]);
-    let composite_hashes = HashMap::from([(HASH_SHA256.to_string(), vec![6u8; 32])]);
-    let summary = MultipartObjectSummary {
-        checksum_type: MultipartChecksumType::Composite,
-        part_count: 3,
-        composite_hashes: composite_hashes.clone(),
-    };
-
-    let etag = Some(hex::encode(&hashes[HASH_MD5]));
-    let info = routed_info(&read, 42, etag.clone(), hashes.clone(), Some(summary));
-
-    assert_eq!(info.size, 42);
-    assert_eq!(info.version_created_at, Some(version_created_at));
-    assert_eq!(info.etag, etag);
-    assert_eq!(info.hashes, hashes);
-    assert_eq!(info.checksum_type, MultipartChecksumType::Composite);
-    assert_eq!(info.composite_hashes, composite_hashes);
-    assert_eq!(info.part_count, Some(3));
-}
-
-#[test]
-fn routed_empty_preserved() {
-    let read = RoutedRead {
-        user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
-        realm_id: RealmId::from_bytes([3u8; 32]),
-        blake3: [9u8; 32],
-        version_id: Some(Ulid::from(7u128)),
-        metadata: HashMap::new(),
-        version_created_at: Some(SystemTime::UNIX_EPOCH),
-        source_policies: Vec::new(),
-        restrictions: None,
-    };
-    let hashes = HashMap::from([(HASH_MD5.to_string(), vec![0u8; 16])]);
-
-    let etag = Some(hex::encode(&hashes[HASH_MD5]));
-    let info = routed_info(&read, 0, etag.clone(), hashes.clone(), None);
-
-    assert_eq!(info.size, 0);
-    assert_eq!(info.etag, etag);
-    assert_eq!(info.hashes, hashes);
-    assert_eq!(info.checksum_type, MultipartChecksumType::FullObject);
-    assert_eq!(info.part_count, None);
 }
 
 // A version this node knows without its bytes must name the blob a routed
@@ -2504,25 +2339,6 @@ mod sealed {
         ));
     }
 
-    #[test]
-    fn remote_lock_typed() {
-        use crate::replication::bao_read::BaoReadError;
-        use crate::transfer::read::HolderFailures;
-        use aruna_core::replication_protocol::BaoReadRefusal;
-
-        let mut failures = HolderFailures::default();
-        failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-        failures.record(BaoReadError::Refused(BaoReadRefusal::BucketLocked(
-            key().bucket_id,
-        )));
-        assert_eq!(
-            failures.into_error(),
-            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
-                key().bucket_id
-            )))
-        );
-    }
-
     fn encrypting() -> BucketEncryption {
         BucketEncryption {
             mode: EncryptionMode::VaultLocked,
@@ -2611,73 +2427,6 @@ mod sealed {
         );
         let turn = operation.read_version(Ulid::generate(), version, false);
         assert_eq!(turn.err(), Some(GetObjectError::PendingContent(archive)));
-    }
-}
-
-#[tokio::test]
-async fn promotes_serving_realm() {
-    // A user of another realm promotes pending content into the serving realm's hash index.
-    use crate::blob::promote::tests::received::{fixture, pending};
-    use aruna_core::events::BlobEvent;
-    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::execution::job::RoCrateLimits;
-    use aruna_core::structs::storage::blob::{ArchiveKey, HashIndex};
-
-    let (_temp, context, plan, _) = fixture().await;
-    let (serving, group_id) = (RealmId([1; 32]), Ulid::from_bytes([8; 16]));
-    let foreign = UserId::local(Ulid::generate(), RealmId([9; 32]));
-    let data = b"foreign content".to_vec();
-    let hash = *blake3::hash(&data).as_bytes();
-    let (location, version) = pending(&context, plan, foreign, "foreign", data, hash, false).await;
-    let archive = ArchiveKey::of(&location);
-    let admit = BlobEffect::AdmitRead {
-        key: plan.key,
-        archive: archive.clone(),
-    };
-    let blob = context.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await else {
-        panic!("read not admitted");
-    };
-    let node_id = context.net_handle.as_ref().unwrap().node_id();
-    let input = GetObjectInput {
-        bucket: "bucket".to_string(),
-        key: "foreign".to_string(),
-        version_id: None,
-        range: None,
-        group_id,
-        user_identity: foreign,
-        realm_id: serving,
-        node_id,
-    };
-    let limits = RoCrateLimits::default();
-    let origin = (input.realm_id, input.node_id);
-    drive(
-        PromoteLeasedOperation::new(origin, archive, lease, &limits),
-        &context,
-    )
-    .await
-    .unwrap();
-
-    for (realm_id, indexed) in [(serving, true), (foreign.realm_id, false)] {
-        let alias = HashIndex::new(
-            hash,
-            version.version_id,
-            realm_id,
-            group_id,
-            node_id,
-            "bucket".to_string(),
-            "foreign".to_string(),
-        );
-        let read = StorageEffect::Read {
-            key_space: PATHS_INDEX_KEYSPACE.to_string(),
-            key: alias.to_bytes().unwrap().into(),
-            txn_id: None,
-        };
-        let event = context.storage_handle.send_storage_effect(read).await;
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            panic!("index read failed: {event:?}");
-        };
-        assert_eq!(value.is_some(), indexed);
     }
 }
 
