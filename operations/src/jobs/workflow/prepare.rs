@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer, ComputeEffect, WorkspaceAddress};
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,
@@ -15,7 +16,11 @@ use aruna_core::compute::{
 };
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, WorkspaceMode};
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::structs::execution::job::{
+    ExecutionSpec, JobError, JobFamilyId, JobRecord, PLUGIN_REPORT_TAG, WorkspaceMode,
+};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 use super::DEFAULT_WALLTIME;
 use super::compute::{compute_answer, compute_call};
@@ -24,7 +29,13 @@ use super::credential::{
 };
 use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, view_entries};
 use super::inputs::LoadInputsOperation;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::alias::AliasFamilyOperation;
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::ids::session_of;
+use crate::jobs::route::JobRouteError;
+use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask, tagged};
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
@@ -58,6 +69,10 @@ fn insert_mount_secrets(
 #[derive(Debug, PartialEq)]
 enum PrepareStep {
     Access,
+    TaskConfig,
+    TaskReservation(Box<RealmConfigDocument>),
+    TaskFamily(Box<RealmConfigDocument>),
+    TaskAdmit,
     Facts,
     Endpoint,
     Inputs,
@@ -134,6 +149,42 @@ impl PrepareAttemptOperation {
             && endpoint
             && self.facts.as_ref().is_some_and(|facts| facts.session);
         session_of(&self.spec).is_some() || workspace
+    }
+
+    /// A plugin task checks its install, account, grants and work row again at every attempt
+    /// start: a lost authority fails the job, anything not decidable now retries it.
+    fn start(&mut self) -> PrepareNext {
+        if tagged(&self.spec).is_none() {
+            return self.read_facts();
+        }
+        let read = GetConfigOperation::new(self.run.realm_id);
+        self.call(PrepareStep::TaskConfig, IoCall::child(read))
+    }
+
+    /// The reservation names the family's job, whose family the receiver must have adopted.
+    fn task_family(
+        &mut self,
+        config: RealmConfigDocument,
+        held: Vec<JobReservationRecord>,
+    ) -> PrepareNext {
+        let Some(reserved) = held.into_iter().next() else {
+            return Err(JobError::permanent(
+                "a plugin task runs only with its reservation",
+            ));
+        };
+        let alias = AliasFamilyOperation::new(reserved.logical_job_id);
+        self.call(
+            PrepareStep::TaskFamily(Box::new(config)),
+            IoCall::child(alias),
+        )
+    }
+
+    fn task_admit(&mut self, config: RealmConfigDocument, family: JobFamilyId) -> PrepareNext {
+        let node = self.run.node_id;
+        let task = (self.spec.as_ref(), self.record.created_by, node);
+        let screen = ScreenTask::new(Arc::new(config), task);
+        let admit = AdmitTask::new(screen, (node, family));
+        self.call(PrepareStep::TaskAdmit, IoCall::child(admit))
     }
 
     /// The capabilities of the backend this run is placed on.
@@ -287,15 +338,46 @@ impl Operation for PrepareAttemptOperation {
             let access = WorkspaceAccessOperation::existing(self.run, &self.bucket);
             return self.call(PrepareStep::Access, IoCall::child(access));
         }
-        self.read_facts()
+        self.start()
     }
 
     fn next(&mut self, result: IoResult) -> PrepareNext {
         match self.step {
             PrepareStep::Access => {
                 result.child::<(), JobError>()??;
-                self.read_facts()
+                self.start()
             }
+            PrepareStep::TaskConfig => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.map_err(|_| JobError::retryable("realm config unavailable"))?;
+                let held = HeldReservations::of_job(self.record.job_id);
+                let step = PrepareStep::TaskReservation(Box::new(config));
+                self.call(step, IoCall::child(held))
+            }
+            PrepareStep::TaskReservation(ref config) => {
+                let config = (**config).clone();
+                let held = result.child::<Vec<JobReservationRecord>, LifecycleError>()?;
+                let held = held.map_err(|error| JobError::retryable(error.to_string()))?;
+                self.task_family(config, held)
+            }
+            PrepareStep::TaskFamily(ref config) => {
+                let config = (**config).clone();
+                let family = result.child::<Option<JobFamilyId>, JobRouteError>()?;
+                let family = family.map_err(|error| JobError::retryable(error.to_string()))?;
+                let Some(family) = family else {
+                    return Err(JobError::retryable(
+                        "the plugin task's family is not here yet",
+                    ));
+                };
+                self.task_admit(config, family)
+            }
+            PrepareStep::TaskAdmit => match result.child::<PluginInstall, ScreenError>()? {
+                Ok(_) => self.read_facts(),
+                Err(error @ (ScreenError::Pending | ScreenError::Unavailable(_))) => {
+                    Err(JobError::retryable(error.to_string()))
+                }
+                Err(error) => Err(JobError::permanent(error.to_string())),
+            },
             PrepareStep::Facts => {
                 if let ComputeAnswer::Facts(facts) = compute_answer(result)? {
                     self.facts = Some(facts);
@@ -398,10 +480,10 @@ pub fn build_task_spec(
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,
-        output_paths: spec
-            .file_outputs
-            .iter()
+        // A plugin task's report is declared so the backend lets it be read; no export takes it.
+        output_paths: (spec.file_outputs.iter())
             .map(|output| output.container_path.clone())
+            .chain(spec.tags.get(PLUGIN_REPORT_TAG).cloned())
             .collect(),
     }
 }
