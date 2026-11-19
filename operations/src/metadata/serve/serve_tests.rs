@@ -336,7 +336,7 @@ fn mirror_needs_token() {
 }
 
 #[test]
-fn read_only_refuses_mirror() {
+fn read_only_refused() {
     // A read-only bucket refuses a mirror like a denied write, before any bucket is made.
     use super::mirror::{MirrorRequest, MirrorServeOperation};
     use crate::staging::bucket_guard::BucketGuardError;

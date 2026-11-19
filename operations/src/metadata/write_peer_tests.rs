@@ -151,7 +151,7 @@ fn mirror_refuses_replay() {
 }
 
 #[test]
-fn mirror_checks_foreign_bearer() {
+fn mirror_checks_foreign() {
     // A bearer of another realm still needs the peer in that realm's config.
     let foreign = RealmId([7u8; 32]);
     let mut check = WritePeerOperation::mirror(node(1), AuthToken::bearer("token").unwrap());
