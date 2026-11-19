@@ -6,7 +6,8 @@
 use crate::blob_node::{
     BUCKET, TestContext, bucket_info, content, progress, put, read, run, setup_on, version, write,
 };
-use aruna_blob::blob::{BackendRegistry, BlobHandler, NodeBackend};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event};

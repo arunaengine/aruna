@@ -5,9 +5,9 @@
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::group::GROUP_WRITE_CHUNK;
 use super::io::compose_chunk;
+use super::registry::{BackendRegistry, NodeBackend};
 use super::{
-    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
-    control_plane::timeout_event,
+    BlobHandle, BlobHandler, ControlPlaneKind, control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
 use crate::messages::{MessageType, ReplicationMessage};

@@ -22,7 +22,8 @@ use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupIn
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_blob::blob::{BackendRegistry, BlobHandler};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::BackendRegistry;
 use aruna_clock::testing::poll_until;
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::UserId;

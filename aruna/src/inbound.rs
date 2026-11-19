@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::inbound_frames;
-use aruna_blob::blob::{InboundError, refuse_stream};
+use aruna_blob::blob::inbound::{InboundError, refuse_stream};
 use aruna_blob::native;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;

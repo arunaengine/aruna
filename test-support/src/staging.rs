@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::blob::{BackendRegistry, BlobHandler};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::BackendRegistry;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::jobs::ProgressReporter;

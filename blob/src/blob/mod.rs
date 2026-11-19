@@ -21,23 +21,21 @@ mod control_plane;
 mod external;
 mod framed_parts;
 mod frames;
-mod group;
+pub mod group;
 mod in_place;
-mod inbound;
+pub mod inbound;
 mod io;
 mod local_spool;
 pub mod pithos;
 mod plain;
 mod read_pins;
-mod registry;
+pub mod registry;
 mod replication;
 mod runtime;
 mod source;
 mod unlock;
 
-pub use group::{BackendClaim, GroupHold};
-pub use inbound::{InboundError, refuse_stream};
-pub use registry::{BackendRegistry, NodeBackend};
+use registry::BackendRegistry;
 
 #[cfg(test)]
 mod tests;

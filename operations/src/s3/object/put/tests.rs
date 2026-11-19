@@ -5,7 +5,7 @@
 
 use super::*;
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::blob::{BackendRegistry, NodeBackend};
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
