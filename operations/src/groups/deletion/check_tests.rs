@@ -25,7 +25,7 @@ use crate::driver::drive;
 use crate::s3::bucket::create::CreateBucketOperation;
 
 /// Creates the buckets and denies the caller READ on `hidden` at `seed`.
-pub(super) async fn buckets(fixture: &Fixture, seed: u8, names: &[&str]) {
+pub async fn buckets(fixture: &Fixture, seed: u8, names: &[&str]) {
     for name in names {
         drive(
             CreateBucketOperation::new(name.to_string(), fixture.bucket()),

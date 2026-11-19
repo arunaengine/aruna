@@ -14,6 +14,7 @@ mod compression_migration;
 mod convergence;
 mod create_backpressure;
 mod create_concurrency;
+mod deletion_peers;
 mod device_documents;
 mod disjoint_turnover;
 mod genesis_confirmation;
