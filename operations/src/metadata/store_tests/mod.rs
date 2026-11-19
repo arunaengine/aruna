@@ -1,8 +1,9 @@
-//! Declares the metadata handle test modules and the imports they share.
+//! Declares the graph store effect tests and the imports they share.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
 use aruna_core::events::Event;
 use aruna_core::metadata::ApplyRoCrateRequest;
@@ -15,6 +16,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_graph::GraphHandle;
 use aruna_storage::FjallStorage;
+use aruna_storage::StorageHandle;
 use tempfile::{TempDir, tempdir};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
@@ -28,17 +30,12 @@ const ROCRATE_13: &str = include_str!(concat!(
     "/tests/fixtures/roundtrip-1.3.json"
 ));
 
-/// A context with this storage, metadata handle and graph store and nothing else.
-fn graph_context(
-    storage: StorageHandle,
-    metadata: MetadataHandle,
-    graph: GraphHandle,
-) -> DriverContext {
+/// A context with this storage and graph store and nothing else.
+fn graph_context(storage: StorageHandle, graph: GraphHandle) -> DriverContext {
     DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: None,
         compute_handle: None,

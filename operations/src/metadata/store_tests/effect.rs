@@ -22,14 +22,8 @@ pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) 
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
-    let metadata_handle = graph_context(storage, metadata_handle, graph_handle);
-    (metadata_dir, metadata_handle)
+    install_indexes(&storage, metadata_dir.path());
+    (metadata_dir, graph_context(storage, graph_handle))
 }
 
 async fn plan_entity(
@@ -328,13 +322,8 @@ async fn policy_mints_nothing() {
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    let handle = MetadataHandle::new(
-        dir.path().join("metadata"),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
-    let handle = graph_context(storage, handle, graph);
+    install_indexes(&storage, dir.path().join("metadata"));
+    let handle = graph_context(storage, graph);
     let graph_iri = "urn:fixture:aruna:policy:restored";
     let policy = |public| MetadataGraphPolicy {
         public,
