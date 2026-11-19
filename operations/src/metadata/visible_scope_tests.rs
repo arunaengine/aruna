@@ -80,7 +80,7 @@ fn scope_drops_deleted() {
         ],
         generation: 3,
     };
-    let refreshed = scope.next(child(Ok::<_, MetadataError>((deleted, 1))));
+    let refreshed = scope.next(child(Ok::<_, MetadataError>((deleted, 1u64))));
     assert_eq!(
         refreshed,
         Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
